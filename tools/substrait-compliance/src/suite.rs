@@ -23,7 +23,7 @@ limitations under the License.
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use snafu::ResultExt;
+use snafu::{ResultExt, ensure};
 
 use crate::compare::{TableData, parse_typed_csv};
 use crate::error::{self, Result};
@@ -99,9 +99,22 @@ pub fn load_tpch_suite(root: &Path) -> Result<LoadedSuite> {
             path: plan_path.clone(),
         })?;
 
+        // A declared golden is required: a missing file must fail the load, not
+        // turn the case into a SKIP that a report-only run would accept. Only
+        // omitted metadata falls back to the conventional path, then to SKIP.
         let expected = {
             let csv_path = match &tc.expected_output {
-                Some(rel) => root.join(rel),
+                Some(rel) => {
+                    let declared = root.join(rel);
+                    ensure!(
+                        declared.exists(),
+                        error::MissingGoldenSnafu {
+                            test_id: tc.id.clone(),
+                            path: declared,
+                        }
+                    );
+                    declared
+                }
                 None => root.join("expected").join(format!("{}.csv", tc.id)),
             };
             if csv_path.exists() {
@@ -184,6 +197,12 @@ testCases:
     }
 
     fn write_mini_suite(label: &str, expected_csv: &[u8]) -> PathBuf {
+        write_mini_suite_with(label, true, Some(expected_csv))
+    }
+
+    /// A one-case suite; `declared` writes `expectedOutput` into the metadata,
+    /// `expected_csv` writes the golden at the conventional path.
+    fn write_mini_suite_with(label: &str, declared: bool, expected_csv: Option<&[u8]>) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "spice-substrait-golden-{}-{label}",
             std::process::id()
@@ -191,22 +210,55 @@ testCases:
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("plans")).expect("mini suite plans dir");
         std::fs::create_dir_all(dir.join("expected")).expect("mini suite expected dir");
+        let declaration = if declared {
+            "\n    expectedOutput: \"expected/q99.csv\""
+        } else {
+            ""
+        };
         std::fs::write(
             dir.join("metadata.yaml"),
-            r#"
+            format!(
+                r#"
 name: "tpch"
 version: "1.0.0"
 testCases:
   - id: "q99"
-    planBinary: "plans/q99.bin"
-    expectedOutput: "expected/q99.csv"
-"#,
+    planBinary: "plans/q99.bin"{declaration}
+"#
+            ),
         )
         .expect("write mini suite metadata");
         std::fs::write(dir.join("plans/q99.bin"), []).expect("write mini suite plan");
-        std::fs::write(dir.join("expected/q99.csv"), expected_csv)
-            .expect("write mini suite golden");
+        if let Some(csv) = expected_csv {
+            std::fs::write(dir.join("expected/q99.csv"), csv).expect("write mini suite golden");
+        }
         dir
+    }
+
+    /// A declared golden that is missing fails the load; it must not become a
+    /// SKIP that a report-only run accepts.
+    #[test]
+    fn declared_missing_golden_is_a_load_error() {
+        let dir = write_mini_suite_with("declared-missing", true, None);
+        let err = load_tpch_suite(&dir).expect_err("declared golden is missing");
+        assert!(
+            matches!(err, error::Error::MissingGolden { ref test_id, .. } if test_id == "q99"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("expected/q99.csv"), "{err}");
+    }
+
+    /// Omitted metadata falls back to the conventional path, and to SKIP
+    /// (no golden) only when that is absent too.
+    #[test]
+    fn omitted_expected_output_falls_back_then_skips() {
+        let with_default = write_mini_suite_with("omitted-default", false, Some(b"n:integer\n1\n"));
+        let suite = load_tpch_suite(&with_default).expect("conventional golden");
+        assert!(suite.cases[0].expected.is_some());
+
+        let without = write_mini_suite_with("omitted-none", false, None);
+        let suite = load_tpch_suite(&without).expect("no golden declared or present");
+        assert!(suite.cases[0].expected.is_none());
     }
 
     #[test]

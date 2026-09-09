@@ -53,6 +53,14 @@ pub enum Error {
         source: crate::compare::ParseTypedCsvError,
     },
 
+    #[snafu(display(
+        "Test '{test_id}' declares expected output '{}' but the file is missing; a case without its golden \
+        would be reported SKIPPED and silently weaken the run. Check the suite checkout \
+        (scripts/fetch-ibm.sh) or remove the declaration",
+        path.display()
+    ))]
+    MissingGolden { test_id: String, path: PathBuf },
+
     #[snafu(display("Unknown TPC-H table '{name}' referenced by test '{test_id}'"))]
     UnknownTable { name: String, test_id: String },
 
