@@ -43,10 +43,13 @@ limitations under the License.
 //! reference and leaves it inlined.
 //!
 //! Consumer filters are OR-ed onto the producer the way `DuckDB`'s
-//! `CTEFilterPusher` does: only when every reference has a predicate that
-//! mentions only the CTE. A copy that needs the full result (TPC-H Q15
-//! `max()`) skips the wrap. Recursive CTEs already have `RecursiveQuery` /
-//! `WorkTableExec` and are left alone.
+//! `CTEFilterPusher` does: only predicates that would sit directly on a CTE
+//! scan after filter pushdown (columns qualified to that copy alone). A
+//! filter on the output of a join of several copies (TPC-DS Q47 / Q57
+//! `v2.d_year = 2001` above a lag/lead self-join) is not local — those
+//! copies still need neighbor years. A copy that needs the full result
+//! (TPC-H Q15 `max()`) skips the wrap. Recursive CTEs already have
+//! `RecursiveQuery` / `WorkTableExec` and are left alone.
 //!
 //! The rewrite is:
 //!
@@ -450,9 +453,14 @@ fn materialize_candidate(plan: LogicalPlan, candidate: CteCandidate) -> Result<L
 }
 
 /// Wrap the CTE body in `Filter(OR of per-copy predicates)` — `DuckDB`
-/// `CTEFilterPusher`. The rule runs before pushdown, so `cs1.syear = 2001` /
-/// `cs2.syear = 2002` still sit on a parent `Filter`. A copy that needs the
-/// full CTE (TPC-H Q15 `max()`) skips the wrap.
+/// `CTEFilterPusher`. That pass runs *after* filter pushdown and only
+/// collects a `Filter` that sits directly on a CTE ref. This rule runs
+/// before pushdown, so `cs1.syear = 2001` / `cs2.syear = 2002` still sit on
+/// a parent `Filter`; a conjunct is local to a copy only when every column
+/// is qualified to that copy's 1:1 alias chain (not an ancestor of a join
+/// of several copies, and not a join predicate that names two copies). A
+/// copy that needs the full CTE (TPC-H Q15 `max()`, TPC-DS Q47 lag/lead)
+/// skips the wrap.
 fn absorb_consumer_filters(plan: &LogicalPlan, candidate: &CteCandidate) -> Option<LogicalPlan> {
     let mut copy_filters = Vec::new();
     collect_copy_filters(
@@ -462,6 +470,7 @@ fn absorb_consumer_filters(plan: &LogicalPlan, candidate: &CteCandidate) -> Opti
         candidate.schema.as_ref(),
         &[],
         &[],
+        false,
         &mut copy_filters,
     );
     // `find_candidate` walks with `apply_with_subqueries`. If this walk
@@ -484,6 +493,10 @@ fn absorb_consumer_filters(plan: &LogicalPlan, candidate: &CteCandidate) -> Opti
         .map(LogicalPlan::Filter)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "walk state is plan + CTE identity + alias/filter stacks; packing it hides the join-reset"
+)]
 fn collect_copy_filters(
     plan: &LogicalPlan,
     cte_name: &str,
@@ -491,6 +504,7 @@ fn collect_copy_filters(
     schema: &DFSchema,
     path_aliases: &[String],
     inherited: &[Expr],
+    crossed_multi_input: bool,
     out: &mut Vec<Option<Expr>>,
 ) {
     if matches!(plan, LogicalPlan::RecursiveQuery(_)) {
@@ -508,6 +522,7 @@ fn collect_copy_filters(
                 schema,
                 path_aliases,
                 &inherited,
+                crossed_multi_input,
                 out,
             );
         }
@@ -516,13 +531,18 @@ fn collect_copy_filters(
             if let Some(join_filter) = join.filter.clone() {
                 inherited.extend(split_conjunction_owned(join_filter));
             }
+            // Aliases above a join name the join output (TPC-DS Q47 `v2`), not
+            // a single copy. Reset so `v2.d_year = 2001` is not local to lag
+            // and lead. Still inherit conjuncts: `a.y = 10 AND b.y = 20` above
+            // a join of two copies is what filter pushdown would split.
             collect_copy_filters(
                 join.left.as_ref(),
                 cte_name,
                 body,
                 schema,
-                path_aliases,
+                &[],
                 &inherited,
+                true,
                 out,
             );
             collect_copy_filters(
@@ -530,8 +550,9 @@ fn collect_copy_filters(
                 cte_name,
                 body,
                 schema,
-                path_aliases,
+                &[],
                 &inherited,
+                true,
                 out,
             );
         }
@@ -541,7 +562,9 @@ fn collect_copy_filters(
             if alias.alias.table() == cte_name && alias.input.as_ref() == body {
                 let local: Vec<Expr> = inherited
                     .iter()
-                    .filter(|expr| is_local_predicate(expr, schema, &path_aliases))
+                    .filter(|expr| {
+                        is_local_predicate(expr, schema, &path_aliases, crossed_multi_input)
+                    })
                     .cloned()
                     .collect();
                 out.push(conjunction(local));
@@ -554,12 +577,28 @@ fn collect_copy_filters(
                 schema,
                 &path_aliases,
                 inherited,
+                crossed_multi_input,
                 out,
             );
         }
         other => {
+            let child_crossed = crossed_multi_input || other.inputs().len() > 1;
+            let child_aliases: &[String] = if other.inputs().len() > 1 {
+                &[]
+            } else {
+                path_aliases
+            };
             for input in other.inputs() {
-                collect_copy_filters(input, cte_name, body, schema, path_aliases, inherited, out);
+                collect_copy_filters(
+                    input,
+                    cte_name,
+                    body,
+                    schema,
+                    child_aliases,
+                    inherited,
+                    child_crossed,
+                    out,
+                );
             }
         }
     }
@@ -586,6 +625,7 @@ fn collect_expr_subquery_filters(
                     schema,
                     &[],
                     &[],
+                    false,
                     out,
                 );
             }
@@ -597,6 +637,7 @@ fn collect_expr_subquery_filters(
                     schema,
                     &[],
                     &[],
+                    false,
                     out,
                 );
             }
@@ -608,6 +649,7 @@ fn collect_expr_subquery_filters(
                     schema,
                     &[],
                     &[],
+                    false,
                     out,
                 );
             }
@@ -617,20 +659,50 @@ fn collect_expr_subquery_filters(
     });
 }
 
-fn is_local_predicate(expr: &Expr, schema: &DFSchema, path_aliases: &[String]) -> bool {
+/// A conjunct that filter pushdown would land on this CTE copy: every column
+/// is in the CTE schema, every qualifier is an alias of *this* copy since the
+/// last join, and the predicate names at most one such alias. Unqualified
+/// columns are local only on a single-child chain (not inherited across a
+/// join of several copies).
+fn is_local_predicate(
+    expr: &Expr,
+    schema: &DFSchema,
+    path_aliases: &[String],
+    crossed_multi_input: bool,
+) -> bool {
     if expr_contains_subquery(expr) {
         return false;
     }
     let mut columns = Vec::new();
     collect_columns_from_expr(expr, &mut columns);
-    columns.iter().all(|column| {
-        schema_has_unqualified_field(schema, &column.name)
-            && column.relation.as_ref().is_none_or(|relation| {
-                path_aliases
-                    .iter()
-                    .any(|alias| alias.as_str() == relation.table())
-            })
-    })
+    if columns.is_empty() {
+        return false;
+    }
+    let mut qualifiers: Vec<&str> = Vec::new();
+    for column in &columns {
+        if !schema_has_unqualified_field(schema, &column.name) {
+            return false;
+        }
+        match column.relation.as_ref() {
+            None => {
+                if crossed_multi_input {
+                    return false;
+                }
+            }
+            Some(relation) => {
+                let table = relation.table();
+                if !path_aliases.iter().any(|alias| alias.as_str() == table) {
+                    return false;
+                }
+                if !qualifiers.contains(&table) {
+                    qualifiers.push(table);
+                }
+            }
+        }
+    }
+    // `v1.cat = v1_lag.cat` names two copies on the lag path (the SQL alias
+    // wraps the CTE name). That is a join predicate, not a filter on one scan.
+    qualifiers.len() <= 1
 }
 
 fn expr_contains_subquery(expr: &Expr) -> bool {
@@ -1628,6 +1700,136 @@ mod tests {
         assert!(
             !display.contains("x = Int64(1)"),
             "a max() copy needs the full CTE, so the producer must stay unfiltered:\n{display}"
+        );
+        Ok(())
+    }
+
+    fn monthly_sales_batches() -> Result<Vec<RecordBatch>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("cat", DataType::Utf8, false),
+            Field::new("yr", DataType::Int64, false),
+            Field::new("moy", DataType::Int64, false),
+            Field::new("sales", DataType::Int64, false),
+        ]));
+        let mut cat = vec!["A".to_string()];
+        let mut yr = vec![2000_i64];
+        let mut moy = vec![12_i64];
+        let mut sales = vec![100_i64];
+        for month in 1..=12 {
+            cat.push("A".to_string());
+            yr.push(2001);
+            moy.push(month);
+            sales.push(100);
+        }
+        cat.push("A".to_string());
+        yr.push(2002);
+        moy.push(1);
+        sales.push(100);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(cat)),
+                Arc::new(Int64Array::from(yr)),
+                Arc::new(Int64Array::from(moy)),
+                Arc::new(Int64Array::from(sales)),
+            ],
+        )?;
+        Ok(vec![batch])
+    }
+
+    fn register_monthly_sales(ctx: &SessionContext) -> Result<()> {
+        let rows = monthly_sales_batches()?;
+        let schema = rows[0].schema();
+        ctx.register_table("t", Arc::new(MemTable::try_new(schema, vec![rows])?))?;
+        Ok(())
+    }
+
+    /// TPC-DS Q47 / Q57: window+rank CTE, lag/lead self-join, outer year filter.
+    const Q47_SHAPED_LAG_LEAD_SQL: &str = "WITH v1 AS ( \
+             SELECT cat, yr, moy, sum(sales) AS sum_sales, \
+                    rank() OVER (PARTITION BY cat ORDER BY yr, moy) AS rn \
+             FROM t \
+             WHERE (yr = 2001) OR (yr = 2000 AND moy = 12) OR (yr = 2002 AND moy = 1) \
+             GROUP BY cat, yr, moy \
+           ), \
+           v2 AS ( \
+             SELECT v1.cat, v1.yr, v1.moy, v1.sum_sales, \
+                    v1_lag.sum_sales AS psum, v1_lead.sum_sales AS nsum \
+             FROM v1, v1 v1_lag, v1 v1_lead \
+             WHERE v1.cat = v1_lag.cat AND v1.cat = v1_lead.cat \
+               AND v1.rn = v1_lag.rn + 1 AND v1.rn = v1_lead.rn - 1 \
+           ) \
+           SELECT yr, moy, CAST(sum_sales AS BIGINT) AS sum_sales, \
+                  CAST(psum AS BIGINT) AS psum, CAST(nsum AS BIGINT) AS nsum \
+           FROM v2 \
+           WHERE yr = 2001 \
+           ORDER BY yr, moy";
+
+    #[tokio::test]
+    async fn does_not_absorb_outer_year_filter_through_lag_lead_join() -> Result<()> {
+        // TPC-DS Q47 / Q57: `v1` is a window+rank monthly aggregate, `v2`
+        // self-joins it as lag/lead, and the outer query keeps one year.
+        // DuckDB's CTEFilterPusher only OR-s filters that sit directly on a
+        // CTE ref after pushdown. A filter on the join output (`v2.yr = 2001`)
+        // is not local to the lag/lead copies — they still need Dec 2000 and
+        // Jan 2002 so January and December 2001 have neighbors.
+        let ctx = SessionContext::new();
+        register_monthly_sales(&ctx)?;
+        let plan = unoptimized(&ctx, Q47_SHAPED_LAG_LEAD_SQL).await?;
+        let rewritten = apply_rule(plan)?;
+        assert!(
+            rewritten.transformed,
+            "expected to materialize v1:\n{}",
+            rewritten.data
+        );
+        let names = materialized_cte_names(&rewritten.data);
+        assert!(
+            names.iter().any(|name| name == "v1"),
+            "expected MaterializedCte v1, got {names:?}:\n{}",
+            rewritten.data
+        );
+        let producer =
+            materialized_producer(&rewritten.data).expect("materialized CTE must have a producer");
+        let display = format!("{producer}");
+        // The CTE body itself filters `t.yr` to 2000-12/2001/2002-01. An extra
+        // unqualified `yr = 2001` wrap would drop Dec 2000 / Jan 2002 from the
+        // shared buffer.
+        assert!(
+            !display.contains("Filter: yr = Int64(2001)"),
+            "outer v2.yr = 2001 must not wrap the shared v1 producer:\n{display}\nfull plan:\n{}",
+            rewritten.data
+        );
+        assert!(
+            !matches!(producer, LogicalPlan::Filter(_)),
+            "producer must stay the window body, not a consumer-filter wrap:\n{display}"
+        );
+
+        let auto_ctx = session_with_rule();
+        register_monthly_sales(&auto_ctx)?;
+        let auto = materialized_sql(&auto_ctx, Q47_SHAPED_LAG_LEAD_SQL).await?;
+        let off_ctx = SessionContext::new();
+        register_monthly_sales(&off_ctx)?;
+        let off = collect_sql(&off_ctx, Q47_SHAPED_LAG_LEAD_SQL).await?;
+        let expected_moy: Vec<Option<i64>> = (1..=12).map(Some).collect();
+        assert_eq!(
+            i64_col(&off, 1),
+            expected_moy,
+            "inlined plan must keep every 2001 month (Jan needs Dec 2000, Dec needs Jan 2002)"
+        );
+        assert_eq!(i64_col(&auto, 0), i64_col(&off, 0), "yr");
+        assert_eq!(i64_col(&auto, 1), i64_col(&off, 1), "moy");
+        assert_eq!(i64_col(&auto, 2), i64_col(&off, 2), "sum_sales");
+        assert_eq!(i64_col(&auto, 3), i64_col(&off, 3), "psum");
+        assert_eq!(i64_col(&auto, 4), i64_col(&off, 4), "nsum");
+        assert_eq!(
+            i64_col(&auto, 3)[0],
+            Some(100),
+            "January 2001 lag must be December 2000"
+        );
+        assert_eq!(
+            i64_col(&auto, 4)[11],
+            Some(100),
+            "December 2001 lead must be January 2002"
         );
         Ok(())
     }

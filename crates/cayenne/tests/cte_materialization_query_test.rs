@@ -27,7 +27,7 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, RecordBatch};
+use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::CreateTableOptions;
 use cayenne::{
@@ -205,3 +205,113 @@ async fn cayenne_table_auto_materializes_and_disabled_stays_inlined_impl(
 }
 
 test_with_backends!(cayenne_table_auto_materializes_and_disabled_stays_inlined_impl);
+
+const Q47_SHAPED_SQL: &str = "WITH v1 AS ( \
+             SELECT cat, yr, moy, sum(sales) AS sum_sales, \
+                    rank() OVER (PARTITION BY cat ORDER BY yr, moy) AS rn \
+             FROM t \
+             WHERE (yr = 2001) OR (yr = 2000 AND moy = 12) OR (yr = 2002 AND moy = 1) \
+             GROUP BY cat, yr, moy \
+           ), \
+           v2 AS ( \
+             SELECT v1.cat, v1.yr, v1.moy, v1.sum_sales, \
+                    v1_lag.sum_sales AS psum, v1_lead.sum_sales AS nsum \
+             FROM v1, v1 v1_lag, v1 v1_lead \
+             WHERE v1.cat = v1_lag.cat AND v1.cat = v1_lead.cat \
+               AND v1.rn = v1_lag.rn + 1 AND v1.rn = v1_lead.rn - 1 \
+           ) \
+           SELECT yr, moy, CAST(sum_sales AS BIGINT) AS sum_sales, \
+                  CAST(psum AS BIGINT) AS psum, CAST(nsum AS BIGINT) AS nsum \
+           FROM v2 \
+           WHERE yr = 2001 \
+           ORDER BY yr, moy";
+
+async fn seeded_monthly_table(fixture: &TestFixture) -> TestResult<Arc<CayenneTableProvider>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("cat", DataType::Utf8, false),
+        Field::new("yr", DataType::Int64, false),
+        Field::new("moy", DataType::Int64, false),
+        Field::new("sales", DataType::Int64, false),
+    ]));
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            CreateTableOptions {
+                table_name: "t".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["cat".to_string(), "yr".to_string(), "moy".to_string()],
+                on_conflict: None,
+                base_path: fixture.data_path.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            },
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    let mut cat = vec!["A".to_string()];
+    let mut yr = vec![2000_i64];
+    let mut moy = vec![12_i64];
+    let mut sales = vec![100_i64];
+    for month in 1..=12 {
+        cat.push("A".to_string());
+        yr.push(2001);
+        moy.push(month);
+        sales.push(100);
+    }
+    cat.push("A".to_string());
+    yr.push(2002);
+    moy.push(1);
+    sales.push(100);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(cat)),
+            Arc::new(Int64Array::from(yr)),
+            Arc::new(Int64Array::from(moy)),
+            Arc::new(Int64Array::from(sales)),
+        ],
+    )?;
+    common::insert_batch(table.as_ref(), batch).await?;
+    Ok(table)
+}
+
+async fn collect_on(
+    cte_auto: bool,
+    table: &Arc<CayenneTableProvider>,
+    sql: &str,
+) -> TestResult<(LogicalPlan, Vec<RecordBatch>)> {
+    let ctx = session(cte_auto);
+    ctx.register_table("t", Arc::clone(table) as Arc<dyn TableProvider>)?;
+    let df = ctx.sql(sql).await?;
+    let logical = df.clone().into_optimized_plan()?;
+    let rows = ctx.sql(sql).await?.collect().await?;
+    Ok((logical, rows))
+}
+
+async fn cayenne_lag_lead_year_filter_matches_inlined_impl(fixture: TestFixture) -> TestResult<()> {
+    // TPC-DS Q47 / Q57 on a real Cayenne table: outer `yr = 2001` must not
+    // strip Dec 2000 / Jan 2002 from the shared v1 buffer.
+    let table = seeded_monthly_table(&fixture).await?;
+    let (auto_plan, auto) = collect_on(true, &table, Q47_SHAPED_SQL).await?;
+    let (off_plan, off) = collect_on(false, &table, Q47_SHAPED_SQL).await?;
+    assert!(
+        plan_contains(&auto_plan, MATERIALIZED_CTE_NODE_NAME),
+        "auto must materialize v1:\n{auto_plan}"
+    );
+    assert!(
+        !plan_contains(&off_plan, MATERIALIZED_CTE_NODE_NAME),
+        "disabled must stay inlined:\n{off_plan}"
+    );
+    let expected_moy: Vec<Option<i64>> = (1..=12).map(Some).collect();
+    assert_eq!(i64_col(&off, 1), expected_moy, "inlined months");
+    assert_eq!(i64_col(&auto, 0), i64_col(&off, 0), "yr");
+    assert_eq!(i64_col(&auto, 1), i64_col(&off, 1), "moy");
+    assert_eq!(i64_col(&auto, 2), i64_col(&off, 2), "sum_sales");
+    assert_eq!(i64_col(&auto, 3), i64_col(&off, 3), "psum");
+    assert_eq!(i64_col(&auto, 4), i64_col(&off, 4), "nsum");
+    Ok(())
+}
+
+test_with_backends!(cayenne_lag_lead_year_filter_matches_inlined_impl);
