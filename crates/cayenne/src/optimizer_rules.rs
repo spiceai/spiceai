@@ -138,7 +138,7 @@ use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
 use runtime_datafusion::join_accumulator::{
     DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES, ExactLeftAccumulator,
 };
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::maintained_aggregate::{
@@ -1057,15 +1057,15 @@ fn join_touches_cayenne(hash_join: &HashJoinExec) -> bool {
         || !collect_cayenne_scans(hash_join.right()).is_empty()
 }
 
-/// Unknown-size self-join of one CTE (TPC-DS `year_total` Q4/Q11/Q74).
-/// Same projected schema or same-named equi-join keys are not enough:
-/// TPC-DS Q97's `ssci` ⋈ `csci` full-outer join projects `customer_sk` /
-/// `item_sk` on both sides but reads `store_sales` vs `catalog_sales`.
-/// Distinct Cayenne scan identities are not a self-join and must still spill.
+/// Unknown-size self-join of one CTE (TPC-DS `year_total` Q4/Q11/Q74):
+/// inner joins whose inputs share a schema or every equi-join key has the
+/// same physical name (`customer_id = customer_id`).
+///
+/// Full-outer joins are not this case: TPC-DS Q97's `ssci` ⋈ `csci` projects
+/// `customer_sk`/`item_sk` on both sides but must still spill. Treating those
+/// as self-joins left a non-spillable `HashJoinInput` at SF-100.
 fn is_unknown_size_self_join(hash_join: &HashJoinExec) -> bool {
-    let left_ids = cayenne_scan_identity_set(hash_join.left());
-    let right_ids = cayenne_scan_identity_set(hash_join.right());
-    if !left_ids.is_empty() && !right_ids.is_empty() && left_ids != right_ids {
+    if *hash_join.join_type() == JoinType::Full {
         return false;
     }
     if hash_join.left().schema() == hash_join.right().schema() {
@@ -1081,13 +1081,6 @@ fn is_unknown_size_self_join(hash_join: &HashJoinExec) -> bool {
                 _ => false,
             }
         })
-}
-
-fn cayenne_scan_identity_set(plan: &Arc<dyn ExecutionPlan>) -> HashSet<Arc<ScanIdentity>> {
-    collect_cayenne_scans(plan)
-        .into_iter()
-        .map(|scan| scan.identity)
-        .collect()
 }
 
 fn coalesce_for_spillable_sort(
@@ -1109,15 +1102,13 @@ fn restore_hash_join_partitioning(
     if n <= 1 || plan.output_partitioning().partition_count() == n {
         return Ok(plan);
     }
-    match partitioning {
-        Partitioning::Hash(exprs, _) => Ok(Arc::new(RepartitionExec::try_new(
-            plan,
-            Partitioning::Hash(exprs.clone(), n),
-        )?)),
-        Partitioning::RoundRobinBatch(_) | Partitioning::UnknownPartitioning(_) => Ok(Arc::new(
-            RepartitionExec::try_new(plan, Partitioning::RoundRobinBatch(n))?,
-        )),
-    }
+    // Round-robin restores N without cloning the hash-join's hash
+    // expressions. Those `Column`s can be `UnKnownColumn` after the
+    // sort-merge wrap (TPC-DS Q30/Q34/Q73/Q78/Q81 at SF-1).
+    Ok(Arc::new(RepartitionExec::try_new(
+        plan,
+        Partitioning::RoundRobinBatch(n),
+    )?))
 }
 
 /// Whether an input is an `AggregateExec` (or a unary wrapper over one).
@@ -3576,6 +3567,38 @@ mod tests {
         assert!(
             optimized.is::<SortMergeJoinExec>(),
             "an aggregated build side against a non-aggregate probe must spill"
+        );
+    }
+
+    #[test]
+    fn rewrites_absent_stats_full_outer_same_named_keys() {
+        // TPC-DS Q97 is a full-outer join on customer_sk/item_sk. Inner
+        // year_total copies stay hash joins; full-outer must still spill.
+        let schema = channel_schema("customer_sk", "item_sk");
+        let left = grouped_count_over(
+            cayenne_file_exec_with_num_rows(&schema, "year_total.vortex", Precision::Absent),
+            "customer_sk",
+        );
+        let right = grouped_count_over(
+            cayenne_file_exec_with_num_rows(&schema, "year_total.vortex", Precision::Absent),
+            "customer_sk",
+        );
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "customer_sk",
+            "customer_sk",
+            JoinType::Full,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<SortMergeJoinExec>(),
+            "full-outer same-named keys must spill (TPC-DS Q97)"
         );
     }
 
