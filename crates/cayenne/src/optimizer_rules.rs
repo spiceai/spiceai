@@ -1064,13 +1064,14 @@ fn input_is_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
     children.len() == 1 && input_is_aggregate(children[0])
 }
 
-/// Spill an unknown-size join only when it is not a CTE self-join *and* both
-/// inputs are aggregates (Q78 `ss` ⋈ `ws`). Inexact stats on a scan join
-/// (Q13) must not flip it to sort-merge.
+/// Spill an unknown-size join when the **build** side (left) is an
+/// aggregate and this is not a CTE self-join. Q78 is `ss LEFT JOIN ws LEFT
+/// JOIN cs`: the inner `ws ⋈ ss` is aggregate-aggregate, but the outer join
+/// builds the `cs` aggregate against that result — requiring *both* inputs
+/// to be aggregates left that outer HashJoinInput at 19 GB. Fact-dimension
+/// joins (Q13) build a Cayenne scan, not an aggregate, and stay hash joins.
 fn should_spill_unknown_size_join(hash_join: &HashJoinExec) -> bool {
-    !is_unknown_size_self_join(hash_join)
-        && input_is_aggregate(hash_join.left())
-        && input_is_aggregate(hash_join.right())
+    !is_unknown_size_self_join(hash_join) && input_is_aggregate(hash_join.left())
 }
 
 /// Count the `HashJoinExec` nodes in a plan. Used to size each join's fair
@@ -3475,6 +3476,44 @@ mod tests {
         assert!(
             optimized.is::<HashJoinExec>(),
             "inexact fact-dimension joins must stay hash joins"
+        );
+    }
+
+    #[test]
+    fn rewrites_inexact_aggregate_build_against_non_aggregate_probe() {
+        // Q78 outer join: build = aggregated `cs`, probe = `ss ⋈ ws` (a join,
+        // not an aggregate). Must still spill.
+        let left_schema = channel_schema("cs_item_sk", "cs_qty");
+        let right_schema = channel_schema("ss_item_sk", "ss_qty");
+        let left = grouped_count_over(
+            cayenne_file_exec_with_num_rows(
+                &left_schema,
+                "cs.vortex",
+                Precision::Inexact(1_000),
+            ),
+            "cs_item_sk",
+        );
+        let right = cayenne_file_exec_with_num_rows(
+            &right_schema,
+            "ss.vortex",
+            Precision::Inexact(1_000),
+        );
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "cs_item_sk",
+            "ss_item_sk",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<SortMergeJoinExec>(),
+            "an aggregated build side against a non-aggregate probe must spill"
         );
     }
 
