@@ -126,7 +126,7 @@ use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::physical_plan::Partitioning;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion_common::stats::Precision;
@@ -830,11 +830,16 @@ fn try_rewrite_oversized_join(
             return finish_sort_merge_rewrite(hash_join, true);
         }
         if !join_touches_cayenne(hash_join) {
-            // Non-Cayenne inner/left unknown-size aggregate joins stay hash
-            // joins. Q78's `--validate` oracle is `ss LEFT JOIN ws LEFT JOIN
-            // cs ... LIMIT 100` over `__test_reference` file scans; a
-            // coalesced sort-merge of those joins returns a different
-            // LIMIT-100 set than the Cayenne plan (regression for #13918).
+            // CTE-auto Q78: `ss`/`ws`/`cs` become `CteScanExec` leaves, so the
+            // join no longer touches Cayenne. EnforceDistribution then
+            // hash-repartitions that 1-partition CTE into N `HashJoinInput`s
+            // (~5 GB each at SF-100) that cannot spill. Collapse to
+            // `CollectLeft` so there is one build copy — same hash-join
+            // algorithm as the `__test_reference` oracle (a coalesced
+            // sort-merge of that oracle changed LIMIT 100 at SF-1).
+            if join_reads_materialized_cte(hash_join) {
+                return rewrite_partitioned_hash_join_to_collect_left(hash_join);
+            }
             return Ok(None);
         }
         // Aggregated CTE bodies (TPC-DS Q78/Q97) often report `Absent` row
@@ -1072,6 +1077,47 @@ fn build_input_row_estimate(hash_join: &HashJoinExec) -> Option<usize> {
 fn join_touches_cayenne(hash_join: &HashJoinExec) -> bool {
     !collect_cayenne_scans(hash_join.left()).is_empty()
         || !collect_cayenne_scans(hash_join.right()).is_empty()
+}
+
+fn join_reads_materialized_cte(hash_join: &HashJoinExec) -> bool {
+    plan_contains_cte_scan(hash_join.left()) || plan_contains_cte_scan(hash_join.right())
+}
+
+fn plan_contains_cte_scan(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.name() == "CteScanExec" {
+        return true;
+    }
+    plan.children()
+        .iter()
+        .any(|child| plan_contains_cte_scan(child))
+}
+
+/// `CteScanExec` is one partition. A `Partitioned` hash join of two of them
+/// hash-repartitions that single buffer onto N build sides. Collect the
+/// build side to one partition instead.
+fn rewrite_partitioned_hash_join_to_collect_left(
+    hash_join: &HashJoinExec,
+) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+    if *hash_join.partition_mode() != PartitionMode::Partitioned {
+        return Ok(None);
+    }
+    let left = if hash_join.left().output_partitioning().partition_count() == 1 {
+        Arc::clone(hash_join.left())
+    } else {
+        Arc::new(CoalescePartitionsExec::new(Arc::clone(hash_join.left())))
+    };
+    let join = HashJoinExec::try_new(
+        left,
+        Arc::clone(hash_join.right()),
+        hash_join.on().to_vec(),
+        hash_join.filter().cloned(),
+        hash_join.join_type(),
+        hash_join.projection.as_ref().map(|indices| indices.to_vec()),
+        PartitionMode::CollectLeft,
+        hash_join.null_equality(),
+        false,
+    )?;
+    Ok(Some(Arc::new(join)))
 }
 
 /// Unknown-size self-join of one CTE (TPC-DS `year_total` Q4/Q11/Q74):
@@ -3706,6 +3752,52 @@ mod tests {
         assert!(
             optimized.is::<HashJoinExec>(),
             "Q78 --validate oracle (no Cayenne scans) must keep unknown-size inner aggregate joins as hash joins"
+        );
+    }
+
+    #[test]
+    fn rewrites_partitioned_cte_scan_join_to_collect_left() {
+        // TPC-DS Q78 with `cte_materialization: auto`: `ss`/`ws` are
+        // `CteScanExec`, so the join does not touch Cayenne.
+        // Hash-repartitioning that 1-partition buffer onto N
+        // `HashJoinInput`s exhausted the pool at SF-100 (regression for #13918).
+        let left_schema = channel_schema("ss_item_sk", "ss_qty");
+        let right_schema = channel_schema("ws_item_sk", "ws_qty");
+        let left = hash_repartition(
+            crate::cte_materialization::test_cte_scan_exec("ss", Arc::clone(&left_schema)),
+            "ss_item_sk",
+            4,
+        );
+        let right = hash_repartition(
+            crate::cte_materialization::test_cte_scan_exec("ws", Arc::clone(&right_schema)),
+            "ws_item_sk",
+            4,
+        );
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "ss_item_sk",
+            "ws_item_sk",
+            JoinType::Left,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        let rewritten = optimized
+            .downcast_ref::<HashJoinExec>()
+            .expect("CTE-scan join must stay a hash join, not sort-merge");
+        assert_eq!(
+            *rewritten.partition_mode(),
+            PartitionMode::CollectLeft,
+            "must collapse N HashJoinInputs of a materialized CTE to one build"
+        );
+        assert_eq!(
+            rewritten.left().output_partitioning().partition_count(),
+            1,
+            "CollectLeft build side must be one partition"
         );
     }
 

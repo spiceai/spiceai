@@ -1194,6 +1194,17 @@ impl CteScanExec {
     }
 }
 
+/// Test leaf that reports `name() == "CteScanExec"` so the sort-merge
+/// rewriter can see a materialized CTE without executing one.
+#[cfg(test)]
+pub(crate) fn test_cte_scan_exec(name: &str, schema: SchemaRef) -> Arc<dyn ExecutionPlan> {
+    Arc::new(CteScanExec::new(
+        name.to_string(),
+        schema,
+        Arc::new(MaterializedCteSlot::new(name.to_string())),
+    ))
+}
+
 impl DisplayAs for CteScanExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match t {
