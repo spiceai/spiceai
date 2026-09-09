@@ -174,12 +174,11 @@ async fn run() -> Result<ExitCode> {
                 // Encode so a missing prost/FlightSQL type fails the stub itself.
                 let _ = engine.run_case(case);
             }
-            let owned: Vec<_> = cases.into_iter().cloned().collect();
             (
                 mode_b::ENGINE_NAME.to_string(),
                 mode_b::ENGINE_VERSION.to_string(),
                 args.mode.name().to_string(),
-                mode_b::FlightSqlComplianceEngine::stub_results(&owned),
+                mode_b::FlightSqlComplianceEngine::stub_results(&cases),
             )
         }
     };

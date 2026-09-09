@@ -32,6 +32,19 @@ pub enum TestStatus {
     Error,
 }
 
+impl TestStatus {
+    /// The lowercase name the JSON report uses (`serde(rename_all = "lowercase")`),
+    /// so the CSV column reads the same.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TestStatus::Passed => "passed",
+            TestStatus::Failed => "failed",
+            TestStatus::Skipped => "skipped",
+            TestStatus::Error => "error",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct CaseResult {
     pub test_id: String,
@@ -165,8 +178,11 @@ impl ComplianceReport {
                 .replace('"', "\"\"");
             writeln!(
                 file,
-                "{},{:?},{},\"{}\"",
-                case.test_id, case.status, case.execution_time_ms, err
+                "{},{},{},\"{}\"",
+                case.test_id,
+                case.status.as_str(),
+                case.execution_time_ms,
+                err
             )
             .context(error::WriteFileSnafu {
                 path: path.to_path_buf(),
@@ -215,5 +231,50 @@ mod tests {
         assert_eq!(report.skipped, 1);
         assert_eq!(report.total, 2);
         assert!((report.pass_rate_pct - 50.0).abs() < f64::EPSILON);
+    }
+
+    /// The CSV status column uses the same lowercase names as the JSON report.
+    #[test]
+    fn csv_status_is_lowercase_like_json() {
+        let results = vec![
+            CaseResult {
+                test_id: "q1".to_string(),
+                description: String::new(),
+                status: TestStatus::Passed,
+                execution_time_ms: 1,
+                error_message: None,
+            },
+            CaseResult {
+                test_id: "q2".to_string(),
+                description: String::new(),
+                status: TestStatus::Error,
+                execution_time_ms: 0,
+                error_message: Some("boom".to_string()),
+            },
+        ];
+        let report = ComplianceReport::finish(
+            ReportMeta {
+                suite_name: "tpch".to_string(),
+                suite_version: "1.0.0".to_string(),
+                engine_name: "DataFusion".to_string(),
+                engine_version: "54.1".to_string(),
+                mode: "mode-a".to_string(),
+                suite_ref: "spiceai/substrait-compliance@test".to_string(),
+                datafusion_pin: "test".to_string(),
+                start_time: Utc::now(),
+            },
+            results,
+        );
+        let dir = std::env::temp_dir().join(format!("spice-substrait-csv-{}", std::process::id()));
+        let path = dir.join("report.csv");
+        report.write_csv(&path).expect("write csv");
+        let csv = std::fs::read_to_string(&path).expect("read csv");
+        assert!(csv.contains("\nq1,passed,1,\"\"\n"), "{csv}");
+        assert!(csv.contains("\nq2,error,0,\"boom\"\n"), "{csv}");
+        assert_eq!(
+            serde_json::to_value(TestStatus::Error).expect("json"),
+            "error"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

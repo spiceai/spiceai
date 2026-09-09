@@ -121,7 +121,8 @@ impl FlightSqlComplianceEngine {
         .fail()
     }
 
-    pub fn stub_results(cases: &[LoadedCase]) -> Vec<CaseResult> {
+    /// One SKIP per case; borrows the cases, whose plan bytes are only measured.
+    pub fn stub_results(cases: &[&LoadedCase]) -> Vec<CaseResult> {
         cases
             .iter()
             .map(|case| CaseResult {
