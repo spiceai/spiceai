@@ -47,6 +47,7 @@ use std::time::{Duration, Instant};
 use app::AppBuilder;
 use axum::{Router, routing::get};
 use datafusion::prelude::*;
+use datafusion::sql::TableReference;
 use runtime::Runtime;
 use spicepod::{
     acceleration::{Acceleration, IndexType, Mode, OnConflictBehavior, RefreshMode},
@@ -254,6 +255,64 @@ async fn wait_for_cached_rows(rt: &Runtime, want: usize, timeout: Duration) -> R
     ))
 }
 
+/// Drives lookups for `query` until the accelerator holds `want` rows.
+///
+/// A refresh is triggered by a lookup and completes in the background, so the
+/// lookup that triggers it returns before the replacement has landed. Polling
+/// alone would not do either: past the TTL it takes a lookup to start the
+/// revalidation at all.
+async fn wait_for_rows_driving_lookups(
+    rt: &Runtime,
+    query: &str,
+    want: usize,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut last = cached_rows(rt).await;
+    while Instant::now() < deadline {
+        if last == want {
+            return Ok(());
+        }
+        fetch_key(rt, query).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        last = cached_rows(rt).await;
+    }
+    if last == want {
+        return Ok(());
+    }
+    Err(format!(
+        "after {}s the acceleration held {last} row(s), expected {want}",
+        timeout.as_secs()
+    ))
+}
+
+/// Waits until `dataset` reports a component error, which a caching accelerator
+/// does once a run of cache writes has been refused.
+///
+/// This is the completion signal for a refused write. Waiting a fixed time
+/// instead would let an assertion that nothing was cached pass simply because no
+/// write had been attempted yet.
+async fn wait_for_dataset_error(
+    rt: &Runtime,
+    dataset: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let table = TableReference::bare(dataset.to_string());
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = rt.status().get_dataset_status(&table)
+            && status.error_message().is_some()
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(format!(
+        "dataset '{dataset}' never reported a cache-write failure within {}s",
+        timeout.as_secs()
+    ))
+}
+
 fn duckdb_params(dir: &std::path::Path, extra: Vec<(&str, &str)>) -> Vec<(String, String)> {
     let mut params = vec![(
         "duckdb_file".to_string(),
@@ -411,7 +470,7 @@ async fn a_request_derived_primary_key_refuses_a_multi_row_response() -> Result<
     let _tracing = init_tracing(None);
     register_test_connectors().await;
 
-    let (shutdown, addr, _fetches) = start_mock(3).await;
+    let (shutdown, addr, fetches) = start_mock(3).await;
     let temp = tempfile::tempdir()?;
     let dataset = caching_dataset(
         addr,
@@ -421,12 +480,36 @@ async fn a_request_derived_primary_key_refuses_a_multi_row_response() -> Result<
     );
     let rt = build_runtime(dataset, "caching_multi_row_request_key").await;
 
-    fetch_key(&rt, "key=a").await;
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // A run of refused writes is what makes the dataset report an error, and
+    // that report is the signal the writes were attempted at all. Cache writes
+    // are batched and flushed on an interval, and the run counts flushes rather
+    // than requests, so the lookups are spaced past that interval instead of
+    // issued back to back -- four in one flush is one refusal, not four.
+    for key in ["key=a", "key=b", "key=c", "key=d"] {
+        fetch_key(&rt, key).await;
+        tokio::time::sleep(Duration::from_millis(900)).await;
+    }
+    wait_for_dataset_error(&rt, "http_data", Duration::from_mins(1))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "the cache writes were never refused, so this test would \
+             have asserted an empty accelerator that nothing had tried to fill: {e}"
+            )
+        })?;
+
     assert_eq!(
         cached_rows(&rt).await,
         0,
         "a response that violates the declared key must not be partially cached"
+    );
+
+    // And the entry is not served: a repeat lookup still reaches the origin.
+    let before = fetches.load(Ordering::SeqCst);
+    fetch_key(&rt, "key=a").await;
+    assert!(
+        fetches.load(Ordering::SeqCst) > before,
+        "the lookup was served from cache, so something was cached after all"
     );
 
     shutdown.send(()).ok();
@@ -515,16 +598,14 @@ async fn a_refreshed_entry_sheds_rows_the_response_no_longer_returns() -> Result
     // The origin now returns one fewer item. Drive lookups past the TTL so a
     // refresh replaces the entry.
     row_count.store(2, Ordering::SeqCst);
-    for _ in 0..6 {
-        fetch_key(&rt, "key=a").await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-
-    assert_eq!(
-        cached_rows(&rt).await,
-        2,
-        "the row dropped from the response is still cached, so a stale row is being served"
-    );
+    wait_for_rows_driving_lookups(&rt, "key=a", 2, Duration::from_mins(1))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "the row dropped from the response is still cached, so a stale row is being \
+                 served: {e}"
+            )
+        })?;
 
     shutdown.send(()).ok();
     Ok(())
