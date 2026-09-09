@@ -820,6 +820,14 @@ fn try_rewrite_oversized_join(
         if !join_touches_cayenne(hash_join) {
             return Ok(None);
         }
+        // TPC-DS Q97: full-outer of two grouped (customer, item) bodies.
+        // Exact aggregate stats can underestimate, so the byte gate keeps a
+        // Partitioned `HashJoinExec` whose `HashJoinInput`s then exhaust the
+        // pool (~20 GB each at SF-100). Full-outer + aggregate build always
+        // coalesces to a spillable sort-merge.
+        if *hash_join.join_type() == JoinType::Full && input_is_aggregate(hash_join.left()) {
+            return finish_sort_merge_rewrite(hash_join, true);
+        }
         // Aggregated CTE bodies (TPC-DS Q78/Q97) often report `Absent` row
         // counts. Skipping the rewrite then leaves a non-spillable hash table
         // that exhausts the pool. Treat unknown size as oversized — except a
@@ -3599,6 +3607,38 @@ mod tests {
         assert!(
             optimized.is::<SortMergeJoinExec>(),
             "full-outer same-named keys must spill (TPC-DS Q97)"
+        );
+    }
+
+    #[test]
+    fn rewrites_full_outer_aggregate_join_even_with_exact_small_stats() {
+        // Q97 at SF-100: Exact grouped-body stats can look tiny and pass
+        // the memory gate, then 20 HashJoinInputs each hold ~20 GB.
+        let schema = channel_schema("customer_sk", "item_sk");
+        let left = grouped_count_over(
+            cayenne_file_exec_with_num_rows(&schema, "store_sales.vortex", Precision::Exact(100)),
+            "customer_sk",
+        );
+        let right = grouped_count_over(
+            cayenne_file_exec_with_num_rows(&schema, "catalog_sales.vortex", Precision::Exact(100)),
+            "customer_sk",
+        );
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "customer_sk",
+            "customer_sk",
+            JoinType::Full,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<SortMergeJoinExec>(),
+            "full-outer aggregate joins must spill even when Exact stats look small"
         );
     }
 
