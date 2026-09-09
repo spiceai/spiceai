@@ -729,6 +729,18 @@ mod tests {
     }
 
     fn plan(root: Rel, names: &[&str]) -> Plan {
+        plan_with(
+            root,
+            names,
+            &[
+                (1, "and:bool"),
+                (2, "equal:any_any"),
+                (3, "not_equal:any_any"),
+            ],
+        )
+    }
+
+    fn plan_with(root: Rel, names: &[&str], extensions: &[(u32, &str)]) -> Plan {
         use datafusion_substrait::substrait::proto::extensions::{
             SimpleExtensionDeclaration,
             simple_extension_declaration::{ExtensionFunction, MappingType},
@@ -741,11 +753,10 @@ mod tests {
             })),
         };
         Plan {
-            extensions: vec![
-                extension(1, "and:bool"),
-                extension(2, "equal:any_any"),
-                extension(3, "not_equal:any_any"),
-            ],
+            extensions: extensions
+                .iter()
+                .map(|(anchor, name)| extension(*anchor, name))
+                .collect(),
             relations: vec![PlanRel {
                 rel_type: Some(plan_rel::RelType::Root(RelRoot {
                     input: Some(root),
@@ -933,5 +944,198 @@ mod tests {
             &["1", "20", "1", "20"],
             &["1", "20", "2", "30"],
         ])
+    }
+
+    // --- Guards for the fork-only sub-behaviors of spiceai/datafusion#220 (the
+    // --- `extract` translation) and #226 (alias uniqueness).
+
+    /// `dates(d)` = {1998-09-01}, a Tuesday.
+    fn register_dates(ctx: &SessionContext) {
+        use std::sync::Arc;
+
+        use arrow::array::Date32Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Date32Array::from(vec![10470]))])
+            .expect("one-row Date32 batch");
+        ctx.register_batch("dates", batch)
+            .expect("register table dates");
+    }
+
+    fn read_dates() -> Rel {
+        use datafusion_substrait::substrait::proto::read_rel::NamedTable;
+        let date_type = Type {
+            kind: Some(r#type::Kind::Date(r#type::Date {
+                type_variation_reference: 0,
+                nullability: i32::from(Nullability::Required),
+            })),
+        };
+        Rel {
+            rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+                base_schema: Some(NamedStruct {
+                    names: vec!["d".to_string()],
+                    r#struct: Some(r#type::Struct {
+                        types: vec![date_type],
+                        type_variation_reference: 0,
+                        nullability: i32::from(Nullability::Required),
+                    }),
+                }),
+                read_type: Some(ReadType::NamedTable(NamedTable {
+                    names: vec!["dates".to_string()],
+                    advanced_extension: None,
+                })),
+                ..Default::default()
+            }))),
+        }
+    }
+
+    fn project(
+        input: Rel,
+        expressions: Vec<datafusion_substrait::substrait::proto::Expression>,
+    ) -> Rel {
+        use datafusion_substrait::substrait::proto::ProjectRel;
+        Rel {
+            rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
+                input: Some(Box::new(input)),
+                expressions,
+                ..Default::default()
+            }))),
+        }
+    }
+
+    /// `extract(<options…>, value)` through function anchor 1, declared `i64`
+    /// as Isthmus declares it.
+    fn extract_call(
+        options: &[&str],
+        value: datafusion_substrait::substrait::proto::Expression,
+    ) -> datafusion_substrait::substrait::proto::Expression {
+        use datafusion_substrait::substrait::proto::{
+            Expression, FunctionArgument,
+            expression::{RexType, ScalarFunction},
+            function_argument::ArgType,
+        };
+        let mut arguments: Vec<FunctionArgument> = options
+            .iter()
+            .map(|option| FunctionArgument {
+                arg_type: Some(ArgType::Enum((*option).to_string())),
+            })
+            .collect();
+        arguments.push(FunctionArgument {
+            arg_type: Some(ArgType::Value(value)),
+        });
+        Expression {
+            rex_type: Some(RexType::ScalarFunction(ScalarFunction {
+                function_reference: 1,
+                arguments,
+                output_type: Some(i64_type()),
+                ..Default::default()
+            })),
+        }
+    }
+
+    /// A UDF registered under the exact name `extract` keeps precedence over
+    /// the `date_part` mapping, as for every other function name.
+    #[tokio::test]
+    async fn registered_extract_udf_takes_precedence_over_date_part() {
+        use std::sync::Arc;
+
+        use datafusion::common::ScalarValue;
+        use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+        let ctx = SessionContext::new();
+        register_dates(&ctx);
+        ctx.register_udf(create_udf(
+            "extract",
+            vec![DataType::Utf8, DataType::Date32],
+            DataType::Int64,
+            Volatility::Immutable,
+            Arc::new(|_args: &[ColumnarValue]| {
+                Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(7))))
+            }),
+        ));
+        let proto = plan_with(
+            project(read_dates(), vec![extract_call(&["YEAR"], field(0, None))]),
+            &["d", "year"],
+            &[(1, "extract:req_date")],
+        );
+        assert_eq!(execute(&ctx, &proto).await, rows(&[&["1998-09-01", "7"]]));
+    }
+
+    /// The `ONE`/`ZERO` indexing option is an offset from `date_part`'s own
+    /// base: 1998-09-01 is month 9 and a Tuesday (Sunday-based day 2), so
+    /// `MONTH ZERO` is 8 and `SUNDAY_DAY_OF_WEEK ONE` is 3.
+    #[tokio::test]
+    async fn extract_indexing_option_is_an_offset_from_date_part() {
+        let ctx = SessionContext::new();
+        register_dates(&ctx);
+        let proto = plan_with(
+            project(
+                read_dates(),
+                vec![
+                    extract_call(&["MONTH", "ZERO"], field(0, None)),
+                    extract_call(&["SUNDAY_DAY_OF_WEEK", "ONE"], field(0, None)),
+                ],
+            ),
+            &["d", "month0", "dow1"],
+            &[(1, "extract:req_req_date")],
+        );
+        assert_eq!(
+            execute(&ctx, &proto).await,
+            rows(&[&["1998-09-01", "8", "3"]])
+        );
+    }
+
+    /// A component `date_part` defines differently is refused by name, not
+    /// silently mapped: `MILLISECOND` counts from the previous whole second in
+    /// Substrait and from the start of the minute in `date_part`. The message
+    /// names the component; the pre-patch consumer failed on the argument kind
+    /// instead (`Function argument non-Value type not supported`).
+    #[tokio::test]
+    async fn unmapped_extract_component_is_rejected_by_name() {
+        let ctx = SessionContext::new();
+        register_dates(&ctx);
+        let proto = plan_with(
+            project(
+                read_dates(),
+                vec![extract_call(&["MILLISECOND"], field(0, None))],
+            ),
+            &["d", "ms"],
+            &[(1, "extract:req_date")],
+        );
+        let err = from_substrait_plan(&ctx.state(), &proto)
+            .await
+            .expect_err("MILLISECOND must not lower to date_part");
+        assert!(
+            err.to_string().contains("extract component MILLISECOND"),
+            "{err}"
+        );
+    }
+
+    /// The enclosing scope reads `t` and a table that is already named `t_1`;
+    /// the inner scan of `t`, correlated to that `t_1`, must not take the name
+    /// `t_1` or the collision comes straight back. It becomes `t_2`.
+    #[tokio::test]
+    async fn subquery_scan_alias_skips_a_taken_name() {
+        let ctx = SessionContext::new();
+        register_t(&ctx, false);
+        register_named(&ctx, "t_1", false);
+        let proto = plan(
+            filter(
+                cross(read_t(None), read_named("t_1", None)),
+                exists(filter(read_t(None), correlated_on(2, 3))),
+            ),
+            &["a", "b", "a1", "b1"],
+        );
+        // Every `t` row pairs with the two `t_1` rows that have a partner in
+        // `t` with the same `a` and a different `b`; `t_1`'s 2|30 has none.
+        assert_eq!(
+            execute(&ctx, &proto).await,
+            rows(&[
+                &["1", "10", "1", "10"],
+                &["1", "10", "1", "20"],
+                &["1", "20", "1", "10"],
+                &["1", "20", "1", "20"],
+                &["2", "30", "1", "10"],
+                &["2", "30", "1", "20"],
+            ])
+        );
     }
 }
