@@ -11,14 +11,15 @@ report-only; it does not fail the repository on a low pass rate.
 
 | Item | Value |
 |------|--------|
-| IBM tag | `v0.1.1` ([release](https://github.com/IBM/substrait-compliance/releases/tag/v0.1.1)) |
+| Suite | [spiceai/substrait-compliance](https://github.com/spiceai/substrait-compliance) branch `spiceai` @ `5ccb99672853bd768019101ebb6a7d1aa4c8f547` = IBM `main` `b9b5f6a` (suite files identical to `v0.1.1`) plus the corrections in its `SPICEAI.md` (TPC-H q01 shipdate cutoff) |
 | Workspace `datafusion` / `datafusion-substrait` | `54.1.0` |
 | spiceai/datafusion fork | `spiceai-54` @ `ce0105748e153bcfe4ae182061ad875694ab4a1c` (workspace `[patch.crates-io]`; merged spiceai/datafusion#220 and #221, includes #215) |
 
 The IBM `examples/datafusion-rust` tree on **`main`** pins
-`datafusion` / `datafusion-substrait` **54.1**. The same example on tag
-`v0.1.1` still pins DataFusion **35** and is not used. Test suites and
-expected-output CSVs come from **`v0.1.1`**.
+`datafusion` / `datafusion-substrait` **54.1** and is the layout Mode A
+follows. Test suites and expected-output CSVs come from the pinned
+fork commit; `scripts/fetch-ibm.sh`, the nightly workflow and `SUITE_REF`
+in `src/main.rs` carry the same pin and move together.
 
 Nothing from the IBM repository is vendored. The suite is cloned at run
 time. See [`NOTICE`](NOTICE) for Apache-2.0 attribution.

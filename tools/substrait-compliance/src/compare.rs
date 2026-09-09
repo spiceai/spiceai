@@ -36,10 +36,13 @@ limitations under the License.
 //!   length is not a tolerance — a 2-digit actual like `0.06` must not
 //!   match `0.05008…`. One ULP at a declared decimal scale applies only
 //!   when both typed headers are `decimal(p,s)` / `numeric(p,s)` with
-//!   the same scale ≥ 2 (q01 `AVG` scale 6). IBM README is absolute
-//!   `1e-9` only.
+//!   the same scale ≥ 2. When the engine's own schema declares the actual
+//!   column `decimal(p,s)` and the golden is `double`, the actual must be
+//!   the golden rounded or truncated at that scale (q01 `AVG_QTY`
+//!   `decimal(19,6)` `25.575154` vs `25.575154611454693`); a value one unit
+//!   off still fails. IBM README is absolute `1e-9` only.
 //!
-//! Not lifted: row-count misses (q21). `string` ↔ numeric type labels
+//! Not lifted: row-count misses. `string` ↔ numeric type labels
 //! (q22 country codes) are compatible; `values_match` decides PASS/FAIL.
 
 /// Absolute numeric floor. IBM documents `1e-9`; `1e-8` covers q06's
@@ -268,7 +271,8 @@ fn cells_match(
         if a.is_nan() && e.is_nan() {
             return true;
         }
-        return numerics_close(a, e, shared_decimal_scale(actual_type, expected_type));
+        return numerics_close(a, e, shared_decimal_scale(actual_type, expected_type))
+            || rendered_at_declared_scale(a, e, engine_declared_scale(actual_type, expected_type));
     }
     let a_lower = actual.to_ascii_lowercase();
     let e_lower = expected.to_ascii_lowercase();
@@ -280,7 +284,7 @@ fn cells_match(
     trim_trailing_char_pad(actual) == trim_trailing_char_pad(expected)
 }
 
-/// `CHAR` pad and DuckDB loader whitespace sit on the right. Leading
+/// `CHAR` pad and `DuckDB` loader whitespace sit on the right. Leading
 /// spaces are significant (q02 `s_comment` `' foxes boost'`).
 fn trim_trailing_char_pad(value: &str) -> &str {
     value.trim_end()
@@ -349,6 +353,38 @@ fn shared_decimal_scale(actual_type: Option<&str>, expected_type: Option<&str>) 
     let actual_scale = declared_decimal_scale(actual_type?)?;
     let expected_scale = declared_decimal_scale(expected_type?)?;
     (actual_scale == expected_scale).then_some(actual_scale)
+}
+
+/// The scale the engine declares for the actual column (`decimal(p,s)` in
+/// its own schema) when the golden is a `double`/`float` rendering of the
+/// unrounded value. `DataFusion` returns `AVG(decimal(15,2))` as
+/// `decimal(19,6)` and the `DuckDB` goldens print `25.575154611454693`, so
+/// the engine's `25.575154` is that value at its declared precision, not a
+/// wrong one. The scale comes from the engine's schema, never from the
+/// printed string, and there is none when the actual is itself a float.
+fn engine_declared_scale(actual_type: Option<&str>, expected_type: Option<&str>) -> Option<i32> {
+    let scale = declared_decimal_scale(actual_type?)?;
+    let expected = expected_type?;
+    (declared_decimal_scale(expected).is_none()
+        && matches!(normalize_type(expected), "double" | "float"))
+    .then_some(scale)
+}
+
+/// Whether `actual` is `expected` rendered at `scale` decimal places: either
+/// rounded (`|Δ| ≤ unit / 2`) or truncated toward zero (`|actual| ≤
+/// |expected|` by less than one unit, same sign). A value one unit off in the
+/// last place is neither — `0.06` for `0.05008…` at scale 2 still fails.
+fn rendered_at_declared_scale(actual: f64, expected: f64, scale: Option<i32>) -> bool {
+    let Some(scale) = scale.filter(|s| *s >= MIN_DECIMAL_SCALE) else {
+        return false;
+    };
+    let unit = 10f64.powi(-scale);
+    if (actual - expected).abs() <= unit / 2.0 {
+        return true;
+    }
+    (actual == 0.0 || actual.signum() == expected.signum())
+        && actual.abs() <= expected.abs()
+        && expected.abs() - actual.abs() < unit
 }
 
 /// Why a golden CSV was rejected at parse time. A zero-byte,
@@ -557,9 +593,12 @@ fn split_pipe_record(line: &str) -> Vec<&str> {
 }
 
 /// Pipe-delimited IBM goldens quote a field when it is empty/NULL (`""`)
-/// or contains the delimiter. Unwrap one layer of RFC-4180 quotes.
+/// or contains the delimiter. Unwrap one layer of RFC-4180 quotes. Only
+/// trailing whitespace is dropped, as on the actual side: a leading space
+/// is part of the value (q02 `s_comment`, q10 `c_comment`), and trimming
+/// it here while the engine keeps it turned two correct results into FAIL.
 fn decode_csv_cell(raw: &str) -> String {
-    unquote_pipe_cell(raw.trim())
+    unquote_pipe_cell(raw.trim_end())
 }
 
 fn unquote_pipe_cell(cell: &str) -> String {
@@ -666,7 +705,7 @@ mod tests {
         assert_eq!(compare(&actual, &expected), None);
 
         let wrong = TableData {
-            columns: actual.columns.clone(),
+            columns: actual.columns,
             rows: vec![vec!["99".to_string()]],
         };
         assert!(matches!(
@@ -696,6 +735,67 @@ mod tests {
             rows: vec![vec!["13271249.89".to_string()]],
         };
         assert_eq!(compare(&actual, &expected), None);
+    }
+
+    /// A golden's leading space survives decode; only the trailing pad is
+    /// dropped, as on the actual side.
+    #[test]
+    fn golden_leading_space_survives_decode() {
+        let golden = parse_typed_csv("c:string\n foxes boost \n").expect("typed golden");
+        assert_eq!(golden.rows, vec![vec![" foxes boost".to_string()]]);
+        let same = TableData {
+            columns: golden.columns.clone(),
+            rows: vec![vec![" foxes boost".to_string()]],
+        };
+        assert_eq!(compare(&same, &golden), None);
+        let stripped = TableData {
+            columns: golden.columns.clone(),
+            rows: vec![vec!["foxes boost".to_string()]],
+        };
+        assert!(matches!(
+            compare(&stripped, &golden),
+            Some(CompareMismatch::Value {
+                row: 0,
+                column: 0,
+                ..
+            })
+        ));
+    }
+
+    /// The engine-declared decimal scale bounds a `double` golden: rounded or
+    /// truncated at that scale passes, one unit off or a float actual does not.
+    #[test]
+    fn engine_declared_scale_bounds_double_goldens() {
+        let dec6 = Some("decimal(19,6)");
+        let dbl = Some("double");
+        // q01 AVG_QTY / AVG_PRICE / AVG_DISC: truncated or rounded at scale 6.
+        assert!(cells_match("25.575154", "25.575154611454693", dec6, dbl));
+        assert!(cells_match("35785.709306", "35785.709306937264", dec6, dbl));
+        assert!(cells_match("0.050081", "0.05008133906964134", dec6, dbl));
+        // Off by more than the last place.
+        assert!(!cells_match("25.575200", "25.575154611454693", dec6, dbl));
+        // One unit off in the last place is not a rendering of the value.
+        assert!(!cells_match(
+            "0.06",
+            "0.05008133906964134",
+            Some("decimal(15,2)"),
+            dbl
+        ));
+        assert!(cells_match(
+            "0.05",
+            "0.05008133906964134",
+            Some("decimal(15,2)"),
+            dbl
+        ));
+        // A float actual has no declared scale: the printed length is not a tolerance.
+        assert!(!cells_match("25.575154", "25.575154611454693", dbl, dbl));
+        // Scale 1 is float formatting, not a declared scale.
+        assert!(!cells_match(
+            "25.5",
+            "25.575154611454693",
+            Some("decimal(15,1)"),
+            dbl
+        ));
     }
 
     #[test]

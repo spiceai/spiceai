@@ -39,8 +39,10 @@ use crate::error::Result;
 use crate::report::ComplianceReport;
 use crate::suite::load_tpch_suite;
 
-/// IBM/substrait-compliance release this harness is pinned to.
-pub const IBM_TAG: &str = "v0.1.1";
+/// The suite commit this harness is pinned to: the `spiceai` branch of
+/// spiceai/substrait-compliance (IBM `main`, suite files identical to
+/// `v0.1.1`, plus the corrections listed in its `SPICEAI.md`).
+pub const SUITE_REF: &str = "spiceai/substrait-compliance@5ccb99672853bd768019101ebb6a7d1aa4c8f547";
 
 /// spiceai/datafusion git rev from the workspace `[patch.crates-io]`.
 pub const DATAFUSION_FORK_REV: &str = "ce0105748e153bcfe4ae182061ad875694ab4a1c";
@@ -119,7 +121,7 @@ async fn run() -> Result<ExitCode> {
     if !suite.description.is_empty() {
         println!("{}", suite.description);
     }
-    println!("IBM tag: {IBM_TAG}");
+    println!("Suite: {SUITE_REF}");
     println!("DataFusion fork rev: {DATAFUSION_FORK_REV}");
 
     let start = Utc::now();
@@ -180,7 +182,7 @@ async fn run() -> Result<ExitCode> {
             engine_name,
             engine_version,
             mode: mode_name,
-            ibm_tag: IBM_TAG.to_string(),
+            suite_ref: SUITE_REF.to_string(),
             datafusion_pin: format!("spiceai/datafusion@{DATAFUSION_FORK_REV}"),
             start_time: start,
         },

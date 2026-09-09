@@ -207,7 +207,7 @@ fn batches_to_table(batches: &[RecordBatch], schema: &arrow::datatypes::Schema) 
         .iter()
         .map(|f| ColumnSpec {
             name: f.name().clone(),
-            type_token: arrow_type_token(f.data_type()).to_string(),
+            type_token: arrow_type_token(f.data_type()),
         })
         .collect();
 
@@ -224,17 +224,23 @@ fn batches_to_table(batches: &[RecordBatch], schema: &arrow::datatypes::Schema) 
     TableData { columns, rows }
 }
 
-fn arrow_type_token(dt: &DataType) -> &'static str {
+/// The typed-header token for an engine column. A decimal keeps its declared
+/// precision and scale (`decimal(19,6)`): `compare` bounds a `double` golden
+/// by that scale, so the engine's own schema, not the printed value, decides.
+fn arrow_type_token(dt: &DataType) -> String {
     match dt {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::UInt8 | DataType::UInt16 => {
-            "integer"
+            "integer".to_string()
         }
-        DataType::Int64 | DataType::UInt32 | DataType::UInt64 => "bigint",
-        DataType::Float32 => "float",
-        DataType::Float64 | DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "double",
-        DataType::Boolean => "boolean",
-        DataType::Date32 | DataType::Date64 => "date",
-        _ => "string",
+        DataType::Int64 | DataType::UInt32 | DataType::UInt64 => "bigint".to_string(),
+        DataType::Float32 => "float".to_string(),
+        DataType::Float64 => "double".to_string(),
+        DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
+            format!("decimal({precision},{scale})")
+        }
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Date32 | DataType::Date64 => "date".to_string(),
+        _ => "string".to_string(),
     }
 }
 
@@ -386,15 +392,21 @@ mod tests {
                                 }),
                             }),
                             read_type: Some(ReadType::VirtualTable(VirtualTable {
-                                values: vec![
-                                    datafusion_substrait::substrait::proto::expression::literal::Struct {
-                                        fields: vec![Literal {
-                                            nullable: false,
-                                            type_variation_reference: 0,
-                                            literal_type: Some(LiteralType::VarChar(VarChar {
-                                                value: "EUROPE".to_string(),
-                                                length: 25,
-                                            })),
+                                expressions: vec![
+                                    datafusion_substrait::substrait::proto::expression::nested::Struct {
+                                        fields: vec![datafusion_substrait::substrait::proto::Expression {
+                                            rex_type: Some(
+                                                datafusion_substrait::substrait::proto::expression::RexType::Literal(
+                                                    Literal {
+                                                        nullable: false,
+                                                        type_variation_reference: 0,
+                                                        literal_type: Some(LiteralType::VarChar(VarChar {
+                                                            value: "EUROPE".to_string(),
+                                                            length: 25,
+                                                        })),
+                                                    },
+                                                ),
+                                            ),
                                         }],
                                     },
                                 ],
@@ -402,7 +414,6 @@ mod tests {
                             })),
                             ..Default::default()
                         }))),
-                        ..Default::default()
                     }),
                     names: vec!["r_name".to_string()],
                 })),

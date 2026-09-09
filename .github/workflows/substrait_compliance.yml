@@ -21,7 +21,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
-  IBM_SUBSTRAIT_COMPLIANCE_TAG: v0.1.1
+  SUBSTRAIT_COMPLIANCE_REF: 5ccb99672853bd768019101ebb6a7d1aa4c8f547
 
 jobs:
   mode_a_tpch:
@@ -34,11 +34,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Checkout IBM/substrait-compliance
+      # spiceai/substrait-compliance `spiceai` branch: IBM main (suite files
+      # identical to v0.1.1) plus the corrections in its SPICEAI.md. Keep this
+      # pin, scripts/fetch-ibm.sh, and SUITE_REF in src/main.rs together.
+      - name: Checkout spiceai/substrait-compliance
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: IBM/substrait-compliance
-          ref: v0.1.1
+          repository: spiceai/substrait-compliance
+          ref: 5ccb99672853bd768019101ebb6a7d1aa4c8f547
           path: tools/substrait-compliance/.ibm
           persist-credentials: false
 
