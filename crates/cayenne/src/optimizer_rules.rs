@@ -60,8 +60,9 @@ limitations under the License.
 //!    of the pool (the smaller of an absolute fraction and an even split across
 //!    all hash joins in the plan). With no pool configured it falls back to the
 //!    original conservative scope: same-source semi/anti joins above a 10M-row
-//!    exact build-side threshold. Joins carrying an embedded projection are left
-//!    alone and fall back to the `runtime.query.prefer_hash_join` knob.
+//!    exact build-side threshold. An embedded `HashJoinExec` projection is
+//!    rebuilt as a `ProjectionExec` from the stored indices so a self-join
+//!    cannot swap same-named columns (TPC-DS Q75).
 //!
 //! The ordinary inner-join probe side is handled by `DataFusion`'s *native*
 //! hash-join dynamic-filter pushdown. For inner joins (the only shape
@@ -960,51 +961,37 @@ fn finish_sort_merge_rewrite(
 }
 
 /// `HashJoinExec` may embed a column projection that `SortMergeJoinExec` does
-/// not. Rebuild it as a `ProjectionExec` so the rewrite cannot change the
-/// output schema. Returns `None` when the projection cannot be reconstructed,
-/// in which case the hash join is left in place.
+/// not. Rebuild it as a `ProjectionExec` using the hash join's projection
+/// *indices* so the rewrite cannot change column identity.
+///
+/// Matching the target schema by field name is wrong for a self-join: both
+/// sides reuse names (`d_year`, `sales_cnt`, …), and the first unused match
+/// binds TPC-DS Q75's `prev_yr.d_year` to `curr_yr.d_year`. Returns `None`
+/// when the stored indices do not apply to the sort-merge schema, in which
+/// case the hash join is left in place.
 fn wrap_sort_merge_to_hash_join_schema(
     sort_merge: Arc<dyn ExecutionPlan>,
     hash_join: &HashJoinExec,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
-    if !hash_join.contains_projection() {
+    let Some(indices) = hash_join.projection.as_ref() else {
         return Ok(Some(sort_merge));
-    }
-    let target = hash_join.schema();
-    let source = sort_merge.schema();
-    let Some(exprs) = projection_exprs_matching_schema(source.as_ref(), target.as_ref()) else {
-        return Ok(None);
     };
-    Ok(Some(Arc::new(ProjectionExec::try_new(exprs, sort_merge)?)))
-}
-
-fn projection_exprs_matching_schema(
-    source: &arrow::datatypes::Schema,
-    target: &arrow::datatypes::Schema,
-) -> Option<Vec<(Arc<dyn PhysicalExpr>, String)>> {
-    let mut used = vec![false; source.fields().len()];
-    let mut exprs = Vec::with_capacity(target.fields().len());
-    for target_field in target.fields() {
-        let mut found = None;
-        for (index, source_field) in source.fields().iter().enumerate() {
-            if used[index] {
-                continue;
-            }
-            if source_field.name() == target_field.name()
-                && source_field.data_type() == target_field.data_type()
-            {
-                found = Some(index);
-                break;
-            }
-        }
-        let index = found?;
-        used[index] = true;
+    let source = sort_merge.schema();
+    let target = hash_join.schema();
+    if indices.len() != target.fields().len() {
+        return Ok(None);
+    }
+    let mut exprs = Vec::with_capacity(indices.len());
+    for (out_index, &src_index) in indices.iter().enumerate() {
+        let Some(src_field) = source.fields().get(src_index) else {
+            return Ok(None);
+        };
         exprs.push((
-            Arc::new(Column::new(target_field.name(), index)) as Arc<dyn PhysicalExpr>,
-            target_field.name().clone(),
+            Arc::new(Column::new(src_field.name(), src_index)) as Arc<dyn PhysicalExpr>,
+            target.field(out_index).name().clone(),
         ));
     }
-    Some(exprs)
+    Ok(Some(Arc::new(ProjectionExec::try_new(exprs, sort_merge)?)))
 }
 
 /// Build-side (LEFT input) row count for the spillable rewrite, accepting an
@@ -1743,6 +1730,7 @@ mod tests {
     use datafusion::physical_plan::Partitioning;
     use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
+    use datafusion::physical_plan::projection::ProjectionExec;
     use datafusion::physical_plan::repartition::RepartitionExec;
     use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::union::UnionExec;
@@ -1760,7 +1748,9 @@ mod tests {
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_functions_aggregate::min_max::{max_udaf, min_udaf};
     use datafusion_functions_aggregate::sum::sum_udaf;
-    use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, cast, col, lit};
+    use datafusion_physical_expr::expressions::{
+        Column, DynamicFilterPhysicalExpr, cast, col, lit,
+    };
     use datafusion_physical_expr::projection::ProjectionExprs;
     use datafusion_physical_expr::{PhysicalExpr, conjunction};
     use datafusion_physical_plan::DisplayFormatType;
@@ -3290,6 +3280,74 @@ mod tests {
         assert!(
             optimized.is::<SortMergeJoinExec>(),
             "Absent build-side stats under a query memory pool must spill via sort-merge, not keep a non-spillable hash table"
+        );
+    }
+
+    /// TPC-DS Q75 self-joins `all_sales` curr/prev: both sides expose `d_year`.
+    /// A hash-join projection that emits right then left must survive the
+    /// sort-merge rewrite as those same indices, not as "first unused field
+    /// named d_year" (which swapped `prev_year`/`year` on the lab SF-10 trunk arm).
+    #[test]
+    fn sort_merge_rewrite_keeps_self_join_projection_indices() {
+        let schema = order_line_schema();
+        let left = cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", Precision::Absent);
+        let right =
+            cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", Precision::Absent);
+        let n_left = schema.fields().len();
+        // Concatenated join schema is [left..., right...]. Pick right.order_id
+        // then left.order_id — two columns with the same name.
+        let projection = Some(vec![n_left, 0]);
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                vec![(
+                    col("order_id", schema.as_ref()).expect("left join key"),
+                    col("order_id", schema.as_ref()).expect("right join key"),
+                )],
+                None,
+                &JoinType::Inner,
+                projection,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .expect("self-join hash join with swapped projection should be valid"),
+        );
+        assert!(join.contains_projection());
+        let expected_schema = join.schema();
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        let projection = optimized
+            .downcast_ref::<ProjectionExec>()
+            .expect("self-join rewrite must wrap SortMergeJoinExec in the hash-join projection");
+        assert_eq!(
+            projection.schema().as_ref(),
+            expected_schema.as_ref(),
+            "rewritten output schema must match the hash join, including column order"
+        );
+        let exprs = projection.expr();
+        let indices: Vec<usize> = exprs
+            .iter()
+            .map(|projection_expr| {
+                projection_expr
+                    .expr
+                    .downcast_ref::<Column>()
+                    .expect("projection expr should be a Column")
+                    .index()
+            })
+            .collect();
+        assert_eq!(
+            indices,
+            vec![n_left, 0],
+            "must keep right.order_id then left.order_id, not the first unused name match"
+        );
+        assert!(
+            projection.input().is::<SortMergeJoinExec>(),
+            "projection input should be the spillable sort-merge join"
         );
     }
 

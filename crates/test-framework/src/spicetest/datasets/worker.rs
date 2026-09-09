@@ -845,13 +845,19 @@ impl SpiceTestQueryWorker {
         // comparison that already passed (including both sides empty) is the
         // oracle: TPC-DS Q25 is empty at some scale factors and must not fail
         // `--validate` when the file scan is empty too.
-        if zero_row_count_is_failure(
-            self.validate_row_count,
-            self.skip_row_count_validation
-                .contains(&query.name.to_string()),
-            result.row_count,
-            reference_validation_passed,
-        ) {
+        //
+        // Only on runs that compare results (`validate`). Timed iterations
+        // under `--validate` + `--reference-schema` set `validate=false` so
+        // they do not re-issue the oracle; they still return 0 rows for Q25.
+        if validate
+            && zero_row_count_is_failure(
+                self.validate_row_count,
+                self.skip_row_count_validation
+                    .contains(&query.name.to_string()),
+                result.row_count,
+                reference_validation_passed,
+            )
+        {
             eprintln!(
                 "{} FAIL - Worker {} - Query '{}' returned 0 rows",
                 chrono::Utc::now(),
@@ -1061,6 +1067,14 @@ mod tests {
             "skip-list queries must not fail on zero rows"
         );
         assert!(!zero_row_count_is_failure(true, false, 1, false));
+        // execute_query only applies this check when `validate` is true.
+        // Timed iterations under --validate + --reference-schema set
+        // validate=false; they still return 0 rows and must not fail Q25.
+        let this_run_validates = false;
+        assert!(
+            !(this_run_validates && zero_row_count_is_failure(true, false, 0, false)),
+            "timed iterations do not re-issue the oracle and must not fail Q25 for 0 rows after warmup passed"
+        );
     }
 
     #[test]
