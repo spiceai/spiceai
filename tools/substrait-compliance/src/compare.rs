@@ -256,7 +256,16 @@ fn cells_match(
         return true;
     }
 
-    let kind = expected_type.or(actual_type).map(normalize_type);
+    // When exactly one side is `string`, the numeric side decides, so the
+    // documented numeric/string compatibility (q22 country codes) holds in
+    // both directions; otherwise the golden's type, then the engine's.
+    let actual_kind = actual_type.map(normalize_type);
+    let expected_kind = expected_type.map(normalize_type);
+    let kind = match (actual_kind, expected_kind) {
+        (Some("string"), Some(expected)) if is_numeric_kind(expected) => Some(expected),
+        (Some(actual), Some("string")) if is_numeric_kind(actual) => Some(actual),
+        _ => expected_kind.or(actual_kind),
+    };
     if matches!(kind, Some("integer" | "bigint")) {
         return integers_equal(actual, expected);
     }
@@ -812,6 +821,20 @@ mod tests {
         assert!(!cells_match("", " ", int, int));
         assert!(cells_match("", "", int, int));
         assert!(values_match(" ", ""));
+    }
+
+    /// The numeric side decides a numeric/string pair whichever side it is
+    /// on: `13` and `13.0` are equal integers, `13` and `14` are not.
+    #[test]
+    fn numeric_string_pairs_compare_numerically_in_both_directions() {
+        let int = Some("integer");
+        let string = Some("string");
+        assert!(cells_match("13", "13.0", int, string));
+        assert!(cells_match("13.0", "13", string, int));
+        assert!(!cells_match("13", "14", int, string));
+        assert!(!cells_match("14", "13", string, int));
+        // Two strings stay an exact (pad-trimmed) string comparison.
+        assert!(!cells_match("13", "13.0", string, string));
     }
 
     #[test]
