@@ -817,16 +817,25 @@ fn try_rewrite_oversized_join(
         // `sort_merge_min_rows` below, so an underestimate can hold a join to the
         // absolute gate instead of its fair share, where before it could only
         // make the rule more eager.
-        if !join_touches_cayenne(hash_join) {
-            return Ok(None);
-        }
         // TPC-DS Q97: full-outer of two grouped (customer, item) bodies.
         // Exact aggregate stats can underestimate, so the byte gate keeps a
         // Partitioned `HashJoinExec` whose `HashJoinInput`s then exhaust the
         // pool (~20 GB each at SF-100). Full-outer + aggregate build always
-        // coalesces to a spillable sort-merge.
+        // coalesces to a spillable sort-merge — including plans that never
+        // touch Cayenne. `testoperator --validate` runs the same SQL against
+        // unaccelerated `__test_reference` file scans in this process; those
+        // HashJoinInputs cannot spill and are what OOMed Q97 at SF-100 after
+        // the Cayenne side had already become `SortMergeJoinExec`.
         if *hash_join.join_type() == JoinType::Full && input_is_aggregate(hash_join.left()) {
             return finish_sort_merge_rewrite(hash_join, true);
+        }
+        if !join_touches_cayenne(hash_join) {
+            // Same `--validate` oracle path for Q78-style unknown-size
+            // aggregate builds (`ss`/`ws`/`cs` over file scans).
+            if should_spill_unknown_size_join(hash_join) {
+                return finish_sort_merge_rewrite(hash_join, true);
+            }
+            return Ok(None);
         }
         // Aggregated CTE bodies (TPC-DS Q78/Q97) often report `Absent` row
         // counts. Skipping the rewrite then leaves a non-spillable hash table
@@ -3639,6 +3648,63 @@ mod tests {
         assert!(
             optimized.is::<SortMergeJoinExec>(),
             "full-outer aggregate joins must spill even when Exact stats look small"
+        );
+    }
+
+    #[test]
+    fn rewrites_full_outer_aggregate_join_without_cayenne_scans() {
+        // TPC-DS Q97 `--validate` oracle: `__test_reference` clones are
+        // unaccelerated file scans, so the full-outer of `ssci`/`csci` never
+        // touches Cayenne. Skipping the rewrite left non-spillable
+        // `HashJoinInput`s that exhausted the 107.5 GB pool at SF-100 while
+        // the Cayenne plan of the same query was already a sort-merge.
+        let schema = channel_schema("customer_sk", "item_sk");
+        let left = grouped_count_over(inlined_exec(&schema), "customer_sk");
+        let right = grouped_count_over(inlined_exec(&schema), "customer_sk");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "customer_sk",
+            "customer_sk",
+            JoinType::Full,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<SortMergeJoinExec>(),
+            "Q97 --validate oracle (no Cayenne scans) must still spill the full-outer aggregate join"
+        );
+    }
+
+    #[test]
+    fn rewrites_unknown_size_aggregate_inner_join_without_cayenne_scans() {
+        // TPC-DS Q78 `--validate` oracle: `ss` ⋈ `ws` over file scans, no
+        // Cayenne exec in the tree. Distinct schemas so this is not the
+        // year_total self-join skip.
+        let left_schema = channel_schema("ss_item_sk", "ss_qty");
+        let right_schema = channel_schema("ws_item_sk", "ws_qty");
+        let left = grouped_count_over(inlined_exec(&left_schema), "ss_item_sk");
+        let right = grouped_count_over(inlined_exec(&right_schema), "ws_item_sk");
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "ss_item_sk",
+            "ws_item_sk",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<SortMergeJoinExec>(),
+            "Q78 --validate oracle (no Cayenne scans) must spill unknown-size aggregate builds"
         );
     }
 
