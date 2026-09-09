@@ -118,9 +118,9 @@ For macOS systems with Apple Silicon, the Metal distribution enables GPU-acceler
 make install-metal
 ```
 
-### CUDA (Linux)
+### CUDA (Linux and Windows)
 
-For Linux systems with NVIDIA GPUs, CUDA distributions enable GPU-accelerated AI/ML inference. Multiple CUDA compute capability versions are available.
+For Linux and Windows systems with NVIDIA GPUs, CUDA distributions enable GPU-accelerated AI/ML inference. Multiple CUDA compute capability versions are available.
 
 > **Open Source:** Available in nightly builds only. **[Cloud Platform](https://spice.ai/pricing) & [Enterprise](https://docs.spice.ai/docs/enterprise):** Production-ready CUDA distribution available.
 
@@ -136,6 +136,8 @@ For Linux systems with NVIDIA GPUs, CUDA distributions enable GPU-accelerated AI
 - 87 (Jetson Orin)
 - 89 (RTX 40xx, L40, L4)
 - 90 (H100, H200)
+
+When `spice install` automatically detects CUDA, it reads the compute capability reported by `nvidia-smi`. The command reports one value per GPU; on systems with multiple GPUs, the first reported capability is used to select the matching CUDA runtime distribution.
 
 **Docker (Nightly):**
 

@@ -355,19 +355,16 @@ impl SystemType {
     /// * `flavor` - The flavor to install: "default" (auto-detect), or "cuda" (explicit CUDA)
     /// * `target_version` - The release tag (e.g. "v2.0.0-rc.1") to determine naming strategy
     pub fn runtime_asset_names(&self, flavor: &str, target_version: &str) -> Vec<String> {
-        let mut names = Vec::new();
-
-        // Determine the accelerator based on flavor
         let accelerator = match flavor {
             "cuda" => {
                 // Explicit CUDA request - try to detect CUDA version
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 {
-                    get_cuda_version()
+                    detect_cuda_accelerator()
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 {
-                    tracing::warn!("CUDA flavor is only supported on Linux");
+                    tracing::warn!("CUDA flavor is only supported on Linux and Windows");
                     None
                 }
             }
@@ -376,6 +373,16 @@ impl SystemType {
                 detect_accelerator()
             }
         };
+
+        self.runtime_asset_names_for_accelerator(accelerator.as_deref(), target_version)
+    }
+
+    fn runtime_asset_names_for_accelerator(
+        &self,
+        accelerator: Option<&str>,
+        target_version: &str,
+    ) -> Vec<String> {
+        let mut names = Vec::new();
 
         if let Some(accel) = accelerator {
             // New naming (v1.11+/trunk): accelerator without "models_" prefix
@@ -442,7 +449,7 @@ fn get_rust_arch() -> &'static str {
     }
 }
 
-/// Detect hardware accelerator (Metal on macOS, CUDA on Linux).
+/// Detect hardware accelerator (Metal on macOS, CUDA on Linux and Windows).
 fn detect_accelerator() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
@@ -451,21 +458,33 @@ fn detect_accelerator() -> Option<String> {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
-        if let Some(cuda_version) = get_cuda_version() {
-            // Supported CUDA compute capabilities
-            let supported = ["80", "86", "87", "89", "90"];
-            if supported.contains(&cuda_version.as_str()) {
-                return Some(format!("cuda_{cuda_version}"));
-            }
-            tracing::warn!(
-                "Detected GPU with compute capability {cuda_version}, but this version is not supported for model acceleration. Falling back to CPU."
-            );
-        }
+        return detect_cuda_accelerator();
     }
 
     None
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn detect_cuda_accelerator() -> Option<String> {
+    let cuda_version = get_cuda_version()?;
+    let Some(accelerator) = cuda_accelerator(&cuda_version) else {
+        tracing::warn!(
+            "Detected GPU with compute capability {cuda_version}, but this version is not supported for model acceleration. Falling back to CPU."
+        );
+        return None;
+    };
+
+    Some(accelerator)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn cuda_accelerator(cuda_version: &str) -> Option<String> {
+    // Supported CUDA compute capabilities
+    ["80", "86", "87", "89", "90"]
+        .contains(&cuda_version)
+        .then(|| format!("cuda_{cuda_version}"))
 }
 
 /// Check if the system has a Metal-capable GPU (macOS only).
@@ -487,8 +506,8 @@ fn has_metal_device() -> bool {
     }
 }
 
-/// Get CUDA compute capability (Linux only).
-#[cfg(target_os = "linux")]
+/// Get CUDA compute capability (Linux and Windows only).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn get_cuda_version() -> Option<String> {
     use std::process::Command;
 
@@ -503,15 +522,30 @@ fn get_cuda_version() -> Option<String> {
         return None;
     }
 
-    let version = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .replace('.', "");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_cuda_version(&stdout)
+}
 
-    if version.is_empty() {
-        None
-    } else {
-        Some(version)
+/// Parse the compute capability reported by `nvidia-smi`.
+///
+/// `nvidia-smi` emits one compute capability per line. The runtime release is
+/// selected for the first GPU reported by the command.
+fn parse_cuda_version(output: &str) -> Option<String> {
+    let value = output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && *line != "compute_cap")?;
+    let (major, minor) = value.split_once('.')?;
+
+    if major.is_empty()
+        || minor.is_empty()
+        || !major.chars().all(|character| character.is_ascii_digit())
+        || !minor.chars().all(|character| character.is_ascii_digit())
+    {
+        return None;
     }
+
+    Some(format!("{major}{minor}"))
 }
 
 #[cfg(test)]
@@ -764,6 +798,37 @@ mod tests {
         let names = os_type.runtime_asset_names(flavor, "v1.0.0");
         // The last entry should always be the fallback base name
         assert!(names.last().is_some_and(|n| n == expected));
+    }
+
+    #[rstest]
+    #[case("8.6\n", Some("86"))]
+    #[case("8.6\n8.6\n", Some("86"))]
+    #[case("8.6\r\n8.6\r\n", Some("86"))]
+    #[case("compute_cap\n8.6\n8.6\n", Some("86"))]
+    #[case("\n", None)]
+    #[case("compute_cap\n", None)]
+    #[case("8.\n", None)]
+    #[case("8.6, other\n", None)]
+    fn test_parse_cuda_version(#[case] output: &str, #[case] expected: Option<&str>) {
+        assert_eq!(parse_cuda_version(output).as_deref(), expected);
+    }
+
+    #[test]
+    fn a_dual_gpu_report_selects_the_matching_cuda_asset() {
+        let capability = parse_cuda_version("8.6\n8.6\n").expect("GPU capability is present");
+        let accelerator = cuda_accelerator(&capability).expect("capability 86 is supported");
+        let names = SystemType::windows_x86()
+            .runtime_asset_names_for_accelerator(Some(&accelerator), "v1.0.0");
+
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("spiced.exe_cuda_86_windows_x86_64.tar.gz")
+        );
+    }
+
+    #[test]
+    fn unsupported_cuda_capability_has_no_accelerator_asset() {
+        assert_eq!(cuda_accelerator("999"), None);
     }
 
     #[test]
