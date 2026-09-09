@@ -10,10 +10,10 @@ fork (`Cargo.toml` `[patch.crates-io]`). Re-run the command below to regenerate
 |------|--------|
 | Suite | [spiceai/substrait-compliance](https://github.com/spiceai/substrait-compliance) branch `spiceai` @ `5ccb99672853bd768019101ebb6a7d1aa4c8f547` = IBM `main` `b9b5f6a` (suite files identical to `v0.1.1`) plus the corrections in its `SPICEAI.md` |
 | `datafusion` / `datafusion-substrait` | `54.1.0` |
-| spiceai/datafusion rev | `45b2f1091dffa98f92d87bdeaf50cf3905f73b0f` (spiceai/datafusion#226 head on `spiceai-54` `ce010574…`, which carries #215, #220 and #221) |
+| spiceai/datafusion rev | `f5b825bdd8d73d7e6359cb68e8a0f6d58af51866` (spiceai/datafusion#226 head on `spiceai-54` `ce010574…`, which carries #215, #220 and #221) |
 | Suite | TPC-H SF 0.01 (22 queries) |
 | Oracle | DuckDB 1.2.0 (IBM goldens) |
-| Run | 2026-09-09T00:55:38Z → 2026-09-09T00:55:43Z |
+| Run | 2026-09-09T01:29:50Z → 2026-09-09T01:29:55Z |
 
 ## Counts
 
@@ -29,7 +29,7 @@ cargo run -p spice-substrait-compliance -- \
   --suite tools/substrait-compliance/.ibm/test-suites/tpch
 
 Suite: spiceai/substrait-compliance@5ccb99672853bd768019101ebb6a7d1aa4c8f547
-DataFusion fork rev: 45b2f1091dffa98f92d87bdeaf50cf3905f73b0f
+DataFusion fork rev: f5b825bdd8d73d7e6359cb68e8a0f6d58af51866
   PASS  q01
   PASS  q02
   PASS  q03
@@ -79,16 +79,16 @@ inferred.
 | q01 | `count_order` 29162 vs 29181 in the `N\|O` group, every sum and average of that group off; first cell reported `AVG_QTY` `25.575154` vs `25.575154611454693` | `plans/q01.bin` filtered `l_shipdate <= 1998-09-01` (Substrait date 10470) while the golden's SQL cutoff is 1998-09-02; `data/lineitem.csv` has exactly 19 rows on 1998-09-02, all `N\|O`. The averages then differed only by scale: the plan declares them `decimal(15,2)`, `DataFusion` returns `decimal(19,6)`, the golden prints the unrounded `double` | Suite: the `spiceai` branch carries date 10471 in both plan files. Harness: a `decimal(p,s)` engine column keeps its declared scale in the typed header and a `double` golden must be the actual rounded or truncated at that scale |
 | q02, q10 | `' foxes boost…'` vs `'foxes boost…'`; `' are carefully…'` vs `'are carefully…'` | `decode_csv_cell` trimmed both ends of a golden cell while the engine side trims trailing pad only; `data/supplier.csv:86`, `data/customer.csv:422` and the goldens all carry the leading space | Harness: goldens decode trailing-only |
 | q07, q08, q09 | `Function argument non-Value type not supported` | `extract:req_date` with a `YEAR` enum argument; the consumer accepted `ArgType::Value` only (upstream `main` too) | spiceai/datafusion#220: enum arguments lower to literals; `extract` is translated component by component to `date_part` cast to the declared type, with `NotImplemented` for components `date_part` defines differently |
-| q21 | `row count 0 != 1` | Both the outer scan and the EXISTS / NOT EXISTS subquery scans were qualified `LINEITEM`; decorrelation resolved `LINEITEM.L_ORDERKEY = outer_ref(LINEITEM.L_ORDERKEY)` to the inner scan alone, the semi/anti joins lost their condition and `L_SUPPKEY != L_SUPPKEY` stayed behind. The same query as SQL (aliases `L1`/`L2`/`L3`) returned the golden `Supplier#000000074\|9` | spiceai/datafusion#226: a subquery's scan of a table an enclosing scope reads gets its own qualifier (`LINEITEM_1`) |
+| q21 | `row count 0 != 1` | Both the outer scan and the EXISTS / NOT EXISTS subquery scans were qualified `LINEITEM`; decorrelation resolved `LINEITEM.L_ORDERKEY = outer_ref(LINEITEM.L_ORDERKEY)` to the inner scan alone, the semi/anti joins lost their condition and `L_SUPPKEY != L_SUPPKEY` stayed behind. The same query as SQL (aliases `L1`/`L2`/`L3`) returned the golden `Supplier#000000074\|9` | spiceai/datafusion#226: a subquery's scan of a table an enclosing scope reads gets its own qualifier (`LINEITEM_1`), its own filter binds to the Substrait base schema above that alias, and a join requalified inside a subquery keeps clear of the enclosing scope's `left`/`right` |
 
 ## Compare rules
 
 Harness compare in `src/compare.rs`:
 
-- `integer` / `bigint` are type-compatible (`COUNT` width)
+- `integer` / `bigint` are type-compatible (`COUNT` width); a numeric/string pair is decided by the numeric side in both directions
 - column names are not compared (plan alias vs DuckDB; IBM Rust SDK skips names)
 - string cells trim trailing `CHAR` pad only, on both sides; a leading space is significant
-- numerics: `integer`/`bigint` exactly; floats/`double` absolute ε `1e-8` or relative `1e-14`; printed fractional length is not a tolerance; one ULP when both headers share a declared decimal scale ≥ 2; when the engine's schema declares the actual column `decimal(p,s)` and the golden is `double`, the actual must be the golden rounded or truncated at that scale, and one unit off still fails
+- numerics: a numeric column must parse (identical malformed text is not a match); `integer`/`bigint` exactly; two declared decimals exactly as scaled integers, never through `f64`, with one ULP at the shared scale ≥ 2; floats/`double` absolute ε `1e-8` or relative `1e-14`; printed fractional length is not a tolerance; when the engine's schema declares the actual column `decimal(p,s)` and the golden is `double`, the actual must be the golden rounded or truncated at that scale, and one unit off still fails
 - quoted-empty `""` is NULL/empty; after decode only the empty string is NULL, whitespace is a value
 - a zero-byte, headerless, or malformed first line is an oracle-load error, not an empty PASS; a legitimate empty result is a typed header with zero data rows; incomplete rows mismatch
 

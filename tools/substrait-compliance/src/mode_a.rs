@@ -564,60 +564,33 @@ mod tests {
         );
     }
 
-    /// TPC-H q21's EXISTS / NOT EXISTS subqueries read `LINEITEM` while the
-    /// enclosing scope also reads `LINEITEM`. Without spiceai/datafusion#226
-    /// both scans share the qualifier, decorrelation resolves the correlated
-    /// predicate to the inner scan alone, and the query returns no rows
-    /// (Mode A q21: `row count 0 != 1`).
-    #[tokio::test]
-    async fn correlated_subquery_over_the_same_table_keeps_its_rows() {
-        use std::sync::Arc;
+    // --- Guards for spiceai/datafusion#226: correlated subqueries that read a
+    // --- table the enclosing scope also reads. Each builds an Isthmus-shaped
+    // --- plan over `t(a, b)` = {1|10, 1|20, 2|30} and executes it.
 
-        use arrow::array::Int64Array;
-        use datafusion_substrait::substrait::proto::{
-            Expression, FilterRel, FunctionArgument,
-            expression::{
-                FieldReference, ReferenceSegment, RexType, ScalarFunction, Subquery,
-                field_reference::{OuterReference, ReferenceType, RootReference, RootType},
-                reference_segment::{self, StructField},
-                subquery::{SetPredicate, SubqueryType, set_predicate::PredicateOp},
-            },
-            extensions::{
-                SimpleExtensionDeclaration,
-                simple_extension_declaration::{ExtensionFunction, MappingType},
-            },
-            function_argument::ArgType,
-            read_rel::NamedTable,
-        };
-
-        let ctx = SessionContext::new();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int64, false),
-            Field::new("b", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 1, 2])),
-                Arc::new(Int64Array::from(vec![10, 20, 30])),
-            ],
-        )
-        .expect("three-row batch");
-        ctx.register_batch("t", batch).expect("register table t");
-
-        let i64_type = || Type {
+    fn i64_type() -> Type {
+        Type {
             kind: Some(r#type::Kind::I64(r#type::I64 {
                 type_variation_reference: 0,
                 nullability: i32::from(Nullability::Required),
             })),
-        };
-        let bool_type = || Type {
+        }
+    }
+
+    fn bool_type() -> Type {
+        Type {
             kind: Some(r#type::Kind::Bool(r#type::Boolean {
                 type_variation_reference: 0,
                 nullability: i32::from(Nullability::Required),
             })),
-        };
-        let read = || Rel {
+        }
+    }
+
+    /// `READ t` with base schema `(a, b)`, optionally carrying its own
+    /// `ReadRel.filter`.
+    fn read_t(filter: Option<datafusion_substrait::substrait::proto::Expression>) -> Rel {
+        use datafusion_substrait::substrait::proto::read_rel::NamedTable;
+        Rel {
             rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
                 base_schema: Some(NamedStruct {
                     names: vec!["a".to_string(), "b".to_string()],
@@ -631,10 +604,48 @@ mod tests {
                     names: vec!["t".to_string()],
                     advanced_extension: None,
                 })),
+                filter: filter.map(Box::new),
                 ..Default::default()
             }))),
+        }
+    }
+
+    fn cross(left: Rel, right: Rel) -> Rel {
+        use datafusion_substrait::substrait::proto::CrossRel;
+        Rel {
+            rel_type: Some(rel::RelType::Cross(Box::new(CrossRel {
+                left: Some(Box::new(left)),
+                right: Some(Box::new(right)),
+                ..Default::default()
+            }))),
+        }
+    }
+
+    fn filter(input: Rel, condition: datafusion_substrait::substrait::proto::Expression) -> Rel {
+        use datafusion_substrait::substrait::proto::FilterRel;
+        Rel {
+            rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
+                input: Some(Box::new(input)),
+                condition: Some(Box::new(condition)),
+                ..Default::default()
+            }))),
+        }
+    }
+
+    /// Field `index` of the current input, or of the scope `steps_out` levels up.
+    fn field(
+        index: i32,
+        steps_out: Option<u32>,
+    ) -> datafusion_substrait::substrait::proto::Expression {
+        use datafusion_substrait::substrait::proto::{
+            Expression,
+            expression::{
+                FieldReference, ReferenceSegment, RexType,
+                field_reference::{OuterReference, ReferenceType, RootReference, RootType},
+                reference_segment::{self, StructField},
+            },
         };
-        let field = |index: i32, steps_out: Option<u32>| Expression {
+        Expression {
             rex_type: Some(RexType::Selection(Box::new(FieldReference {
                 reference_type: Some(ReferenceType::DirectReference(ReferenceSegment {
                     reference_type: Some(reference_segment::ReferenceType::StructField(Box::new(
@@ -649,8 +660,20 @@ mod tests {
                     None => RootType::RootReference(RootReference {}),
                 }),
             }))),
+        }
+    }
+
+    /// Function anchor 1 = `and:bool`, 2 = `equal:any_any`, 3 = `not_equal:any_any`.
+    fn call(
+        reference: u32,
+        args: Vec<datafusion_substrait::substrait::proto::Expression>,
+    ) -> datafusion_substrait::substrait::proto::Expression {
+        use datafusion_substrait::substrait::proto::{
+            Expression, FunctionArgument,
+            expression::{RexType, ScalarFunction},
+            function_argument::ArgType,
         };
-        let call = |reference: u32, args: Vec<Expression>| Expression {
+        Expression {
             rex_type: Some(RexType::ScalarFunction(ScalarFunction {
                 function_reference: reference,
                 arguments: args
@@ -662,28 +685,46 @@ mod tests {
                 output_type: Some(bool_type()),
                 ..Default::default()
             })),
+        }
+    }
+
+    /// `f0 = outer.f<a> AND f1 <> outer.f<b>`: the row has the same `a` as the
+    /// enclosing row and a different `b`.
+    fn correlated_on(
+        outer_a: i32,
+        outer_b: i32,
+    ) -> datafusion_substrait::substrait::proto::Expression {
+        call(
+            1,
+            vec![
+                call(2, vec![field(0, None), field(outer_a, Some(1))]),
+                call(3, vec![field(1, None), field(outer_b, Some(1))]),
+            ],
+        )
+    }
+
+    fn exists(inner: Rel) -> datafusion_substrait::substrait::proto::Expression {
+        use datafusion_substrait::substrait::proto::{
+            Expression,
+            expression::{
+                RexType, Subquery,
+                subquery::{SetPredicate, SubqueryType, set_predicate::PredicateOp},
+            },
         };
-        // inner: t.a = outer.a AND t.b <> outer.b
-        let inner = Rel {
-            rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
-                input: Some(Box::new(read())),
-                condition: Some(Box::new(call(
-                    1,
-                    vec![
-                        call(2, vec![field(0, None), field(0, Some(1))]),
-                        call(3, vec![field(1, None), field(1, Some(1))]),
-                    ],
-                ))),
-                ..Default::default()
-            }))),
-        };
-        let exists = Expression {
+        Expression {
             rex_type: Some(RexType::Subquery(Box::new(Subquery {
                 subquery_type: Some(SubqueryType::SetPredicate(Box::new(SetPredicate {
                     predicate_op: i32::from(PredicateOp::Exists),
                     tuples: Some(Box::new(inner)),
                 }))),
             }))),
+        }
+    }
+
+    fn plan(root: Rel, names: &[&str]) -> Plan {
+        use datafusion_substrait::substrait::proto::extensions::{
+            SimpleExtensionDeclaration,
+            simple_extension_declaration::{ExtensionFunction, MappingType},
         };
         let extension = |anchor: u32, name: &str| SimpleExtensionDeclaration {
             mapping_type: Some(MappingType::ExtensionFunction(ExtensionFunction {
@@ -692,7 +733,7 @@ mod tests {
                 name: name.to_string(),
             })),
         };
-        let proto = Plan {
+        Plan {
             extensions: vec![
                 extension(1, "and:bool"),
                 extension(2, "equal:any_any"),
@@ -700,38 +741,131 @@ mod tests {
             ],
             relations: vec![PlanRel {
                 rel_type: Some(plan_rel::RelType::Root(RelRoot {
-                    input: Some(Rel {
-                        rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
-                            input: Some(Box::new(read())),
-                            condition: Some(Box::new(exists)),
-                            ..Default::default()
-                        }))),
-                    }),
-                    names: vec!["a".to_string(), "b".to_string()],
+                    input: Some(root),
+                    names: names.iter().map(|n| (*n).to_string()).collect(),
                 })),
             }],
             ..Default::default()
-        };
+        }
+    }
 
-        let plan = from_substrait_plan(&ctx.state(), &proto)
+    /// `t(a, b)` = {1|10, 1|20, 2|30}, optionally behind a leading `extra`
+    /// column the plan's base schema does not mention.
+    fn register_t(ctx: &SessionContext, with_extra_column: bool) {
+        use std::sync::Arc;
+
+        use arrow::array::{Int64Array, StringArray};
+        let mut fields = vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ];
+        let mut columns: Vec<arrow::array::ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])),
+            Arc::new(Int64Array::from(vec![10, 20, 30])),
+        ];
+        if with_extra_column {
+            fields.insert(0, Field::new("extra", DataType::Utf8, false));
+            columns.insert(0, Arc::new(StringArray::from(vec!["x", "y", "z"])));
+        }
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("three-row batch");
+        ctx.register_batch("t", batch).expect("register table t");
+    }
+
+    async fn execute(ctx: &SessionContext, proto: &Plan) -> Vec<Vec<String>> {
+        let plan = from_substrait_plan(&ctx.state(), proto)
             .await
-            .expect("same-table correlated EXISTS must lower");
-        let df = ctx
-            .execute_logical_plan(plan)
-            .await
-            .expect("execute correlated EXISTS plan");
+            .expect("plan must lower (spiceai/datafusion#226)");
+        let df = ctx.execute_logical_plan(plan).await.expect("execute plan");
         let schema = df.schema().as_arrow().clone();
-        let batches = df.collect().await.expect("collect correlated EXISTS plan");
+        let batches = df.collect().await.expect("collect plan");
         let mut rows = batches_to_table(&batches, &schema).rows;
         rows.sort();
+        rows
+    }
+
+    fn rows(rows: &[&[&str]]) -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|row| row.iter().map(|cell| (*cell).to_string()).collect())
+            .collect()
+    }
+
+    /// TPC-H q21's EXISTS / NOT EXISTS subqueries read `LINEITEM` while the
+    /// enclosing scope also reads `LINEITEM`. Without spiceai/datafusion#226
+    /// both scans share the qualifier, decorrelation resolves the correlated
+    /// predicate to the inner scan alone, and the query returns no rows
+    /// (Mode A q21: `row count 0 != 1`).
+    #[tokio::test]
+    async fn correlated_subquery_over_the_same_table_keeps_its_rows() {
+        let ctx = SessionContext::new();
+        register_t(&ctx, false);
+        let proto = plan(
+            filter(
+                read_t(None),
+                exists(filter(read_t(None), correlated_on(0, 1))),
+            ),
+            &["a", "b"],
+        );
         // 1|10 and 1|20 each have a partner with the same `a` and a different
         // `b`; 2|30 has none. Without the fork fix the result is empty.
         assert_eq!(
-            rows,
-            vec![
-                vec!["1".to_string(), "10".to_string()],
-                vec!["1".to_string(), "20".to_string()],
-            ]
+            execute(&ctx, &proto).await,
+            rows(&[&["1", "10"], &["1", "20"]])
+        );
+    }
+
+    /// The same correlated predicate carried as the inner scan's own
+    /// `ReadRel.filter`, against a provider whose schema carries a leading
+    /// column the plan's base schema does not mention: the filter's field
+    /// indices must bind to the Substrait base schema (`a`, `b`), not to the
+    /// provider's first column, and the aliased scan must be projected to the
+    /// base schema by name. Without the fork's follow-up the filter bound
+    /// field 0 to `extra` and failed with a cast error.
+    #[tokio::test]
+    async fn correlated_read_filter_binds_to_the_substrait_schema() {
+        let ctx = SessionContext::new();
+        register_t(&ctx, true);
+        let proto = plan(
+            filter(read_t(None), exists(read_t(Some(correlated_on(0, 1))))),
+            &["a", "b"],
+        );
+        assert_eq!(
+            execute(&ctx, &proto).await,
+            rows(&[&["1", "10"], &["1", "20"]])
+        );
+    }
+
+    /// Both scopes self-join `t`, so both joins requalify their sides. The
+    /// inner join must not take the enclosing join's `left`/`right` names or
+    /// the predicate correlating to the outer `left` collapses to nothing;
+    /// its sides become `left_1`/`right_1`.
+    #[tokio::test]
+    async fn requalified_join_inside_a_subquery_keeps_its_correlation() {
+        let ctx = SessionContext::new();
+        register_t(&ctx, false);
+        let proto = plan(
+            filter(
+                cross(read_t(None), read_t(None)),
+                exists(filter(
+                    cross(read_t(None), read_t(None)),
+                    correlated_on(0, 1),
+                )),
+            ),
+            &["a1", "b1", "a2", "b2"],
+        );
+        // The outer `left` rows 1|10 and 1|20 have a partner in `t` with the
+        // same `a` and a different `b`; 2|30 has none. Each keeps its three
+        // outer `right` partners. Without the fork fix the result is empty.
+        assert_eq!(
+            execute(&ctx, &proto).await,
+            rows(&[
+                &["1", "10", "1", "10"],
+                &["1", "10", "1", "20"],
+                &["1", "10", "2", "30"],
+                &["1", "20", "1", "10"],
+                &["1", "20", "1", "20"],
+                &["1", "20", "2", "30"],
+            ])
         );
     }
 }
