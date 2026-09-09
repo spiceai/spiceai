@@ -222,21 +222,26 @@ fn is_overflow_error(e: &ArrowError) -> bool {
 /// or `Ok(None)` when the pair is not decimal-to-float and the caller's general
 /// cast path should handle it.
 ///
-/// arrow's own `Decimal -> Float` cast widens the integer coefficient to the
-/// float *before* dividing by `10^scale`, so a coefficient beyond the float's
-/// exactly-representable integer range (`2^53` for `f64`, `2^24` for `f32`) is
-/// rounded once on the way in and the divide carries that error through, landing
-/// the result up to a couple of ULP off the true value. An `avg()`/`sum()`
-/// pushed to `PostgreSQL` returns an *undeclared* NUMERIC read at scale 20, whose
-/// coefficient always exceeds `2^53`, so an exactly representable answer like
-/// `47.5` came back as `47.500_000_000_000_01` (issue #13978).
+/// arrow's own `Decimal -> Float` cast widens the integer coefficient to `f64`
+/// *before* dividing by `10^scale` (a `Float32` target then rounds that `f64`
+/// once more). When the coefficient is not exactly representable in `f64`,
+/// widening rounds it, and the divide bakes that error into the result — up to a
+/// couple of ULP off. Coefficients below `2^53` are always exact, so the loss
+/// only appears above it; being above `2^53` is *necessary but not sufficient*,
+/// though — an aligned value like the scale-20 coefficient of `2.0` stays exact
+/// (see the control test). An `avg()`/`sum()` pushed to `PostgreSQL` returns an
+/// *undeclared* NUMERIC read at scale 20, whose coefficient exceeds `2^53`, so an
+/// exactly representable answer like `47.5` came back as `47.500_000_000_000_01`
+/// (issue #13978).
 ///
 /// Going through the value's exact decimal digits removes the loss: `Decimal ->
 /// Utf8` renders every coefficient exactly, and `Utf8 -> Float` rounds that
 /// literal once with `f64`/`f32` correct rounding (verified bit-for-bit against
-/// Rust's `str::parse`, which arrow's parser matches). This covers every decimal
-/// width — `Decimal32`/`Decimal64` are lossy on the direct path too — and every
-/// float target, so it applies to every caller of `try_cast_to`.
+/// Rust's `str::parse`, which arrow's parser matches). The coefficient can exceed
+/// `2^53` for `Decimal64` (`i64`), `Decimal128` (`i128`) and `Decimal256`
+/// (`i256`), so all three are lossy on the direct path; `Decimal32` (`i32`) never
+/// can, but is routed here too so its `Float32` result rounds once rather than via
+/// an `f64` intermediate. Applies to every caller of `try_cast_to`.
 ///
 /// The `Utf8` round-trip costs ~20-40x a plain divide, so the common
 /// `Decimal128 -> Float64` case takes a fast path when *every* coefficient is
@@ -1907,25 +1912,50 @@ mod test {
     }
 
     /// `Decimal64 -> Float64` is lossy on arrow's direct path too: an `i64`
-    /// coefficient can exceed `2^53`. Here `47.5` at scale 15 has coefficient
-    /// `4.75e16 > 2^53`, and must still round to exactly 47.5.
+    /// coefficient can exceed `2^53`. This coefficient (`4310892232.2810111`) is
+    /// *not* exactly representable, so the widen-then-divide path lands one ULP
+    /// off — a value chosen so the test fails if `Decimal64` regresses to it,
+    /// rather than one both paths happen to agree on.
     #[test]
     fn decimal64_to_f64_rounds_correctly() {
-        use arrow::array::Decimal64Array;
+        use arrow::array::{Decimal64Array, Float64Array};
 
-        let coeff: i64 = 475 * 10_i64.pow(14);
+        let coeff: i64 = 43_108_922_322_810_111;
         let source = Decimal64Array::from(vec![Some(coeff)])
-            .with_precision_and_scale(18, 15)
-            .expect("valid Decimal64(18,15)");
+            .with_precision_and_scale(18, 7)
+            .expect("valid Decimal64(18,7)");
 
         let out = cast_decimal_column(Arc::new(source), DataType::Float64);
-        assert_eq!(f64_values(&out), vec![Some(47.5)]);
+        let got = out
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Float64Array")
+            .value(0);
+        // Correctly-rounded 4310892232.2810111.
+        assert_eq!(got.to_bits(), 0x41f0_0f2f_ec84_7f05);
+
+        // Guard that this input actually distinguishes the fix: the old
+        // widen-then-divide arithmetic lands one ULP away.
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "reproducing the defective arrow path under test"
+        )]
+        let naive = coeff as f64 / 10f64.powi(7);
+        assert_ne!(
+            naive.to_bits(),
+            got.to_bits(),
+            "input must distinguish the fixed path, got {naive}"
+        );
     }
 
-    /// `Decimal32 -> Float32` is lossy on the direct path: an `i32` coefficient
-    /// can exceed `2^24`. Here `47.5` at scale 6 has coefficient `4.75e7 > 2^24`.
+    /// `Decimal32` coefficients (`i32`) never exceed `2^53`, so the direct path is
+    /// already exact for `Float64`; `Decimal32` is routed through the exact path
+    /// only so a `Float32` result rounds once instead of via an `f64` intermediate.
+    /// This is coverage that the path produces the right value — for this input the
+    /// two paths agree, so it does not (and cannot, for valid `Decimal32`)
+    /// distinguish a lossy direct path.
     #[test]
-    fn decimal32_to_f32_rounds_correctly() {
+    fn decimal32_to_f32_converts_correctly() {
         use arrow::array::{Decimal32Array, Float32Array};
 
         let coeff: i32 = 475 * 10_i32.pow(5);
