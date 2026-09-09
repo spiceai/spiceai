@@ -830,11 +830,11 @@ fn try_rewrite_oversized_join(
             return finish_sort_merge_rewrite(hash_join, true);
         }
         if !join_touches_cayenne(hash_join) {
-            // Same `--validate` oracle path for Q78-style unknown-size
-            // aggregate builds (`ss`/`ws`/`cs` over file scans).
-            if should_spill_unknown_size_join(hash_join) {
-                return finish_sort_merge_rewrite(hash_join, true);
-            }
+            // Non-Cayenne inner/left unknown-size aggregate joins stay hash
+            // joins. Q78's `--validate` oracle is `ss LEFT JOIN ws LEFT JOIN
+            // cs ... LIMIT 100` over `__test_reference` file scans; a
+            // coalesced sort-merge of those joins returns a different
+            // LIMIT-100 set than the Cayenne plan (regression for #13918).
             return Ok(None);
         }
         // Aggregated CTE bodies (TPC-DS Q78/Q97) often report `Absent` row
@@ -3681,10 +3681,11 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_unknown_size_aggregate_inner_join_without_cayenne_scans() {
-        // TPC-DS Q78 `--validate` oracle: `ss` ⋈ `ws` over file scans, no
-        // Cayenne exec in the tree. Distinct schemas so this is not the
-        // year_total self-join skip.
+    fn does_not_rewrite_unknown_size_aggregate_inner_join_without_cayenne_scans() {
+        // TPC-DS Q78 `--validate` oracle: `ss LEFT JOIN ws` over file scans,
+        // no Cayenne exec in the tree. Distinct schemas so this is not the
+        // year_total self-join skip. A coalesced sort-merge of this join
+        // returns 65 rows for LIMIT 100 instead of 100 (regression for #13918).
         let left_schema = channel_schema("ss_item_sk", "ss_qty");
         let right_schema = channel_schema("ws_item_sk", "ws_qty");
         let left = grouped_count_over(inlined_exec(&left_schema), "ss_item_sk");
@@ -3703,8 +3704,8 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.is::<SortMergeJoinExec>(),
-            "Q78 --validate oracle (no Cayenne scans) must spill unknown-size aggregate builds"
+            optimized.is::<HashJoinExec>(),
+            "Q78 --validate oracle (no Cayenne scans) must keep unknown-size inner aggregate joins as hash joins"
         );
     }
 
