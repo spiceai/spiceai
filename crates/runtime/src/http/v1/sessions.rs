@@ -95,11 +95,9 @@ pub(crate) async fn post(
 
     let session = sessions.issue(&df.ctx, owner_stable_id, bearer_api_key);
 
-    tracing::debug!(
-        "Created SQL session '{}' ({} live)",
-        session.id(),
-        sessions.count()
-    );
+    // The id is not logged: it is accepted as a bearer credential, so a debug
+    // log carrying it is a credential in the log.
+    tracing::debug!("Created a SQL session ({} live)", sessions.count());
 
     let body = SessionResponse {
         session_id: session.id().to_string(),

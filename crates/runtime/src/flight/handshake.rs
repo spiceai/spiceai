@@ -65,9 +65,12 @@ pub(crate) async fn handle(
     let session = session_store.issue(&datafusion.ctx, owner_stable_id, auth_token.clone());
     let session_id = session.id().to_string();
 
+    // Same reason the HTTP session endpoint does not log its id: the id is a
+    // bearer credential.
     tracing::debug!(
         authenticated = auth_token.is_some(),
-        "Created new Flight SQL session: {session_id}"
+        owned = owner_stable_id.is_some(),
+        "Created a new Flight SQL session"
     );
 
     // Return the session ID in the response payload

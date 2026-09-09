@@ -42,9 +42,13 @@ const MAX_SESSIONS: u64 = 10_000;
 /// Manages Flight SQL sessions, mapping session IDs to `SessionContext` instances.
 ///
 /// Ids are issued by [`SessionStore::create_session`] and only looked up
-/// afterwards. A request that names an id the store does not hold resolves to
-/// nothing rather than creating a session under that id, which is what keeps two
-/// callers that pick the same id out of one another's prepared statements.
+/// afterwards: a request naming an id the store does not hold resolves to
+/// nothing rather than having a session created under that id.
+///
+/// That is not isolation on its own. [`crate::FlightSqlService`] runs a request
+/// whose session does not resolve against its shared base context, so two
+/// clients naming different unknown ids share one context — and each other's
+/// prepared statements. Only an issued id gets a context of its own.
 #[derive(Clone)]
 pub struct SessionStore {
     sessions: Cache<String, Arc<SessionContext>>,
