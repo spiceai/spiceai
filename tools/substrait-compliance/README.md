@@ -13,7 +13,7 @@ report-only; it does not fail the repository on a low pass rate.
 |------|--------|
 | Suite | [spiceai/substrait-compliance](https://github.com/spiceai/substrait-compliance) branch `spiceai` @ `43d31411c69ef7594887c7d759037bcf8244eeed` = IBM `main` `b9b5f6a` (suite files identical to `v0.1.1`) plus the TPC-H q01 shipdate-cutoff correction, the only difference from upstream |
 | Workspace `datafusion` / `datafusion-substrait` | `54.1.0` |
-| spiceai/datafusion fork | `claude/substrait-subquery-scan-alias` @ `ebb7d2a4490e062b1fa98dfe57bffcb6c1323f3e` (workspace `[patch.crates-io]`; spiceai/datafusion#226 head on `spiceai-54` `ce010574…`, includes #215, #220, #221) |
+| spiceai/datafusion fork | `spiceai-54` @ `11624fb82dc5460d201d0379d269a4613e82f9c7` (workspace `[patch.crates-io]`; merged spiceai/datafusion#220, #221 and #226, includes #215) |
 
 The IBM `examples/datafusion-rust` tree on **`main`** pins
 `datafusion` / `datafusion-substrait` **54.1** and is the layout Mode A
