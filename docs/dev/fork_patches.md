@@ -213,7 +213,7 @@ catch.
 | Spark concat coerces an untyped NULL argument to a string type (fork PR #217) | A string array concatenated with an untyped NULL reaches an unsupported kernel branch | silent (panic) | `crates/runtime/src/datafusion/builder.rs::tests::the_built_session_concatenates_an_untyped_null` |
 | Substrait VarChar literals decode as UTF-8 strings (fork PR #215) | Plans containing VarChar literals fail to decode | silent (query failure) | `crates/runtime/src/flight/flightsql/statement_substrait_plan.rs::tests::decode_plan_executes_a_varchar_literal`; `tools/substrait-compliance/src/mode_a.rs::varchar_literal_lowers_to_utf8` (Isthmus TPC-H plans emit `VarChar` literals such as `EUROPE`, length 25; the Mode A harness `spice-substrait-compliance` exercises them on q02/q03/q05/q11/q12/q16/q17/q19–q22) |
 | Substrait `extract` enum arguments lower to `date_part` cast to the plan's declared output type (fork PR #220) | Isthmus TPC-H q07/q08/q09 emit `extract:req_date` with `FunctionArgument { enum: "YEAR" }`; without the patch `from_substrait_plan` errors (`Function argument non-Value type not supported`) and Mode A reports ERROR for all three | silent (query failure) | `tools/substrait-compliance/src/mode_a.rs::enum_function_argument_lowers_to_date_part`, `::registered_extract_udf_takes_precedence_over_date_part` (a UDF registered as `extract` wins over the mapping), `::extract_indexing_option_is_an_offset_from_date_part` (`MONTH ZERO` and `SUNDAY_DAY_OF_WEEK ONE` on 1998-09-01 give 8 and 3), `::unmapped_extract_component_is_rejected_by_name` (`MILLISECOND` fails as an unsupported component, not as an unsupported argument); Mode A harness (`spice-substrait-compliance`) on q07/q08/q09 |
-| Unparser names a subquery alias's columns when the scan pushdown renames them (fork PR #221, refs spiceai/spiceai#13140) | A `SubqueryAlias` over a projection the alias pushdown requalifies exposes outputs named after the requalified expression while the enclosing scope refers to them by the name the alias's schema reports, so the reference binds to nothing and the remote engine rejects the statement | silent (query failure) | **GAP** in this repo — spiceai/spiceai#13140 is still open and no repo-side test exercises the shape yet; the fork's own `plan_to_sql.rs` tests (`test_subquery_alias_over_pushed_down_scan_is_named_by_the_alias`, `…_keeps_a_named_output_unaliased`, `…_on_dialect_without_column_list`, `…_column_list_escapes_a_quote_in_an_output_name`) guard it today. Carried in by the pin move for fork PR #220 rather than for itself |
+| Unparser names a subquery alias's columns when the scan pushdown renames them (fork PR #221, refs spiceai/spiceai#13140) | A `SubqueryAlias` over a projection the alias pushdown requalifies exposes outputs named after the requalified expression while the enclosing scope refers to them by the name the alias's schema reports, so the reference binds to nothing and the remote engine rejects the statement | silent (query failure) | `crates/data_components/src/federation.rs::a_projected_scan_under_an_alias_names_the_output_its_scope_references` (a pushed-down scan projection under alias `s` unparses so the `FROM` clause exposes the enclosing identifier; without the patch the derived table cannot report that name). Also the fork's own `plan_to_sql.rs` tests (`test_subquery_alias_over_pushed_down_scan_is_named_by_the_alias`, `…_keeps_a_named_output_unaliased`, `…_on_dialect_without_column_list`, `…_column_list_escapes_a_quote_in_an_output_name`) |
 | Substrait subquery scans of a table the enclosing scope also reads get their own qualifier; a scan's own `ReadRel.filter` binds to the Substrait base schema and sits above the scan whenever it holds an outer reference, aliased or not; joins, intersects and excepts requalified inside a subquery keep clear of the enclosing scope's `left`/`right` (fork PR #226) | SQL names such a scan (`lineitem l2`); Substrait cannot, so both scans were `LINEITEM` and decorrelation resolved `LINEITEM.L_ORDERKEY = outer_ref(LINEITEM.L_ORDERKEY)` to the inner scan alone: the semi/anti join lost its condition and `L_SUPPKEY != L_SUPPKEY` stayed behind, so TPC-H q21 returned no rows where the SQL returns one. Without the follow-ups, a correlated predicate carried as `ReadRel.filter` was consumed against the provider's schema (field 0 bound to a provider's extra leading column: `Cannot cast string 'x' to value of Int64 type`), and a self-join inside a subquery took the fixed `left`/`right` that an enclosing self-join already used, collapsing the correlation to no rows | silent (wrong data) | `tools/substrait-compliance/src/mode_a.rs::correlated_subquery_over_the_same_table_keeps_its_rows` (same-table correlated EXISTS over three rows returns two; empty without the patch), `::correlated_read_filter_binds_to_the_substrait_schema` (the predicate as `ReadRel.filter` against a provider with an extra leading column; the fork's own test failed with the cast error before the follow-up), `::requalified_join_inside_a_subquery_keeps_its_correlation` (self-joins in both scopes return six rows; empty on the pin before the follow-up), `::intersect_inside_a_subquery_keeps_its_correlation` (a self-intersect in the subquery; empty on the pin before the follow-up), `::correlated_read_filter_on_another_table_keeps_its_rows` (the predicate as `ReadRel.filter` on a table no enclosing scope reads; unexecutable on the pin before the follow-up), `::subquery_scan_alias_skips_a_taken_name` (the enclosing scope reads `t` and a table named `t_1`, so the inner scan of `t` becomes `t_2`; six rows); Mode A harness (`spice-substrait-compliance`) on q21 |
 | BigQuery renders integer-typed division with `DIV` (fork PR #222) | Fractional division followed by an integer cast rounds cohort cutoff hours instead of preserving the logical plan's integer quotient | silent (wrong data) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the integer cohort hours arm) |
 | Unparser isolates standalone expression state and qualifies filtered recursive join inputs (fork PR #219) | A refused recursive expression poisons a reused unparser, or a filtered recursive self-join renders ambiguous columns | silent (query failure) | `crates/runtime-datafusion/src/dialect/bigquery.rs::filtered_recursive_join_inputs_keep_their_qualified_columns` and `::a_recursive_cte_renders_through_the_wrapper_only_where_it_is_supported`; real-engine control: `test/scripts/bigquery_pushdown.py::filtered-recursive-self-join` |
@@ -528,7 +528,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**38 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**37 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -576,31 +576,26 @@ They are not equal in consequence; this is the order to close them in.
     reader thread rather than surfacing a retriable decode error. The
     listing/overwrite harness 412s before a short successful range body
     reaches the decoder.
-19. `datafusion` subquery-alias column list when the scan pushdown renames the
-    outputs (fork PR #221, spiceai/spiceai#13140) — the derived table exposes one
-    name and the enclosing scope asks for another, so the remote engine rejects
-    the statement. The fork's own `plan_to_sql.rs` tests guard it; the repo-side
-    guard belongs with the #13140 fix.
 
 **Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
 being honoured:
 
-20. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
+19. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
     the sink's own honouring of `target_file_size_mb` is not, so the writer can emit
     one file per flush regardless of size.
-21. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
+20. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
     cannot silently drop the limit, the single-node scan can.
-22. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
+21. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
     misconfigured warehouse produces an opaque error instead of an actionable one.
-23. `model2vec-rs` HF cache directory read from the environment — models are
+22. `model2vec-rs` HF cache directory read from the environment — models are
     re-downloaded instead of reusing the shared cache.
-24. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
+23. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
     installs a global subscriber and hijacks `spiced`'s logging.
 
 **Security posture.** No correctness effect, but a silent downgrade:
 
-25. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
-26. `graph-rs-sdk` tower middleware application.
+24. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
+25. `graph-rs-sdk` tower middleware application.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
@@ -608,7 +603,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-27. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+26. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
