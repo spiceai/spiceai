@@ -825,7 +825,7 @@ fn try_rewrite_oversized_join(
         // Those joins are 1:1 on the grouping key; sort-merge was returning a
         // different LIMIT-100 customer set than hash join at SF-100.
         let Some(build_row_count) = build_input_row_estimate(hash_join) else {
-            if is_same_schema_self_join(hash_join) {
+            if is_unknown_size_self_join(hash_join) {
                 return Ok(None);
             }
             return finish_sort_merge_rewrite(hash_join);
@@ -833,7 +833,7 @@ fn try_rewrite_oversized_join(
         let Some(estimated_build_bytes) =
             build_side_memory_estimate(hash_join.left().as_ref(), build_row_count)
         else {
-            if is_same_schema_self_join(hash_join) {
+            if is_unknown_size_self_join(hash_join) {
                 return Ok(None);
             }
             return finish_sort_merge_rewrite(hash_join);
@@ -1023,11 +1023,25 @@ fn join_touches_cayenne(hash_join: &HashJoinExec) -> bool {
         || !collect_cayenne_scans(hash_join.right()).is_empty()
 }
 
-/// Both inputs expose the same field names and types — the physical shape of a
-/// self-join of one CTE (TPC-DS `year_total`, `all_sales`). Distinct CTE
-/// bodies (Q78 `ss` ⋈ `ws`) do not match.
-fn is_same_schema_self_join(hash_join: &HashJoinExec) -> bool {
-    hash_join.left().schema() == hash_join.right().schema()
+/// Unknown-size self-join of one CTE (TPC-DS `year_total` Q4/Q11/Q74): either
+/// both inputs share a schema, or every equi-join key has the same physical
+/// name on both sides (`customer_id = customer_id`). Distinct CTE bodies
+/// (Q78 `ss` ⋈ `ws` on `ss_item_sk = ws_item_sk`) have different key names
+/// and still spill.
+fn is_unknown_size_self_join(hash_join: &HashJoinExec) -> bool {
+    if hash_join.left().schema() == hash_join.right().schema() {
+        return true;
+    }
+    !hash_join.on().is_empty()
+        && hash_join.on().iter().all(|(left_key, right_key)| {
+            match (
+                physical_column_name(left_key),
+                physical_column_name(right_key),
+            ) {
+                (Some(left_name), Some(right_name)) => left_name == right_name,
+                _ => false,
+            }
+        })
 }
 
 /// Count the `HashJoinExec` nodes in a plan. Used to size each join's fair
@@ -3274,9 +3288,9 @@ mod tests {
         );
     }
 
-    fn channel_schema(qty_name: &str) -> Arc<Schema> {
+    fn channel_schema(item_key: &str, qty_name: &str) -> Arc<Schema> {
         Arc::new(Schema::new(vec![
-            Field::new("order_id", DataType::Int64, false),
+            Field::new(item_key, DataType::Int64, false),
             Field::new(qty_name, DataType::Int64, false),
         ]))
     }
@@ -3286,8 +3300,8 @@ mod tests {
         // Distinct schemas, like TPC-DS Q78 `ss` ⋈ `ws`. A same-schema self-join
         // of one CTE is excluded (see
         // `does_not_rewrite_absent_stats_same_schema_self_join`).
-        let left_schema = channel_schema("ss_qty");
-        let right_schema = channel_schema("ws_qty");
+        let left_schema = channel_schema("ss_item_sk", "ss_qty");
+        let right_schema = channel_schema("ws_item_sk", "ws_qty");
         let left =
             cayenne_file_exec_with_num_rows(&left_schema, "ss.vortex", Precision::Absent);
         let right =
@@ -3295,8 +3309,8 @@ mod tests {
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
-            "order_id",
-            "order_id",
+            "ss_item_sk",
+            "ws_item_sk",
             JoinType::Inner,
             NullEquality::NullEqualsNothing,
         ));
@@ -3337,9 +3351,45 @@ mod tests {
     }
 
     #[test]
+    fn does_not_rewrite_absent_stats_same_named_join_keys() {
+        // Q4 copies of year_total can differ in extra projected columns but
+        // still join customer_id = customer_id.
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("customer_id", DataType::Int64, false),
+            Field::new("year_total", DataType::Int64, false),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("customer_id", DataType::Int64, false),
+            Field::new("year_total", DataType::Int64, false),
+            Field::new("sale_type", DataType::Int64, false),
+        ]));
+        let left =
+            cayenne_file_exec_with_num_rows(&left_schema, "yt1.vortex", Precision::Absent);
+        let right =
+            cayenne_file_exec_with_num_rows(&right_schema, "yt2.vortex", Precision::Absent);
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "customer_id",
+            "customer_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<HashJoinExec>(),
+            "same-named equi-join keys must stay hash joins on the unknown-size path"
+        );
+    }
+
+    #[test]
     fn rewrites_inexact_stats_distinct_schema_hash_join() {
-        let left_schema = channel_schema("ss_qty");
-        let right_schema = channel_schema("ws_qty");
+        let left_schema = channel_schema("ss_item_sk", "ss_qty");
+        let right_schema = channel_schema("ws_item_sk", "ws_qty");
         let left = cayenne_file_exec_with_num_rows(
             &left_schema,
             "ss.vortex",
@@ -3353,8 +3403,8 @@ mod tests {
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
-            "order_id",
-            "order_id",
+            "ss_item_sk",
+            "ws_item_sk",
             JoinType::Inner,
             NullEquality::NullEqualsNothing,
         ));
@@ -3990,8 +4040,8 @@ mod tests {
     fn rewrites_inexact_build_inner_hash_join_under_memory_gate() {
         // Distinct schemas so this is not the Q4/Q11/Q74 year_total self-join
         // exclusion. Inexact stats on `ss` ⋈ `ws` (Q78) must still spill.
-        let left_schema = channel_schema("ss_qty");
-        let right_schema = channel_schema("ws_qty");
+        let left_schema = channel_schema("ss_item_sk", "ss_qty");
+        let right_schema = channel_schema("ws_item_sk", "ws_qty");
         let left = cayenne_file_exec_with_num_rows(
             &left_schema,
             "ss.vortex",
@@ -4005,8 +4055,8 @@ mod tests {
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
-            "order_id",
-            "order_id",
+            "ss_item_sk",
+            "ws_item_sk",
             JoinType::Inner,
             NullEquality::NullEqualsNothing,
         ));
