@@ -665,13 +665,13 @@ impl SpiceTestQueryWorker {
         // Execute query using the configured executor
         let result = self.executor.execute(query, collect_batches).await?;
 
+        let mut reference_validation_passed = false;
+
         // Handle validation if supported and requested
         if validate
             && self.executor.supports_validation()
             && let Some(batches) = &result.batches
         {
-            let mut reference_validation_passed = false;
-
             // Execute reference query if reference_schema is provided
             if let Some(ref_schema) = &self.reference_schema
                 && let Some(spice_client) = self.executor.as_spice_client()
@@ -841,13 +841,17 @@ impl SpiceTestQueryWorker {
             }
         }
 
-        // Check for zero row count if not in skip list
-        if self.validate_row_count
-            && !self
-                .skip_row_count_validation
-                .contains(&query.name.to_string())
-            && result.row_count == 0
-        {
+        // Check for zero row count if not in skip list. A live reference
+        // comparison that already passed (including both sides empty) is the
+        // oracle: TPC-DS Q25 is empty at some scale factors and must not fail
+        // `--validate` when the file scan is empty too.
+        if zero_row_count_is_failure(
+            self.validate_row_count,
+            self.skip_row_count_validation
+                .contains(&query.name.to_string()),
+            result.row_count,
+            reference_validation_passed,
+        ) {
             eprintln!(
                 "{} FAIL - Worker {} - Query '{}' returned 0 rows",
                 chrono::Utc::now(),
@@ -908,6 +912,15 @@ fn status_after_run(current: QueryStatus, query_failure: Option<String>) -> Quer
 /// durations still measure the accelerator. Timed iterations keep static-answer
 /// validation (TPC-H SF-1, scenario gold) because that is a local compare with
 /// no extra query.
+fn zero_row_count_is_failure(
+    validate_row_count: bool,
+    skipped: bool,
+    row_count: usize,
+    reference_validation_passed: bool,
+) -> bool {
+    validate_row_count && !skipped && row_count == 0 && !reference_validation_passed
+}
+
 fn should_validate_on_run(validate: bool, is_warmup: bool, has_reference_schema: bool) -> bool {
     if !validate {
         return false;
@@ -1031,6 +1044,23 @@ mod tests {
         let failed = QueryStatus::Failed(Some("snapshot assertion failed".into()));
 
         assert!(status_after_run(failed.clone(), None) == failed);
+    }
+
+    #[test]
+    fn empty_result_is_ok_when_the_live_oracle_also_returned_empty() {
+        assert!(
+            !zero_row_count_is_failure(true, false, 0, true),
+            "TPC-DS Q25 at SF-10 is empty on the file oracle; --validate must not fail that"
+        );
+        assert!(
+            zero_row_count_is_failure(true, false, 0, false),
+            "zero rows without a passing live oracle remain a failure"
+        );
+        assert!(
+            !zero_row_count_is_failure(true, true, 0, false),
+            "skip-list queries must not fail on zero rows"
+        );
+        assert!(!zero_row_count_is_failure(true, false, 1, false));
     }
 
     #[test]

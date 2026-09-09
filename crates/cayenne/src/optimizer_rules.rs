@@ -784,11 +784,7 @@ fn try_rewrite_oversized_join(
         return Ok(None);
     }
 
-    // `SortMergeJoinExec` carries no embedded output projection and
-    // `HashJoinExec` exposes no accessor to read one back, so a projected join
-    // cannot be rewritten without changing the output schema; leave it to the
-    // deterministic `runtime.query.prefer_hash_join` knob.
-    if hash_join.contains_projection() || hash_join.on().is_empty() {
+    if hash_join.on().is_empty() {
         return Ok(None);
     }
 
@@ -821,13 +817,16 @@ fn try_rewrite_oversized_join(
         if !join_touches_cayenne(hash_join) {
             return Ok(None);
         }
+        // Aggregated CTE bodies (TPC-DS Q78/Q97) often report `Absent` row
+        // counts. Skipping the rewrite then leaves a non-spillable hash table
+        // that exhausts the pool. Treat unknown size as oversized.
         let Some(build_row_count) = build_input_row_estimate(hash_join) else {
-            return Ok(None);
+            return finish_sort_merge_rewrite(hash_join);
         };
         let Some(estimated_build_bytes) =
             build_side_memory_estimate(hash_join.left().as_ref(), build_row_count)
         else {
-            return Ok(None);
+            return finish_sort_merge_rewrite(hash_join);
         };
 
         // Per-join budget: the smaller of the absolute pool fraction and an even
@@ -901,6 +900,12 @@ fn try_rewrite_oversized_join(
         return Ok(None);
     }
 
+    finish_sort_merge_rewrite(hash_join)
+}
+
+fn finish_sort_merge_rewrite(
+    hash_join: &HashJoinExec,
+) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
     let sort_options = vec![SortOptions::default(); hash_join.on().len()];
     let Some(left_ordering) = join_key_ordering(
         hash_join
@@ -941,13 +946,65 @@ fn try_rewrite_oversized_join(
         sort_options,
         hash_join.null_equality(),
     )?;
+    let join: Arc<dyn ExecutionPlan> = Arc::new(join);
+    let Some(join) = wrap_sort_merge_to_hash_join_schema(join, hash_join)? else {
+        return Ok(None);
+    };
 
     tracing::debug!(
         join_type = ?hash_join.join_type(),
         "Replaced large Cayenne HashJoinExec with spillable SortMergeJoinExec"
     );
 
-    Ok(Some(Arc::new(join)))
+    Ok(Some(join))
+}
+
+/// `HashJoinExec` may embed a column projection that `SortMergeJoinExec` does
+/// not. Rebuild it as a `ProjectionExec` so the rewrite cannot change the
+/// output schema. Returns `None` when the projection cannot be reconstructed,
+/// in which case the hash join is left in place.
+fn wrap_sort_merge_to_hash_join_schema(
+    sort_merge: Arc<dyn ExecutionPlan>,
+    hash_join: &HashJoinExec,
+) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+    if !hash_join.contains_projection() {
+        return Ok(Some(sort_merge));
+    }
+    let target = hash_join.schema();
+    let source = sort_merge.schema();
+    let Some(exprs) = projection_exprs_matching_schema(source.as_ref(), target.as_ref()) else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(ProjectionExec::try_new(exprs, sort_merge)?)))
+}
+
+fn projection_exprs_matching_schema(
+    source: &arrow::datatypes::Schema,
+    target: &arrow::datatypes::Schema,
+) -> Option<Vec<(Arc<dyn PhysicalExpr>, String)>> {
+    let mut used = vec![false; source.fields().len()];
+    let mut exprs = Vec::with_capacity(target.fields().len());
+    for target_field in target.fields() {
+        let mut found = None;
+        for (index, source_field) in source.fields().iter().enumerate() {
+            if used[index] {
+                continue;
+            }
+            if source_field.name() == target_field.name()
+                && source_field.data_type() == target_field.data_type()
+            {
+                found = Some(index);
+                break;
+            }
+        }
+        let index = found?;
+        used[index] = true;
+        exprs.push((
+            Arc::new(Column::new(target_field.name(), index)) as Arc<dyn PhysicalExpr>,
+            target_field.name().clone(),
+        ));
+    }
+    Some(exprs)
 }
 
 /// Build-side (LEFT input) row count for the spillable rewrite, accepting an
@@ -3208,6 +3265,31 @@ mod tests {
         assert!(
             optimized.is::<SortMergeJoinExec>(),
             "low-row-count + wide-row build exceeding the byte gate should be rewritten to sort-merge"
+        );
+    }
+
+    #[test]
+    fn rewrites_absent_stats_hash_join_when_memory_pool_configured() {
+        let schema = order_line_schema();
+        let left = cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", Precision::Absent);
+        let right =
+            cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", Precision::Absent);
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<SortMergeJoinExec>(),
+            "Absent build-side stats under a query memory pool must spill via sort-merge, not keep a non-spillable hash table"
         );
     }
 

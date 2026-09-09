@@ -1032,7 +1032,11 @@ pub fn compare_query_result_batches_with_sort_check(
     right_batches: &[RecordBatch],
     row_order: RowOrder,
 ) -> Result<SortCheckedComparison> {
-    let content = compare_query_result_batches(query_name, left_batches, right_batches, row_order)?;
+    let content = if row_order == RowOrder::Preserved {
+        compare_limit_results_allowing_cutoff_ties(query_name, sql, left_batches, right_batches)?
+    } else {
+        compare_query_result_batches(query_name, left_batches, right_batches, row_order)?
+    };
     let content_passed = content == QueryValidationResult::Pass;
 
     // Parsed once for both sides: the AST does not depend on which engine's rows
@@ -1120,6 +1124,155 @@ pub fn validate_against_reference_batches(
         order,
     )?;
     Ok(comparison.result)
+}
+
+/// Compare `ORDER BY … LIMIT` results when the sort key is not unique.
+///
+/// SQL does not define which tied rows a `LIMIT` keeps. TPC-DS Q65 orders by
+/// `s_store_name, i_item_desc`; many items share description `"A"`, so two
+/// correct engines may return different 100-row subsets. Requiring positional
+/// cell equality then fails even though both honor the `ORDER BY`.
+///
+/// Complete tie-groups (a run of equal sort keys followed by a greater key)
+/// must still match as a multiset. The last run is the cutoff: if it contains
+/// more than one row it may be truncated, so only the sort keys are required
+/// to match. A unique last row is compared in full.
+fn compare_limit_results_allowing_cutoff_ties(
+    query_name: &str,
+    sql: &str,
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+) -> Result<QueryValidationResult> {
+    if left_batches.is_empty() && right_batches.is_empty() {
+        return Ok(QueryValidationResult::Pass);
+    }
+    if left_batches.is_empty() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
+    }
+    if right_batches.is_empty() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoExpectedAnswer,
+        ));
+    }
+
+    let left_schema = left_batches[0].schema();
+    let right_schema = right_batches[0].schema();
+    if left_schema.fields().len() != right_schema.fields().len() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::SchemaMismatch,
+        ));
+    }
+
+    let left = arrow::compute::concat_batches(&left_schema, left_batches)?;
+    let right = arrow::compute::concat_batches(&right_schema, right_batches)?;
+    if left.num_rows() != right.num_rows() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::RowCountMismatch {
+                expected: left.num_rows(),
+                actual: right.num_rows(),
+            },
+        ));
+    }
+
+    let statement = sort_order::parse_one_statement(sql);
+    let resolution = statement.as_ref().map_or_else(
+        || SortKeyResolution::Unresolved {
+            reason: "SQL did not parse as a single statement".to_string(),
+        },
+        |parsed| sort_order::resolve_statement_sort_key(parsed, &left.schema()),
+    );
+    let SortKeyResolution::Resolved { key, .. } = resolution else {
+        return compare_query_result_batches(
+            query_name,
+            left_batches,
+            right_batches,
+            RowOrder::Preserved,
+        );
+    };
+
+    let n = left.num_rows();
+    let mut run_start = 0_usize;
+    while run_start < n {
+        let run_key = row_sort_key(&left, run_start, &key)?;
+        if row_sort_key(&right, run_start, &key)? != run_key {
+            println!(
+                "Query '{query_name}' ORDER BY key mismatch at row {} (left vs right cutoff)",
+                run_start + 1
+            );
+            return Ok(QueryValidationResult::Fail(
+                QueryValidationFailReason::DataMismatch {
+                    column: key[0].name.clone(),
+                    row_number: run_start + 1,
+                    expected: run_key
+                        .first()
+                        .and_then(Option::as_deref)
+                        .unwrap_or("")
+                        .to_string(),
+                    actual: row_sort_key(&right, run_start, &key)?
+                        .first()
+                        .and_then(Option::as_deref)
+                        .unwrap_or("")
+                        .to_string(),
+                },
+            ));
+        }
+        let mut run_end = run_start + 1;
+        while run_end < n && row_sort_key(&left, run_end, &key)? == run_key {
+            if row_sort_key(&right, run_end, &key)? != run_key {
+                return Ok(QueryValidationResult::Fail(
+                    QueryValidationFailReason::DataMismatch {
+                        column: key[0].name.clone(),
+                        row_number: run_end + 1,
+                        expected: run_key
+                            .first()
+                            .and_then(Option::as_deref)
+                            .unwrap_or("")
+                            .to_string(),
+                        actual: row_sort_key(&right, run_end, &key)?
+                            .first()
+                            .and_then(Option::as_deref)
+                            .unwrap_or("")
+                            .to_string(),
+                    },
+                ));
+            }
+            run_end += 1;
+        }
+        let is_last_run = run_end == n;
+        let truncated_cutoff = is_last_run && (run_end - run_start) > 1;
+        if !truncated_cutoff {
+            let left_run = left.slice(run_start, run_end - run_start);
+            let right_run = right.slice(run_start, run_end - run_start);
+            let run_result = compare_query_result_batches(
+                query_name,
+                &[left_run],
+                &[right_run],
+                RowOrder::Multiset,
+            )?;
+            if let QueryValidationResult::Fail(reason) = run_result {
+                return Ok(QueryValidationResult::Fail(reason));
+            }
+        }
+        run_start = run_end;
+    }
+    Ok(QueryValidationResult::Pass)
+}
+
+fn row_sort_key(
+    batch: &RecordBatch,
+    row: usize,
+    key: &[SortKeyColumn],
+) -> Result<Vec<Option<String>>> {
+    let mut out = Vec::with_capacity(key.len());
+    for column in key {
+        out.push(array_value_to_string(
+            batch.column(column.index).as_ref(),
+            row,
+        )?);
+    }
+    Ok(out)
 }
 
 /// Canonical row order for multiset equality: sort by stringified cell values
@@ -1785,6 +1938,88 @@ mod test {
             result,
             QueryValidationResult::Pass,
             "TPC-DS queries without ORDER BY + LIMIT must compare as a multiset: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_against_reference_accepts_tied_limit_subsets() {
+        // TPC-DS Q65: ORDER BY store name + item desc is not unique — many
+        // items share description "A". LIMIT 100 may pick different members
+        // of that tie class; both answers are SQL-correct.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s_store_name", arrow::datatypes::DataType::Utf8, false),
+            Field::new("i_item_desc", arrow::datatypes::DataType::Utf8, false),
+            Field::new("revenue", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        let actual = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["able", "able"])),
+                Arc::new(arrow::array::StringArray::from(vec!["A", "A"])),
+                Arc::new(arrow::array::StringArray::from(vec!["4.63", "8.64"])),
+            ],
+        )
+        .expect("actual");
+        let reference = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["able", "able"])),
+                Arc::new(arrow::array::StringArray::from(vec!["A", "A"])),
+                Arc::new(arrow::array::StringArray::from(vec!["4.40", "1.74"])),
+            ],
+        )
+        .expect("reference");
+        let query = Query::new(
+            "tpcds_q65".into(),
+            "SELECT s_store_name, i_item_desc, revenue FROM t \
+             ORDER BY s_store_name, i_item_desc LIMIT 100"
+                .into(),
+            false,
+        );
+        let result =
+            validate_against_reference_batches(&query, &[actual], &[reference]).expect("compare");
+        assert_eq!(
+            result,
+            QueryValidationResult::Pass,
+            "tied ORDER BY + LIMIT subsets must pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_against_reference_rejects_unique_limit_mismatch() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", arrow::datatypes::DataType::Utf8, false),
+            Field::new("v", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let actual = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .expect("actual");
+        let reference = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+                Arc::new(arrow::array::Int64Array::from(vec![1, 99])),
+            ],
+        )
+        .expect("reference");
+        let query = Query::new(
+            "tpcds_q1".into(),
+            "SELECT k, v FROM t ORDER BY k LIMIT 2".into(),
+            false,
+        );
+        let result =
+            validate_against_reference_batches(&query, &[actual], &[reference]).expect("compare");
+        assert!(
+            matches!(
+                result,
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            ),
+            "a unique ORDER BY key must still fail on a wrong cell: {result:?}"
         );
     }
 
