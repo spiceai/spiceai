@@ -1642,6 +1642,194 @@ mod tests {
         }
     }
 
+    /// The identifier a `DISTINCT ON` groups by, taken from the emitted
+    /// `DISTINCT ON (<key>)` rather than from the plan, so a guard reads the key the
+    /// remote engine will resolve rather than the one the plan meant.
+    fn distinct_on_key(sql: &str) -> &str {
+        let open = first_offset_of(sql, "DISTINCT ON (") + "DISTINCT ON (".len();
+        let Some(close) = sql[open..].find(')') else {
+            panic!("expected the DISTINCT ON key list to close in: {sql}");
+        };
+        &sql[open..open + close]
+    }
+
+    /// An identifier with whatever quoting a dialect wrapped it in removed, so two
+    /// spellings of the same name compare equal.
+    fn unquoted(identifier: &str) -> &str {
+        identifier
+            .trim()
+            .trim_matches('"')
+            .trim_matches('`')
+            .trim_matches(|c| c == '[' || c == ']')
+    }
+
+    /// Every `AS <identifier>` binding emitted at `depth`, as the bare identifiers
+    /// they bind. Depth is what separates the `DISTINCT ON`'s own select list from
+    /// the derived table beneath it, which legitimately binds the same name.
+    fn as_bindings_at_depth(sql: &str, depth: usize) -> Vec<&str> {
+        sql.match_indices(" AS ")
+            .filter(|(at, _)| paren_depth_at(sql, *at) == depth)
+            .map(|(at, keyword)| {
+                let rest = &sql[at + keyword.len()..];
+                let end = rest
+                    .find(|c: char| c == ',' || c == ')')
+                    .unwrap_or(rest.len())
+                    .min(rest.find(" FROM ").unwrap_or(rest.len()));
+                unquoted(&rest[..end])
+            })
+            .collect()
+    }
+
+    /// The plan shape that lets a `DISTINCT ON` output alias capture the key: an
+    /// input column whose name is also the logical name of the computed output, so
+    /// naming that output rebinds the key to it.
+    ///
+    /// The enclosing projection is what makes the `DISTINCT ON` a derived table
+    /// whose outputs another scope binds, which is the only shape the naming pass
+    /// runs on at all.
+    fn distinct_on_over_key_named_output(
+        key: Expr,
+        input_alias: &str,
+        select_expr: Expr,
+        output_reference: &str,
+        relation_alias: Option<&str>,
+    ) -> LogicalPlan {
+        let scanned = LogicalPlanBuilder::scan(
+            "t",
+            table_source(vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("b", DataType::Int32, false),
+                Field::new("c", DataType::Int32, false),
+            ]),
+            None,
+        )
+        .expect("scan")
+        .project(vec![
+            col("t.a").alias("a"),
+            col("t.b").alias("b"),
+            col("t.c").alias(input_alias),
+        ])
+        .expect("projection naming an input column after the computed output");
+        let scanned = match relation_alias {
+            Some(alias) => scanned.alias(alias).expect("relation alias"),
+            None => scanned,
+        };
+        scanned
+            .distinct_on(
+                vec![key.clone()],
+                vec![select_expr],
+                Some(vec![key.sort(true, false)]),
+            )
+            .expect("distinct on")
+            .limit(0, Some(5))
+            .expect("limit")
+            .project(vec![Expr::Column(Column::new_unqualified(
+                output_reference,
+            ))])
+            .expect("enclosing projection")
+            .build()
+            .expect("build")
+    }
+
+    /// Naming a `DISTINCT ON`'s computed output must not change which key it groups
+    /// by. PostgreSQL resolves a bare name in `DISTINCT ON` and `ORDER BY` against
+    /// the output list before the input columns, so aliasing the output to the name
+    /// the key already spells rebinds the key from the input column to the output —
+    /// the same rows grouped by a different key, in valid SQL with an unchanged
+    /// reported schema, which is the worst shape this can take.
+    ///
+    /// Only a Spice patch to the `spiceai/datafusion` fork declines that alias (fork
+    /// PR #209). Its three arms are the three ways the key reaches the remote engine
+    /// as a bare name: spelled exactly, spelled in another case (quoting does not say
+    /// how an engine compares identifiers — `DuckDB` folds even quoted ones), and
+    /// carried by an `OuterReferenceColumn`, which unparses through the same path as
+    /// a column and so cannot be told apart from one.
+    ///
+    /// Leaving the output unnamed keeps the enclosing scope's reference unbound,
+    /// which is #13444 — the pre-existing bug, not a new wrong answer. This guard is
+    /// for the wrong answer.
+    #[test]
+    fn a_distinct_on_output_is_not_named_over_its_own_key() {
+        for (arm, key, input_alias) in [
+            (
+                "bare",
+                Expr::Column(Column::new_unqualified("a + b")),
+                "a + b",
+            ),
+            (
+                "case-folded",
+                Expr::Column(Column::new_unqualified("A + B")),
+                "A + B",
+            ),
+            (
+                "correlated",
+                Expr::OuterReferenceColumn(
+                    Arc::new(Field::new("a + b", DataType::Int32, false)),
+                    Column::new_unqualified("a + b"),
+                ),
+                "a + b",
+            ),
+        ] {
+            let plan = distinct_on_over_key_named_output(
+                key,
+                input_alias,
+                col("a") + col("b"),
+                "a + b",
+                None,
+            );
+            for (dialect_name, dialect) in federation_dialects() {
+                let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+                let key = unquoted(distinct_on_key(&sql)).to_lowercase();
+                let depth = paren_depth_at(&sql, first_offset_of(&sql, "DISTINCT ON ("));
+
+                let captured = as_bindings_at_depth(&sql, depth)
+                    .into_iter()
+                    .find(|binding| binding.to_lowercase() == key);
+                assert!(
+                    captured.is_none(),
+                    "{dialect_name}/{arm}: the DISTINCT ON output is named {}, which is the identifier its own key spells, so the remote engine groups by the output instead of by the input column: {sql}",
+                    captured.unwrap_or_default()
+                );
+            }
+        }
+    }
+
+    /// The assumption that keeps the refusal above narrow, and the reason it is not
+    /// simply "never name a `DISTINCT ON` output": only a *bare* key can be captured.
+    /// A qualified key resolves to the relation in both clauses whatever the output
+    /// list holds, so naming still applies there — and has to, or the enclosing
+    /// scope's reference goes unbound for a shape that was never at risk.
+    #[test]
+    fn a_distinct_on_output_is_named_over_a_qualified_key() {
+        let plan = distinct_on_over_key_named_output(
+            Expr::Column(Column::new(Some(TableReference::bare("d")), "a + b")),
+            "a + b",
+            col("d.a") + col("d.b"),
+            "d.a + d.b",
+            Some("d"),
+        );
+        for (dialect_name, dialect) in federation_dialects() {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+            let key = unquoted(distinct_on_key(&sql)).to_lowercase();
+            let depth = paren_depth_at(&sql, first_offset_of(&sql, "DISTINCT ON ("));
+
+            // The `DISTINCT ON` emits one select item, so any binding at its own depth
+            // is that item's alias. Asserted by presence rather than by spelling: a
+            // dialect may sanitise the identifier it derives from the logical name —
+            // `BigQuery` renders `d.a + d.b` as `d_46a + d_46b` — and which name it
+            // picks is not what this guard is about.
+            let bindings = as_bindings_at_depth(&sql, depth);
+            assert!(
+                !bindings.is_empty(),
+                "{dialect_name}: the output of a DISTINCT ON with a qualified key is unnamed, so the enclosing scope's reference does not bind: {sql}"
+            );
+            assert!(
+                !bindings.iter().any(|b| b.to_lowercase() == key),
+                "{dialect_name}: the qualified key and the output alias are the same identifier, so naming the output captured the key: {sql}"
+            );
+        }
+    }
+
     /// The half of #12751 that fork PR #206 does not fix, pinned so the repair is
     /// noticed rather than quietly leaving this shape unguarded.
     ///
