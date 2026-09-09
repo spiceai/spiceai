@@ -245,7 +245,7 @@ fn is_overflow_error(e: &ArrowError) -> bool {
 /// exact digits pay for them.
 ///
 /// This intercepts `try_cast_to` only. A correctly-rounded fix in arrow's cast
-/// kernel would also cover casts DataFusion performs directly (e.g. an explicit
+/// kernel would also cover casts `DataFusion` performs directly (e.g. an explicit
 /// `CAST(x AS DOUBLE)`); that is tracked as follow-up work.
 fn cast_decimal_to_float(
     column: &ArrayRef,
