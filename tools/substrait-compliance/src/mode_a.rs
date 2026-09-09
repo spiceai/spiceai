@@ -589,6 +589,13 @@ mod tests {
     /// `READ t` with base schema `(a, b)`, optionally carrying its own
     /// `ReadRel.filter`.
     fn read_t(filter: Option<datafusion_substrait::substrait::proto::Expression>) -> Rel {
+        read_named("t", filter)
+    }
+
+    fn read_named(
+        name: &str,
+        filter: Option<datafusion_substrait::substrait::proto::Expression>,
+    ) -> Rel {
         use datafusion_substrait::substrait::proto::read_rel::NamedTable;
         Rel {
             rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
@@ -601,7 +608,7 @@ mod tests {
                     }),
                 }),
                 read_type: Some(ReadType::NamedTable(NamedTable {
-                    names: vec!["t".to_string()],
+                    names: vec![name.to_string()],
                     advanced_extension: None,
                 })),
                 filter: filter.map(Box::new),
@@ -752,6 +759,10 @@ mod tests {
     /// `t(a, b)` = {1|10, 1|20, 2|30}, optionally behind a leading `extra`
     /// column the plan's base schema does not mention.
     fn register_t(ctx: &SessionContext, with_extra_column: bool) {
+        register_named(ctx, "t", with_extra_column);
+    }
+
+    fn register_named(ctx: &SessionContext, name: &str, with_extra_column: bool) {
         use std::sync::Arc;
 
         use arrow::array::{Int64Array, StringArray};
@@ -769,7 +780,7 @@ mod tests {
         }
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("three-row batch");
-        ctx.register_batch("t", batch).expect("register table t");
+        ctx.register_batch(name, batch).expect("register table");
     }
 
     async fn execute(ctx: &SessionContext, proto: &Plan) -> Vec<Vec<String>> {
@@ -846,6 +857,28 @@ mod tests {
                 ..Default::default()
             })),
         }
+    }
+
+    /// A correlated `ReadRel.filter` on a table no enclosing scope reads: no
+    /// alias is involved, but the filter must still sit above the scan, since a
+    /// `TableScan`'s filters cannot evaluate an outer reference and the
+    /// decorrelation rules cannot lift one from there.
+    #[tokio::test]
+    async fn correlated_read_filter_on_another_table_keeps_its_rows() {
+        let ctx = SessionContext::new();
+        register_t(&ctx, false);
+        register_named(&ctx, "u", false);
+        let proto = plan(
+            filter(
+                read_t(None),
+                exists(read_named("u", Some(correlated_on(0, 1)))),
+            ),
+            &["a", "b"],
+        );
+        assert_eq!(
+            execute(&ctx, &proto).await,
+            rows(&[&["1", "10"], &["1", "20"]])
+        );
     }
 
     /// Both scopes self-join `t`, so both joins requalify their sides. The
