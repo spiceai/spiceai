@@ -250,13 +250,6 @@ fn cells_match(
     actual_type: Option<&str>,
     expected_type: Option<&str>,
 ) -> bool {
-    if actual == expected {
-        return true;
-    }
-    if is_null_cell(actual) && is_null_cell(expected) {
-        return true;
-    }
-
     // When exactly one side is `string`, the numeric side decides, so the
     // documented numeric/string compatibility (q22 country codes) holds in
     // both directions; otherwise the golden's type, then the engine's.
@@ -267,6 +260,16 @@ fn cells_match(
         (Some(actual), Some("string")) if is_numeric_kind(actual) => Some(actual),
         _ => expected_kind.or(actual_kind),
     };
+    // Identical text is a match only for kinds compared as text: a numeric
+    // column must parse, so a malformed value on both sides (`not-a-number`)
+    // is not certified.
+    let numeric = kind.is_some_and(is_numeric_kind);
+    if actual == expected && !numeric {
+        return true;
+    }
+    if is_null_cell(actual) && is_null_cell(expected) {
+        return true;
+    }
     if matches!(kind, Some("integer" | "bigint")) {
         return integers_equal(actual, expected);
     }
@@ -289,11 +292,16 @@ fn cells_match(
         return equal;
     }
     if let (Ok(a), Ok(e)) = (actual.parse::<f64>(), expected.parse::<f64>()) {
-        if a.is_nan() && e.is_nan() {
+        // Equal parses (including equal infinities) and NaN on both sides.
+        if a.total_cmp(&e).is_eq() || (a.is_nan() && e.is_nan()) {
             return true;
         }
         return numerics_close(a, e, shared_decimal_scale(actual_type, expected_type))
             || rendered_at_declared_scale(a, e, engine_declared_scale(actual_type, expected_type));
+    }
+    if numeric {
+        // A `double`/`float` column whose text does not parse as a number.
+        return false;
     }
     let a_lower = actual.to_ascii_lowercase();
     let e_lower = expected.to_ascii_lowercase();
@@ -935,6 +943,24 @@ mod tests {
         assert_eq!(parse_scaled_decimal("-12.340"), Some((-12340, 3)));
         assert_eq!(parse_scaled_decimal("1e2"), None);
         assert_eq!(parse_scaled_decimal("."), None);
+    }
+
+    /// Identical text certifies nothing on a numeric column: the value must
+    /// parse. Text kinds still match on identical text.
+    #[test]
+    fn identical_malformed_numbers_do_not_match() {
+        let int = Some("integer");
+        let dbl = Some("double");
+        let string = Some("string");
+        assert!(!cells_match("not-a-number", "not-a-number", string, int));
+        assert!(!cells_match("not-a-number", "not-a-number", int, string));
+        assert!(!cells_match("x", "x", int, int));
+        assert!(!cells_match("abc", "abc", dbl, dbl));
+        assert!(cells_match("abc", "abc", string, string));
+        assert!(cells_match("13", "13", int, string));
+        assert!(cells_match("NaN", "NaN", dbl, dbl));
+        assert!(cells_match("inf", "inf", dbl, dbl));
+        assert!(cells_match("", "", int, int));
     }
 
     #[test]
