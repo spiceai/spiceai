@@ -383,6 +383,64 @@ async fn the_item_budget_is_enforced_on_cayenne_with_a_primary_key() -> Result<(
     Ok(())
 }
 
+/// The same budget regression, reached through a `unique` index instead of a
+/// `primary_key` and with no primary key declared at all.
+///
+/// `indexes: unique` becomes a `Constraint::Unique` on the accelerator, which
+/// widens the sweep's group key exactly as a primary key does, so it is an
+/// independently reachable trigger for the same defect. `DuckDB` rather than
+/// Cayenne so this case also runs where Cayenne is not built.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_item_budget_is_enforced_with_a_unique_index() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+    register_test_connectors().await;
+
+    let (shutdown, addr, _fetches) = start_mock(1).await;
+    let temp = tempfile::tempdir()?;
+    let mut dataset = caching_dataset(
+        addr,
+        "duckdb",
+        // Deliberately no primary key: the unique index alone must be enough.
+        None,
+        duckdb_params(
+            temp.path(),
+            vec![
+                ("caching_ttl", "30s"),
+                ("caching_stale_while_revalidate_ttl", "1h"),
+                ("caching_stale_if_error", "enabled"),
+                ("caching_max_items", "1"),
+            ],
+        ),
+    );
+    if let Some(acceleration) = dataset.acceleration.as_mut() {
+        acceleration.indexes.insert(
+            "(request_query,request_path)".to_string(),
+            IndexType::Unique,
+        );
+    }
+    let rt = build_runtime(dataset, "caching_budget_unique_index").await;
+
+    for key in ["key=a", "key=b", "key=c"] {
+        fetch_key(&rt, key).await;
+    }
+
+    // Premise: the cache must fill before eviction can be observed, and a
+    // unique index over the request columns holds here because each request
+    // returns one row.
+    wait_for_cached_rows(&rt, 3, Duration::from_secs(30))
+        .await
+        .map_err(|e| anyhow::anyhow!("cache never filled, so eviction was never exercised: {e}"))?;
+
+    wait_for_cached_rows(&rt, 1, Duration::from_mins(2))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("`caching_max_items: 1` was not enforced under a unique index: {e}")
+        })?;
+
+    shutdown.send(()).ok();
+    Ok(())
+}
+
 /// The default, unkeyed shape: a response holding several rows is cached whole
 /// and served from cache.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
