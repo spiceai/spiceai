@@ -23,7 +23,6 @@ use super::{
 };
 use crate::Runtime;
 use crate::component::access::AccessMode;
-use crate::component::{AcceleratedComponent, deprecated_ready_state_warning};
 use app::App;
 use datafusion::sql::TableReference;
 use runtime_acceleration::snapshot::SnapshotBehavior;
@@ -75,15 +74,13 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
     type Error = crate::Error;
 
     fn try_from(dataset: spicepod_dataset::Dataset) -> std::result::Result<Self, Self::Error> {
+        // `acceleration.ready_state` is honoured but deprecated. The deprecation warning is
+        // not emitted from here: this conversion runs on every `get_valid_datasets` call — a
+        // read as much as a load — so the load path reports it once per component instead
+        // (`init::dataset::warn_about_deprecated_ready_state`).
         #[expect(deprecated)]
         let ready_state = match dataset.acceleration.as_ref().map(|a| a.ready_state) {
-            Some(Some(ready_state)) => {
-                tracing::warn!(
-                    "{}",
-                    deprecated_ready_state_warning(AcceleratedComponent::Dataset, &dataset.name)
-                );
-                ReadyState::from(ready_state)
-            }
+            Some(Some(ready_state)) => ReadyState::from(ready_state),
             _ => ReadyState::from(dataset.ready_state),
         };
 

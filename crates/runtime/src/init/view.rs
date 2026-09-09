@@ -247,6 +247,15 @@ impl Runtime {
                         spicepod_view.acceleration.as_ref(),
                         log_errors,
                     );
+                    // Same gate, same reason (#13749): the deprecated `acceleration.ready_state`
+                    // is honoured by `ViewBuilder::try_from`, but reported from the load path so
+                    // it prints once per view rather than once per `get_valid_views` call.
+                    crate::init::dataset::warn_about_deprecated_ready_state(
+                        crate::component::AcceleratedComponent::View,
+                        &spicepod_view.name,
+                        spicepod_view.acceleration.as_ref(),
+                        log_errors,
+                    );
 
                     Some(ValidatedView {
                         view: Arc::new(view),

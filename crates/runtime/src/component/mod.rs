@@ -84,8 +84,10 @@ impl AcceleratedComponent {
     }
 }
 
-/// Warns that a component set `acceleration.ready_state`, which is honoured but
-/// deprecated in favour of the component's own top-level `ready_state`.
+/// The warning that a component set `acceleration.ready_state`, which is honoured
+/// but deprecated in favour of the component's own top-level `ready_state`. The
+/// load path emits it, once per component
+/// (`init::dataset::warn_about_deprecated_ready_state`).
 ///
 /// One function for both components because it is one deprecation of one key: a
 /// dataset and a view that write the same thing should be told the same thing,
