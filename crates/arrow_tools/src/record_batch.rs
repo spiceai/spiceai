@@ -16,17 +16,16 @@ limitations under the License.
 
 use arrow::{
     array::{
-        Array, ArrayData, ArrayRef, AsArray, BinaryViewArray, DictionaryArray, Float32Builder,
-        Float64Builder, GenericByteViewArray, ListArray, MutableArrayData, PrimitiveArray,
-        RecordBatch, RecordBatchOptions, StringViewArray, StructArray, UInt64Array,
-        downcast_dictionary_array, make_array, new_null_array,
+        Array, ArrayData, ArrayRef, BinaryViewArray, DictionaryArray, GenericByteViewArray,
+        ListArray, MutableArrayData, PrimitiveArray, RecordBatch, RecordBatchOptions,
+        StringViewArray, StructArray, UInt64Array, downcast_dictionary_array, make_array,
+        new_null_array,
     },
     buffer::{Buffer, NullBuffer, OffsetBuffer},
     compute::take,
     datatypes::{
         ArrowDictionaryKeyType, ArrowNativeType, ArrowNativeTypeOp, BinaryViewType, ByteViewType,
-        DataType, Decimal128Type, Decimal256Type, Field, FieldRef, SchemaRef, StringViewType,
-        TimeUnit, i256,
+        DataType, Field, FieldRef, SchemaRef, StringViewType, TimeUnit,
     },
     error::ArrowError,
 };
@@ -49,14 +48,6 @@ pub enum Error {
 
     #[snafu(display("Field is not nullable: {field}"))]
     FieldNotNullable { field: String },
-
-    #[snafu(display(
-        "Failed to convert decimal value '{value}' to a floating-point number: {source}"
-    ))]
-    DecimalToFloat {
-        value: String,
-        source: std::num::ParseFloatError,
-    },
 }
 
 impl From<Error> for DataFusionError {
@@ -67,9 +58,6 @@ impl From<Error> for DataFusionError {
             } => DataFusionError::ArrowError(Box::new(arrow_error), None),
             Error::FieldNotNullable { .. } => {
                 DataFusionError::ArrowError(Box::new(ArrowError::SchemaError(e.to_string())), None)
-            }
-            Error::DecimalToFloat { .. } => {
-                DataFusionError::ArrowError(Box::new(ArrowError::CastError(e.to_string())), None)
             }
         }
     }
@@ -195,7 +183,7 @@ fn cast_column(
         return relabel_nullability(column, target_field);
     }
 
-    if let Some(casted) = cast_decimal_to_float(column, target_field.data_type())? {
+    if let Some(casted) = cast_decimal_to_float(column, target_field.data_type(), strict_options)? {
         return Ok(casted);
     }
 
@@ -240,134 +228,35 @@ fn is_overflow_error(e: &ArrowError) -> bool {
 /// the result up to a couple of ULP off the true value. An `avg()`/`sum()`
 /// pushed to `PostgreSQL` returns an *undeclared* NUMERIC read at scale 20, whose
 /// coefficient always exceeds `2^53`, so an exactly representable answer like
-/// `47.5` came back as `47.500_000_000_000_01` (issue #13978). Rounding from the
-/// value's exact decimal digits instead removes the loss at every scale.
-fn cast_decimal_to_float(column: &ArrayRef, target_type: &DataType) -> Result<Option<ArrayRef>> {
-    match (column.data_type(), target_type) {
-        (DataType::Decimal128(_, scale), DataType::Float64) => {
-            let (scale, values) = (*scale, column.as_primitive::<Decimal128Type>());
-            f64_array_from(values.len(), |i| {
-                if values.is_null(i) {
-                    Ok(None)
-                } else {
-                    decimal128_to_f64(values.value(i), scale).map(Some)
-                }
-            })
-            .map(Some)
-        }
-        (DataType::Decimal128(_, scale), DataType::Float32) => {
-            let (scale, values) = (*scale, column.as_primitive::<Decimal128Type>());
-            f32_array_from(values.len(), |i| {
-                if values.is_null(i) {
-                    Ok(None)
-                } else {
-                    parse_scaled::<f32>(&values.value(i).to_string(), scale).map(Some)
-                }
-            })
-            .map(Some)
-        }
-        (DataType::Decimal256(_, scale), DataType::Float64) => {
-            let (scale, values) = (*scale, column.as_primitive::<Decimal256Type>());
-            f64_array_from(values.len(), |i| {
-                if values.is_null(i) {
-                    Ok(None)
-                } else {
-                    decimal256_to_f64(values.value(i), scale).map(Some)
-                }
-            })
-            .map(Some)
-        }
-        (DataType::Decimal256(_, scale), DataType::Float32) => {
-            let (scale, values) = (*scale, column.as_primitive::<Decimal256Type>());
-            f32_array_from(values.len(), |i| {
-                if values.is_null(i) {
-                    Ok(None)
-                } else {
-                    parse_scaled::<f32>(&values.value(i).to_string(), scale).map(Some)
-                }
-            })
-            .map(Some)
-        }
-        _ => Ok(None),
-    }
-}
-
-fn f64_array_from(len: usize, get: impl Fn(usize) -> Result<Option<f64>>) -> Result<ArrayRef> {
-    let mut builder = Float64Builder::with_capacity(len);
-    for index in 0..len {
-        match get(index)? {
-            Some(value) => builder.append_value(value),
-            None => builder.append_null(),
-        }
-    }
-    Ok(Arc::new(builder.finish()))
-}
-
-fn f32_array_from(len: usize, get: impl Fn(usize) -> Result<Option<f32>>) -> Result<ArrayRef> {
-    let mut builder = Float32Builder::with_capacity(len);
-    for index in 0..len {
-        match get(index)? {
-            Some(value) => builder.append_value(value),
-            None => builder.append_null(),
-        }
-    }
-    Ok(Arc::new(builder.finish()))
-}
-
-fn decimal128_to_f64(value: i128, scale: i8) -> Result<f64> {
-    // Fast path: the coefficient is exactly representable and `10^scale` is too
-    // (`scale <= 22`), so a single IEEE division is already correctly rounded and
-    // no string round-trip is needed.
-    if (0..=22).contains(&scale) && value.unsigned_abs() < (1u128 << 53) {
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "guarded: |value| < 2^53 and scale <= 22, so both operands are exact and the single division is correctly rounded"
-        )]
-        let exact = value as f64 / 10f64.powi(i32::from(scale));
-        return Ok(exact);
-    }
-    parse_scaled(&value.to_string(), scale)
-}
-
-fn decimal256_to_f64(value: i256, scale: i8) -> Result<f64> {
-    parse_scaled(&value.to_string(), scale)
-}
-
-/// Parses the exact decimal `signed_digits` scaled by `10^-scale` into a float,
-/// relying on Rust's correctly-rounded float parsing rather than on integer
-/// widening.
-fn parse_scaled<F>(signed_digits: &str, scale: i8) -> Result<F>
-where
-    F: std::str::FromStr<Err = std::num::ParseFloatError>,
-{
-    let literal = scaled_decimal_literal(signed_digits, scale);
-    literal
-        .parse::<F>()
-        .context(DecimalToFloatSnafu { value: literal })
-}
-
-/// Renders the signed integer coefficient `signed_digits` at `scale` decimal
-/// places as a plain decimal literal (e.g. `"475"` at scale 20 becomes
-/// `"0.00000000000000000475"`). A non-positive scale multiplies by `10^-scale`.
-fn scaled_decimal_literal(signed_digits: &str, scale: i8) -> String {
-    let (sign, magnitude) = match signed_digits.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", signed_digits),
-    };
-
-    if scale <= 0 {
-        let zeros = usize::from(scale.unsigned_abs());
-        return format!("{sign}{magnitude}{}", "0".repeat(zeros));
+/// `47.5` came back as `47.500_000_000_000_01` (issue #13978).
+///
+/// Going through the value's exact decimal digits removes the loss: `Decimal ->
+/// Utf8` renders every coefficient exactly, and `Utf8 -> Float` rounds that
+/// literal once with `f64`/`f32` correct rounding (verified bit-for-bit against
+/// Rust's `str::parse`, which arrow's parser matches). This covers every decimal
+/// width — `Decimal32`/`Decimal64` are lossy on the direct path too — and every
+/// float target, so it applies to every caller of `try_cast_to`.
+fn cast_decimal_to_float(
+    column: &ArrayRef,
+    target_type: &DataType,
+    options: &CastOptions,
+) -> Result<Option<ArrayRef>> {
+    let is_decimal = matches!(
+        column.data_type(),
+        DataType::Decimal32(..)
+            | DataType::Decimal64(..)
+            | DataType::Decimal128(..)
+            | DataType::Decimal256(..)
+    );
+    if !is_decimal || !matches!(target_type, DataType::Float32 | DataType::Float64) {
+        return Ok(None);
     }
 
-    let scale = usize::from(scale.unsigned_abs());
-    if magnitude.len() > scale {
-        let split = magnitude.len() - scale;
-        format!("{sign}{}.{}", &magnitude[..split], &magnitude[split..])
-    } else {
-        // |value| < 1: pad the fraction with leading zeros out to the scale.
-        format!("{sign}0.{magnitude:0>scale$}")
-    }
+    let strings = cast_with_options(column.as_ref(), &DataType::Utf8, options)
+        .context(UnableToConvertRecordBatchSnafu)?;
+    cast_with_options(strings.as_ref(), target_type, options)
+        .context(UnableToConvertRecordBatchSnafu)
+        .map(Some)
 }
 
 /// Whether `target` can be reached from `source` by relabelling alone: the two describe the same
@@ -1961,6 +1850,7 @@ mod test {
     #[test]
     fn decimal256_to_f64_rounds_correctly() {
         use arrow::array::Decimal256Array;
+        use arrow::datatypes::i256;
 
         let coeff = i256::from_i128(475 * 10_i128.pow(19));
         let source = Decimal256Array::from(vec![Some(coeff)])
@@ -1969,6 +1859,41 @@ mod test {
 
         let out = cast_decimal_column(Arc::new(source), DataType::Float64);
         assert_eq!(f64_values(&out), vec![Some(47.5)]);
+    }
+
+    /// `Decimal64 -> Float64` is lossy on arrow's direct path too: an `i64`
+    /// coefficient can exceed `2^53`. Here `47.5` at scale 15 has coefficient
+    /// `4.75e16 > 2^53`, and must still round to exactly 47.5.
+    #[test]
+    fn decimal64_to_f64_rounds_correctly() {
+        use arrow::array::Decimal64Array;
+
+        let coeff: i64 = 475 * 10_i64.pow(14);
+        let source = Decimal64Array::from(vec![Some(coeff)])
+            .with_precision_and_scale(18, 15)
+            .expect("valid Decimal64(18,15)");
+
+        let out = cast_decimal_column(Arc::new(source), DataType::Float64);
+        assert_eq!(f64_values(&out), vec![Some(47.5)]);
+    }
+
+    /// `Decimal32 -> Float32` is lossy on the direct path: an `i32` coefficient
+    /// can exceed `2^24`. Here `47.5` at scale 6 has coefficient `4.75e7 > 2^24`.
+    #[test]
+    fn decimal32_to_f32_rounds_correctly() {
+        use arrow::array::{Decimal32Array, Float32Array};
+
+        let coeff: i32 = 475 * 10_i32.pow(5);
+        let source = Decimal32Array::from(vec![Some(coeff)])
+            .with_precision_and_scale(9, 6)
+            .expect("valid Decimal32(9,6)");
+
+        let out = cast_decimal_column(Arc::new(source), DataType::Float32);
+        let col = out
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("Float32Array");
+        assert_eq!(col.value(0).to_bits(), 47.5_f32.to_bits());
     }
 
     /// Casting to `Float32` preserves values and nulls.
@@ -1987,19 +1912,6 @@ mod test {
             .expect("Float32Array");
         assert!((col.value(0) - 1234.5678_f32).abs() < f32::EPSILON);
         assert!(col.is_null(1));
-    }
-
-    #[test]
-    fn scaled_decimal_literal_formats() {
-        assert_eq!(scaled_decimal_literal("475", 20), "0.00000000000000000475");
-        assert_eq!(scaled_decimal_literal("12345678", 4), "1234.5678");
-        assert_eq!(scaled_decimal_literal("-12345678", 4), "-1234.5678");
-        assert_eq!(scaled_decimal_literal("5", 1), "0.5");
-        assert_eq!(scaled_decimal_literal("5", 3), "0.005");
-        assert_eq!(scaled_decimal_literal("475", 3), "0.475");
-        assert_eq!(scaled_decimal_literal("0", 2), "0.00");
-        assert_eq!(scaled_decimal_literal("123", 0), "123");
-        assert_eq!(scaled_decimal_literal("123", -2), "12300");
     }
 
     /// `rows` strings of `value_len` identical characters, varying by row so a
