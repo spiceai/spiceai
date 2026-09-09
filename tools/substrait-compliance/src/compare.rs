@@ -34,9 +34,10 @@ limitations under the License.
 //!   match when `|Δ| < 1e-8` (q06) or relative error is `< 1e-14` (q01
 //!   `sum_charge` `DataFusion`/`DuckDB` conversion). Printed fractional
 //!   length is not a tolerance — a 2-digit actual like `0.06` must not
-//!   match `0.05008…`. One ULP at a declared decimal scale applies only
-//!   when both typed headers are `decimal(p,s)` / `numeric(p,s)` with
-//!   the same scale ≥ 2. When the engine's own schema declares the actual
+//!   match `0.05008…`. Two declared `decimal(p,s)` / `numeric(p,s)` cells
+//!   compare exactly as scaled integers (never through `f64`, which
+//!   collapses values past 15 significant digits), allowing one ULP at
+//!   the shared scale when it is ≥ 2. When the engine's own schema declares the actual
 //!   column `decimal(p,s)` and the golden is `double`, the actual must be
 //!   the golden rounded or truncated at that scale (q01 `AVG_QTY`
 //!   `decimal(19,6)` `25.575154` vs `25.575154611454693`); a value one unit
@@ -276,6 +277,17 @@ fn cells_match(
     if integers_equal(actual, expected) {
         return true;
     }
+    if let (Some(actual_type), Some(expected_type)) = (actual_type, expected_type)
+        && declared_decimal_scale(actual_type).is_some()
+        && declared_decimal_scale(expected_type).is_some()
+        && let Some(equal) = decimals_match(
+            actual,
+            expected,
+            shared_decimal_scale(Some(actual_type), Some(expected_type)),
+        )
+    {
+        return equal;
+    }
     if let (Ok(a), Ok(e)) = (actual.parse::<f64>(), expected.parse::<f64>()) {
         if a.is_nan() && e.is_nan() {
             return true;
@@ -366,6 +378,60 @@ fn shared_decimal_scale(actual_type: Option<&str>, expected_type: Option<&str>) 
     let actual_scale = declared_decimal_scale(actual_type?)?;
     let expected_scale = declared_decimal_scale(expected_type?)?;
     (actual_scale == expected_scale).then_some(actual_scale)
+}
+
+/// Both sides declared `decimal(p,s)` / `numeric(p,s)`: compare exactly as
+/// scaled integers (`i128` holds the 38 digits a typed header may declare),
+/// keeping the documented one-ULP allowance at the shared declared scale.
+/// `f64` would collapse values that differ past its 15 significant digits
+/// (`10000000000000000000000000000000000000` vs `…0001`). `None` when either
+/// side is not a plain decimal literal, so the float path decides.
+fn decimals_match(actual: &str, expected: &str, shared_scale: Option<i32>) -> Option<bool> {
+    let (actual, actual_scale) = parse_scaled_decimal(actual)?;
+    let (expected, expected_scale) = parse_scaled_decimal(expected)?;
+    let scale = actual_scale.max(expected_scale);
+    let rescale = |value: i128, from: i32| {
+        10i128
+            .checked_pow(u32::try_from(scale - from).ok()?)
+            .and_then(|factor| value.checked_mul(factor))
+    };
+    let diff = rescale(actual, actual_scale)?
+        .checked_sub(rescale(expected, expected_scale)?)?
+        .unsigned_abs();
+    // Strictly less than one unit at the shared scale; with no shared scale
+    // (or one below `MIN_DECIMAL_SCALE`) that is exact equality.
+    let allowed = match shared_scale.filter(|s| *s >= MIN_DECIMAL_SCALE) {
+        Some(shared) if scale > shared => {
+            10u128.checked_pow(u32::try_from(scale - shared).ok()?)?
+        }
+        _ => 1,
+    };
+    Some(diff < allowed)
+}
+
+/// A plain decimal literal (`-12.340`) as its digits and scale: `(-12340, 3)`.
+/// Exponents, `NaN` and anything else are `None`.
+fn parse_scaled_decimal(text: &str) -> Option<(i128, i32)> {
+    let text = text.trim();
+    let (negative, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if (whole.is_empty() && fraction.is_empty())
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits = format!("{whole}{fraction}");
+    let magnitude: i128 = if digits.is_empty() {
+        0
+    } else {
+        digits.parse().ok()?
+    };
+    let scale = i32::try_from(fraction.len()).ok()?;
+    Some((if negative { -magnitude } else { magnitude }, scale))
 }
 
 /// The scale the engine declares for the actual column (`decimal(p,s)` in
@@ -835,6 +901,40 @@ mod tests {
         assert!(!cells_match("14", "13", string, int));
         // Two strings stay an exact (pad-trimmed) string comparison.
         assert!(!cells_match("13", "13.0", string, string));
+    }
+
+    /// Two declared decimals never go through `f64`: values that differ in
+    /// the 38th digit mismatch, trailing zeros are equal, one unit at the
+    /// shared scale is not a match, and a non-literal falls back to floats.
+    #[test]
+    fn declared_decimals_compare_exactly() {
+        let dec38 = Some("decimal(38,0)");
+        assert!(!cells_match(
+            "10000000000000000000000000000000000000",
+            "10000000000000000000000000000000000001",
+            dec38,
+            dec38
+        ));
+        assert!(cells_match(
+            "10000000000000000000000000000000000000",
+            "10000000000000000000000000000000000000",
+            dec38,
+            dec38
+        ));
+        let dec2 = Some("decimal(15,2)");
+        assert!(cells_match("1.10", "1.1", dec2, dec2));
+        assert!(cells_match("-0.00", "0", dec2, dec2));
+        assert!(!cells_match("1.10", "1.11", dec2, dec2));
+        let dec6 = Some("decimal(19,6)");
+        assert!(!cells_match("25.575154", "25.575155", dec6, dec6));
+        // A golden printed past the shared scale is within one ULP of it.
+        assert!(cells_match("25.575154", "25.5751546", dec6, dec6));
+        assert!(!cells_match("25.575154", "25.5751556", dec6, dec6));
+        // Not plain literals: the float path decides.
+        assert!(cells_match("1e2", "100", dec2, dec2));
+        assert_eq!(parse_scaled_decimal("-12.340"), Some((-12340, 3)));
+        assert_eq!(parse_scaled_decimal("1e2"), None);
+        assert_eq!(parse_scaled_decimal("."), None);
     }
 
     #[test]
