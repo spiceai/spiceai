@@ -332,6 +332,13 @@ async fn naming_an_unknown_session_is_reported_as_such() -> Result<(), anyhow::E
                     && body.contains("was not found"),
                 "the message names the session that is missing: {body}"
             );
+            // The error rides inside a `DataFusionError::External`, whose generic
+            // formatting prefixes "External error:" — a DataFusion internal the
+            // caller has no use for.
+            assert!(
+                !body.contains("External error"),
+                "the message must not leak the DataFusion wrapper: {body}"
+            );
 
             Ok(())
         })

@@ -280,7 +280,7 @@ pub async fn sql_to_http_response(
         Ok(res) => res,
         Err(e) => {
             let kind = SqlErrorKind::of_query_error(&e);
-            return sql_error_response(e.to_string(), kind);
+            return sql_error_response(SqlErrorKind::message_for_query_error(&e), kind);
         }
     };
 
@@ -354,9 +354,10 @@ fn transaction_error_to_response(error: TransactionError) -> Response {
         TransactionError::Plan(e) | TransactionError::Stream(e) => {
             sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e))
         }
-        TransactionError::Query(e) => {
-            sql_error_response(e.to_string(), SqlErrorKind::of_query_error(&e))
-        }
+        TransactionError::Query(e) => sql_error_response(
+            SqlErrorKind::message_for_query_error(&e),
+            SqlErrorKind::of_query_error(&e),
+        ),
         TransactionError::Conflict { table } => {
             // Optimistic-concurrency conflict: a participant was committed to
             // between this transaction's start and commit. Retryable — map to
@@ -399,6 +400,21 @@ enum SqlErrorKind {
 }
 
 impl SqlErrorKind {
+    /// The message to answer a query error with.
+    ///
+    /// A session error travels inside a `DataFusionError::External`, and the
+    /// generic formatting wraps that as `Failed to execute query: External
+    /// error: …`. "External error" names a `DataFusion` internal the caller has
+    /// no use for, so the session error states itself.
+    fn message_for_query_error(e: &QueryError) -> String {
+        if let QueryError::UnableToExecuteQuery { source } = e
+            && let Some(session_error) = SessionError::from_datafusion(source)
+        {
+            return session_error.to_string();
+        }
+        e.to_string()
+    }
+
     fn of_query_error(e: &QueryError) -> Self {
         match e {
             QueryError::QueryCancelled { .. } => Self::Cancellation,
