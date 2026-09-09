@@ -1422,6 +1422,86 @@ mod tests {
         (accelerator, federated)
     }
 
+    /// As [`cache_table`], but the schema carries the `response_headers` Map the
+    /// HTTP connector stores on every row, and the accelerator declares a
+    /// `primary_key` on `request_path`. This is the shape that reproduces
+    /// #13976: the Map is nested, and the primary-key constraint's functional
+    /// dependencies keep it in the ranking aggregate, where a row format cannot
+    /// encode it. Rows must have distinct paths so the key is a valid primary
+    /// key over the fixture data.
+    async fn cache_table_with_headers_and_pk(
+        rows: &[Row],
+    ) -> (Arc<dyn TableProvider>, Arc<FederatedTable>) {
+        use arrow::array::{
+            MapBuilder, MapFieldNames, StringArray, StringBuilder, TimestampNanosecondArray,
+        };
+        use datafusion::common::{Constraint, Constraints};
+        use data_components::arrow::write::MemTable;
+
+        // Build the header Map first so the schema field matches the array's
+        // type exactly — an empty map per row is all the sweep needs to plan.
+        let mut headers = MapBuilder::new(
+            Some(MapFieldNames {
+                entry: "entries".to_string(),
+                key: "keys".to_string(),
+                value: "values".to_string(),
+            }),
+            StringBuilder::new(),
+            StringBuilder::new(),
+        );
+        for _ in rows {
+            headers.append(true).expect("append map entry");
+        }
+        let headers = headers.finish();
+
+        let mut fields = http_cache_schema().fields().to_vec();
+        fields.push(Arc::new(Field::new(
+            RESPONSE_HEADERS_COLUMN,
+            headers.data_type().clone(),
+            true,
+        )));
+        let schema = Arc::new(Schema::new(fields));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.path).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|r| r.query.unwrap_or(""))
+                        .collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(StringArray::from(vec![""; rows.len()])) as _,
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.content).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(TimestampNanosecondArray::from(
+                    rows.iter()
+                        .map(|r| Some(nanos_ago(r.age)))
+                        .collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(StringArray::from(vec!["public"; rows.len()])) as _,
+                Arc::new(headers) as _,
+            ],
+        )
+        .expect("batch");
+
+        // `request_path` is field 0. A single-column primary key is enough to
+        // add the functional dependencies that trip the sweep.
+        let table = MemTable::try_new(schema, vec![vec![batch]])
+            .expect("mem table")
+            .try_with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0],
+            )]))
+            .await
+            .expect("primary key constraint");
+        let accelerator = Arc::new(table) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
+        (accelerator, federated)
+    }
+
     /// The `(request_path, request_query)` pairs still stored, sorted.
     async fn remaining(accelerator: &Arc<dyn TableProvider>) -> Vec<(String, Option<String>)> {
         let ctx = SessionContext::new();
@@ -1727,6 +1807,41 @@ mod tests {
         assert_eq!(
             remaining(&accelerator).await,
             vec![("/fresh".to_string(), None)]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_item_budget_is_enforced_when_a_primary_key_is_declared() {
+        // #13976: a declared `primary_key` used to disable the budget. The
+        // sweep's ranking aggregate scans the accelerator's full schema, which
+        // includes the `response_headers` Map; the primary key's functional
+        // dependencies kept that Map in the aggregate, where a row format cannot
+        // encode it, so the sweep failed on every tick and evicted nothing.
+        // Before the projection fix this call returns zero and the cache keeps
+        // all three entries; with it, the budget is enforced exactly as it is
+        // without a key.
+        let (accelerator, federated) = cache_table_with_headers_and_pk(&[
+            row("/oldest", Duration::from_mins(3)),
+            row("/middle", Duration::from_mins(2)),
+            row("/newest", Duration::from_mins(1)),
+        ])
+        .await;
+
+        let deleted = sweep(
+            &accelerator,
+            &federated,
+            CacheLimits {
+                max_items: Some(2),
+                ..no_expiry()
+            },
+        )
+        .await;
+
+        assert_eq!(deleted, 1, "the item budget must evict one entry");
+        assert_eq!(
+            remaining(&accelerator).await,
+            vec![("/middle".to_string(), None), ("/newest".to_string(), None)],
+            "the least-recently-fetched entry is the one dropped"
         );
     }
 
