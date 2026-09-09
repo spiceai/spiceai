@@ -146,12 +146,14 @@ async fn run() -> Result<ExitCode> {
     println!("Suite: {SUITE_REF}");
     println!("DataFusion fork rev: {DATAFUSION_FORK_REV}");
 
+    let selected = suite::select_cases(&suite.cases, args.query.as_deref())?;
+
     let start = Utc::now();
     let (engine_name, engine_version, mode_name, results) = match args.mode {
         Mode::ModeA => {
             let data_dir = suite.root.join("data");
             let engine = mode_a::ModeAEngine::with_tpch_data(&data_dir).await?;
-            let results = engine.run_suite(&suite, args.query.as_deref()).await?;
+            let results = engine.run_suite(&selected).await?;
             (
                 mode_a::ENGINE_NAME.to_string(),
                 mode_a::ENGINE_VERSION.to_string(),
@@ -161,16 +163,7 @@ async fn run() -> Result<ExitCode> {
         }
         Mode::ModeB => {
             let engine = mode_b::FlightSqlComplianceEngine::new(&args.flightsql_endpoint);
-            let cases: Vec<&_> = suite
-                .cases
-                .iter()
-                .filter(|c| {
-                    args.query
-                        .as_deref()
-                        .is_none_or(|q| c.id.eq_ignore_ascii_case(q))
-                })
-                .collect();
-            for case in &cases {
+            for case in &selected {
                 // Encode so a missing prost/FlightSQL type fails the stub itself.
                 let _ = engine.run_case(case);
             }
@@ -178,7 +171,7 @@ async fn run() -> Result<ExitCode> {
                 mode_b::ENGINE_NAME.to_string(),
                 mode_b::ENGINE_VERSION.to_string(),
                 args.mode.name().to_string(),
-                mode_b::FlightSqlComplianceEngine::stub_results(&cases),
+                mode_b::FlightSqlComplianceEngine::stub_results(&selected),
             )
         }
     };

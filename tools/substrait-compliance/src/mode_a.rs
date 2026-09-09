@@ -39,7 +39,7 @@ use crate::compare::{ColumnSpec, TableData, compare};
 use crate::error::{self, Result};
 use crate::report::{CaseResult, TestStatus};
 use crate::schema::{TPCH_TABLES, schema_for};
-use crate::suite::{InputTable, LoadedCase, LoadedSuite};
+use crate::suite::{InputTable, LoadedCase};
 
 pub const ENGINE_NAME: &str = "DataFusion";
 pub const ENGINE_VERSION: &str = "54.1";
@@ -66,18 +66,9 @@ impl ModeAEngine {
         Ok(Self { ctx })
     }
 
-    pub async fn run_suite(
-        &self,
-        suite: &LoadedSuite,
-        only: Option<&str>,
-    ) -> Result<Vec<CaseResult>> {
-        let mut results = Vec::with_capacity(suite.cases.len());
-        for case in &suite.cases {
-            if let Some(filter) = only
-                && !case.id.eq_ignore_ascii_case(filter)
-            {
-                continue;
-            }
+    pub async fn run_suite(&self, cases: &[&LoadedCase]) -> Result<Vec<CaseResult>> {
+        let mut results = Vec::with_capacity(cases.len());
+        for case in cases {
             results.push(self.run_case(case).await);
         }
         Ok(results)

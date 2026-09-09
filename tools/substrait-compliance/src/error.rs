@@ -65,6 +65,18 @@ pub enum Error {
     UnknownTable { name: String, test_id: String },
 
     #[snafu(display(
+        "No TPC-H case matches `--query` '{query}'. Known ids: {known}. \
+         Pass a listed id or omit `--query` to run the full suite"
+    ))]
+    UnknownQuery { query: String, known: String },
+
+    #[snafu(display(
+        "The TPC-H suite loaded 0 cases, so nothing can be certified. \
+         Check the suite checkout (`scripts/fetch-ibm.sh`)"
+    ))]
+    EmptySuite,
+
+    #[snafu(display(
         "Failed to register table '{table}' from '{}': {source}",
         path.display()
     ))]

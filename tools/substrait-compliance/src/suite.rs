@@ -158,6 +158,47 @@ pub fn load_tpch_suite(root: &Path) -> Result<LoadedSuite> {
     })
 }
 
+/// Cases matching `--query`, or the whole suite when it is omitted.
+///
+/// An empty result is a selection error: a typo or an empty checkout must
+/// not write a `total=0` report that a report-only run would accept.
+pub fn select_cases<'a>(
+    cases: &'a [LoadedCase],
+    query: Option<&str>,
+) -> Result<Vec<&'a LoadedCase>> {
+    let selected: Vec<&LoadedCase> = match query {
+        None => cases.iter().collect(),
+        Some(q) => cases
+            .iter()
+            .filter(|c| c.id.eq_ignore_ascii_case(q))
+            .collect(),
+    };
+    if let Some(q) = query {
+        ensure!(
+            !selected.is_empty(),
+            error::UnknownQuerySnafu {
+                query: q,
+                known: known_ids(cases),
+            }
+        );
+    } else {
+        ensure!(!selected.is_empty(), error::EmptySuiteSnafu);
+    }
+    Ok(selected)
+}
+
+fn known_ids(cases: &[LoadedCase]) -> String {
+    if cases.is_empty() {
+        "(none)".to_string()
+    } else {
+        cases
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 fn ensure_exists(path: &Path, name: &str) -> Result<()> {
     if path.exists() {
         Ok(())
@@ -246,6 +287,67 @@ testCases:
             "{err}"
         );
         assert!(err.to_string().contains("expected/q99.csv"), "{err}");
+    }
+
+    fn dummy_case(id: &str) -> LoadedCase {
+        LoadedCase {
+            id: id.to_string(),
+            description: String::new(),
+            plan_path: PathBuf::new(),
+            plan_bytes: Vec::new(),
+            input_tables: Vec::new(),
+            expected: None,
+        }
+    }
+
+    /// A typo in `--query` is a selection error, not a successful empty run.
+    #[test]
+    fn unknown_query_is_a_selection_error() {
+        let cases = ["q01", "q02"].map(dummy_case);
+        let err = select_cases(&cases, Some("q99")).expect_err("unknown query");
+        assert!(
+            matches!(err, error::Error::UnknownQuery { ref query, .. } if query == "q99"),
+            "{err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("'q99'"), "{msg}");
+        assert!(msg.contains("q01"), "{msg}");
+        assert!(msg.contains("`--query`"), "{msg}");
+    }
+
+    /// An empty checkout with no `--query` is a selection error, not `total=0`.
+    #[test]
+    fn empty_suite_is_a_selection_error() {
+        let err = select_cases(&[], None).expect_err("empty suite");
+        assert!(matches!(err, error::Error::EmptySuite), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("0 cases"), "{msg}");
+        assert!(msg.contains("`scripts/fetch-ibm.sh`"), "{msg}");
+    }
+
+    /// An empty checkout named in `--query` still names the unknown id.
+    #[test]
+    fn unknown_query_on_an_empty_suite_names_the_id() {
+        let err = select_cases(&[], Some("q99")).expect_err("unknown query");
+        assert!(
+            matches!(err, error::Error::UnknownQuery { ref query, ref known, .. } if query == "q99" && known == "(none)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn listed_query_selects_one_case() {
+        let cases = ["q01", "q02"].map(dummy_case);
+        let selected = select_cases(&cases, Some("Q01")).expect("match");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "q01");
+    }
+
+    #[test]
+    fn omitted_query_selects_the_whole_suite() {
+        let cases = ["q01", "q02"].map(dummy_case);
+        let selected = select_cases(&cases, None).expect("full suite");
+        assert_eq!(selected.len(), 2);
     }
 
     /// Omitted metadata falls back to the conventional path, and to SKIP
