@@ -58,7 +58,7 @@ fn assert_matches_arrow_row_opts(columns: &[ArrayRef], options: SortOptions) {
     )
     .expect("arrow-row converter builds");
 
-    let our_rows = ours.convert_columns(columns).expect("vendored encode");
+    let mut our_rows = ours.convert_columns(columns).expect("vendored encode");
     let their_rows = theirs.convert_columns(columns).expect("arrow-row encode");
 
     let num_rows = match columns.first() {
@@ -85,6 +85,71 @@ fn assert_matches_arrow_row_opts(columns: &[ArrayRef], options: SortOptions) {
             reencoded.row(i).as_ref(),
             "round-trip changed row {i} for {data_types:?}"
         );
+    }
+
+    // Stale bytes must not survive in null payloads or variable-width padding.
+    // Exercise the reuse path against Arrow's independent encoder for every
+    // type and sort option covered by this helper.
+    our_rows.buffer.fill(0xa5);
+    let reused = ours
+        .convert_columns_reusing(columns, Some(our_rows))
+        .expect("encode with reused buffers");
+    assert_eq!(reused.num_rows(), num_rows);
+    for i in 0..num_rows {
+        assert_eq!(
+            reused.row(i).as_ref(),
+            their_rows.row(i).data(),
+            "reused row {i} differs from arrow-row for {data_types:?} with {options:?}"
+        );
+    }
+}
+
+#[test]
+fn reused_rows_match_arrow_across_changing_batches() {
+    let converter = RowConverter::new(vec![
+        SortField::new(DataType::Int64),
+        SortField::new(DataType::Utf8),
+    ])
+    .expect("composite converter");
+    let reference = arrow_row::RowConverter::new(vec![
+        arrow_row::SortField::new(DataType::Int64),
+        arrow_row::SortField::new(DataType::Utf8),
+    ])
+    .expect("reference converter");
+    let mut scratch = None;
+    for count in [129, 1, 0, 257, 63, 8, 65, 0, 129] {
+        let ids: ArrayRef = Arc::new(
+            (0..count + 3)
+                .map(|i| if i % 3 == 0 { None } else { Some(i64::from(i)) })
+                .collect::<Int64Array>(),
+        );
+        let strings: ArrayRef = Arc::new(
+            (0..count + 3)
+                .map(|i| match i % 4 {
+                    0 => None,
+                    1 => Some(""),
+                    2 => Some("short"),
+                    _ => Some(LONG),
+                })
+                .collect::<StringArray>(),
+        );
+        let count = usize::try_from(count).expect("nonnegative batch size");
+        let columns = [ids.slice(3, count), strings.slice(3, count)];
+        let rows = converter
+            .convert_columns_reusing(&columns, scratch.take())
+            .expect("reuse across changing batch sizes");
+        let expected = reference.convert_columns(&columns).expect("reference rows");
+        assert_eq!(rows.num_rows(), count);
+        for i in 0..count {
+            assert_eq!(rows.row(i).as_ref(), expected.row(i).data());
+        }
+        let decoded = converter
+            .convert_rows(rows.iter())
+            .expect("decode reused rows");
+        for (actual, expected) in decoded.iter().zip(&columns) {
+            assert_eq!(actual.as_ref(), expected.as_ref());
+        }
+        scratch = Some(rows);
     }
 }
 

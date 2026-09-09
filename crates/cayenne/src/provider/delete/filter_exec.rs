@@ -71,8 +71,11 @@ use arrow::array::{ArrayRef, BooleanArray, BooleanBufferBuilder};
 use arrow::compute::{max as arrow_col_max, min as arrow_col_min};
 use datafusion::config::ConfigOptions;
 
-use crate::row_converter::RowConverter;
+use crate::row_converter::{RowConverter, Rows};
 use datafusion_execution::SendableRecordBatchStream;
+use datafusion_execution::memory_pool::{
+    MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+};
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
@@ -541,6 +544,10 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
         context: Arc<datafusion_execution::TaskContext>,
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
         let metrics = DeletionFilterMetrics::new(&self.metrics, partition);
+        let row_scratch = RowEncodingScratch::new(
+            context.memory_pool(),
+            context.session_config().target_partitions(),
+        );
         let input_stream = self.input.execute(partition, context)?;
         let tombstones = Arc::clone(&self.tombstones);
         let insert_record_handling = self.insert_record_handling;
@@ -555,6 +562,7 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
             insert_record_handling,
             pk_column_indices,
             row_converter,
+            row_scratch,
             min_delete_seq_to_apply,
             schema,
             metrics,
@@ -566,6 +574,48 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
     }
 }
 
+/// Optional encoded-row storage between ready scan batches. Retained capacities
+/// are charged to the query pool; allocation of the current batch remains local
+/// to the encoder. An idle stream releases its cache when its input is pending.
+struct RowEncodingScratch {
+    rows: Option<Rows>,
+    reservation: MemoryReservation,
+    max_bytes: usize,
+}
+
+impl RowEncodingScratch {
+    fn new(pool: &Arc<dyn MemoryPool>, target_partitions: usize) -> Self {
+        // Cap retained capacity at one MiB so a large key batch cannot pin its
+        // full allocation. Scale down for finite pools so caches at the configured
+        // fan-out target at most 1/16 of the pool. Reservations enforce admission
+        // against the shared pool even when more streams or queries are active.
+        let max_bytes = match pool.memory_limit() {
+            MemoryLimit::Finite(limit) => (limit / target_partitions.max(1) / 16).min(1 << 20),
+            MemoryLimit::Infinite | MemoryLimit::Unknown => 1 << 20,
+        };
+        Self {
+            rows: None,
+            reservation: MemoryConsumer::new("Cayenne row encoding scratch").register(pool),
+            max_bytes,
+        }
+    }
+
+    fn retain(&mut self, rows: Rows) {
+        let bytes = rows.allocated_bytes();
+        if bytes <= self.max_bytes && self.reservation.try_resize(bytes).is_ok() {
+            self.rows = Some(rows);
+        } else {
+            drop(rows);
+            self.clear();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.rows = None;
+        self.reservation.free();
+    }
+}
+
 /// Stream that filters out deleted rows based on primary key matching.
 pub struct KeyBasedDeletionFilterStream {
     input: SendableRecordBatchStream,
@@ -573,6 +623,7 @@ pub struct KeyBasedDeletionFilterStream {
     insert_record_handling: InsertRecordHandling,
     pk_column_indices: Vec<usize>,
     row_converter: Arc<RowConverter>,
+    row_scratch: RowEncodingScratch,
     /// See [`Int64PkDeletionFilterStream::min_delete_seq_to_apply`].
     min_delete_seq_to_apply: Option<i64>,
     schema: arrow_schema::SchemaRef,
@@ -633,6 +684,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     }
 
                     if this.pk_column_indices.is_empty() {
+                        this.row_scratch.clear();
                         return std::task::Poll::Ready(Some(Err(
                             datafusion_common::DataFusionError::Internal(
                                 "KeyBasedDeletionFilterExec requires at least one primary key column index".to_string(),
@@ -647,6 +699,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     this.pk_columns_scratch.clear();
                     for &idx in &this.pk_column_indices {
                         let Some(column) = batch.columns().get(idx) else {
+                            this.row_scratch.clear();
                             return std::task::Poll::Ready(Some(Err(
                                 datafusion_common::DataFusionError::Internal(format!(
                                     "KeyBasedDeletionFilterExec primary key column index {idx} is out of bounds for a batch with {} columns",
@@ -658,9 +711,13 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     }
 
                     // Convert PK columns to row bytes (single batched conversion).
-                    let rows = match this.row_converter.convert_columns(&this.pk_columns_scratch) {
+                    let rows = match this.row_converter.convert_columns_reusing(
+                        &this.pk_columns_scratch,
+                        this.row_scratch.rows.take(),
+                    ) {
                         Ok(rows) => rows,
                         Err(e) => {
+                            this.row_scratch.clear();
                             return std::task::Poll::Ready(Some(Err(
                                 datafusion_common::DataFusionError::ArrowError(Box::new(e), None),
                             )));
@@ -705,6 +762,9 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                             }
                         },
                     );
+                    // Retention is optional: an oversized encoding or a full pool
+                    // drops the buffers after probing instead of failing the query.
+                    this.row_scratch.retain(rows);
                     let keep_count = batch_size - this.deleted_scratch.len();
 
                     tracing::trace!(
@@ -742,6 +802,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         match arrow::compute::filter_record_batch(&batch, &filter_array) {
                             Ok(filtered) => filtered,
                             Err(e) => {
+                                this.row_scratch.clear();
                                 return std::task::Poll::Ready(Some(Err(
                                     datafusion_common::DataFusionError::ArrowError(
                                         Box::new(e),
@@ -760,12 +821,15 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     return std::task::Poll::Ready(Some(Ok(filtered_batch)));
                 }
                 std::task::Poll::Ready(Some(Err(e))) => {
+                    self.row_scratch.clear();
                     return std::task::Poll::Ready(Some(Err(e)));
                 }
                 std::task::Poll::Ready(None) => {
+                    self.row_scratch.clear();
                     return std::task::Poll::Ready(None);
                 }
                 std::task::Poll::Pending => {
+                    self.row_scratch.clear();
                     return std::task::Poll::Pending;
                 }
             }
@@ -1153,6 +1217,140 @@ mod tests {
     use futures::StreamExt;
     use std::collections::HashMap;
 
+    #[tokio::test]
+    async fn key_based_filter_reuses_rows_and_drops_scratch_under_pressure()
+    -> datafusion_common::Result<()> {
+        use arrow::array::{Array, Int64Array, StringArray};
+        use arrow_schema::{Field, Schema};
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::execution::context::SessionContext;
+        use datafusion_execution::config::SessionConfig;
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+        use std::collections::HashSet;
+
+        const LONG: &str = "a composite primary key that spans multiple encoding blocks";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("key", DataType::Utf8, true),
+        ]));
+        let converter = Arc::new(RowConverter::new(vec![
+            SortField::new(DataType::Int64),
+            SortField::new(DataType::Utf8),
+        ])?);
+        let deleted = HashSet::from([
+            (Some(2_i64), Some("short")),
+            (None, Some(LONG)),
+            (Some(3), Some(LONG)),
+            (Some(5), Some("")),
+        ]);
+        let delete_columns: Vec<ArrayRef> = vec![
+            Arc::new(deleted.iter().map(|(id, _)| *id).collect::<Int64Array>()),
+            Arc::new(deleted.iter().map(|(_, key)| *key).collect::<StringArray>()),
+        ];
+        let delete_rows = converter.convert_columns(&delete_columns)?;
+        let tombstones = Arc::new(KeyDeletionIndex::from_map(
+            delete_rows
+                .iter()
+                .map(|row| (Box::<[u8]>::from(row.as_ref()), 1))
+                .collect(),
+        ));
+        let make_batch = |count: usize| {
+            let ids: ArrayRef = Arc::new(
+                (0..count)
+                    .map(|i| (i % 7 != 0).then(|| i64::try_from(i).expect("small fixture id")))
+                    .collect::<Int64Array>(),
+            );
+            let keys: ArrayRef = Arc::new(
+                (0..count)
+                    .map(|i| match i % 4 {
+                        0 => None,
+                        1 => Some(""),
+                        2 => Some("short"),
+                        _ => Some(LONG),
+                    })
+                    .collect::<StringArray>(),
+            );
+            RecordBatch::try_new(Arc::clone(&schema), vec![ids, keys]).expect("fixture batch")
+        };
+        let batches = vec![
+            make_batch(65),
+            make_batch(257),
+            RecordBatch::try_new(Arc::clone(&schema), delete_columns)?,
+            make_batch(0),
+            make_batch(9),
+            make_batch(32),
+        ];
+        let mut expected = Vec::new();
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("ids");
+            let keys = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("keys");
+            let mask = ids
+                .iter()
+                .zip(keys.iter())
+                .map(|key| !deleted.contains(&key))
+                .collect::<BooleanArray>();
+            let filtered = arrow::compute::filter_record_batch(batch, &mask)?;
+            if filtered.num_rows() > 0 || batch.num_rows() == 0 {
+                expected.push(filtered);
+            }
+        }
+
+        let limit = 8 * 1024 * 1024;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+        let runtime = Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool))
+                .build()?,
+        );
+        let context = SessionContext::new_with_config_rt(
+            SessionConfig::new().with_target_partitions(1),
+            runtime,
+        );
+        let input = MemorySourceConfig::try_new_exec(&[batches], schema, None)?;
+        let exec = KeyBasedDeletionFilterExec::new(
+            input,
+            tombstones,
+            InsertRecordHandling::Apply,
+            vec![0, 1],
+            converter,
+            None,
+        );
+        let mut stream = exec.execute(0, context.task_ctx())?;
+        let first = stream.next().await.expect("first batch")?;
+        assert_eq!(first, expected[0]);
+        let retained = pool.reserved();
+        assert!(retained > 0 && retained <= limit / 16);
+
+        // Leave room for the old cache but not the larger second encoding.
+        // Failed cache admission must still return the correct filtered rows.
+        let pressure = MemoryConsumer::new("test pressure").register(&pool);
+        pressure.try_resize(limit - retained)?;
+        let second = stream.next().await.expect("second batch")?;
+        assert_eq!(second, expected[1]);
+        assert_eq!(pool.reserved(), pressure.size(), "oversized cache released");
+        pressure.free();
+
+        let mut actual = vec![first, second];
+        while let Some(batch) = stream.next().await {
+            actual.push(batch?);
+        }
+        assert_eq!(
+            actual, expected,
+            "nulls, empty keys and padding retain their meaning"
+        );
+        assert_eq!(pool.reserved(), 0, "EOF releases the retained encoding");
+        Ok(())
+    }
+
     /// Regression for the iter-13 `apply_partial_deletion_filter` fix:
     /// probing the full deletion index with `min_delete_seq_to_apply` set
     /// must return identical visibility decisions to probing a freshly
@@ -1312,6 +1510,10 @@ mod tests {
             insert_record_handling: InsertRecordHandling::Apply,
             pk_column_indices: Vec::new(),
             row_converter,
+            row_scratch: RowEncodingScratch::new(
+                datafusion_execution::TaskContext::default().memory_pool(),
+                1,
+            ),
             min_delete_seq_to_apply: None,
             schema,
             metrics: DeletionFilterMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
@@ -1772,6 +1974,10 @@ mod tests {
             insert_record_handling: handling,
             pk_column_indices: vec![0],
             row_converter,
+            row_scratch: RowEncodingScratch::new(
+                datafusion_execution::TaskContext::default().memory_pool(),
+                1,
+            ),
             min_delete_seq_to_apply: None,
             schema,
             metrics: DeletionFilterMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
