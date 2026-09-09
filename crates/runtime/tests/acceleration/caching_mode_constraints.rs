@@ -278,7 +278,8 @@ fn duckdb_params(dir: &std::path::Path, extra: Vec<(&str, &str)>) -> Vec<(String
 /// Cayenne rather than `DuckDB` because the defect is above both engines and
 /// Cayenne had no coverage of the budgets at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(feature = "sqlite")]
+// Cayenne is not built on Windows, so neither is a test that loads it.
+#[cfg(all(feature = "sqlite", not(target_os = "windows")))]
 async fn the_item_budget_is_enforced_on_cayenne_with_a_primary_key() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
     register_test_connectors().await;
