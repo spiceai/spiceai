@@ -548,7 +548,9 @@ mod federation_tests {
         // carries a handler for it: `regexp_count` keeps one on purpose (#13870).
         for name in DUCKDB_DENIED_BUILTINS {
             assert!(
-                !federation.function_support.supports(&stub_udf(name, 2), None),
+                !federation
+                    .function_support
+                    .supports(&stub_udf(name, 2), None),
                 "{name} must be denied so the plan is left for DataFusion to evaluate locally"
             );
         }
