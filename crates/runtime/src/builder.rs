@@ -55,6 +55,10 @@ use tokio::sync::{Mutex, RwLock};
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
 const CAYENNE_FOOTER_CACHE_MB_PARAM: &str = "cayenne_footer_cache_mb";
+/// Directory holding the one `SQLite` metastore (`cayenne.db`) every Cayenne
+/// acceleration in this runtime shares. Runtime-level rather than per-dataset because
+/// the engine opens that metastore once for the whole instance.
+const CAYENNE_METADATA_DIR_PARAM: &str = "cayenne_metadata_dir";
 const CAYENNE_SEGMENT_CACHE_MB_PARAM: &str = "cayenne_segment_cache_mb";
 const CAYENNE_SORT_MERGE_MIN_ROWS_PARAM: &str = "cayenne_sort_merge_min_rows";
 const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
@@ -110,6 +114,7 @@ const MAX_SORT_MERGE_MEMORY_POOL_FRACTION: f64 = 1.0;
 /// `runtime.params` keys with a `cayenne_` prefix that the runtime recognizes.
 const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_FOOTER_CACHE_MB_PARAM,
+    CAYENNE_METADATA_DIR_PARAM,
     CAYENNE_SEGMENT_CACHE_MB_PARAM,
     CAYENNE_SORT_MERGE_MIN_ROWS_PARAM,
     CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
@@ -351,9 +356,13 @@ impl RuntimeBuilder {
         // afterwards instead would mean naming the concrete accelerator from here.
         let cayenne_footer_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
+        let cayenne_metadata_dir =
+            resolve_cayenne_metadata_dir(&spicepod_rt.params, CAYENNE_METADATA_DIR_PARAM);
+        log_applied_cayenne_param(CAYENNE_METADATA_DIR_PARAM, cayenne_metadata_dir.as_ref());
         let accelerator_configs = [data_accelerator_api::AcceleratorRuntimeConfig::Cayenne(
             data_accelerator_api::CayenneRuntimeConfig {
                 footer_cache_mb: cayenne_footer_cache_mb,
+                metadata_dir: cayenne_metadata_dir,
             },
         )];
 
@@ -1140,6 +1149,23 @@ fn warn_on_unknown_runtime_params(params: &HashMap<String, String>) {
             tracing::warn!("runtime.params.{key} is not a recognized runtime parameter; ignoring.");
         }
     }
+}
+
+/// Read `runtime.params.cayenne_metadata_dir`, treating a blank value as unset.
+///
+/// A key present but empty would otherwise resolve the metastore to `/cayenne.db`,
+/// which is a silently wrong location rather than a configuration the operator asked
+/// for; falling back to the derived default is the conservative reading.
+fn resolve_cayenne_metadata_dir(params: &HashMap<String, String>, key: &str) -> Option<String> {
+    let raw = params.get(key)?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        tracing::warn!(
+            "runtime.params.{key} is set to an empty value, so Spice cannot tell where to keep the Cayenne metastore and every Cayenne-accelerated dataset will use the default location instead. Set `{key}` to a directory path, or remove it. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Option<usize> {
@@ -3398,6 +3424,37 @@ mod test {
         let inputs = budget_inputs_for(vec![], vec![arrow_view, disabled_view, unaccelerated_view]);
         assert_eq!(inputs.num_unset_instances, 0);
         assert_eq!(inputs.num_explicit_instances, 0);
+    }
+
+    /// The metastore location is a path, not a number, so it takes its own reader — and
+    /// a key set to nothing is not a location: resolving it would put the metastore at
+    /// `/cayenne.db` rather than where the operator meant.
+    #[test]
+    fn test_resolve_cayenne_metadata_dir() {
+        let key = CAYENNE_METADATA_DIR_PARAM;
+        let resolve = |value: &str| {
+            resolve_cayenne_metadata_dir(
+                &HashMap::from([(key.to_string(), value.to_string())]),
+                key,
+            )
+        };
+
+        assert_eq!(
+            resolve("/srv/spice/catalog"),
+            Some("/srv/spice/catalog".to_string())
+        );
+        assert_eq!(
+            resolve("  /srv/spice/catalog  "),
+            Some("/srv/spice/catalog".to_string()),
+            "surrounding whitespace is not part of the path"
+        );
+        assert_eq!(resolve(""), None);
+        assert_eq!(resolve("   "), None);
+        assert_eq!(
+            resolve_cayenne_metadata_dir(&HashMap::new(), key),
+            None,
+            "unset falls back to the derived default"
+        );
     }
 
     #[test]

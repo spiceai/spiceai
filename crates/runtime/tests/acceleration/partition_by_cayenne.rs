@@ -218,10 +218,6 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
                 "cayenne_file_path".to_string(),
                 cayenne_path.display().to_string(),
             );
-            params.insert(
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.display().to_string(),
-            );
 
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
@@ -236,7 +232,13 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
                 ..Acceleration::default()
             });
 
+            // One metastore serves the whole runtime, so its location is a runtime
+            // parameter; the temp dir keeps this test off the shared default location.
             let app = AppBuilder::new("test_cayenne_partition_by_bucket")
+                .with_runtime_params(HashMap::from([(
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.display().to_string(),
+                )]))
                 .with_dataset(dataset)
                 .build();
 
@@ -357,10 +359,6 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
                 "cayenne_file_path".to_string(),
                 cayenne_path.display().to_string(),
             );
-            param_map.insert(
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.display().to_string(),
-            );
             let acceleration_params = spicepod::param::Params::from_string_map(param_map);
 
             dataset.acceleration = Some(Acceleration {
@@ -383,6 +381,10 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
             });
 
             let app = AppBuilder::new("test_cayenne_partition_by_multiple")
+                .with_runtime_params(HashMap::from([(
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.display().to_string(),
+                )]))
                 .with_dataset(dataset)
                 .build();
 
@@ -499,10 +501,6 @@ async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Err
                 "cayenne_file_path".to_string(),
                 cayenne_path.display().to_string(),
             );
-            param_map.insert(
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.display().to_string(),
-            );
             let acceleration_params = Params::from_string_map(param_map);
 
             dataset.acceleration = Some(Acceleration {
@@ -519,6 +517,10 @@ async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Err
             });
 
             let app = AppBuilder::new("test_cayenne_partition_null")
+                .with_runtime_params(HashMap::from([(
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.display().to_string(),
+                )]))
                 .with_dataset(dataset)
                 .build();
 
@@ -655,10 +657,6 @@ async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::
                 "cayenne_file_path".to_string(),
                 cayenne_path.display().to_string(),
             );
-            param_map.insert(
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.display().to_string(),
-            );
             let acceleration_params = Params::from_string_map(param_map);
 
             dataset.acceleration = Some(Acceleration {
@@ -675,6 +673,10 @@ async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::
             });
 
             let app = AppBuilder::new("test_cayenne_numeric_null")
+                .with_runtime_params(HashMap::from([(
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.display().to_string(),
+                )]))
                 .with_dataset(dataset)
                 .build();
 
@@ -811,10 +813,6 @@ async fn test_cayenne_partition_by_date_part() -> Result<(), anyhow::Error> {
                 "cayenne_file_path".to_string(),
                 cayenne_path.display().to_string(),
             );
-            param_map.insert(
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.display().to_string(),
-            );
             let acceleration_params = Params::from_string_map(param_map);
 
             dataset.acceleration = Some(Acceleration {
@@ -831,6 +829,10 @@ async fn test_cayenne_partition_by_date_part() -> Result<(), anyhow::Error> {
             });
 
             let app = AppBuilder::new("test_cayenne_date_partition")
+                .with_runtime_params(HashMap::from([(
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.display().to_string(),
+                )]))
                 .with_dataset(dataset)
                 .build();
 
@@ -956,10 +958,6 @@ async fn test_refresh_sql_with_bucket_function() -> Result<(), anyhow::Error> {
                 "cayenne_file_path".to_string(),
                 cayenne_path.display().to_string(),
             );
-            params.insert(
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.display().to_string(),
-            );
 
             // Use refresh_sql with bucket() to filter rows — this exercises the
             // refresh-task SessionContext which must have bucket() registered.
@@ -976,6 +974,10 @@ async fn test_refresh_sql_with_bucket_function() -> Result<(), anyhow::Error> {
             });
 
             let app = AppBuilder::new("test_refresh_sql_with_bucket")
+                .with_runtime_params(HashMap::from([(
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.display().to_string(),
+                )]))
                 .with_dataset(dataset)
                 .build();
 

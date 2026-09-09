@@ -56,7 +56,6 @@ use crate::{
 /// directory.
 fn make_dataset(metric: &str, dir: &Path) -> Dataset {
     let data_dir = dir.join("data").to_string_lossy().to_string();
-    let metadata_dir = dir.join("metadata").to_string_lossy().to_string();
     let mut ds = Dataset::new(format!("sink:{metric}"), metric.to_string());
     ds.access = AccessMode::ReadWrite;
     ds.on_schema_change = OnSchemaChange::AppendNewColumns;
@@ -68,10 +67,10 @@ fn make_dataset(metric: &str, dir: &Path) -> Dataset {
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Append),
         primary_key: Some("time_unix_nano".to_string()),
-        params: Some(Params::from_string_map(HashMap::from([
-            ("cayenne_file_path".to_string(), data_dir),
-            ("cayenne_metadata_dir".to_string(), metadata_dir),
-        ]))),
+        params: Some(Params::from_string_map(HashMap::from([(
+            "cayenne_file_path".to_string(),
+            data_dir,
+        )]))),
         ..Acceleration::default()
     });
     ds
@@ -79,7 +78,13 @@ fn make_dataset(metric: &str, dir: &Path) -> Dataset {
 
 /// Starts a runtime serving `metric` out of `dir`, ready for exports.
 async fn start_runtime(metric: &str, dir: &Path) -> Arc<Runtime> {
+    // One metastore serves the whole runtime, so its location is a runtime parameter;
+    // keeping it under `dir` is what lets a second runtime reopen the same one.
     let app = AppBuilder::new("otel_ingest_races")
+        .with_runtime_params(HashMap::from([(
+            "cayenne_metadata_dir".to_string(),
+            dir.join("metadata").to_string_lossy().to_string(),
+        )]))
         .with_dataset(make_dataset(metric, dir))
         .build();
 

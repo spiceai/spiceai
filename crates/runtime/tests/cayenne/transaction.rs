@@ -57,6 +57,18 @@ use crate::utils::{runtime_ready_check, test_request_context};
 // Harness
 // ---------------------------------------------------------------------------
 
+/// `runtime.params` putting the Cayenne metastore under `temp`.
+///
+/// The metastore is one per runtime and shared by every Cayenne table in it — which is
+/// what lets a multi-table commit fuse its publishes into one metastore transaction —
+/// so it is configured here rather than on each dataset.
+fn txn_metastore_params(temp: &std::path::Path) -> HashMap<String, String> {
+    HashMap::from([(
+        "cayenne_metadata_dir".to_string(),
+        temp.join("meta").display().to_string(),
+    )])
+}
+
 /// Build an accelerator-only Cayenne dataset (`on_conflict: upsert` +
 /// `refresh_mode: full` + a primary key) seeded from a local CSV file. This is
 /// the exact shape `resolve_cayenne_staged` accepts as a transaction
@@ -65,16 +77,11 @@ fn make_txn_dataset(
     name: &str,
     csv_path: &std::path::Path,
     cayenne_data_dir: &std::path::Path,
-    cayenne_metadata_dir: &std::path::Path,
 ) -> Dataset {
     let mut params = HashMap::new();
     params.insert(
         "cayenne_file_path".to_string(),
         cayenne_data_dir.display().to_string(),
-    );
-    params.insert(
-        "cayenne_metadata_dir".to_string(),
-        cayenne_metadata_dir.display().to_string(),
     );
 
     let mut on_conflict = HashMap::new();
@@ -240,12 +247,8 @@ async fn test_txn_commit_applies_update() -> Result<(), String> {
             let csv = temp.path().join("seed.csv");
             write_seed_csv(&csv, &[("a", 0)])?;
             let app = AppBuilder::new("test_txn_commit")
-                .with_dataset(make_txn_dataset(
-                    "t",
-                    &csv,
-                    &temp.path().join("data"),
-                    &temp.path().join("meta"),
-                ))
+                .with_runtime_params(txn_metastore_params(temp.path()))
+                .with_dataset(make_txn_dataset("t", &csv, &temp.path().join("data")))
                 .build();
             let rt = build_ready_runtime(app).await?;
 
@@ -291,12 +294,8 @@ async fn test_txn_gate_fail_rolls_back() -> Result<(), String> {
             let csv = temp.path().join("seed.csv");
             write_seed_csv(&csv, &[("a", 0)])?;
             let app = AppBuilder::new("test_txn_gate_fail")
-                .with_dataset(make_txn_dataset(
-                    "t",
-                    &csv,
-                    &temp.path().join("data"),
-                    &temp.path().join("meta"),
-                ))
+                .with_runtime_params(txn_metastore_params(temp.path()))
+                .with_dataset(make_txn_dataset("t", &csv, &temp.path().join("data")))
                 .build();
             let rt = build_ready_runtime(app).await?;
 
@@ -335,12 +334,8 @@ async fn test_txn_cap_enforcement() -> Result<(), String> {
             let csv = temp.path().join("seed.csv");
             write_seed_csv(&csv, &[("a", 0)])?;
             let app = AppBuilder::new("test_txn_cap")
-                .with_dataset(make_txn_dataset(
-                    "t",
-                    &csv,
-                    &temp.path().join("data"),
-                    &temp.path().join("meta"),
-                ))
+                .with_runtime_params(txn_metastore_params(temp.path()))
+                .with_dataset(make_txn_dataset("t", &csv, &temp.path().join("data")))
                 .build();
             let rt = build_ready_runtime(app).await?;
 
@@ -416,12 +411,8 @@ async fn test_txn_quota_reservation_admits_only_what_fits() -> Result<(), String
             let csv = temp.path().join("seed.csv");
             write_seed_csv(&csv, &[("r0", SEEDED)])?;
             let app = AppBuilder::new("test_txn_quota_sequential")
-                .with_dataset(make_txn_dataset(
-                    "t",
-                    &csv,
-                    &temp.path().join("data"),
-                    &temp.path().join("meta"),
-                ))
+                .with_runtime_params(txn_metastore_params(temp.path()))
+                .with_dataset(make_txn_dataset("t", &csv, &temp.path().join("data")))
                 .build();
             let rt = build_ready_runtime(app).await?;
             assert_eq!(read_sum(&rt, "t").await, SEEDED, "seeded quota usage");
@@ -500,12 +491,8 @@ async fn test_txn_quota_holds_under_concurrent_reservations() -> Result<(), Stri
             let csv = temp.path().join("seed.csv");
             write_seed_csv(&csv, &[("r0", SEEDED)])?;
             let app = AppBuilder::new("test_txn_quota_concurrent")
-                .with_dataset(make_txn_dataset(
-                    "t",
-                    &csv,
-                    &temp.path().join("data"),
-                    &temp.path().join("meta"),
-                ))
+                .with_runtime_params(txn_metastore_params(temp.path()))
+                .with_dataset(make_txn_dataset("t", &csv, &temp.path().join("data")))
                 .build();
             let rt = build_ready_runtime(app).await?;
 
@@ -562,12 +549,8 @@ async fn test_txn_null_gate_fail_safe() -> Result<(), String> {
             let csv = temp.path().join("seed.csv");
             write_seed_csv(&csv, &[("a", 0)])?;
             let app = AppBuilder::new("test_txn_null_gate")
-                .with_dataset(make_txn_dataset(
-                    "t",
-                    &csv,
-                    &temp.path().join("data"),
-                    &temp.path().join("meta"),
-                ))
+                .with_runtime_params(txn_metastore_params(temp.path()))
+                .with_dataset(make_txn_dataset("t", &csv, &temp.path().join("data")))
                 .build();
             let rt = build_ready_runtime(app).await?;
 
@@ -595,8 +578,8 @@ async fn test_txn_null_gate_fail_safe() -> Result<(), String> {
 /// tables that share a metastore commits both or neither. A failing gate leaves
 /// both unchanged.
 ///
-/// Both datasets share one `cayenne_metadata_dir`; the runtime keeps a single
-/// `CayenneAccelerator` per engine, so both tables resolve to the same metastore
+/// The runtime keeps a single `CayenneAccelerator` per engine and a single metastore
+/// under `runtime.params.cayenne_metadata_dir`, so both tables resolve to the same
 /// catalog and the commit fuses their publishes into one metastore transaction.
 #[test]
 #[cfg(not(target_os = "windows"))]
@@ -632,12 +615,12 @@ async fn run_test_txn_multi_table_atomic() -> Result<(), String> {
             write_seed_csv(&csv1, &[("a", 0)])?;
             write_seed_csv(&csv2, &[("a", 0)])?;
 
-            // Shared data + metadata dirs => one shared Cayenne metastore.
+            // A shared data dir; the metastore is shared by construction.
             let data_dir = temp.path().join("data");
-            let meta_dir = temp.path().join("meta");
             let app = AppBuilder::new("test_txn_multi_table")
-                .with_dataset(make_txn_dataset("t1", &csv1, &data_dir, &meta_dir))
-                .with_dataset(make_txn_dataset("t2", &csv2, &data_dir, &meta_dir))
+                .with_runtime_params(txn_metastore_params(temp.path()))
+                .with_dataset(make_txn_dataset("t1", &csv1, &data_dir))
+                .with_dataset(make_txn_dataset("t2", &csv2, &data_dir))
                 .build();
             let rt = build_ready_runtime(app).await?;
 
@@ -955,12 +938,8 @@ async fn bench_txn_gated_commit_throughput() -> Result<(), String> {
             let csv = temp.path().join("seed.csv");
             write_seed_csv(&csv, &[("a", 0)])?;
             let app = AppBuilder::new("bench_txn_throughput")
-                .with_dataset(make_txn_dataset(
-                    "t",
-                    &csv,
-                    &temp.path().join("data"),
-                    &temp.path().join("meta"),
-                ))
+                .with_runtime_params(txn_metastore_params(temp.path()))
+                .with_dataset(make_txn_dataset("t", &csv, &temp.path().join("data")))
                 .build();
             let rt = build_ready_runtime(app).await?;
 

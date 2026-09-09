@@ -2204,7 +2204,8 @@ async fn snapshot_int_test_cayenne_inconsistent_snapshots_rejected() -> Result<(
             let dataset_from1 = format!("file://{}", sample_source_path1.display());
             let dataset_from2 = format!("file://{}", sample_source_path2.display());
 
-            // Create data directories for cayenne (separate data dirs, but shared metadata dir)
+            // Separate data dirs; one metastore, which is what the refusal is about — it
+            // is a runtime parameter, so both datasets share it by construction.
             let data_dir1 = temp_dir.path().join("cayenne_data1");
             let data_dir2 = temp_dir.path().join("cayenne_data2");
             let metadata_dir = temp_dir.path().join("cayenne_metadata");
@@ -2230,16 +2231,10 @@ async fn snapshot_int_test_cayenne_inconsistent_snapshots_rejected() -> Result<(
             dataset1.acceleration = Some(Acceleration {
                 mode: Mode::File,
                 engine: Some("cayenne".to_string()),
-                params: Some(Params::from_string_map(HashMap::from([
-                    (
-                        "cayenne_file_path".to_string(),
-                        data_dir1.to_string_lossy().to_string(),
-                    ),
-                    (
-                        "cayenne_metadata_dir".to_string(),
-                        metadata_dir.to_string_lossy().to_string(),
-                    ),
-                ]))),
+                params: Some(Params::from_string_map(HashMap::from([(
+                    "cayenne_file_path".to_string(),
+                    data_dir1.to_string_lossy().to_string(),
+                )]))),
                 refresh_on_startup: RefreshOnStartup::Auto,
                 snapshots: DatasetSnapshotBehavior::Enabled, // ENABLED
                 ..Default::default()
@@ -2251,16 +2246,10 @@ async fn snapshot_int_test_cayenne_inconsistent_snapshots_rejected() -> Result<(
             dataset2.acceleration = Some(Acceleration {
                 mode: Mode::File,
                 engine: Some("cayenne".to_string()),
-                params: Some(Params::from_string_map(HashMap::from([
-                    (
-                        "cayenne_file_path".to_string(),
-                        data_dir2.to_string_lossy().to_string(),
-                    ),
-                    (
-                        "cayenne_metadata_dir".to_string(),
-                        metadata_dir.to_string_lossy().to_string(),
-                    ),
-                ]))),
+                params: Some(Params::from_string_map(HashMap::from([(
+                    "cayenne_file_path".to_string(),
+                    data_dir2.to_string_lossy().to_string(),
+                )]))),
                 refresh_on_startup: RefreshOnStartup::Auto,
                 snapshots: DatasetSnapshotBehavior::Disabled, // DISABLED - inconsistent!
                 ..Default::default()
@@ -2268,6 +2257,10 @@ async fn snapshot_int_test_cayenne_inconsistent_snapshots_rejected() -> Result<(
 
             // Parse the datasets to create acceleration sources
             let app = AppBuilder::new("snapshot_inconsistent_test")
+                .with_runtime_params(HashMap::from([(
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.to_string_lossy().to_string(),
+                )]))
                 .with_dataset(dataset1)
                 .with_dataset(dataset2)
                 .build();

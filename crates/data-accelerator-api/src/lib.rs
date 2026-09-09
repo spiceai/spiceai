@@ -100,6 +100,16 @@ pub struct CayenneRuntimeConfig {
     /// Vortex footer-metadata cache. `None` when the operator set none, which is distinct
     /// from `Some(0)` — no footer cache at all.
     pub footer_cache_mb: Option<usize>,
+
+    /// `runtime.params.cayenne_metadata_dir`: the directory holding the one `SQLite`
+    /// metastore (`cayenne.db`) that every Cayenne acceleration in this runtime shares.
+    ///
+    /// Runtime-level rather than per-dataset because the engine opens that metastore once
+    /// and every dataset resolves through the single open catalog: two datasets naming
+    /// different directories cannot each get their own, so one of them would silently
+    /// record its manifests in the other's catalog. `None` leaves the location derived
+    /// from the dataset's `cayenne_file_path`, else `{spice_data}/metadata`.
+    pub metadata_dir: Option<String>,
 }
 
 /// Runtime-level (not per-dataset) settings for one engine, at construction.
@@ -1244,15 +1254,22 @@ pub struct SpicepodWriteProfile {
 /// cannot be restored consistently, so it is refused up front rather than at restore time.
 ///
 /// Engine-agnostic: it groups by whatever [`DataAccelerator::shared_store_key`] returns,
-/// and an engine that returns `None` — or is simply not linked into this build — takes part
-/// in no group and so can never fail this check.
+/// and an engine that returns `None` — or is simply not registered — takes part in no
+/// group and so can never fail this check.
+///
+/// Asks the `Runtime`'s own registry rather than building an engine from the registration
+/// slice, because where the shared store lives can be a runtime-level setting
+/// (`runtime.params.cayenne_metadata_dir`): a default-built engine answers for a layout
+/// the `Runtime` is not using, which splits datasets that in fact share one store and
+/// admits exactly the mixed pod this refuses.
 ///
 /// # Errors
 ///
 /// Returns [`CayenneSnapshotValidationError::InconsistentSnapshotSettings`] naming the
 /// directory and both sides of the disagreement.
-pub fn validate_snapshot_consistency(
+pub async fn validate_snapshot_consistency(
     sources: &[Arc<dyn AccelerationSource>],
+    registry: &AcceleratorEngineRegistry,
 ) -> Result<(), CayenneSnapshotValidationError> {
     let mut store_groups: HashMap<String, Vec<(String, bool)>> = HashMap::new();
 
@@ -1260,7 +1277,7 @@ pub fn validate_snapshot_consistency(
         let Some(acceleration) = source.acceleration() else {
             continue;
         };
-        let Some(engine) = accelerator_for_engine(acceleration.engine) else {
+        let Some(engine) = registry.get_accelerator_engine(acceleration.engine).await else {
             continue;
         };
         let Some(store_key) = engine.shared_store_key(acceleration) else {
@@ -1307,15 +1324,6 @@ pub fn validate_snapshot_consistency(
     }
 
     Ok(())
-}
-
-/// The registered accelerator for `engine`, or `None` when this build links none.
-fn accelerator_for_engine(engine: Engine) -> Option<Arc<dyn DataAccelerator>> {
-    DATA_ACCELERATOR_REGISTRATIONS
-        .iter()
-        .find(|registration| registration.engine == engine)
-        // Built only to ask it about an acceleration, so it takes no runtime-level settings.
-        .and_then(AcceleratorRegistration::build_with_defaults)
 }
 
 #[cfg(test)]

@@ -182,16 +182,12 @@ impl AccelerationOptions {
                     },
                     refresh_sql: with_zero_results
                         .then(|| format!("SELECT * FROM {table_name} LIMIT 0")),
-                    params: Some(spicepod::param::Params::from_string_map(HashMap::from([
-                        (
-                            "cayenne_metadata_dir".to_string(),
-                            format!(".spice/metadata/cayenne_acceleration_{unique_id}/"),
-                        ),
-                        (
-                            "cayenne_file_path".to_string(),
-                            format!(".spice/data/cayenne_acceleration_{unique_id}/"),
-                        ),
-                    ]))),
+                    // The metastore is one per runtime, so its location is set as a
+                    // runtime parameter where the app is built.
+                    params: Some(spicepod::param::Params::from_string_map(HashMap::from([(
+                        "cayenne_file_path".to_string(),
+                        format!(".spice/data/cayenne_acceleration_{unique_id}/"),
+                    )]))),
                     ..Default::default()
                 }
             }
@@ -414,7 +410,13 @@ async fn test_megascience_permutations(
     let acceleration =
         acceleration_opt.to_acceleration(&unique_id, table_option.table_to_search_on());
 
-    let mut app = AppBuilder::new(slug);
+    // The Cayenne metastore is one per runtime, so its location is a runtime parameter.
+    // Keying it on the permutation's `unique_id` keeps parallel permutations off each
+    // other's catalog; a non-Cayenne acceleration simply never opens it.
+    let mut app = AppBuilder::new(slug).with_runtime_params(HashMap::from([(
+        "cayenne_metadata_dir".to_string(),
+        format!(".spice/metadata/cayenne_acceleration_{unique_id}/"),
+    )]));
     let (views, datasets) = table_option.to_tables();
 
     // Prepare vector store for AWS tests if needed.

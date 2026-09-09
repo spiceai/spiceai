@@ -208,10 +208,6 @@ async fn run_inner_workload() -> Result<(), anyhow::Error> {
         "cayenne_file_path".to_string(),
         cayenne_dir.display().to_string(),
     );
-    params.insert(
-        "cayenne_metadata_dir".to_string(),
-        metadata_dir.display().to_string(),
-    );
     // Keep snapshot write fan-out bounded so this regression test stays deterministic across hosts with different CPU counts
     params.insert(
         "cayenne_write_concurrency".to_string(),
@@ -238,7 +234,13 @@ async fn run_inner_workload() -> Result<(), anyhow::Error> {
         ..Acceleration::default()
     });
 
+    // One metastore serves the whole runtime, so its location is a runtime parameter;
+    // pointing it into the temp dir keeps this test off the process-wide Spice data path.
     let app = AppBuilder::new("retention_oom_repro")
+        .with_runtime_params(HashMap::from([(
+            "cayenne_metadata_dir".to_string(),
+            metadata_dir.display().to_string(),
+        )]))
         .with_dataset(dataset)
         .build();
 

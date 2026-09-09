@@ -339,10 +339,6 @@ async fn test_cayenne_core_arrow_data_types() -> Result<(), anyhow::Error> {
                 "cayenne_file_path".to_string(),
                 cayenne_dir.display().to_string(),
             );
-            params.insert(
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.display().to_string(),
-            );
 
             let mut dataset = Dataset::new(format!("file://{}", types_csv.display()), "types_test");
             dataset.acceleration = Some(Acceleration {
@@ -354,7 +350,13 @@ async fn test_cayenne_core_arrow_data_types() -> Result<(), anyhow::Error> {
                 ..Acceleration::default()
             });
 
+            // One metastore serves the whole runtime, so its location is a runtime
+            // parameter; the temp dir keeps this test off the shared default location.
             let app = AppBuilder::new("test_cayenne_data_types")
+                .with_runtime_params(HashMap::from([(
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.display().to_string(),
+                )]))
                 .with_dataset(dataset)
                 .build();
 
@@ -463,10 +465,6 @@ async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
                 "cayenne_file_path".to_string(),
                 cayenne_dir.display().to_string(),
             );
-            params.insert(
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.display().to_string(),
-            );
 
             let mut dataset = Dataset::new(format!("file://{}", csv_file.display()), "pk_test");
             dataset.acceleration = Some(Acceleration {
@@ -480,6 +478,10 @@ async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
             });
 
             let app = AppBuilder::new("test_cayenne_pk_delete")
+                .with_runtime_params(HashMap::from([(
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.display().to_string(),
+                )]))
                 .with_dataset(dataset)
                 .build();
 
@@ -600,10 +602,6 @@ async fn test_cayenne_partitioned_primary_key() -> Result<(), anyhow::Error> {
                 "cayenne_file_path".to_string(),
                 cayenne_dir.display().to_string(),
             );
-            params.insert(
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.display().to_string(),
-            );
 
             let mut dataset =
                 Dataset::new(format!("file://{}", csv_file.display()), "partitioned_pk_test");
@@ -622,6 +620,10 @@ async fn test_cayenne_partitioned_primary_key() -> Result<(), anyhow::Error> {
             });
 
             let app = AppBuilder::new("test_cayenne_partitioned_pk")
+                .with_runtime_params(HashMap::from([(
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.display().to_string(),
+                )]))
                 .with_dataset(dataset)
                 .build();
 
@@ -1085,10 +1087,6 @@ async fn test_cayenne_on_conflict_runtime_integration() -> Result<(), anyhow::Er
                 "cayenne_file_path".to_string(),
                 cayenne_dir.display().to_string(),
             );
-            params.insert(
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.display().to_string(),
-            );
 
             let mut dataset = Dataset::new(format!("file://{}", initial_csv.display()), "events");
             dataset.access = AccessMode::ReadWrite;
@@ -1104,6 +1102,10 @@ async fn test_cayenne_on_conflict_runtime_integration() -> Result<(), anyhow::Er
             });
 
             let app = AppBuilder::new("test_cayenne_on_conflict_runtime")
+                .with_runtime_params(HashMap::from([(
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.display().to_string(),
+                )]))
                 .with_dataset(dataset)
                 .build();
 
@@ -1904,10 +1906,6 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
                 "cayenne_file_path".to_string(),
                 cayenne_dir.display().to_string(),
             );
-            params.insert(
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.display().to_string(),
-            );
 
             let mut dataset = Dataset::new(
                 format!("file://{}", csv_file.display()),
@@ -1934,6 +1932,10 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
             });
 
             let app = AppBuilder::new("test_cayenne_partitioned_deletion")
+                .with_runtime_params(HashMap::from([(
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.display().to_string(),
+                )]))
                 .with_dataset(dataset)
                 .build();
 

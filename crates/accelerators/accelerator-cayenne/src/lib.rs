@@ -384,6 +384,12 @@ pub struct CayenneAccelerator {
     /// one in-memory database.
     instance_id: u64,
     footer_cache_mb: Option<usize>,
+    /// `runtime.params.cayenne_metadata_dir`, when the operator set one: the directory
+    /// holding the single `SQLite` metastore this engine opens. Held on the instance
+    /// that owns `catalog` because the two have to agree — the `OnceCell` opens one
+    /// metastore for the whole engine, so a location that varied per dataset would give
+    /// every dataset but the first a catalog it never named.
+    metadata_dir: Option<String>,
     /// The process-wide semaphore that bounds concurrent per-table background
     /// compactions, held here so the registration path can hand it to each
     /// table. Sized at `cpu_budget().cayenne_compaction_permits()` so a fleet of
@@ -1193,7 +1199,7 @@ static CAYENNE_ACCELERATOR_INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 impl CayenneAccelerator {
-    /// Builds the engine with no footer cache configured.
+    /// Builds the engine with no runtime-level settings configured.
     #[must_use]
     pub fn new() -> Self {
         Self::with_footer_cache_mb(None)
@@ -1205,13 +1211,23 @@ impl CayenneAccelerator {
     /// by the time they reach here there is nothing left to reject.
     #[must_use]
     pub fn from_runtime_config(config: &data_accelerator_api::CayenneRuntimeConfig) -> Self {
-        Self::with_footer_cache_mb(config.footer_cache_mb)
+        Self {
+            metadata_dir: config.metadata_dir.clone(),
+            ..Self::with_footer_cache_mb(config.footer_cache_mb)
+        }
     }
 
     /// The footer-cache size this engine was configured with.
     #[must_use]
     pub fn footer_cache_mb(&self) -> Option<usize> {
         self.footer_cache_mb
+    }
+
+    /// The metastore directory this engine was configured with, from
+    /// `runtime.params.cayenne_metadata_dir`.
+    #[must_use]
+    pub fn metadata_dir(&self) -> Option<&str> {
+        self.metadata_dir.as_deref()
     }
 
     #[must_use]
@@ -1222,6 +1238,7 @@ impl CayenneAccelerator {
             instance_id: CAYENNE_ACCELERATOR_INSTANCE_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             footer_cache_mb,
+            metadata_dir: None,
             compaction_semaphore: cayenne::compaction_budget(),
         }
     }
@@ -1348,19 +1365,30 @@ impl CayenneAccelerator {
     /// Resolves the metadata directory for Cayenne catalog storage.
     ///
     /// Priority order:
-    /// 1. `cayenne_metadata_dir` - Explicit custom metadata directory
+    /// 1. `runtime.params.cayenne_metadata_dir` - the operator's explicit location for
+    ///    the whole instance
     /// 2. `{cayenne_file_path}/metadata` - When `cayenne_file_path` is a local path (not S3)
     /// 3. `{spice_data_base_path()}/metadata` - Default location
     ///
+    /// The explicit location is a runtime-level setting and not an `acceleration.params`
+    /// one because this engine opens exactly one metastore, through the `catalog`
+    /// `OnceCell`: whichever dataset initializes it decides the location, and every
+    /// other dataset then reads and writes that catalog whatever directory it named.
+    /// A per-dataset key could therefore only be honoured for one dataset, and the
+    /// datasets it was silently ignored for would record their manifests, snapshot
+    /// pointers and partition rows in a catalog they never pointed at. See
+    /// [`ignored_dataset_metadata_dir_warning`] for what an operator who set the old key
+    /// is told.
+    ///
     /// Note: S3 paths are excluded because `SQLite` (used for metadata catalog) cannot run on object storage.
-    pub(crate) fn resolve_metadata_dir(acceleration: Option<&Acceleration>) -> String {
+    pub(crate) fn resolve_metadata_dir(&self, acceleration: Option<&Acceleration>) -> String {
+        if let Some(runtime_dir) = self.metadata_dir.as_deref() {
+            return runtime_dir.to_string();
+        }
+
         let Some(accel) = acceleration else {
             return format!("{}/metadata", spice_data_base_path());
         };
-
-        if let Some(custom_dir) = accel.params.get("cayenne_metadata_dir") {
-            return custom_dir.clone();
-        }
 
         if let Some(file_path) = accel.params.get("cayenne_file_path")
             && is_local_path(file_path)
@@ -1384,10 +1412,11 @@ impl CayenneAccelerator {
     /// prove the delete cannot reach the metastore, and it cannot prove that about a
     /// path it failed to resolve.
     async fn ensure_metastore_outside_data_dir(
+        &self,
         source: &dyn AccelerationSource,
         data_dir: &str,
     ) -> Result<()> {
-        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+        let metadata_dir = self.resolve_metadata_dir(source.acceleration());
         let overlap = overlapping_metastore_dir(data_dir, &metadata_dir)
             .await
             .map_err(|source_error| Error::CayenneDirsUnresolvable {
@@ -1420,10 +1449,12 @@ impl CayenneAccelerator {
     ///   directory whoever configured it — another dataset, or a configuration nothing
     ///   names any more. Nothing on the params path can see those.
     async fn remove_acceleration_data_dir(
+        &self,
         source: &dyn AccelerationSource,
         data_dir: &str,
     ) -> Result<()> {
-        Self::ensure_metastore_outside_data_dir(source, data_dir).await?;
+        self.ensure_metastore_outside_data_dir(source, data_dir)
+            .await?;
         Self::ensure_no_catalog_under_data_dir(source, data_dir).await?;
 
         tokio::fs::remove_dir_all(data_dir)
@@ -1522,6 +1553,7 @@ impl CayenneAccelerator {
     ///
     #[cfg(test)]
     async fn get_vortex_config(
+        &self,
         table_name: &str,
         source: &dyn AccelerationSource,
     ) -> Result<cayenne::metadata::VortexConfig> {
@@ -1529,10 +1561,12 @@ impl CayenneAccelerator {
             .acceleration()
             .is_some_and(|acceleration| uses_small_write_refresh_profile(source, acceleration));
         let workload = autotune::WorkloadProfile::hardware_only(small_write);
-        Self::get_vortex_config_with_footer_cache(table_name, source, None, &workload).await
+        self.get_vortex_config_with_footer_cache(table_name, source, None, &workload)
+            .await
     }
 
     async fn get_vortex_config_with_footer_cache(
+        &self,
         table_name: &str,
         source: &dyn AccelerationSource,
         footer_cache_mb: Option<usize>,
@@ -1582,7 +1616,7 @@ impl CayenneAccelerator {
             // is skipped for object stores. `*_dir` may be a `file://` URI, so
             // strip the scheme before probing the real filesystem path.
             let data_dir = CayenneAccelerator::new().cayenne_data_dir(source).ok();
-            let metadata_dir = CayenneAccelerator::resolve_metadata_dir(Some(acceleration));
+            let metadata_dir = self.resolve_metadata_dir(Some(acceleration));
             let hw = autotune::HardwareProfile::detect(
                 acceleration.storage_profile,
                 data_dir.as_deref().map_or("", fs_probe_path),
@@ -1678,6 +1712,20 @@ impl CayenneAccelerator {
             if let Some(requested_mb) = acceleration.params.get("cayenne_segment_cache_mb") {
                 tracing::warn!(
                     "Dataset {table_name}: acceleration.params.cayenne_segment_cache_mb={requested_mb} is ignored. The Vortex segment cache is now a single budget shared by every table instead of one cache per table, so a per-table size has nothing to size. To control it, set runtime.params.cayenne_segment_cache_mb (in MB; 0 disables caching). See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+                );
+            }
+
+            // The metastore location is a runtime-level setting: this engine opens one
+            // catalog, so a per-dataset directory could only ever be honoured for the
+            // dataset that opened it. Report the key being present, whatever its value.
+            if let Some(requested_dir) = acceleration.params.get("cayenne_metadata_dir") {
+                tracing::warn!(
+                    "{}",
+                    ignored_dataset_metadata_dir_warning(
+                        table_name,
+                        requested_dir,
+                        &self.resolve_metadata_dir(Some(acceleration))
+                    )
                 );
             }
 
@@ -2456,6 +2504,16 @@ impl CayenneAccelerator {
         .map(Arc::clone)
     }
 
+    /// The engine's one metastore, opened on first use and reused for every later
+    /// caller whatever `metadata_dir` they pass.
+    ///
+    /// This is why the metastore location is a runtime-level setting and not an
+    /// `acceleration.params` one: the `OnceCell` cannot open a second catalog, so a
+    /// per-dataset directory would be honoured only for the dataset that got here
+    /// first, and every other dataset would record its manifests, snapshot pointers
+    /// and partition rows in a catalog under a directory it never named — with which
+    /// directory that is decided by a load race. See
+    /// [`Self::resolve_metadata_dir`].
     async fn get_or_create_catalog(
         &self,
         metadata_dir: &str,
@@ -2589,7 +2647,7 @@ impl CayenneAccelerator {
 
         // Get metastore type and metadata directory
         let acceleration = source.acceleration();
-        let metadata_dir = Self::resolve_metadata_dir(acceleration);
+        let metadata_dir = self.resolve_metadata_dir(acceleration);
         let maintained_aggregate_specs =
             maintained_aggregate_specs_for_cayenne(acceleration, &schema, &primary_keys)?;
         let metastore_type = acceleration
@@ -2624,13 +2682,14 @@ impl CayenneAccelerator {
             &primary_keys,
             on_conflict.as_ref(),
         );
-        let mut vortex_config = Self::get_vortex_config_with_footer_cache(
-            table_name,
-            source,
-            self.footer_cache_mb,
-            &workload,
-        )
-        .await?;
+        let mut vortex_config = self
+            .get_vortex_config_with_footer_cache(
+                table_name,
+                source,
+                self.footer_cache_mb,
+                &workload,
+            )
+            .await?;
 
         // Memory mode: make the mem-tier the permanent in-RAM store — never
         // checkpoint/seal to Vortex, no compaction/cold tier, single shard (so a
@@ -3074,6 +3133,24 @@ const fn retention_period_never_reclaimed_warning_applies(
     has_retention_period && !(retention_check_enabled && has_retention_check_interval)
 }
 
+/// What an operator who set the retired `acceleration.params.cayenne_metadata_dir` is
+/// told: that the key is ignored, and where this dataset's catalog rows actually land.
+///
+/// Naming `effective_dir` is the load-bearing half. The key being ignored is only half
+/// the story an operator needs — the other half is that the manifests, snapshot pointers
+/// and partition rows for this dataset are in a metastore somewhere else, which is where
+/// they have to look for them and what they have to migrate if they want the layout they
+/// asked for.
+fn ignored_dataset_metadata_dir_warning(
+    table_name: &str,
+    requested_dir: &str,
+    effective_dir: &str,
+) -> String {
+    format!(
+        "Dataset '{table_name}' (cayenne): `acceleration.params.cayenne_metadata_dir` is set to '{requested_dir}' and is ignored, so this dataset's manifests, snapshot pointers and partition rows are recorded in the metastore at '{effective_dir}' instead. Cayenne opens one metastore for the whole instance, shared by every Cayenne-accelerated dataset, so its location cannot vary per dataset. Set `runtime.params.cayenne_metadata_dir` to the directory that metastore should live in, and remove `cayenne_metadata_dir` from this dataset. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
 fn retention_period_never_reclaimed_warning(table_name: &str) -> String {
     format!(
         "Dataset '{table_name}' (cayenne): `retention_period` hides expired rows from every read, but no scheduled pass deletes them, so their storage comes back only if a compaction happens to rewrite the files holding them — not on any predictable schedule. Reclaiming it reliably needs both `retention_check_enabled: true` and `retention_check_interval` (which has no default). Set both, or use `retention_sql`, which Cayenne applies on every write. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
@@ -3091,7 +3168,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("file_path")
             .description("Path for storing Cayenne data files (Vortex files). Can be a local path or an S3 Express One Zone path. For S3 Express One Zone, use format: 's3://{bucket-name}--{zone-id}--x-s3/{prefix}/'. When S3 Express One Zone is specified, data files are stored exclusively in S3 while metadata (SQLite) remains on local disk."),
         ParameterSpec::component("metadata_dir")
-            .description("Path for storing Cayenne metadata (SQLite catalog). If not specified, defaults to '{cayenne_file_path}/metadata'."),
+            .description("Ignored: Cayenne opens one SQLite metastore for the whole runtime, so a per-dataset location can only be honoured for whichever dataset opens it first and the rest silently write to a catalog they never named. Set runtime.params.cayenne_metadata_dir instead (unset: '{cayenne_file_path}/metadata' when that path is local, else '{spice_data}/metadata'). A value set here is reported at startup and otherwise has no effect."),
         ParameterSpec::component("metastore")
             .description("Metastore backend for Cayenne catalog. Options: 'sqlite' (default), 'turso' (requires 'turso' feature enabled at build time)")
             .one_of(&["sqlite", "turso"])
@@ -3300,7 +3377,7 @@ impl DataAccelerator for CayenneAccelerator {
         // Every Cayenne dataset in one metadata directory shares its SQLite catalog, so
         // the directory is the identity `validate_snapshot_consistency` groups by. Absent
         // this, that validation silently passes for every Cayenne dataset.
-        Some(Self::resolve_metadata_dir(Some(acceleration)))
+        Some(self.resolve_metadata_dir(Some(acceleration)))
     }
 
     fn spicepod_write_profile(
@@ -3357,7 +3434,7 @@ impl DataAccelerator for CayenneAccelerator {
             return AccelerationLayout::default();
         };
 
-        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+        let metadata_dir = self.resolve_metadata_dir(source.acceleration());
 
         AccelerationLayout::cayenne(PathBuf::from(metadata_dir), PathBuf::from(data_dir))
     }
@@ -3371,7 +3448,7 @@ impl DataAccelerator for CayenneAccelerator {
         // (the bucket/prefix is assumed to exist or will be created by the object store)
         if s3::is_s3_express_data_path(source) {
             // For S3 Express, we need to check if the metadata database exists locally
-            let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+            let metadata_dir = self.resolve_metadata_dir(source.acceleration());
             let metadata_db_path = format!("{metadata_dir}/cayenne.db");
             return PathBuf::from(metadata_db_path).exists();
         }
@@ -3387,7 +3464,7 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         // Also check if the metadata database exists (indicates proper initialization)
-        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+        let metadata_dir = self.resolve_metadata_dir(source.acceleration());
         let metadata_db_path = format!("{metadata_dir}/cayenne.db");
         PathBuf::from(metadata_db_path).exists()
     }
@@ -3419,7 +3496,7 @@ impl DataAccelerator for CayenneAccelerator {
                     source: Box::new(source),
                 })?;
 
-            let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+            let metadata_dir = self.resolve_metadata_dir(source.acceleration());
             let metadata_db_path = format!("{metadata_dir}/cayenne.db");
 
             if open_option == OpenOption::OpenExisting
@@ -3516,7 +3593,8 @@ impl DataAccelerator for CayenneAccelerator {
         // dataset's catalog rows, so a refusal never leaves them gone with the files
         // still on disk. This one reasons about the configured paths, so it costs a
         // `canonicalize` and runs for every dataset.
-        Self::ensure_metastore_outside_data_dir(source, &dir_path).await?;
+        self.ensure_metastore_outside_data_dir(source, &dir_path)
+            .await?;
         // The on-disk walk is the expensive half — linear in the entries under the data
         // directory — so it runs only where this call is about to delete that directory.
         // `mode: file_update` reaches its teardown through `drop_table`, which runs both
@@ -3647,7 +3725,7 @@ impl DataAccelerator for CayenneAccelerator {
             let path_buf = PathBuf::from(&dir_path);
             if path_buf.exists() {
                 let metadata_dir_for_snapshot =
-                    PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
+                    PathBuf::from(self.resolve_metadata_dir(Some(acceleration)));
                 let snapshot_layout = runtime_acceleration::snapshot::AccelerationLayout::cayenne(
                     metadata_dir_for_snapshot,
                     path_buf.clone(),
@@ -3680,7 +3758,7 @@ impl DataAccelerator for CayenneAccelerator {
             // table leaves the per-partition children whose stale schemas this
             // rebuild exists to discard. Failing first leaves an acceleration
             // the operator can retry.
-            let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
+            let metadata_dir = self.resolve_metadata_dir(Some(acceleration));
 
             let metastore_type = acceleration
                 .params
@@ -3709,7 +3787,7 @@ impl DataAccelerator for CayenneAccelerator {
                 // `snapshot_before_recreate` creates both directories, so an overlap
                 // only a symlink reveals is resolvable now even though the open-time
                 // check above had nothing to canonicalize.
-                Self::remove_acceleration_data_dir(source, &dir_path).await?;
+                self.remove_acceleration_data_dir(source, &dir_path).await?;
                 tracing::warn!(
                     "Deleted the acceleration data directory '{dir_path}' of dataset '{dataset}' (cayenne), so everything it had accelerated is gone and the dataset reloads empty. `mode: file_create` recreates the acceleration from the source on every load; set `mode: file_update` to keep the existing data across loads. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
                     dataset = source.name(),
@@ -3727,7 +3805,7 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         if let Some(acceleration) = source.acceleration() {
-            let metadata_dir = PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
+            let metadata_dir = PathBuf::from(self.resolve_metadata_dir(Some(acceleration)));
             let snapshot_adapter = runtime_acceleration::snapshot::AccelerationLayout::cayenne(
                 metadata_dir.clone(),
                 path_buf.clone(),
@@ -3946,7 +4024,7 @@ impl DataAccelerator for CayenneAccelerator {
             ))
         } else {
             // Get metadata catalog for partition tracking
-            let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+            let metadata_dir = self.resolve_metadata_dir(source.acceleration());
 
             // Ensure metadata directory exists
             std::fs::create_dir_all(&metadata_dir)
@@ -4014,13 +4092,14 @@ impl DataAccelerator for CayenneAccelerator {
                 &primary_keys,
                 on_conflict.as_ref(),
             );
-            let mut vortex_config = Self::get_vortex_config_with_footer_cache(
-                &table_name,
-                source,
-                self.footer_cache_mb,
-                &workload,
-            )
-            .await?;
+            let mut vortex_config = self
+                .get_vortex_config_with_footer_cache(
+                    &table_name,
+                    source,
+                    self.footer_cache_mb,
+                    &workload,
+                )
+                .await?;
             // Partitioned tables are excluded from v1 schema evolution
             // (per-partition catalog tables would evolve lazily as each
             // partition opens, leaving mixed schemas across partitions); keep
@@ -4152,7 +4231,7 @@ impl DataAccelerator for CayenneAccelerator {
         source: &dyn AccelerationSource,
     ) -> Option<Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>> {
         let acceleration = source.acceleration()?;
-        let metadata_dir = PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
+        let metadata_dir = PathBuf::from(self.resolve_metadata_dir(Some(acceleration)));
         let metastore_type = acceleration
             .params
             .get("cayenne_metastore")
@@ -4227,7 +4306,8 @@ impl DataAccelerator for CayenneAccelerator {
         // the delete-time proof refusing. Both proofs answer for an absent
         // directory already: the configured-path one resolves lexically, and the
         // on-disk one reports no catalog.
-        Self::ensure_metastore_outside_data_dir(source, &dir_path).await?;
+        self.ensure_metastore_outside_data_dir(source, &dir_path)
+            .await?;
         Self::ensure_no_catalog_under_data_dir(source, &dir_path).await?;
 
         // Metadata first, and its failures are fatal. The caller treats a
@@ -4238,7 +4318,7 @@ impl DataAccelerator for CayenneAccelerator {
         // the old schema. Failing before anything is deleted leaves a table the
         // operator can retry; the reverse order leaves one nothing can repair.
         if let Some(acceleration) = source.acceleration() {
-            let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
+            let metadata_dir = self.resolve_metadata_dir(Some(acceleration));
             let metastore_type = acceleration
                 .params
                 .get("cayenne_metastore")
@@ -4250,7 +4330,7 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         if path_buf.exists() {
-            Self::remove_acceleration_data_dir(source, &dir_path).await?;
+            self.remove_acceleration_data_dir(source, &dir_path).await?;
             tracing::info!(
                 "Removed Cayenne data directory '{dir_path}' for schema recreation (file_update mode)"
             );
@@ -4310,7 +4390,7 @@ impl DataAccelerator for CayenneAccelerator {
             }));
         }
 
-        let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
+        let metadata_dir = self.resolve_metadata_dir(Some(acceleration));
         let metastore_type = acceleration
             .params
             .get("cayenne_metastore")
@@ -4448,6 +4528,15 @@ mod tests {
     use cayenne::metastore_layout::absolute_data_dir;
     use runtime_acceleration::OnSchemaChange;
     use runtime_acceleration::testing::TestAccelerationSource;
+
+    /// An engine configured the way `runtime.params.cayenne_metadata_dir` configures
+    /// one, which is the only way to place the metastore explicitly.
+    fn accelerator_with_metadata_dir(metadata_dir: impl Into<String>) -> CayenneAccelerator {
+        CayenneAccelerator::from_runtime_config(&data_accelerator_api::CayenneRuntimeConfig {
+            footer_cache_mb: None,
+            metadata_dir: Some(metadata_dir.into()),
+        })
+    }
 
     /// A timestamp column compared against a string literal is how such a filter
     /// is normally written, and it must survive all the way to *evaluation*.
@@ -5155,6 +5244,7 @@ mod tests {
         let configured = |mb| {
             CayenneAccelerator::from_runtime_config(&CayenneRuntimeConfig {
                 footer_cache_mb: mb,
+                metadata_dir: None,
             })
             .footer_cache_mb
         };
@@ -5198,6 +5288,7 @@ mod tests {
         let built =
             (registration.constructor)(&AcceleratorRuntimeConfig::Cayenne(CayenneRuntimeConfig {
                 footer_cache_mb: Some(321),
+                metadata_dir: Some("/srv/spice/catalog".to_string()),
             }))
             .expect("the Cayenne registration accepts Cayenne configuration");
         let cayenne = built
@@ -5208,6 +5299,11 @@ mod tests {
         assert_eq!(
             cayenne.footer_cache_mb(),
             Some(321),
+            "the registered constructor must pass the runtime config to the engine"
+        );
+        assert_eq!(
+            cayenne.metadata_dir(),
+            Some("/srv/spice/catalog"),
             "the registered constructor must pass the runtime config to the engine"
         );
     }
@@ -5418,8 +5514,53 @@ mod tests {
         }
     }
 
+    /// `runtime.params.cayenne_metadata_dir` places the metastore for every dataset,
+    /// including one that carries no acceleration parameters at all.
     #[test]
-    fn test_resolve_metadata_dir_with_explicit_metadata_dir() {
+    fn test_resolve_metadata_dir_with_explicit_runtime_metadata_dir() {
+        let accelerator =
+            CayenneAccelerator::from_runtime_config(&data_accelerator_api::CayenneRuntimeConfig {
+                footer_cache_mb: None,
+                metadata_dir: Some("/custom/metadata".to_string()),
+            });
+        assert_eq!(
+            accelerator.resolve_metadata_dir(Some(&Acceleration::default())),
+            "/custom/metadata"
+        );
+        assert_eq!(accelerator.resolve_metadata_dir(None), "/custom/metadata");
+    }
+
+    /// The runtime setting wins over the `cayenne_file_path`-derived default, which is
+    /// the whole point of it: one metastore for the instance, wherever each dataset
+    /// happens to keep its Vortex files.
+    #[test]
+    fn test_resolve_metadata_dir_runtime_setting_overrides_file_path() {
+        let acceleration = Acceleration {
+            params: [(
+                "cayenne_file_path".to_string(),
+                "/persistent/data".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let accelerator =
+            CayenneAccelerator::from_runtime_config(&data_accelerator_api::CayenneRuntimeConfig {
+                footer_cache_mb: None,
+                metadata_dir: Some("/srv/catalog".to_string()),
+            });
+        assert_eq!(
+            accelerator.resolve_metadata_dir(Some(&acceleration)),
+            "/srv/catalog"
+        );
+    }
+
+    /// The retired `acceleration.params.cayenne_metadata_dir` no longer places the
+    /// metastore. Honouring it would give whichever dataset opened the engine's one
+    /// catalog its own location and silently point every other dataset at that same
+    /// catalog under a directory it never named.
+    #[test]
+    fn a_dataset_metadata_dir_no_longer_places_the_metastore() {
         let acceleration = Acceleration {
             params: [(
                 "cayenne_metadata_dir".to_string(),
@@ -5429,9 +5570,84 @@ mod tests {
             .collect(),
             ..Default::default()
         };
+        let resolved = CayenneAccelerator::new().resolve_metadata_dir(Some(&acceleration));
+        assert_ne!(resolved, "/custom/metadata");
+        assert!(
+            resolved.ends_with(".spice/data/metadata"),
+            "the dataset key is ignored, so the default applies; got: {resolved}"
+        );
+
+        // And it does not displace the runtime setting either.
+        let accelerator =
+            CayenneAccelerator::from_runtime_config(&data_accelerator_api::CayenneRuntimeConfig {
+                footer_cache_mb: None,
+                metadata_dir: Some("/srv/catalog".to_string()),
+            });
         assert_eq!(
-            CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
-            "/custom/metadata"
+            accelerator.resolve_metadata_dir(Some(&acceleration)),
+            "/srv/catalog"
+        );
+    }
+
+    /// The invariant the runtime-level setting exists to serve: this engine opens exactly
+    /// one metastore, and a second directory asked for afterwards is silently the first
+    /// one. Observed against a running `spiced` before this became a runtime parameter —
+    /// two datasets with different `cayenne_metadata_dir` values put both tables in one
+    /// `cayenne.db`, the other directory never getting a Cayenne catalog at all, and
+    /// which of the two won varied across restarts of one unchanged spicepod.
+    #[tokio::test]
+    async fn the_engine_opens_one_metastore_whatever_directory_is_asked_for_next() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let first = base.path().join("meta_a");
+        let second = base.path().join("meta_b");
+        std::fs::create_dir_all(&first).expect("first metastore dir");
+        std::fs::create_dir_all(&second).expect("second metastore dir");
+
+        let accelerator = CayenneAccelerator::new();
+        let opened = accelerator
+            .get_or_create_catalog(&first.to_string_lossy(), "sqlite")
+            .await
+            .expect("the first metastore opens");
+        let reopened = accelerator
+            .get_or_create_catalog(&second.to_string_lossy(), "sqlite")
+            .await
+            .expect("asking for a second metastore must not fail");
+
+        assert!(
+            Arc::ptr_eq(&opened, &reopened),
+            "a second directory must hand back the catalog already open, which is what \
+             makes a per-dataset location unimplementable"
+        );
+        assert!(
+            first.join("cayenne.db").exists(),
+            "the first directory asked for is the one that gets the metastore"
+        );
+        assert!(
+            !second.join("cayenne.db").exists(),
+            "the second directory never gets a catalog, so a dataset naming it would have \
+             its rows recorded somewhere it never pointed at"
+        );
+    }
+
+    /// The warning an operator who set the retired key sees has to carry the dataset,
+    /// the ignored value, where the rows actually land, and the key that replaces it —
+    /// dropping any one of them leaves them unable to find their catalog.
+    #[test]
+    fn the_ignored_dataset_metadata_dir_warning_names_what_the_operator_needs() {
+        let message =
+            ignored_dataset_metadata_dir_warning("orders", "/custom/metadata", "/srv/catalog");
+
+        assert!(message.contains("'orders'"), "{message}");
+        assert!(message.contains("'/custom/metadata'"), "{message}");
+        assert!(message.contains("'/srv/catalog'"), "{message}");
+        assert!(message.contains("is ignored"), "{message}");
+        assert!(
+            message.contains("`runtime.params.cayenne_metadata_dir`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("https://spiceai.org/docs/components/data-accelerators/cayenne"),
+            "{message}"
         );
     }
 
@@ -5447,7 +5663,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
+            CayenneAccelerator::new().resolve_metadata_dir(Some(&acceleration)),
             "/persistent/data/metadata"
         );
     }
@@ -5464,14 +5680,15 @@ mod tests {
             ..Default::default()
         };
         // Should fall back to default, not use S3 path
-        let result = CayenneAccelerator::resolve_metadata_dir(Some(&acceleration));
+        let result = CayenneAccelerator::new().resolve_metadata_dir(Some(&acceleration));
         assert!(result.ends_with("/metadata"));
         assert!(!result.starts_with("s3://"));
     }
 
+    /// With no runtime setting, the `cayenne_file_path`-derived default applies even
+    /// when the dataset carries the retired key.
     #[test]
-    fn test_resolve_metadata_dir_explicit_overrides_file_path() {
-        // When both are set, cayenne_metadata_dir takes priority
+    fn test_resolve_metadata_dir_ignores_the_dataset_key_beside_a_file_path() {
         let acceleration = Acceleration {
             params: [
                 (
@@ -5488,15 +5705,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
-            "/explicit/metadata"
+            CayenneAccelerator::new().resolve_metadata_dir(Some(&acceleration)),
+            "/persistent/data/metadata"
         );
     }
 
     #[test]
     fn test_resolve_metadata_dir_default() {
         // No acceleration - uses default
-        let result = CayenneAccelerator::resolve_metadata_dir(None);
+        let result = CayenneAccelerator::new().resolve_metadata_dir(None);
         assert!(
             result.ends_with(".spice/data/metadata"),
             "Expected path to end with '.spice/data/metadata', got: {result}"
@@ -5504,7 +5721,7 @@ mod tests {
 
         // Empty acceleration params - uses default
         let acceleration = Acceleration::default();
-        let result = CayenneAccelerator::resolve_metadata_dir(Some(&acceleration));
+        let result = CayenneAccelerator::new().resolve_metadata_dir(Some(&acceleration));
         assert!(
             result.ends_with(".spice/data/metadata"),
             "Expected path to end with '.spice/data/metadata', got: {result}"
@@ -5517,7 +5734,7 @@ mod tests {
     /// in the instance. Regression test for #13055 / #13068.
     #[tokio::test]
     async fn overlap_detects_the_default_collision_for_a_dataset_named_metadata() {
-        let metastore = CayenneAccelerator::resolve_metadata_dir(None);
+        let metastore = CayenneAccelerator::new().resolve_metadata_dir(None);
 
         let colliding = CayenneAccelerator::resolve_default_data_path("metadata");
         assert!(
@@ -5557,8 +5774,8 @@ mod tests {
         );
     }
 
-    /// An explicit `cayenne_metadata_dir` may legally point anywhere, including
-    /// beneath a dataset's data directory — where the recreate deletes it.
+    /// An explicit `runtime.params.cayenne_metadata_dir` may legally point anywhere,
+    /// including beneath a dataset's data directory — where the recreate deletes it.
     #[tokio::test]
     async fn overlap_detects_an_explicit_metadata_dir_nested_under_the_data_dir() {
         let base = tempfile::tempdir().expect("temp dir");
@@ -5787,16 +6004,10 @@ mod tests {
         dataset.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::FileUpdate,
-            params: [
-                (
-                    "cayenne_file_path".to_string(),
-                    base.path().to_string_lossy().into_owned(),
-                ),
-                (
-                    "cayenne_metadata_dir".to_string(),
-                    metadata_dir.to_string_lossy().into_owned(),
-                ),
-            ]
+            params: [(
+                "cayenne_file_path".to_string(),
+                base.path().to_string_lossy().into_owned(),
+            )]
             .into_iter()
             .collect(),
             ..Default::default()
@@ -5806,7 +6017,7 @@ mod tests {
         let catalog_file = metadata_dir.join("cayenne.db");
         std::fs::write(&catalog_file, b"catalog").expect("catalog file");
 
-        let err = CayenneAccelerator::new()
+        let err = accelerator_with_metadata_dir(metadata_dir.to_string_lossy().into_owned())
             .drop_table("orders", &dataset)
             .await
             .expect_err("drop_table must refuse to delete a data directory holding the metastore");
@@ -5914,10 +6125,10 @@ mod tests {
         let catalog_file = foreign_metastore.join("cayenne.db");
         std::fs::write(&catalog_file, b"catalog").expect("catalog file");
 
-        let err =
-            CayenneAccelerator::remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
-                .await
-                .expect_err("a data directory holding any metastore must not be deleted");
+        let err = CayenneAccelerator::new()
+            .remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
+            .await
+            .expect_err("a data directory holding any metastore must not be deleted");
 
         assert!(
             catalog_file.exists(),
@@ -5962,7 +6173,8 @@ mod tests {
         )
         .expect("decoy file");
 
-        CayenneAccelerator::remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
+        CayenneAccelerator::new()
+            .remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
             .await
             .expect("a data directory with no metastore under it is deleted");
 
@@ -6008,10 +6220,10 @@ mod tests {
         let alias = data_dir.join("catalog");
         std::os::unix::fs::symlink(&outside, &alias).expect("symlink");
 
-        let err =
-            CayenneAccelerator::remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
-                .await
-                .expect_err("a link aliasing a metadata directory must refuse the teardown");
+        let err = CayenneAccelerator::new()
+            .remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
+            .await
+            .expect_err("a link aliasing a metadata directory must refuse the teardown");
 
         assert!(
             alias.exists(),
@@ -6062,7 +6274,8 @@ mod tests {
         let data_dir = base.path().join("q");
         std::os::unix::fs::symlink(&elsewhere, &data_dir).expect("symlink the data dir");
 
-        CayenneAccelerator::remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
+        CayenneAccelerator::new()
+            .remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
             .await
             .expect_err("a link whose target holds a catalog must refuse the teardown");
 
@@ -6107,7 +6320,8 @@ mod tests {
         std::os::unix::fs::symlink(base.path().join("nothing"), data_dir.join("dangling"))
             .expect("dangling symlink");
 
-        CayenneAccelerator::remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
+        CayenneAccelerator::new()
+            .remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
             .await
             .expect("a link that aliases no catalog does not block the teardown");
 
@@ -6155,7 +6369,8 @@ mod tests {
             "the premise: this local path is classified as remote"
         );
 
-        CayenneAccelerator::remove_acceleration_data_dir(&dataset, &spelled)
+        CayenneAccelerator::new()
+            .remove_acceleration_data_dir(&dataset, &spelled)
             .await
             .expect_err("a scheme separator in the name must not wave the delete through");
         assert!(
@@ -6196,7 +6411,8 @@ mod tests {
         // relative path it denotes, so the teardown must fail to remove it and must not
         // reach for the real directory instead.
         let spelled = format!("file://{}", resolved.to_string_lossy());
-        CayenneAccelerator::remove_acceleration_data_dir(&dataset, &spelled)
+        CayenneAccelerator::new()
+            .remove_acceleration_data_dir(&dataset, &spelled)
             .await
             .expect_err("nothing exists at the path the caller would have checked");
 
@@ -6324,10 +6540,10 @@ mod tests {
         let link = data_dir.join("cayenne.db");
         std::os::unix::fs::symlink(&real_catalog, &link).expect("symlink");
 
-        let err =
-            CayenneAccelerator::remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
-                .await
-                .expect_err("a link occupying the metastore name must refuse the teardown");
+        let err = CayenneAccelerator::new()
+            .remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
+            .await
+            .expect_err("a link occupying the metastore name must refuse the teardown");
 
         assert!(
             std::fs::symlink_metadata(&link).is_ok(),
@@ -6348,7 +6564,7 @@ mod tests {
 
     /// The companion to the test above, holding the classification to the name it is
     /// about. A link to a database file under some *other* name costs nothing: no
-    /// `cayenne_metadata_dir` can reach a metastore through it — the database file name
+    /// metastore directory can reach a metastore through it — the database file name
     /// inside that directory is fixed — so unlinking it orphans no catalog, and refusing
     /// the teardown over it would be a false refusal on a directory Spice is asked to
     /// recreate.
@@ -6380,7 +6596,8 @@ mod tests {
         std::fs::create_dir_all(&data_dir).expect("data dir");
         std::os::unix::fs::symlink(&real_catalog, data_dir.join("catalog.bak")).expect("symlink");
 
-        CayenneAccelerator::remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
+        CayenneAccelerator::new()
+            .remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
             .await
             .expect("a link named nothing the metastore is configured as must not refuse");
 
@@ -6395,7 +6612,7 @@ mod tests {
     }
 
     /// The preflight cannot be gated on the data directory existing. With
-    /// `cayenne_metadata_dir` nested under a data directory that is absent at the moment
+    /// `runtime.params.cayenne_metadata_dir` nested under a data directory absent at the moment
     /// the rebuild starts, `get_or_create_catalog` is itself what creates both — so a
     /// gated preflight is skipped on exactly the run that then puts a catalog inside the
     /// tree it is about to delete, and the delete-time proof refuses with this dataset's
@@ -6411,16 +6628,10 @@ mod tests {
         dataset.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::FileUpdate,
-            params: [
-                (
-                    "cayenne_file_path".to_string(),
-                    base.path().to_string_lossy().into_owned(),
-                ),
-                (
-                    "cayenne_metadata_dir".to_string(),
-                    data_dir.join("meta").to_string_lossy().into_owned(),
-                ),
-            ]
+            params: [(
+                "cayenne_file_path".to_string(),
+                base.path().to_string_lossy().into_owned(),
+            )]
             .into_iter()
             .collect(),
             ..Default::default()
@@ -6431,10 +6642,11 @@ mod tests {
             "the case under test is a data directory that does not exist yet"
         );
 
-        let err = CayenneAccelerator::new()
-            .drop_table("q", &dataset)
-            .await
-            .expect_err("a metastore configured inside the data directory must refuse");
+        let err =
+            accelerator_with_metadata_dir(data_dir.join("meta").to_string_lossy().into_owned())
+                .drop_table("q", &dataset)
+                .await
+                .expect_err("a metastore configured inside the data directory must refuse");
 
         assert!(
             !data_dir.exists(),
@@ -6514,7 +6726,8 @@ mod tests {
         std::fs::create_dir_all(&data_dir).expect("data dir");
         std::os::unix::fs::symlink(&outside, data_dir.join("catalog")).expect("symlink");
 
-        CayenneAccelerator::remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
+        CayenneAccelerator::new()
+            .remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
             .await
             .expect("a directory of that name holds no catalog, so it must not refuse");
 
@@ -6567,10 +6780,10 @@ mod tests {
         let alias = data_dir.join("catalog");
         std::os::unix::fs::symlink(&aliased, &alias).expect("outer link");
 
-        let err =
-            CayenneAccelerator::remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
-                .await
-                .expect_err("a link occupying the metastore name behind an alias must refuse");
+        let err = CayenneAccelerator::new()
+            .remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
+            .await
+            .expect_err("a link occupying the metastore name behind an alias must refuse");
 
         assert!(
             real_catalog.exists() && data_dir.exists(),
@@ -6702,10 +6915,12 @@ mod tests {
             ..Default::default()
         });
 
-        let hot = CayenneAccelerator::get_vortex_config("hot", &hot_dataset)
+        let hot = CayenneAccelerator::new()
+            .get_vortex_config("hot", &hot_dataset)
             .await
             .expect("hot config should be valid");
-        let quiet = CayenneAccelerator::get_vortex_config("quiet", &quiet_dataset)
+        let quiet = CayenneAccelerator::new()
+            .get_vortex_config("quiet", &quiet_dataset)
             .await
             .expect("quiet config should be valid");
 
@@ -6820,6 +7035,47 @@ mod tests {
         fn drop(&mut self) {
             CAPTURE_SINK.with(|sink| *sink.borrow_mut() = None);
         }
+    }
+
+    /// The retired key has to be *reported*, not merely inert: a dataset that keeps
+    /// pointing at its own directory is writing into a metastore somewhere else, and the
+    /// warning is the only place an operator learns that. Asserted through the real
+    /// config path rather than the message builder, so removing the call site fails here.
+    #[tokio::test]
+    async fn a_dataset_metadata_dir_is_reported_as_ignored() {
+        const TABLE: &str = "ignored_metadata_dir_table";
+        let requested = tempfile::tempdir().expect("requested dir");
+        let effective = tempfile::tempdir().expect("effective dir");
+
+        let mut dataset = TestAccelerationSource::new(TABLE);
+        dataset.set_acceleration(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [(
+                "cayenne_metadata_dir".to_string(),
+                requested.path().to_string_lossy().into_owned(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let captured = capture_logs();
+        let _ = accelerator_with_metadata_dir(effective.path().to_string_lossy().into_owned())
+            .get_vortex_config(TABLE, &dataset)
+            .await
+            .expect("the configuration is otherwise valid");
+
+        assert_eq!(
+            captured.occurrences_of("acceleration.params.cayenne_metadata_dir"),
+            1,
+            "an operator who set the retired key must be told it is ignored"
+        );
+        assert_eq!(
+            captured.occurrences_of(&effective.path().to_string_lossy()),
+            1,
+            "the warning must name the metastore the dataset's rows actually go to"
+        );
     }
 
     #[test]
@@ -6955,7 +7211,8 @@ mod tests {
 
         let dataset = build(misconfigured());
         for _ in 0..3 {
-            let _ = CayenneAccelerator::get_vortex_config(TABLE, &dataset)
+            let _ = CayenneAccelerator::new()
+                .get_vortex_config(TABLE, &dataset)
                 .await
                 .expect("config should be valid");
         }
@@ -6975,7 +7232,8 @@ mod tests {
         let mut retuned_params = misconfigured();
         retuned_params.push(("cayenne_target_file_size_mb".to_string(), "512".to_string()));
         let retuned = build(retuned_params);
-        let _ = CayenneAccelerator::get_vortex_config(TABLE, &retuned)
+        let _ = CayenneAccelerator::new()
+            .get_vortex_config(TABLE, &retuned)
             .await
             .expect("config should be valid");
         assert_eq!(
@@ -7006,7 +7264,8 @@ mod tests {
                 ..Default::default()
             });
 
-            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset)
+            let config = CayenneAccelerator::new()
+                .get_vortex_config(table_name, &dataset)
                 .await
                 .expect("config should be valid");
 
@@ -7049,7 +7308,8 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("append_hot", &dataset)
+        let config = CayenneAccelerator::new()
+            .get_vortex_config("append_hot", &dataset)
             .await
             .expect("config should be valid");
 
@@ -7086,7 +7346,8 @@ mod tests {
                 ..Default::default()
             });
 
-            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset)
+            let config = CayenneAccelerator::new()
+                .get_vortex_config(table_name, &dataset)
                 .await
                 .expect("config should be valid");
 
@@ -7118,7 +7379,8 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("append_batch_load", &dataset)
+        let config = CayenneAccelerator::new()
+            .get_vortex_config("append_batch_load", &dataset)
             .await
             .expect("config should be valid");
 
@@ -7177,7 +7439,8 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset)
+        let config = CayenneAccelerator::new()
+            .get_vortex_config("cdc_hot", &dataset)
             .await
             .expect("config should be valid");
 
@@ -7222,7 +7485,8 @@ mod tests {
 
         // Global goal only.
         let global_goal = cdc_dataset("global_goal", vec![]);
-        let config = CayenneAccelerator::get_vortex_config("global_goal", &global_goal)
+        let config = CayenneAccelerator::new()
+            .get_vortex_config("global_goal", &global_goal)
             .await
             .expect("config should be valid");
         assert!(
@@ -7239,7 +7503,8 @@ mod tests {
             "dataset_goal",
             vec![("cayenne_goal_freshness".to_string(), "30s".to_string())],
         );
-        let config = CayenneAccelerator::get_vortex_config("dataset_goal", &dataset_goal)
+        let config = CayenneAccelerator::new()
+            .get_vortex_config("dataset_goal", &dataset_goal)
             .await
             .expect("config should be valid");
         assert!(
@@ -7252,7 +7517,8 @@ mod tests {
             "adaptive",
             vec![("cayenne_tuning".to_string(), "adaptive".to_string())],
         );
-        let config = CayenneAccelerator::get_vortex_config("adaptive", &adaptive)
+        let config = CayenneAccelerator::new()
+            .get_vortex_config("adaptive", &adaptive)
             .await
             .expect("config should be valid");
         assert!(
@@ -7279,7 +7545,8 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset)
+        let config = CayenneAccelerator::new()
+            .get_vortex_config("cdc_hot", &dataset)
             .await
             .expect("config should be valid");
 
@@ -7302,7 +7569,8 @@ mod tests {
             refresh_mode: Some(RefreshMode::Changes),
             ..Default::default()
         });
-        let config = CayenneAccelerator::get_vortex_config("cdc_auto_tier", &cdc)
+        let config = CayenneAccelerator::new()
+            .get_vortex_config("cdc_auto_tier", &cdc)
             .await
             .expect("config should be valid");
         assert!(
@@ -7330,7 +7598,8 @@ mod tests {
             refresh_mode: Some(RefreshMode::Full),
             ..Default::default()
         });
-        let config = CayenneAccelerator::get_vortex_config("full_tier", &full)
+        let config = CayenneAccelerator::new()
+            .get_vortex_config("full_tier", &full)
             .await
             .expect("config should be valid");
         assert_eq!(
@@ -7360,7 +7629,8 @@ mod tests {
         };
 
         let full = build("full_tbl", RefreshMode::Full, vec![]);
-        let config = CayenneAccelerator::get_vortex_config("full_tbl", &full)
+        let config = CayenneAccelerator::new()
+            .get_vortex_config("full_tbl", &full)
             .await
             .expect("config should be valid");
         assert_eq!(
@@ -7394,14 +7664,16 @@ mod tests {
                 "15000".to_string(),
             )],
         );
-        let config = CayenneAccelerator::get_vortex_config("full_pinned", &pinned)
+        let config = CayenneAccelerator::new()
+            .get_vortex_config("full_pinned", &pinned)
             .await
             .expect("config should be valid");
         assert_eq!(config.compaction_background_interval_ms, 15_000);
 
         // CDC is untouched: tight cadence, inlining on.
         let cdc = build("cdc_tbl", RefreshMode::Changes, vec![]);
-        let config = CayenneAccelerator::get_vortex_config("cdc_tbl", &cdc)
+        let config = CayenneAccelerator::new()
+            .get_vortex_config("cdc_tbl", &cdc)
             .await
             .expect("config should be valid");
         assert_eq!(
@@ -7413,7 +7685,8 @@ mod tests {
         // Snapshot mode accumulates files, so it keeps the conservative cadence and
         // stays OUT of the inline tier (its entries would never be drained promptly).
         let snapshot = build("snap_tbl", RefreshMode::Snapshot, vec![]);
-        let config = CayenneAccelerator::get_vortex_config("snap_tbl", &snapshot)
+        let config = CayenneAccelerator::new()
+            .get_vortex_config("snap_tbl", &snapshot)
             .await
             .expect("config should be valid");
         assert_ne!(
@@ -7450,14 +7723,10 @@ mod tests {
 
         // CDC (changes) + PK + unset mode → auto-resolves to Key.
         let ds = build("cdc_pk", RefreshMode::Changes, vec![]);
-        let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
-            "cdc_pk",
-            &ds,
-            None,
-            &pk_workload,
-        )
-        .await
-        .expect("config should be valid");
+        let config = CayenneAccelerator::new()
+            .get_vortex_config_with_footer_cache("cdc_pk", &ds, None, &pk_workload)
+            .await
+            .expect("config should be valid");
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Key);
 
         // Explicit `position` on the same shape is respected.
@@ -7466,14 +7735,10 @@ mod tests {
             RefreshMode::Changes,
             vec![("cayenne_deletion_mode".to_string(), "position".to_string())],
         );
-        let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
-            "cdc_pk_pos",
-            &ds,
-            None,
-            &pk_workload,
-        )
-        .await
-        .expect("config should be valid");
+        let config = CayenneAccelerator::new()
+            .get_vortex_config_with_footer_cache("cdc_pk_pos", &ds, None, &pk_workload)
+            .await
+            .expect("config should be valid");
         assert_eq!(
             config.deletion_mode,
             cayenne::metadata::DeletionMode::Position
@@ -7486,26 +7751,18 @@ mod tests {
             small_write: true,
             ..Default::default()
         };
-        let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
-            "cdc_nopk",
-            &ds,
-            None,
-            &nopk_workload,
-        )
-        .await
-        .expect("config should be valid");
+        let config = CayenneAccelerator::new()
+            .get_vortex_config_with_footer_cache("cdc_nopk", &ds, None, &nopk_workload)
+            .await
+            .expect("config should be valid");
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
 
         // A non-CDC profile with a PK stays Auto (position downstream).
         let ds = build("full_pk", RefreshMode::Full, vec![]);
-        let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
-            "full_pk",
-            &ds,
-            None,
-            &pk_workload,
-        )
-        .await
-        .expect("config should be valid");
+        let config = CayenneAccelerator::new()
+            .get_vortex_config_with_footer_cache("full_pk", &ds, None, &pk_workload)
+            .await
+            .expect("config should be valid");
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
     }
 
@@ -7641,10 +7898,10 @@ mod tests {
             ..Default::default()
         });
 
-        let small_write_config =
-            CayenneAccelerator::get_vortex_config("cdc_partial_override", &small_write_dataset)
-                .await
-                .expect("config should be valid");
+        let small_write_config = CayenneAccelerator::new()
+            .get_vortex_config("cdc_partial_override", &small_write_dataset)
+            .await
+            .expect("config should be valid");
 
         assert_eq!(small_write_config.inline_max_rows, 321);
         assert_eq!(
@@ -7667,10 +7924,10 @@ mod tests {
             ..Default::default()
         });
 
-        let large_write_config =
-            CayenneAccelerator::get_vortex_config("full_partial_override", &large_write_dataset)
-                .await
-                .expect("config should be valid");
+        let large_write_config = CayenneAccelerator::new()
+            .get_vortex_config("full_partial_override", &large_write_dataset)
+            .await
+            .expect("config should be valid");
 
         // Bulk-overwrite inlines too, on the same static caps as small-write, so
         // the un-overridden knobs keep those defaults rather than the zeros that
@@ -7722,7 +7979,8 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("compact", &dataset)
+        let config = CayenneAccelerator::new()
+            .get_vortex_config("compact", &dataset)
             .await
             .expect("config should be valid");
 
@@ -7747,7 +8005,7 @@ mod tests {
         };
         // Should not have double slashes
         assert_eq!(
-            CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
+            CayenneAccelerator::new().resolve_metadata_dir(Some(&acceleration)),
             "/persistent/data/metadata"
         );
     }
@@ -7768,6 +8026,8 @@ mod tests {
         // Keep the metastore this test may open inside a temp dir rather than the
         // process-wide Spice data path.
         let metadata_dir = tempfile::TempDir::new().expect("tempdir");
+        let accelerator =
+            accelerator_with_metadata_dir(metadata_dir.path().to_string_lossy().to_string());
         let build = |partition_by: Vec<PartitionedBy>| {
             let mut dataset = TestAccelerationSource::new("users").with_app(Arc::clone(&app));
             dataset.set_acceleration(Acceleration {
@@ -7775,12 +8035,6 @@ mod tests {
                 mode: Mode::FileUpdate,
                 refresh_mode: Some(RefreshMode::Full),
                 partition_by,
-                params: [(
-                    "cayenne_metadata_dir".to_string(),
-                    metadata_dir.path().to_string_lossy().to_string(),
-                )]
-                .into_iter()
-                .collect(),
                 ..Default::default()
             });
             dataset
@@ -7800,7 +8054,7 @@ mod tests {
             name: "bucket".to_string(),
             expression: "bucket".to_string(),
         }]);
-        let error = CayenneAccelerator::new()
+        let error = accelerator
             .evolve_table_schema("users", &partitioned, &plan)
             .await
             .expect_err("in-place evolution of a partitioned table must be refused");
@@ -7817,7 +8071,7 @@ mod tests {
         // The unpartitioned path is untouched: it still reaches the metastore,
         // which is what the refusal above must not pre-empt. `users` was never
         // created, so it fails on the missing table rather than on partitioning.
-        let unpartitioned_error = CayenneAccelerator::new()
+        let unpartitioned_error = accelerator
             .evolve_table_schema("users", &build(Vec::new()), &plan)
             .await
             .expect_err("no such table exists in a fresh metastore");
@@ -7857,12 +8111,11 @@ mod tests {
         };
         let workload = autotune::WorkloadProfile::default();
         let evolution_mode = async |dataset: &TestAccelerationSource| {
-            CayenneAccelerator::get_vortex_config_with_footer_cache(
-                "users", dataset, None, &workload,
-            )
-            .await
-            .expect("the vortex config is built")
-            .schema_evolution
+            CayenneAccelerator::new()
+                .get_vortex_config_with_footer_cache("users", dataset, None, &workload)
+                .await
+                .expect("the vortex config is built")
+                .schema_evolution
         };
 
         assert!(
@@ -7893,7 +8146,7 @@ mod tests {
     /// `shared_store_key` would leave it looking green while checking nothing.
     #[tokio::test]
     async fn mixed_snapshot_settings_in_one_metadata_dir_are_refused() {
-        use data_accelerator_api::validate_snapshot_consistency;
+        use data_accelerator_api::{AcceleratorEngineRegistry, validate_snapshot_consistency};
         use runtime_acceleration::snapshot::SnapshotBehavior;
         use runtime_acceleration::testing::TestAccelerationSource;
         use spicepod::acceleration::SnapshotsCompaction;
@@ -7904,13 +8157,20 @@ mod tests {
             .join("spice_cayenne_shared_metastore")
             .to_string_lossy()
             .to_string();
+        // The grouping has to see the engine this `Runtime` configured: with
+        // `runtime.params.cayenne_metadata_dir` set, every Cayenne dataset shares that one
+        // metastore whatever its own parameters say.
+        let registry = AcceleratorEngineRegistry::new();
+        registry
+            .register_accelerator_engine(
+                Engine::Cayenne,
+                Arc::new(accelerator_with_metadata_dir(dir.clone())),
+            )
+            .await;
         let acceleration = |snapshots: bool| {
             let mut acceleration = Acceleration {
                 engine: Engine::Cayenne,
                 mode: Mode::File,
-                params: [("cayenne_metadata_dir".to_string(), dir.clone())]
-                    .into_iter()
-                    .collect(),
                 ..Default::default()
             };
             // `Disabled` is the default, so the *enabled* side is what has to be built
@@ -7937,7 +8197,9 @@ mod tests {
             ),
         ];
         assert!(
-            validate_snapshot_consistency(&sources).is_err(),
+            validate_snapshot_consistency(&sources, &registry)
+                .await
+                .is_err(),
             "a metadata directory with both snapshotting and non-snapshotting datasets must be refused"
         );
 
@@ -7947,7 +8209,9 @@ mod tests {
             Arc::new(TestAccelerationSource::new("b").with_acceleration(acceleration(true))),
         ];
         assert!(
-            validate_snapshot_consistency(&agreeing).is_ok(),
+            validate_snapshot_consistency(&agreeing, &registry)
+                .await
+                .is_ok(),
             "datasets that agree may share a metadata directory"
         );
     }

@@ -198,13 +198,6 @@ fn cdc_dataset(
             .display()
             .to_string(),
     );
-    accel_params.insert(
-        "cayenne_metadata_dir".to_string(),
-        accel_dir
-            .join(format!("{table}_meta"))
-            .display()
-            .to_string(),
-    );
 
     dataset.acceleration = Some(Acceleration {
         enabled: true,
@@ -229,9 +222,18 @@ fn cdc_dataset(
     dataset
 }
 
-async fn build_runtime(name: &str, datasets: Vec<Dataset>) -> Result<Arc<Runtime>, anyhow::Error> {
+/// `accel_dir` is where the datasets keep their Cayenne files; the metastore is one per
+/// runtime, so it is set here as a runtime parameter rather than on each dataset.
+async fn build_runtime(
+    name: &str,
+    accel_dir: &Path,
+    datasets: Vec<Dataset>,
+) -> Result<Arc<Runtime>, anyhow::Error> {
     register_test_connectors().await;
-    let mut builder = AppBuilder::new(name);
+    let mut builder = AppBuilder::new(name).with_runtime_params(HashMap::from([(
+        "cayenne_metadata_dir".to_string(),
+        accel_dir.join("metastore").display().to_string(),
+    )]));
     for dataset in datasets {
         builder = builder.with_dataset(dataset);
     }
@@ -402,6 +404,7 @@ async fn a_write_outside_a_transaction_is_refused() -> Result<(), anyhow::Error>
             let accel = tempfile::tempdir()?;
             let rt = build_runtime(
                 "write_back_plain_write",
+                accel.path(),
                 vec![write_back_dataset(
                     port,
                     "wb_plain_write",
@@ -463,6 +466,7 @@ async fn a_plain_cdc_dataset_bootstraps_and_follows_the_source() -> Result<(), a
             let accel = tempfile::tempdir()?;
             let rt = build_runtime(
                 "cdc_plain",
+                accel.path(),
                 vec![cdc_dataset(
                     port,
                     "cdc_plain",
@@ -510,6 +514,7 @@ async fn write_back_bootstraps_without_an_explicit_slot() -> Result<(), anyhow::
             let accel = tempfile::tempdir()?;
             let rt = build_runtime(
                 "wb_noslot",
+                accel.path(),
                 vec![cdc_dataset(
                     port,
                     "wb_noslot",
@@ -594,6 +599,7 @@ async fn a_transactions_echo_is_dropped_while_a_foreign_write_lands() -> Result<
             let accel = tempfile::tempdir()?;
             let rt = build_runtime(
                 "write_back_echo",
+                accel.path(),
                 vec![write_back_dataset(
                     port,
                     "wb_echo",
@@ -698,6 +704,7 @@ async fn a_pk_point_lookup_ordered_by_the_pk_plans_after_a_transactional_commit(
             let accel = tempfile::tempdir()?;
             let rt = build_runtime(
                 "wb_counter",
+                accel.path(),
                 vec![write_back_dataset(
                     port,
                     "wb_counter",

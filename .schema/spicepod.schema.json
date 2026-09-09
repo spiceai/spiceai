@@ -8941,7 +8941,7 @@
           "type": "string"
         },
         "cayenne_metadata_dir": {
-          "description": "Path for storing Cayenne metadata (SQLite catalog). If not specified, defaults to '{cayenne_file_path}/metadata'.",
+          "description": "Ignored: Cayenne opens one SQLite metastore for the whole runtime, so a per-dataset location can only be honoured for whichever dataset opens it first and the rest silently write to a catalog they never named. Set runtime.params.cayenne_metadata_dir instead (unset: '{cayenne_file_path}/metadata' when that path is local, else '{spice_data}/metadata'). A value set here is reported at startup and otherwise has no effect.",
           "type": "string"
         },
         "cayenne_metastore": {

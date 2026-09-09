@@ -51,7 +51,8 @@ use tokio::time::sleep;
 
 use crate::mysql::common;
 use crate::utils::{
-    register_test_connectors, run_query, runtime_ready_check, test_request_context, wait_until_true,
+    cayenne_metastore_runtime_params, register_test_connectors, run_query, runtime_ready_check,
+    test_request_context, wait_until_true,
 };
 use crate::{configure_test_datafusion, init_tracing};
 
@@ -225,7 +226,7 @@ async fn wait_for_scalar_i64(
     }
 }
 
-async fn run_replication_e2e(port: u16, engine: EngineConfig) -> Result<(), anyhow::Error> {
+async fn run_replication_e2e(port: u16, mut engine: EngineConfig) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
         "integration=debug,runtime=debug,data_components::mysql_replication=debug,info",
     ));
@@ -252,8 +253,12 @@ async fn run_replication_e2e(port: u16, engine: EngineConfig) -> Result<(), anyh
             // 2. Build a Spice app with the replicated datasets.
             // ------------------------------------------------------------
             let params = mysql_params(port);
+            // The Cayenne metastore is one per runtime, so a caller's temp directory has
+            // to reach the runtime parameters rather than the acceleration's.
+            let runtime_params = cayenne_metastore_runtime_params(&mut engine.accel_params);
             let mut builder =
-                AppBuilder::new(format!("mysql_replication_integration_{}", engine.engine));
+                AppBuilder::new(format!("mysql_replication_integration_{}", engine.engine))
+                    .with_runtime_params(runtime_params);
             for ds in DATASETS {
                 builder = builder.with_dataset(make_dataset(ds, &params, &engine));
             }
@@ -448,16 +453,14 @@ async fn mysql_binlog_replication_restart_resume_cayenne() -> Result<(), anyhow:
             let temp_dir = tempfile::tempdir()?;
             let data_dir = temp_dir.path().join("cayenne");
             std::fs::create_dir_all(&data_dir)?;
-            let accel_params = HashMap::from([
-                (
-                    "cayenne_file_path".to_string(),
-                    data_dir.display().to_string(),
-                ),
-                (
-                    "cayenne_metadata_dir".to_string(),
-                    temp_dir.path().join("metadata.db").display().to_string(),
-                ),
-            ]);
+            let accel_params = HashMap::from([(
+                "cayenne_file_path".to_string(),
+                data_dir.display().to_string(),
+            )]);
+            // The metastore is one per runtime, so it is a runtime parameter; both runs
+            // below have to open the same one for the restart to resume rather than
+            // re-snapshot.
+            let metastore_dir = temp_dir.path().join("metadata.db").display().to_string();
             // Distinct server_ids so the two runs never collide on the source
             // replica id within the same process (a real process restart reuses
             // the derived id, but sequential runs here overlap briefly).
@@ -473,7 +476,12 @@ async fn mysql_binlog_replication_restart_resume_cayenne() -> Result<(), anyhow:
                     accel_params: accel_params.clone(),
                 };
                 let ds = make_dataset(&DATASETS[1], &params, &engine);
-                AppBuilder::new("mysql_replication_restart").with_dataset(ds)
+                AppBuilder::new("mysql_replication_restart")
+                    .with_runtime_params(HashMap::from([(
+                        "cayenne_metadata_dir".to_string(),
+                        metastore_dir.clone(),
+                    )]))
+                    .with_dataset(ds)
             };
 
             configure_test_datafusion();
@@ -584,16 +592,14 @@ async fn mysql_binlog_replication_gtid_resume_cayenne() -> Result<(), anyhow::Er
             let temp_dir = tempfile::tempdir()?;
             let data_dir = temp_dir.path().join("cayenne");
             std::fs::create_dir_all(&data_dir)?;
-            let accel_params = HashMap::from([
-                (
-                    "cayenne_file_path".to_string(),
-                    data_dir.display().to_string(),
-                ),
-                (
-                    "cayenne_metadata_dir".to_string(),
-                    temp_dir.path().join("metadata.db").display().to_string(),
-                ),
-            ]);
+            let accel_params = HashMap::from([(
+                "cayenne_file_path".to_string(),
+                data_dir.display().to_string(),
+            )]);
+            // The metastore is one per runtime, so it is a runtime parameter; both runs
+            // below have to open the same one for the restart to resume rather than
+            // re-snapshot.
+            let metastore_dir = temp_dir.path().join("metadata.db").display().to_string();
             // Distinct server_ids so the two runs never collide on the source
             // replica id (a real process restart reuses the derived id, but
             // sequential runs here overlap briefly).
@@ -609,7 +615,12 @@ async fn mysql_binlog_replication_gtid_resume_cayenne() -> Result<(), anyhow::Er
                     accel_params: accel_params.clone(),
                 };
                 let ds = make_dataset(&DATASETS[1], &params, &engine);
-                AppBuilder::new("mysql_replication_gtid").with_dataset(ds)
+                AppBuilder::new("mysql_replication_gtid")
+                    .with_runtime_params(HashMap::from([(
+                        "cayenne_metadata_dir".to_string(),
+                        metastore_dir.clone(),
+                    )]))
+                    .with_dataset(ds)
             };
 
             configure_test_datafusion();
@@ -858,10 +869,6 @@ async fn mysql_binlog_replication_survives_a_dump_reconnect_cayenne() -> Result<
                     "cayenne_file_path".to_string(),
                     data_dir.display().to_string(),
                 ),
-                (
-                    "cayenne_metadata_dir".to_string(),
-                    temp_dir.path().join("metadata.db").display().to_string(),
-                ),
                 // Widen coalescing so one write carries many envelopes.
                 ("cdc_prefetch_buffer".to_string(), "16384".to_string()),
                 (
@@ -882,6 +889,10 @@ async fn mysql_binlog_replication_survives_a_dump_reconnect_cayenne() -> Result<
                 accel_params,
             };
             let app = AppBuilder::new("mysql_replication_reconnect")
+                .with_runtime_params(HashMap::from([(
+                    "cayenne_metadata_dir".to_string(),
+                    temp_dir.path().join("metadata.db").display().to_string(),
+                )]))
                 .with_dataset(make_dataset(
                     &dataset,
                     &mysql_params(MYSQL_E2E_RECONNECT_PORT),
@@ -1260,16 +1271,10 @@ async fn mysql_binlog_replication_decodes_every_column_type_cayenne() -> Result<
             let temp_dir = tempfile::tempdir()?;
             let data_dir = temp_dir.path().join("cayenne");
             std::fs::create_dir_all(&data_dir)?;
-            let accel_params = HashMap::from([
-                (
-                    "cayenne_file_path".to_string(),
-                    data_dir.display().to_string(),
-                ),
-                (
-                    "cayenne_metadata_dir".to_string(),
-                    temp_dir.path().join("metadata.db").display().to_string(),
-                ),
-            ]);
+            let accel_params = HashMap::from([(
+                "cayenne_file_path".to_string(),
+                data_dir.display().to_string(),
+            )]);
             let dataset = ReplicatedDataset {
                 dataset_name: "types",
                 table: "mysqldb.repl_types",
@@ -1277,6 +1282,10 @@ async fn mysql_binlog_replication_decodes_every_column_type_cayenne() -> Result<
                 expected_initial_count: 3,
             };
             let app = AppBuilder::new("mysql_replication_types")
+                .with_runtime_params(HashMap::from([(
+                    "cayenne_metadata_dir".to_string(),
+                    temp_dir.path().join("metadata.db").display().to_string(),
+                )]))
                 .with_dataset(make_dataset(
                     &dataset,
                     &mysql_params(MYSQL_E2E_TYPES_PORT),
