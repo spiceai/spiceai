@@ -137,6 +137,7 @@ pub mod request;
 mod scheduling;
 pub(crate) use runtime_component::schema_evolution;
 pub mod search;
+pub mod sessions;
 // Secrets live in `runtime-secrets`. Crate-visible for the same reason as
 // `parameters` above: reach for `runtime-secrets` instead.
 pub(crate) mod secrets {
@@ -704,6 +705,10 @@ pub struct Runtime {
     /// fetched from the scheduler; for all other modes it is set before
     /// the runtime starts.
     telemetry_config: Option<Arc<tokio::sync::SetOnce<TelemetryConfig>>>,
+
+    /// SQL sessions, shared by the HTTP and Flight endpoints so a session id
+    /// issued by either is usable on both.
+    sessions: sessions::SessionStore,
 }
 
 impl Debug for Runtime {
@@ -732,6 +737,12 @@ impl Runtime {
     #[must_use]
     pub fn config(&self) -> Arc<Config> {
         Arc::clone(&self.config)
+    }
+
+    /// The SQL session store both endpoints resolve sessions against.
+    #[must_use]
+    pub fn sessions(&self) -> sessions::SessionStore {
+        self.sessions.clone()
     }
 
     #[must_use]

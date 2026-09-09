@@ -147,7 +147,6 @@ pub use runtime_datafusion::composed_catalog;
 // through here.
 pub(crate) use runtime_datafusion::error;
 pub use runtime_table::filter_converter;
-pub mod flight_session_extension;
 pub mod iceberg_ddl;
 pub mod job_executor_context_extension;
 pub use runtime_datafusion::managed_runtime;
@@ -162,6 +161,7 @@ pub use runtime_table::table_provider_with_spicepod_metadata;
 pub mod secrets_context_extension;
 pub mod table;
 pub use runtime_datafusion::sort_columns;
+pub mod sql_session_extension;
 pub(crate) mod sql_validator;
 pub mod tool_udf;
 pub mod udf;

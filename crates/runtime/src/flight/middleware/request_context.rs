@@ -16,14 +16,15 @@ limitations under the License.
 
 use crate::{
     datafusion::{
-        DataFusion, flight_session_extension::FlightSessionExtension,
+        DataFusion,
         job_executor_context_extension::JobExecutorContextExtension,
         request_context_extension::DataFusionContextExtension,
+        sql_session_extension::{ImplicitSessions, SqlSessionExtension},
     },
-    flight::SessionStore,
     jobs::JobExecutor,
     model::ModelContextExtension,
     secrets,
+    sessions::{RequestedSession, SessionStore},
 };
 use app::App;
 use runtime_request_context::{Protocol, RequestContext};
@@ -119,16 +120,19 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
-        // Try to get or create a session for this request. Capture the owning
-        // principal's stable id (if the request names an existing, owned session)
-        // so the session can be bound to its owner at execution time. This layer
-        // runs before auth, so ownership is *recorded* here and *enforced* later
-        // where the authenticated principal is known.
-        let owner_stable_id = self.session_store.owner_stable_id_from_http(req.headers());
-        let session_ext = self
-            .session_store
-            .get_or_create_session_from_http(req.headers(), &self.df.ctx)
-            .map(|ctx| FlightSessionExtension::new(ctx, owner_stable_id));
+        // Record which session the request names. This layer runs before auth,
+        // so the session is not resolved here — the ownership check needs the
+        // authenticated principal, which is only known once the query runs.
+        //
+        // Flight enables implicit sessions: a client that skips the handshake
+        // and presents its API key as the bearer token still gets a session of
+        // its own, which is what `PREPARE`/`EXECUTE` over a Flight connection
+        // has always relied on.
+        let session_ext = SqlSessionExtension::new(
+            self.session_store.clone(),
+            RequestedSession::from_headers(req.headers()),
+            ImplicitSessions::Enabled,
+        );
 
         let app_lock = Arc::clone(&self.app);
         let df = Arc::clone(&self.df);
@@ -153,10 +157,7 @@ where
                 builder = builder.with_extension(JobExecutorContextExtension::new(executor));
             }
 
-            // Add session extension if we have one
-            if let Some(session_ext) = session_ext {
-                builder = builder.with_extension(session_ext);
-            }
+            builder = builder.with_extension(session_ext);
 
             let request_context = Arc::new(builder.from_headers(req.headers()).build());
 

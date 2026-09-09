@@ -18,6 +18,8 @@ limitations under the License.
 
 use crate::datafusion::DataFusion;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
+use crate::datafusion::sql_session_extension::{ImplicitSessions, SqlSessionExtension};
+use crate::sessions::{RequestedSession, SessionStore};
 use crate::model::ModelContextLayer;
 use crate::request::DatabricksAuthExtension;
 use crate::status::RuntimeStatus;
@@ -33,7 +35,10 @@ use crate::http::v1::{
 use runtime_request_context::{Protocol, RequestContext};
 
 use app::App;
-use axum::{extract::State, routing::patch};
+use axum::{
+    extract::State,
+    routing::{delete, patch},
+};
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use opentelemetry::KeyValue;
 #[cfg(feature = "mcp")]
@@ -88,6 +93,8 @@ use tower_http::limit::RequestBodyLimitLayer;
     paths(
         // Order here will be preserved in sidebar at https://spiceai.org/docs/api/http/runtime.
         v1::query::post,
+        v1::sessions::post,
+        v1::sessions::delete,
         v1::datasets::get,
         v1::datasets::acceleration,
         v1::datasets::refresh,
@@ -329,6 +336,8 @@ pub(crate) fn routes(
 ) -> Router {
     let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
+        .route("/v1/sessions", post(v1::sessions::post))
+        .route("/v1/sessions/{session_id}", delete(v1::sessions::delete))
         .route("/v1/sql/active", get(v1::queries::list_active))
         .route(
             "/v1/sql/{query_id}/cancel",
@@ -529,12 +538,14 @@ pub(crate) fn routes(
             track_metrics,
         ))
         .layer(Extension(Arc::clone(&rt.app)))
+        .layer(Extension(rt.sessions()))
         .layer(cors_layer(cors_config))
 }
 
 async fn track_metrics(
     State(df): State<Arc<DataFusion>>,
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
+    Extension(sessions): Extension<SessionStore>,
     headers: http::HeaderMap,
     mut req: Request<Body>,
     next: Next,
@@ -548,9 +559,25 @@ async fn track_metrics(
     {
         request_context_builder = ext.add_from_headers(request_context_builder, &headers);
     }
+    // Record which session the request names. This layer runs before auth, so
+    // the session is resolved later, where the principal is known and its
+    // ownership can be checked.
+    //
+    // Implicit sessions are off here: unlike a Flight connection, an HTTP API
+    // key is routinely shared across a fleet of unrelated callers, and giving
+    // them one session between them would put them in a single
+    // prepared-statement namespace where the second caller to `PREPARE p`
+    // fails. On HTTP a session is asked for, via `POST /v1/sessions`.
+    let session_extension = SqlSessionExtension::new(
+        sessions,
+        RequestedSession::from_headers(&headers),
+        ImplicitSessions::Disabled,
+    );
+
     let request_context = Arc::new(
         request_context_builder
             .with_extension(DataFusionContextExtension::new(Arc::clone(&df)))
+            .with_extension(session_extension)
             .build(),
     );
     let auth_request_context: Arc<dyn AuthRequestContext + Send + Sync> =

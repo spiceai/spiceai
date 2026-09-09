@@ -91,8 +91,10 @@ use super::managed_runtime;
 use crate::datafusion::{
     DataFusion,
     query::cache::RequestCacheManager,
+    sql_session_extension::{SessionError, SqlSessionExtension},
     sql_validator::{validate_sql_query_operations, validate_sql_query_read_only},
 };
+use crate::sessions::SqlSession;
 use crate::task_history::correlation;
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
@@ -510,30 +512,27 @@ impl Query {
         Some(selected)
     }
 
-    /// Returns the session state for local query execution.
+    /// The SQL session this request runs in, or `None` to run against the
+    /// runtime's shared context.
     ///
-    /// For Flight SQL sessions, returns the session-specific context to preserve
-    /// prepared statements. Otherwise, returns the default local context.
-    fn get_session_state(&self, request_context: &Arc<RequestContext>) -> SessionState {
-        // Check if there's a Flight SQL session-specific context
-        if let Some(flight_session) =
-            request_context.extension::<super::flight_session_extension::FlightSessionExtension>()
-        {
-            // Only honor the session if it belongs to the current principal. The
-            // session is selected from a client-controlled `x-session-id` header
-            // before authentication runs; binding it to the authenticated
-            // principal here prevents one principal from executing against
-            // another's session (and its prepared statements) if a session id is
-            // leaked.
-            let current = request_context.auth_principal().and_then(|p| p.stable_id());
-            if principal_owns_session(flight_session.owner_stable_id(), current.as_deref()) {
-                // Use session-specific context to preserve prepared statements
-                return flight_session.session_context().state();
-            }
-        }
-
-        // Always use local execution for synchronous APIs (/v1/sql, FlightSQL)
-        self.df.ctx.state()
+    /// This is the single point at which a request is bound to a session, so
+    /// planning, statement execution and schema resolution cannot disagree about
+    /// which context they are using — and cannot each forget the ownership check
+    /// that [`SqlSessionExtension::resolve`] applies.
+    ///
+    /// Synchronous APIs (`/v1/sql`, Flight SQL) always execute locally, so the
+    /// session context is the execution context.
+    fn resolve_session(
+        request_context: &Arc<RequestContext>,
+        base_ctx: &SessionContext,
+    ) -> Result<Option<Arc<SqlSession>>, DataFusionError> {
+        let Some(extension) = request_context.extension::<SqlSessionExtension>() else {
+            return Ok(None);
+        };
+        let principal = request_context.auth_principal();
+        extension
+            .resolve(principal, base_ctx)
+            .map_err(SessionError::into_datafusion)
     }
 
     /// Run a query and return the result.
@@ -1075,11 +1074,28 @@ impl Query {
             async {
                 Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
 
-                let mut session = self.get_session_state(&request_context);
-
                 let ctx = self;
                 let results_cache_mode = ctx.results_cache_mode;
                 let tracker = ctx.tracker;
+
+                // Bind the request to its session once. Both the planning state
+                // below and the Statement branch further down run in whichever
+                // context this picks, so `PREPARE` and the `EXECUTE` that
+                // follows it cannot land in different ones.
+                let session_scope =
+                    match Self::resolve_session(&request_context, &ctx.df.ctx) {
+                        Ok(scope) => scope,
+                        Err(e) => handle_error!(
+                            tracker,
+                            &request_context,
+                            ErrorCode::QueryPlanningError,
+                            e,
+                            UnableToExecuteQuery
+                        ),
+                    };
+                let mut session = session_scope
+                    .as_ref()
+                    .map_or_else(|| ctx.df.ctx.state(), |scope| scope.context().state());
 
                 // Sets the request context as an extension on DataFusion, to allow recovering it to track telemetry
                 session
@@ -1364,22 +1380,24 @@ impl Query {
                 ) = if matches!(&*plan, LogicalPlan::Statement(_)) {
                     // For Statement plans, use SessionContext::execute_logical_plan()
                     // which handles PREPARE/EXECUTE/DEALLOCATE by modifying session state.
-                    // Use the session-specific context if available to ensure prepared statements
-                    // are scoped to individual sessions.
-                    let session_ctx = if let Some(flight_session) =
-                        request_context
-                            .extension::<super::flight_session_extension::FlightSessionExtension>()
-                    {
-                        tracing::debug!(
-                            "Statement plan using Flight session: {}",
-                            flight_session.session_context().session_id()
-                        );
-                        Arc::clone(flight_session.session_context())
-                    } else {
-                        tracing::debug!(
-                            "Statement plan using ad-hoc session (no FlightSessionExtension)"
-                        );
-                        Arc::new(SessionContext::new_with_state(ctx.df.ctx.state()))
+                    // These are the statements a session exists for, so they run in
+                    // the session bound at the top of this block — never in one
+                    // resolved separately here, which would skip its ownership check.
+                    let session_ctx = match &session_scope {
+                        Some(scope) => {
+                            tracing::debug!(
+                                "Statement plan using SQL session: {}",
+                                scope.context().session_id()
+                            );
+                            Arc::clone(scope.context())
+                        }
+                        None => {
+                            // No session: the statement mutates a context that is
+                            // discarded when the request ends, so a `PREPARE` here
+                            // is not visible to any later request.
+                            tracing::debug!("Statement plan using ad-hoc session (no SQL session)");
+                            Arc::new(SessionContext::new_with_state(ctx.df.ctx.state()))
+                        }
                     };
 
                     Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
@@ -1673,13 +1691,15 @@ impl Query {
     pub async fn get_schema(self) -> Result<(Schema, Option<Schema>), DataFusionError> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
 
-        // Check if there's a Flight SQL session-specific context for session isolation
-        let session = if let Some(flight_session) =
-            request_context.extension::<super::flight_session_extension::FlightSessionExtension>()
-        {
-            flight_session.session_context().state()
-        } else {
-            self.df.ctx.state()
+        // Resolve against the same session the query will execute in, so the
+        // schema advertised for a statement matches what running it produces.
+        let session = match Self::resolve_session(&request_context, &self.df.ctx) {
+            Ok(Some(scope)) => scope.context().state(),
+            Ok(None) => self.df.ctx.state(),
+            Err(e) => {
+                self.handle_schema_error(&request_context, &e);
+                return Err(e);
+            }
         };
 
         let plan = match self.sql {
@@ -2802,46 +2822,6 @@ fn is_dml_extension(plan: &LogicalPlan) -> bool {
                 .downcast_ref::<datafusion_dml::DmlExtensionNode>()
                 .is_some()
     )
-}
-
-/// Returns whether a Flight SQL session may be used by the current principal.
-///
-/// An unowned session (`owner` is `None`) is always permitted, preserving
-/// behavior for unauthenticated setups. An owned session is permitted only when
-/// the current principal's stable id matches the owner's — this is the check
-/// that stops a leaked session id from being usable by a different principal.
-fn principal_owns_session(owner: Option<&str>, current_principal: Option<&str>) -> bool {
-    match owner {
-        None => true,
-        Some(owner) => current_principal == Some(owner),
-    }
-}
-
-#[cfg(test)]
-mod session_ownership_tests {
-    use super::principal_owns_session;
-
-    #[test]
-    fn unowned_session_is_always_allowed() {
-        assert!(principal_owns_session(None, None));
-        assert!(principal_owns_session(None, Some("apikey:abc")));
-    }
-
-    #[test]
-    fn owned_session_requires_matching_principal() {
-        // Same principal: allowed.
-        assert!(principal_owns_session(
-            Some("apikey:abc"),
-            Some("apikey:abc")
-        ));
-        // Different principal: rejected (cross-principal session access).
-        assert!(!principal_owns_session(
-            Some("apikey:abc"),
-            Some("apikey:xyz")
-        ));
-        // Unauthenticated caller cannot use an owned session.
-        assert!(!principal_owns_session(Some("apikey:abc"), None));
-    }
 }
 
 #[cfg(test)]

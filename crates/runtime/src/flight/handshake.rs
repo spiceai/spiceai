@@ -16,7 +16,7 @@ limitations under the License.
 
 use arrow_flight::HandshakeResponse;
 use futures::Stream;
-use runtime_auth::FlightBasicAuth;
+use runtime_auth::{AuthVerdict, FlightBasicAuth};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -52,9 +52,26 @@ pub(crate) async fn handle(
     let request_context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&request_context);
 
-    // Create a new session from the base context, associating it with the auth token
-    let (session_id, _session_ctx) =
-        session_store.create_session(&datafusion.ctx, auth_token.as_deref());
+    // Bind the session to the principal that just authenticated, so a leaked id
+    // is not usable by anyone else. The principal is resolved from the validated
+    // token rather than from the request context because the auth layer has not
+    // run for this RPC — the handshake *is* where authentication happens, so the
+    // context carries no principal yet.
+    let owner_stable_id = auth_token.as_deref().and_then(|token| {
+        basic_auth
+            .and_then(|auth| auth.is_valid(token).ok())
+            .and_then(|verdict| match verdict {
+                AuthVerdict::Allow(principal) => {
+                    principal.stable_id().map(std::borrow::Cow::into_owned)
+                }
+                AuthVerdict::Deny => None,
+            })
+    });
+
+    // `auth_token` is also the credential the session id stands in for when a
+    // client presents the id as its bearer token (see `SessionAwareAuth`).
+    let session = session_store.issue(&datafusion.ctx, owner_stable_id, auth_token.clone());
+    let session_id = session.id().to_string();
 
     tracing::debug!(
         authenticated = auth_token.is_some(),

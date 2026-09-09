@@ -20,6 +20,7 @@ mod json_nested_fields;
 mod view_hot_reload;
 
 mod deferred;
+mod sessions;
 mod trace_id;
 
 use std::collections::HashMap;
