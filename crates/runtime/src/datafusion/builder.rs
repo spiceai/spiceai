@@ -1918,12 +1918,12 @@ fn runtime_env_with_effective_memory_limit_and_object_store_registry(
     #[expect(clippy::cast_possible_truncation)]
     let effective_memory_bytes = effective_memory_limit as usize;
 
-    let memory_pool = Arc::new(TrackConsumersPool::new(
-        // The runtime supports only 64-bit platforms, so casting u64 to usize
-        // will not truncate on supported targets.
-        GreedyMemoryPool::new(effective_memory_bytes),
-        topn,
-    ));
+    // Greedy first-come, but spillable operators (`ExternalSorter`) cannot
+    // take the last 1/16 of the pool. A coalesced TPC-DS Q97 sort-merge held
+    // 103.6 GiB of 107.50 GiB and the cayenne store_sales scan could not get
+    // 1 MiB (regression for #13918).
+    let memory_pool =
+        super::query_memory_pool::tracked_query_memory_pool(effective_memory_bytes, topn);
 
     let mut runtime_env_builder = RuntimeEnvBuilder::default()
         .with_object_store_registry(object_store_registry)

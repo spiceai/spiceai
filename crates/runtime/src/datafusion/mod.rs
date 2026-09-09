@@ -137,6 +137,7 @@ pub mod query;
 
 pub mod app_context_extension;
 pub mod builder;
+pub(crate) mod query_memory_pool;
 pub(crate) mod caching_retention;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
