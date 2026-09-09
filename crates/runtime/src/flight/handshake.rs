@@ -16,7 +16,7 @@ limitations under the License.
 
 use arrow_flight::HandshakeResponse;
 use futures::Stream;
-use runtime_auth::{AuthVerdict, FlightBasicAuth};
+use runtime_auth::{AuthPrincipalRef, AuthRequestContext, AuthVerdict, FlightBasicAuth};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -52,21 +52,13 @@ pub(crate) async fn handle(
     let request_context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&request_context);
 
-    // Bind the session to the principal that just authenticated, so a leaked id
-    // is not usable by anyone else. The principal is resolved from the validated
-    // token rather than from the request context because the auth layer has not
-    // run for this RPC — the handshake *is* where authentication happens, so the
-    // context carries no principal yet.
-    let owner_stable_id = auth_token.as_deref().and_then(|token| {
-        basic_auth
-            .and_then(|auth| auth.is_valid(token).ok())
-            .and_then(|verdict| match verdict {
-                AuthVerdict::Allow(principal) => {
-                    principal.stable_id().map(std::borrow::Cow::into_owned)
-                }
-                AuthVerdict::Deny => None,
-            })
-    });
+    // Bind the session to the principal that authenticated, so a leaked id is
+    // not usable by anyone else.
+    let owner_stable_id = session_owner(
+        request_context.auth_principal(),
+        auth_token.as_deref(),
+        basic_auth,
+    );
 
     // `auth_token` is also the credential the session id stands in for when a
     // client presents the id as its bearer token (see `SessionAwareAuth`).
@@ -105,4 +97,116 @@ pub(crate) async fn handle(
     }
 
     Ok(resp)
+}
+
+/// The stable id to record as the session's owner, or `None` when the handshake
+/// was unauthenticated.
+///
+/// Two things authenticate a handshake, and they become known at different
+/// points. Under `client_auth` as identity the mTLS layer has already resolved
+/// the peer certificate and set the principal on the request context — it runs
+/// before this RPC — so that principal is authoritative. For Basic auth nothing
+/// has run yet: the handshake *is* where the credential is checked, so the owner
+/// has to be resolved from the token this call just validated.
+///
+/// Preferring the context principal is what stops an mTLS handshake from minting
+/// an *unowned* session, which [`crate::sessions::SqlSession::is_owned_by`]
+/// would then let any other certificate use.
+fn session_owner(
+    context_principal: Option<&AuthPrincipalRef>,
+    auth_token: Option<&str>,
+    basic_auth: Option<&Arc<dyn FlightBasicAuth + Send + Sync>>,
+) -> Option<String> {
+    if let Some(stable_id) = context_principal.and_then(|principal| principal.stable_id()) {
+        return Some(stable_id.into_owned());
+    }
+
+    match basic_auth?.is_valid(auth_token?).ok()? {
+        AuthVerdict::Allow(principal) => principal.stable_id().map(std::borrow::Cow::into_owned),
+        AuthVerdict::Deny => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // `stable_id` is called below on a concrete `ApiKey` rather than through the
+    // `AuthPrincipalRef` trait object, so the trait has to be in scope.
+    use runtime_auth::AuthPrincipal;
+    use runtime_auth::api_key::ApiKeyAuth;
+    use runtime_auth::mtls::MtlsPrincipal;
+    use spicepod::component::runtime::ApiKey;
+
+    fn api_key_auth(key: &str) -> Arc<dyn FlightBasicAuth + Send + Sync> {
+        Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str(key)]))
+            as Arc<dyn FlightBasicAuth + Send + Sync>
+    }
+
+    fn mtls_principal(identity: &str) -> AuthPrincipalRef {
+        Arc::new(MtlsPrincipal {
+            identity: identity.to_string(),
+            subject_dn: identity.to_string(),
+            cert_fingerprint: [0u8; 32],
+        }) as AuthPrincipalRef
+    }
+
+    fn stable_id_of(principal: &AuthPrincipalRef) -> String {
+        principal
+            .stable_id()
+            .map(std::borrow::Cow::into_owned)
+            .expect("this principal has a stable id")
+    }
+
+    /// Under mTLS-as-identity there is no Basic-auth token, and the principal
+    /// the mTLS layer put on the request context is the only thing identifying
+    /// the client. Missing it mints an unowned session, which any other
+    /// certificate may then use.
+    #[test]
+    fn an_mtls_handshake_is_owned_by_the_certificate_principal() {
+        let principal = mtls_principal("CN=client-a");
+
+        let owner = session_owner(Some(&principal), None, None);
+
+        assert_eq!(owner, Some(stable_id_of(&principal)));
+    }
+
+    #[test]
+    fn a_basic_auth_handshake_is_owned_by_the_principal_the_token_names() {
+        let auth = api_key_auth("k:rw");
+
+        let owner = session_owner(None, Some("k"), Some(&auth));
+
+        let expected = ApiKey::parse_str("k")
+            .stable_id()
+            .map(std::borrow::Cow::into_owned);
+        assert_eq!(owner, expected);
+    }
+
+    /// Both present is mTLS-as-channel with `runtime.auth` also configured. The
+    /// context principal is the one the rest of the request is authorized
+    /// against, so the session has to agree with it.
+    #[test]
+    fn the_context_principal_wins_over_the_token() {
+        let principal = mtls_principal("CN=client-a");
+        let auth = api_key_auth("k:rw");
+
+        let owner = session_owner(Some(&principal), Some("k"), Some(&auth));
+
+        assert_eq!(owner, Some(stable_id_of(&principal)));
+    }
+
+    /// An unauthenticated runtime has no identity to bind a session to, which is
+    /// the one case an unowned session is correct.
+    #[test]
+    fn an_unauthenticated_handshake_has_no_owner() {
+        assert_eq!(session_owner(None, None, None), None);
+        assert_eq!(session_owner(None, Some("k"), None), None);
+    }
+
+    #[test]
+    fn a_token_the_validator_rejects_has_no_owner() {
+        let auth = api_key_auth("k:rw");
+
+        assert_eq!(session_owner(None, Some("wrong"), Some(&auth)), None);
+    }
 }
