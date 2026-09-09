@@ -41,13 +41,16 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
 
 - [ ] Create `release/X.Y` from `trunk` one day before release.
   - Refer to [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md).
+- [ ] Update the branch to the necessary version (should only need to drop `-unstable`).
+- [ ] Update `trunk` to the next version (with `-unstable` appended).
 - [ ] Lock the branch to critical fixes only and notify the team.
 - [ ] (Docs DRI) Create `release/X.Y.Z` in [spiceai/docs](https://github.com/spiceai/docs). All PRs should target the release branch until the release goes live.
 
 ## Pre-Release Testing & Validation
 
 1. **Build Validations**
-   - [ ] Ensure all builds (including CUDA) pass on **Linux and Windows**.
+   - [ ] Ensure [`build_and_release`](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml)(launched automatically) pass on **Linux and Windows**.
+   - [ ] Launch and ensure [`build_and_release_cuda`](https://github.com/spiceai/spiceai/actions/workflows/build_and_release_cuda.yml)(launch the workflow against the release branch) builds pass on **Linux and Windows**.
    - [ ] Verify all CI workflows complete without warnings or errors.
 
 1. **Unit/Integration Tests**
@@ -249,6 +252,8 @@ Testing focus DRIs are responsible for:
 ## Release Publication Steps
 
 - [ ] Cherry-pick release notes onto the release branch.
+- [ ] Cherry-pick the schema update PR onto the release branch.
+- [ ] Cherry-pick the acknowledgements onto the release branch.
 - [ ] Create a **pre-release** [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with a tag (e.g. `v1.0.0-rc.1`). Leave the body empty so automation can populate it from the checked-in notes.
 - [ ] Tag and release docs (e.g. `v1.0.0`) **after** the [build_and_release workflow](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml) completes.
   - [ ] (Docs DRI) Create and merge PR from `release/X.Y.Z` into `trunk`.
