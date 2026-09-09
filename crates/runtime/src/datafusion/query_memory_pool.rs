@@ -21,18 +21,19 @@ limitations under the License.
 //! `ExternalSorter` (`can_spill: true`) only spills when that grow *fails*, so
 //! a coalesced TPC-DS Q97 sort-merge held 103.6 GiB of a 107.50 GiB pool and
 //! `cayenne_scan[store_sales, partition=2]` could not get 1 MiB (lab SF-100
-//! `--validate`, 3d692f7d21). Unspillable consumers still use the full pool;
-//! spillable ones stop at `pool_size - headroom` so a scan can allocate.
+//! `--validate`, 3d692f7d21). The cap is on *spillable* bytes, not total
+//! used: capping total used let Q78 `HashJoinInput`s (unspillable) fill
+//! `pool - headroom` and then starve `GroupedHashAggregateStream` (b51504b3bc).
 
 use std::fmt::{Display, Formatter};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use datafusion::common::{Result, resources_datafusion_err};
 use datafusion::execution::memory_pool::{
     MemoryLimit, MemoryPool, MemoryReservation, TrackConsumersPool, human_readable_size,
 };
+use parking_lot::Mutex;
 
 /// Spillable operators cannot consume this fraction of the pool, so a
 /// `cayenne_scan` batch (1 MiB) can still allocate after a large sort.
@@ -51,10 +52,16 @@ pub(crate) fn tracked_query_memory_pool(
 }
 
 #[derive(Debug)]
+struct PoolState {
+    used: usize,
+    spillable_used: usize,
+}
+
+#[derive(Debug)]
 struct GreedyPoolWithSpillHeadroom {
     pool_size: usize,
     spillable_headroom: usize,
-    used: AtomicUsize,
+    state: Mutex<PoolState>,
 }
 
 impl GreedyPoolWithSpillHeadroom {
@@ -62,7 +69,10 @@ impl GreedyPoolWithSpillHeadroom {
         Self {
             pool_size,
             spillable_headroom: spillable_headroom_bytes(pool_size),
-            used: AtomicUsize::new(0),
+            state: Mutex::new(PoolState {
+                used: 0,
+                spillable_used: 0,
+            }),
         }
     }
 
@@ -85,40 +95,58 @@ impl MemoryPool for GreedyPoolWithSpillHeadroom {
         "greedy_spill_headroom"
     }
 
-    fn grow(&self, _reservation: &MemoryReservation, additional: usize) {
-        self.used.fetch_add(additional, Ordering::Relaxed);
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        let mut state = self.state.lock();
+        state.used = state.used.saturating_add(additional);
+        if reservation.consumer().can_spill() {
+            state.spillable_used = state.spillable_used.saturating_add(additional);
+        }
     }
 
-    fn shrink(&self, _reservation: &MemoryReservation, shrink: usize) {
-        self.used.fetch_sub(shrink, Ordering::Relaxed);
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        let mut state = self.state.lock();
+        state.used = state.used.saturating_sub(shrink);
+        if reservation.consumer().can_spill() {
+            state.spillable_used = state.spillable_used.saturating_sub(shrink);
+        }
     }
 
     fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
-        let cap = if reservation.consumer().can_spill() {
-            self.spillable_cap()
-        } else {
-            self.pool_size
+        let remaining = {
+            let mut state = self.state.lock();
+            let new_used = state.used.saturating_add(additional);
+            if new_used > self.pool_size {
+                Some(self.pool_size.saturating_sub(state.used))
+            } else if reservation.consumer().can_spill() {
+                let new_spillable = state.spillable_used.saturating_add(additional);
+                if new_spillable > self.spillable_cap() {
+                    Some(self.spillable_cap().saturating_sub(state.spillable_used))
+                } else {
+                    state.spillable_used = new_spillable;
+                    state.used = new_used;
+                    None
+                }
+            } else {
+                state.used = new_used;
+                None
+            }
         };
-        self.used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                let new_used = used.saturating_add(additional);
-                (new_used <= cap).then_some(new_used)
-            })
-            .map_err(|used| {
-                resources_datafusion_err!(
-                    "Failed to allocate additional {} for {} with {} already allocated for this reservation - {} remain available for the total memory pool: {}",
-                    human_readable_size(additional),
-                    reservation.consumer().name(),
-                    human_readable_size(reservation.size()),
-                    human_readable_size(cap.saturating_sub(used)),
-                    self
-                )
-            })?;
-        Ok(())
+        // Format `self` only after dropping the state lock (`Display` re-locks).
+        let Some(remaining) = remaining else {
+            return Ok(());
+        };
+        Err(resources_datafusion_err!(
+            "Failed to allocate additional {} for {} with {} already allocated for this reservation - {} remain available for the total memory pool: {}",
+            human_readable_size(additional),
+            reservation.consumer().name(),
+            human_readable_size(reservation.size()),
+            human_readable_size(remaining),
+            self
+        ))
     }
 
     fn reserved(&self) -> usize {
-        self.used.load(Ordering::Relaxed)
+        self.state.lock().used
     }
 
     fn memory_limit(&self) -> MemoryLimit {
@@ -128,11 +156,13 @@ impl MemoryPool for GreedyPoolWithSpillHeadroom {
 
 impl Display for GreedyPoolWithSpillHeadroom {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.lock();
         write!(
             f,
-            "{}(used: {}, pool_size: {}, spillable_cap: {})",
+            "{}(used: {}, spillable_used: {}, pool_size: {}, spillable_cap: {})",
             self.name(),
-            human_readable_size(self.used.load(Ordering::Relaxed)),
+            human_readable_size(state.used),
+            human_readable_size(state.spillable_used),
             human_readable_size(self.pool_size),
             human_readable_size(self.spillable_cap()),
         )
@@ -199,5 +229,29 @@ mod tests {
             .expect("unspillable consumers use the full pool");
         scan.try_grow(1)
             .expect_err("unspillable still cannot exceed the pool");
+    }
+
+    #[test]
+    fn unspillable_hash_joins_do_not_starve_spillable_aggregates() {
+        // Lab SF-100 Q78 on b51504b3bc: HashJoinInput (unspillable) filled
+        // total used to the spillable cap, then GroupedHashAggregateStream
+        // could not get 3.8 MiB. The cap is on spillable bytes only.
+        let pool_size = 16 * 1024;
+        let memory = pool(pool_size);
+        let cap = pool_size - spillable_headroom_bytes(pool_size);
+        let hash_join = MemoryConsumer::new("HashJoinInput[8]")
+            .with_can_spill(false)
+            .register(&memory);
+        hash_join
+            .try_grow(cap)
+            .expect("unspillable hash join may fill up to the spillable cap of total used");
+
+        let aggregate = MemoryConsumer::new("GroupedHashAggregateStream[12]")
+            .with_can_spill(true)
+            .register(&memory);
+        aggregate
+            .try_grow(1024)
+            .expect("spillable aggregate must still grow while unspillable holds the cap");
+        assert_eq!(memory.reserved(), cap + 1024);
     }
 }
