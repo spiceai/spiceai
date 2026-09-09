@@ -138,7 +138,7 @@ impl Catalog for RestCatalog {
     }
 }
 
-/// Guards the SigV4 signing middleware the `spiceai/iceberg-rust` fork adds to its
+/// Guards the `SigV4` signing middleware the `spiceai/iceberg-rust` fork adds to its
 /// REST catalog client, which is what lets a Glue-backed Iceberg catalog
 /// authenticate at all.
 ///

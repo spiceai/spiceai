@@ -1660,7 +1660,7 @@ mod tests {
             .trim()
             .trim_matches('"')
             .trim_matches('`')
-            .trim_matches(|c| c == '[' || c == ']')
+            .trim_matches(['[', ']'])
     }
 
     /// Every `AS <identifier>` binding emitted at `depth`, as the bare identifiers
@@ -1672,7 +1672,7 @@ mod tests {
             .map(|(at, keyword)| {
                 let rest = &sql[at + keyword.len()..];
                 let end = rest
-                    .find(|c: char| c == ',' || c == ')')
+                    .find([',', ')'])
                     .unwrap_or(rest.len())
                     .min(rest.find(" FROM ").unwrap_or(rest.len()));
                 unquoted(&rest[..end])
@@ -1732,7 +1732,7 @@ mod tests {
     }
 
     /// Naming a `DISTINCT ON`'s computed output must not change which key it groups
-    /// by. PostgreSQL resolves a bare name in `DISTINCT ON` and `ORDER BY` against
+    /// by. `PostgreSQL` resolves a bare name in `DISTINCT ON` and `ORDER BY` against
     /// the output list before the input columns, so aliasing the output to the name
     /// the key already spells rebinds the key from the input column to the output —
     /// the same rows grouped by a different key, in valid SQL with an unchanged
