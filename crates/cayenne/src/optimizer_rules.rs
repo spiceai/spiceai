@@ -1068,7 +1068,7 @@ fn input_is_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// aggregate and this is not a CTE self-join. Q78 is `ss LEFT JOIN ws LEFT
 /// JOIN cs`: the inner `ws ⋈ ss` is aggregate-aggregate, but the outer join
 /// builds the `cs` aggregate against that result — requiring *both* inputs
-/// to be aggregates left that outer HashJoinInput at 19 GB. Fact-dimension
+/// to be aggregates left that outer `HashJoinInput` at 19 GB. Fact-dimension
 /// joins (Q13) build a Cayenne scan, not an aggregate, and stay hash joins.
 fn should_spill_unknown_size_join(hash_join: &HashJoinExec) -> bool {
     !is_unknown_size_self_join(hash_join) && input_is_aggregate(hash_join.left())
