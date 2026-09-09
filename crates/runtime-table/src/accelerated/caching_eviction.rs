@@ -729,8 +729,27 @@ async fn rank_entries(
         get_df_default_config(),
         default_runtime_env(io_runtime.clone()),
     );
+    // Project away nested columns before aggregating. `read_table` scans the
+    // accelerator's whole schema, which for an HTTP cache includes the
+    // `response_headers` Map stored on every row. The sweep never reads that
+    // Map, but a declared `primary_key` adds functional dependencies that keep
+    // it live into the aggregate, where DataFusion's row format has no encoding
+    // for a Map — so the sweep fails on every tick and the budget is silently
+    // never enforced (#13976). Keeping only the columns `measured_bytes` can
+    // weigh retains exactly what the aggregate reads — the utf8 keys,
+    // `_fetched_at`, and the payload columns a byte budget sums — and drops
+    // every nested column a row format cannot encode, so the sweep plans with
+    // or without a declared key.
+    let projection: Vec<Expr> = schema
+        .fields()
+        .iter()
+        .filter(|field| measured_bytes(field).is_some())
+        .map(|field| col(field.name()))
+        .collect();
+
     let mut df = ctx
         .read_table(Arc::clone(accelerator))?
+        .select(projection)?
         .aggregate(key_columns.iter().map(col).collect(), aggregates)?;
 
     if has_fetched_at {
