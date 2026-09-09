@@ -8,12 +8,12 @@ fork (`Cargo.toml` `[patch.crates-io]`). Re-run the command below to regenerate
 
 | Item | Value |
 |------|--------|
-| Suite | [spiceai/substrait-compliance](https://github.com/spiceai/substrait-compliance) branch `spiceai` @ `5ccb99672853bd768019101ebb6a7d1aa4c8f547` = IBM `main` `b9b5f6a` (suite files identical to `v0.1.1`) plus the corrections in its `SPICEAI.md` |
+| Suite | [spiceai/substrait-compliance](https://github.com/spiceai/substrait-compliance) branch `spiceai` @ `43d31411c69ef7594887c7d759037bcf8244eeed` = IBM `main` `b9b5f6a` (suite files identical to `v0.1.1`) plus the TPC-H q01 shipdate-cutoff correction, the only difference from upstream |
 | `datafusion` / `datafusion-substrait` | `54.1.0` |
 | spiceai/datafusion rev | `8a0d18799449efcf0c4e087535ec3056cc41c03f` (spiceai/datafusion#226 head on `spiceai-54` `ce010574…`, which carries #215, #220 and #221) |
 | Suite | TPC-H SF 0.01 (22 queries) |
 | Oracle | DuckDB 1.2.0 (IBM goldens) |
-| Run | 2026-09-09T01:36:50Z → 2026-09-09T01:36:55Z |
+| Run | 2026-09-09T01:47:51Z → 2026-09-09T01:47:56Z |
 
 ## Counts
 
@@ -28,7 +28,7 @@ cargo run -p spice-substrait-compliance -- \
   --mode mode-a \
   --suite tools/substrait-compliance/.ibm/test-suites/tpch
 
-Suite: spiceai/substrait-compliance@5ccb99672853bd768019101ebb6a7d1aa4c8f547
+Suite: spiceai/substrait-compliance@43d31411c69ef7594887c7d759037bcf8244eeed
 DataFusion fork rev: 8a0d18799449efcf0c4e087535ec3056cc41c03f
   PASS  q01
   PASS  q02

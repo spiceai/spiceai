@@ -41,8 +41,8 @@ use crate::suite::load_tpch_suite;
 
 /// The suite commit this harness is pinned to: the `spiceai` branch of
 /// spiceai/substrait-compliance (IBM `main`, suite files identical to
-/// `v0.1.1`, plus the corrections listed in its `SPICEAI.md`).
-pub const SUITE_REF: &str = "spiceai/substrait-compliance@5ccb99672853bd768019101ebb6a7d1aa4c8f547";
+/// `v0.1.1`, plus the TPC-H q01 shipdate-cutoff correction).
+pub const SUITE_REF: &str = "spiceai/substrait-compliance@43d31411c69ef7594887c7d759037bcf8244eeed";
 
 /// spiceai/datafusion git rev from the workspace `[patch.crates-io]`.
 pub const DATAFUSION_FORK_REV: &str = "8a0d18799449efcf0c4e087535ec3056cc41c03f";

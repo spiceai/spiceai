@@ -5,8 +5,8 @@ This harness consumes the IBM Substrait Compliance Framework
 (https://github.com/IBM/substrait-compliance) as an external test-suite
 source, through the `spiceai` branch of the spiceai/substrait-compliance
 fork (https://github.com/spiceai/substrait-compliance): IBM's `main` plus
-the suite corrections listed in that branch's SPICEAI.md, pinned at commit
-5ccb99672853bd768019101ebb6a7d1aa4c8f547. The suite is cloned at run time (and in CI)
+the TPC-H q01 shipdate-cutoff correction, pinned at commit
+43d31411c69ef7594887c7d759037bcf8244eeed. The suite is cloned at run time (and in CI)
 and is not vendored into this tree.
 
 IBM/substrait-compliance is licensed under the Apache License,

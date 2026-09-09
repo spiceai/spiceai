@@ -2,15 +2,15 @@
 # Fetch the compliance suite into tools/substrait-compliance/.ibm at the pinned commit.
 #
 # The default is the `spiceai` branch of spiceai/substrait-compliance: IBM's
-# `main` (suite files identical to the `v0.1.1` release) plus the corrections
-# listed in that branch's SPICEAI.md. Pin a commit, not the branch, so a run is
-# reproducible; move the pin here, in the workflow, and in `SUITE_REF`
+# `main` (suite files identical to the `v0.1.1` release) plus the TPC-H q01
+# shipdate-cutoff correction, kept upstreamable. Pin a commit, not the branch,
+# so a run is reproducible; move the pin here, in the workflow, and in `SUITE_REF`
 # (src/main.rs) together.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="${ROOT}/.ibm"
-REF="${SUBSTRAIT_COMPLIANCE_REF:-5ccb99672853bd768019101ebb6a7d1aa4c8f547}"
+REF="${SUBSTRAIT_COMPLIANCE_REF:-43d31411c69ef7594887c7d759037bcf8244eeed}"
 REPO="${SUBSTRAIT_COMPLIANCE_REPO:-https://github.com/spiceai/substrait-compliance.git}"
 
 if [[ ! -d "${DEST}/.git" ]]; then
