@@ -835,6 +835,19 @@ mod tests {
         );
     }
 
+    /// `t INTERSECT t`, which `intersect` builds as a semi join whose sides
+    /// are requalified like a join's.
+    fn intersect_t_with_t() -> Rel {
+        use datafusion_substrait::substrait::proto::{SetRel, set_rel::SetOp};
+        Rel {
+            rel_type: Some(rel::RelType::Set(SetRel {
+                inputs: vec![read_t(None), read_t(None)],
+                op: i32::from(SetOp::IntersectionPrimary),
+                ..Default::default()
+            })),
+        }
+    }
+
     /// Both scopes self-join `t`, so both joins requalify their sides. The
     /// inner join must not take the enclosing join's `left`/`right` names or
     /// the predicate correlating to the outer `left` collapses to nothing;
@@ -856,16 +869,36 @@ mod tests {
         // The outer `left` rows 1|10 and 1|20 have a partner in `t` with the
         // same `a` and a different `b`; 2|30 has none. Each keeps its three
         // outer `right` partners. Without the fork fix the result is empty.
-        assert_eq!(
-            execute(&ctx, &proto).await,
-            rows(&[
-                &["1", "10", "1", "10"],
-                &["1", "10", "1", "20"],
-                &["1", "10", "2", "30"],
-                &["1", "20", "1", "10"],
-                &["1", "20", "1", "20"],
-                &["1", "20", "2", "30"],
-            ])
+        assert_eq!(execute(&ctx, &proto).await, six_rows_for_outer_left_1());
+    }
+
+    /// The enclosing scope self-joins `t` and the subquery self-intersects
+    /// it: `intersect`/`except` requalify their sides too, and must keep
+    /// clear of the enclosing `left`/`right` as a join does.
+    #[tokio::test]
+    async fn intersect_inside_a_subquery_keeps_its_correlation() {
+        let ctx = SessionContext::new();
+        register_t(&ctx, false);
+        let proto = plan(
+            filter(
+                cross(read_t(None), read_t(None)),
+                exists(filter(intersect_t_with_t(), correlated_on(0, 1))),
+            ),
+            &["a1", "b1", "a2", "b2"],
         );
+        // `t INTERSECT t` is `t`; the same six rows as for the self-join.
+        // Without the fork fix the result is empty.
+        assert_eq!(execute(&ctx, &proto).await, six_rows_for_outer_left_1());
+    }
+
+    fn six_rows_for_outer_left_1() -> Vec<Vec<String>> {
+        rows(&[
+            &["1", "10", "1", "10"],
+            &["1", "10", "1", "20"],
+            &["1", "10", "2", "30"],
+            &["1", "20", "1", "10"],
+            &["1", "20", "1", "20"],
+            &["1", "20", "2", "30"],
+        ])
     }
 }
