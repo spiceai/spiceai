@@ -1778,12 +1778,12 @@ mod tests {
         )
         .expect("failed to create table");
         let ctx = SessionContext::new();
-        let state = ctx.state();
+        let session_state = ctx.state();
 
         for (id, expected) in [(7_i64, 1_usize), (30_000_i64, 0_usize)] {
             let filter = col("id").eq(lit(id));
             let plan = table
-                .scan(&state, None, std::slice::from_ref(&filter), None)
+                .scan(&session_state, None, std::slice::from_ref(&filter), None)
                 .await
                 .expect("scan");
             let stats = plan.partition_statistics(None).expect("statistics");
