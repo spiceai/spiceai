@@ -16,16 +16,17 @@ limitations under the License.
 
 use arrow::{
     array::{
-        Array, ArrayData, ArrayRef, BinaryViewArray, DictionaryArray, GenericByteViewArray,
-        ListArray, MutableArrayData, PrimitiveArray, RecordBatch, RecordBatchOptions,
-        StringViewArray, StructArray, UInt64Array, downcast_dictionary_array, make_array,
-        new_null_array,
+        Array, ArrayData, ArrayRef, AsArray, BinaryViewArray, DictionaryArray,
+        GenericByteViewArray, ListArray, MutableArrayData, PrimitiveArray, RecordBatch,
+        RecordBatchOptions, StringViewArray, StructArray, UInt64Array, downcast_dictionary_array,
+        make_array, new_null_array,
     },
     buffer::{Buffer, NullBuffer, OffsetBuffer},
     compute::take,
     datatypes::{
         ArrowDictionaryKeyType, ArrowNativeType, ArrowNativeTypeOp, BinaryViewType, ByteViewType,
-        DataType, Field, FieldRef, SchemaRef, StringViewType, TimeUnit,
+        DataType, Decimal128Type, Field, FieldRef, Float64Type, SchemaRef, StringViewType,
+        TimeUnit,
     },
     error::ArrowError,
 };
@@ -236,6 +237,16 @@ fn is_overflow_error(e: &ArrowError) -> bool {
 /// Rust's `str::parse`, which arrow's parser matches). This covers every decimal
 /// width — `Decimal32`/`Decimal64` are lossy on the direct path too — and every
 /// float target, so it applies to every caller of `try_cast_to`.
+///
+/// The `Utf8` round-trip costs ~20-40x a plain divide, so the common
+/// `Decimal128 -> Float64` case takes a fast path when *every* coefficient is
+/// already exactly representable: a single divide is then correctly rounded on
+/// its own (see [`decimal128_to_f64_exact`]). Only values that actually need the
+/// exact digits pay for them.
+///
+/// This intercepts `try_cast_to` only. A correctly-rounded fix in arrow's cast
+/// kernel would also cover casts DataFusion performs directly (e.g. an explicit
+/// `CAST(x AS DOUBLE)`); that is tracked as follow-up work.
 fn cast_decimal_to_float(
     column: &ArrayRef,
     target_type: &DataType,
@@ -252,11 +263,45 @@ fn cast_decimal_to_float(
         return Ok(None);
     }
 
+    if let (DataType::Decimal128(_, scale), DataType::Float64) = (column.data_type(), target_type)
+        && let Some(exact) = decimal128_to_f64_exact(column, *scale)
+    {
+        return Ok(Some(exact));
+    }
+
     let strings = cast_with_options(column.as_ref(), &DataType::Utf8, options)
         .context(UnableToConvertRecordBatchSnafu)?;
     cast_with_options(strings.as_ref(), target_type, options)
         .context(UnableToConvertRecordBatchSnafu)
         .map(Some)
+}
+
+/// Fast, exact `Decimal128 -> Float64` for the common case, or `None` to fall back
+/// to the digit-exact `Utf8` path.
+///
+/// When `scale <= 22` and every coefficient is within `±2^53`, both the
+/// coefficient and `10^scale` are exactly representable, so a single IEEE division
+/// is already correctly rounded — no `Utf8` round-trip needed. The `min`/`max`
+/// gate makes this all-or-nothing per batch: if any value is out of range the
+/// whole batch takes the correct fallback, so no value is ever silently rounded
+/// on the way in.
+fn decimal128_to_f64_exact(column: &ArrayRef, scale: i8) -> Option<ArrayRef> {
+    if !(0..=22).contains(&scale) {
+        return None;
+    }
+    let values = column.as_primitive::<Decimal128Type>();
+    let within = |bound: Option<i128>| bound.is_none_or(|v| v.unsigned_abs() < (1u128 << 53));
+    if !within(arrow::compute::min(values)) || !within(arrow::compute::max(values)) {
+        return None;
+    }
+
+    let pow = 10f64.powi(i32::from(scale));
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "gated above: every coefficient is < 2^53, so i128 -> f64 is exact"
+    )]
+    let floats = values.unary::<_, Float64Type>(|v| v as f64 / pow);
+    Some(Arc::new(floats))
 }
 
 /// Whether `target` can be reached from `source` by relabelling alone: the two describe the same
