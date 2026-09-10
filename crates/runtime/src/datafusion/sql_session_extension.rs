@@ -30,14 +30,6 @@ use crate::sessions::{RequestedSession, SessionStore, SqlSession};
 #[derive(Debug, Snafu)]
 pub enum SessionError {
     #[snafu(display(
-        "Session '{session_id}' was not found, so the prepared statements it held are gone and \
-        this request cannot run in it. It expired after a period of inactivity, or it was never \
-        created. Retry without `x-session-id` to use this principal's own session, or start a new \
-        one with a Flight SQL handshake. See: https://spiceai.org/docs/api/HTTP/post-sql"
-    ))]
-    NotFound { session_id: String },
-
-    #[snafu(display(
         "Session '{session_id}' belongs to a different principal, so this request cannot run in \
         it. Use a session created with the credentials this request presents. \
         See: https://spiceai.org/docs/api/HTTP/post-sql"
@@ -101,14 +93,17 @@ impl SqlSessionExtension {
         principal: Option<&AuthPrincipalRef>,
         base_ctx: &SessionContext,
     ) -> Result<Option<Arc<SqlSession>>, SessionError> {
-        // `x-session-id` is a request to use one specific session. Not finding
-        // it is an error the caller needs to see: silently running against the
-        // shared context instead would surface later as a missing prepared
-        // statement, pointing at the query rather than at the expired session.
-        if let Some(id) = self.requested.explicit_id.as_deref() {
-            let session = self.store.get_issued(id).context(NotFoundSnafu {
-                session_id: id.to_string(),
-            })?;
+        // `x-session-id` when the request set it, otherwise its bearer token,
+        // which is only sometimes a session id.
+        let named = self
+            .requested
+            .explicit_id
+            .as_deref()
+            .or(self.requested.bearer_token.as_deref());
+
+        if let Some(id) = named
+            && let Some(session) = self.store.get_issued(id)
+        {
             ensure!(
                 session.is_owned_by(principal),
                 NotOwnedSnafu {
@@ -118,27 +113,18 @@ impl SqlSessionExtension {
             return Ok(Some(session));
         }
 
-        // A bearer token only *might* be a session id — most are just API keys —
-        // so one that names no session is not an error, it names nothing.
-        if let Some(token) = self.requested.bearer_token.as_deref()
-            && let Some(session) = self.store.get_issued(token)
-        {
-            ensure!(
-                session.is_owned_by(principal),
-                NotOwnedSnafu {
-                    session_id: session.id().to_string()
-                }
-            );
-            return Ok(Some(session));
-        }
-
-        // A caller that named no session still gets one, derived from its
-        // principal and created on first use. This is what makes
-        // `PREPARE`/`EXECUTE` span requests without a client having to ask for
-        // a session, and it is keyed on the principal so no client can choose
-        // which session it lands in.
+        // An id that resolves to nothing is not an error. Most bearer tokens are
+        // API keys rather than session ids, and `x-session-id` is a name other
+        // systems use too — failing those requests would break callers that have
+        // nothing to do with sessions.
         if let Some(stable_id) = principal.and_then(|principal| principal.stable_id()) {
             return Ok(Some(self.store.implicit_for(base_ctx, stable_id.as_ref())));
+        }
+
+        // No principal to key a session on: the id the request supplied is the
+        // key, as it has always been on Flight SQL.
+        if let Some(id) = named {
+            return Ok(Some(self.store.open_unowned(base_ctx, id)));
         }
 
         Ok(None)
@@ -215,17 +201,45 @@ mod tests {
         assert!(matches!(error, SessionError::NotOwned { .. }), "{error}");
     }
 
-    /// An `x-session-id` the store does not hold is reported, not quietly
-    /// downgraded to a stateless request.
+    /// An `x-session-id` the store does not hold is not an error: `x-session-id`
+    /// is a name other systems use too, and failing every request that carries
+    /// a stale or unrelated one would break callers with no interest in
+    /// sessions. The caller runs in its own session instead.
     #[test]
-    fn an_unknown_explicit_session_is_an_error() {
+    fn an_unknown_explicit_session_falls_through_to_the_callers_own() {
         let store = SessionStore::new();
         let ext = SqlSessionExtension::new(store, named(Some("no-such-session"), None));
 
-        let error = ext
+        let resolved = ext
             .resolve(Some(&principal("a")), &SessionContext::new())
-            .expect_err("an unknown session id is an error");
-        assert!(matches!(error, SessionError::NotFound { .. }), "{error}");
+            .expect("an unknown session id is not an error")
+            .expect("the caller still gets its own session");
+        assert!(resolved.is_owned_by(Some(&principal("a"))));
+    }
+
+    /// With no principal there is nothing to key a session on, so the id the
+    /// request supplied is the key — the behaviour Flight SQL has always had,
+    /// and what makes prepared statements work on a runtime with no auth.
+    #[test]
+    fn an_unauthenticated_caller_gets_a_session_keyed_on_the_id_it_supplied() {
+        let store = SessionStore::new();
+        let base = SessionContext::new();
+
+        let first = SqlSessionExtension::new(store.clone(), named(Some("my-own-id"), None))
+            .resolve(None, &base)
+            .expect("resolving is not an error")
+            .expect("a session is created under the supplied id");
+        let again = SqlSessionExtension::new(store.clone(), named(Some("my-own-id"), None))
+            .resolve(None, &base)
+            .expect("resolving is not an error")
+            .expect("and is reused on the next request");
+        assert!(Arc::ptr_eq(first.context(), again.context()));
+
+        let other = SqlSessionExtension::new(store, named(Some("a-different-id"), None))
+            .resolve(None, &base)
+            .expect("resolving is not an error")
+            .expect("a different id is a different session");
+        assert!(!Arc::ptr_eq(first.context(), other.context()));
     }
 
     /// A bearer token is ordinarily an API key. One that names no session must
@@ -292,52 +306,34 @@ mod tests {
         );
     }
 
-    /// These messages are the only explanation a caller gets for a session that
-    /// is gone or not theirs, so a reword must not quietly drop the session it
-    /// names, what the caller should do, or where to read more.
+    /// This message is the only explanation a caller gets for a session that is
+    /// not theirs, so a reword must not quietly drop the session it names, what
+    /// the caller should do, or where to read more.
     #[test]
     fn a_session_error_names_the_session_the_fix_and_the_docs() {
-        for error in [
-            SessionError::NotFound {
-                session_id: "sess-1".to_string(),
-            },
-            SessionError::NotOwned {
-                session_id: "sess-1".to_string(),
-            },
-        ] {
-            let message = error.to_string();
-            assert!(message.contains("'sess-1'"), "names the session: {message}");
-            assert!(
-                message.contains("https://spiceai.org/docs/"),
-                "links the docs: {message}"
-            );
-            assert!(
-                !message.contains('\n'),
-                "stays on one line so it is greppable: {message}"
-            );
+        let message = SessionError::NotOwned {
+            session_id: "sess-1".to_string(),
         }
+        .to_string();
 
+        assert!(message.contains("'sess-1'"), "names the session: {message}");
         assert!(
-            SessionError::NotFound {
-                session_id: "s".to_string(),
-            }
-            .to_string()
-            .contains("x-session-id"),
-            "a missing session tells the caller how to get a working one"
+            message.contains("https://spiceai.org/docs/"),
+            "links the docs: {message}"
         );
         assert!(
-            SessionError::NotOwned {
-                session_id: "s".to_string(),
-            }
-            .to_string()
-            .contains("credentials this request presents"),
-            "a foreign session tells the caller which credentials to use"
+            message.contains("credentials this request presents"),
+            "says which credentials to use: {message}"
+        );
+        assert!(
+            !message.contains('\n'),
+            "stays on one line so it is greppable: {message}"
         );
     }
 
     #[test]
     fn a_session_error_survives_a_round_trip_through_datafusion() {
-        let error = SessionError::NotFound {
+        let error = SessionError::NotOwned {
             session_id: "abc".to_string(),
         };
         let message = error.to_string();
@@ -345,7 +341,7 @@ mod tests {
 
         let recovered =
             SessionError::from_datafusion(&carried).expect("the session error is recoverable");
-        assert!(matches!(recovered, SessionError::NotFound { .. }));
+        assert!(matches!(recovered, SessionError::NotOwned { .. }));
         assert_eq!(recovered.to_string(), message);
 
         assert!(

@@ -154,30 +154,30 @@ async fn a_session_cannot_be_used_by_another_principal() -> Result<(), anyhow::E
         .await
 }
 
-/// Regression: session ids are issued, never accepted. Two principals that pick
-/// the same `x-session-id` must not land in one context — which is what happened
-/// when naming an unknown id created a session under it.
+/// Regression: two principals naming the same id must not share a context.
+/// They are authenticated, so each lands in the session its own principal owns
+/// and the id they chose is ignored.
 #[tokio::test]
 async fn two_principals_naming_the_same_id_do_not_share_a_session() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
         .scope(async {
+            let (channel, _df) = start_spice_test_app(Some(two_key_auth()), None, None).await?;
             const GUESSABLE: &str = "shared-guessable-id";
 
-            let (channel, _df) = start_spice_test_app(Some(two_key_auth()), None, None).await?;
-
             let mut first = client_for(&channel, "a", Some(GUESSABLE));
-            let status = run(&mut first, "PREPARE squat AS SELECT 'a private' AS v")
-                .await
-                .expect_err("a client-chosen id names no session");
-            assert_eq!(status.code(), Code::NotFound, "{}", status.message());
+            run(&mut first, "PREPARE squat AS SELECT 'a private' AS v").await?;
 
             let mut second = client_for(&channel, "b", Some(GUESSABLE));
             let status = run(&mut second, "EXECUTE squat")
                 .await
-                .expect_err("and creates none for the next caller to find");
-            assert_eq!(status.code(), Code::NotFound, "{}", status.message());
+                .expect_err("the second principal must not reach the first's statement");
+            assert!(
+                status.message().contains("'squat' does not exist"),
+                "expected a missing statement, got: {}",
+                status.message()
+            );
 
             Ok(())
         })

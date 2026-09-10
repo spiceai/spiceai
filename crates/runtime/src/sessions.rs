@@ -250,6 +250,34 @@ impl SessionStore {
         session
     }
 
+    /// The session a request's own id names on a runtime with no
+    /// authentication, created on first use.
+    ///
+    /// With no `runtime.auth` there is no principal to key a session on, so the
+    /// id the request supplied — `x-session-id`, or its bearer token — is the
+    /// key, which is how Flight SQL has always behaved. The session is unowned
+    /// and so reachable by anyone who names the same id; that is only offered
+    /// where the runtime has no identities to keep apart in the first place.
+    #[must_use]
+    pub fn open_unowned(&self, base_ctx: &SessionContext, id: &str) -> Arc<SqlSession> {
+        if let Some(session) = self.get_issued(id) {
+            return session;
+        }
+
+        let session = self.sessions.get_with(id.to_string(), || {
+            Arc::new(SqlSession {
+                ctx: Self::context_from(base_ctx, id),
+                kind: SessionKind::Issued,
+                id: id.to_string(),
+                owner_stable_id: None,
+                // Never a credential: it was not issued against one.
+                bearer_api_key: None,
+            })
+        });
+        self.sessions.run_pending_tasks();
+        session
+    }
+
     /// The API key an issued session id stands in for, so a bearer token that is
     /// a session id authenticates as the principal the session was issued to.
     ///

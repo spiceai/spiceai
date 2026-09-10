@@ -287,37 +287,33 @@ async fn two_principals_do_not_share_prepared_statements() -> Result<(), anyhow:
         .await
 }
 
-/// An expired or mistyped session id is reported as a missing session, not left
-/// to surface later as a missing prepared statement — which would point the
-/// caller at its SQL instead of at its session.
+/// A stale or unrelated `x-session-id` must not fail the request. The header
+/// name is one other systems use, and on HTTP the runtime never issues an id,
+/// so a value it does not recognise says nothing about what the caller wants —
+/// the request runs in the caller's own session.
 #[tokio::test]
-async fn naming_an_unknown_session_is_reported_as_such() -> Result<(), anyhow::Error> {
+async fn an_unknown_session_id_does_not_fail_the_request() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
         .scope(async {
             let rt = start(&["k:rw"]).await?;
+            let stale = "00000000-0000-4000-8000-000000000000";
 
-            let (status, body) = rt
-                .sql(
-                    "k",
-                    Some("00000000-0000-4000-8000-000000000000"),
-                    "SELECT 1",
-                )
-                .await?;
-
-            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-            assert!(
-                body.contains("00000000-0000-4000-8000-000000000000")
-                    && body.contains("was not found"),
-                "the message names the session that is missing: {body}"
+            let body = rt.sql_ok("k", Some(stale), "SELECT 1 AS n").await?;
+            assert_eq!(
+                serde_json::from_str::<Value>(&body)?,
+                serde_json::json!([{ "n": 1 }]),
+                "an ordinary query is unaffected by a session id the runtime does not hold"
             );
-            // The error rides inside a `DataFusionError::External`, whose generic
-            // formatting prefixes "External error:" — a DataFusion internal the
-            // caller has no use for.
-            assert!(
-                !body.contains("External error"),
-                "the message must not leak the DataFusion wrapper: {body}"
+
+            // And it is the caller's own session, so statements still carry over.
+            rt.sql_ok("k", Some(stale), "PREPARE p AS SELECT 2 AS n")
+                .await?;
+            let body = rt.sql_ok("k", None, "EXECUTE p").await?;
+            assert_eq!(
+                serde_json::from_str::<Value>(&body)?,
+                serde_json::json!([{ "n": 2 }])
             );
 
             Ok(())
@@ -369,34 +365,30 @@ async fn a_session_cannot_be_used_by_another_principal() -> Result<(), anyhow::E
         .await
 }
 
-/// Regression: session ids are issued, never accepted. Two principals that pick
-/// the same id must not land in one context — which is what happened when a
-/// request naming an unknown id had a session created for it under that id.
+/// Regression: two principals naming the same id must not share a context.
+/// They are authenticated, so each gets the session its own principal owns and
+/// the id they chose is ignored.
 #[tokio::test]
 async fn two_principals_naming_the_same_id_do_not_share_a_session() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
         .scope(async {
+            let rt = start(&["a:rw", "b:rw"]).await?;
             const GUESSABLE: &str = "shared-guessable-id";
 
-            let rt = start(&["a:rw", "b:rw"]).await?;
-
-            let (status, body) = rt
-                .sql(
-                    "a",
-                    Some(GUESSABLE),
-                    "PREPARE squat AS SELECT 'a private' AS v",
-                )
-                .await?;
-            assert_eq!(
-                status,
-                StatusCode::NOT_FOUND,
-                "a client-chosen id names no session and creates none: {body}"
-            );
+            rt.sql_ok(
+                "a",
+                Some(GUESSABLE),
+                "PREPARE squat AS SELECT 'a private' AS v",
+            )
+            .await?;
 
             let (status, body) = rt.sql("b", Some(GUESSABLE), "EXECUTE squat").await?;
-            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert!(
+                !status.is_success() && body.contains("'squat' does not exist"),
+                "the second principal must not reach the first's statement: {status} {body}"
+            );
 
             Ok(())
         })

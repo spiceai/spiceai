@@ -698,12 +698,10 @@ pub(crate) fn handle_datafusion_error(e: DataFusionError) -> Status {
     if query::is_timeout_error(&e) {
         return Status::deadline_exceeded(e.to_string());
     }
-    // A session the runtime does not hold, or one belonging to someone else,
-    // is not a malformed query — report it as the distinct condition it is so a
-    // client can tell "create a new session" from "fix your SQL".
+    // A session belonging to someone else is not a malformed query — report it
+    // as the distinct condition it is.
     if let Some(session_error) = SessionError::from_datafusion(&e) {
         return match session_error {
-            SessionError::NotFound { .. } => Status::not_found(session_error.to_string()),
             SessionError::NotOwned { .. } => Status::permission_denied(session_error.to_string()),
         };
     }

@@ -390,10 +390,6 @@ enum SqlErrorKind {
     /// separately so it can be logged as the operator-actionable condition it
     /// is and answered with a retriable status.
     ResourcesExhausted,
-    /// The request named a session the runtime does not hold. Distinguished so
-    /// the caller is told to create a session rather than left to read a
-    /// missing prepared statement as a mistake in its SQL.
-    SessionNotFound,
     /// The request named a session belonging to another principal.
     SessionNotOwned,
 }
@@ -426,7 +422,6 @@ impl SqlErrorKind {
     fn of_datafusion_error(e: &datafusion::error::DataFusionError) -> Self {
         if let Some(session_error) = SessionError::from_datafusion(e) {
             return match session_error {
-                SessionError::NotFound { .. } => Self::SessionNotFound,
                 SessionError::NotOwned { .. } => Self::SessionNotOwned,
             };
         }
@@ -465,7 +460,6 @@ fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
         // replica. Flight already reports the same failure as the retriable
         // `RESOURCE_EXHAUSTED`.
         SqlErrorKind::ResourcesExhausted => StatusCode::SERVICE_UNAVAILABLE,
-        SqlErrorKind::SessionNotFound => StatusCode::NOT_FOUND,
         SqlErrorKind::SessionNotOwned => StatusCode::FORBIDDEN,
         SqlErrorKind::General => status_for_sql_error(&message),
     };
