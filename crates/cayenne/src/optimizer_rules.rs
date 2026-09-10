@@ -1038,11 +1038,22 @@ fn wrap_sort_merge_to_hash_join_schema(
     sort_merge: Arc<dyn ExecutionPlan>,
     hash_join: &HashJoinExec,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
-    let Some(indices) = hash_join.projection.as_ref() else {
-        return Ok(Some(sort_merge));
-    };
     let source = sort_merge.schema();
     let target = hash_join.schema();
+    let Some(indices) = hash_join.projection.as_ref() else {
+        // No embedded projection: SMJ must still emit the hash join's types.
+        // TPC-DS Q92 SF-10: N-way SMJ of an oracle aggregate join produced
+        // Decimal128(30, 15) where HashJoinExec had Decimal128(7, 2).
+        if source.fields().len() != target.fields().len() {
+            return Ok(None);
+        }
+        for i in 0..target.fields().len() {
+            if source.field(i).data_type() != target.field(i).data_type() {
+                return Ok(None);
+            }
+        }
+        return Ok(Some(sort_merge));
+    };
     if indices.len() != target.fields().len() {
         return Ok(None);
     }
