@@ -10,6 +10,7 @@ on:
     paths:
       - 'install/**'
       - 'test/scripts/install-scripts-test.sh'
+      - 'test/scripts/install-download-test.py'
       - '.github/workflows/install_scripts_test.yml'
   push:
     branches:
@@ -17,6 +18,7 @@ on:
     paths:
       - 'install/**'
       - 'test/scripts/install-scripts-test.sh'
+      - 'test/scripts/install-download-test.py'
       - '.github/workflows/install_scripts_test.yml'
   workflow_dispatch:
 
@@ -358,6 +360,9 @@ jobs:
             echo "ERROR: Alternative HTTP client is still available"
             exit 1
           fi
+
+      - name: Test runtime download retries with ${{ matrix.client }}
+        run: python3 test/scripts/install-download-test.py --client "${{ matrix.client }}"
 
       - name: Test install.sh with ${{ matrix.client }}
         env:
