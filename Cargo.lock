@@ -4443,6 +4443,8 @@ dependencies = [
  "runtime-parameters",
  "runtime-udfs-api",
  "secrecy",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "snafu",
  "tokio",
