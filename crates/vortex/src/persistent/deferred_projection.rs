@@ -375,6 +375,11 @@ mod tests {
 
         fn assert_bytes_under(&self, budget: u64, what: &str) {
             assert!(
+                self.bytes_read > 0,
+                "{what} reported zero bytes read, so the {budget}-byte budget below would \
+                 pass without the scan having done any I/O"
+            );
+            assert!(
                 self.bytes_read < budget,
                 "{what} read {} bytes of a {}-byte file in {} reads, over the {budget}-byte \
                  budget: projection setup is running before the filter resolves",
@@ -460,25 +465,37 @@ mod tests {
                 rows: batches.iter().map(RecordBatch::num_rows).sum(),
                 first_value,
                 first_row,
-                bytes_read: sum_metric(plan.as_ref(), "vortex.io.read.total_size"),
-                reads: sum_metric(plan.as_ref(), "vortex.io.read.size_count"),
+                bytes_read: sum_metric(plan.as_ref(), "vortex.io.read.total_size")?,
+                reads: sum_metric(plan.as_ref(), "vortex.io.read.size_count")?,
                 file_bytes: self.file_bytes,
             })
         }
     }
 
     /// Sums one Vortex counter across every Vortex scan in `plan`.
-    fn sum_metric(plan: &dyn ExecutionPlan, metric_name: &str) -> u64 {
-        VortexMetricsFinder::find_all(plan)
-            .iter()
-            .flat_map(MetricsSet::iter)
-            .filter_map(|metric| match metric.value() {
-                MetricValue::Count { name, count } if name == metric_name => {
-                    Some(count.value() as u64)
-                }
-                _ => None,
-            })
-            .sum()
+    ///
+    /// Errors when no scan reported the counter at all, rather than summing to zero: a
+    /// budget compared against a metric that stopped being collected — renamed upstream, or
+    /// no longer reachable from the plan — would pass no matter how much the scan read.
+    fn sum_metric(plan: &dyn ExecutionPlan, metric_name: &str) -> anyhow::Result<u64> {
+        let sets = VortexMetricsFinder::find_all(plan);
+        let mut total = 0u64;
+        let mut found = false;
+        for metric in sets.iter().flat_map(MetricsSet::iter) {
+            if let MetricValue::Count { name, count } = metric.value()
+                && name == metric_name
+            {
+                total += count.value() as u64;
+                found = true;
+            }
+        }
+        anyhow::ensure!(
+            found,
+            "no Vortex scan reported `{metric_name}`, so this measurement is not measuring \
+             anything; {} metric set(s) were found on the plan",
+            sets.len()
+        );
+        Ok(total)
     }
 
     #[tokio::test]
