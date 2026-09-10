@@ -137,10 +137,10 @@ pub mod query;
 
 pub mod app_context_extension;
 pub mod builder;
-pub(crate) mod query_memory_pool;
 pub(crate) mod caching_retention;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
+pub(crate) mod query_memory_pool;
 pub use runtime_datafusion::composed_catalog;
 // `error` and `refresh_sql` below are named throughout the runtime through these
 // aliases, but they belong to `runtime-datafusion`. Crate-visible so a crate outside
