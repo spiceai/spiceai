@@ -114,7 +114,17 @@ jobs:
           fi
           query_set="$QUERY_SET"
           query_set="${query_set%%\[*\]*}"
-          fixture_scale="${SCALE_FACTOR//./_}"
+          scale_factor="$SCALE_FACTOR"
+          while [[ "$scale_factor" == 0[0-9]* ]]; do
+            scale_factor="${scale_factor#0}"
+          done
+          if [[ "$scale_factor" == *.* ]]; then
+            while [[ "$scale_factor" == *0 ]]; do
+              scale_factor="${scale_factor%0}"
+            done
+            scale_factor="${scale_factor%.}"
+          fi
+          fixture_scale="${scale_factor//./_}"
           SPICEPOD_PATH="./test/spicepods/${query_set}/sf${fixture_scale}/${SPICEPOD_FILE}"
           {
             echo "SPICEPOD_PATH=${SPICEPOD_PATH}"

@@ -30,7 +30,17 @@ runs:
           echo "Error: scale_factor must be a positive number"
           exit 1
         fi
-        echo "directory_scale=${SCALE_FACTOR//./_}" >> "$GITHUB_OUTPUT"
+        scale_factor="$SCALE_FACTOR"
+        while [[ "$scale_factor" == 0[0-9]* ]]; do
+          scale_factor="${scale_factor#0}"
+        done
+        if [[ "$scale_factor" == *.* ]]; then
+          while [[ "$scale_factor" == *0 ]]; do
+            scale_factor="${scale_factor%0}"
+          done
+          scale_factor="${scale_factor%.}"
+        fi
+        echo "directory_scale=${scale_factor//./_}" >> "$GITHUB_OUTPUT"
 
     - name: Prepare file-based data directory (Linux/macOS)
       if: runner.os != 'Windows'
