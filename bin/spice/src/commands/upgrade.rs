@@ -49,6 +49,8 @@ pub struct UpgradeArgs {
 
 /// Execute the upgrade command.
 pub async fn execute(ctx: &RuntimeContext, args: &UpgradeArgs) -> Result<()> {
+    ctx.ensure_local_runtime_supported()?;
+
     // Validate version format if provided
     if let Some(ref version) = args.version
         && !version.starts_with('v')
