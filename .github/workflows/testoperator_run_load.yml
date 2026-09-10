@@ -22,14 +22,17 @@ jobs:
         REFERENCE_DREMIO_ENDPOINT: ${{ vars.TEST_DREMIO_ENDPOINT}}
         REFERENCE_DREMIO_USERNAME: ${{ secrets.TEST_DREMIO_USERNAME}}
         REFERENCE_DREMIO_PASSWORD: ${{ secrets.TEST_DREMIO_PASSWORD}}
-      run: "python3 - <<'PYTHON'\nimport json,os\nfrom pathlib import Path\nimport psycopg\nimport pyarrow.flight as flight\nresults=[]\nfor label in ['LOAD','REFERENCE']:\n    settings={k:os.environ.get(label+'_'+k,'')\
-        \ for k in ['POSTGRES_HOST','POSTGRES_PASSWORD','DREMIO_ENDPOINT','DREMIO_USERNAME','DREMIO_PASSWORD']}\n    record={'binding':label,'postgres_configured':all(settings[k] for k in ['POSTGRES_HOST','POSTGRES_PASSWORD']),'dremio_configured':all(settings[k]\
-        \ for k in ['DREMIO_ENDPOINT','DREMIO_USERNAME','DREMIO_PASSWORD'])}\n    if record['postgres_configured']:\n        try:\n            with psycopg.connect(host=settings['POSTGRES_HOST'],password=settings['POSTGRES_PASSWORD'],user='postgres',dbname='tpch_sf1',sslmode='disable',connect_timeout=10,options='-c\
+      run: "python3 - <<'PYTHON'\nimport json,os\nfrom pathlib import Path\nimport psycopg\nimport pyarrow.flight as flight\nresults=[]\ndef safe_error(exc,settings):\n    text=str(exc)\n    for value in\
+        \ sorted((v for v in settings.values() if v),key=len,reverse=True):text=text.replace(value,'<configured value>')\n    return text[:1200]\nfor label in ['LOAD','REFERENCE']:\n    settings={k:os.environ.get(label+'_'+k,'')\
+        \ for k in ['POSTGRES_HOST','POSTGRES_PASSWORD','DREMIO_ENDPOINT','DREMIO_USERNAME','DREMIO_PASSWORD']}\n    record={'binding':label,'present':{k:bool(v) for k,v in settings.items()},'postgres_configured':all(settings[k]\
+        \ for k in ['POSTGRES_HOST','POSTGRES_PASSWORD']),'dremio_configured':all(settings[k] for k in ['DREMIO_ENDPOINT','DREMIO_USERNAME','DREMIO_PASSWORD'])}\n    if record['postgres_configured']:\n\
+        \        try:\n            with psycopg.connect(host=settings['POSTGRES_HOST'],password=settings['POSTGRES_PASSWORD'],user='postgres',dbname='tpch_sf1',sslmode='disable',connect_timeout=10,options='-c\
         \ default_transaction_read_only=on -c statement_timeout=15000') as conn:\n                with conn.cursor() as cur:\n                    cur.execute('SELECT 1');assert cur.fetchone()==(1,)\n  \
         \                  cur.execute('SELECT count(*) FROM nation');record['postgres_nation_rows']=cur.fetchone()[0]\n                    record['postgres_select']='pass'\n        except Exception as\
-        \ exc:record['postgres_error_type']=type(exc).__name__;record['postgres_sqlstate']=getattr(exc,'sqlstate',None)\n    if record['dremio_configured']:\n        try:\n            endpoint=settings['DREMIO_ENDPOINT'].replace('https://','grpc+tls://').replace('http://','grpc://')\n\
-        \            with flight.FlightClient(endpoint) as client:\n                token=client.authenticate_basic_token(settings['DREMIO_USERNAME'],settings['DREMIO_PASSWORD'],flight.FlightCallOptions(timeout=15))\n\
-        \                record['dremio_authenticated']=bool(token and token[1])\n        except Exception as exc:record['dremio_error_type']=type(exc).__name__\n    results.append(record);print(json.dumps(record),flush=True)\n\
+        \ exc:record['postgres_error_type']=type(exc).__name__;record['postgres_sqlstate']=getattr(exc,'sqlstate',None);record['postgres_error']=safe_error(exc,settings)\n    if record['dremio_configured']:\n\
+        \        try:\n            endpoint=settings['DREMIO_ENDPOINT'].replace('https://','grpc+tls://').replace('http://','grpc://')\n            with flight.FlightClient(endpoint) as client:\n      \
+        \          token=client.authenticate_basic_token(settings['DREMIO_USERNAME'],settings['DREMIO_PASSWORD'],flight.FlightCallOptions(timeout=15))\n                record['dremio_authenticated']=bool(token\
+        \ and token[1])\n        except Exception as exc:record['dremio_error_type']=type(exc).__name__;record['dremio_error']=safe_error(exc,settings)\n    results.append(record);print(json.dumps(record),flush=True)\n\
         Path('load-backend-results.json').write_text(json.dumps(results,indent=2)+'\\n')\nPYTHON\n"
     - name: Retain non-secret probe results
       if: always()
