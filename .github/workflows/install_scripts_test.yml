@@ -368,6 +368,20 @@ jobs:
           ./install/install.sh
           "$SPICE_CLI_INSTALL_DIR/spice" version
 
+      - name: Reject invalid release credentials with ${{ matrix.client }}
+        env:
+          GITHUB_TOKEN: invalid-installer-test-token
+          LC_ALL: C
+          SPICED_INSTALL_DIR: ${{ runner.temp }}/spiced-bin
+        run: |
+          if bash install/install-spiced.sh > "${{ runner.temp }}/invalid-token.log" 2>&1; then
+            echo "ERROR: Runtime installer accepted invalid release credentials"
+            exit 1
+          fi
+          cat "${{ runner.temp }}/invalid-token.log"
+          grep -E '(^|[^0-9])401([^0-9]|$)|Username/Password Authentication Failed\.' "${{ runner.temp }}/invalid-token.log"
+          grep -F "Failed to get latest release information" "${{ runner.temp }}/invalid-token.log"
+
       - name: Test install-spiced.sh with ${{ matrix.client }}
         env:
           SPICED_INSTALL_DIR: ${{ runner.temp }}/spiced-bin
