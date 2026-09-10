@@ -551,10 +551,12 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
 ///
 /// Delete-all discards the tier wholesale (#11987, #12072). A filtered delete
 /// evaluates the predicate against the tier and rebuilds it without the matching
-/// rows (#12008); `delete_mem_tier_rows_matching` restricts itself to
-/// memory-resident tables, because a `cdc_durability: memory` table makes its RAM
-/// rows durable before either sink is built and has a byte reservation only its
-/// checkpoint may release.
+/// rows (#12008), for memory-resident tables only — see
+/// `delete_mem_tier_rows_matching` for why the other memory profile is excluded.
+///
+/// The two arms are not symmetric: the delete-all branch applies to every mode
+/// and carries slot-advancer and budget bookkeeping, while the filtered branch
+/// self-gates on memory residency and carries neither.
 ///
 /// Rebuilding is the general mechanism rather than landing an in-RAM tombstone per
 /// matched key. A tombstone is keyed by primary key and hides every row at or

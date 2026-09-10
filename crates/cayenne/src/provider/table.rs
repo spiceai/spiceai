@@ -14068,7 +14068,7 @@ impl CayenneTableProvider {
                 if !has_rows && !has_deletions {
                     return None;
                 }
-                let superseded = deletions.total_superseded() as u64;
+                let superseded = u64::try_from(deletions.total_superseded()).unwrap_or(u64::MAX);
                 Some(self.append_to_shard(
                     s,
                     filtered_batches.clone(),
@@ -24173,6 +24173,12 @@ impl CayenneTableProvider {
         // `DoNothing` table's keyset, and the next insert of that key would be dropped as
         // a duplicate of a row that no longer exists. The exact-count scan costs nothing
         // for the usual time/value retention predicate, which never had a fast path.
+        // Deliberately NOT wrapped in `InlineAwareDeletionSink`, so retention does
+        // not get its mem-tier arm: this is the one `build_deletion_vector_sink`
+        // caller that passes the `write_lock` INTO the sink rather than holding it,
+        // and the wrapper takes that same non-reentrant lock itself. The consequence
+        // is that `retention_sql` does not reach a `mode: memory` tier, which the
+        // accelerator warns about at registration.
         let sink = self
             .build_deletion_vector_sink(
                 &filters,
@@ -29825,7 +29831,9 @@ impl CayenneTableProvider {
     /// safe.
     ///
     /// A predicate that matches nothing rebuilds nothing: every segment keeps its
-    /// `Arc`s, so a no-match delete costs one predicate pass and no allocation.
+    /// `Arc`s, so a no-match delete costs one predicate pass over the tier and no
+    /// batch copy. A predicate that does match pays a visibility probe over the
+    /// matched rows only.
     pub(crate) async fn delete_mem_tier_rows_matching(
         &self,
         filters: &[Expr],
@@ -29844,62 +29852,83 @@ impl CayenneTableProvider {
         }
 
         let mut visible_deleted: u64 = 0;
-        let mut tier_changed = false;
+        let mut raw_removed: u64 = 0;
         // Each shard is rebuilt under ITS OWN publish lock, in index order — the
         // deadlock-free order every other multi-shard site uses. Memory mode is
-        // single-shard today (enforced by the accelerator's memory-mode overrides),
-        // so this is one iteration; pairing the lock with the shard rather than
-        // hardcoding shard 0 is what keeps it correct if that ever stops being true.
+        // single-shard (enforced by the accelerator's memory-mode overrides), so
+        // this is one iteration, and it relies on that: shards are swapped one at a
+        // time, so at N>1 a lock-free scan could capture one shard before the delete
+        // and the next after it. Making this atomic across shards needs more than
+        // per-shard locking, and nothing here provides it.
         for (shard_id, shard) in self.mem_tier.shards().iter().enumerate() {
             let _publish = self.mem_tier_publish_locks[shard_id].lock().await;
             let current = shard.load_full();
-            if current.is_empty() || current.segments.is_empty() {
+            if current.segments.is_empty() {
                 continue;
             }
 
-            // A tier holding an upsert history carries superseded versions that no
-            // scan serves. Removing one is harmless — it is invisible either way,
-            // and its segment's tombstone stays to hide anything older — but
-            // COUNTING one is not: a user `DELETE` reports an exact `rows affected`,
-            // and a client that upserted a key twice would be told two rows went.
-            // So the count is taken against the batches a scan would serve, the
-            // same way `purge_mem_tier_all` counts what it discards. With no
-            // tombstone anywhere in the tier every raw row is visible and the
-            // rebuild's own tally is already exact, which is the common case (a
-            // tier that never upserted) and skips this pass entirely.
-            if Self::mem_tier_has_tombstones(&current) {
-                for batch in self.visible_mem_tier_batches(&current, None)? {
-                    visible_deleted = visible_deleted.saturating_add(
-                        self.delete_match_mask(&batch, &physical_filters)?
-                            .map_or(0, |matched| matched.true_count() as u64),
-                    );
+            // The predicate is evaluated EXACTLY ONCE per batch, and both answers
+            // this loop needs come from that one mask. Evaluating it again to count
+            // would not merely cost a second pass: a volatile predicate
+            // (`WHERE random() < 0.5`) answers differently each time, so the count a
+            // client is told would describe a different row set than the one removed.
+            let deletion_maps = Self::mem_tier_deletion_maps(&current);
+            let tier_has_tombstones = Self::mem_tier_has_tombstones(&current);
+            let mut shard_visible: u64 = 0;
+            let (next, removed) = current.retain_rows(|batch, data_sequence| {
+                let Some(matched) = self.delete_match_mask(batch, &physical_filters)? else {
+                    return Ok(batch.clone());
+                };
+                let match_count = matched.true_count();
+                // Nothing to remove: hand the batch back untouched rather than
+                // building an all-true mask and filtering by it, which would
+                // allocate one `ArrayData` per column to reproduce the input.
+                if match_count == 0 {
+                    return Ok(batch.clone());
                 }
-            }
 
-            let mut raw_matched: u64 = 0;
-            let (next, removed) =
-                current.retain_rows(|batch| -> datafusion_common::Result<RecordBatch> {
-                    let Some(matched) = self.delete_match_mask(batch, &physical_filters)? else {
-                        return Ok(batch.clone());
-                    };
-                    raw_matched = raw_matched.saturating_add(matched.true_count() as u64);
-                    let keep = arrow::compute::not(&matched)?;
-                    Ok(arrow::compute::filter_record_batch(batch, &keep)?)
-                })?;
+                // A tier holding an upsert history carries superseded versions that
+                // no scan serves. Removing one is harmless — it is invisible either
+                // way, and its segment's tombstone stays to hide anything older —
+                // but COUNTING one is not: a user `DELETE` reports an exact
+                // `rows affected`, and a client that upserted a key twice would be
+                // told two rows went. Visibility is therefore resolved over the
+                // MATCHED rows alone — a probe of what is being deleted, not a walk
+                // of the tier. With no tombstone anywhere every row is visible and
+                // even that probe is skipped.
+                shard_visible = shard_visible.saturating_add(if tier_has_tombstones {
+                    let matched_rows = arrow::compute::filter_record_batch(batch, &matched)?;
+                    self.filter_inlined_batch_for_deletions(
+                        matched_rows,
+                        data_sequence,
+                        &deletion_maps,
+                    )
+                    .map_err(|error| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to resolve mem-tier row visibility while deleting from dataset '{}': {error}",
+                            self.table_metadata.table_name
+                        ))
+                    })?
+                    .map_or(0, |visible| visible.num_rows() as u64)
+                } else {
+                    match_count as u64
+                });
+
+                let keep = arrow::compute::not(&matched)?;
+                Ok(arrow::compute::filter_record_batch(batch, &keep)?)
+            })?;
             if removed == 0 {
                 continue;
             }
-            if !Self::mem_tier_has_tombstones(&current) {
-                visible_deleted = visible_deleted.saturating_add(raw_matched);
-            }
+            visible_deleted = visible_deleted.saturating_add(shard_visible);
             shard.store(Arc::new(next));
-            tier_changed = true;
+            raw_removed = raw_removed.saturating_add(removed);
         }
 
         // Keyed on the PHYSICAL fact, not on the number reported to the client: a
         // rebuild that dropped only superseded rows still swapped the tier, and
         // every scan-view cache keyed on its version has to re-key.
-        if tier_changed {
+        if raw_removed > 0 {
             self.notify_scan_input_change();
             self.clear_scan_file_statistics_cache();
         }
@@ -29939,9 +29968,10 @@ impl CayenneTableProvider {
                         array.data_type()
                     ))
                 })?;
-            let mask = match mask.nulls() {
-                Some(nulls) => arrow::array::BooleanArray::new(mask.values() & nulls.inner(), None),
-                None => mask.clone(),
+            let mask = if mask.null_count() == 0 {
+                mask.clone()
+            } else {
+                arrow::compute::prep_null_mask_filter(mask)
             };
             matched = Some(match matched {
                 None => mask,

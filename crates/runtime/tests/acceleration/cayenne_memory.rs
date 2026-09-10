@@ -191,233 +191,242 @@ async fn test_cayenne_memory_mode_full_refresh_and_query() -> Result<(), anyhow:
 }
 
 // ── #12008: DML against a `mode: memory` Cayenne acceleration ──────────────
+//
+// One `cfg` for the whole section rather than one per test: the engine is not
+// built on Windows, so without it the helpers below compile there with no callers.
+#[cfg(not(target_os = "windows"))]
+mod dml {
+    use super::*;
+    use super::{execute_sql, refresh};
 
-/// A request context that bypasses the results cache, so a `SELECT` after a
-/// mutation reflects the accelerator rather than a cached answer.
-fn no_cache_context() -> Arc<RequestContext> {
-    Arc::new(
-        RequestContext::builder(Protocol::Internal)
-            .with_user_agent(UserAgent::from_ua_str(&format!(
-                "spiceci/{}",
-                env!("CARGO_PKG_VERSION")
-            )))
-            .with_cache_control(CacheControl::NoCache)
-            .build(),
-    )
-}
+    /// A request context that bypasses the results cache, so a `SELECT` after a
+    /// mutation reflects the accelerator rather than a cached answer.
+    fn no_cache_context() -> Arc<RequestContext> {
+        Arc::new(
+            RequestContext::builder(Protocol::Internal)
+                .with_user_agent(UserAgent::from_ua_str(&format!(
+                    "spiceci/{}",
+                    env!("CARGO_PKG_VERSION")
+                )))
+                .with_cache_control(CacheControl::NoCache)
+                .build(),
+        )
+    }
 
-/// Stand up a one-dataset runtime whose `table_name` is a Cayenne acceleration in
-/// `mode`, over a five-row CSV, and assert the two preconditions every DML case
-/// below depends on.
-///
-/// `primary_key` + `on_conflict` is what routes writes to the accelerator alone
-/// (`select_accelerated_write_mode`), which is how a client statement reaches
-/// Cayenne rather than the file source.
-///
-/// Returns the temp dir alongside the runtime because the CSV source lives in it
-/// and must outlive the runtime.
-async fn cayenne_dml_runtime(
-    mode: Mode,
-    table_name: &str,
-) -> Result<(tempfile::TempDir, Arc<Runtime>), anyhow::Error> {
-    let temp_dir = tempfile::tempdir()?;
-    let csv = temp_dir.path().join(format!("{table_name}.csv"));
-    std::fs::write(
-        &csv,
-        "id,name,value\n\
+    /// Stand up a one-dataset runtime whose `table_name` is a Cayenne acceleration in
+    /// `mode`, over a five-row CSV, and assert the two preconditions every DML case
+    /// below depends on.
+    ///
+    /// `primary_key` + `on_conflict` is what routes writes to the accelerator alone
+    /// (`select_accelerated_write_mode`), which is how a client statement reaches
+    /// Cayenne rather than the file source.
+    ///
+    /// Returns the temp dir alongside the runtime because the CSV source lives in it
+    /// and must outlive the runtime.
+    async fn cayenne_dml_runtime(
+        mode: Mode,
+        table_name: &str,
+    ) -> Result<(tempfile::TempDir, Arc<Runtime>), anyhow::Error> {
+        let temp_dir = tempfile::tempdir()?;
+        let csv = temp_dir.path().join(format!("{table_name}.csv"));
+        std::fs::write(
+            &csv,
+            "id,name,value\n\
          1,alpha,100\n\
          2,beta,200\n\
          3,gamma,300\n\
          4,delta,400\n\
          5,epsilon,500\n",
-    )?;
+        )?;
 
-    crate::configure_test_datafusion();
+        crate::configure_test_datafusion();
 
-    let is_memory = matches!(mode, Mode::Memory);
-    let mode_label = format!("{mode:?}");
+        let is_memory = matches!(mode, Mode::Memory);
+        let mode_label = format!("{mode:?}");
 
-    // A file acceleration needs somewhere to put its Vortex files and its
-    // metastore; a memory acceleration builds both in RAM and takes neither.
-    let params = if is_memory {
-        None
-    } else {
-        let mut params = HashMap::new();
-        params.insert(
-            "cayenne_file_path".to_string(),
-            temp_dir.path().join("cayenne").display().to_string(),
-        );
-        params.insert(
-            "cayenne_metadata_dir".to_string(),
-            temp_dir.path().join("metadata").display().to_string(),
-        );
-        Some(Params::from_string_map(params))
-    };
+        // A file acceleration needs somewhere to put its Vortex files and its
+        // metastore; a memory acceleration builds both in RAM and takes neither.
+        let params = if is_memory {
+            None
+        } else {
+            let mut params = HashMap::new();
+            params.insert(
+                "cayenne_file_path".to_string(),
+                temp_dir.path().join("cayenne").display().to_string(),
+            );
+            params.insert(
+                "cayenne_metadata_dir".to_string(),
+                temp_dir.path().join("metadata").display().to_string(),
+            );
+            Some(Params::from_string_map(params))
+        };
 
-    let mut dataset = Dataset::new(format!("file://{}", csv.display()), table_name);
-    dataset.access = AccessMode::ReadWrite;
-    dataset.acceleration = Some(Acceleration {
-        enabled: true,
-        engine: Some("cayenne".to_string()),
-        mode,
-        refresh_mode: Some(RefreshMode::Full),
-        params,
-        primary_key: Some("id".to_string()),
-        on_conflict: HashMap::from([("id".to_string(), OnConflictBehavior::Upsert)]),
-        ..Acceleration::default()
-    });
+        let mut dataset = Dataset::new(format!("file://{}", csv.display()), table_name);
+        dataset.access = AccessMode::ReadWrite;
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode,
+            refresh_mode: Some(RefreshMode::Full),
+            params,
+            primary_key: Some("id".to_string()),
+            on_conflict: HashMap::from([("id".to_string(), OnConflictBehavior::Upsert)]),
+            ..Acceleration::default()
+        });
 
-    let app = AppBuilder::new("test_cayenne_memory_dml")
-        .with_dataset(dataset)
-        .build();
-    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+        let app = AppBuilder::new("test_cayenne_memory_dml")
+            .with_dataset(dataset)
+            .build();
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-            return Err(anyhow::Error::msg("Timeout waiting for components to load"));
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                return Err(anyhow::Error::msg("Timeout waiting for components to load"));
+            }
+            () = Arc::clone(&rt).load_components() => {}
         }
-        () = Arc::clone(&rt).load_components() => {}
-    }
-    runtime_ready_check(&rt).await;
+        runtime_ready_check(&rt).await;
 
-    // Premise: the acceleration really resolved to the residency this arm is
-    // about. Without this a `mode: memory` arm would still fail if it had
-    // silently fallen back to a file acceleration, and the failure would say
-    // nothing about the mem-tier.
-    let table = rt
-        .datafusion()
-        .get_table(&TableReference::bare(table_name))
-        .await
-        .ok_or_else(|| anyhow::anyhow!("table '{table_name}' not found"))?;
-    let accelerated_table =
-        spice_table::find_layer::<AcceleratedTable>(table.as_ref(), spice_table::LayerWalk::Read)
-            .ok_or_else(|| anyhow::anyhow!("table '{table_name}' is not an AcceleratedTable"))?;
-    let accelerator = accelerated_table.get_accelerator();
-    // The accelerator may be wrapped in `SpiceTable` layers; walk down to the
-    // Cayenne provider itself.
-    let cayenne = accelerator
-        .downcast_ref::<cayenne::CayenneTableProvider>()
-        .or_else(|| {
-            spice_table::nodes(accelerator.as_ref(), spice_table::LayerWalk::Read).find_map(
-                |node| {
-                    node.base_provider()
-                        .downcast_ref::<cayenne::CayenneTableProvider>()
-                },
-            )
-        })
-        .ok_or_else(|| anyhow::anyhow!("accelerator is not a CayenneTableProvider"))?;
-    ensure!(
-        cayenne.is_memory_resident_mode() == is_memory,
-        "precondition: acceleration mode {mode_label} must resolve to \
+        // Premise: the acceleration really resolved to the residency this arm is
+        // about. Without this a `mode: memory` arm would still fail if it had
+        // silently fallen back to a file acceleration, and the failure would say
+        // nothing about the mem-tier.
+        let table = rt
+            .datafusion()
+            .get_table(&TableReference::bare(table_name))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("table '{table_name}' not found"))?;
+        let accelerated_table = spice_table::find_layer::<AcceleratedTable>(
+            table.as_ref(),
+            spice_table::LayerWalk::Read,
+        )
+        .ok_or_else(|| anyhow::anyhow!("table '{table_name}' is not an AcceleratedTable"))?;
+        let accelerator = accelerated_table.get_accelerator();
+        // The accelerator may be wrapped in `SpiceTable` layers; walk down to the
+        // Cayenne provider itself.
+        let cayenne = accelerator
+            .downcast_ref::<cayenne::CayenneTableProvider>()
+            .or_else(|| {
+                spice_table::nodes(accelerator.as_ref(), spice_table::LayerWalk::Read).find_map(
+                    |node| {
+                        node.base_provider()
+                            .downcast_ref::<cayenne::CayenneTableProvider>()
+                    },
+                )
+            })
+            .ok_or_else(|| anyhow::anyhow!("accelerator is not a CayenneTableProvider"))?;
+        ensure!(
+            cayenne.is_memory_resident_mode() == is_memory,
+            "precondition: acceleration mode {mode_label} must resolve to \
          is_memory_resident_mode() == {is_memory}, got {}",
-        cayenne.is_memory_resident_mode()
-    );
-    // Premise: writes go to the accelerator, so the statements below are
-    // Cayenne's and not the file connector's.
-    ensure!(
-        accelerated_table.is_accelerator_only(),
-        "precondition: on_conflict must route writes to the accelerator alone, \
+            cayenne.is_memory_resident_mode()
+        );
+        // Premise: writes go to the accelerator, so the statements below are
+        // Cayenne's and not the file connector's.
+        ensure!(
+            accelerated_table.is_accelerator_only(),
+            "precondition: on_conflict must route writes to the accelerator alone, \
          otherwise the statement never reaches Cayenne"
-    );
+        );
 
-    Ok((temp_dir, rt))
-}
+        Ok((temp_dir, rt))
+    }
 
-/// The `count` a DML statement reported. Every mutation below asserts this as
-/// well as the resulting rows: the count is what a client is told changed, and a
-/// path that removes the right rows while reporting the wrong number is still
-/// wrong (`with_exact_count` makes a user DELETE an exact count, not an estimate).
-fn reported_count(batches: &[RecordBatch]) -> u64 {
-    batches
-        .first()
-        .and_then(|b| {
-            b.column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::UInt64Array>()
-        })
-        .and_then(|a| a.values().first())
-        .copied()
-        .expect("a DML result must carry a UInt64 count column")
-}
+    /// The `count` a DML statement reported. Every mutation below asserts this as
+    /// well as the resulting rows: the count is what a client is told changed, and a
+    /// path that removes the right rows while reporting the wrong number is still
+    /// wrong (`with_exact_count` makes a user DELETE an exact count, not an estimate).
+    fn reported_count(batches: &[RecordBatch]) -> u64 {
+        batches
+            .first()
+            .and_then(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt64Array>()
+            })
+            .and_then(|a| a.values().first())
+            .copied()
+            .expect("a DML result must carry a UInt64 count column")
+    }
 
-/// Rows whose primary key appears more than once. Empty is the only correct
-/// answer for a table declaring `primary_key: id` with `on_conflict: upsert`.
-async fn duplicate_keys(
-    rt: &Arc<Runtime>,
-    table_name: &str,
-) -> Result<Vec<RecordBatch>, anyhow::Error> {
-    execute_sql(
+    /// Rows whose primary key appears more than once. Empty is the only correct
+    /// answer for a table declaring `primary_key: id` with `on_conflict: upsert`.
+    async fn duplicate_keys(
+        rt: &Arc<Runtime>,
+        table_name: &str,
+    ) -> Result<Vec<RecordBatch>, anyhow::Error> {
+        execute_sql(
         rt,
         &format!(
             "SELECT id, COUNT(*) AS n FROM {table_name} GROUP BY id HAVING COUNT(*) > 1 ORDER BY id"
         ),
     )
     .await
-}
+    }
 
-/// `DELETE … WHERE`, per-key and range.
-async fn filtered_delete_by_mode(mode: Mode, table_name: &str) -> Result<(), anyhow::Error> {
-    let _tracing = crate::init_tracing(Some("integration=debug,info"));
-    no_cache_context()
-        .scope(async {
-            let mode_label = format!("{mode:?}");
-            let (_temp_dir, rt) = cayenne_dml_runtime(mode, table_name).await?;
+    /// `DELETE … WHERE`, per-key and range.
+    async fn filtered_delete_by_mode(mode: Mode, table_name: &str) -> Result<(), anyhow::Error> {
+        let _tracing = crate::init_tracing(Some("integration=debug,info"));
+        no_cache_context()
+            .scope(async {
+                let mode_label = format!("{mode:?}");
+                let (_temp_dir, rt) = cayenne_dml_runtime(mode, table_name).await?;
 
-            let result =
-                execute_sql(&rt, &format!("SELECT id FROM {table_name} ORDER BY id")).await?;
-            let expected = [
-                "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 3  |", "| 4  |", "| 5  |",
-                "+----+",
-            ];
-            assert_batches_eq!(expected, &result);
+                let result =
+                    execute_sql(&rt, &format!("SELECT id FROM {table_name} ORDER BY id")).await?;
+                let expected = [
+                    "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 3  |", "| 4  |", "| 5  |",
+                    "+----+",
+                ];
+                assert_batches_eq!(expected, &result);
 
-            let deleted =
-                execute_sql(&rt, &format!("DELETE FROM {table_name} WHERE id = 2")).await?;
-            let after =
-                execute_sql(&rt, &format!("SELECT id FROM {table_name} ORDER BY id")).await?;
-            eprintln!(
-                "[{mode_label}] DELETE WHERE id = 2 reported:\n{}\nrows now:\n{}",
-                pretty_format_batches(&deleted)?,
-                pretty_format_batches(&after)?
-            );
-            assert_eq!(
-                reported_count(&deleted),
-                1,
-                "exactly one row matches `id = 2`"
-            );
-            let expected = [
-                "+----+", "| id |", "+----+", "| 1  |", "| 3  |", "| 4  |", "| 5  |", "+----+",
-            ];
-            assert_batches_eq!(expected, &after);
+                let deleted =
+                    execute_sql(&rt, &format!("DELETE FROM {table_name} WHERE id = 2")).await?;
+                let after =
+                    execute_sql(&rt, &format!("SELECT id FROM {table_name} ORDER BY id")).await?;
+                eprintln!(
+                    "[{mode_label}] DELETE WHERE id = 2 reported:\n{}\nrows now:\n{}",
+                    pretty_format_batches(&deleted)?,
+                    pretty_format_batches(&after)?
+                );
+                assert_eq!(
+                    reported_count(&deleted),
+                    1,
+                    "exactly one row matches `id = 2`"
+                );
+                let expected = [
+                    "+----+", "| id |", "+----+", "| 1  |", "| 3  |", "| 4  |", "| 5  |", "+----+",
+                ];
+                assert_batches_eq!(expected, &after);
 
-            let deleted =
-                execute_sql(&rt, &format!("DELETE FROM {table_name} WHERE id > 3")).await?;
-            let after =
-                execute_sql(&rt, &format!("SELECT id FROM {table_name} ORDER BY id")).await?;
-            eprintln!(
-                "[{mode_label}] DELETE WHERE id > 3 reported:\n{}\nrows now:\n{}",
-                pretty_format_batches(&deleted)?,
-                pretty_format_batches(&after)?
-            );
-            assert_eq!(
-                reported_count(&deleted),
-                2,
-                "exactly two rows match `id > 3`"
-            );
-            let expected = ["+----+", "| id |", "+----+", "| 1  |", "| 3  |", "+----+"];
-            assert_batches_eq!(expected, &after);
+                let deleted =
+                    execute_sql(&rt, &format!("DELETE FROM {table_name} WHERE id > 3")).await?;
+                let after =
+                    execute_sql(&rt, &format!("SELECT id FROM {table_name} ORDER BY id")).await?;
+                eprintln!(
+                    "[{mode_label}] DELETE WHERE id > 3 reported:\n{}\nrows now:\n{}",
+                    pretty_format_batches(&deleted)?,
+                    pretty_format_batches(&after)?
+                );
+                assert_eq!(
+                    reported_count(&deleted),
+                    2,
+                    "exactly two rows match `id > 3`"
+                );
+                let expected = ["+----+", "| id |", "+----+", "| 1  |", "| 3  |", "+----+"];
+                assert_batches_eq!(expected, &after);
 
-            Ok(())
-        })
-        .await
-}
+                Ok(())
+            })
+            .await
+    }
 
-/// `UPDATE … WHERE`, which `UpdateExec` runs as delete-then-insert, so its
-/// delete leg hits the same gap. The failure is not a no-op: the insert leg
-/// still lands, so the row is DUPLICATED under a declared primary key.
-async fn update_by_mode(mode: Mode, table_name: &str) -> Result<(), anyhow::Error> {
-    let _tracing = crate::init_tracing(Some("integration=debug,info"));
-    no_cache_context()
+    /// `UPDATE … WHERE`, which `UpdateExec` runs as delete-then-insert, so its
+    /// delete leg hits the same gap. The failure is not a no-op: the insert leg
+    /// still lands, so the row is DUPLICATED under a declared primary key.
+    async fn update_by_mode(mode: Mode, table_name: &str) -> Result<(), anyhow::Error> {
+        let _tracing = crate::init_tracing(Some("integration=debug,info"));
+        no_cache_context()
         .scope(async {
             let mode_label = format!("{mode:?}");
             let (_temp_dir, rt) = cayenne_dml_runtime(mode, table_name).await?;
@@ -468,17 +477,17 @@ async fn update_by_mode(mode: Mode, table_name: &str) -> Result<(), anyhow::Erro
             Ok(())
         })
         .await
-}
+    }
 
-/// `INSERT` of a primary key that already exists.
-///
-/// No `DELETE` is involved, which is what makes this a defect of its own rather
-/// than a consequence of the delete gap: the memory-mode standard-DML append
-/// (`write_batches_memory_mode`) passes `OnConflictDeletions::default()`, so the
-/// prior version is never superseded.
-async fn upsert_insert_by_mode(mode: Mode, table_name: &str) -> Result<(), anyhow::Error> {
-    let _tracing = crate::init_tracing(Some("integration=debug,info"));
-    no_cache_context()
+    /// `INSERT` of a primary key that already exists.
+    ///
+    /// No `DELETE` is involved, which is what makes this a defect of its own rather
+    /// than a consequence of the delete gap: the memory-mode standard-DML append
+    /// (`write_batches_memory_mode`) passes `OnConflictDeletions::default()`, so the
+    /// prior version is never superseded.
+    async fn upsert_insert_by_mode(mode: Mode, table_name: &str) -> Result<(), anyhow::Error> {
+        let _tracing = crate::init_tracing(Some("integration=debug,info"));
+        no_cache_context()
         .scope(async {
             let mode_label = format!("{mode:?}");
             let (_temp_dir, rt) = cayenne_dml_runtime(mode, table_name).await?;
@@ -526,21 +535,21 @@ async fn upsert_insert_by_mode(mode: Mode, table_name: &str) -> Result<(), anyho
             Ok(())
         })
         .await
-}
+    }
 
-/// A `DELETE` over an upsert history must count the rows a scan SERVES, not the
-/// raw versions the store happens to hold.
-///
-/// After `INSERT (3, gamma2)` supersedes `(3, gamma)`, the superseded version is
-/// still resident and hidden by its successor's tombstone. `DELETE WHERE id = 3`
-/// must report ONE row, and a predicate matching only the hidden version must
-/// report NONE and remove nothing a client can see.
-async fn delete_over_upsert_history_by_mode(
-    mode: Mode,
-    table_name: &str,
-) -> Result<(), anyhow::Error> {
-    let _tracing = crate::init_tracing(Some("integration=debug,info"));
-    no_cache_context()
+    /// A `DELETE` over an upsert history must count the rows a scan SERVES, not the
+    /// raw versions the store happens to hold.
+    ///
+    /// After `INSERT (3, gamma2)` supersedes `(3, gamma)`, the superseded version is
+    /// still resident and hidden by its successor's tombstone. `DELETE WHERE id = 3`
+    /// must report ONE row, and a predicate matching only the hidden version must
+    /// report NONE and remove nothing a client can see.
+    async fn delete_over_upsert_history_by_mode(
+        mode: Mode,
+        table_name: &str,
+    ) -> Result<(), anyhow::Error> {
+        let _tracing = crate::init_tracing(Some("integration=debug,info"));
+        no_cache_context()
         .scope(async {
             let mode_label = format!("{mode:?}");
             let (_temp_dir, rt) = cayenne_dml_runtime(mode, table_name).await?;
@@ -604,56 +613,49 @@ async fn delete_over_upsert_history_by_mode(
             Ok(())
         })
         .await
-}
+    }
 
-// ── control arms: `mode: file`, where all three statements work ──
+    // ── control arms: `mode: file`, where all three statements work ──
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
-async fn test_cayenne_file_mode_filtered_delete() -> Result<(), anyhow::Error> {
-    filtered_delete_by_mode(Mode::File, "file_mode_delete_test").await
-}
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_file_mode_filtered_delete() -> Result<(), anyhow::Error> {
+        filtered_delete_by_mode(Mode::File, "file_mode_delete_test").await
+    }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
-async fn test_cayenne_file_mode_update() -> Result<(), anyhow::Error> {
-    update_by_mode(Mode::File, "file_mode_update_test").await
-}
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_file_mode_update() -> Result<(), anyhow::Error> {
+        update_by_mode(Mode::File, "file_mode_update_test").await
+    }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
-async fn test_cayenne_file_mode_upsert_insert() -> Result<(), anyhow::Error> {
-    upsert_insert_by_mode(Mode::File, "file_mode_upsert_test").await
-}
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_file_mode_upsert_insert() -> Result<(), anyhow::Error> {
+        upsert_insert_by_mode(Mode::File, "file_mode_upsert_test").await
+    }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
-async fn test_cayenne_file_mode_delete_over_upsert_history() -> Result<(), anyhow::Error> {
-    delete_over_upsert_history_by_mode(Mode::File, "file_mode_history_test").await
-}
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_file_mode_delete_over_upsert_history() -> Result<(), anyhow::Error> {
+        delete_over_upsert_history_by_mode(Mode::File, "file_mode_history_test").await
+    }
 
-// ── reproduction arms: `mode: memory` (#12008 and its upsert sibling) ──
+    // ── reproduction arms: `mode: memory` (#12008 and its upsert sibling) ──
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
-async fn test_cayenne_memory_mode_filtered_delete() -> Result<(), anyhow::Error> {
-    filtered_delete_by_mode(Mode::Memory, "memory_mode_delete_test").await
-}
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_memory_mode_filtered_delete() -> Result<(), anyhow::Error> {
+        filtered_delete_by_mode(Mode::Memory, "memory_mode_delete_test").await
+    }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
-async fn test_cayenne_memory_mode_update() -> Result<(), anyhow::Error> {
-    update_by_mode(Mode::Memory, "memory_mode_update_test").await
-}
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_memory_mode_update() -> Result<(), anyhow::Error> {
+        update_by_mode(Mode::Memory, "memory_mode_update_test").await
+    }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
-async fn test_cayenne_memory_mode_upsert_insert() -> Result<(), anyhow::Error> {
-    upsert_insert_by_mode(Mode::Memory, "memory_mode_upsert_test").await
-}
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_memory_mode_upsert_insert() -> Result<(), anyhow::Error> {
+        upsert_insert_by_mode(Mode::Memory, "memory_mode_upsert_test").await
+    }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
-async fn test_cayenne_memory_mode_delete_over_upsert_history() -> Result<(), anyhow::Error> {
-    delete_over_upsert_history_by_mode(Mode::Memory, "memory_mode_history_test").await
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_memory_mode_delete_over_upsert_history() -> Result<(), anyhow::Error> {
+        delete_over_upsert_history_by_mode(Mode::Memory, "memory_mode_history_test").await
+    }
 }

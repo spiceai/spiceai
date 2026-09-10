@@ -508,11 +508,12 @@ impl MemTier {
     /// where the mem-tier is the permanent store and there is no durable tier for
     /// a deletion sink to write into (#12008).
     ///
-    /// Returns the rebuilt tier and the number of RAW rows it dropped. That is a
-    /// physical figure, not a `rows affected` count: a tier holding an upsert
-    /// history carries superseded versions that no scan serves, and dropping one
-    /// changes nothing a client can observe. A caller reporting a count to a user
-    /// resolves visibility itself, against the batches a scan would serve.
+    /// Returns the rebuilt tier and the number of RAW rows it dropped — a physical
+    /// figure. A caller reporting `rows affected` to a user must resolve visibility
+    /// itself, which is why the closure is handed the segment's `data_sequence`:
+    /// that is the watermark a tombstone is compared against, so it is what lets a
+    /// caller ask which of the rows it is about to drop a scan would have served.
+    /// See `delete_mem_tier_rows_matching`, which does exactly that.
     ///
     /// EVERY SEGMENT IS PRESERVED, even one whose rows are all removed. A segment
     /// carries its OWN tombstones, which hide rows in OLDER segments; dropping the
@@ -530,18 +531,22 @@ impl MemTier {
     ///
     /// A segment that loses no row keeps its `Arc`s verbatim — no statistics
     /// recompute and no batch copy — so a predicate matching a few segments costs
-    /// nothing on the rest. A segment that does lose rows has its statistics
-    /// RECOMPUTED rather than inherited: the inherited min/max would still be
-    /// sound for pruning (a superset never prunes a live row away), but its
-    /// `num_rows` would over-report, and Cayenne feeds these statistics to the
-    /// optimizer.
+    /// nothing on the rest.
+    ///
+    /// A segment that does lose rows has its statistics RECOMPUTED rather than
+    /// inherited, and neither way of inheriting them works. Kept `Exact`, an
+    /// inherited min/max advertises a bound no surviving row satisfies, and these
+    /// statistics answer `MIN`/`MAX` as well as pruning. Downgraded to `Inexact`,
+    /// it stops pruning altogether — `DataFusion`'s `PrunableStatistics` reads only
+    /// `Exact` bounds and treats anything else as unknown — so the segments a
+    /// delete touched would be the ones that lost their pruning.
     ///
     /// `epoch` is preserved (a content change, not a checkpoint) and `version` is
     /// bumped so every scan-view cache keyed on it re-keys.
-    pub(crate) fn retain_rows<E>(
+    pub(crate) fn retain_rows(
         &self,
-        mut keep_batch: impl FnMut(&RecordBatch) -> std::result::Result<RecordBatch, E>,
-    ) -> std::result::Result<(Self, u64), E> {
+        mut keep_batch: impl FnMut(&RecordBatch, i64) -> datafusion_common::Result<RecordBatch>,
+    ) -> datafusion_common::Result<(Self, u64)> {
         let mut segments: Vec<MemSegment> = Vec::with_capacity(self.segments.len());
         let mut removed_rows: u64 = 0;
         let mut bytes = 0u64;
@@ -552,7 +557,7 @@ impl MemTier {
             let mut segment_removed = 0u64;
             for batch in segment.batches.iter() {
                 let before = batch.num_rows() as u64;
-                let batch = keep_batch(batch)?;
+                let batch = keep_batch(batch, segment.data_sequence)?;
                 segment_removed = segment_removed.saturating_add(before - batch.num_rows() as u64);
                 if batch.num_rows() > 0 {
                     kept.push(batch);

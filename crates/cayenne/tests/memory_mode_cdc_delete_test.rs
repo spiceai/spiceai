@@ -19,13 +19,18 @@ limitations under the License.
 //! The CDC apply loop's per-key delete on a `mode: memory` table (#12008).
 //!
 //! A memory-resident table is excluded from the deferred-commit queue, so the
-//! runtime never installs a slot advancer on it. `write_cdc_delete_keys_in_memory`
-//! declines without one, and the apply loop falls through to
-//! `delete_from_cdc_fast` — which reaches the same deletion sink a client
-//! `DELETE` does. Before the mem-tier rebuild landed there, that sink scanned only
-//! the durable tiers, which in memory mode are permanently empty: it reported the
-//! delete as HANDLED while removing nothing, so a row deleted at the source stayed
-//! served forever.
+//! runtime never installs a slot advancer on it. The apply loop checks
+//! `has_slot_advancer()` directly and declines to absorb the delete in RAM
+//! (`refresh_task::changes`, `"no_advancer"`), falling through to
+//! `delete_from_cdc_fast` — which reaches the same deletion sink a client `DELETE`
+//! does. Cayenne's own gate inside `write_cdc_delete_keys_in_memory` is a second,
+//! defensive check on the same condition that production therefore never reaches;
+//! this test drives it anyway, because it is the gate this crate owns.
+//!
+//! Before the mem-tier rebuild landed in that sink, it scanned only the durable
+//! tiers, which in memory mode are permanently empty: it reported the delete as
+//! HANDLED while removing nothing, so a row deleted at the source stayed served
+//! forever.
 //!
 //! End-to-end coverage of the client `DELETE`/`UPDATE`/`INSERT` statements lives
 //! in `crates/runtime/tests/acceleration/cayenne_memory.rs`. This path needs a
@@ -138,18 +143,13 @@ async fn cdc_key_delete_removes_a_memory_mode_row_impl(
     )?;
     let sql = "SELECT id, value FROM mem_cdc_delete ORDER BY id";
 
-    // Precondition: NO slot advancer is installed. That is what routes a CDC
-    // delete past `write_cdc_delete_keys_in_memory` and into
-    // `delete_from_cdc_fast`, and it is the state the runtime leaves a
-    // memory-resident table in — `refresh_task::changes` builds the
-    // deferred-commit queue only for `is_cdc_memory_mode() &&
-    // !is_memory_resident_mode()`, and installs the advancer only when that queue
-    // exists. Deliberately not installed here for that reason.
-    assert!(
-        !table.has_slot_advancer(),
-        "precondition: a mode: memory table never gets a slot advancer, which is what \
-         routes a CDC delete to delete_from_cdc_fast"
-    );
+    // No slot advancer is installed, matching the state the runtime leaves a
+    // memory-resident table in: `refresh_task::changes` builds the deferred-commit
+    // queue only for `is_cdc_memory_mode() && !is_memory_resident_mode()` and
+    // installs the advancer only when that queue exists. Asserting that here would
+    // be a tautology — nothing in this crate installs one — so the invariant is
+    // stated rather than pinned; pinning it belongs to a test over that predicate
+    // in `runtime-table`.
 
     common::insert_batches(
         &table,
