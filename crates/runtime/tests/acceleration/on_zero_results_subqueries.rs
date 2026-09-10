@@ -37,7 +37,10 @@ use crate::{
     utils::{register_test_connectors, run_query, test_request_context},
 };
 
-const QUERIES: &[(&str, &[i64])] = &[
+/// A query paired with the ids it must return.
+type Cases = &'static [(&'static str, &'static [i64])];
+
+const QUERIES: Cases = &[
     (
         "SELECT id FROM items WHERE EXISTS (SELECT 1 FROM details WHERE item_id = id)",
         &[1, 2],
@@ -76,7 +79,7 @@ const QUERIES: &[(&str, &[i64])] = &[
     ),
 ];
 
-const PARTIAL_QUERIES: &[(&str, &[i64])] = &[
+const PARTIAL_QUERIES: Cases = &[
     (
         "SELECT id FROM items WHERE id = 2 AND id IN (SELECT item_id FROM details WHERE val = 5)",
         &[2],
@@ -101,7 +104,7 @@ const PARTIAL_QUERIES: &[(&str, &[i64])] = &[
 
 // Quantified comparisons exercise fallback planning; SQLite's federated SQL
 // path does not support ANY/ALL syntax.
-const QUANTIFIED_FALLBACK_QUERIES: &[(&str, &[i64])] = &[
+const QUANTIFIED_FALLBACK_QUERIES: Cases = &[
     (
         "SELECT id FROM items WHERE v > ANY (SELECT val FROM details)",
         &[1, 2, 4],
@@ -137,7 +140,7 @@ const QUANTIFIED_FALLBACK_QUERIES: &[(&str, &[i64])] = &[
 // expression"), so this pins a residual limit of the fix, not a regression.
 // Lifting it means deciding fallback above decorrelation rather than at the
 // scan -- see #14010.
-const SUBQUERY_ONLY_PARTIAL_QUERIES: &[(&str, &[i64])] = &[
+const SUBQUERY_ONLY_PARTIAL_QUERIES: Cases = &[
     (
         "SELECT id FROM items WHERE id IN (SELECT item_id FROM details WHERE val = 5)",
         &[],
@@ -151,7 +154,7 @@ const SUBQUERY_ONLY_PARTIAL_QUERIES: &[(&str, &[i64])] = &[
 // Controls for the queries above: a predicate the scan *can* evaluate empties
 // the accelerator, so fallback fires and the source supplies the missing row.
 // These fail if the fixture stops exercising the partial-acceleration path.
-const PARTIAL_FALLBACK_CONTROLS: &[(&str, &[i64])] = &[
+const PARTIAL_FALLBACK_CONTROLS: Cases = &[
     ("SELECT id FROM items WHERE id = 2", &[2]),
     (
         "SELECT id FROM items WHERE id = 2 AND id IN (SELECT item_id FROM details WHERE val = 5)",
@@ -305,12 +308,11 @@ async fn check_subqueries(
         } else {
             QUERIES
         };
-        let (subquery_only, fallback_controls): (&[(&str, &[i64])], &[(&str, &[i64])]) =
-            if contents == Contents::Partial {
-                (SUBQUERY_ONLY_PARTIAL_QUERIES, PARTIAL_FALLBACK_CONTROLS)
-            } else {
-                (&[], &[])
-            };
+        let (subquery_only, fallback_controls): (Cases, Cases) = if contents == Contents::Partial {
+            (SUBQUERY_ONLY_PARTIAL_QUERIES, PARTIAL_FALLBACK_CONTROLS)
+        } else {
+            (&[], &[])
+        };
         let quantified_queries =
             if contents != Contents::Partial && *action == ZeroResultsAction::UseSource {
                 QUANTIFIED_FALLBACK_QUERIES
