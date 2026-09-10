@@ -21,6 +21,7 @@ use spicepod::{acceleration::Mode, param::Params};
 use std::sync::Arc;
 
 mod caching_mode;
+mod caching_mode_constraints;
 #[cfg(feature = "duckdb")]
 mod caching_mode_per_principal;
 #[cfg(feature = "duckdb")]
