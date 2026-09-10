@@ -180,14 +180,14 @@ downloadWithRetry() {
         echo "Download attempt $attempt of $MAX_RETRIES..."
         
         if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-            if curl -H "Accept:application/octet-stream" -SsL "$url" -o "$output" 2>/dev/null; then
-                if [ -f "$output" ]; then
+            if curl --fail -H "Accept:application/octet-stream" -SsL "$url" -o "$output" 2>/dev/null; then
+                if [ -f "$output" ] && tar -tzf "$output" >/dev/null 2>&1; then
                     return 0
                 fi
             fi
         else
             if wget -q --auth-no-challenge --header='Accept:application/octet-stream' "$url" -O "$output" 2>/dev/null; then
-                if [ -f "$output" ]; then
+                if [ -f "$output" ] && tar -tzf "$output" >/dev/null 2>&1; then
                     return 0
                 fi
             fi
