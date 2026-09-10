@@ -12,11 +12,12 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
-def archive_bytes():
+def archive_bytes(filename="spiced"):
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w:gz") as archive:
         content = b"installer download fixture\n"
-        entry = tarfile.TarInfo("fixture.txt")
+        entry = tarfile.TarInfo(filename)
+        entry.mode = 0o755
         entry.size = len(content)
         archive.addfile(entry, io.BytesIO(content))
     return output.getvalue()
@@ -67,7 +68,7 @@ downloadWithRetry "$2" "$3"
             )
             if success:
                 with tarfile.open(output, "r:gz") as archive:
-                    assert archive.getnames() == ["fixture.txt"], "Unexpected archive contents"
+                    assert [name.removeprefix("./") for name in archive.getnames()] == ["spiced"], "Unexpected archive contents"
             return {"requests": Handler.requests, "exit_code": result.returncode}
     finally:
         server.shutdown()
@@ -89,6 +90,11 @@ def main():
     valid = archive_bytes()
     cases = {
         "valid_archive": ([(200, valid)], 1, True),
+        "dot_prefixed_archive": ([(200, archive_bytes("./spiced"))], 1, True),
+        "missing_runtime_then_archive": (
+            [(200, archive_bytes("README")), (200, archive_bytes("README")), (200, valid)], 3, True,
+        ),
+        "missing_runtime_exhausts_retries": ([(200, archive_bytes("README"))], 3, False),
         "http_error_then_archive": (
             [(503, b"unavailable"), (503, b"unavailable"), (200, valid)], 3, True,
         ),

@@ -175,19 +175,22 @@ downloadWithRetry() {
     local url="$1"
     local output="$2"
     local attempt=1
+    local archive_contents
     
     while [ $attempt -le $MAX_RETRIES ]; do
         echo "Download attempt $attempt of $MAX_RETRIES..."
         
         if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
             if curl --fail -H "Accept:application/octet-stream" -SsL "$url" -o "$output" 2>/dev/null; then
-                if [ -f "$output" ] && tar -tzf "$output" >/dev/null 2>&1; then
+                if [ -f "$output" ] && archive_contents=$(tar -tzf "$output" 2>/dev/null) &&
+                    printf '%s\n' "$archive_contents" | grep -Fxq -e "$SPICED_FILENAME" -e "./$SPICED_FILENAME"; then
                     return 0
                 fi
             fi
         else
             if wget -q --auth-no-challenge --header='Accept:application/octet-stream' "$url" -O "$output" 2>/dev/null; then
-                if [ -f "$output" ] && tar -tzf "$output" >/dev/null 2>&1; then
+                if [ -f "$output" ] && archive_contents=$(tar -tzf "$output" 2>/dev/null) &&
+                    printf '%s\n' "$archive_contents" | grep -Fxq -e "$SPICED_FILENAME" -e "./$SPICED_FILENAME"; then
                     return 0
                 fi
             fi
