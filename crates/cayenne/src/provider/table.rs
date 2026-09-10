@@ -64,7 +64,7 @@ use super::pk_index::{
     CheckedOutShardedPkIndex, ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence,
     PendingPkKeys, PkBloom, PkCheckoutGuard, PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome,
     RowLocation, ShardedPkIndex, approx_captured_file_bytes, deserialize_pk_bloom_sidecar,
-    pk_digest, serialize_pk_bloom_sidecar, shard_of_pk,
+    pk_digest, pk_digest_bytes, serialize_pk_bloom_sidecar, shard_of_pk,
 };
 use super::pk_validation::null_primary_key_message;
 use super::streaming::StreamingExec;
@@ -84,7 +84,7 @@ use crate::resource_starvation::ResourceStarvationTracker;
 use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, BooleanBufferBuilder, Int64Array};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef};
-use hash_index::{PrehashedBuildHasher, hash_key_128};
+use hash_index::PrehashedBuildHasher;
 use snafu::ensure;
 
 use crate::row_converter::{RowConverter, SortField};
@@ -13359,7 +13359,10 @@ impl CayenneTableProvider {
         // cross-batch `incoming_keys`, and the `existing_keys` keyset), so the
         // per-row hashing cost is paid a single time and the maps reuse it via
         // `PrehashedBuildHasher`.
-        let row_digests: Vec<u128> = rows.iter().map(|row| hash_key_128(row.as_ref())).collect();
+        let row_digests: Vec<u128> = rows
+            .iter()
+            .map(|row| pk_digest_bytes(row.as_ref()))
+            .collect();
         let is_survivor: Vec<bool> = if deduplicate_batch {
             let mut survivor: HashMap<u128, usize, PrehashedBuildHasher> =
                 HashMap::with_capacity_and_hasher(batch.num_rows(), PrehashedBuildHasher);
@@ -13666,7 +13669,7 @@ impl CayenneTableProvider {
             // negatives, so a cold MISS here is safely fast-pathed).
             let cold_hit = cold_existence.is_some_and(|c| c.maybe_contains(key.as_ref()));
             // One hash per row, reused for both existence-set probes below.
-            let digest = hash_key_128(key.as_ref());
+            let digest = pk_digest_bytes(key.as_ref());
             // A concurrent writer committed this key after the index was checked
             // out, so the bloom cannot hold it — route it to the HIT path, which
             // supersedes the row it committed. Fast-pathing it as brand-new would

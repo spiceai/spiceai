@@ -104,6 +104,63 @@ fn assert_matches_arrow_row_opts(columns: &[ArrayRef], options: SortOptions) {
     }
 }
 
+/// Reusing a scratch must reuse its allocation, not merely produce equal bytes.
+///
+/// Every other test here compares encoded bytes, which an implementation that
+/// dropped the scratch and encoded into fresh buffers would satisfy too. The
+/// scratch here comes from a larger batch, so it carries more capacity than the
+/// smaller batch needs, while a fresh encode sizes its buffers to the batch.
+/// Capacity is tracked by the `Vec` rather than the allocator, so the check holds
+/// even when an allocator hands a just-freed block straight back.
+#[test]
+fn reusing_a_scratch_keeps_its_allocation() {
+    let converter = RowConverter::new(vec![SortField::new(DataType::Int64)]).expect("converter");
+    let large: ArrayRef = Arc::new(Int64Array::from_iter_values(0..4096_i64));
+    let small: ArrayRef = Arc::new(Int64Array::from_iter_values(0..512_i64));
+
+    let scratch = converter
+        .convert_columns(&[large])
+        .expect("encode the larger batch");
+    let buffer_ptr = scratch.buffer.as_ptr();
+    let buffer_capacity = scratch.buffer.capacity();
+    let offsets_capacity = scratch.offsets.capacity();
+
+    let reused = converter
+        .convert_columns_reusing(&[Arc::clone(&small)], Some(scratch))
+        .expect("encode the smaller batch into the scratch");
+    let fresh = converter
+        .convert_columns(&[small])
+        .expect("encode the smaller batch into fresh buffers");
+
+    assert!(
+        fresh.buffer.capacity() < buffer_capacity,
+        "precondition: the smaller batch must need less capacity than the scratch holds"
+    );
+    assert_eq!(
+        reused.buffer.capacity(),
+        buffer_capacity,
+        "the byte buffer must keep the scratch's allocation"
+    );
+    assert_eq!(
+        reused.offsets.capacity(),
+        offsets_capacity,
+        "the offset buffer must keep the scratch's allocation"
+    );
+    assert_eq!(
+        reused.buffer.as_ptr(),
+        buffer_ptr,
+        "the byte buffer must not move"
+    );
+    assert_eq!(
+        reused.buffer, fresh.buffer,
+        "reuse must not change the encoded bytes"
+    );
+    assert_eq!(
+        reused.offsets, fresh.offsets,
+        "reuse must not change the row boundaries"
+    );
+}
+
 #[test]
 fn reused_rows_match_arrow_across_changing_batches() {
     let converter = RowConverter::new(vec![
