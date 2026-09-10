@@ -157,7 +157,7 @@ row here. Its behaviour is covered where the code lives, by
 | `vortex.date` → `vortex.timestamp` **scalar** cast (fork PR #93) | The row above converts a chunk's rows. A scan also casts the file's `max` statistic — a scalar — to decide whether to read the file at all, and without this `Scalar::cast` re-labels it through the target's storage type instead of converting it. `date[days]` fails the scan; `date[ms]` shares `i64` with `timestamp[ns]`, so it succeeds with an instant 10^6 too small and the file is pruned as unable to match ([#13624](https://github.com/spiceai/spiceai/issues/13624)) | silent (wrong data) | `crates/vortex/src/persistent/mod.rs::a_pushed_down_date_to_timestamp_cast_returns_the_matching_rows` for the failure, `…::a_pushed_down_date64_to_timestamp_cast_does_not_prune_the_matching_file` for the wrongly pruned file |
 | Timestamp validation uses `storage_range`, and rendering never aborts (fork PR #93) | The row above converts a date into a count of the target unit; this is the range that count has to land inside, and the same fork PR carries both. A Jiff span's limits are not a timestamp's: they stop one short of `i64::MIN` nanoseconds — 1677-09-21, which a `timestamp[ns]` column holds as an ordinary value read from Arrow — so a scalar built from such a column's `min`/`max` statistic was refused although the array carried it, and the scan failed on data it could read. They also run past the last instant, and the unchecked constructors abort outside them, so rendering a count past the span range took the process down rather than reporting it. (No `vortex.date` reaches `i64::MIN` nanoseconds — neither of its units divides it — so this is the range being wrong, not the conversion.) | silent (wrong data), and abort | `crates/vortex/src/persistent/mod.rs::a_nanosecond_timestamp_scalar_spans_the_whole_i64_range`, which builds that scalar and renders it, and `…::a_timestamp_count_that_is_not_an_instant_renders_instead_of_aborting` for the other three units — they keep a span, so what the patch changes for them is that it is built and added through the checked forms, and only a count outside the range exercises that. The two cast guards above pass on either side of this row, so a re-cut that carried only the cast would not be caught without these |
 | Balanced `list_contains` OR tree for large `IN` lists (fork PR #37) | A large `IN (...)` filter builds a right-leaning OR tree; deep enough and the plan blows the stack during pushdown conversion | silent (crash) | `crates/vortex/src/persistent/mod.rs::test_large_in_list_filter_pushdown_stays_evaluable` |
-| Avoid session lock re-entry in writer init (fork PR #29) | Deadlock in `vortex-file` writer initialisation — the write never completes and the refresh hangs | silent (hang) | **GAP** |
+| Avoid session lock re-entry in writer init (fork PR #29) | Deadlock in `vortex-file` writer initialisation — the write never completes and the refresh hangs | silent (hang) | **GAP** — the deadlock needs a writer waiting on the session lock *between* the two reads this patch collapses into one, so a test either wins the race and passes on unpatched code or hangs the suite. That is a timing test, not a guard; what would close it is making the re-entry unrepresentable rather than avoided by convention |
 | Unsupported pushdown node bubbles `TRUE` rather than erroring; empty `IN` list handled (fork PR #8) | A predicate Vortex cannot convert fails the scan instead of degrading to "keep the row" | silent | vendored: the pushdown conversion now lives in `crates/vortex/src/convert/exprs.rs`, guarded by `test_empty_in_list_conversion_produces_boolean_literal` and the `can_be_pushed_down` unsupported-operand cases |
 | Intra-file decode parallelism — sub-split large chunk spans (fork PR #62) | Scan throughput on large chunk spans drops to single-stream decode | silent (perf) | **GAP** — a perf-only row; see [Open gaps](#open-gaps) for why it is deliberately unguarded |
 
@@ -239,7 +239,7 @@ path (`parquet/src/util/push_buffers.rs` and its callers), and in
 | `with_object_versioning_type` — attach `if_match`/`version` to every metadata, byte-range and suffix fetch; a `Version` pin with no version id falls back to `If-Match` on the listed ETag; `set_object_version` applies a `HEAD` version id to later page reads | The reader stops pinning the object version. A file replaced between the metadata read and the data reads is read as a mixture of both — the footer of one file, the pages of another. Losing the ETag fallback is quieter still: unversioned buckets never carry a version id, so the pin becomes a no-op | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version`, `…::a_versioned_parquet_read_pins_by_etag_when_the_listing_has_no_version_id` |
 | `get_byte_ranges` override — coalesce ranges through `get_opts` rather than `ObjectStore::get_ranges` | Version pinning is dropped for the data reads specifically (the metadata read keeps it), and range coalescing is lost, so a scan issues one request per column chunk | silent | as above |
 | `Buffer::has_custom_allocation` — expose whether a buffer's memory is freed by its own owner rather than by the buffer ([spiceai/arrow-rs#25](https://github.com/spiceai/arrow-rs/pull/25)) | The results cache can no longer tell that a batch rests on memory it does not own, so it shares the producer's arrays instead of copying them. `capacity` reports the size the producer declared, so such an entry looks compact and is billed as if it were: a DuckDB- or ADBC-imported result pins the driver's chunk, a Flight-decoded one pins the whole IPC message body, and `max_size` bounds none of it. Measured at ~4.5 KB per entry unbilled on a one-row DuckDB result, flat as the result widened to 10 rows | build (the predicate) + silent (the accounting, if the call is dropped rather than the function) | `crates/arrow_tools/src/record_batch.rs::a_batch_resting_on_foreign_memory_is_copied_even_with_nothing_to_reclaim` |
-| `PushBuffers::push_range` returns `ParquetError` on a short read instead of asserting (apache/arrow-rs#10564) | A footer prefetch that races an in-place shrink panics the reader thread (`Range length must match buffer length`) instead of a retriable decode error | silent (panic) | **GAP** — the listing/overwrite harness 412s a pinned `If-Match` before a short successful range body reaches `PushBuffers`, so that test stays green if only this patch is dropped |
+| `PushBuffers::push_range` returns `ParquetError` on a short read instead of asserting (apache/arrow-rs#10564) | A footer prefetch that races an in-place shrink panics the reader thread (`Range length must match buffer length`) instead of a retriable decode error | silent (panic) | `crates/data-connector-api/src/listing/connector.rs::a_short_range_body_is_a_parquet_error_and_not_a_panic`, driven through `ParquetMetaDataPushDecoder`, which is the public surface `push_range` sits behind. The listing/overwrite harness cannot reach it: it 412s a pinned `If-Match` before a short *successful* range body is ever decoded |
 
 ## datafusion-ballista
 
@@ -415,6 +415,14 @@ Upstream [SeaQL/sea-query](https://github.com/SeaQL/sea-query).
 Upstream [andrusha/snowflake-rs](https://github.com/andrusha/snowflake-rs), branch
 `spiceai-58`.
 
+Every row below is **GAP**, and none is reachable from this repo as it stands:
+`snowflake-api` builds its URL as `https://{account}.snowflakecomputing.com` with
+no host override, so no local server can stand in for Snowflake, and `responses`
+is a private module, so the response types cannot be deserialized directly
+either. Closing any of these needs a live Snowflake account, or an upstream
+change that lets the base URL be set — the cheaper of the two, and it would make
+all five testable at once.
+
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | Streaming Arrow batches instead of collecting the whole result | Large Snowflake queries materialise fully in memory — OOM risk | silent (memory) | **GAP** |
@@ -430,7 +438,7 @@ Upstream [sreeise/graph-rs-sdk](https://github.com/sreeise/graph-rs-sdk).
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | Default drive for `Group` | SharePoint group-scoped datasets cannot resolve their drive | build | compile-guarded by `crates/data-connectors/connector-sharepoint` |
-| Tower service setup moved to `RequestHandler` (upstream PR #494) | Middleware (retry, tracing) is not applied to Graph requests | silent | **GAP** |
+| Tower service setup moved to `RequestHandler` (upstream PR #494) | Middleware (retry, tracing) is not applied to Graph requests | silent | **GAP** — nothing here configures Graph middleware, so there is no behaviour of *ours* to assert on, and the only seam that reaches the client is the opt-in `sharepoint-mock-host` feature, which the gate does not build. Closing it means configuring the retry middleware this patch exists to enable, which is a change to the connector rather than a test |
 
 ## docx-rs
 
@@ -448,8 +456,8 @@ Upstream [MinishLab/model2vec-rs](https://github.com/MinishLab/model2vec-rs).
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | IDs-only fast WordPiece tokenizer for the potion models | Static embedding throughput drops sharply | silent (perf) | **GAP** |
-| `config.json` made optional for sentence-transformers compatibility | Loading a sentence-transformers static model fails | silent (load failure) | **GAP** |
-| HF cache directory read from the environment | Models are re-downloaded instead of reusing the shared cache | silent | **GAP** |
+| `config.json` made optional for sentence-transformers compatibility (fork commit `f1190f1f`) | Loading a sentence-transformers static model fails | silent (load failure) | `crates/llms/src/model2vec.rs::a_local_model_loads_without_a_config_json`, against a model directory the test writes — a tokenizer and a hand-built `safetensors` embedding tensor, and no `config.json` |
+| HF cache directory read from the environment (fork commit `1259c0d3`) | Models are re-downloaded instead of reusing the shared cache | silent | `crates/llms/tests/model2vec_hf_cache.rs::a_cached_model_is_read_from_the_directory_hf_hub_cache_names`. Its own test binary because it sets a process-wide environment variable, so it is selected by name in the Makefile's `NEXTEST_FILTER` alongside the other credential-free `llms` binaries |
 
 ## text-splitter
 
@@ -532,7 +540,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**24 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**21 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -542,37 +550,33 @@ They are not equal in consequence; this is the order to close them in.
 
 1. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
    PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
-2. `snowflake-rs` chunked JSON responses and record-batch ordering.
-3. `mistral.rs` `tool_calls` chat-template handling.
-4. `text-embeddings-inference` pooling and model-loading fixes — embeddings
+   `ballista_scheduler::test_utils` is public and the fork's own
+   `test_task_update_after_reset_stage` is portable, which makes this the most
+   reachable of the remaining rows.
+2. `mistral.rs` `tool_calls` chat-template handling.
+3. `text-embeddings-inference` pooling and model-loading fixes — embeddings
    differ from the reference implementation.
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-5. `vortex` session lock re-entry in writer init (fork PR #29).
-6. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+4. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
    resilience (fork PRs #61–#63).
-7. `model2vec-rs` optional `config.json`.
-8. `snowflake-rs` async query response support — long-running queries time out.
-9. `arrow-rs` `PushBuffers::push_range` asserts instead of returning an error
-   on a short read — a footer prefetch racing an in-place shrink panics the
-   reader thread rather than surfacing a retriable decode error. The
-   listing/overwrite harness 412s before a short successful range body
-   reaches the decoder.
 
 **Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
 being honoured:
 
-10. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
-    misconfigured warehouse produces an opaque error instead of an actionable one.
-11. `model2vec-rs` HF cache directory read from the environment — models are
-    re-downloaded instead of reusing the shared cache.
-12. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
-    installs a global subscriber and hijacks `spiced`'s logging.
+5. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
+   installs a global subscriber and hijacks `spiced`'s logging.
 
-**Security posture.** No correctness effect, but a silent downgrade:
+**Blocked, not merely undone.** These have been looked at and cannot be closed by
+writing a test; each says what would unblock it:
 
-13. `graph-rs-sdk` tower middleware application.
+6. `snowflake-rs` (five rows) — no host override, private response types. Needs a
+   live account, or an upstream change letting the base URL be set.
+7. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
+   race, so any test of it is a timing test.
+8. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
+   there is no behaviour of ours to assert on.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
@@ -580,8 +584,9 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-14. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
-    `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
-    `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
-    `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
-    cheap one exists); `async-openai` retry-after handling.
+9. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+   `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
+   `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
+   `snowflake-rs` streaming batches (memory, not latency — but see the
+   `snowflake-rs` note above: it is blocked with the rest of that fork);
+   `async-openai` retry-after handling.

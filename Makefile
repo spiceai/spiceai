@@ -154,6 +154,9 @@ endif
 # name for the same reason: each stands a local one-shot HTTP server up on an
 # ephemeral port and drives a provider adapter against it, so they exercise the
 # real client's error mapping with no credentials and no external service.
+# `model2vec_hf_cache` is selected for a different reason: it is its own binary
+# because it sets a process-wide environment variable, which is only sound with
+# one test in the process.
 # `llms`'s remaining `kind(=test)` binary, `integration`, calls the live
 # provider APIs and needs a `.env`, so it stays in the nightly gate.
 #
@@ -181,7 +184,7 @@ endif
 # one did not run.
 NEXTEST_SELECTION := --all --exclude libnfs \
 	--features cayenne/result-correctness-duckdb
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=llms) & binary(=anthropic_stream_errors)) + (package(=llms) & binary(=list_models_errors)) + binary(=metrics)
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=llms) & binary(=anthropic_stream_errors)) + (package(=llms) & binary(=list_models_errors)) + (package(=llms) & binary(=model2vec_hf_cache)) + binary(=metrics)
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would

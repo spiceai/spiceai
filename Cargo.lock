@@ -6293,6 +6293,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-credential-bridge",
+ "bytes",
  "chrono",
  "data-connector-types",
  "data-http-rate-control",
