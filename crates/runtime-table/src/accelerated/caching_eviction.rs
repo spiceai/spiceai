@@ -69,7 +69,7 @@ limitations under the License.
 //! though it were whole. Working within that, the doomed entries are cleared by
 //! **one** predicate that combines two shapes (see [`partition_doomed`]):
 //!
-//! * a single `_fetched_at <= ceiling` range that clears every doomed entry
+//! * a single `floor <= _fetched_at <= ceiling` range that clears every doomed entry
 //!   lying wholly below the oldest row of anything the sweep keeps or that
 //!   straddles the boundary — unbounded in how many entries it covers, so this
 //!   carries the bulk of a large eviction; and
@@ -439,7 +439,7 @@ impl RetentionPredicate for CacheEvictionPredicate {
         // over-budget tail of a boundary tie named individually — then render
         // both into one `DELETE` predicate. Combining them is what lets a cache
         // ingesting faster than the naming cap can evict still converge: the
-        // unbounded range carries the bulk and naming only mops up the boundary.
+        // bounded range carries the bulk and naming only mops up the boundary.
         let (terms, deferred) =
             partition_doomed(&doomed, &survivors).delete_terms(refreshed_at.as_ref(), &doomed);
 
@@ -461,12 +461,30 @@ impl RetentionPredicate for CacheEvictionPredicate {
 /// to. Three callers rely on that: the no-request-column expiry path (safe there
 /// because with no key there is no entry to leave half of, and a row past its
 /// window is unservable on its own terms — a row with no fetch time is treated
-/// as expired too); the range term in [`partition_doomed`] (safe because the
+/// as expired too); the range term in [`partition_doomed`] (safe because its
 /// ceiling sits below every kept or straddling entry's oldest row); and the
 /// per-entry `<= ranked_newest` guard in [`entry_predicate`].
 fn fetched_at_at_most(refreshed_at: Option<&TimestampFilterConvert>, t: i64) -> Option<Expr> {
     let converter = refreshed_at?;
     Some(converter.convert(u128::try_from(t).ok()?, Operator::LtEq))
+}
+
+/// `from <= _fetched_at <= to`, built for the column's stored type.
+///
+/// Unlike [`fetched_at_at_most`], this can only reach timestamps the ranking
+/// observed in its range bucket. The lower bound keeps a response written after
+/// ranking with an older origin-provided `Date` out of this sweep.
+fn fetched_at_between(
+    refreshed_at: Option<&TimestampFilterConvert>,
+    from: i64,
+    to: i64,
+) -> Option<Expr> {
+    let converter = refreshed_at?;
+    Some(
+        converter
+            .convert(u128::try_from(from).ok()?, Operator::GtEq)
+            .and(converter.convert(u128::try_from(to).ok()?, Operator::LtEq)),
+    )
 }
 
 /// The instant before which an entry can no longer be served: `caching_ttl`
@@ -628,9 +646,11 @@ fn nameable<'a>(doomed: &'a [&'a EntryCost]) -> (&'a [&'a EntryCost], usize) {
 /// that must be named. Both are applied — the sweep's `DELETE` predicate is
 /// their `OR`.
 struct DoomedSplit<'a> {
-    /// Upper bound of a `_fetched_at <= ceiling` range that deletes every doomed
-    /// entry lying wholly below the survivor cutoff, in one predicate unbounded
-    /// in how many entries it covers. `None` when no entry is cleanly rangeable.
+    /// Bounds of a `floor <= _fetched_at <= ceiling` range that deletes every
+    /// doomed entry lying wholly below the survivor cutoff, in one predicate
+    /// unbounded in how many entries it covers. `None` when no entry is cleanly
+    /// rangeable.
+    range_floor: Option<i64>,
     range_ceiling: Option<i64>,
     /// The straddlers and the over-budget tail of the boundary tie: the doomed
     /// entries the range cannot cover. [`entry_predicate`] names each by key,
@@ -641,8 +661,9 @@ struct DoomedSplit<'a> {
 
 impl<'a> DoomedSplit<'a> {
     /// Renders the split into the `DELETE` predicate terms to be `OR`-combined:
-    /// the `_fetched_at <= ceiling` range term, when a ceiling exists and can be
-    /// built for the column, followed by one named-entry term per capped entry.
+    /// the `floor <= _fetched_at <= ceiling` range term, when both bounds exist
+    /// and can be built for the column, followed by one named-entry term per
+    /// capped entry.
     ///
     /// `doomed` is the full doomed set, used only as the fallback for when the
     /// range term cannot be rendered for the column's stored type — then every
@@ -656,8 +677,8 @@ impl<'a> DoomedSplit<'a> {
         doomed: &[&'a EntryCost],
     ) -> (Vec<Expr>, usize) {
         let mut terms: Vec<Expr> = Vec::new();
-        if let Some(ceiling) = self.range_ceiling {
-            match fetched_at_at_most(refreshed_at, ceiling) {
+        if let Some((floor, ceiling)) = self.range_floor.zip(self.range_ceiling) {
+            match fetched_at_between(refreshed_at, floor, ceiling) {
                 Some(expr) => terms.push(expr),
                 None => self.named = doomed.to_vec(),
             }
@@ -710,8 +731,10 @@ impl<'a> DoomedSplit<'a> {
 ///
 /// The range-bucket is every doomed entry lying wholly below `X` (`newest < X`),
 /// and the returned [`DoomedSplit::range_ceiling`] is `max(newest)` over that
-/// bucket — a `_fetched_at <= ceiling` range that selects exactly those entries,
-/// unbounded in count. Everything else doomed — the straddlers and the
+/// bucket — a `floor <= _fetched_at <= ceiling` range that selects exactly those
+/// entries, unbounded in count. `floor` is the oldest row of that bucket, so a
+/// row written after ranking with an origin-provided older fetch time is not
+/// swept up. Everything else doomed — the straddlers and the
 /// over-budget tail of the boundary tie — goes to [`DoomedSplit::named`], which
 /// [`entry_predicate`] names by key. When the doomed set is cleanly older than
 /// everything kept there are no straddlers, so the whole set falls in the
@@ -724,21 +747,17 @@ impl<'a> DoomedSplit<'a> {
 /// Correctness this preserves:
 /// * **No entry is split.** After the fixed point every doomed entry is wholly
 ///   below `X` (ranged) or has `oldest >= X` (named). So
+///   `floor = min(oldest of range-bucket)`,
 ///   `ceiling = max(newest of range-bucket) < X <= oldest of every named entry`,
-///   and the `_fetched_at <= ceiling` range reaches no row of any named entry —
+///   and the bounded range reaches no row of any named entry —
 ///   even one the cap defers to a later sweep — while the named entry's key
 ///   predicate takes all of its rows. No entry is left half-present.
 /// * **No survivor is touched.** Survivors have `oldest >= C >= X > ceiling`, so
 ///   no survivor row is `<= ceiling`, and no survivor is named.
-/// * **The range has no lower bound, by design.** Caching mode requires
-///   `_fetched_at` to be the fetch instant — TTL, stale-while-revalidate and the
-///   read-path freshness check all read it as "how long ago this was fetched",
-///   and the per-entry naming guard relies on a refresh appending rows at
-///   `now()`. Under that invariant a row written after the lock-free ranking
-///   carries `_fetched_at ≈ now()`, far above `ceiling`, so it cannot fall in
-///   the range; the ranking already guarantees no kept or straddling entry has a
-///   row `<= ceiling`. An unbounded-below `_fetched_at <= ceiling` is thus
-///   exact, and lets the range reuse [`fetched_at_at_most`].
+/// * **Post-ranking older writes are protected.** HTTP may stamp `_fetched_at`
+///   from an origin-provided `Date`, rather than the local write time. Bounding
+///   below at the oldest ranged row means a response written after lock-free
+///   ranking with an older origin timestamp cannot match this sweep's range.
 /// * **A survivor with no fetch time is unknowable**, so the cutoff cannot be
 ///   placed and every doomed entry is named rather than risk a range clipping
 ///   one. A timestampless doomed entry is likewise always named.
@@ -757,6 +776,7 @@ fn partition_doomed<'a>(doomed: &[&'a EntryCost], survivors: &[&'a EntryCost]) -
             Some(cutoff) => cutoff,
             None => {
                 return DoomedSplit {
+                    range_floor: None,
                     range_ceiling: None,
                     named: doomed.to_vec(),
                 };
@@ -782,7 +802,7 @@ fn partition_doomed<'a>(doomed: &[&'a EntryCost], survivors: &[&'a EntryCost]) -
         .iter()
         .filter_map(|entry| Some((entry.oldest?, entry.newest?)))
         .collect();
-    spanning.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    spanning.sort_unstable_by_key(|&(_, newest)| std::cmp::Reverse(newest));
     let mut upper = cutoff;
     for (oldest, newest) in spanning {
         if newest >= upper {
@@ -795,12 +815,14 @@ fn partition_doomed<'a>(doomed: &[&'a EntryCost], survivors: &[&'a EntryCost]) -
     // Range-bucket vs name-bucket at X. An entry is rangeable only when both its
     // bounds are known and its whole extent lies below X; everything else is
     // named, which deletes it whole by key. The ceiling is the newest row the
-    // range must reach — `max(newest)` over the range-bucket.
+    // range must reach — `min(oldest)` and `max(newest)` over the range-bucket.
+    let mut range_floor: Option<i64> = None;
     let mut range_ceiling: Option<i64> = None;
     let mut named: Vec<&EntryCost> = Vec::new();
     for entry in doomed {
         match (entry.oldest, entry.newest) {
-            (Some(_), Some(newest)) if newest < upper => {
+            (Some(oldest), Some(newest)) if newest < upper => {
+                range_floor = Some(range_floor.map_or(oldest, |floor| floor.min(oldest)));
                 range_ceiling = Some(range_ceiling.map_or(newest, |c| c.max(newest)));
             }
             _ => named.push(entry),
@@ -808,6 +830,7 @@ fn partition_doomed<'a>(doomed: &[&'a EntryCost], survivors: &[&'a EntryCost]) -
     }
 
     DoomedSplit {
+        range_floor,
         range_ceiling,
         named,
     }
@@ -1145,23 +1168,26 @@ mod tests {
         let s: Vec<&EntryCost> = survivors.iter().collect();
 
         let split = partition_doomed(&d, &s);
+        assert_eq!(split.range_floor, Some(5));
         assert_eq!(split.range_ceiling, Some(20));
         assert!(split.named.is_empty(), "a clean separation names nothing");
     }
 
     #[test]
-    fn the_range_ceiling_stays_below_the_oldest_row_anything_kept_holds() {
-        // The range deletes `_fetched_at <= ceiling`, so the ceiling must sit
-        // strictly below the oldest row of every survivor and straddler, or the
-        // range would clip one. Here the doomed entries top out at 20 and the
-        // only survivor starts at 30.
+    fn the_range_stays_inside_the_ranked_window() {
+        // The range must stay strictly below every survivor and straddler, and
+        // must not reach below the oldest doomed row the ranking observed. HTTP
+        // can use an origin-provided `Date` for `_fetched_at`, so a response
+        // written after ranking can have an older timestamp.
         let doomed = [cost(Some(10), Some(20)), cost(Some(14), Some(18))];
         let survivors = [cost(Some(30), Some(40))];
         let d: Vec<&EntryCost> = doomed.iter().collect();
         let s: Vec<&EntryCost> = survivors.iter().collect();
 
         let split = partition_doomed(&d, &s);
+        let floor = split.range_floor.expect("range");
         let ceiling = split.range_ceiling.expect("range");
+        assert_eq!(floor, 10, "the floor is the oldest row the ranking saw");
         assert_eq!(ceiling, 20, "the ceiling is the newest row the ranking saw");
         assert!(split.named.is_empty(), "a clean separation names nothing");
 
@@ -1170,16 +1196,25 @@ mod tests {
             ceiling < oldest_survivor_row,
             "the range must stop below anything kept: {ceiling} !< {oldest_survivor_row}"
         );
+
+        let post_ranking_origin_timestamp = 5;
+        assert!(
+            post_ranking_origin_timestamp < floor,
+            "a post-ranking row with an older origin timestamp must fall below the range"
+        );
     }
 
     #[test]
-    fn the_range_predicate_is_bounded_above() {
-        // The range is `_fetched_at <= ceiling`. Asserting its shape guards
-        // against the term degenerating into something unbounded that would
-        // delete more than the range-bucket.
-        let rendered = fetched_at_at_most(refreshed_at_converter().as_ref(), 20)
+    fn the_range_predicate_bounds_both_ends() {
+        // The lower bound is what protects post-ranking writes carrying an
+        // older HTTP `Date`; the upper bound protects kept and named entries.
+        let rendered = fetched_at_between(refreshed_at_converter().as_ref(), 10, 20)
             .expect("predicate")
             .to_string();
+        assert!(
+            rendered.contains(">="),
+            "the range must be closed below: {rendered}"
+        );
         assert!(
             rendered.contains("<="),
             "the range must be bounded above: {rendered}"
@@ -1241,6 +1276,7 @@ mod tests {
         let d: Vec<&EntryCost> = doomed.iter().collect();
 
         let split = partition_doomed(&d, &[]);
+        assert_eq!(split.range_floor, Some(1));
         assert_eq!(split.range_ceiling, Some(4));
         assert!(
             split.named.is_empty(),
@@ -1287,6 +1323,7 @@ mod tests {
         let s: Vec<&EntryCost> = survivors.iter().collect();
 
         let split = partition_doomed(&d, &s);
+        assert_eq!(split.range_floor, Some(998));
         assert_eq!(
             split.range_ceiling,
             Some(999),
@@ -1313,6 +1350,7 @@ mod tests {
         let s: Vec<&EntryCost> = survivors.iter().collect();
 
         let split = partition_doomed(&d, &s);
+        assert_eq!(split.range_floor, Some(1));
         assert_eq!(
             split.range_ceiling,
             Some(2),
@@ -1338,6 +1376,7 @@ mod tests {
         let d: Vec<&EntryCost> = doomed.iter().collect();
 
         let split = partition_doomed(&d, &[]);
+        assert_eq!(split.range_floor, Some(1));
         assert_eq!(
             split.range_ceiling,
             Some(4),
@@ -1441,6 +1480,7 @@ mod tests {
         let s: Vec<&EntryCost> = survivors.iter().collect();
         let split = partition_doomed(&doomed, &s);
 
+        assert_eq!(split.range_floor, Some(24));
         assert_eq!(
             split.range_ceiling,
             Some(26),
