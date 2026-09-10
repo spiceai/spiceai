@@ -1,249 +1,130 @@
-name: load tests
-run-name: load - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
-
-on:
+name: Validate configured load fixtures
+run-name: Load fixture probe - ${{ inputs.query_set }} SF${{ inputs.scale_factor }}
+'on':
   workflow_dispatch:
     inputs:
       spiced_commit:
-        description: 'spiced build commit'
+        description: spiced build commit
         required: false
         type: string
       duration:
-        description: 'The test duration in seconds'
+        description: The test duration in seconds
         required: true
         default: '28800'
         type: string
       spicepod_path:
-        description: 'The spicepod file to test with'
+        description: The spicepod file to test with
         required: true
         type: string
       query_set:
-        description: 'Query set'
+        description: Query set
         required: true
-        default: 'tpch'
+        default: tpch
         type: choice
         options:
-          - 'tpch'
-          - 'tpch[parameterized]'
-          - 'tpcds'
-          - 'clickbench'
+        - tpch
+        - tpch[parameterized]
+        - tpcds
+        - clickbench
       query_overrides:
-        description: 'Query overrides'
+        description: Query overrides
         required: false
         type: choice
         default: ''
         options:
-          - ''
-          - 'sqlite'
-          - 'postgresql'
-          - 'mysql'
-          - 'dremio'
-          - 'odbc-athena'
-          - 'odbc-databricks'
-          - 'duckdb'
-          - 'duckdb-zero-results'
-          - 'snowflake'
-          - 'spark'
-          - 'iceberg-sf1'
-          - 'spicecloud-catalog'
-          - 'glue-catalog'
-          - 'databricks-catalog'
-          - 'spicecloud'
-          - 'iceberg-hadoop'
-          - 'postgres-catalog'
-          - 'mysql-catalog'
-          - 'mssql-catalog'
-          - 'arrow'
-          - 'bigquery'
-          - 'dynamodb'
-          - 'scylladb'
-          - 'turso'
+        - ''
+        - sqlite
+        - postgresql
+        - mysql
+        - dremio
+        - odbc-athena
+        - odbc-databricks
+        - duckdb
+        - duckdb-zero-results
+        - snowflake
+        - spark
+        - iceberg-sf1
+        - spicecloud-catalog
+        - glue-catalog
+        - databricks-catalog
+        - spicecloud
+        - iceberg-hadoop
+        - postgres-catalog
+        - mysql-catalog
+        - mssql-catalog
+        - arrow
+        - bigquery
+        - dynamodb
+        - scylladb
+        - turso
       scale_factor:
-        description: 'Scale factor for the data and queries'
+        description: Scale factor for the data and queries
         required: false
         type: string
         default: '1'
       runner_type:
-        description: 'Runner type'
+        description: Runner type
         required: true
-        default: 'spiceai-dev-runners'
+        default: spiceai-dev-runners
         type: choice
         options:
-          - 'spiceai-dev-runners'
-          - 'spiceai-dev-large-runners'
+        - spiceai-dev-runners
+        - spiceai-dev-large-runners
       concurrency:
-        description: 'How many concurrent client connections to use?'
+        description: How many concurrent client connections to use?
         required: true
         default: '8'
         type: string
       random_param_set_count:
-        description: 'Number of random parameter sets to generate for parameterized queries (optional)'
+        description: Number of random parameter sets to generate for parameterized queries (optional)
         required: false
         type: string
       http_clients:
-        description: 'Use HTTP clients for the test?'
+        description: Use HTTP clients for the test?
         required: false
         type: boolean
-        default: false
+        default: 'false'
       scrape_spiced_metrics:
-        description: 'Scrape Prometheus metrics from spiced during the test'
+        description: Scrape Prometheus metrics from spiced during the test
         required: false
         type: boolean
-        default: false
-
+        default: 'false'
+permissions:
+  contents: read
 jobs:
-  run-load:
-    name: Run load test
-    runs-on: ${{ github.event.inputs.runner_type }}
-    timeout-minutes: 600
+  probe:
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Set spicepod path
-        id: set_spicepod_path
-        env:
-          QUERY_SET: ${{ github.event.inputs.query_set }}
-          SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
-          SPICEPOD_FILE: ${{ github.event.inputs.spicepod_path }}
-        run: |
-          if [[ ! "$SCALE_FACTOR" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ -z "${SCALE_FACTOR//[0.]/}" ]]; then
-            echo "Error: scale_factor must be a positive number"
-            exit 1
-          fi
-          query_set="$QUERY_SET"
-          query_set="${query_set%%\[*\]*}"
-          scale_factor="$SCALE_FACTOR"
-          while [[ "$scale_factor" == 0[0-9]* ]]; do
-            scale_factor="${scale_factor#0}"
-          done
-          if [[ "$scale_factor" == *.* ]]; then
-            while [[ "$scale_factor" == *0 ]]; do
-              scale_factor="${scale_factor%0}"
-            done
-            scale_factor="${scale_factor%.}"
-          fi
-          fixture_scale="${scale_factor//./_}"
-          SPICEPOD_PATH="./test/spicepods/${query_set}/sf${fixture_scale}/${SPICEPOD_FILE}"
-          {
-            echo "SPICEPOD_PATH=${SPICEPOD_PATH}"
-            echo "query_set=${query_set}"
-            echo "fixture_scale=${fixture_scale}"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Validate spicepod file exists
-        run: |
-          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
-            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
-            exit 1
-          fi
-          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
-
-      - name: Install MinIO
-        uses: ./.github/actions/setup-minio
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-
-      - name: Build spicepod validator
-        uses: ./.github/actions/build-spicepod-validator
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-
-      - name: Validate spicepod
-        run: |
-          spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
-
-      - name: Setup spiced
-        uses: ./.github/actions/setup-spiced
-        with:
-          spiced_commit: ${{ github.event.inputs.spiced_commit }}
-
-      - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-
-      - name: Setup Testoperator
-        uses: ./.github/actions/setup-testoperator-data
-        with:
-          query_set: ${{ github.event.inputs.query_set }}
-          scale_factor: ${{ github.event.inputs.scale_factor }}
-
-      - name: Setup MySQL
-        env:
-          QUERY_SET: ${{ steps.set_spicepod_path.outputs.query_set }}
-          FIXTURE_SCALE: ${{ steps.set_spicepod_path.outputs.fixture_scale }}
-        run: |
-          if [[ "$QUERY_SET" == "tpcds" || "$QUERY_SET" == "tpch" ]]; then
-            echo "MYSQL_DB=${QUERY_SET}_sf${FIXTURE_SCALE}" >> "$GITHUB_ENV"
-          fi
-
-      - name: Install OpenMP runtime library
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgomp1
-
-      - name: Install ADBC BigQuery Driver
-        if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
-        uses: ./.github/actions/setup-adbc-bigquery
-
-      - name: Run the load test - ${{ github.event.inputs.spicepod_path }}
-        run: |
-          rm -rf .spice/data
-          testoperator run load \
-            -s /usr/local/bin/spiced \
-            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
-            -d /opt/spiced/data \
-            --query-set ${{ github.event.inputs.query_set }} \
-            --scale-factor "$TEST_SCALE_FACTOR" \
-            --ready-wait 900 \
-            --disable-progress-bars \
-            --duration ${{ github.event.inputs.duration }} \
-            ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
-            --concurrency ${{ github.event.inputs.concurrency }} \
-            ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
-            ${{ github.event.inputs.http_clients == 'true' && '--http-clients' || '' }} \
-            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }} \
-            --metrics
-        env:
-          TEST_SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY}}
-          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
-          DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
-          DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
-          DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.DATABRICKS_SQL_WAREHOUSE_ID }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
-          MYSQL_HOST: ${{ vars.TEST_MYSQL_HOST }}
-          MYSQL_TCP_PORT: 3306
-          MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
-          MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
-          POSTGRES_HOST: ${{ vars.POSTGRES_HOST }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-          SPICEAI_TEST_ENDPOINT: ${{ vars.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
-          SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
-          SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
-          SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
-          SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
-          SQL_WAREHOUSE_DATABRICKS_HOST: ${{ vars.SQL_WAREHOUSE_DATABRICKS_HOST }}
-          SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
-          DREMIO_ENDPOINT: ${{ vars.SPICE_DREMIO_ENDPOINT}}
-          DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
-          DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
-          MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
-          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
-          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: 'false'
+    - name: Set spicepod path
+      id: set_spicepod_path
+      env:
+        QUERY_SET: ${{ github.event.inputs.query_set }}
+        SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
+        SPICEPOD_FILE: ${{ github.event.inputs.spicepod_path }}
+      run: "if [[ ! \"$SCALE_FACTOR\" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ -z \"${SCALE_FACTOR//[0.]/}\" ]]; then\n  echo \"Error: scale_factor must be a positive number\"\n  exit 1\nfi\nquery_set=\"$QUERY_SET\"\
+        \nquery_set=\"${query_set%%\\[*\\]*}\"\nscale_factor=\"$SCALE_FACTOR\"\nwhile [[ \"$scale_factor\" == 0[0-9]* ]]; do\n  scale_factor=\"${scale_factor#0}\"\ndone\nif [[ \"$scale_factor\" == *.* ]];\
+        \ then\n  while [[ \"$scale_factor\" == *0 ]]; do\n    scale_factor=\"${scale_factor%0}\"\n  done\n  scale_factor=\"${scale_factor%.}\"\nfi\nfixture_scale=\"${scale_factor//./_}\"\nSPICEPOD_PATH=\"\
+        ./test/spicepods/${query_set}/sf${fixture_scale}/${SPICEPOD_FILE}\"\n{\n  echo \"SPICEPOD_PATH=${SPICEPOD_PATH}\"\n  echo \"query_set=${query_set}\"\n  echo \"fixture_scale=${fixture_scale}\"\n\
+        } >> \"$GITHUB_OUTPUT\"\n"
+    - name: Validate spicepod file exists
+      run: "if [ ! -f \"${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}\" ]; then\n  echo \"Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}\"\n  exit 1\nfi\n\
+        echo \"Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}\"\n"
+    - name: Install MinIO
+      uses: ./.github/actions/setup-minio
+      with:
+        minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+        minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+    - name: Verify selected fixture objects
+      env:
+        QUERY_SET: ${{ steps.set_spicepod_path.outputs.query_set }}
+        FIXTURE_SCALE: ${{ steps.set_spicepod_path.outputs.fixture_scale }}
+      run: "set -euo pipefail\nprefix=\"spice-minio/benchmarks/${QUERY_SET}_sf${FIXTURE_SCALE}\"\nmc stat --json \"${prefix}/${QUERY_SET}.db\"\nif [[ \"$QUERY_SET\" == tpch ]]; then\n  mc stat --json \"\
+        ${prefix}/lineitem.parquet\"\nelse\n  mc stat --json \"${prefix}/store_sales.parquet\"\nfi\nmc ls --json \"${prefix}/\" > \"$RUNNER_TEMP/fixture-objects.json\"\npython3 - <<'PYTHON'\nfrom pathlib\
+        \ import Path\nimport json, os\nobjects = [json.loads(line) for line in Path(os.environ['RUNNER_TEMP'], 'fixture-objects.json').read_text().splitlines()]\nassert objects and all(item.get('status')\
+        \ == 'success' for item in objects)\nprint(json.dumps({'query_set': os.environ['QUERY_SET'], 'fixture_scale': os.environ['FIXTURE_SCALE'], 'objects': len(objects), 'bytes': sum(item.get('size',\
+        \ 0) for item in objects)}))\nPYTHON\n"
