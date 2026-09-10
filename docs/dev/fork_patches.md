@@ -93,7 +93,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
-| [datafusion](#datafusion) | `c2fbafe20cbc1d65aadedb2626a3ad4f37c5ff55` | `spiceai-54` |
+| [datafusion](#datafusion) | `PINNED_REV` | `spiceai-54` |
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `3af703dba0accdff5fdb0ae92ef12588e1dfe88a` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
@@ -211,7 +211,11 @@ catch.
 | Placeholder type inference (`Expr::infer_placeholder_types`, incl. `CASE`, `LIMIT`/`OFFSET` `Int64`, name/metadata preservation) (fork PRs #87, #88, #89) | A parameterised query fails to plan, or infers the wrong type for `$1` | silent (query failure) | **GAP** |
 | BigQuery dialect: temporal typing and naming — a tz-naive timestamp cast is `DATETIME` not `TIMESTAMP`, a timestamp literal's cast target follows the offset it renders with, sub-second digits are truncated to six, a comparison BigQuery has no supertype for is brought to one, `date - date` is `DATE_DIFF`, `CAST(date AS INT64)` is `UNIX_DATE`, `btrim`/`now`/`to_unixtime`/`unix_seconds`/`to_timestamp` are renamed or type-directed, `median`/`approx_percentile_cont` are rendered by ordering the group, a constant `GROUP BY` key is cast to its own type, and `array_element` subscripts with `SAFE_ORDINAL` (fork PR #212) | BigQuery puts no timezone qualifier on a timestamp type, so a tz-naive value typed `TIMESTAMP` becomes an instant with no supertype against a `DATETIME` column and the statement is refused; the name and cast rows are refused outright too. Two are quieter: `array_element` is 1-based where a bare BigQuery subscript is 0-based, so the neighbouring element is read with no error, and dropping a constant grouping key turns a grouped aggregate into a global one, returning one row of zeros where the grouped form returns none | silent (query failure; wrong data for the subscript and the dropped grouping key) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the four `#212` arms: `DATE_DIFF`, `UNIX_DATE`, `DATETIME`, cast `GROUP BY`) and `::array_element_federates_only_for_a_non_negative_integer_index`; in the fork, the per-rendering tests in `plan_to_sql.rs` and, restored by fork PR #214 after #212 deleted them, `rewrite.rs`'s own; real-engine guard: `test/scripts/bigquery-pushdown.sh` |
 | Spark concat coerces an untyped NULL argument to a string type (fork PR #217) | A string array concatenated with an untyped NULL reaches an unsupported kernel branch | silent (panic) | `crates/runtime/src/datafusion/builder.rs::tests::the_built_session_concatenates_an_untyped_null` |
+| Unparser: a subquery alias whose scan pushdown renames the projection's outputs gets a column list naming them for the enclosing scope (fork PR #221) | The alias pushdown requalifies the projection onto the alias before the derived table is built, so the derived table reports `s.a + s.b` while the enclosing scope references `s."t.a + t.b"` — the remote engine cannot bind the statement ([#13140](https://github.com/spiceai/spiceai/issues/13140)) | silent (query failure) | `crates/data_components/src/federation.rs::a_projected_scan_under_an_alias_names_the_output_its_scope_references` |
+| Unparser: a filter on a projection output that cannot be repeated — a volatile expression or a subquery — is applied from a scope above the projection, an aliased output is inlined, and a dialect whose derived tables do not fix a volatile value (`SqliteDialect`, `MySqlDialect`; `TursoDialect` and Spice's `MsSqlDialect` forward or opt out) refuses the shape (fork PR #227) | `SELECT * FROM (SELECT c, random() AS r FROM t) WHERE r > 0.5` was emitted as `… random() AS "r" FROM "t" WHERE ("r" > 0.5)` where the filter folded into the projection's SELECT, which PostgreSQL rejects and SQLite resolves by drawing `random()` again; and through Spice's federation path the derived-table form itself returns rows the predicate excluded on SQLite (476 of 974, measured through `spiced`) ([#12751](https://github.com/spiceai/spiceai/issues/12751), [#13445](https://github.com/spiceai/spiceai/issues/13445)) | silent (wrong data / query failure) | `…::a_filter_on_a_volatile_projection_output_is_applied_above_the_projection`, `…::a_filter_on_an_aliased_projection_output_is_inlined`, `…::sqlite_refuses_every_route_to_a_volatile_output_scope`, the `sqlite` arm of `…::a_derived_volatile_output_is_evaluated_once`, `crates/data_components/src/turso.rs::tests::test_turso_dialect_reports_that_a_derived_table_does_not_fix_a_volatile_value`, `crates/data_components/src/mssql/dialect.rs::tests::test_derived_table_is_not_trusted_to_fix_a_volatile_value` |
 | Substrait VarChar literals decode as UTF-8 strings (fork PR #215) | Plans containing VarChar literals fail to decode | silent (query failure) | `crates/runtime/src/flight/flightsql/statement_substrait_plan.rs::tests::decode_plan_executes_a_varchar_literal` |
+| Substrait: an enum function argument (`extract:req_date` with `enum = YEAR`) is lowered to a literal and `extract` maps to `date_part` (fork PR #220) | Isthmus-shaped TPC-H q07/q08/q09 plans fail with `Function argument non-Value type not supported` | silent (query failure) | **GAP** — the fork's own `test_extract_enum_arg` and `tpch_test_07`/`08`/`09` cover it; the repo-side Substrait compliance harness (#13879) is not merged |
+| Substrait: a subquery's `NamedTable` scan of a table an enclosing scope also reads gets its own qualifier (`LINEITEM_1`) (fork PR #226) | Decorrelation matches a pulled-up predicate's columns by qualified name, so `LINEITEM.L_ORDERKEY = outer_ref(LINEITEM.L_ORDERKEY)` resolved both sides to the subquery's own scan: TPC-H q21 over Substrait lost both semi/anti join conditions and returned 0 rows | silent (wrong data) | **GAP** — covered in the fork by `subquery_execution.rs` and the `self_correlated_exists*` plans; no repo-side Substrait path exercises it until #13879 lands |
 | BigQuery renders integer-typed division with `DIV` (fork PR #222) | Fractional division followed by an integer cast rounds cohort cutoff hours instead of preserving the logical plan's integer quotient | silent (wrong data) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the integer cohort hours arm) |
 | Unparser isolates standalone expression state and qualifies filtered recursive join inputs (fork PR #219) | A refused recursive expression poisons a reused unparser, or a filtered recursive self-join renders ambiguous columns | silent (query failure) | `crates/runtime-datafusion/src/dialect/bigquery.rs::filtered_recursive_join_inputs_keep_their_qualified_columns` and `::a_recursive_cte_renders_through_the_wrapper_only_where_it_is_supported`; real-engine control: `test/scripts/bigquery_pushdown.py::filtered-recursive-self-join` |
 | Unparser preserves a recursive CTE column-list projection through a join alias (fork PR #225) | A recursive hour generator with an explicit column list fails SQL generation when joined to a remote table | silent (query failure) | `crates/runtime-datafusion/src/dialect/bigquery.rs::recursive_column_list_survives_a_join_alias`; real-engine guard: `test/scripts/bigquery_pushdown.py::recursive-cte-joined-to-a-table` |
@@ -525,7 +529,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**37 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**39 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -541,58 +545,66 @@ They are not equal in consequence; this is the order to close them in.
    `a_derived_projection_names_the_output_its_scope_references` do not catch it
    because they assert the output *is* named, which still holds if the patch is
    lost.
-3. `iceberg-rust` pinned snapshot reads (fork PR #45) — time travel silently reads live data.
-4. `datafusion-ballista` null-aware anti-join swap (fork PR #58).
-5. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
+3. `datafusion` Substrait subquery scan qualifier (fork PR #226) — TPC-H q21 over
+   Substrait loses both semi/anti join conditions and returns 0 rows. The fork's own
+   `subquery_execution.rs` covers it; the repo-side guard is the Substrait compliance
+   harness (#13879), not yet merged.
+4. `iceberg-rust` pinned snapshot reads (fork PR #45) — time travel silently reads live data.
+5. `datafusion-ballista` null-aware anti-join swap (fork PR #58).
+6. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
    PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
-6. `snowflake-rs` chunked JSON responses and record-batch ordering.
-7. `clickhouse-rs` `Date32` range.
-8. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
+7. `snowflake-rs` chunked JSON responses and record-batch ordering.
+8. `clickhouse-rs` `Date32` range.
+9. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
    change the text that gets embedded.
-9. `mistral.rs` `tool_calls` chat-template handling.
-10. `text-embeddings-inference` pooling and model-loading fixes — embeddings
+10. `mistral.rs` `tool_calls` chat-template handling.
+11. `text-embeddings-inference` pooling and model-loading fixes — embeddings
     differ from the reference implementation.
 
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-11. `datafusion` bloom-filter replacement readers sharing the listed object
+12. `datafusion` bloom-filter replacement readers sharing the listed object
     version — a predicate scan whose bloom-filter reader is built separately
     falls back to stale `If-Match`, so a replaced object 412s; the query retries
     or fails rather than mixing generations. The overwrite harness has no
     bloom data.
-12. `vortex` session lock re-entry in writer init (fork PR #29).
-13. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+13. `vortex` session lock re-entry in writer init (fork PR #29).
+14. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
     resilience (fork PRs #61–#63).
-14. `async-openai` null-suppression in requests.
-15. `spark-connect-rs` `http` scheme when `use_ssl` is false.
-16. `model2vec-rs` optional `config.json`.
-17. `snowflake-rs` async query response support — long-running queries time out.
-18. `arrow-rs` `PushBuffers::push_range` asserts instead of returning an error
+15. `async-openai` null-suppression in requests.
+16. `spark-connect-rs` `http` scheme when `use_ssl` is false.
+17. `model2vec-rs` optional `config.json`.
+18. `snowflake-rs` async query response support — long-running queries time out.
+19. `arrow-rs` `PushBuffers::push_range` asserts instead of returning an error
     on a short read — a footer prefetch racing an in-place shrink panics the
     reader thread rather than surfacing a retriable decode error. The
     listing/overwrite harness 412s before a short successful range body
     reaches the decoder.
+20. `datafusion` Substrait enum function arguments (fork PR #220) — TPC-H q07/q08/q09
+    over Substrait fail with `Function argument non-Value type not supported`. The
+    fork's `test_extract_enum_arg` and `tpch_test_07`/`08`/`09` cover it; the
+    repo-side guard is the Substrait compliance harness (#13879).
 
 **Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
 being honoured:
 
-19. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
+21. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
     the sink's own honouring of `target_file_size_mb` is not, so the writer can emit
     one file per flush regardless of size.
-20. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
+22. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
     cannot silently drop the limit, the single-node scan can.
-21. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
+23. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
     misconfigured warehouse produces an opaque error instead of an actionable one.
-22. `model2vec-rs` HF cache directory read from the environment — models are
+24. `model2vec-rs` HF cache directory read from the environment — models are
     re-downloaded instead of reusing the shared cache.
-23. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
+25. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
     installs a global subscriber and hijacks `spiced`'s logging.
 
 **Security posture.** No correctness effect, but a silent downgrade:
 
-24. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
-25. `graph-rs-sdk` tower middleware application.
+26. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
+27. `graph-rs-sdk` tower middleware application.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
@@ -600,7 +612,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-26. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+28. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a

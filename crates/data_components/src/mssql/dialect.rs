@@ -43,6 +43,16 @@ impl Dialect for MsSqlDialect {
         None
     }
 
+    /// Not measured for SQL Server, so answered conservatively: the trait default
+    /// (`true`) lets the unparser read a volatile projection output through a derived
+    /// table, and an engine that expands the derived table and evaluates the
+    /// expression again for the predicate — as SQLite and MySQL do — returns rows the
+    /// predicate excluded. Refusing that shape costs the pushdown and never a row;
+    /// flip this once a run against SQL Server shows the value is fixed.
+    fn derived_table_evaluates_volatile_outputs_once(&self) -> bool {
+        false
+    }
+
     fn float64_ast_dtype(&self) -> ast::DataType {
         ast::DataType::Float(ExactNumberInfo::None)
     }
@@ -122,6 +132,17 @@ mod tests {
 
     fn create_dialect() -> MsSqlDialect {
         MsSqlDialect::new()
+    }
+
+    /// Pinned so a trait default cannot quietly re-enable the scope: SQL Server has
+    /// not been measured to fix a volatile value inside a derived table, and the
+    /// unparser refuses the shape on a dialect that answers `false` here.
+    #[test]
+    fn test_derived_table_is_not_trusted_to_fix_a_volatile_value() {
+        assert!(
+            !create_dialect().derived_table_evaluates_volatile_outputs_once(),
+            "MsSqlDialect must opt out until SQL Server is measured to evaluate the value once"
+        );
     }
 
     #[test]

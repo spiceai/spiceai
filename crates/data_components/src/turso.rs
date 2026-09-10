@@ -288,6 +288,13 @@ impl Dialect for TursoDialect {
         self.inner.supports_column_alias_in_table_alias()
     }
 
+    /// Forwarded rather than inherited: the trait's default says a derived table
+    /// fixes a volatile value, and libSQL flattens one the way SQLite does, so the
+    /// default would let a filter on such an output through as wrong rows.
+    fn derived_table_evaluates_volatile_outputs_once(&self) -> bool {
+        self.inner.derived_table_evaluates_volatile_outputs_once()
+    }
+
     fn interval_style(&self) -> IntervalStyle {
         self.inner.interval_style()
     }
@@ -3278,6 +3285,19 @@ mod tests {
             )
             .await,
             vec![3, 1, 2, 4]
+        );
+    }
+
+    /// The Turso dialect wraps `SqliteDialect` and forwards each answer by hand, so a
+    /// method added to the trait with a default reaches Turso as that default unless
+    /// it is forwarded. This one must not: libSQL flattens a derived table like
+    /// SQLite, and the default (`true`) would let the unparser read a volatile
+    /// projection output through one and return rows the predicate excluded.
+    #[test]
+    fn test_turso_dialect_reports_that_a_derived_table_does_not_fix_a_volatile_value() {
+        assert!(
+            !TursoDialect::new().derived_table_evaluates_volatile_outputs_once(),
+            "TursoDialect must forward SqliteDialect's answer, not inherit the trait default"
         );
     }
 
