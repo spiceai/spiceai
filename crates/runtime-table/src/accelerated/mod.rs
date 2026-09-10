@@ -2053,16 +2053,20 @@ impl TableLayer for AcceleratedTable {
                 filters
                     .iter()
                     .map(|filter| {
-                        // Subqueries need plan operators outside the scan. Federation
-                        // can push filters before the main optimizer decorrelates them,
-                        // including when another table supplies the federation provider.
-                        let has_subquery = filter.exists(|expr| {
+                        // Subqueries and outer references need planning outside the scan.
+                        // Federation can push filters before the main optimizer
+                        // decorrelates them, including when another table supplies the
+                        // federation provider.
+                        let needs_subquery_planning = filter.exists(|expr| {
                             Ok(matches!(
                                 expr,
-                                Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+                                Expr::Exists(_)
+                                    | Expr::InSubquery(_)
+                                    | Expr::ScalarSubquery(_)
+                                    | Expr::OuterReferenceColumn(_, _)
                             ))
                         })?;
-                        Ok(if has_subquery {
+                        Ok(if needs_subquery_planning {
                             TableProviderFilterPushDown::Unsupported
                         } else {
                             TableProviderFilterPushDown::Inexact

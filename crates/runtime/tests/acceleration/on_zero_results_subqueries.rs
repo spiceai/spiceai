@@ -185,7 +185,10 @@ async fn check_subqueries(
             mode,
             contents,
             if mixed_federation {
-                &ZeroResultsAction::ReturnEmpty
+                match action {
+                    ZeroResultsAction::UseSource => &ZeroResultsAction::ReturnEmpty,
+                    ZeroResultsAction::ReturnEmpty => &ZeroResultsAction::UseSource,
+                }
             } else {
                 action
             },
@@ -299,16 +302,12 @@ async fn check_engine(engine: &str, modes: &[Mode]) -> anyhow::Result<()> {
             }
             // An enabled SQL-federated table elsewhere in the statement can
             // invoke federation even when the fallback table has no provider.
-            if let Err(error) = check_subqueries(
-                engine,
-                &modes[0],
-                Contents::Populated,
-                &ZeroResultsAction::UseSource,
-                true,
-            )
-            .await
-            {
-                failures.push(format!("{error:#}"));
+            for action in [ZeroResultsAction::UseSource, ZeroResultsAction::ReturnEmpty] {
+                if let Err(error) =
+                    check_subqueries(engine, &modes[0], Contents::Populated, &action, true).await
+                {
+                    failures.push(format!("{error:#}"));
+                }
             }
             anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n"));
             Ok(())
