@@ -28,6 +28,7 @@ expression: response
 | sql_query              | truncated                                                                    |
 | sql_query              | truncated                                                                    |
 | sql_query              | truncated                                                                    |
+| sql_query              | truncated                                                                    |
 | tool_use::sample_data  | DistinctColumns({"dataset":"spice.public.taxi_trips","limit":3,"cols":null}) |
 | tool_use::sample_data  | RandomSample({"dataset":"spice.public.taxi_trips","limit":3})                |
 | tool_use::table_schema | {"tables":["spice.public.taxi_trips"],"output":"full"}                       |
