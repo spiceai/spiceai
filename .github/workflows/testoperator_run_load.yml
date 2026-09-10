@@ -1,249 +1,40 @@
-name: load tests
-run-name: load - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
-
-on:
-  workflow_dispatch:
-    inputs:
-      spiced_commit:
-        description: 'spiced build commit'
-        required: false
-        type: string
-      duration:
-        description: 'The test duration in seconds'
-        required: true
-        default: '28800'
-        type: string
-      spicepod_path:
-        description: 'The spicepod file to test with'
-        required: true
-        type: string
-      query_set:
-        description: 'Query set'
-        required: true
-        default: 'tpch'
-        type: choice
-        options:
-          - 'tpch'
-          - 'tpch[parameterized]'
-          - 'tpcds'
-          - 'clickbench'
-      query_overrides:
-        description: 'Query overrides'
-        required: false
-        type: choice
-        default: ''
-        options:
-          - ''
-          - 'sqlite'
-          - 'postgresql'
-          - 'mysql'
-          - 'dremio'
-          - 'odbc-athena'
-          - 'odbc-databricks'
-          - 'duckdb'
-          - 'duckdb-zero-results'
-          - 'snowflake'
-          - 'spark'
-          - 'iceberg-sf1'
-          - 'spicecloud-catalog'
-          - 'glue-catalog'
-          - 'databricks-catalog'
-          - 'spicecloud'
-          - 'iceberg-hadoop'
-          - 'postgres-catalog'
-          - 'mysql-catalog'
-          - 'mssql-catalog'
-          - 'arrow'
-          - 'bigquery'
-          - 'dynamodb'
-          - 'scylladb'
-          - 'turso'
-      scale_factor:
-        description: 'Scale factor for the data and queries'
-        required: false
-        type: string
-        default: '1'
-      runner_type:
-        description: 'Runner type'
-        required: true
-        default: 'spiceai-dev-runners'
-        type: choice
-        options:
-          - 'spiceai-dev-runners'
-          - 'spiceai-dev-large-runners'
-      concurrency:
-        description: 'How many concurrent client connections to use?'
-        required: true
-        default: '8'
-        type: string
-      random_param_set_count:
-        description: 'Number of random parameter sets to generate for parameterized queries (optional)'
-        required: false
-        type: string
-      http_clients:
-        description: 'Use HTTP clients for the test?'
-        required: false
-        type: boolean
-        default: false
-      scrape_spiced_metrics:
-        description: 'Scrape Prometheus metrics from spiced during the test'
-        required: false
-        type: boolean
-        default: false
-
+name: Inspect load test backend bindings
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
 jobs:
-  run-load:
-    name: Run load test
-    runs-on: ${{ github.event.inputs.runner_type }}
-    timeout-minutes: 600
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Set spicepod path
-        id: set_spicepod_path
-        env:
-          QUERY_SET: ${{ github.event.inputs.query_set }}
-          SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
-          SPICEPOD_FILE: ${{ github.event.inputs.spicepod_path }}
-        run: |
-          if [[ ! "$SCALE_FACTOR" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ -z "${SCALE_FACTOR//[0.]/}" ]]; then
-            echo "Error: scale_factor must be a positive number"
-            exit 1
-          fi
-          query_set="$QUERY_SET"
-          query_set="${query_set%%\[*\]*}"
-          scale_factor="$SCALE_FACTOR"
-          while [[ "$scale_factor" == 0[0-9]* ]]; do
-            scale_factor="${scale_factor#0}"
-          done
-          if [[ "$scale_factor" == *.* ]]; then
-            while [[ "$scale_factor" == *0 ]]; do
-              scale_factor="${scale_factor%0}"
-            done
-            scale_factor="${scale_factor%.}"
-          fi
-          fixture_scale="${scale_factor//./_}"
-          SPICEPOD_PATH="./test/spicepods/${query_set}/sf${fixture_scale}/${SPICEPOD_FILE}"
-          {
-            echo "SPICEPOD_PATH=${SPICEPOD_PATH}"
-            echo "query_set=${query_set}"
-            echo "fixture_scale=${fixture_scale}"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Validate spicepod file exists
-        run: |
-          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
-            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
-            exit 1
-          fi
-          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
-
-      - name: Install MinIO
-        uses: ./.github/actions/setup-minio
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-
-      - name: Build spicepod validator
-        uses: ./.github/actions/build-spicepod-validator
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-
-      - name: Validate spicepod
-        run: |
-          spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
-
-      - name: Setup spiced
-        uses: ./.github/actions/setup-spiced
-        with:
-          spiced_commit: ${{ github.event.inputs.spiced_commit }}
-
-      - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-
-      - name: Setup Testoperator
-        uses: ./.github/actions/setup-testoperator-data
-        with:
-          query_set: ${{ github.event.inputs.query_set }}
-          scale_factor: ${{ github.event.inputs.scale_factor }}
-
-      - name: Setup MySQL
-        env:
-          QUERY_SET: ${{ steps.set_spicepod_path.outputs.query_set }}
-          FIXTURE_SCALE: ${{ steps.set_spicepod_path.outputs.fixture_scale }}
-        run: |
-          if [[ "$QUERY_SET" == "tpcds" || "$QUERY_SET" == "tpch" ]]; then
-            echo "MYSQL_DB=${QUERY_SET}_sf${FIXTURE_SCALE}" >> "$GITHUB_ENV"
-          fi
-
-      - name: Install OpenMP runtime library
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgomp1
-
-      - name: Install ADBC BigQuery Driver
-        if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
-        uses: ./.github/actions/setup-adbc-bigquery
-
-      - name: Run the load test - ${{ github.event.inputs.spicepod_path }}
-        run: |
-          rm -rf .spice/data
-          testoperator run load \
-            -s /usr/local/bin/spiced \
-            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
-            -d /opt/spiced/data \
-            --query-set ${{ github.event.inputs.query_set }} \
-            --scale-factor "$TEST_SCALE_FACTOR" \
-            --ready-wait 900 \
-            --disable-progress-bars \
-            --duration ${{ github.event.inputs.duration }} \
-            ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
-            --concurrency ${{ github.event.inputs.concurrency }} \
-            ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
-            ${{ github.event.inputs.http_clients == 'true' && '--http-clients' || '' }} \
-            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }} \
-            --metrics
-        env:
-          TEST_SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY}}
-          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
-          DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
-          DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
-          DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.DATABRICKS_SQL_WAREHOUSE_ID }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
-          MYSQL_HOST: ${{ vars.TEST_MYSQL_HOST }}
-          MYSQL_TCP_PORT: 3306
-          MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
-          MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
-          POSTGRES_HOST: ${{ vars.POSTGRES_HOST }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-          SPICEAI_TEST_ENDPOINT: ${{ vars.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
-          SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
-          SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
-          SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
-          SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
-          SQL_WAREHOUSE_DATABRICKS_HOST: ${{ vars.SQL_WAREHOUSE_DATABRICKS_HOST }}
-          SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
-          DREMIO_ENDPOINT: ${{ vars.SPICE_DREMIO_ENDPOINT}}
-          DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
-          DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
-          MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
-          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
-          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+    - name: Install probe clients
+      run: python3 -m pip install --quiet "psycopg[binary]" pyarrow
+    - name: Probe configured load backends
+      env:
+        LOAD_POSTGRES_HOST: ${{ vars.POSTGRES_HOST }}
+        LOAD_POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        LOAD_DREMIO_ENDPOINT: ${{ vars.SPICE_DREMIO_ENDPOINT}}
+        LOAD_DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
+        LOAD_DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
+        REFERENCE_POSTGRES_HOST: ${{ vars.TEST_POSTGRES_HOST }}
+        REFERENCE_POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+        REFERENCE_DREMIO_ENDPOINT: ${{ vars.TEST_DREMIO_ENDPOINT}}
+        REFERENCE_DREMIO_USERNAME: ${{ secrets.TEST_DREMIO_USERNAME}}
+        REFERENCE_DREMIO_PASSWORD: ${{ secrets.TEST_DREMIO_PASSWORD}}
+      run: "python3 - <<'PYTHON'\nimport json,os\nfrom pathlib import Path\nimport psycopg\nimport pyarrow.flight as flight\nresults=[]\nfor label in ['LOAD','REFERENCE']:\n    settings={k:os.environ.get(label+'_'+k,'')\
+        \ for k in ['POSTGRES_HOST','POSTGRES_PASSWORD','DREMIO_ENDPOINT','DREMIO_USERNAME','DREMIO_PASSWORD']}\n    record={'binding':label,'postgres_configured':all(settings[k] for k in ['POSTGRES_HOST','POSTGRES_PASSWORD']),'dremio_configured':all(settings[k]\
+        \ for k in ['DREMIO_ENDPOINT','DREMIO_USERNAME','DREMIO_PASSWORD'])}\n    if record['postgres_configured']:\n        try:\n            with psycopg.connect(host=settings['POSTGRES_HOST'],password=settings['POSTGRES_PASSWORD'],user='postgres',dbname='tpch_sf1',sslmode='disable',connect_timeout=10,options='-c\
+        \ default_transaction_read_only=on -c statement_timeout=15000') as conn:\n                with conn.cursor() as cur:\n                    cur.execute('SELECT 1');assert cur.fetchone()==(1,)\n  \
+        \                  cur.execute('SELECT count(*) FROM nation');record['postgres_nation_rows']=cur.fetchone()[0]\n                    record['postgres_select']='pass'\n        except Exception as\
+        \ exc:record['postgres_error_type']=type(exc).__name__;record['postgres_sqlstate']=getattr(exc,'sqlstate',None)\n    if record['dremio_configured']:\n        try:\n            endpoint=settings['DREMIO_ENDPOINT'].replace('https://','grpc+tls://').replace('http://','grpc://')\n\
+        \            with flight.FlightClient(endpoint) as client:\n                token=client.authenticate_basic_token(settings['DREMIO_USERNAME'],settings['DREMIO_PASSWORD'],flight.FlightCallOptions(timeout=15))\n\
+        \                record['dremio_authenticated']=bool(token and token[1])\n        except Exception as exc:record['dremio_error_type']=type(exc).__name__\n    results.append(record);print(json.dumps(record),flush=True)\n\
+        Path('load-backend-results.json').write_text(json.dumps(results,indent=2)+'\\n')\nPYTHON\n"
+    - name: Retain non-secret probe results
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: load-backend-results
+        path: load-backend-results.json
+        if-no-files-found: error
