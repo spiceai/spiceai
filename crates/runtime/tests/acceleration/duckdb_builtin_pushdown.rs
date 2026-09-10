@@ -87,6 +87,18 @@ fn write_hex_source(path: &Path) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+fn write_regexp_source(path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::write(
+        path,
+        "id,s\n\
+         1,ab\n\
+         2,xyz\n\
+         3,aXbY\n\
+         4,\n",
+    )?;
+    Ok(())
+}
+
 /// Strings whose SHA-256 exercises the hex-text-vs-bytes divergence: ASCII, a
 /// mixed-case string with a space, a non-ASCII one (whose UTF-8 bytes are what
 /// gets hashed), and NULL.
@@ -502,6 +514,207 @@ async fn duckdb_accelerated_sha256_agrees_with_local() -> Result<(), anyhow::Err
                 to_pretty_display(&accelerated)?.to_string(),
                 to_pretty_display(&local)?.to_string(),
                 "DuckDB-accelerated sha256 of the empty string must agree with local evaluation"
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// `regexp_match` returns the first match's capture groups, and NULL when
+/// nothing matches. `DuckDB` has no function with those semantics, and the
+/// `regexp_extract(s, p, 0)` the dialect used to rewrite it into answered a
+/// different question on both counts: it collapsed `['a','b']` to `['ab']` and
+/// turned a non-match's NULL into `['']`. It also emitted `ARRAY[...] AS item`,
+/// which `DuckDB`'s parser rejects outright wherever the expression carried an
+/// alias or sat in a predicate. `regexp_match` is denied for `DuckDB` now, so
+/// the call evaluates locally and agrees with the control by construction
+/// (regression test for #13809).
+///
+/// The body covers the whole regexp deny-list decision, not `regexp_match`
+/// alone: `regexp_instr` and `regexp_count` are denied here too and are checked
+/// the same way, while `regexp_like` and `regexp_replace` are the controls that
+/// must *still* be pushed down -- `regexp_like` in particular is what keeps the
+/// negative assertions from being vacuous.
+#[tokio::test]
+async fn duckdb_accelerated_regexp_builtins_agree_with_local() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("regexp.csv");
+            write_regexp_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("duckdb_builtin_pushdown_regexp_match")
+                .with_dataset(duckdb_accelerated(&from, "accelerated"))
+                .with_dataset(unaccelerated(&from, "local"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            // The deny-list is what this test is about, so assert the call is
+            // *not* pushed down. Reading `base_sql` rather than the logical
+            // plan matters here: the plan names `regexp_match` either way.
+            let plan = to_pretty_display(
+                &run_query(
+                    &rt,
+                    "EXPLAIN SELECT id, regexp_match(s, '(a)(b)') AS m FROM accelerated ORDER BY id",
+                )
+                .await?,
+            )?
+            .to_string();
+            // `can_execute_plan` refuses to federate a plan containing a denied
+            // function at all, so this plan may carry no `base_sql` whatsoever --
+            // which is the intended outcome, not a missing measurement. The
+            // `regexp_like` control at the end of this test is what keeps the
+            // negative assertions here from being vacuous: it proves a federated
+            // scan with a translated regexp call is still produced on this setup.
+            let remote_sql = pushed_down_sql(&plan);
+            assert!(
+                !remote_sql.contains("regexp_extract"),
+                "regexp_match must not be rewritten into DuckDB's regexp_extract; \
+                 plan was:\n{plan}"
+            );
+            assert!(
+                !remote_sql.contains("regexp_match"),
+                "regexp_match must not be sent to DuckDB under its DataFusion name either; \
+                 plan was:\n{plan}"
+            );
+
+            // Capture groups: the rewrite answered `[ab]` for row 1, because
+            // `regexp_extract(..., 0)` is the whole match rather than the groups.
+            let groups = "SELECT id, regexp_match(s, '(a)(b)') AS m FROM {table} ORDER BY id";
+            let accelerated = run_query(&rt, &groups.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &groups.replace("{table}", "local")).await?;
+            let expected = [
+                "+----+--------+",
+                "| id | m      |",
+                "+----+--------+",
+                "| 1  | [a, b] |",
+                "| 2  |        |",
+                "| 3  |        |",
+                "| 4  |        |",
+                "+----+--------+",
+            ];
+            assert_batches_eq!(expected, &accelerated);
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "DuckDB-accelerated regexp_match must agree with local evaluation"
+            );
+
+            // A non-match is NULL, not the `['']` DuckDB's regexp_extract
+            // answers — a one-element list holding the empty string, which
+            // pretty-prints as `[]` and so reads as an empty list. `IS NULL` is
+            // where the two readings disagree about the truth of a row rather
+            // than only about its value.
+            let no_match = "SELECT id, regexp_match(s, 'zzz') IS NULL AS unmatched \
+                            FROM {table} ORDER BY id";
+            let accelerated = run_query(&rt, &no_match.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &no_match.replace("{table}", "local")).await?;
+            assert_batches_eq!(
+                [
+                    "+----+-----------+",
+                    "| id | unmatched |",
+                    "+----+-----------+",
+                    "| 1  | true      |",
+                    "| 2  | true      |",
+                    "| 3  | true      |",
+                    "| 4  | true      |",
+                    "+----+-----------+",
+                ],
+                &accelerated
+            );
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "a non-matching regexp_match must be NULL accelerated and local alike"
+            );
+
+            // `regexp_instr` has no DuckDB function of that name and the dialect
+            // renders none, so before the deny this failed remotely with
+            // `Catalog Error: Scalar Function with name regexp_instr does not
+            // exist!` rather than answering.
+            let instr = "SELECT id, regexp_instr(s, 'b') AS i FROM {table} ORDER BY id";
+            let accelerated = run_query(&rt, &instr.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &instr.replace("{table}", "local")).await?;
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "regexp_instr must answer, and agree with local evaluation"
+            );
+
+            // Pinned separately over the non-NULL rows, so the values assert
+            // what the function returns without depending on whether the CSV
+            // reader gives the empty field NULL or an empty string.
+            let instr_rows = "SELECT id, regexp_instr(s, 'b') AS i FROM accelerated \
+                              WHERE id <= 3 ORDER BY id";
+            assert_batches_eq!(
+                [
+                    "+----+---+",
+                    "| id | i |",
+                    "+----+---+",
+                    "| 1  | 2 |",
+                    "| 2  | 0 |",
+                    "| 3  | 3 |",
+                    "+----+---+",
+                ],
+                &run_query(&rt, instr_rows).await?
+            );
+
+            // All three remaining regexp built-ins agree with local evaluation over
+            // every row, the NULL one included — `regexp_like` and `regexp_replace`
+            // because DuckDB answers them identically and they are still pushed
+            // down, `regexp_count` because it is denied and so evaluated locally.
+            let siblings = "SELECT id, regexp_like(s, '(a)(b)') AS l, \
+                            regexp_replace(s, '(a)(b)', 'X') AS r, \
+                            regexp_count(s, 'a') AS c FROM {table} ORDER BY id";
+            let accelerated = run_query(&rt, &siblings.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &siblings.replace("{table}", "local")).await?;
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "regexp_like/replace/count must agree with local evaluation on every row"
+            );
+
+            // The NULL row is where `regexp_count` used to part company: the dialect
+            // renders it `len(regexp_extract_all(..))`, and `regexp_extract_all(NULL,
+            // p)` is NULL in DuckDB, so the federated answer was NULL where
+            // DataFusion counts zero matches and answers 0. Denying it makes both
+            // sides 0; #13870 tracks restoring the pushdown with a NULL-preserving
+            // rewrite, at which point this assertion still has to hold.
+            let null_row = "SELECT regexp_count(s, 'a') AS c FROM {table} WHERE s IS NULL";
+            let accelerated = run_query(&rt, &null_row.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &null_row.replace("{table}", "local")).await?;
+            for batches in [&accelerated, &local] {
+                assert_batches_eq!(["+---+", "| c |", "+---+", "| 0 |", "+---+",], batches);
+            }
+
+            // And it is no longer sent to DuckDB at all.
+            let plan = to_pretty_display(
+                &run_query(&rt, "EXPLAIN SELECT regexp_count(s, 'a') FROM accelerated").await?,
+            )?
+            .to_string();
+            assert!(
+                !pushed_down_sql(&plan).contains("regexp_extract_all"),
+                "regexp_count must not be pushed down as len(regexp_extract_all(..)); \
+                 plan was:\n{plan}"
+            );
+
+            let plan = to_pretty_display(
+                &run_query(&rt, "EXPLAIN SELECT regexp_like(s, 'a') FROM accelerated").await?,
+            )?
+            .to_string();
+            assert!(
+                pushed_down_sql(&plan).contains("regexp_matches"),
+                "regexp_like must still be pushed down as DuckDB's regexp_matches; \
+                 plan was:\n{plan}"
             );
 
             rt.shutdown().await;
