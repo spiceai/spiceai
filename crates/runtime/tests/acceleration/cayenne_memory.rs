@@ -190,7 +190,6 @@ async fn test_cayenne_memory_mode_full_refresh_and_query() -> Result<(), anyhow:
         .await
 }
 
-
 // ── #12008: DML against a `mode: memory` Cayenne acceleration ──────────────
 
 /// A request context that bypasses the results cache, so a `SELECT` after a
@@ -299,10 +298,12 @@ async fn cayenne_dml_runtime(
     let cayenne = accelerator
         .downcast_ref::<cayenne::CayenneTableProvider>()
         .or_else(|| {
-            spice_table::nodes(accelerator.as_ref(), spice_table::LayerWalk::Read).find_map(|node| {
-                node.base_provider()
-                    .downcast_ref::<cayenne::CayenneTableProvider>()
-            })
+            spice_table::nodes(accelerator.as_ref(), spice_table::LayerWalk::Read).find_map(
+                |node| {
+                    node.base_provider()
+                        .downcast_ref::<cayenne::CayenneTableProvider>()
+                },
+            )
         })
         .ok_or_else(|| anyhow::anyhow!("accelerator is not a CayenneTableProvider"))?;
     ensure!(
@@ -320,6 +321,23 @@ async fn cayenne_dml_runtime(
     );
 
     Ok((temp_dir, rt))
+}
+
+/// The `count` a DML statement reported. Every mutation below asserts this as
+/// well as the resulting rows: the count is what a client is told changed, and a
+/// path that removes the right rows while reporting the wrong number is still
+/// wrong (`with_exact_count` makes a user DELETE an exact count, not an estimate).
+fn reported_count(batches: &[RecordBatch]) -> u64 {
+    batches
+        .first()
+        .and_then(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+        })
+        .and_then(|a| a.values().first())
+        .copied()
+        .expect("a DML result must carry a UInt64 count column")
 }
 
 /// Rows whose primary key appears more than once. Empty is the only correct
@@ -362,6 +380,11 @@ async fn filtered_delete_by_mode(mode: Mode, table_name: &str) -> Result<(), any
                 pretty_format_batches(&deleted)?,
                 pretty_format_batches(&after)?
             );
+            assert_eq!(
+                reported_count(&deleted),
+                1,
+                "exactly one row matches `id = 2`"
+            );
             let expected = [
                 "+----+", "| id |", "+----+", "| 1  |", "| 3  |", "| 4  |", "| 5  |", "+----+",
             ];
@@ -375,6 +398,11 @@ async fn filtered_delete_by_mode(mode: Mode, table_name: &str) -> Result<(), any
                 "[{mode_label}] DELETE WHERE id > 3 reported:\n{}\nrows now:\n{}",
                 pretty_format_batches(&deleted)?,
                 pretty_format_batches(&after)?
+            );
+            assert_eq!(
+                reported_count(&deleted),
+                2,
+                "exactly two rows match `id > 3`"
             );
             let expected = ["+----+", "| id |", "+----+", "| 1  |", "| 3  |", "+----+"];
             assert_batches_eq!(expected, &after);
@@ -408,6 +436,11 @@ async fn update_by_mode(mode: Mode, table_name: &str) -> Result<(), anyhow::Erro
                 "[{mode_label}] UPDATE SET value = 999 WHERE id = 2 reported:\n{}\nrows now:\n{}",
                 pretty_format_batches(&updated)?,
                 pretty_format_batches(&after)?
+            );
+            assert_eq!(
+                reported_count(&updated),
+                1,
+                "exactly one row matches `id = 2`"
             );
             let expected = [
                 "+----+-------+",
@@ -465,6 +498,11 @@ async fn upsert_insert_by_mode(mode: Mode, table_name: &str) -> Result<(), anyho
                 pretty_format_batches(&inserted)?,
                 pretty_format_batches(&after)?
             );
+            assert_eq!(
+                reported_count(&inserted),
+                1,
+                "one row was inserted — not the mem-tier epoch"
+            );
             let expected = [
                 "+----+---------+-------+",
                 "| id | name    | value |",
@@ -484,6 +522,84 @@ async fn upsert_insert_by_mode(mode: Mode, table_name: &str) -> Result<(), anyho
                 pretty_format_batches(&dupes)?
             );
             assert_batches_eq!(["++", "++"], &dupes);
+
+            Ok(())
+        })
+        .await
+}
+
+/// A `DELETE` over an upsert history must count the rows a scan SERVES, not the
+/// raw versions the store happens to hold.
+///
+/// After `INSERT (3, gamma2)` supersedes `(3, gamma)`, the superseded version is
+/// still resident and hidden by its successor's tombstone. `DELETE WHERE id = 3`
+/// must report ONE row, and a predicate matching only the hidden version must
+/// report NONE and remove nothing a client can see.
+async fn delete_over_upsert_history_by_mode(
+    mode: Mode,
+    table_name: &str,
+) -> Result<(), anyhow::Error> {
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+    no_cache_context()
+        .scope(async {
+            let mode_label = format!("{mode:?}");
+            let (_temp_dir, rt) = cayenne_dml_runtime(mode, table_name).await?;
+
+            execute_sql(
+                &rt,
+                &format!("INSERT INTO {table_name} (id, name, value) VALUES (3, 'gamma2', 3333)"),
+            )
+            .await?;
+
+            // Matches only the SUPERSEDED version, which no scan serves.
+            let deleted = execute_sql(
+                &rt,
+                &format!("DELETE FROM {table_name} WHERE name = 'gamma'"),
+            )
+            .await?;
+            let after = execute_sql(
+                &rt,
+                &format!("SELECT id, name FROM {table_name} WHERE id = 3 ORDER BY name"),
+            )
+            .await?;
+            eprintln!(
+                "[{mode_label}] DELETE WHERE name = 'gamma' (superseded version only) reported:\n{}\nid=3 rows now:\n{}",
+                pretty_format_batches(&deleted)?,
+                pretty_format_batches(&after)?
+            );
+            assert_eq!(
+                reported_count(&deleted),
+                0,
+                "no row a scan serves matches `name = 'gamma'` — the superseded version is not one"
+            );
+            let expected = [
+                "+----+--------+",
+                "| id | name   |",
+                "+----+--------+",
+                "| 3  | gamma2 |",
+                "+----+--------+",
+            ];
+            assert_batches_eq!(expected, &after);
+
+            // Matches the LIVE version. One row, not two.
+            let deleted =
+                execute_sql(&rt, &format!("DELETE FROM {table_name} WHERE id = 3")).await?;
+            let after = execute_sql(
+                &rt,
+                &format!("SELECT id FROM {table_name} WHERE id = 3"),
+            )
+            .await?;
+            eprintln!(
+                "[{mode_label}] DELETE WHERE id = 3 over an upsert history reported:\n{}\nid=3 rows now:\n{}",
+                pretty_format_batches(&deleted)?,
+                pretty_format_batches(&after)?
+            );
+            assert_eq!(
+                reported_count(&deleted),
+                1,
+                "one row is served for id = 3, however many versions the store holds"
+            );
+            assert_batches_eq!(["++", "++"], &after);
 
             Ok(())
         })
@@ -510,6 +626,12 @@ async fn test_cayenne_file_mode_upsert_insert() -> Result<(), anyhow::Error> {
     upsert_insert_by_mode(Mode::File, "file_mode_upsert_test").await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(not(target_os = "windows"))]
+async fn test_cayenne_file_mode_delete_over_upsert_history() -> Result<(), anyhow::Error> {
+    delete_over_upsert_history_by_mode(Mode::File, "file_mode_history_test").await
+}
+
 // ── reproduction arms: `mode: memory` (#12008 and its upsert sibling) ──
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -528,4 +650,10 @@ async fn test_cayenne_memory_mode_update() -> Result<(), anyhow::Error> {
 #[cfg(not(target_os = "windows"))]
 async fn test_cayenne_memory_mode_upsert_insert() -> Result<(), anyhow::Error> {
     upsert_insert_by_mode(Mode::Memory, "memory_mode_upsert_test").await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(not(target_os = "windows"))]
+async fn test_cayenne_memory_mode_delete_over_upsert_history() -> Result<(), anyhow::Error> {
+    delete_over_upsert_history_by_mode(Mode::Memory, "memory_mode_history_test").await
 }

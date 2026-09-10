@@ -229,18 +229,15 @@ impl DataSink for CayenneDataSink {
             }
             // Draining the prepared stream is what RAN the validation, so the
             // conflict state is only complete now.
-            let (deletions, validated_keys) = match post_validation
-                .map(|state| state.lock().take().unwrap_or_default())
-            {
-                Some(super::on_conflict::PostValidationState {
-                    on_conflict_deletions,
-                    validated_keys,
-                }) => (on_conflict_deletions, Some(validated_keys)),
-                None => (
-                    super::on_conflict::OnConflictDeletions::default(),
-                    None,
-                ),
-            };
+            let (deletions, validated_keys) = post_validation
+                .map(|state| {
+                    let super::on_conflict::PostValidationState {
+                        on_conflict_deletions,
+                        validated_keys,
+                    } = super::mutation_writer::take_post_validation(&state);
+                    (on_conflict_deletions, Some(validated_keys))
+                })
+                .unwrap_or_default();
 
             let rows = self
                 .table

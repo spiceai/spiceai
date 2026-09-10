@@ -323,6 +323,22 @@ pub(crate) struct MemSegment {
     pub(crate) source_position: Option<u64>,
 }
 
+/// Exact per-column min/max over a segment's batches, for predicate pruning.
+/// An empty batch list has nothing to describe, so it reports unknown.
+fn segment_statistics(batches: &[RecordBatch]) -> Arc<Statistics> {
+    batches.first().map_or_else(
+        || Arc::new(Statistics::new_unknown(&Schema::empty())),
+        |first| {
+            Arc::new(
+                crate::provider::file_pruning::statistics_from_record_batches(
+                    first.schema_ref(),
+                    batches,
+                ),
+            )
+        },
+    )
+}
+
 /// The in-memory CDC tier for one table. Immutable once constructed: every
 /// mutation produces a new `Arc<MemTier>` that is stored into the provider's
 /// `ArcSwap`, so concurrent readers always observe a consistent snapshot and a
@@ -449,17 +465,7 @@ impl MemTier {
         superseded: u64,
         source_position: Option<u64>,
     ) -> Self {
-        let statistics = batches.first().map_or_else(
-            || Arc::new(Statistics::new_unknown(&Schema::empty())),
-            |first| {
-                Arc::new(
-                    crate::provider::file_pruning::statistics_from_record_batches(
-                        first.schema_ref(),
-                        batches.as_ref(),
-                    ),
-                )
-            },
-        );
+        let statistics = segment_statistics(batches.as_ref());
 
         // O(1): clones the persistent maps' HAMT roots (Arc bumps), NOT the
         // accumulated corpus. `merge_segment` then applies only the incoming
@@ -502,7 +508,11 @@ impl MemTier {
     /// where the mem-tier is the permanent store and there is no durable tier for
     /// a deletion sink to write into (#12008).
     ///
-    /// Returns the rebuilt tier and the number of rows it dropped.
+    /// Returns the rebuilt tier and the number of RAW rows it dropped. That is a
+    /// physical figure, not a `rows affected` count: a tier holding an upsert
+    /// history carries superseded versions that no scan serves, and dropping one
+    /// changes nothing a client can observe. A caller reporting a count to a user
+    /// resolves visibility itself, against the batches a scan would serve.
     ///
     /// EVERY SEGMENT IS PRESERVED, even one whose rows are all removed. A segment
     /// carries its OWN tombstones, which hide rows in OLDER segments; dropping the
@@ -566,17 +576,7 @@ impl MemTier {
                 .iter()
                 .map(|b| b.num_rows() as u64)
                 .fold(0, u64::saturating_add);
-            let statistics = kept.first().map_or_else(
-                || Arc::new(Statistics::new_unknown(&Schema::empty())),
-                |first| {
-                    Arc::new(
-                        crate::provider::file_pruning::statistics_from_record_batches(
-                            first.schema_ref(),
-                            &kept,
-                        ),
-                    )
-                },
-            );
+            let statistics = segment_statistics(&kept);
             bytes = bytes.saturating_add(segment_bytes);
             rows = rows.saturating_add(segment_rows);
             segments.push(MemSegment {

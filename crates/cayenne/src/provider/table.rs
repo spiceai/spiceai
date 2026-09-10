@@ -14068,7 +14068,7 @@ impl CayenneTableProvider {
                 if !has_rows && !has_deletions {
                     return None;
                 }
-                let superseded = u64::try_from(deletions.total_superseded()).unwrap_or(u64::MAX);
+                let superseded = deletions.total_superseded() as u64;
                 Some(self.append_to_shard(
                     s,
                     filtered_batches.clone(),
@@ -29843,50 +29843,86 @@ impl CayenneTableProvider {
             return Ok(0);
         }
 
-        let mut removed_total: u64 = 0;
-        for shard in self.mem_tier.shards() {
-            let _publish = self.mem_tier_publish_locks[0].lock().await;
+        let mut visible_deleted: u64 = 0;
+        let mut tier_changed = false;
+        // Each shard is rebuilt under ITS OWN publish lock, in index order — the
+        // deadlock-free order every other multi-shard site uses. Memory mode is
+        // single-shard today (enforced by the accelerator's memory-mode overrides),
+        // so this is one iteration; pairing the lock with the shard rather than
+        // hardcoding shard 0 is what keeps it correct if that ever stops being true.
+        for (shard_id, shard) in self.mem_tier.shards().iter().enumerate() {
+            let _publish = self.mem_tier_publish_locks[shard_id].lock().await;
             let current = shard.load_full();
             if current.is_empty() || current.segments.is_empty() {
                 continue;
             }
-            let (next, removed) = current.retain_rows(|batch| {
-                self.keep_rows_not_matching_delete_filters(batch, &physical_filters)
-            })?;
+
+            // A tier holding an upsert history carries superseded versions that no
+            // scan serves. Removing one is harmless — it is invisible either way,
+            // and its segment's tombstone stays to hide anything older — but
+            // COUNTING one is not: a user `DELETE` reports an exact `rows affected`,
+            // and a client that upserted a key twice would be told two rows went.
+            // So the count is taken against the batches a scan would serve, the
+            // same way `purge_mem_tier_all` counts what it discards. With no
+            // tombstone anywhere in the tier every raw row is visible and the
+            // rebuild's own tally is already exact, which is the common case (a
+            // tier that never upserted) and skips this pass entirely.
+            if Self::mem_tier_has_tombstones(&current) {
+                for batch in self.visible_mem_tier_batches(&current, None)? {
+                    visible_deleted = visible_deleted.saturating_add(
+                        self.delete_match_mask(&batch, &physical_filters)?
+                            .map_or(0, |matched| matched.true_count() as u64),
+                    );
+                }
+            }
+
+            let mut raw_matched: u64 = 0;
+            let (next, removed) =
+                current.retain_rows(|batch| -> datafusion_common::Result<RecordBatch> {
+                    let Some(matched) = self.delete_match_mask(batch, &physical_filters)? else {
+                        return Ok(batch.clone());
+                    };
+                    raw_matched = raw_matched.saturating_add(matched.true_count() as u64);
+                    let keep = arrow::compute::not(&matched)?;
+                    Ok(arrow::compute::filter_record_batch(batch, &keep)?)
+                })?;
             if removed == 0 {
                 continue;
             }
+            if !Self::mem_tier_has_tombstones(&current) {
+                visible_deleted = visible_deleted.saturating_add(raw_matched);
+            }
             shard.store(Arc::new(next));
-            removed_total = removed_total.saturating_add(removed);
+            tier_changed = true;
         }
 
-        if removed_total > 0 {
-            // The tier was swapped without a structural-epoch bump, so advance the
-            // scan-input version the way `overwrite_mem_tier` does — the next
-            // capture re-keys over the rebuilt tier.
+        // Keyed on the PHYSICAL fact, not on the number reported to the client: a
+        // rebuild that dropped only superseded rows still swapped the tier, and
+        // every scan-view cache keyed on its version has to re-key.
+        if tier_changed {
             self.notify_scan_input_change();
             self.clear_scan_file_statistics_cache();
         }
-        Ok(removed_total)
+        Ok(visible_deleted)
     }
 
-    /// The rows of `batch` a `DELETE ... WHERE` must KEEP: those for which the
-    /// conjunction of `physical_filters` is not TRUE.
+    /// The rows of `batch` a `DELETE ... WHERE` matches: the conjunction of
+    /// `physical_filters`, with NULL folded to "did not match". `None` when there
+    /// is nothing to decide — an empty batch, or no predicate at all (which means
+    /// every row, and is the delete-all purge's job, not this one's).
     ///
-    /// The complement is deliberately not `arrow::compute::not` over the raw
-    /// predicate mask. SQL deletes a row only where the predicate evaluates TRUE,
-    /// so NULL and FALSE both mean keep — but `not(NULL)` is NULL, and
-    /// `filter_record_batch` drops a NULL-masked row. Folding the null mask into
-    /// the values FIRST (a row whose predicate is NULL becomes a definite "did not
-    /// match") makes the inversion total, so a NULL predicate keeps its row instead
-    /// of silently deleting it.
-    fn keep_rows_not_matching_delete_filters(
+    /// SQL deletes a row only where the predicate evaluates TRUE, so NULL and
+    /// FALSE both mean keep. Folding the null mask into the values here is what
+    /// makes the caller's inversion total: `not(NULL)` is NULL, and
+    /// `filter_record_batch` drops a NULL-masked row, so inverting the raw mask
+    /// would silently delete the rows the predicate could not evaluate.
+    fn delete_match_mask(
         &self,
         batch: &RecordBatch,
         physical_filters: &[Arc<dyn PhysicalExpr>],
-    ) -> datafusion_common::Result<RecordBatch> {
-        if batch.num_rows() == 0 {
-            return Ok(batch.clone());
+    ) -> datafusion_common::Result<Option<arrow::array::BooleanArray>> {
+        if batch.num_rows() == 0 || physical_filters.is_empty() {
+            return Ok(None);
         }
 
         let mut matched: Option<arrow::array::BooleanArray> = None;
@@ -29903,7 +29939,6 @@ impl CayenneTableProvider {
                         array.data_type()
                     ))
                 })?;
-            // NULL means "did not match", so fold the null mask into the values.
             let mask = match mask.nulls() {
                 Some(nulls) => arrow::array::BooleanArray::new(mask.values() & nulls.inner(), None),
                 None => mask.clone(),
@@ -29913,12 +29948,7 @@ impl CayenneTableProvider {
                 Some(prev) => arrow::compute::and(&prev, &mask)?,
             });
         }
-
-        let Some(matched) = matched else {
-            return Ok(batch.clone());
-        };
-        let keep = arrow::compute::not(&matched)?;
-        Ok(arrow::compute::filter_record_batch(batch, &keep)?)
+        Ok(matched)
     }
 
     /// Fire the installed [`SlotAdvancer`] for `durable_epoch`, if one is wired
@@ -30889,31 +30919,13 @@ impl CayenneTableProvider {
 
     fn apply_inlined_delete_filters(
         &self,
-        mut batch: RecordBatch,
+        batch: RecordBatch,
         physical_filters: &[Arc<dyn PhysicalExpr>],
     ) -> datafusion_common::Result<RecordBatch> {
-        for filter in physical_filters {
-            if batch.num_rows() == 0 {
-                break;
-            }
-
-            let filter_value = filter.evaluate(&batch)?;
-            let filter_array = filter_value.into_array(batch.num_rows())?;
-            let filter_array = filter_array
-                .as_any()
-                .downcast_ref::<arrow::array::BooleanArray>()
-                .ok_or_else(|| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Delete filter for table {} did not evaluate to BooleanArray, got {:?}",
-                        self.table_metadata.table_name,
-                        filter_array.data_type()
-                    ))
-                })?;
-
-            batch = arrow::compute::filter_record_batch(&batch, filter_array)?;
+        match self.delete_match_mask(&batch, physical_filters)? {
+            Some(matched) => Ok(arrow::compute::filter_record_batch(&batch, &matched)?),
+            None => Ok(batch),
         }
-
-        Ok(batch)
     }
 
     fn extract_primary_keys_from_batch(
@@ -33847,6 +33859,9 @@ impl TableProvider for CayenneTableProvider {
         // sink inside the execution-time critical section, not here.
         let file_sink = {
             let _guard = self.write_lock.lock().await;
+            // A no-op in `mode: memory`, which has no Vortex tier to checkpoint
+            // into — there the sink reconciles the tier itself at execution time
+            // (`delete_mem_tier_rows_matching`).
             self.checkpoint_mem_tier_for_delete().await?;
             self.build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
                 .await?
@@ -39668,13 +39683,23 @@ mod tests {
         let b1 = int64_id_batch(&[1, 2, 3]);
         let bytes1 = b1.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b1], bytes1, false, &crate::provider::on_conflict::OnConflictDeletions::default())
+            .write_batches_memory_mode(
+                vec![b1],
+                bytes1,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("memory-mode append 1");
         let b2 = int64_id_batch(&[4, 5]);
         let bytes2 = b2.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b2], bytes2, false, &crate::provider::on_conflict::OnConflictDeletions::default())
+            .write_batches_memory_mode(
+                vec![b2],
+                bytes2,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("memory-mode append 2");
         assert_eq!(
@@ -39742,7 +39767,12 @@ mod tests {
         let batch = int64_id_batch(&[1, 2, 3]);
         let bytes = batch.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![batch], bytes, false, &crate::provider::on_conflict::OnConflictDeletions::default())
+            .write_batches_memory_mode(
+                vec![batch],
+                bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("memory-mode append");
 
@@ -40279,13 +40309,23 @@ mod tests {
         let b1 = int64_id_batch(&[1, 2, 3]);
         let bytes1 = b1.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b1], bytes1, false, &crate::provider::on_conflict::OnConflictDeletions::default())
+            .write_batches_memory_mode(
+                vec![b1],
+                bytes1,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("append 1");
         let b2 = int64_id_batch(&[4, 5]);
         let bytes2 = b2.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b2], bytes2, false, &crate::provider::on_conflict::OnConflictDeletions::default())
+            .write_batches_memory_mode(
+                vec![b2],
+                bytes2,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("append 2");
         assert_eq!(
@@ -40298,7 +40338,12 @@ mod tests {
         let b3 = int64_id_batch(&[10, 20, 30, 40]);
         let bytes3 = b3.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b3], bytes3, true, &crate::provider::on_conflict::OnConflictDeletions::default())
+            .write_batches_memory_mode(
+                vec![b3],
+                bytes3,
+                true,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("overwrite");
         assert_eq!(
@@ -40365,7 +40410,12 @@ mod tests {
             "batch ({bytes} bytes) must exceed the cap for the test to be meaningful"
         );
         let err = provider
-            .write_batches_memory_mode(vec![big], bytes, false, &crate::provider::on_conflict::OnConflictDeletions::default())
+            .write_batches_memory_mode(
+                vec![big],
+                bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect_err("a write exceeding the memory limit must error");
         assert!(
@@ -40423,7 +40473,12 @@ mod tests {
             "seed ({seed_bytes} bytes) must fit under the cap ({cap})"
         );
         provider
-            .write_batches_memory_mode(vec![seed], seed_bytes, false, &crate::provider::on_conflict::OnConflictDeletions::default())
+            .write_batches_memory_mode(
+                vec![seed],
+                seed_bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("seed write under cap");
 
@@ -40436,7 +40491,12 @@ mod tests {
         // Overwrite that would fit *after* replace must still fail while the old
         // tier is resident (peak = resident + incoming).
         let err = provider
-            .write_batches_memory_mode(vec![replacement], replacement_bytes, true, &crate::provider::on_conflict::OnConflictDeletions::default())
+            .write_batches_memory_mode(
+                vec![replacement],
+                replacement_bytes,
+                true,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect_err("overwrite must count resident bytes toward the hard cap");
         assert!(
