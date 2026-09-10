@@ -190,6 +190,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgomp1
 
+      - name: Install ADBC BigQuery Driver
+        if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
+        uses: ./.github/actions/setup-adbc-bigquery
+
       - name: Run the load test - ${{ github.event.inputs.spicepod_path }}
         run: |
           rm -rf .spice/data
@@ -215,6 +219,7 @@ jobs:
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY}}
           DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
           DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
           DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
           DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.DATABRICKS_SQL_WAREHOUSE_ID }}
