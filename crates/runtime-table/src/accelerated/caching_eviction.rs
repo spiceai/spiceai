@@ -696,9 +696,17 @@ impl<'a> DoomedSplit<'a> {
 ///
 /// ```text
 ///   C = min(oldest) over survivors                 // the cutoff to protect
-///   straddler = doomed entry whose newest >= C     // overlaps a survivor in time
-///   X = min(oldest) over survivors ∪ straddlers    // range's exclusive ceiling
+///   straddler = doomed entry whose newest >= X     // overlaps the ceiling itself
+///   X = largest value <= C that no doomed entry straddles (oldest < X <= newest)
 /// ```
+///
+/// `X` is a **fixed point**, not a single pass over the entries crossing `C`.
+/// Lowering the ceiling below one straddler can expose another entry that
+/// crosses only the *lowered* ceiling without ever crossing `C`; such an entry
+/// is named, and if the naming cap defers it while the range deletes its older
+/// rows below the ceiling, the entry is split (#13994 review). Descending to a
+/// fixed point makes every doomed entry lie either wholly below `X` or wholly at
+/// or above it — so no named entry, deferred or not, has a row the range reaches.
 ///
 /// The range-bucket is every doomed entry lying wholly below `X` (`newest < X`),
 /// and the returned [`DoomedSplit::range_ceiling`] is `max(newest)` over that
@@ -708,15 +716,18 @@ impl<'a> DoomedSplit<'a> {
 /// [`entry_predicate`] names by key. When the doomed set is cleanly older than
 /// everything kept there are no straddlers, so the whole set falls in the
 /// range-bucket and nothing is named — the ordinary case for a cache fetching
-/// new keys over time.
+/// new keys over time. Where entries genuinely interleave in fetch time (wide
+/// multi-row responses), the fixed point pulls `X` down until nothing is safely
+/// rangeable and the whole set is named, capped — correct, if slower, for a case
+/// no time cutoff can separate.
 ///
 /// Correctness this preserves:
-/// * **No entry is split.** A range-bucket entry lies wholly below `X`, so
-///   `ceiling = max(newest of range-bucket) < X <= oldest of every survivor and
-///   straddler`. The `_fetched_at <= ceiling` range therefore reaches no row of
-///   a kept or straddling entry, and every such entry the range does not cover
-///   is named, whose key predicate takes all of its rows. No entry is left
-///   half-present.
+/// * **No entry is split.** After the fixed point every doomed entry is wholly
+///   below `X` (ranged) or has `oldest >= X` (named). So
+///   `ceiling = max(newest of range-bucket) < X <= oldest of every named entry`,
+///   and the `_fetched_at <= ceiling` range reaches no row of any named entry —
+///   even one the cap defers to a later sweep — while the named entry's key
+///   predicate takes all of its rows. No entry is left half-present.
 /// * **No survivor is touched.** Survivors have `oldest >= C >= X > ceiling`, so
 ///   no survivor row is `<= ceiling`, and no survivor is named.
 /// * **The range has no lower bound, by design.** Caching mode requires
@@ -753,16 +764,33 @@ fn partition_doomed<'a>(doomed: &[&'a EntryCost], survivors: &[&'a EntryCost]) -
         }
     };
 
-    // X: place the range's exclusive ceiling below the oldest row of any doomed
-    // entry that straddles the cutoff (its newest reaches at or above C), so the
-    // range never clips a straddler. Survivors already contribute `cutoff`, and
-    // `oldest`/`newest` are both null or both set, so a straddler that reaches
-    // the cutoff has a known `oldest`.
-    let upper = doomed
+    // X: the exclusive ceiling the range must stay under. It sits below the
+    // oldest row of every doomed entry that straddles it, so no straddler — and
+    // in particular no *named* entry — has a row the range can reach. Lowering
+    // the ceiling below one straddler can expose another that only crosses the
+    // lowered ceiling, so this is a fixed point, not a single pass: descend until
+    // no doomed entry straddles the ceiling (#13994 review — a single pass left a
+    // named entry whose older rows the range deleted while the naming cap
+    // deferred the entry, splitting it).
+    //
+    // Processed newest-first: an entry whose newest still reaches the ceiling
+    // pulls it down to at most that entry's oldest; once an entry's newest falls
+    // below the ceiling, so does every later entry, and the ceiling is final.
+    // A row with no fetch time cannot straddle and is always named, so only
+    // fully-timestamped entries take part.
+    let mut spanning: Vec<(i64, i64)> = doomed
         .iter()
-        .filter(|entry| entry.newest.is_none_or(|newest| newest >= cutoff))
-        .filter_map(|entry| entry.oldest)
-        .fold(cutoff, i64::min);
+        .filter_map(|entry| Some((entry.oldest?, entry.newest?)))
+        .collect();
+    spanning.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    let mut upper = cutoff;
+    for (oldest, newest) in spanning {
+        if newest >= upper {
+            upper = upper.min(oldest);
+        } else {
+            break;
+        }
+    }
 
     // Range-bucket vs name-bucket at X. An entry is rangeable only when both its
     // bounds are known and its whole extent lies below X; everything else is
@@ -1328,6 +1356,88 @@ mod tests {
             2,
             "every doomed entry named"
         );
+    }
+
+    #[test]
+    fn a_deferred_named_entry_is_never_reached_by_the_range() {
+        // Regression for the #13994 review split. The range deletes rows by time,
+        // so a named entry with rows at or below the range ceiling that the
+        // naming cap defers would have its older rows deleted while its newer
+        // rows survive — a half-present entry served as whole. A single-pass
+        // ceiling only steps below entries crossing the survivor cutoff, leaving
+        // entries that cross the *lowered* ceiling in the name bucket with rows
+        // under it; the fixed-point ceiling pulls those out too.
+        let survivors = [named_cost("/s", Some(100), Some(100))];
+
+        let mut doomed_owned: Vec<EntryCost> = Vec::new();
+        // Over the naming cap, so at least one is deferred. Each spans [10, 90]:
+        // oldest below the ceiling a single pass would pick, newest below the
+        // survivor cutoff so it does not lower that single-pass ceiling.
+        for i in 0..=MAX_ENTRIES_PER_SWEEP {
+            doomed_owned.push(named_cost(&format!("/overlap{i}"), Some(10), Some(90)));
+        }
+        // A straddler above the cutoff, and a cleanly-older entry a single pass
+        // would range with ceiling 40 — exactly the ceiling that split the
+        // overlaps.
+        doomed_owned.push(named_cost("/straddler", Some(50), Some(120)));
+        doomed_owned.push(named_cost("/clean", Some(1), Some(40)));
+
+        let doomed: Vec<&EntryCost> = doomed_owned.iter().collect();
+        let survivors_ref: Vec<&EntryCost> = survivors.iter().collect();
+        let split = partition_doomed(&doomed, &survivors_ref);
+
+        // Whatever ceiling is chosen, no entry the cap defers may hold a row at
+        // or below it. On the buggy single-pass ceiling (40) the deferred
+        // overlaps had rows at 10 and this fails.
+        let (_, deferred) = nameable(&split.named);
+        if let Some(ceiling) = split.range_ceiling {
+            for entry in &split.named[..deferred] {
+                assert!(
+                    entry.oldest.is_none_or(|oldest| oldest > ceiling),
+                    "deferred named entry {key:?} has a row <= range ceiling {ceiling}; \
+                     the range would delete its older rows while it waits to be named",
+                    key = entry.key,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_coarse_boundary_tie_over_the_cap_still_ranges_the_bulk() {
+        // The fixed-point ceiling must not over-pull in the ordinary coarse-clock
+        // case: single-timestamp entries never straddle, so the older buckets are
+        // still cleared by one range and only the boundary tie is named — the
+        // convergence property #13994 restored.
+        let mut doomed_owned: Vec<EntryCost> = Vec::new();
+        for bucket in [24_i64, 25, 26] {
+            for i in 0..300 {
+                doomed_owned.push(named_cost(
+                    &format!("/b{bucket}_{i}"),
+                    Some(bucket),
+                    Some(bucket),
+                ));
+            }
+        }
+        // Over-budget overflow sharing the survivor's timestamp.
+        let overflow = MAX_ENTRIES_PER_SWEEP + 50;
+        for i in 0..overflow {
+            doomed_owned.push(named_cost(&format!("/b27d_{i}"), Some(27), Some(27)));
+        }
+        let survivors = [named_cost("/s", Some(27), Some(27))];
+        let doomed: Vec<&EntryCost> = doomed_owned.iter().collect();
+        let s: Vec<&EntryCost> = survivors.iter().collect();
+        let split = partition_doomed(&doomed, &s);
+
+        assert_eq!(
+            split.range_ceiling,
+            Some(26),
+            "the three older buckets range in one predicate"
+        );
+        assert!(
+            split.named.iter().all(|e| e.oldest == Some(27)),
+            "only the boundary-tie overflow is named, not the older bulk"
+        );
+        assert_eq!(split.named.len(), overflow);
     }
 
     #[tokio::test]
