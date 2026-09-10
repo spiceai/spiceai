@@ -20,6 +20,12 @@ on:
       - '.github/workflows/install_scripts_test.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}
   cancel-in-progress: true
@@ -207,7 +213,6 @@ jobs:
 
       - name: Test install-spiced.sh with custom directory
         env:
-          VARIANT: models
           SPICED_INSTALL_DIR: ${{ github.workspace }}/custom-spiced-bin
         run: |
           mkdir -p "$SPICED_INSTALL_DIR"
@@ -235,23 +240,14 @@ jobs:
           - os: linux-x64
             runner: ubuntu-24.04
             variant: ''
-          - os: linux-x64
-            runner: ubuntu-24.04
-            variant: models
           # Linux ARM64 variants
           - os: linux-arm64
             runner: ubuntu-24.04-arm
             variant: ''
-          - os: linux-arm64
-            runner: ubuntu-24.04-arm
-            variant: models
           # macOS ARM64 variants
           - os: macos-arm64
             runner: macos-latest
             variant: ''
-          - os: macos-arm64
-            runner: macos-latest
-            variant: models
           - os: macos-arm64
             runner: macos-latest
             variant: metal
@@ -264,12 +260,12 @@ jobs:
       - name: Test install-spiced.sh with variant '${{ matrix.variant }}'
         env:
           VARIANT: ${{ matrix.variant }}
-          SPICED_INSTALL_DIR: ${{ github.workspace }}/bin
+          SPICED_INSTALL_DIR: ${{ runner.temp }}/spiced-bin
         run: |
-          mkdir -p bin
+          mkdir -p "$SPICED_INSTALL_DIR"
           chmod +x install/install-spiced.sh
           ./install/install-spiced.sh
-          ./bin/spiced --version
+          "$SPICED_INSTALL_DIR/spiced" --version
 
   # Test specific version installation
   test-specific-version:
@@ -295,27 +291,30 @@ jobs:
         id: get_version
         run: |
           # Get the latest release tag and strip the 'v' prefix (scripts add it back)
-          VERSION=$(curl -sS "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*: "v\?\(.*\)",/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          VERSION=$(gh api repos/spiceai/spiceai/releases/latest --jq '.tag_name')
+          VERSION=${VERSION#v}
+          test -n "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Testing with version: $VERSION"
 
       - name: Test install.sh with specific version
         env:
           SPICE_CLI_INSTALL_DIR: ${{ github.workspace }}/bin-cli
+          RELEASE_VERSION: ${{ steps.get_version.outputs.version }}
         run: |
           mkdir -p "$SPICE_CLI_INSTALL_DIR"
           chmod +x install/install.sh
-          ./install/install.sh ${{ steps.get_version.outputs.version }}
+          ./install/install.sh "$RELEASE_VERSION"
           "$SPICE_CLI_INSTALL_DIR/spice" version
 
       - name: Test install-spiced.sh with specific version
         env:
-          VARIANT: models
           SPICED_INSTALL_DIR: ${{ github.workspace }}/bin-spiced
+          RELEASE_VERSION: ${{ steps.get_version.outputs.version }}
         run: |
           mkdir -p "$SPICED_INSTALL_DIR"
           chmod +x install/install-spiced.sh
-          ./install/install-spiced.sh ${{ steps.get_version.outputs.version }}
+          ./install/install-spiced.sh "$RELEASE_VERSION"
           "$SPICED_INSTALL_DIR/spiced" --version
 
   # Test HTTP client fallback (curl vs wget)
@@ -335,26 +334,34 @@ jobs:
       - name: Remove alternative HTTP client
         run: |
           if [ "${{ matrix.client }}" = "curl" ]; then
-            # Hide wget so script must use curl
-            sudo mv /usr/bin/wget /usr/bin/wget.bak 2>/dev/null || true
+            alternate=wget
           else
-            # Hide curl so script must use wget
-            sudo mv /usr/bin/curl /usr/bin/curl.bak 2>/dev/null || true
+            alternate=curl
           fi
+          while command -v "$alternate" >/dev/null 2>&1; do
+            client_path=$(command -v "$alternate")
+            sudo mv "$client_path" "$client_path.install-test-backup"
+            echo "$client_path" >> "${{ runner.temp }}/hidden-http-clients"
+            hash -r
+          done
 
       - name: Verify only ${{ matrix.client }} is available
         run: |
           if [ "${{ matrix.client }}" = "curl" ]; then
-            which curl
-            ! which wget || echo "wget still available (ok if it fails)"
+            command -v curl
+            alternate=wget
           else
-            which wget
-            ! which curl || echo "curl still available (ok if it fails)"
+            command -v wget
+            alternate=curl
+          fi
+          if command -v "$alternate"; then
+            echo "ERROR: Alternative HTTP client is still available"
+            exit 1
           fi
 
       - name: Test install.sh with ${{ matrix.client }}
         env:
-          SPICE_CLI_INSTALL_DIR: ${{ github.workspace }}/bin
+          SPICE_CLI_INSTALL_DIR: ${{ runner.temp }}/spice-bin
         run: |
           mkdir -p "$SPICE_CLI_INSTALL_DIR"
           chmod +x install/install.sh
@@ -364,13 +371,20 @@ jobs:
       - name: Restore HTTP clients
         if: always()
         run: |
-          sudo mv /usr/bin/wget.bak /usr/bin/wget 2>/dev/null || true
-          sudo mv /usr/bin/curl.bak /usr/bin/curl 2>/dev/null || true
+          if [ -f "${{ runner.temp }}/hidden-http-clients" ]; then
+            while IFS= read -r client_path; do
+              sudo mv "$client_path.install-test-backup" "$client_path"
+            done < "${{ runner.temp }}/hidden-http-clients"
+          fi
 
   # Test error handling
   test-error-handling:
-    name: Error Handling
-    runs-on: ubuntu-24.04
+    name: Error Handling (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -380,11 +394,11 @@ jobs:
       - name: Test invalid version handling
         run: |
           chmod +x install/install-spiced.sh
-          export SPICED_INSTALL_DIR="${{ github.workspace }}/bin"
+          export SPICED_INSTALL_DIR="${{ runner.temp }}/spiced-bin"
           mkdir -p "$SPICED_INSTALL_DIR"
 
           # This should fail gracefully with a non-existent version
-          if ./install/install-spiced.sh v0.0.0-nonexistent 2>&1; then
+          if ./install/install-spiced.sh 0.0.0-nonexistent 2>&1; then
             echo "ERROR: Script should have failed for non-existent version"
             exit 1
           else
@@ -395,16 +409,18 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           chmod +x install/install-spiced.sh
-          export SPICED_INSTALL_DIR="${{ github.workspace }}/bin"
+          export SPICED_INSTALL_DIR="${{ runner.temp }}/spiced-bin"
           export VARIANT="cuda"
           export CUDA_VERSION="90"
           mkdir -p "$SPICED_INSTALL_DIR"
 
           # This should fail on macOS
-          if ./install/install-spiced.sh 2>&1; then
+          if ./install/install-spiced.sh > "${{ runner.temp }}/cuda-rejection.log" 2>&1; then
             echo "ERROR: CUDA variant should not be allowed on macOS"
             exit 1
           else
+            cat "${{ runner.temp }}/cuda-rejection.log"
+            grep -F "CUDA variants are only supported on Linux" "${{ runner.temp }}/cuda-rejection.log"
             echo "✓ Script correctly rejected CUDA variant on macOS"
           fi
 
@@ -412,6 +428,8 @@ jobs:
   test-windows-wsl:
     name: Windows WSL (${{ matrix.distro }})
     runs-on: windows-latest
+    env:
+      WSLENV: GITHUB_TOKEN/u
     strategy:
       fail-fast: false
       matrix:
@@ -423,10 +441,10 @@ jobs:
           persist-credentials: false
 
       - name: Setup WSL
-        uses: Vampire/setup-wsl@2d33ce25ddebc8780792ec86a25a0557e1c7de96 # v6
+        uses: Vampire/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364 # v7
         with:
           distribution: ${{ matrix.distro }}
-          additional-packages: curl wget
+          additional-packages: curl wget python3
 
       - name: Run install script tests in WSL
         shell: wsl-bash {0}
@@ -450,8 +468,6 @@ jobs:
 
       - name: Test install-spiced.sh in WSL
         shell: wsl-bash {0}
-        env:
-          VARIANT: models
         run: |
           chmod +x install/install-spiced.sh
           export SPICED_INSTALL_DIR="$HOME/bin"
