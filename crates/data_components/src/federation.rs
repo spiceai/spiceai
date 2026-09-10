@@ -1433,15 +1433,12 @@ mod tests {
             ),
             (
                 // Reached through a relation alias, so the enclosing reference is
-                // qualified — and the alias carries no column list, so it names the
-                // relation without naming any of its columns. An alias that *does* carry
-                // one already names every output and must be left alone; that half is
-                // reachable only from parsed SQL, so the fork's own round-trip tests are
-                // what guard it. The scan here carries no projection, which is the half of
-                // the alias class the naming repairs — with one pushed down the output
-                // cannot be named at all, which
-                // `a_projected_scan_under_an_alias_does_not_name_the_output_its_scope_references`
-                // pins.
+                // qualified. The scan here carries no projection, which is the half of
+                // the alias class the #206 naming walk repairs. A scan projection
+                // pushed down under the alias is named by a column list on the alias
+                // itself (fork PR #221), which
+                // `a_projected_scan_under_an_alias_names_the_output_its_scope_references`
+                // guards.
                 "aliased",
                 projected()
                     .alias("x")
@@ -1473,32 +1470,13 @@ mod tests {
         &list[..end]
     }
 
-    /// The derived table's own `SELECT` list — what it exposes to the scope that
-    /// encloses it.
-    ///
-    /// Narrower than "everything after the derived table starts", because `AS`
-    /// introduces relation aliases as well as column aliases (`FROM t AS s`, `) AS s`)
-    /// and those are emitted whether or not the outputs are named. A guard that reads
-    /// the wider region cannot tell a named output from an unnamed one.
-    fn derived_select_list(sql: &str) -> &str {
-        let opens = "FROM (SELECT ";
-        let list = &sql[first_offset_of(sql, opens) + opens.len()..];
-        let Some(end) = list.find(" FROM ") else {
-            panic!("expected the derived table's own FROM clause in: {sql}");
-        };
-        &list[..end]
-    }
-
     /// Everything the enclosing `SELECT` list draws from — the derived table and the
     /// alias it is attached to.
     ///
-    /// Deliberately wider than `derived_select_list`: the repair for the remaining
-    /// half of #12751 names the *relation's* columns on the alias it attaches
-    /// (`) AS s ("t.a + t.b")`), which lands after the derived table closes and so
-    /// falls outside the derived `SELECT` list entirely. A guard that reads only that
-    /// list cannot see that repair land. Searching for a specific column is what makes
-    /// the wider region safe here — the reason `derived_select_list` is narrow is that
-    /// a bare `AS` matches the relation aliases too.
+    /// Wider than the derived `SELECT` list: fork PR #221 names the *relation's*
+    /// columns on the alias it attaches (`) AS s ("t.a + t.b")`), which lands after
+    /// the derived table closes. Searching for a specific column is what makes the
+    /// wider region safe — a bare `AS` would also match the relation aliases.
     fn from_clause(sql: &str) -> &str {
         let Some(start) = sql.find(" FROM ") else {
             panic!("expected a FROM clause after the SELECT list: {sql}");
@@ -1548,8 +1526,8 @@ mod tests {
     /// computed expression, a literal, a literal whose logical name carries each
     /// dialect's own quote character, and a volatile call — across every enclosing
     /// shape the naming walk handles (`derived_scope_shapes`) — every shape it can
-    /// repair, which is not every shape #12751 reports: a projected scan under a
-    /// relation alias still cannot be named, and the test below this one pins that.
+    /// repair. A projected scan under a relation alias is named by a column list
+    /// on the alias (fork PR #221), which the test below this one guards.
     /// The volatile output is
     /// the one the flattened-`SELECT` repair (#12599) cannot help: inlining a
     /// volatile expression evaluates it a second time in a clause that can observe a
@@ -1660,7 +1638,7 @@ mod tests {
             .trim()
             .trim_matches('"')
             .trim_matches('`')
-            .trim_matches(|c| c == '[' || c == ']')
+            .trim_matches(['[', ']'])
     }
 
     /// Every `AS <identifier>` binding emitted at `depth`, as the bare identifiers
@@ -1672,7 +1650,7 @@ mod tests {
             .map(|(at, keyword)| {
                 let rest = &sql[at + keyword.len()..];
                 let end = rest
-                    .find(|c: char| c == ',' || c == ')')
+                    .find([',', ')'])
                     .unwrap_or(rest.len())
                     .min(rest.find(" FROM ").unwrap_or(rest.len()));
                 unquoted(&rest[..end])
@@ -1732,7 +1710,7 @@ mod tests {
     }
 
     /// Naming a `DISTINCT ON`'s computed output must not change which key it groups
-    /// by. PostgreSQL resolves a bare name in `DISTINCT ON` and `ORDER BY` against
+    /// by. `PostgreSQL` resolves a bare name in `DISTINCT ON` and `ORDER BY` against
     /// the output list before the input columns, so aliasing the output to the name
     /// the key already spells rebinds the key from the input column to the output —
     /// the same rows grouped by a different key, in valid SQL with an unchanged
@@ -1830,30 +1808,23 @@ mod tests {
         }
     }
 
-    /// The half of #12751 that fork PR #206 does not fix, pinned so the repair is
-    /// noticed rather than quietly leaving this shape unguarded.
-    ///
-    /// A scan projection pushed down under a relation alias is requalified onto the
-    /// alias before the derived table is built, so the only name the derived table can
-    /// report for the output — `s.a + s.b` — is not the one the enclosing scope holds
-    /// for it, `t.a + t.b`:
+    /// Regression test for the remaining half of #12751, fixed by fork PR #221
+    /// (refs #13140): a scan projection pushed down under a relation alias is
+    /// requalified onto the alias before the derived table is built, so the
+    /// derived `SELECT` list cannot report the name the enclosing scope holds.
+    /// The repair names the relation's columns on the alias it attaches:
     ///
     /// ```sql
-    /// SELECT s."t.a + t.b" FROM (SELECT (s.a + s.b) AS "s.a + s.b" FROM t AS s) AS s
+    /// SELECT s."t.a + t.b" FROM (SELECT (s.a + s.b) FROM t AS s) AS s ("t.a + t.b")
     /// ```
     ///
-    /// Naming the output cannot close that gap, which is why the fix above does not
-    /// try: both names are right for their own scope, and the repair is for the
-    /// enclosing scope to name the relation's columns on the alias it attaches. The
-    /// fork pins the same rendering in `test_subquery_alias_over_pushed_down_scan_
-    /// still_unbindable`; this is the repo-side canary for it.
-    ///
-    /// Projection pushdown is an ordinary optimized shape, so this is a live defect on
-    /// the federated pushdown path, and it is what keeps #12751 open. This test fails
-    /// once the gap is repaired: move the shape into `derived_scope_shapes` and close
-    /// #12751, rather than re-pinning the rendering below.
+    /// Asked of the whole `FROM` clause rather than of the derived `SELECT`
+    /// list, because that is where the column list lands — after the derived
+    /// table closes. A dialect that inlines instead (`BigQuery`) still has to
+    /// expose the same identifier somewhere in that clause, or the outer
+    /// reference cannot bind.
     #[test]
-    fn a_projected_scan_under_an_alias_does_not_name_the_output_its_scope_references() {
+    fn a_projected_scan_under_an_alias_names_the_output_its_scope_references() {
         let plan = LogicalPlanBuilder::scan("t", two_column_source(), Some(vec![0, 1]))
             .expect("scan t with a pushed-down projection")
             .project(vec![col("t.a") + col("t.b")])
@@ -1866,38 +1837,20 @@ mod tests {
             .expect("build");
         for (dialect_name, dialect) in federation_dialects() {
             let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
-            let list = derived_select_list(&sql);
-
-            // The derived table does name an output — this is the requalified name, not
-            // the absence of naming that preceded the fix — so the pin below is about
-            // *which* name it reports, not about whether it reports one. Read from the
-            // derived SELECT list alone: `AS` also introduces the relation aliases
-            // (`FROM t AS s`, `) AS s`), which are present either way, so a search over
-            // the whole statement would hold on the pre-#206 rendering too and this
-            // assertion would distinguish nothing.
             assert!(
-                list.contains(" AS "),
-                "{dialect_name}: the derived table names no output at all, which is the \
-                 pre-#206 behaviour rather than the gap this pins: {sql}"
+                sql.contains("FROM (SELECT "),
+                "{dialect_name}: the projection flattened into one SELECT, so this guard is \
+                 not looking at the derived-table shape it is for: {sql}"
             );
 
             // `column_of` panics unless the enclosing reference is qualified by `s`,
             // which is what makes the requalification the subject of this guard.
-            //
-            // Asked of the whole `FROM` clause rather than of the derived `SELECT`
-            // list, because the two ways a pin bump can close this gap land in
-            // different places: naming the derived output puts the name inside the
-            // list, while naming the relation's columns on the alias — the repair the
-            // comment above says this shape actually needs — puts it after the derived
-            // table closes. Reading only the list would leave this sentinel green
-            // through exactly the fix it exists to catch. Today the enclosing scope is
-            // the one place the name appears at all.
             let column = column_of(outer_reference(&sql), Some("s"));
             assert!(
-                !from_clause(&sql).contains(column),
-                "{dialect_name}: the derived table now exposes {column}, so this shape binds and \
-                 the remaining half of #12751 is repaired — move it into \
-                 `derived_scope_shapes` and close the issue instead of re-pinning this: {sql}"
+                from_clause(&sql).contains(column),
+                "{dialect_name}: the alias does not expose {column}, which is the identifier \
+                 the enclosing scope references, so the remote engine cannot bind the \
+                 statement: {sql}"
             );
         }
     }
@@ -2348,7 +2301,7 @@ mod tests {
 
         let postgres = unparse_with("postgres", &PostgreSqlDialect {}, &plan);
         assert!(
-            postgres.contains("(key)"),
+            postgres.contains(r#"("key")"#) || postgres.contains("(key)"),
             "this plan no longer unparses to a column alias list on any dialect, so there \
              is nothing for the BigQuery arms above to have inlined: {postgres}"
         );
