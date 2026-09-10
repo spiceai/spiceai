@@ -35,7 +35,6 @@ use data_connector_api::accelerated::{
 };
 use data_connector_api::write_back::WriteBackDeliverer;
 use datafusion::catalog::Session;
-use datafusion::common::tree_node::TreeNode;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
@@ -2050,30 +2049,25 @@ impl TableLayer for AcceleratedTable {
                 // its internal filter_plan to evaluate those predicates before making a
                 // correct fallback decision. Unsupported-function filters are therefore kept
                 // out of accelerator SQL pushdown, but still participate in the fallback check.
-                filters
+                //
+                // An expression the scan cannot evaluate is the exception: the
+                // federation analyzer runs its filter pushdown over the whole plan as
+                // soon as *any* table in the statement is federated, which is before
+                // decorrelation, so a subquery accepted here is written into this
+                // scan's filters and then fails physical planning. Declining it leaves
+                // it above the scan, which is where decorrelation puts it anyway.
+                // Consequence: such a predicate is absent from the fallback check, so
+                // the zero-results decision is made without it.
+                Ok(filters
                     .iter()
                     .map(|filter| {
-                        // Subqueries and outer references need planning outside the scan.
-                        // Federation can push filters before the main optimizer
-                        // decorrelates them, including when another table supplies the
-                        // federation provider.
-                        let needs_subquery_planning = filter.exists(|expr| {
-                            Ok(matches!(
-                                expr,
-                                Expr::Exists(_)
-                                    | Expr::InSubquery(_)
-                                    | Expr::ScalarSubquery(_)
-                                    | Expr::SetComparison(_)
-                                    | Expr::OuterReferenceColumn(_, _)
-                            ))
-                        })?;
-                        Ok(if needs_subquery_planning {
+                        if util::expr::cannot_be_evaluated_at_scan(filter) {
                             TableProviderFilterPushDown::Unsupported
                         } else {
                             TableProviderFilterPushDown::Inexact
-                        })
+                        }
                     })
-                    .collect()
+                    .collect())
             }
         }
     }

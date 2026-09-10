@@ -51,8 +51,7 @@ impl AcceleratedTable {
             .map(SQLTableSource::table_reference)?;
 
         let fed_provider = Arc::new(AcceleratedTableFederationProvider::new(
-            true,
-            Some(accelerated_table_federation_provider),
+            accelerated_table_federation_provider,
             self.refresher(),
         ));
 

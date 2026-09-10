@@ -316,3 +316,76 @@ mod tests {
         value.clone()
     }
 }
+
+/// Returns `true` if `expr` cannot be evaluated as a physical expression against
+/// a single scan's schema, and so must stay above the scan for the logical
+/// optimizer to rewrite.
+///
+/// A `TableProvider` reporting such a filter as pushed down (`Exact` or
+/// `Inexact`) lets `push_down_filter` write it into `TableScan::filters` before
+/// decorrelation has run. `create_physical_expr` has no arm for any of these
+/// variants, so the statement then fails at physical planning with
+/// "Physical plan does not support logical expression …". Reporting
+/// [`datafusion::logical_expr::TableProviderFilterPushDown::Unsupported`]
+/// instead leaves the expression above the scan, which is where decorrelation
+/// puts it anyway — a subquery becomes a semi-join over the scan, and the scan
+/// carries no such filter.
+///
+/// The variant set mirrors `DataFusion`'s own `can_evaluate_as_join_condition`
+/// in `datafusion-optimizer`'s `push_down_filter`, which is exhaustive over
+/// [`Expr`]. It is written as an exhaustive `match` here for the same reason: a
+/// `DataFusion` upgrade that adds a variant is a build failure rather than a
+/// silently mis-planned filter.
+#[must_use]
+pub fn cannot_be_evaluated_at_scan(expr: &Expr) -> bool {
+    use datafusion::common::tree_node::TreeNode;
+
+    #[expect(
+        deprecated,
+        reason = "Expr::Wildcard is deprecated upstream but still a variant this match must cover"
+    )]
+    expr.exists(|e| {
+        Ok(match e {
+            Expr::Exists(_)
+            | Expr::InSubquery(_)
+            | Expr::ScalarSubquery(_)
+            | Expr::SetComparison(_)
+            | Expr::OuterReferenceColumn(_, _)
+            | Expr::Unnest(_) => true,
+            Expr::Alias(_)
+            | Expr::Column(_)
+            | Expr::ScalarVariable(_, _)
+            | Expr::Literal(_, _)
+            | Expr::BinaryExpr(_)
+            | Expr::Like(_)
+            | Expr::SimilarTo(_)
+            | Expr::Not(_)
+            | Expr::IsNotNull(_)
+            | Expr::IsNull(_)
+            | Expr::IsTrue(_)
+            | Expr::IsFalse(_)
+            | Expr::IsUnknown(_)
+            | Expr::IsNotTrue(_)
+            | Expr::IsNotFalse(_)
+            | Expr::IsNotUnknown(_)
+            | Expr::Negative(_)
+            | Expr::Between(_)
+            | Expr::Case(_)
+            | Expr::Cast(_)
+            | Expr::TryCast(_)
+            | Expr::ScalarFunction(_)
+            | Expr::AggregateFunction(_)
+            | Expr::WindowFunction(_)
+            | Expr::InList(_)
+            | Expr::HigherOrderFunction(_)
+            | Expr::Lambda(_)
+            | Expr::LambdaVariable(_)
+            | Expr::Wildcard { .. }
+            | Expr::GroupingSet(_)
+            | Expr::Placeholder(_) => false,
+        })
+    })
+    // `exists` only fails when the closure fails, and this one cannot. Treating
+    // an expression we could not inspect as unevaluable is the safe direction.
+    .unwrap_or(true)
+}

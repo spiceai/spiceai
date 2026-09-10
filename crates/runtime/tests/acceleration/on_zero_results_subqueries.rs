@@ -128,6 +128,37 @@ const QUANTIFIED_FALLBACK_QUERIES: &[(&str, &[i64])] = &[
     ),
 ];
 
+// A predicate the scan cannot evaluate is declined, so it is absent from the
+// fallback check and the zero-results decision is made without it. With a
+// partially populated accelerator that suppresses fallback: the unfiltered scan
+// is non-empty, so the source is never consulted even though the accelerator
+// cannot answer the predicate. Measured on DuckDB and SQLite; on trunk these
+// same queries fail outright ("Physical plan does not support logical
+// expression"), so this pins a residual limit of the fix, not a regression.
+// Lifting it means deciding fallback above decorrelation rather than at the
+// scan -- see #14010.
+const SUBQUERY_ONLY_PARTIAL_QUERIES: &[(&str, &[i64])] = &[
+    (
+        "SELECT id FROM items WHERE id IN (SELECT item_id FROM details WHERE val = 5)",
+        &[],
+    ),
+    (
+        "SELECT id FROM items WHERE EXISTS (SELECT 1 FROM details WHERE item_id = id AND val = 5)",
+        &[],
+    ),
+];
+
+// Controls for the queries above: a predicate the scan *can* evaluate empties
+// the accelerator, so fallback fires and the source supplies the missing row.
+// These fail if the fixture stops exercising the partial-acceleration path.
+const PARTIAL_FALLBACK_CONTROLS: &[(&str, &[i64])] = &[
+    ("SELECT id FROM items WHERE id = 2", &[2]),
+    (
+        "SELECT id FROM items WHERE id = 2 AND id IN (SELECT item_id FROM details WHERE val = 5)",
+        &[2],
+    ),
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Contents {
     Populated,
@@ -274,13 +305,24 @@ async fn check_subqueries(
         } else {
             QUERIES
         };
+        let (subquery_only, fallback_controls): (&[(&str, &[i64])], &[(&str, &[i64])]) =
+            if contents == Contents::Partial {
+                (SUBQUERY_ONLY_PARTIAL_QUERIES, PARTIAL_FALLBACK_CONTROLS)
+            } else {
+                (&[], &[])
+            };
         let quantified_queries =
             if contents != Contents::Partial && *action == ZeroResultsAction::UseSource {
                 QUANTIFIED_FALLBACK_QUERIES
             } else {
                 &[]
             };
-        for &(query, expected) in queries.iter().chain(quantified_queries) {
+        for &(query, expected) in queries
+            .iter()
+            .chain(quantified_queries)
+            .chain(subquery_only)
+            .chain(fallback_controls)
+        {
             match run_query(&rt, query).await {
                 Ok(batches) => {
                     let expected = if contents == Contents::Empty
