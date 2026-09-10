@@ -140,12 +140,28 @@ checkHttpRequestCLI() {
 getLatestRelease() {
     local spiceReleaseUrl="https://api.github.com/repos/${GITHUB_ORG}/${GITHUB_REPO}/releases/latest"
     local latest_release=""
+    local response=""
+    local headers=()
 
     if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-        latest_release=$(curl -s "$spiceReleaseUrl" | grep \"tag_name\" | awk 'NR==1{print $2}' |  sed -n 's/"\(.*\)",/\1/p')
+        if [ -n "${GITHUB_TOKEN:-}" ]; then
+            headers=(-H "Authorization: Bearer $GITHUB_TOKEN")
+        fi
+        response=$(curl -fsS "${headers[@]}" "$spiceReleaseUrl") || {
+            echo "Failed to get latest release information"
+            exit 1
+        }
     else
-        latest_release=$(wget -q --header="Accept: application/json" -O - "$spiceReleaseUrl" | grep \"tag_name\" | awk 'NR==1{print $2}' |  sed -n 's/"\(.*\)",/\1/p')
+        if [ -n "${GITHUB_TOKEN:-}" ]; then
+            headers=(--header="Authorization: Bearer $GITHUB_TOKEN")
+        fi
+        response=$(wget -nv "${headers[@]}" --header="Accept: application/json" -O - "$spiceReleaseUrl") || {
+            echo "Failed to get latest release information"
+            exit 1
+        }
     fi
+
+    latest_release=$(printf '%s\n' "$response" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 
     if [ -z "$latest_release" ]; then
         echo "Failed to get latest release information"

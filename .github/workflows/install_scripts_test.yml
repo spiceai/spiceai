@@ -368,6 +368,14 @@ jobs:
           ./install/install.sh
           "$SPICE_CLI_INSTALL_DIR/spice" version
 
+      - name: Test install-spiced.sh with ${{ matrix.client }}
+        env:
+          SPICED_INSTALL_DIR: ${{ runner.temp }}/spiced-bin
+        run: |
+          mkdir -p "$SPICED_INSTALL_DIR"
+          bash install/install-spiced.sh
+          "$SPICED_INSTALL_DIR/spiced" --version
+
       - name: Restore HTTP clients
         if: always()
         run: |
