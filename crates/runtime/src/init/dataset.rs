@@ -138,8 +138,10 @@ impl DatasetLoadSummary {
     /// [`status::RuntimeStatus::has_dataset_ever_been_ready`]); a `Refreshing`
     /// dataset that never was is on its first load and counts as loading, alongside
     /// `Initializing`. `Error` counts as unhealthy. `Disabled`, `NotLoaded` and
-    /// `ShuttingDown` have nothing left to load and fall into no bucket, so they
-    /// neither inflate the ready count nor keep the sampler alive.
+    /// `ShuttingDown` fall into no bucket: the summary reports the progress of
+    /// loads that are under way, and a dataset in one of those states has no load
+    /// in flight to report, so it neither inflates the ready count nor keeps the
+    /// sampler alive.
     pub(crate) fn from_statuses(
         statuses: &HashMap<TableReference, status::ComponentStatus>,
         has_ever_been_ready: impl Fn(&TableReference) -> bool,
