@@ -23,13 +23,24 @@ limitations under the License.
 //! disagree with the table the moment a row was evicted by anything else.
 //! Asking costs one aggregate per sweep and cannot drift.
 //!
-//! Three bounds are applied, in order:
+//! One assumption underlies everything here: `_fetched_at` is the instant a row
+//! was fetched. `caching_ttl`, stale-while-revalidate, the read-path freshness
+//! check and this eviction all read it that way. The range delete below relies
+//! on it too — a row written after a sweep ranks the table carries a newer
+//! `_fetched_at`, so the range cannot reach it (see [`partition_doomed`]).
 //!
-//! 1. **Expiry** — rows fetched longer ago than `caching_ttl` plus the
+//! These bounds are applied, in order. Each is judged per entry, because a
+//! row-level delete could take part of a multi-row response and leave the rest
+//! to be served as though it were whole:
+//!
+//! 1. **Expiry** — entries fetched longer ago than `caching_ttl` plus the
 //!    stale-while-revalidate window are deleted. They can no longer be served,
 //!    so keeping them only consumes budget.
-//! 2. **Item count** — `caching_max_items`.
-//! 3. **Byte budget** — `caching_max_size`, measured by summing each row's
+//! 2. **Configured retention** — entries the dataset's own `retention_period`
+//!    or `retention_sql` matches. A caching accelerator may set these too, and
+//!    they evict entries the cache budgets know nothing about.
+//! 3. **Item count** — `caching_max_items`.
+//! 4. **Byte budget** — `caching_max_size`, measured by summing each row's
 //!    payload bytes.
 //!
 //! ## What a sweep costs
@@ -59,14 +70,20 @@ limitations under the License.
 //! **one** predicate that combines two shapes (see [`partition_doomed`]):
 //!
 //! * a single `_fetched_at <= ceiling` range that clears every doomed entry
-//!   lying cleanly below the oldest entry the sweep keeps — unbounded in how many
-//!   entries it covers, so this carries the bulk of a large eviction; and
+//!   lying wholly below the oldest row of anything the sweep keeps or that
+//!   straddles the boundary — unbounded in how many entries it covers, so this
+//!   carries the bulk of a large eviction; and
 //! * a per-entry `OR` naming the few entries that straddle that boundary in
 //!   fetch time, capped at [`MAX_ENTRIES_PER_SWEEP`].
 //!
 //! Combining them is what lets a cache ingesting faster than the naming cap
-//! still converge: the range is not bounded by the cap, and naming only mops up
-//! the fetch-time tie at the budget boundary.
+//! still converge (#13994). Naming alone caps eviction at
+//! [`MAX_ENTRIES_PER_SWEEP`] entries per sweep, and a coarse fetch clock makes
+//! that the usual path rather than the exception: the HTTP connector stamps
+//! `_fetched_at` from the response `Date` header at one-second resolution, so a
+//! burst of concurrent fetches shares one timestamp and the budget boundary
+//! lands inside that tie. The range is not bounded by the cap, so it carries the
+//! bulk; naming only mops up the tie at the boundary.
 //!
 //! Both the deadline and the size are *derived* rather than stored. A row's
 //! deadline is `_fetched_at + caching_ttl`, and `caching_ttl` is dataset
