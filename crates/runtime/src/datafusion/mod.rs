@@ -3322,12 +3322,13 @@ impl DataFusion {
 
                     accelerated_table_builder.retention(cache_retention);
                 }
-                // The policy built above this block is the dataset's own, and it
-                // can bound a stale-on-error cache.
-                caching_retention::CachingRetention::LeaveDeclared => {}
-                // Cache limits are installed as entry-aware eviction by the
-                // accelerated-table builder below.
-                caching_retention::CachingRetention::BoundedByCacheLimit => {}
+                // Nothing to install: the accelerator is already bounded, either
+                // by the dataset's own policy built above this block — which can
+                // bound a stale-on-error cache — or by a cache budget, whose
+                // entry-aware eviction the accelerated-table builder installs
+                // below.
+                caching_retention::CachingRetention::LeaveDeclared
+                | caching_retention::CachingRetention::BoundedByCacheLimit => {}
                 caching_retention::CachingRetention::Unbounded => {
                     tracing::warn!(
                         "{}",
