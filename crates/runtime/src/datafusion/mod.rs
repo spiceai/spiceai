@@ -3292,12 +3292,15 @@ impl DataFusion {
             // served as though it were the whole response.
             //
             // Nothing in the caching read path removes an entry, so the
-            // accelerator is bounded by a retention policy or by nothing at all.
+            // accelerator is bounded by a retention policy, a cache budget, or
+            // nothing at all.
             match caching_retention::caching_retention(
                 acceleration_settings.caching_stale_if_error.is_enabled(),
                 acceleration_settings.caching_ttl,
                 acceleration_settings.caching_stale_while_revalidate_ttl,
                 declared_retention_runs,
+                acceleration_settings.caching_max_size.is_some()
+                    || acceleration_settings.caching_max_items.is_some(),
             ) {
                 caching_retention::CachingRetention::Derive {
                     period,
@@ -3320,8 +3323,11 @@ impl DataFusion {
                     accelerated_table_builder.retention(cache_retention);
                 }
                 // The policy built above this block is the dataset's own, and it
-                // is the only thing that can bound a stale-on-error cache.
+                // can bound a stale-on-error cache.
                 caching_retention::CachingRetention::LeaveDeclared => {}
+                // Cache limits are installed as entry-aware eviction by the
+                // accelerated-table builder below.
+                caching_retention::CachingRetention::BoundedByCacheLimit => {}
                 caching_retention::CachingRetention::Unbounded => {
                     tracing::warn!(
                         "{}",
