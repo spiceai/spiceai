@@ -840,25 +840,24 @@ fn try_rewrite_oversized_join(
                 return rewrite_partitioned_hash_join_to_collect_left(hash_join);
             }
             // `__test_reference` Q78: same `ss LEFT JOIN ws LEFT JOIN cs` over
-            // file scans, no CTE. CollectLeft of that build is one ~100 GB
-            // unspillable `HashJoinInput` (SF-100 5cb097 trunk r1). Partitioned
-            // HJ is N copies of ~5 GB (9736 trunk r2). Spill with an N-way
-            // sort-merge — do not coalesce: a 1-partition SMJ of this oracle
-            // returned 65 rows for LIMIT 100 at SF-1.
-            // Inner stays a hash join: SF-10 Q92's oracle `avg(ws_ext_discount_amt)`
-            // join emitted Decimal128(30, 15) where HashJoinExec had Decimal128(7, 2)
-            // (aef067 type-guard was not enough — plan schemas matched).
-            // The inner `ss LEFT JOIN ws` and outer `(ss⋈ws) LEFT JOIN cs` are
-            // aggregate joins, but Q78's CTE bodies also do
-            // `store_sales LEFT JOIN store_returns` (file scans). DataFusion
-            // swaps that to a Partitioned *Right* hash join of returns ⋈ sales.
-            // Restricting the spill to Left left those as N unspillable
-            // HashJoinInputs (SF-100 f374a271 trunk r1 EXPLAIN: 3 Partitioned
-            // Right HJ, 2 SMJ of ss⋈ws/cs).
+            // file scans, no CTE. CollectLeft of that aggregate build is one
+            // ~100 GB unspillable `HashJoinInput`. Inner stays a hash join:
+            // SF-10 Q92's oracle `avg(ws_ext_discount_amt)` join emitted
+            // Decimal128(30, 15) where HashJoinExec had Decimal128(7, 2).
+            // Aggregate Left/Right (`ss LEFT JOIN ws`, `(ss⋈ws) LEFT JOIN cs`)
+            // use N-way sort-merge — a coalesced SMJ of those returned 65
+            // rows for LIMIT 100 at SF-1. File-scan Left/Right (CTE bodies:
+            // `store_sales LEFT JOIN store_returns`, swapped to Partitioned
+            // Right of returns ⋈ sales) coalesce to one sorter per side:
+            // N-way SMJ of those fact tables is 20 ExternalSorters per side
+            // and fills the spillable cap at SF-100 so a new sorter with 0
+            // bytes cannot allocate (regression for #13918).
             if matches!(*hash_join.join_type(), JoinType::Left | JoinType::Right)
                 && should_spill_oracle_outer_join(hash_join)
             {
-                return finish_sort_merge_rewrite(hash_join, false);
+                let coalesce = !plan_contains_aggregate(hash_join.left())
+                    && !plan_contains_aggregate(hash_join.right());
+                return finish_sort_merge_rewrite(hash_join, coalesce);
             }
             return Ok(None);
         }
@@ -1218,6 +1217,15 @@ fn input_is_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
     }
     let children = plan.children();
     children.len() == 1 && input_is_aggregate(children[0])
+}
+
+fn plan_contains_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.downcast_ref::<AggregateExec>().is_some() {
+        return true;
+    }
+    plan.children()
+        .iter()
+        .any(|child| plan_contains_aggregate(child))
 }
 
 /// Spill an unknown-size join when the **build** side (left) is an
@@ -3906,12 +3914,49 @@ mod tests {
         assert_eq!(rewritten.right().output_partitioning().partition_count(), 4);
     }
 
+    fn assert_coalesced_oracle_file_scan_sort_merge(
+        optimized: &Arc<dyn ExecutionPlan>,
+        partitions: usize,
+    ) {
+        assert_eq!(
+            optimized.output_partitioning().partition_count(),
+            partitions,
+            "coalesced sort-merge must restore the original partition count"
+        );
+        let wrapper_children = optimized.children();
+        let smj_node = if optimized.is::<SortMergeJoinExec>() {
+            Arc::clone(optimized)
+        } else {
+            Arc::clone(
+                wrapper_children
+                    .first()
+                    .expect("repartition wrapper must have a child"),
+            )
+        };
+        let smj = smj_node
+            .downcast_ref::<SortMergeJoinExec>()
+            .expect("Q78 oracle fact-return join must spill via coalesced sort-merge");
+        for (side, child) in smj.children().iter().enumerate() {
+            let sort = child
+                .downcast_ref::<SortExec>()
+                .unwrap_or_else(|| panic!("sort-merge input {side} must be SortExec"));
+            let sort_children = sort.children();
+            let sort_input = sort_children
+                .first()
+                .unwrap_or_else(|| panic!("SortExec {side} must have an input"));
+            assert!(
+                sort_input.is::<CoalescePartitionsExec>(),
+                "file-scan oracle outer join must coalesce before sorting (N-way ExternalSorter OOM at SF-100)"
+            );
+        }
+    }
+
     #[test]
-    fn rewrites_partitioned_oracle_left_join_of_file_scans_to_nway_sort_merge() {
+    fn rewrites_partitioned_oracle_left_join_of_file_scans_to_coalesced_sort_merge() {
         // TPC-DS Q78 `--validate` oracle CTE body: `store_sales LEFT JOIN
         // store_returns` over file scans, then `GROUP BY`. Neither input is
-        // an AggregateExec. SF-100 38eb30d trunk r1 still showed N × 5 GB
-        // HashJoinInput after aggregate-only Left spill (regression for #13918).
+        // an AggregateExec. N-way SMJ of these scans is 20 ExternalSorters
+        // per side and fills the spillable cap at SF-100 (regression for #13918).
         let left_schema = channel_schema("ss_item_sk", "ss_ticket_number");
         let right_schema = channel_schema("sr_item_sk", "sr_ticket_number");
         let left = hash_repartition(inlined_exec(&left_schema), "ss_item_sk", 4);
@@ -3928,25 +3973,15 @@ mod tests {
             config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
-
-        let rewritten = optimized
-            .downcast_ref::<SortMergeJoinExec>()
-            .expect("Q78 oracle fact-return Left join must spill via N-way sort-merge");
-        assert_eq!(
-            rewritten.left().output_partitioning().partition_count(),
-            4,
-            "must not coalesce; coalesced SMJ changed LIMIT 100 at SF-1"
-        );
-        assert_eq!(rewritten.right().output_partitioning().partition_count(), 4);
+        assert_coalesced_oracle_file_scan_sort_merge(&optimized, 4);
     }
 
     #[test]
-    fn rewrites_partitioned_oracle_right_join_of_file_scans_to_nway_sort_merge() {
+    fn rewrites_partitioned_oracle_right_join_of_file_scans_to_coalesced_sort_merge() {
         // TPC-DS Q78 `--validate` oracle CTE body after join swap:
-        // `store_returns RIGHT JOIN store_sales` (equivalent to
-        // `store_sales LEFT JOIN store_returns`). SF-100 f374a271 trunk r1
-        // EXPLAIN still had 3 Partitioned Right HashJoinExecs; those
-        // HashJoinInputs were N × 5 GB (regression for #13918).
+        // `store_returns RIGHT JOIN store_sales`. N-way SMJ of these file
+        // scans fills the spillable cap at SF-100 so a new ExternalSorter
+        // with 0 bytes cannot allocate (regression for #13918).
         let left_schema = channel_schema("sr_item_sk", "sr_ticket_number");
         let right_schema = channel_schema("ss_item_sk", "ss_ticket_number");
         let left = hash_repartition(inlined_exec(&left_schema), "sr_item_sk", 4);
@@ -3963,16 +3998,7 @@ mod tests {
             config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
-
-        let rewritten = optimized
-            .downcast_ref::<SortMergeJoinExec>()
-            .expect("Q78 oracle swapped fact-return Right join must spill via N-way sort-merge");
-        assert_eq!(
-            rewritten.left().output_partitioning().partition_count(),
-            4,
-            "must not coalesce; coalesced SMJ changed LIMIT 100 at SF-1"
-        );
-        assert_eq!(rewritten.right().output_partitioning().partition_count(), 4);
+        assert_coalesced_oracle_file_scan_sort_merge(&optimized, 4);
     }
 
     #[test]
@@ -4155,7 +4181,7 @@ mod tests {
     /// TPC-DS Q75 self-joins `all_sales` curr/prev: both sides expose `d_year`.
     /// A hash-join projection that emits right then left must survive the
     /// sort-merge rewrite as those same indices, not as "first unused field
-    /// named d_year" (which swapped `prev_year`/`year` on the lab SF-10 trunk arm).
+    /// named `d_year`" (which swapped `prev_year`/`year` on the lab SF-10 trunk arm).
     #[test]
     fn sort_merge_rewrite_keeps_self_join_projection_indices() {
         let schema = order_line_schema();
