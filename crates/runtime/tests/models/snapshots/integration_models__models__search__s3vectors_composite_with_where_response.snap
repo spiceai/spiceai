@@ -23,12 +23,12 @@ expression: "normalize_search_response(resp, round_scores)"
       "dataset": "qs",
       "matches": {
         "answer": [
-          "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*)."
+          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
         ]
       },
       "primary_key": {
-        "id": 821,
-        "question": "What causes dermatomycosis, and what are some examples of this condition?"
+        "id": 449,
+        "question": "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
       }
     },
     {
@@ -36,12 +36,12 @@ expression: "normalize_search_response(resp, round_scores)"
       "dataset": "qs",
       "matches": {
         "answer": [
-          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
+          "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*)."
         ]
       },
       "primary_key": {
-        "id": 449,
-        "question": "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
+        "id": 821,
+        "question": "What causes dermatomycosis, and what are some examples of this condition?"
       }
     },
     {
