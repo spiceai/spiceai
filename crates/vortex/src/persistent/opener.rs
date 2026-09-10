@@ -330,6 +330,33 @@ impl FileOpener for VortexOpener {
                 &layout_reader,
             )?;
 
+            // Resolved before the filter below so that a split whose byte range covers no
+            // whole row group still short-circuits to an empty stream, rather than
+            // reporting a pushdown failure it will never act on.
+            let row_range = match file.range {
+                Some(file_range) => {
+                    let byte_range = Range {
+                        start: u64::try_from(file_range.start).map_err(|_| {
+                            exec_datafusion_err!("Vortex file range start is negative")
+                        })?,
+                        end: u64::try_from(file_range.end).map_err(|_| {
+                            exec_datafusion_err!("Vortex file range end is negative")
+                        })?,
+                    };
+
+                    let Some(row_range) = split_aligned_row_range(
+                        byte_range,
+                        file.object_meta.size,
+                        natural_split_ranges.as_ref(),
+                    ) else {
+                        return Ok(stream::empty().boxed());
+                    };
+
+                    Some(row_range)
+                }
+                None => None,
+            };
+
             // Stats-layout pruning chain (Vortex 0.74 `FileStatsLayoutReader` / zoned
             // `StatFn`). The conjuncts collected here are translated to a Vortex
             // `Expression` and handed to `ScanBuilder::with_some_filter` below. Inside
@@ -398,22 +425,7 @@ impl FileOpener for VortexOpener {
                 scan_builder = vortex_plan.apply_to_builder(scan_builder);
             }
 
-            if let Some(file_range) = file.range {
-                let byte_range = Range {
-                    start: u64::try_from(file_range.start)
-                        .map_err(|_| exec_datafusion_err!("Vortex file range start is negative"))?,
-                    end: u64::try_from(file_range.end)
-                        .map_err(|_| exec_datafusion_err!("Vortex file range end is negative"))?,
-                };
-
-                let Some(row_range) = split_aligned_row_range(
-                    byte_range,
-                    file.object_meta.size,
-                    natural_split_ranges.as_ref(),
-                ) else {
-                    return Ok(stream::empty().boxed());
-                };
-
+            if let Some(row_range) = row_range {
                 scan_builder = scan_builder.with_row_range(row_range);
             }
 
