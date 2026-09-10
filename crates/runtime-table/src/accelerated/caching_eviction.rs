@@ -73,12 +73,12 @@ use datafusion::catalog::TableProvider;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::functions::expr_fn::octet_length;
 use datafusion::functions_aggregate::expr_fn::{bool_or, count, max, min, sum};
-use datafusion::prelude::{Expr, SessionContext, cast, coalesce, col, lit};
+use datafusion::prelude::{DataFrame, Expr, SessionContext, cast, coalesce, col, lit};
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
 use tokio::runtime::Handle;
 
-use datafusion::logical_expr::Operator;
+use datafusion::logical_expr::{LogicalPlanBuilder, LogicalPlanBuilderOptions, Operator};
 use util::timestamp_filter::TimestampFilterConvert;
 
 use super::caching::{
@@ -729,9 +729,22 @@ async fn rank_entries(
         get_df_default_config(),
         default_runtime_env(io_runtime.clone()),
     );
-    let mut df = ctx
-        .read_table(Arc::clone(accelerator))?
-        .aggregate(key_columns.iter().map(col).collect(), aggregates)?;
+    // The group key is exactly `key_columns`, and has to stay that way.
+    // `DataFrame::aggregate` opts into appending every column the group key
+    // functionally determines, so an accelerator carrying a primary-key or
+    // unique constraint over the request columns has it widened to the whole
+    // stored row -- which puts the payload, and the `Map` a response's headers
+    // are stored in, into a group key that then has to be row-encoded, and the
+    // sweep fails on every pass. Adding `_fetched_at` to the key would be worse
+    // than failing: it splits a paginated entry into one group per page.
+    let plan = LogicalPlanBuilder::from(
+        ctx.read_table(Arc::clone(accelerator))?
+            .into_unoptimized_plan(),
+    )
+    .with_options(LogicalPlanBuilderOptions::new().with_add_implicit_group_by_exprs(false))
+    .aggregate(key_columns.iter().map(col), aggregates)?
+    .build()?;
+    let mut df = DataFrame::new(ctx.state(), plan);
 
     if has_fetched_at {
         df = df.sort(vec![col("oldest").sort(false, false)])?;
