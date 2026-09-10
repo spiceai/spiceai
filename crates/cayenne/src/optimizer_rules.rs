@@ -845,7 +845,11 @@ fn try_rewrite_oversized_join(
             // HJ is N copies of ~5 GB (9736 trunk r2). Spill with an N-way
             // sort-merge — do not coalesce: a 1-partition SMJ of this oracle
             // returned 65 rows for LIMIT 100 at SF-1.
-            if should_spill_unknown_size_join(hash_join) {
+            // Inner stays a hash join: SF-10 Q92's oracle `avg(ws_ext_discount_amt)`
+            // join emitted Decimal128(30, 15) where HashJoinExec had Decimal128(7, 2)
+            // (aef067 type-guard was not enough — plan schemas matched).
+            if should_spill_unknown_size_join(hash_join) && *hash_join.join_type() == JoinType::Left
+            {
                 return finish_sort_merge_rewrite(hash_join, false);
             }
             return Ok(None);
@@ -3791,6 +3795,43 @@ mod tests {
             "must not coalesce; coalesced SMJ changed LIMIT 100 at SF-1"
         );
         assert_eq!(rewritten.right().output_partitioning().partition_count(), 4);
+    }
+
+    #[test]
+    fn does_not_nway_sort_merge_oracle_inner_aggregate_join() {
+        // TPC-DS Q92 `--validate` oracle: inner join of an aggregated
+        // `avg(ws_ext_discount_amt)` over file scans. N-way SMJ of this
+        // shape emitted Decimal128(30, 15) vs HashJoinExec Decimal128(7, 2)
+        // at SF-10 (aef067). Keep the hash join.
+        let left_schema = channel_schema("ws_item_sk", "ws_amt");
+        let right_schema = channel_schema("i_item_sk", "i_id");
+        let left = hash_repartition(
+            grouped_count_over(inlined_exec(&left_schema), "ws_item_sk"),
+            "ws_item_sk",
+            4,
+        );
+        let right = hash_repartition(
+            grouped_count_over(inlined_exec(&right_schema), "i_item_sk"),
+            "i_item_sk",
+            4,
+        );
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "ws_item_sk",
+            "i_item_sk",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<HashJoinExec>(),
+            "Q92 --validate oracle inner aggregate joins must stay hash joins"
+        );
     }
 
     #[test]
