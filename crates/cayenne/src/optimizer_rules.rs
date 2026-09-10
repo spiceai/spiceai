@@ -844,20 +844,17 @@ fn try_rewrite_oversized_join(
             // ~100 GB unspillable `HashJoinInput`. Inner stays a hash join:
             // SF-10 Q92's oracle `avg(ws_ext_discount_amt)` join emitted
             // Decimal128(30, 15) where HashJoinExec had Decimal128(7, 2).
-            // Aggregate Left/Right (`ss LEFT JOIN ws`, `(ss⋈ws) LEFT JOIN cs`)
-            // use N-way sort-merge — a coalesced SMJ of those returned 65
-            // rows for LIMIT 100 at SF-1. File-scan Left/Right (CTE bodies:
-            // `store_sales LEFT JOIN store_returns`, swapped to Partitioned
-            // Right of returns ⋈ sales) coalesce to one sorter per side:
-            // N-way SMJ of those fact tables is 20 ExternalSorters per side
-            // and fills the spillable cap at SF-100 so a new sorter with 0
-            // bytes cannot allocate (regression for #13918).
+            // Every oracle Left/Right join coalesces to one sorter per side.
+            // N-way SMJ of the fact-return file scans *or* of the aggregated
+            // `ss`/`ws`/`cs` bodies is 20 ExternalSorters per side and fills
+            // the spillable cap at SF-100 so a new sorter with 0 bytes cannot
+            // allocate (regression for #13918). The parent of these joins is
+            // also rewritten to sort-merge, so RoundRobin restore after
+            // coalesce is not fed into a Partitioned hash join.
             if matches!(*hash_join.join_type(), JoinType::Left | JoinType::Right)
                 && should_spill_oracle_outer_join(hash_join)
             {
-                let coalesce = !plan_contains_aggregate(hash_join.left())
-                    && !plan_contains_aggregate(hash_join.right());
-                return finish_sort_merge_rewrite(hash_join, coalesce);
+                return finish_sort_merge_rewrite(hash_join, true);
             }
             return Ok(None);
         }
@@ -1217,15 +1214,6 @@ fn input_is_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
     }
     let children = plan.children();
     children.len() == 1 && input_is_aggregate(children[0])
-}
-
-fn plan_contains_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if plan.downcast_ref::<AggregateExec>().is_some() {
-        return true;
-    }
-    plan.children()
-        .iter()
-        .any(|child| plan_contains_aggregate(child))
 }
 
 /// Spill an unknown-size join when the **build** side (left) is an
@@ -3778,14 +3766,12 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_partitioned_oracle_aggregate_join_to_nway_sort_merge() {
+    fn rewrites_partitioned_oracle_aggregate_join_to_coalesced_sort_merge() {
         // TPC-DS Q78 `--validate` oracle: `ss LEFT JOIN ws` over file scans,
         // no Cayenne exec in the tree. Distinct schemas so this is not the
-        // year_total self-join skip. A coalesced sort-merge of this join
-        // returns 65 rows for LIMIT 100 instead of 100 (regression for #13918).
-        // CollectLeft of the same join is one ~100 GB unspillable
-        // `HashJoinInput` (SF-100 5cb097 trunk r1). N-way SMJ spills and
-        // keeps the Partitioned hash join's partition count.
+        // year_total self-join skip. CollectLeft of this join is one ~100 GB
+        // unspillable `HashJoinInput`. N-way SMJ is 20 ExternalSorters per
+        // side and fills the spillable cap at SF-100 (regression for #13918).
         let left_schema = channel_schema("ss_item_sk", "ss_qty");
         let right_schema = channel_schema("ws_item_sk", "ws_qty");
         let left = hash_repartition(
@@ -3810,16 +3796,7 @@ mod tests {
             config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
-
-        let rewritten = optimized
-            .downcast_ref::<SortMergeJoinExec>()
-            .expect("Q78 --validate oracle must spill via N-way sort-merge, not CollectLeft");
-        assert_eq!(
-            rewritten.left().output_partitioning().partition_count(),
-            4,
-            "must not coalesce; coalesced SMJ changed LIMIT 100 at SF-1"
-        );
-        assert_eq!(rewritten.right().output_partitioning().partition_count(), 4);
+        assert_coalesced_oracle_file_scan_sort_merge(&optimized, 4);
     }
 
     #[test]
@@ -3860,12 +3837,11 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_partitioned_oracle_outer_left_join_of_join_to_nway_sort_merge() {
+    fn rewrites_partitioned_oracle_outer_left_join_of_join_to_coalesced_sort_merge() {
         // TPC-DS Q78 `--validate` oracle outer join: `(ss ⋈ ws) LEFT JOIN cs`.
-        // The left input is itself a join, not an AggregateExec, so the
-        // `input_is_aggregate(left)` gate left this as Partitioned
-        // HashJoinExec. SF-100 852632 trunk r1: N × 5 GB HashJoinInput
-        // exhausted the 107.5 GB pool (regression for #13918).
+        // The left input is itself a join, not an AggregateExec. N-way SMJ of
+        // this join is 20 ExternalSorters per side and fills the spillable
+        // cap at SF-100 (regression for #13918).
         let ss_schema = channel_schema("ss_item_sk", "ss_qty");
         let ws_schema = channel_schema("ws_item_sk", "ws_qty");
         let cs_schema = channel_schema("cs_item_sk", "cs_qty");
@@ -3902,16 +3878,7 @@ mod tests {
             config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
-
-        let rewritten = optimized
-            .downcast_ref::<SortMergeJoinExec>()
-            .expect("Q78 oracle outer (ss⋈ws) LEFT JOIN cs must spill via N-way sort-merge");
-        assert_eq!(
-            rewritten.left().output_partitioning().partition_count(),
-            4,
-            "must not coalesce; coalesced SMJ changed LIMIT 100 at SF-1"
-        );
-        assert_eq!(rewritten.right().output_partitioning().partition_count(), 4);
+        assert_coalesced_oracle_file_scan_sort_merge(&optimized, 4);
     }
 
     fn assert_coalesced_oracle_file_scan_sort_merge(
