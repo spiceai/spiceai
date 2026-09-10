@@ -226,8 +226,9 @@ catch.
 Upstream [apache/arrow-rs](https://github.com/apache/arrow-rs), branch
 `spiceai-58`. The pin lives in the object-store Parquet reader
 (`parquet/src/arrow/async_reader/store.rs`), in the push-decoder short-read
-path (`parquet/src/util/push_buffers.rs` and its callers), and in
-`arrow-buffer/src/buffer/immutable.rs`.
+path (`parquet/src/util/push_buffers.rs` and its callers), in
+`arrow-buffer/src/buffer/immutable.rs`, and in the cast kernel
+(`arrow-cast/src/cast/mod.rs`).
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
