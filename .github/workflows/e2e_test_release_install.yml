@@ -34,11 +34,11 @@ jobs:
       matrix:
         include:
           - name: Linux x64
-            runner: spiceai-dev-runners
+            runner: ubuntu-latest
             target_os: linux
             target_arch: x86_64
           - name: Linux aarch64
-            runner: hosted-linux-arm-runner
+            runner: ubuntu-24.04-arm
             target_os: linux
             target_arch: aarch64
           - name: macOS aarch64 (Apple Silicon)
@@ -81,7 +81,7 @@ jobs:
 
       - name: add Spice bin to PATH
         run: |
-          echo "$HOME/.spice/bin" >> $GITHUB_PATH
+          echo "$HOME/.spice/bin" >> "$GITHUB_PATH"
 
       - name: resolve latest Spice release version
         id: resolve_latest_release
