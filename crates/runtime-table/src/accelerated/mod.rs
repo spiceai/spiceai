@@ -35,6 +35,7 @@ use data_connector_api::accelerated::{
 };
 use data_connector_api::write_back::WriteBackDeliverer;
 use datafusion::catalog::Session;
+use datafusion::common::tree_node::TreeNode;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
@@ -2044,12 +2045,30 @@ impl TableLayer for AcceleratedTable {
                 Ok(results)
             }
             ZeroResultsAction::UseSource => {
-                // In UseSource mode, all filters must still flow into scan() so that
+                // In UseSource mode, row filters must still flow into scan() so that
                 // FallbackOnZeroResultsScanExec receives the full predicate set and can use
                 // its internal filter_plan to evaluate those predicates before making a
                 // correct fallback decision. Unsupported-function filters are therefore kept
                 // out of accelerator SQL pushdown, but still participate in the fallback check.
-                Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+                filters
+                    .iter()
+                    .map(|filter| {
+                        // Subqueries need plan operators outside the scan. Federation
+                        // can push filters before the main optimizer decorrelates them,
+                        // including when another table supplies the federation provider.
+                        let has_subquery = filter.exists(|expr| {
+                            Ok(matches!(
+                                expr,
+                                Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+                            ))
+                        })?;
+                        Ok(if has_subquery {
+                            TableProviderFilterPushDown::Unsupported
+                        } else {
+                            TableProviderFilterPushDown::Inexact
+                        })
+                    })
+                    .collect()
             }
         }
     }
