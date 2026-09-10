@@ -3859,10 +3859,10 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
     }
 
     /// A dataset performing its first load reports `Refreshing`, exactly like one
-    /// refreshing data it already holds; only the registry's ever-ready record tells
-    /// them apart. Regression test for #13974: the summary counted first loads as
-    /// ready, reported 25/25 ready eleven minutes before the runtime was, and stopped
-    /// sampling.
+    /// refreshing data it already holds; the registry's ever-ready record is what
+    /// tells them apart, so the summary counts the first as loading and the second
+    /// as ready, and stays unsettled while the first load is in flight.
+    /// Regression test for #13974.
     #[test]
     fn a_first_load_counts_as_loading_and_a_refresh_of_loaded_data_as_ready() {
         let registry = status::RuntimeStatus::new();
