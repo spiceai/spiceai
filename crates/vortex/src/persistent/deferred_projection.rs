@@ -276,21 +276,100 @@ mod tests {
         Ok(())
     }
 
-    /// The scan wiring, not just the wrapper: a point lookup through the real
-    /// `VortexOpener` must not read the whole projected column.
+    /// The scan wiring, not just the wrapper: bytes read must fall with selectivity.
     ///
     /// The four tests above construct `DeferredProjectionReader` directly and all still
     /// pass if `VortexOpener` never wraps anything, so none of them guards the seam. This
-    /// one measures the bytes Vortex actually pulled from the object store.
+    /// one goes through the real opener and measures `vortex.io.read.total_size` off the
+    /// executed plan.
     ///
-    /// Measured on the file this test writes (13,998,704 bytes, 64 chunks, `id` plus four
-    /// payload columns): the point lookup reads 3,496,560 bytes without the wrapper and
-    /// 208,424 bytes with it. Without deferral every chunk's `p0` segment is registered up
-    /// front and the read driver's coalescer merges all 17 of them into one read spanning
-    /// the entire column, even though 63 of the 64 chunks match nothing. The 5%-of-file
-    /// budget below sits between the two by more than 3x on either side.
+    /// Measured on the file it writes (13,998,704 bytes, 64 chunks, `id` plus four payload
+    /// columns), eager setup versus deferred:
+    ///
+    /// | rows matched | before    | after     |
+    /// |--------------|-----------|-----------|
+    /// | 1 of 262,144 | 3,496,560 |   208,424 |
+    /// | half         | 3,923,936 | 1,734,364 |
+    /// | all          | 5,229,296 | 3,937,280 |
+    ///
+    /// Without deferral the point lookup reads the whole `p0` column: all 17 of its
+    /// segments are registered up front, and the read driver's coalescer merges them into
+    /// one read spanning the column even though 63 of the 64 chunks match nothing.
+    ///
+    /// Only the two selective cases carry a byte budget. The all-rows gap is 1.33x, too
+    /// narrow to assert without turning a compression or layout change in a Vortex bump
+    /// into a spurious failure; it is covered for row count and values instead, which is
+    /// what says the deferral did not break unselective scans.
     #[tokio::test(flavor = "multi_thread")]
-    async fn point_lookup_does_not_read_the_whole_projected_column() -> anyhow::Result<()> {
+    async fn filtered_scan_reads_fewer_bytes_as_selectivity_rises() -> anyhow::Result<()> {
+        let ctx = fixture().await?;
+
+        // Budgets sit roughly midway between the measured arms, on a log scale.
+        let point = ctx
+            .run("SELECT p0 FROM '/deferred_projection.vortex' WHERE id = 5")
+            .await?;
+        assert_eq!(point.rows, 1, "the predicate matches exactly one row");
+        assert_eq!(
+            point.first_value,
+            Some(format!("0-0-5-{}", "x".repeat(48))),
+            "the deferred projection must return the value the eager one did"
+        );
+        point.assert_bytes_under(700_000, "point lookup");
+
+        let half = ctx
+            .run("SELECT p0 FROM '/deferred_projection.vortex' WHERE id < 131072")
+            .await?;
+        assert_eq!(half.rows, 131_072);
+        half.assert_bytes_under(2_600_000, "half the rows");
+
+        let all = ctx
+            .run("SELECT p0 FROM '/deferred_projection.vortex' WHERE id >= 0")
+            .await?;
+        assert_eq!(
+            all.rows, 262_144,
+            "an unselective filter still returns everything"
+        );
+        assert_eq!(
+            all.first_value,
+            Some(format!("0-0-0-{}", "x".repeat(48))),
+            "an unselective filtered scan must be unaffected"
+        );
+
+        Ok(())
+    }
+
+    /// A Vortex file plus a session that can query it, shared by the cases above.
+    struct Fixture {
+        ctx: TestSessionContext,
+        file_bytes: u64,
+    }
+
+    /// What one query read, and what it returned.
+    struct Scan {
+        rows: usize,
+        first_value: Option<String>,
+        bytes_read: u64,
+        reads: u64,
+        file_bytes: u64,
+    }
+
+    impl Scan {
+        fn assert_bytes_under(&self, budget: u64, what: &str) {
+            assert!(
+                self.bytes_read < budget,
+                "{what} read {} bytes of a {}-byte file in {} reads, over the {budget}-byte \
+                 budget: projection setup is running before the filter resolves",
+                self.bytes_read,
+                self.file_bytes,
+                self.reads,
+            );
+        }
+    }
+
+    /// Writes a 64-chunk file: an `id` column plus four payload columns, so the projected
+    /// column is not adjacent to the filter column. That is the layout in which an eager
+    /// projection read spans the file.
+    async fn fixture() -> anyhow::Result<Fixture> {
         const CHUNKS: u32 = 64;
         const ROWS_PER_CHUNK: u32 = 4096;
 
@@ -307,8 +386,6 @@ mod tests {
             .collect::<ChunkedArray>()
             .into_array();
 
-        // Four payload columns so the projected column is not adjacent to the filter
-        // column, which is the layout that lets an eager projection read span the file.
         let payload = |salt: u32| {
             (0..CHUNKS)
                 .map(|chunk| {
@@ -339,44 +416,44 @@ mod tests {
         writer.shutdown().await?;
         let file_bytes = ctx.store.head(&path).await?.size;
 
-        let df = ctx
-            .session
-            .sql("SELECT p0 FROM '/deferred_projection.vortex' WHERE id = 5")
-            .await?;
-        let plan = ctx
-            .session
-            .state()
-            .create_physical_plan(df.logical_plan())
-            .await?;
-        let task_ctx = Arc::new(TaskContext::from(&ctx.session.state()));
-        let batches = collect(Arc::clone(&plan), task_ctx).await?;
-
-        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(rows, 1, "the predicate matches exactly one row");
-        assert_eq!(
-            array_value_to_string(batches[0].column(0), 0)?,
-            format!("0-0-5-{}", "x".repeat(48)),
-            "the deferred projection must return the same value the eager one did"
-        );
-
-        let bytes_read = read_total_size(plan.as_ref());
-        let budget = file_bytes / 20;
-        assert!(
-            bytes_read < budget,
-            "a point lookup read {bytes_read} bytes of a {file_bytes}-byte file, over the \
-             {budget}-byte budget: the projection is being set up before the filter resolves"
-        );
-
-        Ok(())
+        Ok(Fixture { ctx, file_bytes })
     }
 
-    /// Sums `vortex.io.read.total_size` across every Vortex scan in `plan`.
-    fn read_total_size(plan: &dyn ExecutionPlan) -> u64 {
+    impl Fixture {
+        async fn run(&self, sql: &str) -> anyhow::Result<Scan> {
+            let df = self.ctx.session.sql(sql).await?;
+            let plan = self
+                .ctx
+                .session
+                .state()
+                .create_physical_plan(df.logical_plan())
+                .await?;
+            let task_ctx = Arc::new(TaskContext::from(&self.ctx.session.state()));
+            let batches = collect(Arc::clone(&plan), task_ctx).await?;
+
+            let first_value = batches
+                .iter()
+                .find(|batch| batch.num_rows() > 0)
+                .map(|batch| array_value_to_string(batch.column(0), 0))
+                .transpose()?;
+
+            Ok(Scan {
+                rows: batches.iter().map(RecordBatch::num_rows).sum(),
+                first_value,
+                bytes_read: sum_metric(plan.as_ref(), "vortex.io.read.total_size"),
+                reads: sum_metric(plan.as_ref(), "vortex.io.read.size_count"),
+                file_bytes: self.file_bytes,
+            })
+        }
+    }
+
+    /// Sums one Vortex counter across every Vortex scan in `plan`.
+    fn sum_metric(plan: &dyn ExecutionPlan, metric_name: &str) -> u64 {
         VortexMetricsFinder::find_all(plan)
             .iter()
             .flat_map(MetricsSet::iter)
             .filter_map(|metric| match metric.value() {
-                MetricValue::Count { name, count } if name == "vortex.io.read.total_size" => {
+                MetricValue::Count { name, count } if name == metric_name => {
                     Some(count.value() as u64)
                 }
                 _ => None,
