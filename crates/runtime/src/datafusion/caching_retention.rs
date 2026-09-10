@@ -100,13 +100,16 @@ fn check_interval_for(period: Duration) -> Duration {
 /// all, with no task started and no error raised, so reading intent off the
 /// config would suppress this warning for an accelerator that is just as
 /// unbounded as one configured with no policy at all.
+///
+/// `cache_limit_configured` is whether `caching_max_items` or
+/// `caching_max_size` is configured. Their entry-aware eviction is installed
+/// outside this retention-policy selection, so a budget bounds the accelerator
+/// even though nothing here derives a period for it.
 pub(crate) fn caching_retention(
     stale_if_error: bool,
     caching_ttl: Option<Duration>,
     caching_stale_while_revalidate_ttl: Option<Duration>,
     declared_retention_runs: bool,
-    /// Whether `caching_max_items` or `caching_max_size` is configured. These
-    /// install entry-aware eviction outside this retention-policy selection.
     cache_limit_configured: bool,
 ) -> CachingRetention {
     if !stale_if_error {
