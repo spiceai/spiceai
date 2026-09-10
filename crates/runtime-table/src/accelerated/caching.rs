@@ -626,21 +626,19 @@ async fn flush_cache_writes(
 
     let write_start = std::time::Instant::now();
 
-    // Check if the accelerator has constraints configured (primary key, unique, etc.).
-    // If it does, we can use native upsert (append_to_accelerator) which is more efficient
-    // than the read-filter-write pattern (batched_upsert_into_accelerator).
-    let has_constraints = accelerator.constraints().is_some_and(|c| !c.is_empty());
-
     // Acquire the mutex once for the entire batch
     let lock_wait_start = std::time::Instant::now();
     let lock_guard = accelerator_write_mutex.lock().await;
     let lock_wait_ms = lock_wait_start.elapsed().as_millis();
 
+    // A declared constraint gets no write path of its own. Replacing an entry
+    // means the rows the cache key now maps to are exactly the ones the response
+    // carried, so the superseded rows are deleted before the new ones are
+    // appended -- a native upsert keyed on the constraint would append and
+    // update in place, leaving behind any row that the response no longer
+    // returns for that key.
     let result = if all_batches.is_empty() {
         Ok(())
-    } else if has_constraints {
-        // Use native upsert via append - the accelerator's OnConflict::Upsert handles deduplication
-        CacheRefreshHelper::append_to_accelerator(accelerator, dataset_name, all_batches).await
     } else if replace_filters.is_empty() {
         CacheRefreshHelper::insert_into_accelerator(accelerator, dataset_name, all_batches).await
     } else {
