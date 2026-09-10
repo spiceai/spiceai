@@ -322,17 +322,23 @@ mod tests {
         assert_eq!(half.rows, 131_072);
         half.assert_bytes_under(2_600_000, "half the rows");
 
+        // Aggregated rather than row-by-row: the scan is concurrent and unordered, so which
+        // row arrives first is not defined, but the projection still runs over every row.
         let all = ctx
-            .run("SELECT p0 FROM '/deferred_projection.vortex' WHERE id >= 0")
+            .run(
+                "SELECT count(p0) AS n, min(p0) AS lo, max(p0) AS hi \
+                 FROM '/deferred_projection.vortex' WHERE id >= 0",
+            )
             .await?;
+        assert_eq!(all.rows, 1);
         assert_eq!(
-            all.rows, 262_144,
-            "an unselective filter still returns everything"
-        );
-        assert_eq!(
-            all.first_value,
-            Some(format!("0-0-0-{}", "x".repeat(48))),
-            "an unselective filtered scan must be unaffected"
+            all.row_values()?,
+            vec![
+                "262144".to_string(),
+                format!("0-0-0-{}", "x".repeat(48)),
+                format!("0-9-999-{}", "x".repeat(48)),
+            ],
+            "an unselective filtered scan must project every row unchanged"
         );
 
         Ok(())
@@ -348,12 +354,25 @@ mod tests {
     struct Scan {
         rows: usize,
         first_value: Option<String>,
+        first_row: Option<RecordBatch>,
         bytes_read: u64,
         reads: u64,
         file_bytes: u64,
     }
 
     impl Scan {
+        /// Every column of the first row, as display strings. Only meaningful for a query
+        /// whose result is a single row.
+        fn row_values(&self) -> anyhow::Result<Vec<String>> {
+            let batch = self
+                .first_row
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("query returned no rows"))?;
+            Ok((0..batch.num_columns())
+                .map(|column| array_value_to_string(batch.column(column), 0))
+                .collect::<Result<Vec<_>, _>>()?)
+        }
+
         fn assert_bytes_under(&self, budget: u64, what: &str) {
             assert!(
                 self.bytes_read < budget,
@@ -431,15 +450,16 @@ mod tests {
             let task_ctx = Arc::new(TaskContext::from(&self.ctx.session.state()));
             let batches = collect(Arc::clone(&plan), task_ctx).await?;
 
-            let first_value = batches
-                .iter()
-                .find(|batch| batch.num_rows() > 0)
+            let first_row = batches.iter().find(|batch| batch.num_rows() > 0).cloned();
+            let first_value = first_row
+                .as_ref()
                 .map(|batch| array_value_to_string(batch.column(0), 0))
                 .transpose()?;
 
             Ok(Scan {
                 rows: batches.iter().map(RecordBatch::num_rows).sum(),
                 first_value,
+                first_row,
                 bytes_read: sum_metric(plan.as_ref(), "vortex.io.read.total_size"),
                 reads: sum_metric(plan.as_ref(), "vortex.io.read.size_count"),
                 file_bytes: self.file_bytes,
