@@ -60,6 +60,7 @@ use crate::convert::schema::calculate_physical_schema;
 use crate::metrics::PARTITION_LABEL;
 use crate::metrics::PATH_LABEL;
 use crate::persistent::cache::CachedVortexMetadata;
+use crate::persistent::deferred_projection::DeferredProjectionReader;
 use crate::persistent::reader::VortexReaderFactory;
 use crate::persistent::segment_cache::SharedSegmentCache;
 use crate::persistent::stream::PrunableStream;
@@ -329,31 +330,6 @@ impl FileOpener for VortexOpener {
                 &layout_reader,
             )?;
 
-            let mut scan_builder = ScanBuilder::new(session.clone(), layout_reader);
-
-            if let Some(vortex_plan) = file.extensions.get::<VortexAccessPlan>() {
-                scan_builder = vortex_plan.apply_to_builder(scan_builder);
-            }
-
-            if let Some(file_range) = file.range {
-                let byte_range = Range {
-                    start: u64::try_from(file_range.start)
-                        .map_err(|_| exec_datafusion_err!("Vortex file range start is negative"))?,
-                    end: u64::try_from(file_range.end)
-                        .map_err(|_| exec_datafusion_err!("Vortex file range end is negative"))?,
-                };
-
-                let Some(row_range) = split_aligned_row_range(
-                    byte_range,
-                    file.object_meta.size,
-                    natural_split_ranges.as_ref(),
-                ) else {
-                    return Ok(stream::empty().boxed());
-                };
-
-                scan_builder = scan_builder.with_row_range(row_range);
-            }
-
             // Stats-layout pruning chain (Vortex 0.74 `FileStatsLayoutReader` / zoned
             // `StatFn`). The conjuncts collected here are translated to a Vortex
             // `Expression` and handed to `ScanBuilder::with_some_filter` below. Inside
@@ -365,11 +341,11 @@ impl FileOpener for VortexOpener {
             // `DynamicFilterPhysicalExpr` via `.current()` at file-open time (not plan
             // build time), and Vortex's `PruningResult::mask()` re-derives the zone mask
             // whenever the dynamic expression's version advances — so a build side that
-            // populates after the scan starts still prunes zones. `VortexAccessPlan`
-            // (applied above) only adds a row `Selection`; it does not bypass this
-            // filter, so stats pruning still engages under position-delete scans.
-            // Filters Vortex can't translate (`skipped_dynamic`) are dropped here but
-            // still feed the coarser per-file `FilePruner`/`PrunableStream` above.
+            // populates after the scan starts still prunes zones. `VortexAccessPlan` only
+            // adds a row `Selection`; it does not bypass this filter, so stats pruning
+            // still engages under position-delete scans. Filters Vortex can't translate
+            // (`skipped_dynamic`) are dropped here but still feed the coarser per-file
+            // `FilePruner`/`PrunableStream` above.
             let filter = filter
                 .and_then(|f| {
                     // Verify that all filters we've accepted from DataFusion get pushed down.
@@ -405,6 +381,41 @@ impl FileOpener for VortexOpener {
                     }
                 })
                 .transpose()?;
+
+            // Built after the filter so we know whether there is one: a filtered scan
+            // discards splits whose mask comes back empty, and deferring projection setup
+            // keeps those splits from registering reads for the output columns. An
+            // unfiltered scan has nothing to wait on, and its eager registration is what
+            // lets the read driver coalesce adjacent splits, so it keeps the plain reader.
+            let layout_reader: Arc<dyn LayoutReader> = if filter.is_some() {
+                Arc::new(DeferredProjectionReader::new(layout_reader))
+            } else {
+                layout_reader
+            };
+            let mut scan_builder = ScanBuilder::new(session.clone(), layout_reader);
+
+            if let Some(vortex_plan) = file.extensions.get::<VortexAccessPlan>() {
+                scan_builder = vortex_plan.apply_to_builder(scan_builder);
+            }
+
+            if let Some(file_range) = file.range {
+                let byte_range = Range {
+                    start: u64::try_from(file_range.start)
+                        .map_err(|_| exec_datafusion_err!("Vortex file range start is negative"))?,
+                    end: u64::try_from(file_range.end)
+                        .map_err(|_| exec_datafusion_err!("Vortex file range end is negative"))?,
+                };
+
+                let Some(row_range) = split_aligned_row_range(
+                    byte_range,
+                    file.object_meta.size,
+                    natural_split_ranges.as_ref(),
+                ) else {
+                    return Ok(stream::empty().boxed());
+                };
+
+                scan_builder = scan_builder.with_row_range(row_range);
+            }
 
             if let Some(limit) = limit
                 && filter.is_none()
