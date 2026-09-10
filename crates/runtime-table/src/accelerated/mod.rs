@@ -2063,6 +2063,7 @@ impl TableLayer for AcceleratedTable {
                                 Expr::Exists(_)
                                     | Expr::InSubquery(_)
                                     | Expr::ScalarSubquery(_)
+                                    | Expr::SetComparison(_)
                                     | Expr::OuterReferenceColumn(_, _)
                             ))
                         })?;

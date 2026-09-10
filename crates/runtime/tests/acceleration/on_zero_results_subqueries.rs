@@ -89,6 +89,43 @@ const PARTIAL_QUERIES: &[(&str, &[i64])] = &[
         "SELECT id FROM items WHERE id = 2 AND v > (SELECT avg(val) FROM details WHERE item_id = id)",
         &[2],
     ),
+    (
+        "SELECT id FROM items WHERE id = 2 AND v > ANY (SELECT val FROM details)",
+        &[2],
+    ),
+    (
+        "SELECT id FROM items WHERE id = 2 AND v >= ALL (SELECT val FROM details)",
+        &[2],
+    ),
+];
+
+// Quantified comparisons exercise fallback planning; SQLite's federated SQL
+// path does not support ANY/ALL syntax.
+const QUANTIFIED_FALLBACK_QUERIES: &[(&str, &[i64])] = &[
+    (
+        "SELECT id FROM items WHERE v > ANY (SELECT val FROM details)",
+        &[1, 2, 4],
+    ),
+    (
+        "SELECT id FROM items WHERE v >= ALL (SELECT val FROM details)",
+        &[2, 4],
+    ),
+    (
+        "SELECT id FROM items WHERE id > ALL (SELECT item_id FROM details)",
+        &[],
+    ),
+    (
+        "SELECT id FROM items WHERE v > ALL (SELECT val FROM details WHERE val > 100)",
+        &[1, 2, 3, 4],
+    ),
+    (
+        "SELECT id FROM items WHERE v > ANY (SELECT val FROM details WHERE item_id = id)",
+        &[2],
+    ),
+    (
+        "SELECT id FROM items WHERE v >= ALL (SELECT val FROM details WHERE item_id = id)",
+        &[2, 3, 4],
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,7 +274,13 @@ async fn check_subqueries(
         } else {
             QUERIES
         };
-        for &(query, expected) in queries {
+        let quantified_queries =
+            if contents != Contents::Partial && *action == ZeroResultsAction::UseSource {
+                QUANTIFIED_FALLBACK_QUERIES
+            } else {
+                &[]
+            };
+        for &(query, expected) in queries.iter().chain(quantified_queries) {
             match run_query(&rt, query).await {
                 Ok(batches) => {
                     let expected = if contents == Contents::Empty
