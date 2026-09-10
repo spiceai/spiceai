@@ -27585,19 +27585,23 @@ impl CayenneTableProvider {
         batches: Vec<RecordBatch>,
         incoming_bytes: u64,
         overwrite: bool,
+        deletions: &crate::provider::on_conflict::OnConflictDeletions,
     ) -> Result<u64> {
         self.enforce_memory_limit(incoming_bytes)?;
         if overwrite {
-            self.overwrite_mem_tier(batches, incoming_bytes).await
-        } else {
-            self.append_to_mem_tier(
-                batches,
-                &crate::provider::on_conflict::OnConflictDeletions::default(),
-                incoming_bytes,
-                0,
-            )
-            .await
+            return self.overwrite_mem_tier(batches, incoming_bytes).await;
         }
+
+        let incoming_rows: u64 = batches
+            .iter()
+            .map(|b| b.num_rows() as u64)
+            .fold(0, u64::saturating_add);
+        let superseded = u64::try_from(deletions.total_superseded()).unwrap_or(u64::MAX);
+        // `append_to_mem_tier` answers with the mem-tier epoch, which is not a row
+        // count — returning it would report the epoch as `rows affected`.
+        self.append_to_mem_tier(batches, deletions, incoming_bytes, superseded)
+            .await?;
+        Ok(incoming_rows)
     }
 
     /// Atomically REPLACE the entire RAM mem-tier with `batches` (memory-mode full
@@ -39664,13 +39668,13 @@ mod tests {
         let b1 = int64_id_batch(&[1, 2, 3]);
         let bytes1 = b1.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b1], bytes1, false)
+            .write_batches_memory_mode(vec![b1], bytes1, false, &crate::provider::on_conflict::OnConflictDeletions::default())
             .await
             .expect("memory-mode append 1");
         let b2 = int64_id_batch(&[4, 5]);
         let bytes2 = b2.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b2], bytes2, false)
+            .write_batches_memory_mode(vec![b2], bytes2, false, &crate::provider::on_conflict::OnConflictDeletions::default())
             .await
             .expect("memory-mode append 2");
         assert_eq!(
@@ -39738,7 +39742,7 @@ mod tests {
         let batch = int64_id_batch(&[1, 2, 3]);
         let bytes = batch.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![batch], bytes, false)
+            .write_batches_memory_mode(vec![batch], bytes, false, &crate::provider::on_conflict::OnConflictDeletions::default())
             .await
             .expect("memory-mode append");
 
@@ -40275,13 +40279,13 @@ mod tests {
         let b1 = int64_id_batch(&[1, 2, 3]);
         let bytes1 = b1.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b1], bytes1, false)
+            .write_batches_memory_mode(vec![b1], bytes1, false, &crate::provider::on_conflict::OnConflictDeletions::default())
             .await
             .expect("append 1");
         let b2 = int64_id_batch(&[4, 5]);
         let bytes2 = b2.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b2], bytes2, false)
+            .write_batches_memory_mode(vec![b2], bytes2, false, &crate::provider::on_conflict::OnConflictDeletions::default())
             .await
             .expect("append 2");
         assert_eq!(
@@ -40294,7 +40298,7 @@ mod tests {
         let b3 = int64_id_batch(&[10, 20, 30, 40]);
         let bytes3 = b3.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b3], bytes3, true)
+            .write_batches_memory_mode(vec![b3], bytes3, true, &crate::provider::on_conflict::OnConflictDeletions::default())
             .await
             .expect("overwrite");
         assert_eq!(
@@ -40361,7 +40365,7 @@ mod tests {
             "batch ({bytes} bytes) must exceed the cap for the test to be meaningful"
         );
         let err = provider
-            .write_batches_memory_mode(vec![big], bytes, false)
+            .write_batches_memory_mode(vec![big], bytes, false, &crate::provider::on_conflict::OnConflictDeletions::default())
             .await
             .expect_err("a write exceeding the memory limit must error");
         assert!(
@@ -40419,7 +40423,7 @@ mod tests {
             "seed ({seed_bytes} bytes) must fit under the cap ({cap})"
         );
         provider
-            .write_batches_memory_mode(vec![seed], seed_bytes, false)
+            .write_batches_memory_mode(vec![seed], seed_bytes, false, &crate::provider::on_conflict::OnConflictDeletions::default())
             .await
             .expect("seed write under cap");
 
@@ -40432,7 +40436,7 @@ mod tests {
         // Overwrite that would fit *after* replace must still fail while the old
         // tier is resident (peak = resident + incoming).
         let err = provider
-            .write_batches_memory_mode(vec![replacement], replacement_bytes, true)
+            .write_batches_memory_mode(vec![replacement], replacement_bytes, true, &crate::provider::on_conflict::OnConflictDeletions::default())
             .await
             .expect_err("overwrite must count resident bytes toward the hard cap");
         assert!(
