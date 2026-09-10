@@ -365,10 +365,14 @@ impl RuntimeStatus {
     /// from a first load that is still filling the dataset.
     #[must_use]
     pub fn has_dataset_ever_been_ready(&self, dataset: &TableReference) -> bool {
+        self.has_component_ever_been_ready(&format!("dataset:{dataset}"))
+    }
+
+    fn has_component_ever_been_ready(&self, component_name: &str) -> bool {
         self.ever_ready_components
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&format!("dataset:{dataset}"))
+            .contains(component_name)
     }
 
     /// Returns the status of all registered views.

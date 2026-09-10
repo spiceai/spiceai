@@ -133,21 +133,22 @@ pub(crate) struct DatasetLoadSummary {
 impl DatasetLoadSummary {
     /// Buckets each dataset by whether its first load has finished.
     ///
-    /// A refresh task reports `Refreshing` from the moment a load starts, including the
-    /// very first one, so the status alone does not say whether the dataset holds any
-    /// data yet; `has_ever_been_ready` does. A `Refreshing` dataset that was `Ready`
-    /// before is refreshing data it already loaded and counts as ready, while one that
-    /// never was is still performing its first load and counts as loading, alongside
-    /// `Initializing`. `Disabled`, `NotLoaded` and `ShuttingDown` datasets have nothing
-    /// left to load, so they fall into no bucket: they neither inflate the ready count
-    /// nor keep the sampler alive.
-    pub(crate) fn from_statuses<'a>(
-        statuses: impl IntoIterator<Item = (&'a TableReference, &'a status::ComponentStatus)>,
+    /// `Ready` counts as ready, and so does `Refreshing` when `has_ever_been_ready`
+    /// says the dataset was loaded before (see
+    /// [`status::RuntimeStatus::has_dataset_ever_been_ready`]); a `Refreshing`
+    /// dataset that never was is on its first load and counts as loading, alongside
+    /// `Initializing`. `Error` counts as unhealthy. `Disabled`, `NotLoaded` and
+    /// `ShuttingDown` have nothing left to load and fall into no bucket, so they
+    /// neither inflate the ready count nor keep the sampler alive.
+    pub(crate) fn from_statuses(
+        statuses: &HashMap<TableReference, status::ComponentStatus>,
         has_ever_been_ready: impl Fn(&TableReference) -> bool,
     ) -> Self {
-        let mut summary = Self::default();
+        let mut summary = Self {
+            total: statuses.len(),
+            ..Self::default()
+        };
         for (dataset, current) in statuses {
-            summary.total += 1;
             match current {
                 status::ComponentStatus::Ready => summary.ready += 1,
                 status::ComponentStatus::Refreshing if has_ever_been_ready(dataset) => {
@@ -3858,23 +3859,29 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
     }
 
     /// A dataset performing its first load reports `Refreshing`, exactly like one
-    /// refreshing data it already holds; only the ever-ready record tells them apart.
-    /// Regression test for #13974: the summary counted first loads as ready, reported
-    /// 25/25 ready eleven minutes before the runtime was, and stopped sampling.
+    /// refreshing data it already holds; only the registry's ever-ready record tells
+    /// them apart. Regression test for #13974: the summary counted first loads as
+    /// ready, reported 25/25 ready eleven minutes before the runtime was, and stopped
+    /// sampling.
     #[test]
     fn a_first_load_counts_as_loading_and_a_refresh_of_loaded_data_as_ready() {
+        let registry = status::RuntimeStatus::new();
         let first_load = TableReference::bare("first_load");
         let refreshing = TableReference::bare("refreshing");
-        let statuses = std::collections::HashMap::from([
-            (first_load.clone(), status::ComponentStatus::Refreshing),
-            (refreshing.clone(), status::ComponentStatus::Refreshing),
-        ]);
+        registry.update_dataset(&first_load, status::ComponentStatus::Initializing);
+        registry.update_dataset(&first_load, status::ComponentStatus::Refreshing);
+        registry.update_dataset(&refreshing, status::ComponentStatus::Ready);
+        registry.update_dataset(&refreshing, status::ComponentStatus::Refreshing);
 
-        let summary =
-            DatasetLoadSummary::from_statuses(&statuses, |dataset| *dataset == refreshing);
+        let summarize = || {
+            DatasetLoadSummary::from_statuses(&registry.get_dataset_statuses(), |dataset| {
+                registry.has_dataset_ever_been_ready(dataset)
+            })
+        };
 
+        let during_first_load = summarize();
         assert_eq!(
-            summary,
+            during_first_load,
             DatasetLoadSummary {
                 ready: 1,
                 unhealthy: 0,
@@ -3883,18 +3890,23 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             }
         );
         assert!(
-            !summary.is_settled(),
+            !during_first_load.is_settled(),
             "a first load in flight keeps the sampler alive"
         );
         assert_eq!(
-            summary.log_line(30),
+            during_first_load.log_line(30),
             "Dataset load summary (after 30s): 1/2 ready, 0 unhealthy, 1 still initializing."
         );
+
+        registry.update_dataset(&first_load, status::ComponentStatus::Ready);
+        let after_first_load = summarize();
+        assert_eq!((after_first_load.ready, after_first_load.loading), (2, 0));
+        assert!(after_first_load.is_settled());
     }
 
     #[test]
     fn the_summary_settles_once_nothing_is_loading() {
-        let statuses = std::collections::HashMap::from([
+        let mut statuses = HashMap::from([
             (
                 TableReference::bare("ready"),
                 status::ComponentStatus::Ready,
@@ -3918,7 +3930,6 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         ]);
 
         let summary = DatasetLoadSummary::from_statuses(&statuses, |_| false);
-
         assert_eq!(
             summary,
             DatasetLoadSummary {
@@ -3930,7 +3941,6 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         );
         assert!(summary.is_settled());
 
-        let mut statuses = statuses;
         statuses.insert(
             TableReference::bare("waiting"),
             status::ComponentStatus::Initializing,
@@ -3941,33 +3951,5 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             !summary.is_settled(),
             "an Initializing dataset keeps the sampler alive"
         );
-    }
-
-    /// The same classification driven by the status registry the sampler reads at
-    /// runtime, through the transitions a refresh task actually makes.
-    #[test]
-    fn the_summary_follows_a_first_load_through_the_status_registry() {
-        let registry = status::RuntimeStatus::new();
-        let first_load = TableReference::bare("first_load");
-        let refreshing = TableReference::bare("refreshing");
-        registry.update_dataset(&first_load, status::ComponentStatus::Initializing);
-        registry.update_dataset(&first_load, status::ComponentStatus::Refreshing);
-        registry.update_dataset(&refreshing, status::ComponentStatus::Ready);
-        registry.update_dataset(&refreshing, status::ComponentStatus::Refreshing);
-
-        let summarize = || {
-            DatasetLoadSummary::from_statuses(&registry.get_dataset_statuses(), |dataset| {
-                registry.has_dataset_ever_been_ready(dataset)
-            })
-        };
-
-        let during_first_load = summarize();
-        assert_eq!((during_first_load.ready, during_first_load.loading), (1, 1));
-        assert!(!during_first_load.is_settled());
-
-        registry.update_dataset(&first_load, status::ComponentStatus::Ready);
-        let after_first_load = summarize();
-        assert_eq!((after_first_load.ready, after_first_load.loading), (2, 0));
-        assert!(after_first_load.is_settled());
     }
 }
