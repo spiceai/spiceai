@@ -12,7 +12,7 @@
 #   ./test/scripts/install-scripts-test.sh [--live] [--verbose]
 #
 # Options:
-#   --live      Run live download tests (requires network, slower)
+#   --live      Run live download tests (requires network and Python 3, slower)
 #   --verbose   Show detailed output for each test
 #
 # Exit codes:
@@ -48,6 +48,14 @@ NC='\033[0m' # No Color
 # =============================================================================
 # Utility Functions
 # =============================================================================
+
+github_api() {
+    local headers=(-H "Accept: application/vnd.github+json")
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        headers+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+    fi
+    curl --fail --silent --show-error "${headers[@]}" "$@"
+}
 
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $*"
@@ -300,7 +308,8 @@ test_artifacts_exist_in_latest_release() {
     fi
     
     local release_assets
-    release_assets=$(curl -sS "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"name":' | grep -E "spice.*\.tar\.gz" || true)
+    release_assets=$(github_api "https://api.github.com/repos/spiceai/spiceai/releases/latest" |
+        python3 -c 'import json, sys; print(json.dumps([asset["name"] for asset in json.load(sys.stdin)["assets"]]))') || return 1
     
     if [[ -z "$release_assets" ]]; then
         log_verbose "Could not fetch release assets"
@@ -659,7 +668,8 @@ test_live_latest_release_accessible() {
     fi
     
     local response
-    response=$(curl -sS -o /dev/null -w "%{http_code}" "https://api.github.com/repos/spiceai/spiceai/releases/latest")
+    response=$(github_api -o /dev/null -w "%{http_code}" "https://api.github.com/repos/spiceai/spiceai/releases/latest") || return 1
+    log_verbose "Latest release HTTP status: $response"
     [[ "$response" == "200" ]]
 }
 
@@ -670,14 +680,15 @@ test_live_download_url_resolves() {
     
     # Get latest release tag
     local tag
-    tag=$(curl -sS "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*: "\(.*\)",/\1/')
+    tag=$(github_api "https://api.github.com/repos/spiceai/spiceai/releases/latest" |
+        python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])') || return 1
     
     if [[ -z "$tag" ]]; then
         log_verbose "Could not get latest tag"
         return 1
     fi
     
-    # Check if a known artifact URL returns 302 (redirect to download)
+    # Follow the asset redirect and require a successful download.
     local url="https://github.com/spiceai/spiceai/releases/download/${tag}/spice_linux_x86_64.tar.gz"
     local response
     response=$(curl -sS -o /dev/null -w "%{http_code}" -L "$url" 2>/dev/null || echo "000")
@@ -691,7 +702,8 @@ test_live_spiced_linux_downloadable() {
     fi
     
     local tag
-    tag=$(curl -sS "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*: "\(.*\)",/\1/')
+    tag=$(github_api "https://api.github.com/repos/spiceai/spiceai/releases/latest" |
+        python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])') || return 1
     
     if [[ -z "$tag" ]]; then
         return 1
