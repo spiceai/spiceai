@@ -3385,6 +3385,137 @@ mod tests {
         }
     }
 
+    /// A second reader built for the *same* file has to stay on the generation the
+    /// first one pinned.
+    ///
+    /// This is not a hypothetical second reader. A predicate scan reads the
+    /// bloom filters through the reader it already has and then builds a fresh one
+    /// to decode with, from the same `PartitionedFile` the listing produced — and a
+    /// listing from `ListObjectsV2` carries an `ETag` and no version id. The first
+    /// reader `HEAD`s to promote a version id from that `ETag` (so page reads pin a
+    /// generation rather than a size); the replacement starts from the listing
+    /// again and knows nothing of it, so without this patch it falls back to
+    /// `If-Match` on the listed `ETag`. Against an object that has since been
+    /// replaced the two disagree: the pinned reader keeps reading the generation it
+    /// started on and the `If-Match` reader gets a `412`, so the query retries or
+    /// fails where it should have completed.
+    ///
+    /// The whole mechanism is a `spiceai/datafusion` patch to
+    /// `CachedParquetFileReaderFactory` — the map from `(location, ETag)` to the
+    /// promoted version id, and the two calls that fill it and read it back. It has
+    /// no API of its own, so losing it compiles, scans, and silently stops sharing
+    /// the pin.
+    #[tokio::test]
+    async fn a_second_reader_for_the_same_file_keeps_the_version_the_first_one_pinned() {
+        use datafusion::datasource::listing::PartitionedFile;
+        use datafusion::datasource::physical_plan::ParquetFileReaderFactory;
+        use datafusion::datasource::physical_plan::parquet::CachedParquetFileReaderFactory;
+        use datafusion::execution::context::SessionContext;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::arrow::async_reader::ObjectVersionType;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+
+        const VERSION: &str = "the-version-the-head-promoted";
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new("name", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3])),
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .expect("builds a batch");
+
+        // Bloom filters written because that is what makes a real scan build the
+        // second reader at all; nothing here reads them, so the guard does not
+        // depend on the optimiser choosing to.
+        let properties = WriterProperties::builder()
+            .set_bloom_filter_enabled(true)
+            .build();
+        let mut buffer = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buffer, Arc::clone(&schema), Some(properties))
+            .expect("parquet writer");
+        writer.write(&batch).expect("writes the batch");
+        writer.close().expect("closes the file");
+
+        let store = Arc::new(VersionRecordingStore::new(VERSION));
+        let location = Path::from("listing/data.parquet");
+        store
+            .put(&location, buffer.into())
+            .await
+            .expect("stores the file");
+
+        // The listing a scan actually starts from: an `ETag`, no version id. Taken
+        // from the inner store because the wrapper is what adds the version, and
+        // adding it here would pin the reader without the patch doing anything.
+        let listed = store
+            .inner
+            .head(&location)
+            .await
+            .expect("heads the file through the unversioned inner store");
+        assert!(
+            listed.version.is_none(),
+            "this guard needs a listing with no version id"
+        );
+        assert!(
+            listed.e_tag.is_some(),
+            "this guard needs a listing that carries an ETag for the HEAD to match against"
+        );
+
+        let factory = CachedParquetFileReaderFactory::new(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            SessionContext::new()
+                .runtime_env()
+                .cache_manager
+                .get_file_metadata_cache(),
+        )
+        .with_object_versioning_type(Some(ObjectVersionType::Version));
+        let file = PartitionedFile::new_from_meta(listed);
+        let metrics = ExecutionPlanMetricsSet::new();
+
+        let mut first = factory
+            .create_reader(0, file.clone(), None, &metrics)
+            .expect("builds the metadata reader");
+        first
+            .get_metadata(None)
+            .await
+            .expect("the metadata load must HEAD and promote the listed generation");
+        drop(first);
+        store.forget_reads();
+
+        let mut replacement = factory
+            .create_reader(0, file, None, &metrics)
+            .expect("builds the replacement reader");
+        replacement
+            .get_bytes(0..8)
+            .await
+            .expect("the replacement reader must be able to read a range");
+
+        let reads = store.reads();
+        assert!(
+            !reads.is_empty(),
+            "the replacement reader issued no request at all, so this asserts nothing"
+        );
+        for options in &reads {
+            assert_eq!(
+                options.version.as_deref(),
+                Some(VERSION),
+                "the replacement reader did not carry the version the first reader promoted, so \
+                 a replaced object answers it with 412 while the first reader reads on: \
+                 {options:?}"
+            );
+            assert!(
+                options.if_match.is_none(),
+                "a read pinned to a version id must not also send If-Match: {options:?}"
+            );
+        }
+    }
+
     /// Unversioned buckets still report an `ETag` and never a version id. A
     /// `Version` pin that only sends `version=` is then a no-op; every request
     /// has to carry `If-Match` instead, or a replacement is read as a mixture.

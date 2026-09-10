@@ -134,6 +134,14 @@ so patches to it are not fork state and are not listed. Only patches to
 `vortex-array`, `vortex-arrow`, `vortex-io`, `vortex-file`, `vortex-layout` and
 `vortex-utils` can be lost by a re-cut.
 
+Fork PR #33, which made the sink honour `target_file_size_mb`, is one of those
+vendored patches — it touches `vortex-datafusion` and nothing else — so it has no
+row here. Its behaviour is covered where the code lives, by
+`crates/vortex/src/persistent/sink.rs::test_file_splitting_62mb_into_4_files`,
+`…::test_file_splitting_compressible_data`,
+`…::test_write_large_batch_target_file_size_disabled` and
+`…::test_target_file_size_uses_single_sink_input_partition`.
+
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | `FunctionSupport::with_aggregate_call_support` and `with_window_call_support`, and the aggregate/window arms of the walk that consult them (fork PR #70) | The name-based `FunctionRestriction` cannot refuse a *shape*, and the aggregate and window slots were unused entirely — so every aggregate and window call federated unconditionally. The BigQuery dialect declines the filtered-aggregate shapes it cannot rewrite exactly, and a declined rendering is a **failed query** unless federation refuses the same shape, because a federated statement has no local-execution fallback. Losing this patch therefore does not lose a pushdown, it breaks the query: `array_agg(v) FILTER (…)` reaches BigQuery as `FILTER` it cannot parse, and `COUNT(x) FILTER (…) OVER (…)` does the same through the window arm (measured: `Syntax error: Expected ")" but got "("`) | silent (query failure) | `crates/data-connectors/connector-adbc/src/lib.rs::bigquery_refuses_only_the_filtered_aggregate_shapes_it_cannot_rewrite`, which tests the allowlist *boundary* rather than a fixed set because the two sides live in different repositories, and `::bigquery_refuses_a_filtered_window_call` |
@@ -145,7 +153,6 @@ so patches to it are not fork state and are not listed. Only patches to
 | `set_available_parallelism` (`vortex-utils`) | Vortex sizes encode fan-out and scan lookahead from the machine's core count instead of the process's CPU entitlement, so a limited pod over-subscribes ([#12328](https://github.com/spiceai/spiceai/issues/12328)) | silent | `bin/spiced/tests/cpu_budget.rs::spicepod_cores_size_the_runtime_pools` |
 | `DECIMAL` → floating-point cast applies the scale (fork PR #51) | Decimal columns read back off by a factor of 10^scale | silent (wrong data) | `crates/vortex/src/persistent/mod.rs::test_decimal_to_float_cast_applies_scale` |
 | `UncompressedSizeInBytes` statistic handling | `ColumnStatistics.byte_size` is wrong, so the optimizer mis-sizes joins built over Vortex scans | silent | `crates/vortex/src/persistent/format.rs::propagates_per_column_byte_size` |
-| Target file size respected in the sink (fork PR #33) | The writer ignores `target_file_size_mb` and emits one file per flush regardless of size | silent | `crates/vortex/src/persistent/format.rs::format_plumbs_target_file_size_mb` guards the plumbing only; the sink's own honouring of it is a **GAP** |
 | `vortex.date` → `vortex.timestamp` **array** cast (fork PR #28) | Upstream refuses the cast, so a pushed-down `CAST(date_col AS TIMESTAMP)` fails the scan on the rows it reads | silent | `crates/vortex/src/persistent/mod.rs::test_date_to_timestamp_extension_cast` |
 | `vortex.date` → `vortex.timestamp` **scalar** cast (fork PR #93) | The row above converts a chunk's rows. A scan also casts the file's `max` statistic — a scalar — to decide whether to read the file at all, and without this `Scalar::cast` re-labels it through the target's storage type instead of converting it. `date[days]` fails the scan; `date[ms]` shares `i64` with `timestamp[ns]`, so it succeeds with an instant 10^6 too small and the file is pruned as unable to match ([#13624](https://github.com/spiceai/spiceai/issues/13624)) | silent (wrong data) | `crates/vortex/src/persistent/mod.rs::a_pushed_down_date_to_timestamp_cast_returns_the_matching_rows` for the failure, `…::a_pushed_down_date64_to_timestamp_cast_does_not_prune_the_matching_file` for the wrongly pruned file |
 | Timestamp validation uses `storage_range`, and rendering never aborts (fork PR #93) | The row above converts a date into a count of the target unit; this is the range that count has to land inside, and the same fork PR carries both. A Jiff span's limits are not a timestamp's: they stop one short of `i64::MIN` nanoseconds — 1677-09-21, which a `timestamp[ns]` column holds as an ordinary value read from Arrow — so a scalar built from such a column's `min`/`max` statistic was refused although the array carried it, and the scan failed on data it could read. They also run past the last instant, and the unchecked constructors abort outside them, so rendering a count past the span range took the process down rather than reporting it. (No `vortex.date` reaches `i64::MIN` nanoseconds — neither of its units divides it — so this is the range being wrong, not the conversion.) | silent (wrong data), and abort | `crates/vortex/src/persistent/mod.rs::a_nanosecond_timestamp_scalar_spans_the_whole_i64_range`, which builds that scalar and renders it, and `…::a_timestamp_count_that_is_not_an_instant_renders_instead_of_aborting` for the other three units — they keep a span, so what the patch changes for them is that it is built and added through the checked forms, and only a count outside the range exercises that. The two cast guards above pass on either side of this row, so a re-cut that carried only the cast would not be caught without these |
@@ -207,7 +214,7 @@ catch.
 | Unparser: a sort above an aggregate given a scope of its own names that scope's output | The sort key is unprojected into the grouping expression, which names the relation the scope encloses, so the remote binder reports the qualifier as unknown. One predicate now owns the scope decision for both the projection acting on it and the sort reading it | silent (query failure) | in the fork, `plan_to_sql.rs::test_a_sort_over_a_scoped_aggregate_names_the_scope_not_its_grouping_expr` |
 | Metadata columns (`_location`, `_last_modified`, `_size`) on `ListingOptions`/`FileScanConfig`, and their projection, pushdown and statistics handling | Datasets that select file metadata columns lose them, or project the wrong column | build | `crates/data-connector-api/src/listing/connector.rs` (metadata-column tests) |
 | Object-version pinning on `ListingOptions` (`with_object_versioning_type`), forwarded through `DFParquetMetadata` and `CachedParquetFileReader` on the **scan** path; `HEAD` when the listing has no version id, kept only when HEAD's ETag matches the listed ETag. Schema/statistics inference (`ParquetFormat::{infer_schema,infer_stats,infer_stats_and_ordering}`) does not forward the pin | A scan stops pinning the object version, so a file replaced mid-scan is read half-old and half-new. Losing only the metadata-path forward is enough: the scan footer is unpinned while the pages stay pinned. Losing the `HEAD` leaves versioned buckets pinning by ETag, so a replace 412s instead of reading the listed generation | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version`, `…::a_versioned_parquet_read_pins_by_etag_when_the_listing_has_no_version_id`, `crates/runtime/tests/s3_parquet_overwrite/mod.rs::listing_table_scan_does_not_decode_a_replaced_object` (listing/overwrite **scan** race). Planning-time schema/statistics footer reads are a remaining unpinned gap, unreproduced as a product failure |
-| Bloom-filter replacement readers reuse the version discovered on the listing-table scan | A predicate scan whose bloom-filter reader is built separately still sends the listed ETag as `If-Match`. A replaced object therefore 412s instead of mixing generations; the query retries or fails | silent (query failure / extra retry) | **GAP** — the scan/overwrite harness has no predicate and writes no bloom data; the fork's own bloom-filter reader tests are what cover this today |
+| Bloom-filter replacement readers reuse the version discovered on the listing-table scan (fork PR #213) | A predicate scan whose bloom-filter reader is built separately still sends the listed ETag as `If-Match`. A replaced object therefore 412s instead of mixing generations; the query retries or fails | silent (query failure / extra retry) | `crates/data-connector-api/src/listing/connector.rs::a_second_reader_for_the_same_file_keeps_the_version_the_first_one_pinned` for the factory, which is where the patch lives, and `crates/runtime/tests/s3_parquet_overwrite/mod.rs::a_predicate_scan_of_bloom_filtered_parquet_pins_one_generation` for the scan that builds that second reader — the wire assertion is guarded by the plan's bloom-filter metric so it cannot pass by never taking the branch |
 | Placeholder type inference (`Expr::infer_placeholder_types`, incl. `CASE`, `LIMIT`/`OFFSET` `Int64`, name/metadata preservation) (fork PRs #87, #88, #89, #167, and commit `d37a426e`) | A parameterised query fails to plan, or infers the wrong type for `$1` | silent (query failure) | `crates/runtime/src/datafusion/query.rs::every_shape_the_fork_patches_cover_infers_its_parameter_type`, `…::a_limit_and_an_offset_placeholder_are_both_int64`, `…::a_comparison_of_two_placeholders_still_plans`, `…::a_placeholder_inferred_from_a_column_keeps_the_columns_metadata` |
 | BigQuery dialect: temporal typing and naming — a tz-naive timestamp cast is `DATETIME` not `TIMESTAMP`, a timestamp literal's cast target follows the offset it renders with, sub-second digits are truncated to six, a comparison BigQuery has no supertype for is brought to one, `date - date` is `DATE_DIFF`, `CAST(date AS INT64)` is `UNIX_DATE`, `btrim`/`now`/`to_unixtime`/`unix_seconds`/`to_timestamp` are renamed or type-directed, `median`/`approx_percentile_cont` are rendered by ordering the group, a constant `GROUP BY` key is cast to its own type, and `array_element` subscripts with `SAFE_ORDINAL` (fork PR #212) | BigQuery puts no timezone qualifier on a timestamp type, so a tz-naive value typed `TIMESTAMP` becomes an instant with no supertype against a `DATETIME` column and the statement is refused; the name and cast rows are refused outright too. Two are quieter: `array_element` is 1-based where a bare BigQuery subscript is 0-based, so the neighbouring element is read with no error, and dropping a constant grouping key turns a grouped aggregate into a global one, returning one row of zeros where the grouped form returns none | silent (query failure; wrong data for the subscript and the dropped grouping key) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the four `#212` arms: `DATE_DIFF`, `UNIX_DATE`, `DATETIME`, cast `GROUP BY`) and `::array_element_federates_only_for_a_non_negative_integer_index`; in the fork, the per-rendering tests in `plan_to_sql.rs` and, restored by fork PR #214 after #212 deleted them, `rewrite.rs`'s own; real-engine guard: `test/scripts/bigquery-pushdown.sh` |
 | Spark concat coerces an untyped NULL argument to a string type (fork PR #217) | A string array concatenated with an untyped NULL reaches an unsupported kernel branch | silent (panic) | `crates/runtime/src/datafusion/builder.rs::tests::the_built_session_concatenates_an_untyped_null` |
@@ -381,7 +388,7 @@ by tag `0.2.2`.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
-| `Date32` support — `DateConverter for i32`, `Value`/`ValueRef::Date32`, `FromSql for NaiveDate` | ClickHouse `Date32` columns (dates outside 1970–2149) fail to decode | build (variant) + silent (range) | **GAP** — `crates/data-connectors/connector-clickhouse/src/block_to_arrow.rs` covers `Date` only |
+| `Date32` support — `DateConverter for i32`, `Value`/`ValueRef::Date32`, `FromSql for NaiveDate` (fork commit `7e98394f`, which is the pinned revision itself) | ClickHouse `Date32` columns (dates outside 1970–2149) fail to decode | build (variant) + silent (range) | `crates/data-connectors/connector-clickhouse/src/block_to_arrow.rs::a_date32_value_decodes_the_dates_a_date_column_cannot_hold` for the decode `block_to_arrow` calls and for `Date32` still reporting `SqlType::Date`, which is what selects that arm. The wire half is only reachable against a server — `column::factory`'s `"Date32"` arm is fed from the `pub(crate)` `Block::load`, and `Block::add_column` over `NaiveDate` builds the 16-bit column — so the `Date32` column in `test/scripts/setup-data-clickhouse.sql` guards it end-to-end in the ClickHouse quickstart job |
 | `ConnectionError::NoPacketReceived` | A dropped connection surfaces as a less specific error | build | compile-guarded |
 
 ## rusqlite and tokio-rusqlite
@@ -432,7 +439,7 @@ Upstream [bokuweb/docx-rs](https://github.com/bokuweb/docx-rs).
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | `Render` trait for `Document`/`DocumentChild`, including paragraph newlines and table rendering | `.docx` documents cannot be turned into text — the document parser has no extraction path | build (trait) | `crates/document_parse/src/docx.rs` imports `docx_rs::Render` |
-| Paragraph and table newline placement | Extracted text runs together, changing chunk boundaries and therefore embeddings | silent (wrong text) | **GAP** |
+| Paragraph and table newline placement (fork commits `3bf3c89e` for paragraphs, `ccea2029` for tables) | Extracted text runs together, changing chunk boundaries and therefore embeddings | silent (wrong text) | `crates/document_parse/src/docx.rs::a_docx_separates_paragraphs_and_not_the_runs_inside_one` and `…::a_docx_table_separates_its_rows_and_cells`, which build a `.docx` in memory and assert the placement in both directions — the fork got this wrong once internally before fixing it, by separating paragraph children instead of document children |
 
 ## model2vec-rs
 
@@ -450,7 +457,7 @@ Upstream [benbrandt/text-splitter](https://github.com/benbrandt/text-splitter).
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
-| Tokenizer sizing accounts for special characters (`src/chunk_size/huggingface.rs`) | Chunks are sized without the tokenizer's special tokens, so a chunk can exceed the model's context window at embed time | silent (embedding failure / truncation) | **GAP** — `crates/chunking` tests cover the splitter, not the sizing |
+| Tokenizer sizing accounts for special characters (`src/chunk_size/huggingface.rs`, fork commit `b33e4748`) | Chunks are sized without the tokenizer's special tokens, so a chunk can exceed the model's context window at embed time | silent (embedding failure / truncation) | `crates/chunking/src/lib.rs::a_tokenizer_sized_chunk_counts_the_special_tokens_the_model_will_add` for the sizing and `…::a_tokenizer_sized_chunk_fits_the_budget_the_model_will_measure_it_against` for the consequence, both against a `WordPiece` fixture built in the test rather than a downloaded model |
 
 ## mistral.rs and text-embeddings-inference
 
@@ -493,7 +500,7 @@ Upstream [sjrusso8/spark-connect-rs](https://github.com/sjrusso8/spark-connect-r
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
-| Default to the `http` scheme when `use_ssl` is false | A non-TLS Spark Connect endpoint is dialled over TLS and the connection fails | silent (connection failure) | **GAP** |
+| Default to the `http` scheme when `use_ssl` is false (fork PR #3) | A non-TLS Spark Connect endpoint is dialled over TLS and the connection fails | silent (connection failure) | `crates/data_components/src/spark_connect.rs::a_non_tls_spark_endpoint_is_dialled_in_plaintext`, which asserts the HTTP/2 preface arrives at a local plaintext listener through the real `SparkSessionBuilder::remote(…).build()` path, and `…::a_non_tls_connection_string_resolves_to_an_http_endpoint` for the mechanism |
 | Edmondo fork changes merged in | Spark Connect features Spice depends on go missing | build | compile-guarded |
 
 ## delta-kernel-rs
@@ -525,7 +532,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**30 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**24 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -536,49 +543,36 @@ They are not equal in consequence; this is the order to close them in.
 1. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
    PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
 2. `snowflake-rs` chunked JSON responses and record-batch ordering.
-3. `clickhouse-rs` `Date32` range.
-4. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
-   change the text that gets embedded.
-5. `mistral.rs` `tool_calls` chat-template handling.
-6. `text-embeddings-inference` pooling and model-loading fixes — embeddings
-    differ from the reference implementation.
-
+3. `mistral.rs` `tool_calls` chat-template handling.
+4. `text-embeddings-inference` pooling and model-loading fixes — embeddings
+   differ from the reference implementation.
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-7. `datafusion` bloom-filter replacement readers sharing the listed object
-    version — a predicate scan whose bloom-filter reader is built separately
-    falls back to stale `If-Match`, so a replaced object 412s; the query retries
-    or fails rather than mixing generations. The overwrite harness has no
-    bloom data.
-8. `vortex` session lock re-entry in writer init (fork PR #29).
-9. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
-    resilience (fork PRs #61–#63).
-10. `spark-connect-rs` `http` scheme when `use_ssl` is false.
-11. `model2vec-rs` optional `config.json`.
-12. `snowflake-rs` async query response support — long-running queries time out.
-13. `arrow-rs` `PushBuffers::push_range` asserts instead of returning an error
-    on a short read — a footer prefetch racing an in-place shrink panics the
-    reader thread rather than surfacing a retriable decode error. The
-    listing/overwrite harness 412s before a short successful range body
-    reaches the decoder.
+5. `vortex` session lock re-entry in writer init (fork PR #29).
+6. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+   resilience (fork PRs #61–#63).
+7. `model2vec-rs` optional `config.json`.
+8. `snowflake-rs` async query response support — long-running queries time out.
+9. `arrow-rs` `PushBuffers::push_range` asserts instead of returning an error
+   on a short read — a footer prefetch racing an in-place shrink panics the
+   reader thread rather than surfacing a retriable decode error. The
+   listing/overwrite harness 412s before a short successful range body
+   reaches the decoder.
 
 **Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
 being honoured:
 
-14. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
-    the sink's own honouring of `target_file_size_mb` is not, so the writer can emit
-    one file per flush regardless of size.
-15. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
+10. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
     misconfigured warehouse produces an opaque error instead of an actionable one.
-16. `model2vec-rs` HF cache directory read from the environment — models are
+11. `model2vec-rs` HF cache directory read from the environment — models are
     re-downloaded instead of reusing the shared cache.
-17. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
+12. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
     installs a global subscriber and hijacks `spiced`'s logging.
 
 **Security posture.** No correctness effect, but a silent downgrade:
 
-18. `graph-rs-sdk` tower middleware application.
+13. `graph-rs-sdk` tower middleware application.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
@@ -586,7 +580,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-19. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+14. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a

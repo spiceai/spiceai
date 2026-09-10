@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use anyhow::ensure;
 use app::AppBuilder;
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -160,6 +160,33 @@ fn write_snappy_parquet(batch: &RecordBatch) -> Vec<u8> {
         let mut writer =
             ArrowWriter::try_new(&mut buffer, batch.schema(), Some(snappy_properties()))
                 .expect("parquet writer");
+        writer.write(batch).expect("write batch");
+        writer.close().expect("close writer");
+    }
+    buffer
+}
+
+/// Writer properties that also emit a bloom filter per column chunk, which is
+/// what makes a predicate scan build a second reader for the same file (see
+/// `a_predicate_scan_of_bloom_filtered_parquet_pins_one_generation`).
+fn bloom_filtered_properties() -> WriterProperties {
+    WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_max_row_group_row_count(Some(ROW_GROUP_SIZE))
+        .set_dictionary_enabled(false)
+        .set_bloom_filter_enabled(true)
+        .build()
+}
+
+fn write_bloom_filtered_parquet(batch: &RecordBatch) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    {
+        let mut writer = ArrowWriter::try_new(
+            &mut buffer,
+            batch.schema(),
+            Some(bloom_filtered_properties()),
+        )
+        .expect("parquet writer");
         writer.write(batch).expect("write batch");
         writer.close().expect("close writer");
     }
@@ -350,31 +377,33 @@ async fn start_minio() -> Result<RunningContainer<'static>, anyhow::Error> {
     Ok(container)
 }
 
+/// What the proxy has seen, shared with every connection task.
+///
+/// Held together rather than passed one handle at a time so a new observation is
+/// one field here, not one more argument through the whole path.
+#[derive(Default)]
+struct ProxyCounters {
+    seen_first_get: AtomicBool,
+    seen_first_pinned_get: AtomicBool,
+    unpinned_object_gets: AtomicU64,
+    pinned_object_gets: AtomicU64,
+    if_match_object_gets: AtomicU64,
+    precondition_failures: AtomicU64,
+}
+
 /// Delay object GETs after the first one so a replacement can land mid-scan.
 ///
 /// Schema/statistics inference GETs the object without a generation pin.
 /// The refresh scan pins via `If-Match` or `versionId`. Overwrite waits must
 /// use the pinned GET, or they fire during inference and miss the 412 path.
 struct MixProxy {
-    seen_first_get: Arc<AtomicBool>,
-    seen_first_pinned_get: Arc<AtomicBool>,
-    unpinned_object_gets: Arc<AtomicU64>,
-    pinned_object_gets: Arc<AtomicU64>,
-    precondition_failures: Arc<AtomicU64>,
+    counters: Arc<ProxyCounters>,
 }
 
 impl MixProxy {
     fn start() -> Self {
-        let seen_first_get = Arc::new(AtomicBool::new(false));
-        let seen_first_pinned_get = Arc::new(AtomicBool::new(false));
-        let unpinned_object_gets = Arc::new(AtomicU64::new(0));
-        let pinned_object_gets = Arc::new(AtomicU64::new(0));
-        let precondition_failures = Arc::new(AtomicU64::new(0));
-        let seen = Arc::clone(&seen_first_get);
-        let seen_pinned = Arc::clone(&seen_first_pinned_get);
-        let unpinned = Arc::clone(&unpinned_object_gets);
-        let pinned = Arc::clone(&pinned_object_gets);
-        let preconditions = Arc::clone(&precondition_failures);
+        let counters = Arc::new(ProxyCounters::default());
+        let listening = Arc::clone(&counters);
         tokio::spawn(async move {
             let listener = TcpListener::bind(("127.0.0.1", PROXY_PORT))
                 .await
@@ -383,55 +412,53 @@ impl MixProxy {
                 let Ok((client, _)) = listener.accept().await else {
                     continue;
                 };
-                let seen = Arc::clone(&seen);
-                let seen_pinned = Arc::clone(&seen_pinned);
-                let unpinned = Arc::clone(&unpinned);
-                let pinned = Arc::clone(&pinned);
-                let preconditions = Arc::clone(&preconditions);
+                let counters = Arc::clone(&listening);
                 tokio::spawn(async move {
-                    if let Err(err) = proxy_connection(
-                        client,
-                        &seen,
-                        &seen_pinned,
-                        &unpinned,
-                        &pinned,
-                        &preconditions,
-                    )
-                    .await
-                    {
+                    if let Err(err) = proxy_connection(client, &counters).await {
                         tracing::debug!("overwrite-race proxy connection ended: {err}");
                     }
                 });
             }
         });
-        Self {
-            seen_first_get,
-            seen_first_pinned_get,
-            unpinned_object_gets,
-            pinned_object_gets,
-            precondition_failures,
-        }
+        Self { counters }
     }
 
     fn reset(&self) {
-        self.seen_first_get.store(false, Ordering::SeqCst);
-        self.seen_first_pinned_get.store(false, Ordering::SeqCst);
-        self.unpinned_object_gets.store(0, Ordering::SeqCst);
-        self.pinned_object_gets.store(0, Ordering::SeqCst);
-        self.precondition_failures.store(0, Ordering::SeqCst);
+        self.counters.seen_first_get.store(false, Ordering::SeqCst);
+        self.counters
+            .seen_first_pinned_get
+            .store(false, Ordering::SeqCst);
+        self.counters
+            .unpinned_object_gets
+            .store(0, Ordering::SeqCst);
+        self.counters.pinned_object_gets.store(0, Ordering::SeqCst);
+        self.counters
+            .if_match_object_gets
+            .store(0, Ordering::SeqCst);
+        self.counters
+            .precondition_failures
+            .store(0, Ordering::SeqCst);
     }
 
     fn precondition_failures(&self) -> u64 {
-        self.precondition_failures.load(Ordering::SeqCst)
+        self.counters.precondition_failures.load(Ordering::SeqCst)
     }
 
     fn unpinned_object_gets(&self) -> u64 {
-        self.unpinned_object_gets.load(Ordering::SeqCst)
+        self.counters.unpinned_object_gets.load(Ordering::SeqCst)
+    }
+
+    /// Object GETs pinned by `If-Match` rather than by a version id. On a
+    /// versioned bucket every pinned read should carry `versionId`, so an
+    /// `If-Match` here is a reader that started from the listing again and did not
+    /// share the version the first one discovered.
+    fn if_match_object_gets(&self) -> u64 {
+        self.counters.if_match_object_gets.load(Ordering::SeqCst)
     }
 
     async fn wait_for_first_pinned_object_get(&self) -> Result<(), anyhow::Error> {
         let started = std::time::Instant::now();
-        while !self.seen_first_pinned_get.load(Ordering::SeqCst) {
+        while !self.counters.seen_first_pinned_get.load(Ordering::SeqCst) {
             ensure!(
                 started.elapsed() < Duration::from_secs(15),
                 "timed out waiting for the first generation-pinned object GET (If-Match or versionId)"
@@ -473,6 +500,12 @@ fn is_object_get_request(headers: &[u8]) -> bool {
     line.starts_with("GET ") && line.contains(OBJECT_KEY)
 }
 
+/// An object GET pinned by `If-Match` on the listed `ETag`.
+fn is_if_match_object_get(headers: &[u8]) -> bool {
+    is_object_get_request(headers)
+        && http_header_present(&String::from_utf8_lossy(headers), "if-match")
+}
+
 /// A listing-table scan pin: `If-Match` on the listed `ETag`, or `versionId` on
 /// a versioned bucket. Schema inference GETs the same key without either.
 fn is_generation_pinned_object_get(headers: &[u8]) -> bool {
@@ -486,11 +519,7 @@ fn is_generation_pinned_object_get(headers: &[u8]) -> bool {
 
 async fn proxy_connection(
     mut client: TcpStream,
-    seen_first_get: &AtomicBool,
-    seen_first_pinned_get: &AtomicBool,
-    unpinned_object_gets: &AtomicU64,
-    pinned_object_gets: &AtomicU64,
-    precondition_failures: &AtomicU64,
+    counters: &ProxyCounters,
 ) -> Result<(), anyhow::Error> {
     loop {
         let Some((headers, body)) = read_http_message(&mut client, true).await? else {
@@ -500,7 +529,8 @@ async fn proxy_connection(
         let is_head = line.starts_with("HEAD ");
         let is_object_get = is_object_get_request(&headers);
         let is_pinned_get = is_generation_pinned_object_get(&headers);
-        let delay_later_gets = is_object_get && seen_first_get.load(Ordering::SeqCst);
+        let is_if_match_get = is_if_match_object_get(&headers);
+        let delay_later_gets = is_object_get && counters.seen_first_get.load(Ordering::SeqCst);
         if delay_later_gets {
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
@@ -512,18 +542,23 @@ async fn proxy_connection(
             return Ok(());
         };
         if http_response_status(&resp_headers) == Some(412) {
-            precondition_failures.fetch_add(1, Ordering::SeqCst);
+            counters
+                .precondition_failures
+                .fetch_add(1, Ordering::SeqCst);
         }
         client.write_all(&resp_headers).await?;
         client.write_all(&resp_body).await?;
         if is_object_get {
             if is_pinned_get {
-                pinned_object_gets.fetch_add(1, Ordering::SeqCst);
-                seen_first_pinned_get.store(true, Ordering::SeqCst);
+                counters.pinned_object_gets.fetch_add(1, Ordering::SeqCst);
+                counters.seen_first_pinned_get.store(true, Ordering::SeqCst);
             } else {
-                unpinned_object_gets.fetch_add(1, Ordering::SeqCst);
+                counters.unpinned_object_gets.fetch_add(1, Ordering::SeqCst);
             }
-            seen_first_get.store(true, Ordering::SeqCst);
+            if is_if_match_get {
+                counters.if_match_object_gets.fetch_add(1, Ordering::SeqCst);
+            }
+            counters.seen_first_get.store(true, Ordering::SeqCst);
         }
     }
 }
@@ -747,6 +782,145 @@ async fn race_listing_scan(
             );
         }
     }
+    Ok(())
+}
+
+/// The number of row groups a scan's bloom filters examined, read out of an
+/// `EXPLAIN ANALYZE` plan.
+///
+/// `PruningMetrics` renders as `<total> total → <matched> matched`, and the
+/// metric is registered whether or not the bloom-filter check runs — so `total`
+/// is what says the check happened, and a plan reporting `0 total` is a scan
+/// that never looked at a bloom filter.
+fn bloom_filter_row_groups_examined(plan: &str) -> Option<u64> {
+    plan_metric(plan, "row_groups_pruned_bloom_filter=")
+}
+
+/// The first number reported for `metric` in a plan, which for a `PruningMetrics`
+/// is its `total`.
+fn plan_metric(plan: &str, metric: &str) -> Option<u64> {
+    let at = plan.find(metric)? + metric.len();
+    let value: String = plan[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    value.parse().ok()
+}
+
+async fn explain_analyze(rt: &Runtime, sql: &str) -> Result<String, anyhow::Error> {
+    let result = rt
+        .datafusion()
+        .query_builder(&format!("EXPLAIN ANALYZE {sql}"))
+        .build()
+        .run()
+        .await
+        .map_err(|e| anyhow::anyhow!("EXPLAIN ANALYZE failed: {e}"))?;
+    let mut plan = String::new();
+    let mut data = result.data;
+    while let Some(batch) = data
+        .next()
+        .await
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("collecting the analyzed plan: {e}"))?
+    {
+        for column in batch.columns() {
+            if let Some(values) = column.as_any().downcast_ref::<StringArray>() {
+                for i in 0..values.len() {
+                    if values.is_valid(i) {
+                        plan.push_str(values.value(i));
+                        plan.push('\n');
+                    }
+                }
+            }
+        }
+    }
+    ensure!(!plan.is_empty(), "EXPLAIN ANALYZE returned no plan text");
+    Ok(plan)
+}
+
+/// A predicate scan of bloom-filtered Parquet has to read every byte of one
+/// object generation, including the bytes it reads to check the bloom filters.
+///
+/// That check runs on the reader the scan already has, and the scan then builds a
+/// *fresh* reader to decode with — from the same `PartitionedFile` the listing
+/// produced. A `ListObjectsV2` listing carries an `ETag` and no version id, so
+/// the first reader `HEAD`s to promote one; only a `spiceai/datafusion` patch to
+/// `CachedParquetFileReaderFactory` carries that promoted version to the second
+/// reader. Without it the second reader pins the listed `ETag` with `If-Match`
+/// instead, which on a bucket whose object has since been replaced answers `412`
+/// while the first reader reads on — the query retries or fails where it should
+/// have completed.
+///
+/// Asserted on a versioned bucket, where the two pins are distinguishable on the
+/// wire: every pinned read should carry `versionId`, so an `If-Match` is a reader
+/// that went back to the listing. The plan's bloom-filter metric is what says the
+/// second reader was built at all, so the wire assertion cannot pass by the scan
+/// never taking the branch.
+async fn a_predicate_scan_of_bloom_filtered_parquet_pins_one_generation(
+    mix: &MixProxy,
+    proxy: &str,
+    minio: &str,
+    bucket: &str,
+    bloom_filtered: Vec<u8>,
+) -> Result<(), anyhow::Error> {
+    // One row's exact payload. The predicate has to be met on both sides of the
+    // branch this guards: min/max statistics must keep a row group (so a bloom
+    // filter is consulted at all), and the bloom filter must then keep it (so the
+    // replacement reader decodes and therefore issues the reads under assertion).
+    //
+    // Both failures were measured on the way here. A probe outside every row
+    // group's range is pruned by statistics first — `row_groups_pruned_statistics=
+    // 10 total → 0 matched`, `row_groups_pruned_bloom_filter=0 total` — and a probe
+    // no row holds is pruned by the bloom filter itself, leaving nothing to decode
+    // and no request to assert on. Taken from the generator rather than written out
+    // so it cannot drift from the data.
+    let probe = generation_payload(1, 5);
+    let query = format!("SELECT COUNT(*) AS matches FROM overwrite_race WHERE payload = '{probe}'");
+    let query = query.as_str();
+
+    ensure_bucket_and_object(minio, bucket, bloom_filtered, true).await?;
+    let rt = run_runtime(proxy, bucket).await?;
+    // Schema inference has run by now and GETs without a pin; only the query's own
+    // reads are under assertion.
+    mix.reset();
+
+    let matches = scan_i64_query(rt.as_ref(), query)
+        .await
+        .map_err(|e| anyhow::anyhow!("bloom-filtered predicate scan failed: {e}"))?;
+    ensure!(
+        matches == 1,
+        "the guard's predicate must match the one row that holds it, got {matches}"
+    );
+
+    let plan = explain_analyze(rt.as_ref(), query).await?;
+    let examined = bloom_filter_row_groups_examined(&plan).ok_or_else(|| {
+        anyhow::anyhow!("no row_groups_pruned_bloom_filter metric in the analyzed plan: {plan}")
+    })?;
+    ensure!(
+        examined > 0,
+        "the scan consulted no bloom filter, so it never built the second reader this guards: \
+         {plan}"
+    );
+    let scanned = plan_metric(&plan, "bytes_scanned=")
+        .ok_or_else(|| anyhow::anyhow!("no bytes_scanned metric in the analyzed plan: {plan}"))?;
+    ensure!(
+        scanned > 0,
+        "the scan read no data after the bloom-filter check, so the replacement reader issued no \
+         request and the pin below is asserted over nothing: {plan}"
+    );
+
+    // Not `unpinned_object_gets == 0`: planning-time schema/statistics footer reads
+    // carry no pin at all (measured: 2 per scan), which is a separate row in
+    // docs/dev/fork_patches.md and not what this guard is about. On a versioned
+    // bucket every *scan* read should carry `versionId`, so `If-Match` is the
+    // signature of a reader that went back to the listing.
+    ensure!(
+        mix.if_match_object_gets() == 0,
+        "{} object GET(s) of a versioned bucket pinned by If-Match rather than by the version id \
+         the metadata read promoted: a reader went back to the listing, so a replaced object \
+         answers it with 412 while the rest of the scan reads on",
+        mix.if_match_object_gets()
+    );
     Ok(())
 }
 
@@ -1019,6 +1193,14 @@ async fn listing_table_scan_does_not_decode_a_replaced_object() -> Result<(), an
                     &minio,
                     "overwrite-race-accel-append",
                     &append_generations,
+                )
+                .await?;
+                a_predicate_scan_of_bloom_filtered_parquet_pins_one_generation(
+                    &mix,
+                    &proxy,
+                    &minio,
+                    "overwrite-race-bloom",
+                    write_bloom_filtered_parquet(&gen_a),
                 )
                 .await?;
                 Ok::<(), anyhow::Error>(())

@@ -671,4 +671,131 @@ mod tests {
             );
         }
     }
+
+    /// A tokenizer that wraps every encoding in two special tokens, which is what
+    /// every embedding model Spice loads through `tokenizers` does — `BERT` and its
+    /// descendants encode as `[CLS]` … `[SEP]`.
+    ///
+    /// Built here rather than loaded from a model so the guard needs no network and
+    /// no committed fixture: `Tokenizer::from_pretrained` is a download, and a real
+    /// `tokenizer.json` is most of a megabyte of vocabulary to assert two tokens.
+    /// `WordPiece` reads its vocabulary as one token per line, id from the line
+    /// number, so the file below is the whole model.
+    fn tokenizer_that_adds_two_special_tokens() -> (tempfile::TempDir, Tokenizer) {
+        use tokenizers::models::wordpiece::WordPiece;
+        use tokenizers::pre_tokenizers::whitespace::Whitespace;
+        use tokenizers::processors::template::TemplateProcessing;
+
+        // `[UNK]` first so an out-of-vocabulary word cannot be silently dropped:
+        // the ids are line numbers, and the guard's counts assume one token per
+        // word.
+        let dir = tempfile::tempdir().expect("creates a directory for the fixture vocabulary");
+        let vocab_path = dir.path().join("vocab.txt");
+        std::fs::write(
+            &vocab_path,
+            "[UNK]\n[CLS]\n[SEP]\nan\napple\na\nday\nkeeps\nthe\ndoctor\naway\n",
+        )
+        .expect("writes the fixture vocabulary");
+
+        let model = WordPiece::from_file(
+            vocab_path
+                .to_str()
+                .expect("the fixture vocabulary path is UTF-8"),
+        )
+        .unk_token("[UNK]".to_string())
+        .build()
+        .expect("builds the fixture WordPiece model");
+
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        tokenizer.with_post_processor(Some(
+            TemplateProcessing::builder()
+                .try_single("[CLS] $A [SEP]")
+                .expect("the single-sequence template parses")
+                .special_tokens(vec![("[CLS]", 1), ("[SEP]", 2)])
+                .build()
+                .expect("builds the fixture post-processor"),
+        ));
+
+        (dir, tokenizer)
+    }
+
+    /// The number of tokens the model is actually handed for `text`, counted
+    /// through the tokenizer rather than through the sizer under test, so the two
+    /// cannot agree by sharing one mistake.
+    fn tokens_the_model_receives(tokenizer: &Tokenizer, text: &str) -> usize {
+        tokenizer
+            .encode(text, true)
+            .expect("the fixture tokenizer encodes the guard's text")
+            .get_ids()
+            .len()
+    }
+
+    /// A tokenizer-sized chunk has to be measured the way the model will measure
+    /// it: including the special tokens the tokenizer adds.
+    ///
+    /// Only a Spice patch to the `spiceai/text-splitter` fork asks for them
+    /// (`add_special_tokens = true` in `src/chunk_size/huggingface.rs`); upstream
+    /// sizes without them. Two tokens reads like rounding, but the sizer's answer
+    /// is what decides where a chunk ends, so *every* chunk comes out over budget
+    /// by exactly the amount the sizer declined to count — and a chunk sized
+    /// against a context window is then over that window when it is embedded. The
+    /// overflow also surfaces a pipeline away from its cause: chunking reports
+    /// success, and the embedding provider is what truncates or rejects.
+    #[test]
+    fn a_tokenizer_sized_chunk_counts_the_special_tokens_the_model_will_add() {
+        let (_vocab_dir, tokenizer) = tokenizer_that_adds_two_special_tokens();
+        let tokenizer = Arc::new(tokenizer);
+        let sizer = TokenizerWrapper::from(Arc::clone(&tokenizer));
+
+        let text = "an apple a day";
+        let sized = sizer.size(text);
+        let received = tokens_the_model_receives(&tokenizer, text);
+        assert_eq!(
+            sized, received,
+            "the sizer measured {sized} tokens for {text:?} but the model is handed {received}: \
+             sizing that skips the tokenizer's special tokens puts every chunk over its budget"
+        );
+    }
+
+    /// The same loss at the level a caller sees, which is the contract
+    /// `target_chunk_size` states: no chunk may need more tokens than the budget it
+    /// was chunked to. Asserted through the chunker, not the sizer alone, because
+    /// this is what stays true if the sizing moves — a chunk is only correct when
+    /// the tokens the *model* counts fit.
+    ///
+    /// The budget is deliberately tight. A two-token overhead is a third of a
+    /// six-token budget, which is the ratio a small context window makes real; on a
+    /// large budget the same lost patch is a rounding error until a chunk lands
+    /// exactly on the boundary.
+    #[test]
+    fn a_tokenizer_sized_chunk_fits_the_budget_the_model_will_measure_it_against() {
+        let target = 6;
+        let (_vocab_dir, tokenizer) = tokenizer_that_adds_two_special_tokens();
+        let tokenizer = Arc::new(tokenizer);
+        let cfg = ChunkingConfig {
+            target_chunk_size: target,
+            overlap_size: 0,
+            trim_whitespace: true,
+            file_format: None,
+        };
+
+        let chunker = RecursiveSplittingChunker::with_tokenizer_sizer(&cfg, Arc::clone(&tokenizer))
+            .expect("failed to create tokenizer-sized chunker");
+
+        let text = "an apple a day keeps the doctor away";
+        let chunks: Vec<_> = chunker.chunks(text).collect();
+        assert!(
+            !chunks.is_empty(),
+            "the chunker returned nothing, so this asserts nothing"
+        );
+        for chunk in &chunks {
+            let received = tokens_the_model_receives(&tokenizer, chunk);
+            assert!(
+                received <= target,
+                "chunk {chunk:?} is {received} tokens once the tokenizer's special tokens are \
+                 added, over its {target}-token budget: it was sized without them"
+            );
+        }
+    }
 }
