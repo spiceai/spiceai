@@ -45,16 +45,32 @@ use std::sync::{Arc, LazyLock};
 /// at these cardinalities: ~0.3% collision odds at the same scale.)
 #[inline]
 pub(crate) fn pk_digest(key: &OwnedRow) -> u128 {
-    hash_key_128(key.as_ref())
+    pk_digest_bytes(key.as_ref())
+}
+
+/// [`pk_digest`] over an encoded key that is still borrowed from a [`Rows`]
+/// batch, so the conflict loop can compute a row's identity without first
+/// copying it into an [`OwnedRow`].
+///
+/// Both spellings must stay one function: the digest a row is filed under has
+/// to equal the digest it is later probed by, and `insert_with_digest` only
+/// checks that under `debug_assert`. Hashing the bytes directly at a borrowed
+/// call site would leave two definitions of primary-key identity that a change
+/// to the seed or the hash could silently pull apart in release builds.
+///
+/// [`Rows`]: crate::row_converter::Rows
+#[inline]
+pub(crate) fn pk_digest_bytes(key: &[u8]) -> u128 {
+    hash_key_128(key)
 }
 
 /// A set of primary-key [`OwnedRow`]s identified by their [`pk_digest`] and
 /// fronted by [`PrehashedBuildHasher`]. Presents a `HashSet`-like API while
-/// keying on the 128-bit digest, so the per-apply accumulators
-/// (`incoming_keys` / `kept_keys` / bloom-MISS keys) share the conflict loop's
-/// single hash pass. The `OwnedRow` is retained (as the map value) because
-/// downstream consumers — the keyset insert, bloom rebuild, deletion lists, and
-/// shard routing — need the raw key bytes, never the digest.
+/// keying on the 128-bit digest, so the per-apply accumulators (`kept_keys` and
+/// the bloom-MISS keys) share the conflict loop's single hash pass. The
+/// `OwnedRow` is retained (as the map value) because downstream consumers — the
+/// keyset insert, bloom rebuild, deletion lists, and shard routing — need the
+/// raw key bytes, never the digest.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PkDigestSet {
     inner: HashMap<u128, OwnedRow, PrehashedBuildHasher>,
@@ -109,12 +125,9 @@ impl PkDigestSet {
         self.inner.extend(other.inner);
     }
 
-    /// Copy every key of `other` into `self`, reusing its stored digests.
-    pub(crate) fn extend_ref(&mut self, other: &PkDigestSet) {
-        self.inner.reserve(other.inner.len());
-        for (&digest, key) in &other.inner {
-            self.inner.insert(digest, key.clone());
-        }
+    /// Iterate key identities without copying the retained key bytes.
+    pub(crate) fn digests(&self) -> impl Iterator<Item = u128> {
+        self.inner.keys().copied()
     }
 
     /// Iterate `(digest, key)` pairs, so a consumer rebuilding another

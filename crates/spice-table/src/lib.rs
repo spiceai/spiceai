@@ -73,6 +73,40 @@ impl From<InsertOp> for WriteWindow {
     }
 }
 
+/// Whether an index removes the rest of a key group around its surviving members — the answer to
+/// [`Index::group_pruning`], and what a caller of [`Index::delete_group_remainder`] can expect of
+/// it.
+///
+/// Three states rather than two because an index can compose others: a compound whose one half
+/// prunes and whose other half cannot should still be asked (so the half that can does), while
+/// the caller still learns which entries stay behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupPruning {
+    /// Every store beneath this index prunes — or holds nothing of its own to prune, which the
+    /// no-op default of [`Index::delete_group_remainder`] covers for a co-located index.
+    Complete,
+    /// Some store beneath this index prunes and the named ones cannot: their superseded
+    /// entries stay in place. [`Index::delete_group_remainder`] still reaches the ones that
+    /// can.
+    Partial { cannot: Vec<&'static str> },
+    /// Nothing beneath this index can prune, so there is no point handing it members.
+    Unsupported,
+}
+
+impl GroupPruning {
+    /// The names of the indexes that cannot prune, `own_name` standing for an index that reports
+    /// [`GroupPruning::Unsupported`] for itself. What a caller names when it says the superseded
+    /// entries stay in place.
+    #[must_use]
+    pub fn gaps(self, own_name: &'static str) -> Vec<&'static str> {
+        match self {
+            GroupPruning::Complete => Vec::new(),
+            GroupPruning::Partial { cannot } => cannot,
+            GroupPruning::Unsupported => vec![own_name],
+        }
+    }
+}
+
 #[async_trait]
 pub trait Index: Debug + Send + Sync + 'static {
     fn name(&self) -> &'static str;
@@ -156,6 +190,57 @@ pub trait Index: Debug + Send + Sync + 'static {
     /// silently sends a partial-key-capable inner index down the enumerate-first path.
     fn deletes_by_partial_key(&self) -> bool {
         false
+    }
+
+    /// Delete every entry that agrees with a row of `members` on `group_columns` — a strict
+    /// subset of this index's primary key — but whose full primary key is not itself a row of
+    /// `members`: the rest of each named group, with the listed members kept.
+    ///
+    /// The caller this exists for is `ChunkedSearchIndex`, which stores one entry per chunk of
+    /// a source row under the row's key plus a chunk id. After it has written a row's current
+    /// chunks it hands them over as `members`, with the row's key columns as `group_columns`,
+    /// and what goes is exactly the chunks a shorter text no longer produces. Nothing in
+    /// `members` is touched, so this can run *after* the write: deleting the whole group first
+    /// and rewriting it would leave a row with no entries at all if the rewrite then failed.
+    ///
+    /// `members` carries at least this index's primary-key columns; implementations look their
+    /// key columns up by name and ignore anything else present, as [`Index::delete_by_keys`]
+    /// does.
+    ///
+    /// Default is a no-op, which is correct for co-located indexes: their entries live in the
+    /// accelerated table row, and the upsert rewrites that row whole. Whether an index is asked
+    /// at all is decided by [`Index::group_pruning`], which defaults to "cannot".
+    ///
+    /// Wrapper implementations MUST forward this to the index they wrap — inheriting the default
+    /// silently leaves the inner index's superseded entries in place.
+    async fn delete_group_remainder(
+        &self,
+        group_columns: &[String],
+        members: RecordBatch,
+    ) -> Result<()> {
+        let _ = (group_columns, members);
+        Ok(())
+    }
+
+    /// Whether [`Index::delete_group_remainder`] leaves each named group holding exactly its
+    /// members — see [`GroupPruning`].
+    ///
+    /// Defaults to [`GroupPruning::Unsupported`], the conservative answer (as
+    /// [`Index::deletes_by_partial_key`] defaults to `false`): an index this trait knows nothing
+    /// about is assumed to have a store of its own that cannot address entries by part of their
+    /// key, so its [`Index::delete_group_remainder`] is never called and the caller says once
+    /// that the superseded entries stay in place — a warning, where a default of "complete" would
+    /// have let stale entries sit silently. An index that does leave each group holding exactly
+    /// its members opts in with [`GroupPruning::Complete`]: one that implements the method, and a
+    /// co-located index whose entries live in the accelerated table row (there is no separate
+    /// group to prune, so the no-op default of the method already satisfies it). An index
+    /// composing others combines their answers, so a caller keeps pruning the part that can
+    /// ([`GroupPruning::Partial`]).
+    ///
+    /// Wrapper implementations MUST forward this to the index they wrap — inheriting the default
+    /// reports a pruning the inner index does perform as unsupported.
+    fn group_pruning(&self) -> GroupPruning {
+        GroupPruning::Unsupported
     }
 
     /// Resolves the primary-key rows of `table` matching `filters`, for a later
@@ -246,7 +331,33 @@ pub trait Index: Debug + Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    use super::{InsertOp, WriteWindow};
+    use super::{GroupPruning, Index, InsertOp, WriteWindow};
+    use std::any::Any;
+
+    /// An index this crate knows nothing about: no store declared, nothing overridden.
+    #[derive(Debug)]
+    struct UnknownIndex;
+
+    impl Index for UnknownIndex {
+        fn name(&self) -> &'static str {
+            "unknown"
+        }
+        fn required_columns(&self) -> Vec<String> {
+            vec![]
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// An index that implements nothing about group pruning must not be *reported* as pruning:
+    /// the defaulted [`Index::delete_group_remainder`] is a no-op, so a default of "complete"
+    /// would let a chunked wrapper over an out-of-tree store keep superseded chunks with no
+    /// warning. The conservative default makes the wrapper say so instead.
+    #[test]
+    fn group_pruning_defaults_to_unsupported() {
+        assert_eq!(UnknownIndex.group_pruning(), GroupPruning::Unsupported);
+    }
 
     /// The mapping decides whether an index clears itself, so each arm is spelled out. The
     /// `Replace` arm is the load-bearing one: it is an upsert, and it is also what
