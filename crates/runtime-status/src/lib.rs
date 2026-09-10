@@ -359,6 +359,18 @@ impl RuntimeStatus {
         self.get_component_status(&format!("dataset:{dataset}"))
     }
 
+    /// Returns `true` if the dataset has reported `Ready` at least once since it was
+    /// registered. A refresh task reports `Refreshing` from the moment a load starts,
+    /// including the first one, so this is what tells a refresh of loaded data apart
+    /// from a first load that is still filling the dataset.
+    #[must_use]
+    pub fn has_dataset_ever_been_ready(&self, dataset: &TableReference) -> bool {
+        self.ever_ready_components
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&format!("dataset:{dataset}"))
+    }
+
     /// Returns the status of all registered views.
     #[must_use]
     pub fn get_view_statuses(&self) -> HashMap<TableReference, ComponentStatus> {
@@ -997,5 +1009,30 @@ mod tests {
         status.update_dataset(&dataset, ComponentStatus::Ready);
         receiver.changed().await.expect("should receive change");
         assert_eq!(*receiver.borrow(), ComponentStatus::Ready);
+    }
+
+    #[test]
+    fn a_refreshing_dataset_that_was_never_ready_has_not_been_ready() {
+        let status = RuntimeStatus::new();
+        let first_load = TableReference::bare("first_load");
+        let refreshed = TableReference::bare("refreshed");
+
+        status.update_dataset(&first_load, ComponentStatus::Initializing);
+        status.update_dataset(&first_load, ComponentStatus::Refreshing);
+        status.update_dataset(&refreshed, ComponentStatus::Ready);
+        status.update_dataset(&refreshed, ComponentStatus::Refreshing);
+
+        assert!(
+            !status.has_dataset_ever_been_ready(&first_load),
+            "a dataset whose first load is in flight has never been ready"
+        );
+        assert!(
+            status.has_dataset_ever_been_ready(&refreshed),
+            "a dataset refreshing data it already loaded has been ready"
+        );
+        assert!(
+            !status.has_dataset_ever_been_ready(&TableReference::bare("unregistered")),
+            "an unregistered dataset has never been ready"
+        );
     }
 }
