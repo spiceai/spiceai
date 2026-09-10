@@ -834,6 +834,7 @@ def main() -> int:
     dataset_ref = bigquery.Dataset(f"{project}.{dataset}")
     dataset_ref.location = location
     dataset_ref.labels = {"purpose": "spice-bigquery-pushdown"}
+    dataset_ref.default_table_expiration_ms = 86_400_000
     created_dataset = False
     succeeded = False
     process: subprocess.Popen[bytes] | None = None
