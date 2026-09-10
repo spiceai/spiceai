@@ -246,6 +246,113 @@ jobs:
           retention-days: 3
           compression-level: 1
 
+  test-bigquery:
+    name: BigQuery Regression Tests
+    needs: check_changes
+    if: ${{ github.event.inputs.run_all_tests == 'true' }}
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 210
+    permissions:
+      contents: read
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      SPICED_BIN: ${{ github.workspace }}/target/debug/spiced
+      ADBC_BIGQUERY_DRIVER_PATH: /etc/adbc/drivers/libadbc_driver_bigquery.so
+      BIGQUERY_TEST_CLEANUP: always
+      BIGQUERY_EXPECT: single
+    steps:
+      - name: Require BigQuery test credentials
+        shell: bash
+        env:
+          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          : "${BIGQUERY_SERVICE_ACCOUNT_JSON:?BIGQUERY_SERVICE_ACCOUNT_JSON is required for run_all_tests}"
+
+      - name: Set test output paths
+        id: test_env
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'BIGQUERY_GATE_OUTPUT=%s/bigquery-regression-%s-%s\n' \
+            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          printf 'BIGQUERY_GATE_VENV=%s/bigquery-regression-venv-%s-%s\n' \
+            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      - name: Install protoc
+        uses: ./.github/actions/install-protoc
+
+      - name: Set up sccache
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Set up ADBC BigQuery driver
+        uses: ./.github/actions/setup-adbc-bigquery
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install BigQuery test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$BIGQUERY_GATE_VENV"
+          "$BIGQUERY_GATE_VENV/bin/python" -m pip install google-cloud-bigquery==3.38.0
+
+      - name: Build the runtime under test
+        timeout-minutes: 120
+        run: cargo build -p spiced --no-default-features --features adbc --locked
+
+      - name: Validate the BigQuery corpus harness
+        run: '"$BIGQUERY_GATE_VENV/bin/python" test/scripts/bigquery_corpus.py --self-test'
+
+      - name: Run BigQuery regression tests
+        timeout-minutes: 60
+        shell: bash
+        env:
+          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$BIGQUERY_GATE_OUTPUT"
+          failed=0
+          for suite in corpus federation pushdown json_pushdown; do
+            if ! BIGQUERY_TEST_OUTPUT="$BIGQUERY_GATE_OUTPUT/$suite" \
+              "$BIGQUERY_GATE_VENV/bin/python" "test/scripts/bigquery_${suite}.py"; then
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+      - name: Upload BigQuery test evidence
+        if: ${{ always() && steps.test_env.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bigquery-regression-evidence
+          path: ${{ env.BIGQUERY_GATE_OUTPUT }}
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove the test Python environment
+        if: ${{ always() && steps.test_env.outcome == 'success' }}
+        shell: bash
+        run: rm -rf -- "$BIGQUERY_GATE_VENV"
+
   test-partitions:
     name: Run Integration Tests (part ${{ matrix.label }})
     needs: [build, check_changes]
