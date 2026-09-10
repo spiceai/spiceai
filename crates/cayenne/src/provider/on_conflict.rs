@@ -503,6 +503,24 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
                 .await
                 .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
             deleted = deleted.saturating_add(purged);
+        } else {
+            // A FILTERED delete on a `mode: memory` table, where the mem-tier is
+            // the permanent store: evaluate the predicate against the tier and
+            // rebuild it without the matching rows (#12008). A table with no
+            // primary key has no key to tombstone, so rebuilding is the only
+            // mechanism that can express this delete at all.
+            //
+            // Restricted to memory-resident mode inside the helper: a
+            // `cdc_durability: memory` table makes its RAM rows durable before the
+            // scan instead, and rebuilding its tier would leak the global byte
+            // reservation only its checkpoint releases.
+            let _guard = self.table.write_lock.lock().await;
+            let removed = self
+                .table
+                .delete_mem_tier_rows_matching(&self.filters)
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+            deleted = deleted.saturating_add(removed);
         }
 
         if deleted > 0 {
@@ -614,6 +632,36 @@ impl DeletionSink for InlineAwareDeletionSink {
                 .await
                 .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
             deleted = deleted.saturating_add(purged);
+        } else {
+            // A FILTERED delete on a `mode: memory` table, where the mem-tier is
+            // the permanent store and no checkpoint can make its rows durable for
+            // the sink above to see: evaluate the predicate against the tier and
+            // rebuild it without the matching rows (#12008). Runs under the
+            // `write_lock` held above, so the capture, the predicate pass and the
+            // swap are one critical section.
+            //
+            // Restricted to memory-resident mode inside the helper: a
+            // `cdc_durability: memory` table materializes its RAM rows into Vortex
+            // before this sink is even built, so the rows the sink scanned already
+            // include them.
+            //
+            // Rebuilding is the general mechanism rather than landing an in-RAM
+            // tombstone per matched key. A tombstone is keyed by primary key and
+            // hides every row at or below its sequence, so a key whose live version
+            // an upsert wrote after this delete captured the tier would be taken
+            // with it — the lost-update shape #13574 closed one tier over. Doing it
+            // by key WOULD let the predicate pass run off-lock (the split
+            // `SegmentTombstones` already exists for the CDC delete path, and
+            // `transaction_has_conflict` is the footprint check that would make it
+            // safe), and is the optimization to reach for if this hold ever
+            // measures as a problem — but it cannot serve a table with no primary
+            // key, which reaches the position-based sink above.
+            let removed = self
+                .table
+                .delete_mem_tier_rows_matching(&self.filters)
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+            deleted = deleted.saturating_add(removed);
         }
 
         if deleted > 0 {

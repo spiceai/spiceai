@@ -497,6 +497,116 @@ impl MemTier {
         }
     }
 
+    /// Rebuild this tier keeping, per batch, only the rows `keep_batch` returns —
+    /// the in-RAM equivalent of a deletion vector for a `mode: memory` table,
+    /// where the mem-tier is the permanent store and there is no durable tier for
+    /// a deletion sink to write into (#12008).
+    ///
+    /// Returns the rebuilt tier and the number of rows it dropped.
+    ///
+    /// EVERY SEGMENT IS PRESERVED, even one whose rows are all removed. A segment
+    /// carries its OWN tombstones, which hide rows in OLDER segments; dropping the
+    /// segment would drop those tombstones and RESURRECT the rows they hide. A
+    /// segment left with no batches is skipped by the scan
+    /// (`visible_mem_tier_segments_unpruned` pushes only non-empty batch lists),
+    /// so keeping it costs one empty `Vec` and no data. For the same reason the
+    /// tier-level `tombstones` aggregate is carried over untouched rather than
+    /// re-folded: its inputs are exactly the per-segment tombstones, none of which
+    /// this rebuild changes.
+    ///
+    /// `superseded` is likewise carried per segment: it counts rows this segment's
+    /// upsert superseded in OLDER segments, which removing this segment's own rows
+    /// does not change.
+    ///
+    /// A segment that loses no row keeps its `Arc`s verbatim — no statistics
+    /// recompute and no batch copy — so a predicate matching a few segments costs
+    /// nothing on the rest. A segment that does lose rows has its statistics
+    /// RECOMPUTED rather than inherited: the inherited min/max would still be
+    /// sound for pruning (a superset never prunes a live row away), but its
+    /// `num_rows` would over-report, and Cayenne feeds these statistics to the
+    /// optimizer.
+    ///
+    /// `epoch` is preserved (a content change, not a checkpoint) and `version` is
+    /// bumped so every scan-view cache keyed on it re-keys.
+    pub(crate) fn retain_rows<E>(
+        &self,
+        mut keep_batch: impl FnMut(&RecordBatch) -> std::result::Result<RecordBatch, E>,
+    ) -> std::result::Result<(Self, u64), E> {
+        let mut segments: Vec<MemSegment> = Vec::with_capacity(self.segments.len());
+        let mut removed_rows: u64 = 0;
+        let mut bytes = 0u64;
+        let mut rows = 0u64;
+
+        for segment in self.segments.iter() {
+            let mut kept: Vec<RecordBatch> = Vec::with_capacity(segment.batches.len());
+            let mut segment_removed = 0u64;
+            for batch in segment.batches.iter() {
+                let before = batch.num_rows() as u64;
+                let batch = keep_batch(batch)?;
+                segment_removed = segment_removed.saturating_add(before - batch.num_rows() as u64);
+                if batch.num_rows() > 0 {
+                    kept.push(batch);
+                }
+            }
+
+            if segment_removed == 0 {
+                // Untouched: reuse the segment wholesale, statistics included.
+                bytes = bytes.saturating_add(segment.bytes);
+                rows = rows.saturating_add(segment.rows);
+                segments.push(segment.clone());
+                continue;
+            }
+
+            removed_rows = removed_rows.saturating_add(segment_removed);
+            let segment_bytes: u64 = kept
+                .iter()
+                .map(|b| b.get_array_memory_size() as u64)
+                .fold(0, u64::saturating_add);
+            let segment_rows: u64 = kept
+                .iter()
+                .map(|b| b.num_rows() as u64)
+                .fold(0, u64::saturating_add);
+            let statistics = kept.first().map_or_else(
+                || Arc::new(Statistics::new_unknown(&Schema::empty())),
+                |first| {
+                    Arc::new(
+                        crate::provider::file_pruning::statistics_from_record_batches(
+                            first.schema_ref(),
+                            &kept,
+                        ),
+                    )
+                },
+            );
+            bytes = bytes.saturating_add(segment_bytes);
+            rows = rows.saturating_add(segment_rows);
+            segments.push(MemSegment {
+                batches: Arc::new(kept),
+                data_sequence: segment.data_sequence,
+                statistics,
+                tombstones: segment.tombstones.clone(),
+                bytes: segment_bytes,
+                rows: segment_rows,
+                superseded: segment.superseded,
+                source_position: segment.source_position,
+            });
+        }
+
+        Ok((
+            Self {
+                segments: Arc::new(segments),
+                tombstones: self.tombstones.clone(),
+                bytes,
+                rows,
+                superseded: self.superseded,
+                epoch: self.epoch,
+                oldest_append: self.oldest_append,
+                version: self.version + 1,
+                sealed_segments: self.sealed_segments,
+            },
+            removed_rows,
+        ))
+    }
+
     /// The tier that REMAINS after a checkpoint durably flushed the first
     /// `flushed_segment_count` segments (an append-ordered prefix — appends only
     /// ever push to the end, so the flushed snapshot is always a prefix of the

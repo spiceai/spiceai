@@ -29801,6 +29801,122 @@ impl CayenneTableProvider {
         Ok(removed_rows)
     }
 
+    /// Remove every mem-tier row matching `filters` on a `mode: memory` table, and
+    /// return how many rows that removed (#12008).
+    ///
+    /// The caller must hold `write_lock`, and must be executing the delete rather
+    /// than planning it: the capture, the predicate pass and the swap all happen
+    /// inside this one hold, so no write can land between deciding what to delete
+    /// and deleting it. That is what keeps this path clear of the plan/execute
+    /// window #13828 describes for the durable arm.
+    ///
+    /// RESTRICTED TO MEMORY-RESIDENT MODE, for two reasons. A
+    /// `cdc_durability: memory` table already has this covered: its scanning
+    /// DELETE checkpoints the tier into Vortex first, so the rows are durable and
+    /// the deletion sink sees them. And its tier bytes are RESERVED against the
+    /// process-global mem-tier budget, released only by the checkpoint that flushes
+    /// them — shrinking the tier here would leak that reservation. Memory mode
+    /// skips the global reservation entirely (`write_cdc_in_memory` does not
+    /// reserve, so it must not release), which is what makes rebuilding the tier
+    /// safe.
+    ///
+    /// A predicate that matches nothing rebuilds nothing: every segment keeps its
+    /// `Arc`s, so a no-match delete costs one predicate pass and no allocation.
+    pub(crate) async fn delete_mem_tier_rows_matching(
+        &self,
+        filters: &[Expr],
+    ) -> datafusion_common::Result<u64> {
+        if !self.is_memory_resident_mode() || self.mem_tier.is_empty() {
+            return Ok(0);
+        }
+
+        let coerced = self.coerce_filters_for_inlined_delete(filters)?;
+        let physical_filters = self.build_physical_filters_for_inlined_delete(&coerced)?;
+        if physical_filters.is_empty() {
+            // No predicate means every row (the `TableProvider::delete_from`
+            // contract), which is delete-all — handled by `purge_mem_tier_all`,
+            // not here.
+            return Ok(0);
+        }
+
+        let mut removed_total: u64 = 0;
+        for shard in self.mem_tier.shards() {
+            let _publish = self.mem_tier_publish_locks[0].lock().await;
+            let current = shard.load_full();
+            if current.is_empty() || current.segments.is_empty() {
+                continue;
+            }
+            let (next, removed) = current.retain_rows(|batch| {
+                self.keep_rows_not_matching_delete_filters(batch, &physical_filters)
+            })?;
+            if removed == 0 {
+                continue;
+            }
+            shard.store(Arc::new(next));
+            removed_total = removed_total.saturating_add(removed);
+        }
+
+        if removed_total > 0 {
+            // The tier was swapped without a structural-epoch bump, so advance the
+            // scan-input version the way `overwrite_mem_tier` does — the next
+            // capture re-keys over the rebuilt tier.
+            self.notify_scan_input_change();
+            self.clear_scan_file_statistics_cache();
+        }
+        Ok(removed_total)
+    }
+
+    /// The rows of `batch` a `DELETE ... WHERE` must KEEP: those for which the
+    /// conjunction of `physical_filters` is not TRUE.
+    ///
+    /// The complement is deliberately not `arrow::compute::not` over the raw
+    /// predicate mask. SQL deletes a row only where the predicate evaluates TRUE,
+    /// so NULL and FALSE both mean keep — but `not(NULL)` is NULL, and
+    /// `filter_record_batch` drops a NULL-masked row. Folding the null mask into
+    /// the values FIRST (a row whose predicate is NULL becomes a definite "did not
+    /// match") makes the inversion total, so a NULL predicate keeps its row instead
+    /// of silently deleting it.
+    fn keep_rows_not_matching_delete_filters(
+        &self,
+        batch: &RecordBatch,
+        physical_filters: &[Arc<dyn PhysicalExpr>],
+    ) -> datafusion_common::Result<RecordBatch> {
+        if batch.num_rows() == 0 {
+            return Ok(batch.clone());
+        }
+
+        let mut matched: Option<arrow::array::BooleanArray> = None;
+        for filter in physical_filters {
+            let value = filter.evaluate(batch)?;
+            let array = value.into_array(batch.num_rows())?;
+            let mask = array
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .ok_or_else(|| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Delete filter for table {} did not evaluate to BooleanArray, got {:?}",
+                        self.table_metadata.table_name,
+                        array.data_type()
+                    ))
+                })?;
+            // NULL means "did not match", so fold the null mask into the values.
+            let mask = match mask.nulls() {
+                Some(nulls) => arrow::array::BooleanArray::new(mask.values() & nulls.inner(), None),
+                None => mask.clone(),
+            };
+            matched = Some(match matched {
+                None => mask,
+                Some(prev) => arrow::compute::and(&prev, &mask)?,
+            });
+        }
+
+        let Some(matched) = matched else {
+            return Ok(batch.clone());
+        };
+        let keep = arrow::compute::not(&matched)?;
+        Ok(arrow::compute::filter_record_batch(batch, &keep)?)
+    }
+
     /// Fire the installed [`SlotAdvancer`] for `durable_epoch`, if one is wired
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
@@ -39592,10 +39708,13 @@ mod tests {
         );
     }
 
-    /// The purge is gated on the delete being a tautology: a filtered delete
-    /// through the same position-based sink must NOT discard the whole tier.
-    /// (Filtered deletes not reaching mem-tier rows is #12008; what matters here
-    /// is that the delete-all fix cannot over-delete.)
+    /// A filtered delete through the position-based sink must remove exactly the
+    /// matching mem-tier rows — not nothing (#12008), and not the whole tier (the
+    /// delete-all purge must not fire on a predicate).
+    ///
+    /// A table with no primary key has no key to tombstone, so this is the arm
+    /// that can only be served by rebuilding the tier
+    /// (`delete_mem_tier_rows_matching`).
     #[tokio::test]
     async fn filtered_delete_does_not_purge_the_mem_tier_without_a_primary_key() {
         use arrow::datatypes::{DataType, Field, Schema};
@@ -39630,13 +39749,24 @@ mod tests {
             )
             .await
             .expect("filtered delete plan");
-        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+        let results = datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
             .await
             .expect("filtered delete executed");
+        let deleted = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .expect("uint64 count column")
+            .value(0);
+        assert_eq!(deleted, 1, "exactly one mem-tier row matches `id = 2`");
 
         assert_eq!(
             scan_sorted_ids(&provider).await,
-            vec![1, 2, 3],
+            vec![1, 3],
+            "a filtered delete must remove the matching mem-tier row, and only it"
+        );
+        assert!(
+            !provider.mem_tier.is_empty(),
             "a filtered delete must not purge the whole mem-tier"
         );
     }
