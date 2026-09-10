@@ -43,7 +43,7 @@ use super::{ResponseMimeType, current_principal_requires_read_only, sql_to_http_
     tag = "SQL",
     params(
         ("Accept" = String, Header, description = "The format of the response, one of 'application/json' (default), 'application/vnd.spiceai.sql.v1+json', 'text/csv' or 'text/plain'."),
-        ("x-session-id" = Option<String>, Header, description = "Run in the session with this id, as returned by POST /v1/sessions. Statements that carry over between requests — PREPARE, EXECUTE, DEALLOCATE — only do so within a session. Omit to run stateless."),
+        ("x-session-id" = Option<String>, Header, description = "Run in the session with this id, such as one returned by an Arrow Flight SQL handshake. Omit it and the request runs in a session of its own, derived from the authenticated principal, which is what lets PREPARE, EXECUTE and DEALLOCATE carry over between requests."),
     ),
     request_body(
         description = "SQL query to execute",

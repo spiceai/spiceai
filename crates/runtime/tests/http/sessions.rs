@@ -124,41 +124,6 @@ async fn start_with_sql_cache(
 }
 
 impl TestRuntime {
-    /// Creates a session, returning its id.
-    async fn create_session(&self, key: &str) -> Result<String, anyhow::Error> {
-        let response = Client::new()
-            .post(format!("{}/v1/sessions", self.http_url))
-            .bearer_auth(key)
-            .send()
-            .await?;
-
-        anyhow::ensure!(
-            response.status() == StatusCode::CREATED,
-            "creating a session should return 201, got {} ({})",
-            response.status(),
-            response.text().await.unwrap_or_default()
-        );
-
-        let body: Value = response.json().await?;
-        assert!(
-            body["expires_in"].as_u64().is_some_and(|ttl| ttl > 0),
-            "a session reports when it will lapse: {body}"
-        );
-        Ok(body["session_id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("no session_id in {body}"))?
-            .to_string())
-    }
-
-    async fn delete_session(&self, key: &str, session: &str) -> Result<StatusCode, anyhow::Error> {
-        Ok(Client::new()
-            .delete(format!("{}/v1/sessions/{session}", self.http_url))
-            .bearer_auth(key)
-            .send()
-            .await?
-            .status())
-    }
-
     /// Posts `sql` to `/v1/sql`, in `session` when one is given.
     async fn sql(
         &self,
@@ -221,6 +186,17 @@ impl TestRuntime {
         Ok(body)
     }
 
+    /// Performs a Flight SQL handshake and returns the session id it issues —
+    /// the one way to get an explicit session id, now that HTTP mints none.
+    async fn handshake_session(&self, key: &str) -> Result<String, anyhow::Error> {
+        let channel = Channel::from_shared(self.flight_url.clone())?
+            .connect()
+            .await?;
+        let mut client = FlightSqlServiceClient::new(channel);
+        let token = client.handshake("", key).await?;
+        Ok(String::from_utf8(token.to_vec())?)
+    }
+
     /// Runs `sql` over Flight SQL in `session`, returning the rows.
     async fn flight_sql(
         &self,
@@ -248,29 +224,29 @@ impl TestRuntime {
 }
 
 /// The feature: a statement prepared in one request is executable by the next,
-/// and stops being executable once deallocated.
+/// with no session to ask for and no header to send. The caller's principal is
+/// what ties the requests together.
 #[tokio::test]
-async fn prepared_statements_span_requests_in_a_session() -> Result<(), anyhow::Error> {
+async fn prepared_statements_span_requests() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
         .scope(async {
             let rt = start(&["k:rw"]).await?;
-            let session = rt.create_session("k").await?;
 
-            rt.sql_ok("k", Some(&session), "PREPARE p AS SELECT 1 + 10 AS result")
+            rt.sql_ok("k", None, "PREPARE p AS SELECT 1 + 10 AS result")
                 .await?;
 
-            let body = rt.sql_ok("k", Some(&session), "EXECUTE p").await?;
+            let body = rt.sql_ok("k", None, "EXECUTE p").await?;
             assert_eq!(
                 serde_json::from_str::<Value>(&body)?,
                 serde_json::json!([{ "result": 11 }]),
-                "EXECUTE in the session runs the statement PREPARE put there"
+                "a later request executes the statement the earlier one prepared"
             );
 
-            rt.sql_ok("k", Some(&session), "DEALLOCATE p").await?;
+            rt.sql_ok("k", None, "DEALLOCATE p").await?;
 
-            let (status, body) = rt.sql("k", Some(&session), "EXECUTE p").await?;
+            let (status, body) = rt.sql("k", None, "EXECUTE p").await?;
             assert!(
                 !status.is_success() && body.contains("'p' does not exist"),
                 "a deallocated statement is gone: {status} {body}"
@@ -281,25 +257,29 @@ async fn prepared_statements_span_requests_in_a_session() -> Result<(), anyhow::
         .await
 }
 
-/// A request that names no session keeps the behavior it has always had:
-/// stateless, with `PREPARE` discarded when the request ends. Adding sessions
-/// must not quietly make every caller sharing an API key stateful.
+/// The session is keyed on the principal, so two API keys never see each
+/// other's statements even though neither asked for a session.
 #[tokio::test]
-async fn without_a_session_a_prepared_statement_does_not_survive_the_request()
--> Result<(), anyhow::Error> {
+async fn two_principals_do_not_share_prepared_statements() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
         .scope(async {
-            let rt = start(&["k:rw"]).await?;
+            let rt = start(&["a:rw", "b:rw"]).await?;
 
-            rt.sql_ok("k", None, "PREPARE p AS SELECT 1 AS result")
+            rt.sql_ok("a", None, "PREPARE mine AS SELECT 'a data' AS v")
                 .await?;
 
-            let (status, body) = rt.sql("k", None, "EXECUTE p").await?;
+            let (status, body) = rt.sql("b", None, "EXECUTE mine").await?;
             assert!(
-                !status.is_success() && body.contains("'p' does not exist"),
-                "without a session each request gets its own context: {status} {body}"
+                !status.is_success() && body.contains("'mine' does not exist"),
+                "another principal must not reach it: {status} {body}"
+            );
+
+            let body = rt.sql_ok("a", None, "EXECUTE mine").await?;
+            assert_eq!(
+                serde_json::from_str::<Value>(&body)?,
+                serde_json::json!([{ "v": "a data" }])
             );
 
             Ok(())
@@ -359,7 +339,7 @@ async fn a_session_cannot_be_used_by_another_principal() -> Result<(), anyhow::E
     test_request_context()
         .scope(async {
             let rt = start(&["a:rw", "b:rw"]).await?;
-            let session = rt.create_session("a").await?;
+            let session = rt.handshake_session("a").await?;
 
             rt.sql_ok(
                 "a",
@@ -376,12 +356,6 @@ async fn a_session_cannot_be_used_by_another_principal() -> Result<(), anyhow::E
                     "`{sql}` from another principal must be refused, got {status}: {body}"
                 );
             }
-
-            assert_eq!(
-                rt.delete_session("b", &session).await?,
-                StatusCode::FORBIDDEN,
-                "another principal must not delete the session either"
-            );
 
             let body = rt.sql_ok("a", Some(&session), "EXECUTE victim").await?;
             assert_eq!(
@@ -429,42 +403,6 @@ async fn two_principals_naming_the_same_id_do_not_share_a_session() -> Result<()
         .await
 }
 
-/// Deleting a session frees it immediately rather than waiting out its idle
-/// timeout, and takes its prepared statements with it.
-#[tokio::test]
-async fn deleting_a_session_drops_its_prepared_statements() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-
-    test_request_context()
-        .scope(async {
-            let rt = start(&["k:rw"]).await?;
-            let session = rt.create_session("k").await?;
-
-            rt.sql_ok("k", Some(&session), "PREPARE p AS SELECT 1 AS result")
-                .await?;
-
-            assert_eq!(
-                rt.delete_session("k", &session).await?,
-                StatusCode::NO_CONTENT
-            );
-            assert_eq!(
-                rt.delete_session("k", &session).await?,
-                StatusCode::NOT_FOUND,
-                "deleting a session twice reports it was already gone"
-            );
-
-            let (status, body) = rt.sql("k", Some(&session), "EXECUTE p").await?;
-            assert_eq!(
-                status,
-                StatusCode::NOT_FOUND,
-                "the session is gone, so naming it is a missing session: {body}"
-            );
-
-            Ok(())
-        })
-        .await
-}
-
 /// One session, both protocols: a session created over HTTP carries its prepared
 /// statements to Flight SQL and back, and its id authenticates on both.
 #[tokio::test]
@@ -474,7 +412,7 @@ async fn a_session_is_shared_between_the_http_and_flight_endpoints() -> Result<(
     test_request_context()
         .scope(async {
             let rt = start(&["k:rw"]).await?;
-            let session = rt.create_session("k").await?;
+            let session = rt.handshake_session("k").await?;
 
             rt.sql_ok("k", Some(&session), "PREPARE shared AS SELECT 7 AS n")
                 .await?;
@@ -534,7 +472,7 @@ async fn a_prepared_statement_is_cached_per_argument_list() -> Result<(), anyhow
                 }),
             )
             .await?;
-            let session = rt.create_session("k").await?;
+            let session = rt.handshake_session("k").await?;
 
             rt.sql_ok("k", Some(&session), "PREPARE p(BIGINT) AS SELECT $1 AS n")
                 .await?;

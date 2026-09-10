@@ -31,7 +31,6 @@ pub mod queries;
 pub mod query;
 pub mod ready;
 pub mod search;
-pub mod sessions;
 pub mod spicepods;
 pub mod status;
 pub mod tools;

@@ -18,7 +18,7 @@ limitations under the License.
 
 use crate::datafusion::DataFusion;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
-use crate::datafusion::sql_session_extension::{ImplicitSessions, SqlSessionExtension};
+use crate::datafusion::sql_session_extension::SqlSessionExtension;
 use crate::model::ModelContextLayer;
 use crate::request::DatabricksAuthExtension;
 use crate::sessions::{RequestedSession, SESSION_ID_HEADER, SessionStore};
@@ -35,10 +35,7 @@ use crate::http::v1::{
 use runtime_request_context::{Protocol, RequestContext};
 
 use app::App;
-use axum::{
-    extract::State,
-    routing::{delete, patch},
-};
+use axum::{extract::State, routing::patch};
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use opentelemetry::KeyValue;
 #[cfg(feature = "mcp")]
@@ -93,8 +90,6 @@ use tower_http::limit::RequestBodyLimitLayer;
     paths(
         // Order here will be preserved in sidebar at https://spiceai.org/docs/api/http/runtime.
         v1::query::post,
-        v1::sessions::post,
-        v1::sessions::delete,
         v1::datasets::get,
         v1::datasets::acceleration,
         v1::datasets::refresh,
@@ -336,8 +331,6 @@ pub(crate) fn routes(
 ) -> Router {
     let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
-        .route("/v1/sessions", post(v1::sessions::post))
-        .route("/v1/sessions/{session_id}", delete(v1::sessions::delete))
         .route("/v1/sql/active", get(v1::queries::list_active))
         .route(
             "/v1/sql/{query_id}/cancel",
@@ -562,17 +555,8 @@ async fn track_metrics(
     // Record which session the request names. This layer runs before auth, so
     // the session is resolved later, where the principal is known and its
     // ownership can be checked.
-    //
-    // Implicit sessions are off here: unlike a Flight connection, an HTTP API
-    // key is routinely shared across a fleet of unrelated callers, and giving
-    // them one session between them would put them in a single
-    // prepared-statement namespace where the second caller to `PREPARE p`
-    // fails. On HTTP a session is asked for, via `POST /v1/sessions`.
-    let session_extension = SqlSessionExtension::new(
-        sessions,
-        RequestedSession::from_headers(&headers),
-        ImplicitSessions::Disabled,
-    );
+    let session_extension =
+        SqlSessionExtension::new(sessions, RequestedSession::from_headers(&headers));
 
     let request_context = Arc::new(
         request_context_builder
@@ -695,18 +679,11 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
         cors_config.allowed_origins
     );
 
-    cors.allow_methods([
-        Method::GET,
-        Method::POST,
-        Method::PATCH,
-        Method::DELETE,
-        Method::OPTIONS,
-    ])
-    .allow_headers([ACCEPT, CONTENT_TYPE, AUTHORIZATION, SESSION_ID_HEADER])
-    // A browser can only read a response header that is exposed, and
-    // `POST /v1/sessions` returns the new session's id in one.
-    .expose_headers([SESSION_ID_HEADER])
-    .allow_origin(allowed_origins)
+    cors.allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
+        // `x-session-id` selects a SQL session on `/v1/sql`, so a cross-origin
+        // caller has to be allowed to send it.
+        .allow_headers([ACCEPT, CONTENT_TYPE, AUTHORIZATION, SESSION_ID_HEADER])
+        .allow_origin(allowed_origins)
 }
 
 /// Map common HTTP methods to static metric labels (avoids per-request allocation).

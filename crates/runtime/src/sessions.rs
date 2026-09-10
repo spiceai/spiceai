@@ -33,11 +33,12 @@ limitations under the License.
 //!
 //! # Interchangeable across protocols
 //!
-//! One store serves both endpoints, so an id issued by a Flight SQL handshake
-//! works on `POST /v1/sql` and one issued by `POST /v1/sessions` works over
-//! Flight — including as the bearer token, which both endpoints resolve back to
-//! the credential the session was issued against (see
-//! [`SessionStore::bearer_credential`]).
+//! One store serves both endpoints. A caller that names no session gets an
+//! implicit one keyed on its principal, so `PREPARE`/`EXECUTE` span requests on
+//! either protocol without a client asking for a session. An id issued by a
+//! Flight SQL handshake is also usable on `/v1/sql` — as `x-session-id`, or as
+//! the bearer token, which both endpoints resolve back to the credential the
+//! session was issued against (see [`SessionStore::bearer_credential`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,9 +71,9 @@ const IMPLICIT_KEY_PREFIX: &str = "implicit:";
 /// How a session came to exist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionKind {
-    /// The client asked for a session and was given an id — a Flight SQL
-    /// handshake, or `POST /v1/sessions`. The id is what the client presents on
-    /// later requests, so it is a CSPRNG-random `UUIDv4`: it must be
+    /// The client asked for a session and was given an id — today that is the
+    /// Flight SQL handshake. The id is what the client presents on later
+    /// requests, so it is a CSPRNG-random `UUIDv4`: it must be
     /// unpredictable, and (unlike the time-ordered `UUIDv7`) must not leak when
     /// the session was created.
     Issued,
@@ -146,14 +147,12 @@ impl std::fmt::Debug for SqlSession {
 #[derive(Clone)]
 pub struct SessionStore {
     sessions: Cache<String, Arc<SqlSession>>,
-    ttl: Duration,
 }
 
 impl std::fmt::Debug for SessionStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionStore")
             .field("session_count", &self.sessions.entry_count())
-            .field("ttl", &self.ttl)
             .finish_non_exhaustive()
     }
 }
@@ -172,15 +171,7 @@ impl SessionStore {
                 .max_capacity(MAX_SESSIONS)
                 .time_to_idle(SESSION_TTL)
                 .build(),
-            ttl: SESSION_TTL,
         }
-    }
-
-    /// How long a session survives without being used. Reported to clients so
-    /// they know when to expect one to lapse.
-    #[must_use]
-    pub fn ttl(&self) -> Duration {
-        self.ttl
     }
 
     /// Creates a session and returns it. The id is the caller's to hand back to

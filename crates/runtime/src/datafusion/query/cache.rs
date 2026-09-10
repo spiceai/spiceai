@@ -1052,7 +1052,7 @@ mod tests {
         datafusion::{
             DataFusion,
             query::{QueryBuilder, ResultsCacheMode},
-            sql_session_extension::{ImplicitSessions, SqlSessionExtension},
+            sql_session_extension::SqlSessionExtension,
         },
         sessions::{RequestedSession, SessionStore},
         status,
@@ -2738,7 +2738,6 @@ mod tests {
                         explicit_id: Some(session_id.to_string()),
                         bearer_token: None,
                     },
-                    ImplicitSessions::Disabled,
                 ))
                 .build(),
         )

@@ -16,10 +16,9 @@ limitations under the License.
 
 use crate::{
     datafusion::{
-        DataFusion,
-        job_executor_context_extension::JobExecutorContextExtension,
+        DataFusion, job_executor_context_extension::JobExecutorContextExtension,
         request_context_extension::DataFusionContextExtension,
-        sql_session_extension::{ImplicitSessions, SqlSessionExtension},
+        sql_session_extension::SqlSessionExtension,
     },
     jobs::JobExecutor,
     model::ModelContextExtension,
@@ -124,14 +123,9 @@ where
         // so the session is not resolved here — the ownership check needs the
         // authenticated principal, which is only known once the query runs.
         //
-        // Flight enables implicit sessions: a client that skips the handshake
-        // and presents its API key as the bearer token still gets a session of
-        // its own, which is what `PREPARE`/`EXECUTE` over a Flight connection
-        // has always relied on.
         let session_ext = SqlSessionExtension::new(
             self.session_store.clone(),
             RequestedSession::from_headers(req.headers()),
-            ImplicitSessions::Enabled,
         );
 
         let app_lock = Arc::clone(&self.app);

@@ -32,8 +32,8 @@ pub enum SessionError {
     #[snafu(display(
         "Session '{session_id}' was not found, so the prepared statements it held are gone and \
         this request cannot run in it. It expired after a period of inactivity, or it was never \
-        created. Start a new session — `POST /v1/sessions`, or a Flight SQL handshake — and retry. \
-        See: https://spiceai.org/docs/api/HTTP/post-sql"
+        created. Retry without `x-session-id` to use this principal's own session, or start a new \
+        one with a Flight SQL handshake. See: https://spiceai.org/docs/api/HTTP/post-sql"
     ))]
     NotFound { session_id: String },
 
@@ -65,29 +65,6 @@ impl SessionError {
     }
 }
 
-/// Whether a caller that named no session gets one derived from its principal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImplicitSessions {
-    /// A caller that names no session runs in a session of its own, created on
-    /// first use and keyed by its principal.
-    ///
-    /// Flight SQL uses this. A client that skips the handshake and presents its
-    /// API key as the bearer token — `spice sql --api-key …` among them — has
-    /// always had `PREPARE`/`EXECUTE` work across requests, and that only holds
-    /// if it gets a session without asking for one.
-    Enabled,
-
-    /// A caller that names no session runs against the runtime's shared context,
-    /// exactly as if sessions did not exist.
-    ///
-    /// HTTP uses this. An API key there is routinely shared across a whole fleet
-    /// of callers, so deriving one session from it would put unrelated clients
-    /// in the same prepared-statement namespace, where the second one to
-    /// `PREPARE p` fails because the first already did. On HTTP a session is
-    /// asked for explicitly.
-    Disabled,
-}
-
 /// Resolves the [`SqlSession`] a request runs in.
 ///
 /// Attached to the request context by the HTTP and Flight middlewares, which run
@@ -99,21 +76,12 @@ pub enum ImplicitSessions {
 pub struct SqlSessionExtension {
     store: SessionStore,
     requested: RequestedSession,
-    implicit: ImplicitSessions,
 }
 
 impl SqlSessionExtension {
     #[must_use]
-    pub fn new(
-        store: SessionStore,
-        requested: RequestedSession,
-        implicit: ImplicitSessions,
-    ) -> Self {
-        Self {
-            store,
-            requested,
-            implicit,
-        }
+    pub fn new(store: SessionStore, requested: RequestedSession) -> Self {
+        Self { store, requested }
     }
 
     /// The session this request runs in, or `None` to run against the shared
@@ -164,9 +132,12 @@ impl SqlSessionExtension {
             return Ok(Some(session));
         }
 
-        if self.implicit == ImplicitSessions::Enabled
-            && let Some(stable_id) = principal.and_then(|principal| principal.stable_id())
-        {
+        // A caller that named no session still gets one, derived from its
+        // principal and created on first use. This is what makes
+        // `PREPARE`/`EXECUTE` span requests without a client having to ask for
+        // a session, and it is keyed on the principal so no client can choose
+        // which session it lands in.
+        if let Some(stable_id) = principal.and_then(|principal| principal.stable_id()) {
             return Ok(Some(self.store.implicit_for(base_ctx, stable_id.as_ref())));
         }
 
@@ -178,7 +149,6 @@ impl std::fmt::Debug for SqlSessionExtension {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqlSessionExtension")
             .field("requested", &self.requested)
-            .field("implicit", &self.implicit)
             .finish_non_exhaustive()
     }
 }
@@ -214,32 +184,12 @@ mod tests {
     }
 
     #[test]
-    fn a_request_naming_nothing_runs_against_the_shared_context() {
-        let store = SessionStore::new();
-        let base = SessionContext::new();
-        let ext = SqlSessionExtension::new(
-            store,
-            RequestedSession::default(),
-            ImplicitSessions::Disabled,
-        );
-
-        let resolved = ext
-            .resolve(Some(&principal("a")), &base)
-            .expect("naming no session is not an error");
-        assert!(resolved.is_none());
-    }
-
-    #[test]
     fn an_explicitly_named_session_resolves_for_its_owner() {
         let store = SessionStore::new();
         let base = SessionContext::new();
         let session = store.issue(&base, Some(stable_id_of("a")), None);
 
-        let ext = SqlSessionExtension::new(
-            store,
-            named(Some(session.id()), None),
-            ImplicitSessions::Disabled,
-        );
+        let ext = SqlSessionExtension::new(store, named(Some(session.id()), None));
 
         let resolved = ext
             .resolve(Some(&principal("a")), &base)
@@ -257,11 +207,7 @@ mod tests {
         let base = SessionContext::new();
         let session = store.issue(&base, Some(stable_id_of("a")), None);
 
-        let ext = SqlSessionExtension::new(
-            store,
-            named(Some(session.id()), None),
-            ImplicitSessions::Disabled,
-        );
+        let ext = SqlSessionExtension::new(store, named(Some(session.id()), None));
 
         let error = ext
             .resolve(Some(&principal("b")), &base)
@@ -274,11 +220,7 @@ mod tests {
     #[test]
     fn an_unknown_explicit_session_is_an_error() {
         let store = SessionStore::new();
-        let ext = SqlSessionExtension::new(
-            store,
-            named(Some("no-such-session"), None),
-            ImplicitSessions::Disabled,
-        );
+        let ext = SqlSessionExtension::new(store, named(Some("no-such-session"), None));
 
         let error = ext
             .resolve(Some(&principal("a")), &SessionContext::new())
@@ -292,11 +234,7 @@ mod tests {
     #[test]
     fn a_bearer_token_that_names_no_session_is_not_an_error() {
         let store = SessionStore::new();
-        let ext = SqlSessionExtension::new(
-            store,
-            named(None, Some("an-api-key")),
-            ImplicitSessions::Disabled,
-        );
+        let ext = SqlSessionExtension::new(store, named(None, Some("an-api-key")));
 
         let resolved = ext
             .resolve(Some(&principal("an-api-key")), &SessionContext::new())
@@ -310,11 +248,7 @@ mod tests {
         let base = SessionContext::new();
         let session = store.issue(&base, Some(stable_id_of("a")), Some("a".to_string()));
 
-        let ext = SqlSessionExtension::new(
-            store,
-            named(None, Some(session.id())),
-            ImplicitSessions::Disabled,
-        );
+        let ext = SqlSessionExtension::new(store, named(None, Some(session.id())));
 
         let resolved = ext
             .resolve(Some(&principal("a")), &base)
@@ -323,44 +257,33 @@ mod tests {
         assert_eq!(resolved.id(), session.id());
     }
 
+    /// A caller that names no session gets one of its own, keyed on its
+    /// principal — the same behavior on both protocols, and what lets
+    /// `PREPARE`/`EXECUTE` span requests without a client asking for a session.
     #[test]
-    fn an_implicit_session_is_given_only_where_it_is_enabled() {
+    fn a_caller_naming_no_session_gets_one_keyed_on_its_principal() {
         let store = SessionStore::new();
         let base = SessionContext::new();
+        let ext = SqlSessionExtension::new(store, RequestedSession::default());
 
-        let off = SqlSessionExtension::new(
-            store.clone(),
-            RequestedSession::default(),
-            ImplicitSessions::Disabled,
-        );
-        assert!(
-            off.resolve(Some(&principal("a")), &base)
-                .expect("resolving is not an error")
-                .is_none()
-        );
-
-        let on = SqlSessionExtension::new(
-            store,
-            RequestedSession::default(),
-            ImplicitSessions::Enabled,
-        );
-        let resolved = on
+        let resolved = ext
             .resolve(Some(&principal("a")), &base)
             .expect("resolving is not an error")
             .expect("an implicit session is created on first use");
+
         assert!(resolved.is_owned_by(Some(&principal("a"))));
-        assert!(!resolved.is_owned_by(Some(&principal("b"))));
+        assert!(
+            !resolved.is_owned_by(Some(&principal("b"))),
+            "another principal must not land in it"
+        );
     }
 
     /// Without a principal there is nothing to key an implicit session on, so an
-    /// unauthenticated caller runs stateless rather than joining a shared one.
+    /// unauthenticated caller runs against the shared context rather than
+    /// joining a session others could reach.
     #[test]
     fn an_unauthenticated_caller_gets_no_implicit_session() {
-        let ext = SqlSessionExtension::new(
-            SessionStore::new(),
-            RequestedSession::default(),
-            ImplicitSessions::Enabled,
-        );
+        let ext = SqlSessionExtension::new(SessionStore::new(), RequestedSession::default());
 
         assert!(
             ext.resolve(None, &SessionContext::new())
@@ -399,8 +322,8 @@ mod tests {
                 session_id: "s".to_string(),
             }
             .to_string()
-            .contains("POST /v1/sessions"),
-            "a missing session tells the caller how to get one"
+            .contains("x-session-id"),
+            "a missing session tells the caller how to get a working one"
         );
         assert!(
             SessionError::NotOwned {

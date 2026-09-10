@@ -104,8 +104,8 @@ impl Service {
     /// Creates a new Flight service using the shared data update broadcaster.
     ///
     /// `session_store` is the runtime's, not this service's: a session id issued
-    /// by the handshake here is equally usable on `/v1/sql`, and one issued by
-    /// `POST /v1/sessions` is usable here.
+    /// by the handshake here is equally usable on `/v1/sql`, and both endpoints
+    /// derive the same implicit session for a caller that names none.
     #[must_use]
     pub fn new(
         basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
