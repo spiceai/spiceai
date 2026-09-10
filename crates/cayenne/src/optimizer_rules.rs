@@ -848,11 +848,12 @@ fn try_rewrite_oversized_join(
             // Inner stays a hash join: SF-10 Q92's oracle `avg(ws_ext_discount_amt)`
             // join emitted Decimal128(30, 15) where HashJoinExec had Decimal128(7, 2)
             // (aef067 type-guard was not enough — plan schemas matched).
-            // The inner `ss LEFT JOIN ws` has an aggregate build; the outer
-            // `(ss⋈ws) LEFT JOIN cs` has a join on the left and the `cs`
-            // aggregate on the right. Restricting the spill to
-            // `input_is_aggregate(left)` left that outer join as N unspillable
-            // HashJoinInputs (SF-100 852632 trunk r1).
+            // The inner `ss LEFT JOIN ws` and outer `(ss⋈ws) LEFT JOIN cs` are
+            // aggregate joins, but Q78's CTE bodies also do
+            // `store_sales LEFT JOIN store_returns` (file scans, no aggregate).
+            // Restricting the spill to aggregates left those fact-return joins
+            // as N unspillable HashJoinInputs (SF-100 38eb30d trunk r1, same
+            // 5.0 GB × N pattern as 852632).
             if *hash_join.join_type() == JoinType::Left && should_spill_oracle_left_join(hash_join)
             {
                 return finish_sort_merge_rewrite(hash_join, false);
@@ -1221,19 +1222,19 @@ fn input_is_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// aggregate and this is not a CTE self-join. Used on the Cayenne path,
 /// where fact–dimension joins (Q13) build a Cayenne scan, not an aggregate,
 /// and must stay hash joins — sort-merge of those swapped Decimal/Utf8
-/// columns. Do not widen this to `input_is_aggregate(right)`: that is the
-/// oracle-only gate in [`should_spill_oracle_left_join`].
+/// columns. Oracle Left joins use [`should_spill_oracle_left_join`] instead
+/// and are not gated on an aggregate build.
 fn should_spill_unknown_size_join(hash_join: &HashJoinExec) -> bool {
     !is_unknown_size_self_join(hash_join) && input_is_aggregate(hash_join.left())
 }
 
-/// `__test_reference` Q78 is `ss LEFT JOIN ws LEFT JOIN cs`. The inner join
-/// has an aggregate build; the outer join's left is that join result and its
-/// right is the `cs` aggregate. Spill either shape. Inner oracle joins stay
-/// hash joins (Q92 Decimal128). Self-joins are still skipped (`year_total`).
+/// `__test_reference` Q78 Left-joins file scans inside each CTE body
+/// (`store_sales LEFT JOIN store_returns`, and the ws/cs analogues) and then
+/// Left-joins the aggregated `ss`/`ws`/`cs` results. Any of those Left joins
+/// that is not a `year_total` self-join must spill. Inner oracle joins stay
+/// hash joins (Q92 Decimal128).
 fn should_spill_oracle_left_join(hash_join: &HashJoinExec) -> bool {
     !is_unknown_size_self_join(hash_join)
-        && (input_is_aggregate(hash_join.left()) || input_is_aggregate(hash_join.right()))
 }
 
 /// Count the `HashJoinExec` nodes in a plan. Used to size each join's fair
@@ -3895,6 +3896,40 @@ mod tests {
         let rewritten = optimized
             .downcast_ref::<SortMergeJoinExec>()
             .expect("Q78 oracle outer (ss⋈ws) LEFT JOIN cs must spill via N-way sort-merge");
+        assert_eq!(
+            rewritten.left().output_partitioning().partition_count(),
+            4,
+            "must not coalesce; coalesced SMJ changed LIMIT 100 at SF-1"
+        );
+        assert_eq!(rewritten.right().output_partitioning().partition_count(), 4);
+    }
+
+    #[test]
+    fn rewrites_partitioned_oracle_left_join_of_file_scans_to_nway_sort_merge() {
+        // TPC-DS Q78 `--validate` oracle CTE body: `store_sales LEFT JOIN
+        // store_returns` over file scans, then `GROUP BY`. Neither input is
+        // an AggregateExec. SF-100 38eb30d trunk r1 still showed N × 5 GB
+        // HashJoinInput after aggregate-only Left spill (regression for #13918).
+        let left_schema = channel_schema("ss_item_sk", "ss_ticket_number");
+        let right_schema = channel_schema("sr_item_sk", "sr_ticket_number");
+        let left = hash_repartition(inlined_exec(&left_schema), "ss_item_sk", 4);
+        let right = hash_repartition(inlined_exec(&right_schema), "sr_item_sk", 4);
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "ss_item_sk",
+            "sr_item_sk",
+            JoinType::Left,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        let rewritten = optimized
+            .downcast_ref::<SortMergeJoinExec>()
+            .expect("Q78 oracle fact-return Left join must spill via N-way sort-merge");
         assert_eq!(
             rewritten.left().output_partitioning().partition_count(),
             4,
