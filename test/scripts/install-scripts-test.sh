@@ -602,36 +602,35 @@ test_cuda_version_invalid() {
 # Default Value Tests
 # =============================================================================
 
-test_default_variant_is_models() {
-    # Source the script in a subshell and check VARIANT default
+read_spiced_variant() {
+    local installer_preamble
+    installer_preamble=$(awk '
+        /^# main$/ { found = 1; exit }
+        { print }
+        END { if (!found) exit 1 }
+    ' "$INSTALL_SPICED_SCRIPT") || return 1
+    bash -c "$installer_preamble"$'\nprintf "%s" "$VARIANT"\n'
+}
+
+test_default_variant_is_empty() {
     local variant
-    variant=$(bash -c 'source /dev/stdin <<< "
-        : \${VARIANT:=\"models\"}
-        echo \$VARIANT
-    "')
-    [[ "$variant" == "models" ]]
+    variant=$(
+        unset VARIANT
+        read_spiced_variant
+    ) || return 1
+    [[ -z "$variant" ]]
 }
 
 test_variant_can_be_overridden() {
     local variant
-    variant=$(VARIANT="metal" bash -c '
-        : ${VARIANT:="models"}
-        echo $VARIANT
-    ')
+    variant=$(VARIANT="metal" read_spiced_variant) || return 1
     [[ "$variant" == "metal" ]]
 }
 
 test_variant_can_be_empty() {
     local variant
-    variant=$(VARIANT="" bash -c '
-        : ${VARIANT:="models"}
-        echo $VARIANT
-    ')
-    # When VARIANT is set to empty, :="models" will still set it to models
-    # because := checks for unset OR empty. To allow empty, use := vs :-
-    # The current script uses := so empty becomes "models"
-    # This test validates the current behavior
-    [[ "$variant" == "models" ]]
+    variant=$(VARIANT="" read_spiced_variant) || return 1
+    [[ -z "$variant" ]]
 }
 
 # =============================================================================
@@ -861,7 +860,7 @@ run_all_tests() {
     # Artifact Naming - Linux x86_64
     echo "--- Artifact Naming: Linux x86_64 ---"
     run_test "Linux x86_64 default artifact name" test_artifact_name_linux_x86_64_default
-    run_test "Linux x86_64 models artifact name" test_artifact_name_linux_x86_64_models
+    run_test "Legacy Linux x86_64 models artifact name" test_artifact_name_linux_x86_64_models
     run_test "Linux x86_64 CUDA 90 artifact name" test_artifact_name_linux_x86_64_cuda_90
     run_test "Linux x86_64 CUDA 89 artifact name" test_artifact_name_linux_x86_64_cuda_89
     run_test "Linux x86_64 CUDA 87 artifact name" test_artifact_name_linux_x86_64_cuda_87
@@ -872,20 +871,20 @@ run_all_tests() {
     # Artifact Naming - Linux aarch64
     echo "--- Artifact Naming: Linux aarch64 ---"
     run_test "Linux aarch64 default artifact name" test_artifact_name_linux_aarch64_default
-    run_test "Linux aarch64 models artifact name" test_artifact_name_linux_aarch64_models
+    run_test "Legacy Linux aarch64 models artifact name" test_artifact_name_linux_aarch64_models
     echo ""
     
     # Artifact Naming - macOS
     echo "--- Artifact Naming: macOS (darwin) ---"
     run_test "Darwin aarch64 default artifact name" test_artifact_name_darwin_aarch64_default
-    run_test "Darwin aarch64 models artifact name" test_artifact_name_darwin_aarch64_models
+    run_test "Legacy Darwin aarch64 models artifact name" test_artifact_name_darwin_aarch64_models
     run_test "Darwin aarch64 metal artifact name" test_artifact_name_darwin_aarch64_metal
     echo ""
     
     # Artifact Naming - Windows
     echo "--- Artifact Naming: Windows ---"
-    run_test "Windows x86_64 default artifact name" test_artifact_name_windows_x86_64_default
-    run_test "Windows x86_64 models artifact name" test_artifact_name_windows_x86_64_models
+    run_test "Legacy Windows x86_64 runtime artifact name" test_artifact_name_windows_x86_64_default
+    run_test "Legacy Windows x86_64 models artifact name" test_artifact_name_windows_x86_64_models
     echo ""
     
     # Artifact Naming - Spice CLI
@@ -948,7 +947,7 @@ run_all_tests() {
     
     # Default Values
     echo "--- Default Values ---"
-    run_test "Default variant is models" test_default_variant_is_models
+    run_test "Default variant has no archive suffix" test_default_variant_is_empty
     run_test "Variant can be overridden" test_variant_can_be_overridden
     run_test "Empty variant behavior" test_variant_can_be_empty
     echo ""
@@ -977,7 +976,7 @@ run_all_tests() {
     echo "--- Documentation ---"
     run_test "Naming convention documented" test_spiced_naming_convention_documented
     run_test "Empty variant documented" test_spiced_variant_empty_documented
-    run_test "Models variant documented" test_spiced_variant_models_documented
+    run_test "Model support documented" test_spiced_variant_models_documented
     run_test "Metal variant documented" test_spiced_variant_metal_documented
     run_test "CUDA variant documented" test_spiced_variant_cuda_documented
     echo ""
