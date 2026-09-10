@@ -312,15 +312,16 @@ test_artifacts_exist_in_latest_release() {
         "spice_linux_x86_64.tar.gz"
         "spice_linux_aarch64.tar.gz"
         "spice_darwin_aarch64.tar.gz"
+        "spice.exe_windows_x86_64.tar.gz"
         "spiced_linux_x86_64.tar.gz"
         "spiced_linux_aarch64.tar.gz"
         "spiced_darwin_aarch64.tar.gz"
-        "spiced_models_linux_x86_64.tar.gz"
-        "spiced_models_linux_aarch64.tar.gz"
-        "spiced_models_darwin_aarch64.tar.gz"
         "spiced_metal_darwin_aarch64.tar.gz"
-        "spiced.exe_windows_x86_64.tar.gz"
-        "spiced.exe_models_windows_x86_64.tar.gz"
+        "spiced_cuda_80_linux_x86_64.tar.gz"
+        "spiced_cuda_86_linux_x86_64.tar.gz"
+        "spiced_cuda_87_linux_x86_64.tar.gz"
+        "spiced_cuda_89_linux_x86_64.tar.gz"
+        "spiced_cuda_90_linux_x86_64.tar.gz"
     )
     
     local missing=0
@@ -684,7 +685,7 @@ test_live_download_url_resolves() {
     [[ "$response" == "200" ]]
 }
 
-test_live_spiced_models_linux_downloadable() {
+test_live_spiced_linux_downloadable() {
     if [[ "$LIVE_TESTS" != "true" ]]; then
         return 0
     fi
@@ -696,7 +697,7 @@ test_live_spiced_models_linux_downloadable() {
         return 1
     fi
     
-    local url="https://github.com/spiceai/spiceai/releases/download/${tag}/spiced_models_linux_x86_64.tar.gz"
+    local url="https://github.com/spiceai/spiceai/releases/download/${tag}/spiced_linux_x86_64.tar.gz"
     local response
     response=$(curl -sS -o /dev/null -w "%{http_code}" -L "$url" 2>/dev/null || echo "000")
     
@@ -982,7 +983,7 @@ run_all_tests() {
         echo "--- Live Network Tests ---"
         run_test "Latest release accessible" test_live_latest_release_accessible
         run_test "Download URL resolves" test_live_download_url_resolves
-        run_test "spiced_models_linux downloadable" test_live_spiced_models_linux_downloadable
+        run_test "spiced_linux downloadable" test_live_spiced_linux_downloadable
         run_test "All expected artifacts exist" test_artifacts_exist_in_latest_release
         echo ""
     fi

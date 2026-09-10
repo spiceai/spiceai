@@ -29,6 +29,9 @@ jobs:
   test-install-scripts:
     name: Test Install Scripts (${{ matrix.os }}, ${{ matrix.shell }})
     runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }} {0}
     strategy:
       fail-fast: false
       matrix:
@@ -65,18 +68,21 @@ jobs:
 
       - name: Install zsh (Ubuntu)
         if: contains(matrix.os, 'linux') && matrix.shell == 'zsh'
+        shell: bash
         run: sudo apt-get update && sudo apt-get install -y zsh
 
       - name: Run install script tests
-        shell: ${{ matrix.shell }} {0}
         run: |
           chmod +x test/scripts/install-scripts-test.sh
-          ${{ matrix.shell }} test/scripts/install-scripts-test.sh --live
+          bash test/scripts/install-scripts-test.sh --live
 
   # Test shell detection and PATH configuration
   test-shell-detection:
     name: Shell Detection (${{ matrix.os }}, ${{ matrix.shell }})
     runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }} {0}
     strategy:
       fail-fast: false
       matrix:
@@ -107,10 +113,10 @@ jobs:
 
       - name: Install zsh (Ubuntu)
         if: contains(matrix.os, 'linux') && matrix.shell == 'zsh'
+        shell: bash
         run: sudo apt-get update && sudo apt-get install -y zsh
 
       - name: Create shell profile
-        shell: ${{ matrix.shell }} {0}
         run: |
           if [ "${{ matrix.shell }}" = "bash" ]; then
             touch ~/.bashrc
@@ -120,7 +126,6 @@ jobs:
           fi
 
       - name: Test install.sh with shell detection
-        shell: ${{ matrix.shell }} {0}
         env:
           SHELL: /bin/${{ matrix.shell }}
         run: |
@@ -143,7 +148,6 @@ jobs:
           "$HOME/.spice/bin/spice" version
 
       - name: Verify PATH instructions
-        shell: ${{ matrix.shell }} {0}
         run: |
           # Check that the shell profile was updated with PATH
           profile_file=""
