@@ -138,7 +138,7 @@ impl Catalog for RestCatalog {
     }
 }
 
-/// Guards the SigV4 signing middleware the `spiceai/iceberg-rust` fork adds to its
+/// Guards the `SigV4` signing middleware the `spiceai/iceberg-rust` fork adds to its
 /// REST catalog client, which is what lets a Glue-backed Iceberg catalog
 /// authenticate at all.
 ///
@@ -187,12 +187,16 @@ mod sigv4_signing {
         server
     }
 
-    /// List namespaces through a catalog built from `props`, and return the
-    /// `Authorization` headers the stub saw.
+    /// List namespaces through a catalog built from `props`, and return one entry per
+    /// request the stub saw — `None` where that request carried no `Authorization`.
+    ///
+    /// One entry per *request*, not per header: filtering the unsigned ones out would
+    /// let a middleware that signs only some requests pass the assertion below, since
+    /// the requests it skipped would simply not appear.
     async fn authorization_headers(
         server: &MockServer,
         props: HashMap<String, String>,
-    ) -> Vec<String> {
+    ) -> Vec<Option<String>> {
         let catalog = RestCatalog::new(
             RestCatalogBuilder::default()
                 .load("rest", props)
@@ -209,7 +213,7 @@ mod sigv4_signing {
             .await
             .expect("the stub records what it received")
             .iter()
-            .filter_map(|request| {
+            .map(|request| {
                 request
                     .headers
                     .get("authorization")
@@ -239,13 +243,23 @@ mod sigv4_signing {
     #[tokio::test]
     async fn a_sigv4_catalog_signs_every_request_it_sends() {
         let server = stub_catalog().await;
-        let headers = authorization_headers(&server, props(&server, true)).await;
+        let requests = authorization_headers(&server, props(&server, true)).await;
 
         assert!(
-            !headers.is_empty(),
-            "a SigV4 catalog sent no Authorization header at all, so the signing middleware is not installed"
+            !requests.is_empty(),
+            "the stub saw no request at all, so this asserts nothing"
         );
-        for header in &headers {
+        // Every request, not merely every signature: a catalog that signs the config
+        // fetch and not the listing authenticates for exactly as long as it takes to
+        // reach the first real call.
+        let unsigned = requests.iter().filter(|header| header.is_none()).count();
+        assert_eq!(
+            unsigned,
+            0,
+            "{unsigned} of {} requests carried no Authorization header, so the signing middleware is missing or applied to only some calls",
+            requests.len()
+        );
+        for header in requests.iter().flatten() {
             assert!(
                 header.starts_with("AWS4-HMAC-SHA256 "),
                 "expected a SigV4 signature, got: {header}"
@@ -268,10 +282,11 @@ mod sigv4_signing {
     #[tokio::test]
     async fn a_catalog_without_sigv4_sends_no_signature() {
         let server = stub_catalog().await;
+        let requests = authorization_headers(&server, props(&server, false)).await;
+        assert!(!requests.is_empty(), "the stub saw no request at all");
         assert!(
-            authorization_headers(&server, props(&server, false))
-                .await
-                .is_empty()
+            requests.iter().all(Option::is_none),
+            "a catalog with no SigV4 configured signed a request anyway: {requests:?}"
         );
     }
 }
