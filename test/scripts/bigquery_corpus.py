@@ -129,6 +129,41 @@ def fixtures() -> tuple[
     return aliases, tables
 
 
+def physical_schemas(index: int, explain: str, physical: str) -> list[str]:
+    """Read rendered field names, types and nullability from the same plan stage."""
+    schema_plan = next(
+        (
+            entry["plan"]
+            for entry in json.loads(explain)
+            if entry["plan_type"] == "initial_physical_plan_with_schema"
+        ),
+        None,
+    )
+    if schema_plan is None:
+        raise harness.HarnessError(
+            f"Query {index:03}: missing initial physical plan with schemas"
+        )
+    lines, schemas = [], []
+    for line in schema_plan.splitlines():
+        # SQL and nested types can contain commas or brackets. The display
+        # appends the complete output schema after the node's own text.
+        plan_line, separator, schema = line.rpartition(", schema=")
+        if not separator:
+            plan_line = line
+        if PLAN_NODE.match(plan_line):
+            if not separator or not (schema.startswith("[") and schema.endswith("]")):
+                raise harness.HarnessError(
+                    f"Query {index:03}: missing physical node schema"
+                )
+            schemas.append(schema)
+        lines.append(plan_line)
+    if lines != physical.splitlines():
+        raise harness.HarnessError(
+            f"Query {index:03}: schema plan does not match the initial physical plan"
+        )
+    return schemas
+
+
 def check_plan(index: int, explain: str) -> None:
     physical = harness.physical_plan(explain)
     nodes = [(len(match[1]), match[2]) for match in PLAN_NODE.finditer(physical)]
@@ -158,9 +193,14 @@ def check_plan(index: int, explain: str) -> None:
         raise harness.HarnessError(
             f"Query {index:03}: expected one chain ending at the remote leaf"
         )
+    schemas = physical_schemas(index, explain, physical)
     windows = 0
-    for _, name in nodes[:-1]:
+    for position, (_, name) in enumerate(nodes[:-1]):
         if name in TRANSPORT:
+            if schemas[position] != schemas[position + 1]:
+                raise harness.HarnessError(
+                    f"Query {index:03}: {name} must not change its child schema"
+                )
             continue
         if index == 241:
             if name == "WindowAggExec":

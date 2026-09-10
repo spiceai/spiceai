@@ -25,10 +25,15 @@ import bigquery_corpus as corpus
 from bigquery_federation import HarnessError
 
 
-def explain(physical, logical="Projection: test"):
+def explain(physical, logical="Projection: test", schema_plan=None):
+    if schema_plan is None:
+        schema_plan = "\n".join(
+            line + ", schema=[x:Utf8;N]" for line in physical.splitlines()
+        )
     return json.dumps(
         [
             {"plan_type": "initial_physical_plan", "plan": physical},
+            {"plan_type": "initial_physical_plan_with_schema", "plan": schema_plan},
             {"plan_type": "logical_plan", "plan": logical},
         ]
     )
@@ -79,6 +84,52 @@ class CorpusTests(unittest.TestCase):
         corpus.check_plan(5, explain(FULL))
         corpus.check_plan(241, explain(PARTIAL))
         corpus.check_plan(0, explain("DataSourceExec: values"))
+
+    def test_transport_cannot_change_field_type_name_or_nullability(self):
+        for name in corpus.TRANSPORT:
+            physical = name + "\n  " + REMOTE
+            for schema in ("[x:Int64;N]", "[renamed:Utf8;N]", "[x:Utf8]"):
+                with self.subTest(name=name, schema=schema):
+                    schema_plan = (
+                        f"{name}, schema={schema}\n  {REMOTE}, schema=[x:Utf8;N]"
+                    )
+                    with self.assertRaisesRegex(HarnessError, "child schema"):
+                        corpus.check_plan(5, explain(physical, schema_plan=schema_plan))
+
+    def test_schema_evidence_must_match_the_initial_plan(self):
+        plans = json.loads(explain(FULL))
+        del plans[1]
+        with self.assertRaisesRegex(HarnessError, "missing initial physical plan"):
+            corpus.check_plan(5, json.dumps(plans))
+        plans.insert(1, {"plan_type": "physical_plan_with_schema", "plan": FULL})
+        with self.assertRaisesRegex(HarnessError, "missing initial physical plan"):
+            corpus.check_plan(5, json.dumps(plans))
+        valid = json.loads(explain(FULL))[1]["plan"]
+        for invalid in (
+            "",
+            FULL,
+            valid.replace("SELECT 1", "SELECT 2"),
+            valid.replace("  " + REMOTE, "    " + REMOTE),
+            valid.replace("  " + REMOTE + ", schema=[x:Utf8;N]", "  " + REMOTE),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(HarnessError):
+                corpus.check_plan(5, explain(FULL, schema_plan=invalid))
+
+    def test_nested_schema_and_schema_text_in_sql(self):
+        physical = FULL.replace("SELECT 1", "SELECT ', schema=[text]' AS x")
+        schema = "[x:Struct(a:List(Utf8);N, b:Int64);N]"
+        schema_plan = "\n".join(
+            line + ", schema=" + schema for line in physical.splitlines()
+        )
+        corpus.check_plan(5, explain(physical, schema_plan=schema_plan))
+        with self.assertRaisesRegex(HarnessError, "child schema"):
+            corpus.check_plan(
+                5,
+                explain(
+                    physical,
+                    schema_plan=schema_plan.replace("List(Utf8)", "List(Int64)", 1),
+                ),
+            )
 
     def test_one_remote_does_not_hide_local_work(self):
         for name in (
