@@ -5,6 +5,7 @@
 mod access_plan;
 mod cache;
 pub use cache::synthetic_object_meta;
+mod deferred_projection;
 mod format;
 pub mod metrics;
 mod opener;
