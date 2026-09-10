@@ -25,7 +25,7 @@ jobs:
       with:
         persist-credentials: false
         fetch-depth: 0
-        ref: 20cfb434796742a3b625caabea65cba820342cac
+        ref: 187b3dbc322f2f104eca700b07bdef78cf5e0a66
     - name: Check for code changes
       if: ${{ github.event_name != 'pull_request' }}
       id: check
@@ -44,7 +44,7 @@ jobs:
       with:
         persist-credentials: false
         fetch-depth: 1
-        ref: 20cfb434796742a3b625caabea65cba820342cac
+        ref: 187b3dbc322f2f104eca700b07bdef78cf5e0a66
     - name: Cache Cargo registry
       if: needs.check_changes.outputs.relevant_changes == 'true'
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -125,7 +125,7 @@ jobs:
         '
     - name: Record tested source identity
       if: needs.check_changes.outputs.relevant_changes == 'true'
-      run: 'printf ''%s\n'' ''Tested source: 20cfb434796742a3b625caabea65cba820342cac (OSS trunk plus SQL Warehouse and permissions environment fix)''
+      run: 'printf ''%s\n'' ''Tested source: 187b3dbc322f2f104eca700b07bdef78cf5e0a66 (OSS trunk plus SQL Warehouse and permissions environment fix)''
 
         '
     - name: Upload test archive (artifact fallback)
@@ -165,7 +165,7 @@ jobs:
       with:
         persist-credentials: false
         fetch-depth: 1
-        ref: 20cfb434796742a3b625caabea65cba820342cac
+        ref: 187b3dbc322f2f104eca700b07bdef78cf5e0a66
     - name: Set up Rust
       if: needs.check_changes.outputs.relevant_changes == 'true'
       uses: ./.github/actions/setup-rust
@@ -334,7 +334,7 @@ jobs:
       with:
         persist-credentials: false
         fetch-depth: 1
-        ref: 20cfb434796742a3b625caabea65cba820342cac
+        ref: 187b3dbc322f2f104eca700b07bdef78cf5e0a66
     - name: Download integration snapshots artifacts
       id: download_snapshots
       continue-on-error: true
@@ -382,7 +382,7 @@ jobs:
       with:
         persist-credentials: false
         fetch-depth: 1
-        ref: 20cfb434796742a3b625caabea65cba820342cac
+        ref: 187b3dbc322f2f104eca700b07bdef78cf5e0a66
     - name: Test GitHub permission diagnostics
       run: python3 -m unittest discover -s test/github -p test_permissions.py -v
     - name: Verify GitHub API permissions
@@ -479,7 +479,7 @@ jobs:
       with:
         persist-credentials: false
         fetch-depth: 1
-        ref: 20cfb434796742a3b625caabea65cba820342cac
+        ref: 187b3dbc322f2f104eca700b07bdef78cf5e0a66
     - name: Set up Rust
       uses: ./.github/actions/setup-rust
     - name: Set up MinIO client
@@ -541,7 +541,7 @@ jobs:
       with:
         persist-credentials: false
         fetch-depth: 1
-        ref: 20cfb434796742a3b625caabea65cba820342cac
+        ref: 187b3dbc322f2f104eca700b07bdef78cf5e0a66
     - name: Set up Rust
       uses: ./.github/actions/setup-rust
     - name: Set up MinIO client
@@ -606,7 +606,7 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         fetch-depth: 1
-        ref: 20cfb434796742a3b625caabea65cba820342cac
+        ref: 187b3dbc322f2f104eca700b07bdef78cf5e0a66
     - name: Set up Rust
       uses: ./.github/actions/setup-rust
     - name: Set up MinIO client
@@ -667,7 +667,7 @@ jobs:
       with:
         persist-credentials: false
         fetch-depth: 1
-        ref: 20cfb434796742a3b625caabea65cba820342cac
+        ref: 187b3dbc322f2f104eca700b07bdef78cf5e0a66
     - name: Set up Rust
       uses: ./.github/actions/setup-rust
     - name: Set up MinIO client
@@ -720,7 +720,7 @@ jobs:
       with:
         persist-credentials: false
         fetch-depth: 1
-        ref: 20cfb434796742a3b625caabea65cba820342cac
+        ref: 187b3dbc322f2f104eca700b07bdef78cf5e0a66
     - name: Set up Rust
       uses: ./.github/actions/setup-rust
     - name: Set up MinIO client
