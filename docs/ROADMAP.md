@@ -15,15 +15,6 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### [v2.3](https://github.com/spiceai/spiceai/milestone/100) (September 2026)
-
-**Focus:** Schema Registry & Write-Back Acceleration.
-
-**DataFusion:** v55
-
-- **Schema Registry (Initial)**: Versioning and backward compatibility checks.
-- **Write-Back Acceleration DML**: Full UPDATE/DELETE DML on write-through accelerated tables.
-
 ### [v2.4](https://github.com/spiceai/spiceai/milestone/101) (October 2026)
 
 **Focus:** Distributed Search, Enterprise Security, Compliance, & Governance.
