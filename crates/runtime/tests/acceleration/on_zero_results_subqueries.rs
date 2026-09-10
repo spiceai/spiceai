@@ -76,6 +76,28 @@ const QUERIES: &[(&str, &[i64])] = &[
     ),
 ];
 
+const PARTIAL_QUERIES: &[(&str, &[i64])] = &[
+    (
+        "SELECT id FROM items WHERE id = 2 AND id IN (SELECT item_id FROM details WHERE val = 5)",
+        &[2],
+    ),
+    (
+        "SELECT id FROM items WHERE id = 2 AND EXISTS (SELECT 1 FROM details WHERE item_id = id AND val = 5)",
+        &[2],
+    ),
+    (
+        "SELECT id FROM items WHERE id = 2 AND v > (SELECT avg(val) FROM details WHERE item_id = id)",
+        &[2],
+    ),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Contents {
+    Populated,
+    Empty,
+    Partial,
+}
+
 fn ids(batches: &[RecordBatch]) -> Vec<i64> {
     let mut ids: Vec<_> = batches
         .iter()
@@ -98,7 +120,7 @@ fn dataset(
     table: &str,
     engine: &str,
     mode: &Mode,
-    empty: bool,
+    contents: Contents,
     action: &ZeroResultsAction,
 ) -> Dataset {
     let mut dataset = Dataset::new(
@@ -128,7 +150,13 @@ fn dataset(
         engine: Some(engine.to_string()),
         mode: mode.clone(),
         on_zero_results: action.clone(),
-        refresh_sql: empty.then(|| format!("SELECT * FROM {table} LIMIT 0")),
+        refresh_sql: match contents {
+            Contents::Empty => Some(format!("SELECT * FROM {table} LIMIT 0")),
+            Contents::Partial if table == "items" => {
+                Some("SELECT * FROM items WHERE id != 2".to_string())
+            }
+            _ => None,
+        },
         params,
         ..Acceleration::default()
     });
@@ -138,7 +166,7 @@ fn dataset(
 async fn check_subqueries(
     engine: &str,
     mode: &Mode,
-    empty: bool,
+    contents: Contents,
     action: &ZeroResultsAction,
     mixed_federation: bool,
 ) -> anyhow::Result<()> {
@@ -149,13 +177,13 @@ async fn check_subqueries(
         "item_id,val\n1,10\n1,20\n2,5\n,7\n",
     )?;
     let app = AppBuilder::new("on_zero_results_subqueries")
-        .with_dataset(dataset(dir.path(), "items", engine, mode, empty, action))
+        .with_dataset(dataset(dir.path(), "items", engine, mode, contents, action))
         .with_dataset(dataset(
             dir.path(),
             "details",
             engine,
             mode,
-            empty,
+            contents,
             if mixed_federation {
                 &ZeroResultsAction::ReturnEmpty
             } else {
@@ -189,15 +217,29 @@ async fn check_subqueries(
                 .await?;
             assert_eq!(
                 batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-                if empty { 0 } else { 4 }
+                match (contents, table) {
+                    (Contents::Empty, _) => 0,
+                    (Contents::Partial, "items") => 3,
+                    _ => 4,
+                }
             );
+            if contents == Contents::Partial && table == "items" {
+                assert_eq!(ids(&batches), vec![1, 3, 4]);
+            }
         }
 
         let mut failures = Vec::new();
-        for &(query, expected) in QUERIES {
+        let queries = if contents == Contents::Partial {
+            PARTIAL_QUERIES
+        } else {
+            QUERIES
+        };
+        for &(query, expected) in queries {
             match run_query(&rt, query).await {
                 Ok(batches) => {
-                    let expected = if empty && *action == ZeroResultsAction::ReturnEmpty {
+                    let expected = if contents == Contents::Empty
+                        && *action == ZeroResultsAction::ReturnEmpty
+                    {
                         &[][..]
                     } else {
                         expected
@@ -214,7 +256,7 @@ async fn check_subqueries(
         }
         anyhow::ensure!(
             failures.is_empty(),
-            "{engine} {mode:?}, empty={empty}, {action:?}, mixed_federation={mixed_federation}:\n{}",
+            "{engine} {mode:?}, {contents:?}, {action:?}, mixed_federation={mixed_federation}:\n{}",
             failures.join("\n")
         );
         Ok(())
@@ -232,13 +274,26 @@ async fn check_engine(engine: &str, modes: &[Mode]) -> anyhow::Result<()> {
         .scope(async {
             let mut failures = Vec::new();
             for mode in modes {
-                for empty in [false, true] {
+                for contents in [Contents::Populated, Contents::Empty] {
                     for action in [ZeroResultsAction::UseSource, ZeroResultsAction::ReturnEmpty] {
                         if let Err(error) =
-                            check_subqueries(engine, mode, empty, &action, false).await
+                            check_subqueries(engine, mode, contents, &action, false).await
                         {
                             failures.push(format!("{error:#}"));
                         }
+                    }
+                }
+                for mixed_federation in [false, true] {
+                    if let Err(error) = check_subqueries(
+                        engine,
+                        mode,
+                        Contents::Partial,
+                        &ZeroResultsAction::UseSource,
+                        mixed_federation,
+                    )
+                    .await
+                    {
+                        failures.push(format!("{error:#}"));
                     }
                 }
             }
@@ -247,7 +302,7 @@ async fn check_engine(engine: &str, modes: &[Mode]) -> anyhow::Result<()> {
             if let Err(error) = check_subqueries(
                 engine,
                 &modes[0],
-                false,
+                Contents::Populated,
                 &ZeroResultsAction::UseSource,
                 true,
             )
