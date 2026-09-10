@@ -16,10 +16,12 @@
 """Execute the anonymized BigQuery corpus through the release's real spiced.
 
 Uses the credential, driver and binary contract in bigquery_federation.py. Every
-run creates isolated, empty tables from the offline corpus schemas and deletes
-its datasets on exit. Empty-table execution checks remote SQL acceptance and the
-connector path; it is not a result-correctness oracle. The release gate also runs
-the nonempty federation, pushdown and JSON harnesses with their result oracles.
+run creates isolated tables from the offline corpus schemas and deletes its
+datasets on exit. Most statements execute against empty tables, checking remote
+SQL acceptance and the connector path without a result-correctness oracle. The
+cohort-ratio statements execute last against synthetic rows with exact expected
+results. The release gate also runs the nonempty federation, pushdown and JSON
+harnesses with their result oracles.
 
 Run with the pinned google-cloud-bigquery dependency, or use --self-test to
 validate fixtures and the plan guard without credentials or a running service.
@@ -48,6 +50,7 @@ FIXTURES = (
     / "crates/data-connectors/connector-adbc/src/function_support_tests/fixtures/bigquery"
 )
 TABLE_FREE = {0, 1, 2, 3, 4, 80, 229, 230}
+COHORT_CASES = {168, 169}
 TRANSPORT = {
     "SchemaCastScanExec",
     "CoalescePartitionsExec",
@@ -191,7 +194,7 @@ def spicepod(
                 "runtime": {"caching": {"sql_results": {"enabled": False}}},
                 "datasets": [
                     {
-                        "from": f"adbc:{project}.{datasets[entry['dataset']]}.{entry['table']}",
+                        "from": f"adbc:{datasets[entry['dataset']]}.{entry['table']}",
                         "name": entry["alias"],
                         "params": {
                             "adbc_driver": "bigquery",
@@ -210,8 +213,111 @@ def spicepod(
     )
 
 
-def execute_case(index: int, sql: str, port: int, output: Path) -> dict[str, Any]:
+def seed_cohorts(
+    client: bigquery.Client,
+    project: str,
+    location: str,
+    datasets: dict[str, str],
+    aliases: list[dict[str, Any]],
+    tables: dict[tuple[str, str], list[bigquery.SchemaField]],
+) -> dict[str, Any]:
+    """Populate nonzero denominators and conversions on days one, three, four, seven."""
+    conversions = {
+        101: "2026-04-11T00:00:00Z",
+        102: "2026-04-14T00:00:00Z",
+        201: "2026-04-14T00:00:00Z",
+        301: "2025-04-08T00:00:00Z",
+    }
+    rows = {
+        "v0215": [
+            {
+                "v0177": person,
+                "v0031": "value0110",
+                "v0629": "value0192",
+                "v0367": "2026-04-10T00:00:00Z",
+            }
+            for person in (101, 102)
+        ]
+        + [
+            {
+                "v0177": 201,
+                "v0031": "value0073",
+                "v0565": "value0230",
+                "v0367": "2026-04-11T00:00:00Z",
+            }
+        ],
+        "v0212": [{"id": 401, "v0177": 301}],
+        "v0056": [{"v0175": 401, "v0201": 1.0, "v0090": "2025-04-01T00:00:00Z"}],
+        "v0176": [
+            {"id": person, "v0058": f"person-{person}"} for person in conversions
+        ],
+        "v0426": [
+            {
+                "v0171": f"person-{person}",
+                "type": "value0016",
+                "v0031": "value0231",
+                "v0839": "(value0092)",
+                "v0837": timestamp,
+            }
+            for person, timestamp in conversions.items()
+        ],
+        "v0326": [
+            {"v0177": person, "v0323": timestamp}
+            for person, timestamp in conversions.items()
+        ],
+    }
+    sources = {entry["alias"]: entry for entry in aliases}
+    evidence = {}
+    for alias, records in rows.items():
+        source = sources[alias]
+        table = f"{project}.{datasets[source['dataset']]}.{source['table']}"
+        # LOAD jobs do not enter the QUERY job census. WRITE_EMPTY also rejects
+        # an accidentally reused fixture instead of appending duplicate rows.
+        job = client.load_table_from_json(
+            records,
+            table,
+            location=location,
+            job_config=bigquery.LoadJobConfig(
+                schema=tables[(source["dataset"], source["table"])],
+                write_disposition=bigquery.WriteDisposition.WRITE_EMPTY,
+            ),
+        )
+        job.result(timeout=90)
+        evidence[alias] = {"rows": records, "load_job_id": job.job_id}
+    return evidence
+
+
+def cohort_expected_rows(index: int) -> list[dict[str, Any]]:
+    counts = (
+        ("v0845", "v0846", "v0847") if index == 168 else ("v0849", "v0850", "v0851")
+    )
+    return [
+        {
+            "v0808": day,
+            counts[0]: 1 if day < 4 else 2,
+            "v0810": 2,
+            "v0811": 0.5 if day < 4 else 1.0,
+            counts[1]: int(day >= 3),
+            "v0813": 1,
+            "v0814": float(day >= 3),
+            counts[2]: int(day >= 7),
+            "v0816": 1,
+            "v0817": float(day >= 7),
+        }
+        for day in range(1, 8)
+    ]
+
+
+def execute_case(
+    index: int,
+    sql: str,
+    port: int,
+    output: Path,
+    expected_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     record: dict[str, Any] = {"index": index, "errors": []}
+    if expected_rows is not None:
+        harness.write_json(output / f"{index:03}.expected.json", expected_rows)
     start = time.monotonic()
     for explain in (True, False):
         label = "explain" if explain else "result"
@@ -230,6 +336,10 @@ def execute_case(index: int, sql: str, port: int, output: Path) -> dict[str, Any
                 if not isinstance(rows, list):
                     raise harness.HarnessError("Result must be a JSON row array")
                 record["rows"] = len(rows)
+                if expected_rows is not None and rows != expected_rows:
+                    raise harness.HarnessError(
+                        f"Query {index:03}: rows differ from the nonempty fixture oracle"
+                    )
         except (harness.HarnessError, ValueError, OSError) as error:
             record["errors"].append(str(error))
     record["seconds"] = round(time.monotonic() - start, 3)
@@ -266,7 +376,8 @@ def main() -> int:
     created = []
     process = None
     summary: dict[str, Any] = {
-        "fixture_rows_per_table": 0,
+        "initial_fixture_rows_per_table": 0,
+        "nonempty_query_indexes": sorted(COHORT_CASES),
         "queries": [],
         "errors": [],
         "datasets": datasets,
@@ -320,7 +431,20 @@ def main() -> int:
             harness.wait_until_ready(process, http, timeout=300)
             since = datetime.now(timezone.utc)
             for index, sql in queries:
+                if index in COHORT_CASES:
+                    continue
                 summary["queries"].append(execute_case(index, sql, http, output))
+                harness.write_json(output / "summary.json", summary)
+            # Cohort ratios require nonzero denominators. Seed them only after
+            # the other statements have executed against their empty fixtures.
+            seed = seed_cohorts(client, project, location, datasets, aliases, tables)
+            harness.write_json(output / "cohort-fixtures.json", seed)
+            for index, sql in queries:
+                if index not in COHORT_CASES:
+                    continue
+                summary["queries"].append(
+                    execute_case(index, sql, http, output, cohort_expected_rows(index))
+                )
                 harness.write_json(output / "summary.json", summary)
             until = datetime.now(timezone.utc)
             # One shared observation window avoids waiting 90 seconds per query.

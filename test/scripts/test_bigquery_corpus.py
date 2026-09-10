@@ -154,6 +154,24 @@ class CorpusTests(unittest.TestCase):
                     corpus.execute_case(5, "SELECT x", 1234, Path(directory))["errors"]
                 )
 
+    def test_nonempty_oracle_rejects_empty_or_wrong_rows(self):
+        expected = [{"count": 2, "ratio": 0.5}]
+        for rows in ([], [{"count": 2, "ratio": 0.0}]):
+            with (
+                self.subTest(rows=rows),
+                tempfile.TemporaryDirectory() as directory,
+                patch.object(
+                    corpus.harness,
+                    "http_sql",
+                    side_effect=[(200, {}, explain(FULL)), (200, {}, json.dumps(rows))],
+                ),
+            ):
+                record = corpus.execute_case(
+                    168, "SELECT x", 1234, Path(directory), expected
+                )
+                self.assertEqual(len(record["errors"]), 1)
+                self.assertIn("nonempty fixture oracle", record["errors"][0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,15 +4,18 @@ Run with `cargo test -p connector-adbc --lib bigquery_federation_corpus`.
 The test also runs in the normal workspace Rust test suite. It needs no driver,
 credentials, service or network connection.
 
-The integration workflow's `run_all_tests` release gate executes every corpus
+The E2E Test CI workflow's `run_all_tests` release gate executes every corpus
 statement through real BigQuery using `test/scripts/bigquery_corpus.py`. It creates
-isolated empty tables from `schemas.json`, checks federation plans and successful
+isolated tables from `schemas.json`, checks federation plans and successful
 execution, and requires 263 successful data-query jobs. The eight table-free
-statements execute locally. Empty-table execution does not establish result
-correctness; the gate also runs the nonempty federation, pushdown and JSON
-harnesses in `test/scripts/`, which compare results with explicit oracles.
+statements execute locally. Queries 168 and 169 divide by cohort counts, so they
+execute last against synthetic cohorts with nonzero denominators and exact
+expected results. The other queries execute against empty tables, which does not
+establish result correctness. The gate also runs the nonempty federation,
+pushdown and JSON harnesses in `test/scripts/` with explicit result oracles.
 
-These tests build `spiced` from the tested commit and use the pinned ADBC driver.
+These tests reuse the Linux `spiced` artifact from the same E2E workflow run and
+use the pinned ADBC driver.
 They require the `BIGQUERY_SERVICE_ACCOUNT_JSON` repository secret; missing
 credentials fail the gate. The service account needs query-job and dataset/table creation/deletion
 permissions in its own project. Each harness deletes its datasets on exit, and
