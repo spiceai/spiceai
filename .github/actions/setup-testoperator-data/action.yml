@@ -12,10 +12,26 @@ inputs:
       - 'tpcds'
       - 'clickbench'
       - 'scenario'
+  scale_factor:
+    description: 'Scale factor of the fixture data'
+    required: false
+    default: '1'
 
 runs:
   using: 'composite'
   steps:
+    - name: Select fixture scale
+      id: scale
+      shell: bash
+      env:
+        SCALE_FACTOR: ${{ inputs.scale_factor }}
+      run: |
+        if [[ ! "$SCALE_FACTOR" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ -z "${SCALE_FACTOR//[0.]/}" ]]; then
+          echo "Error: scale_factor must be a positive number"
+          exit 1
+        fi
+        echo "directory_scale=${SCALE_FACTOR//./_}" >> "$GITHUB_OUTPUT"
+
     - name: Prepare file-based data directory (Linux/macOS)
       if: runner.os != 'Windows'
       shell: bash
@@ -38,7 +54,7 @@ runs:
       if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]' || inputs.query_set == 'scenario') && runner.os != 'Windows'
       run: |
         cd /opt/spiced/data
-        mc cp spice-minio/benchmarks/tpch_sf1/tpch.db ./
+        mc cp spice-minio/benchmarks/tpch_sf${{ steps.scale.outputs.directory_scale }}/tpch.db ./
 
     - name: Download DuckDB TPCH Data (Windows)
       shell: pwsh
@@ -46,14 +62,14 @@ runs:
       run: |
         $ErrorActionPreference = 'Stop'
         cd C:\spiced\data
-        mc cp spice-minio/benchmarks/tpch_sf1/tpch.db ./
+        mc cp spice-minio/benchmarks/tpch_sf${{ steps.scale.outputs.directory_scale }}/tpch.db ./
 
     - name: Download DuckDB TPCDS Data (Linux/macOS)
       shell: bash
       if: inputs.query_set == 'tpcds' && runner.os != 'Windows'
       run: |
         cd /opt/spiced/data
-        mc cp spice-minio/benchmarks/tpcds_sf1/tpcds.db ./
+        mc cp spice-minio/benchmarks/tpcds_sf${{ steps.scale.outputs.directory_scale }}/tpcds.db ./
 
     - name: Download DuckDB TPCDS Data (Windows)
       shell: pwsh
@@ -61,14 +77,14 @@ runs:
       run: |
         $ErrorActionPreference = 'Stop'
         cd C:\spiced\data
-        mc cp spice-minio/benchmarks/tpcds_sf1/tpcds.db ./
+        mc cp spice-minio/benchmarks/tpcds_sf${{ steps.scale.outputs.directory_scale }}/tpcds.db ./
 
     - name: Download File Connector TPCH Data (Linux/macOS)
       shell: bash
       if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]' || inputs.query_set == 'scenario') && runner.os != 'Windows'
       run: |
         cd /opt/spiced/data
-        mc cp --recursive spice-minio/benchmarks/tpch_sf1/ ./
+        mc cp --recursive spice-minio/benchmarks/tpch_sf${{ steps.scale.outputs.directory_scale }}/ ./
 
     - name: Download File Connector TPCH Data (Windows)
       shell: pwsh
@@ -76,14 +92,14 @@ runs:
       run: |
         $ErrorActionPreference = 'Stop'
         cd C:\spiced\data
-        mc cp --recursive spice-minio/benchmarks/tpch_sf1/ ./
+        mc cp --recursive spice-minio/benchmarks/tpch_sf${{ steps.scale.outputs.directory_scale }}/ ./
 
     - name: Download File Connector TPCDS Data (Linux/macOS)
       shell: bash
       if: inputs.query_set == 'tpcds' && runner.os != 'Windows'
       run: |
         cd /opt/spiced/data
-        mc cp --recursive spice-minio/benchmarks/tpcds_sf1/ ./
+        mc cp --recursive spice-minio/benchmarks/tpcds_sf${{ steps.scale.outputs.directory_scale }}/ ./
         mkdir ./sf0_01
         cd ./sf0_01
         mc cp --recursive spice-minio/benchmarks/tpcds_sf0_01/ ./
@@ -94,7 +110,7 @@ runs:
       run: |
         $ErrorActionPreference = 'Stop'
         cd C:\spiced\data
-        mc cp --recursive spice-minio/benchmarks/tpcds_sf1/ ./
+        mc cp --recursive spice-minio/benchmarks/tpcds_sf${{ steps.scale.outputs.directory_scale }}/ ./
         New-Item -ItemType Directory -Force -Path .\sf0_01 | Out-Null
         cd .\sf0_01
         mc cp --recursive spice-minio/benchmarks/tpcds_sf0_01/ ./

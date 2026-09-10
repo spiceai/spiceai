@@ -53,6 +53,16 @@ on:
           - 'postgres-catalog'
           - 'mysql-catalog'
           - 'mssql-catalog'
+          - 'arrow'
+          - 'bigquery'
+          - 'dynamodb'
+          - 'scylladb'
+          - 'turso'
+      scale_factor:
+        description: 'Scale factor for the data and queries'
+        required: false
+        type: string
+        default: '1'
       runner_type:
         description: 'Runner type'
         required: true
@@ -93,11 +103,24 @@ jobs:
 
       - name: Set spicepod path
         id: set_spicepod_path
+        env:
+          QUERY_SET: ${{ github.event.inputs.query_set }}
+          SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
+          SPICEPOD_FILE: ${{ github.event.inputs.spicepod_path }}
         run: |
-          query_set="${{ github.event.inputs.query_set }}"
+          if [[ ! "$SCALE_FACTOR" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ -z "${SCALE_FACTOR//[0.]/}" ]]; then
+            echo "Error: scale_factor must be a positive number"
+            exit 1
+          fi
+          query_set="$QUERY_SET"
           query_set="${query_set%%\[*\]*}"
-          SPICEPOD_PATH="./test/spicepods/${query_set}/sf1/${{ github.event.inputs.spicepod_path }}"
-          echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
+          fixture_scale="${SCALE_FACTOR//./_}"
+          SPICEPOD_PATH="./test/spicepods/${query_set}/sf${fixture_scale}/${SPICEPOD_FILE}"
+          {
+            echo "SPICEPOD_PATH=${SPICEPOD_PATH}"
+            echo "query_set=${query_set}"
+            echo "fixture_scale=${fixture_scale}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Validate spicepod file exists
         run: |
@@ -141,13 +164,15 @@ jobs:
         uses: ./.github/actions/setup-testoperator-data
         with:
           query_set: ${{ github.event.inputs.query_set }}
+          scale_factor: ${{ github.event.inputs.scale_factor }}
 
       - name: Setup MySQL
+        env:
+          QUERY_SET: ${{ steps.set_spicepod_path.outputs.query_set }}
+          FIXTURE_SCALE: ${{ steps.set_spicepod_path.outputs.fixture_scale }}
         run: |
-          if [[ ${{ github.event.inputs.query_set }} == "tpcds" ]]; then
-            echo "MYSQL_DB=tpcds_sf1" >> $GITHUB_ENV
-          elif [[ ${{ github.event.inputs.query_set }} == "tpch" ]]; then
-            echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
+          if [[ "$QUERY_SET" == "tpcds" || "$QUERY_SET" == "tpch" ]]; then
+            echo "MYSQL_DB=${QUERY_SET}_sf${FIXTURE_SCALE}" >> "$GITHUB_ENV"
           fi
 
       - name: Install OpenMP runtime library
@@ -163,6 +188,7 @@ jobs:
             -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
+            --scale-factor "$TEST_SCALE_FACTOR" \
             --ready-wait 900 \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
@@ -173,6 +199,7 @@ jobs:
             ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }} \
             --metrics
         env:
+          TEST_SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY}}
