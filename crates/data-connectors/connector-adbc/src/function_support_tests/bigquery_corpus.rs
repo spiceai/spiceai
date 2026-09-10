@@ -247,11 +247,11 @@ fn percentile_window_partial(plan: &dyn ExecutionPlan) -> std::result::Result<()
                 return Err(format!("unexpected local window functions: {functions:?}"));
             }
             windows += 1;
-        } else if !transport(node, child.as_ref())
-            && !(node.is::<ProjectionExec>() && windows == 0)
-            && !node.is::<SortExec>()
-            && !node.is::<SortPreservingMergeExec>()
-            && !node.is::<RepartitionExec>()
+        } else if !(transport(node, child.as_ref())
+            || (node.is::<ProjectionExec>() && windows == 0)
+            || node.is::<SortExec>()
+            || node.is::<SortPreservingMergeExec>()
+            || node.is::<RepartitionExec>())
         {
             return Err(format!("unexpected local percentile work: {}", node.name()));
         }
