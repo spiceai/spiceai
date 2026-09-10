@@ -506,7 +506,7 @@ fn system_prompt_is_template_with_variables(prompt: &str) -> bool {
 /// [`ChatWrapper::with_stream_usage`] sets `include_usage` on every streaming
 /// request and leaves `include_obfuscation` unset, so this shape is what Spice puts
 /// on the wire for *all* streamed chat completions. Without the patch each of them
-/// carries `"include_obfuscation": null`, and the OpenAI-compatible servers that
+/// carries `"include_obfuscation": null`, and the `OpenAI`-compatible servers that
 /// reject fields they do not know — NVIDIA NIM is the one the fork names — refuse
 /// the request outright rather than degrading.
 ///

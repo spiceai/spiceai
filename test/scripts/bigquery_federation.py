@@ -660,6 +660,7 @@ def main() -> int:
             reference = bigquery.Dataset(f"{project}.{dataset}")
             reference.location = location
             reference.labels = {"purpose": "spice-bigquery-federation"}
+            reference.default_table_expiration_ms = 86_400_000
             try:
                 created.append(client.create_dataset(reference))
             except Conflict as error:
