@@ -257,7 +257,8 @@ so the rows below name the contracts, not every commit.
 | Scheduler lock hygiene across persists and awaits (fork PR #60) | Cluster wedge / runtime freeze under load | silent (hang) | **GAP** |
 | Don't swap null-aware anti joins in `JoinSelection` (fork PR #58) | A distributed anti-join returns wrong rows | silent (wrong data) | `crates/runtime/src/cluster/datafusion/mod.rs::a_null_among_the_values_leaves_no_row_selected`, `…::a_null_among_the_values_leaves_no_row_selected_where_no_swap_is_profitable`, `…::values_without_a_null_select_every_probe_absent_from_them`, `…::the_rule_neither_swaps_the_sides_nor_drops_the_flag` — these drive the scheduler's own rule rather than a live cluster, because a distributed `NOT IN` currently fails before it can return rows (the rule forces `CollectLeft` on a stage whose left input is already hash-partitioned, and `to_resolved` cannot repartition) |
 | Vortex columnar shuffle format (fork PR #7) | Shuffles fall back to Arrow IPC | build | compile-guarded |
-| Stuck-query detection and stale `TaskStatus` rejection (fork PRs #39, #53) | A reset partition's stale status is accepted, corrupting the execution graph | silent | **GAP** |
+| Stale `TaskStatus` rejection for reset partitions (fork PR #53) | A status update already in flight when its executor was lost arrives for a partition whose task info the reset cleared. Upstream unwraps that `None`, and the panic lands on the scheduler event-loop worker: the event channel closes and every later job submission and executor heartbeat fails with `Fail to send event due to channel closed` — one late packet wedges the cluster | silent (panic, then cluster wedge) | `crates/runtime/src/cluster/datafusion/mod.rs::stale_status_for_a_reset_partition::a_status_for_a_partition_with_no_scheduled_task_is_refused`, asserted against `RunningStage::update_task_info` on a stage in the state a reset leaves. Driving the real reset would be closer to the incident, but `ExecutionGraph::pop_next_task` is `#[cfg(test)]` on the fork and unreachable from here |
+| Stuck-query detection (fork PR #39) | A distributed query that stops making progress is not reported, so it has to be diagnosed by rerunning it | silent (no diagnostic) | **GAP** — the detection runs on the scheduler's own timer against live executor state, and the scheduler's task-issuing API is `#[cfg(test)]` on the fork, so there is no way from here to drive a query into the stuck state |
 
 ## datafusion-federation and datafusion-table-providers
 
@@ -548,11 +549,10 @@ They are not equal in consequence; this is the order to close them in.
 
 **Wrong data or wrong text, silently.** These change what a user gets back:
 
-1. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
-   PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
-   `ballista_scheduler::test_utils` is public and the fork's own
-   `test_task_update_after_reset_stage` is portable, which makes this the most
-   reachable of the remaining rows.
+1. `datafusion-ballista` stuck-query detection (fork PR #39) — a query that stops
+   making progress goes unreported. Its sibling, stale `TaskStatus` rejection, is
+   now guarded; this half needs the scheduler driven into the stuck state, and the
+   task-issuing API for that is `#[cfg(test)]` on the fork.
 2. `mistral.rs` `tool_calls` chat-template handling.
 3. `text-embeddings-inference` pooling and model-loading fixes — embeddings
    differ from the reference implementation.
