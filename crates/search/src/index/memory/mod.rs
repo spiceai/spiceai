@@ -41,7 +41,7 @@ use itertools::Itertools;
 use llms::embeddings::Embed;
 use parking_lot::RwLock;
 use snafu::{ResultExt, Snafu, ensure};
-use spice_table::{Index, WriteWindow};
+use spice_table::{GroupPruning, Index, WriteWindow};
 
 use crate::index::{
     SearchIndex, VectorIndex, embedding_col,
@@ -209,11 +209,12 @@ impl MemoryVectorIndex {
         for (key, vector) in primary_keys.iter().zip(embedding_vectors.iter()) {
             rows.push(match (key, vector) {
                 (Some(key), Some(vector)) => {
-                    // All-zero / all-NaN vectors have no defined direction and
-                    // would corrupt similarity scores — skip them.
-                    if vector.iter().all(|&v| v == 0.0 || v.is_nan()) {
+                    // A vector with no defined direction would corrupt similarity scores —
+                    // skip it, and evict whatever the key already holds.
+                    if let Some(rejection) = write_util::classify_vector(vector) {
+                        let reason = rejection.reason();
                         tracing::warn!(
-                            "Skipping record '{key}' for memory vector index '{INDEX_NAME}': Embedding vector is all zeroes or contains only invalid values. Any vector already stored for this record is removed, so it is not returned at its previous value"
+                            "Skipping record '{key}' for memory vector index '{INDEX_NAME}': {reason}. Any vector already stored for this record is removed, so it is not returned at its previous value"
                         );
                         Some((key.as_str(), write_util::RowOutcome::Rejected))
                     } else {
@@ -361,6 +362,25 @@ impl Index for MemoryVectorIndex {
                 .collect::<Vec<_>>();
 
         self.store.write().delete_by_keys(&key_strings)
+    }
+
+    async fn delete_group_remainder(
+        &self,
+        group_columns: &[String],
+        members: RecordBatch,
+    ) -> Result<(), DataFusionError> {
+        let member_keys =
+            write_util::extract_and_format_primary_key(INDEX_NAME, &self.primary_key, &members)
+                .map_err(|e| DataFusionError::External(Box::new(*e)))?;
+        let member_keys: HashSet<&str> = member_keys.iter().flatten().map(String::as_str).collect();
+
+        self.store
+            .write()
+            .delete_group_remainder(group_columns, &members, &member_keys)
+    }
+
+    fn group_pruning(&self) -> GroupPruning {
+        GroupPruning::Complete
     }
 
     /// Entries live in this index's own store, not in the accelerated table row, so a
@@ -517,7 +537,8 @@ impl VectorIndex for MemoryVectorIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
+    use crate::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex, DelimChunker};
+    use arrow::array::{Int64Array, StringArray, UInt64Array};
     use datafusion_expr::{Volatility, create_udf};
     use llms::embeddings::EmbeddingInput;
 
@@ -528,6 +549,9 @@ mod tests {
     struct ByteEmbed;
 
     fn byte_vector(text: &str) -> Vec<f32> {
+        if let Some(shape) = unindexable_shape(text) {
+            return shape;
+        }
         let dim = usize::try_from(DIM).expect("DIM is positive");
         let mut vector = vec![0.0_f32; dim];
         for (i, b) in text.bytes().enumerate() {
@@ -565,6 +589,23 @@ mod tests {
                 ))
             }),
         ))
+    }
+
+    /// Text that embeds to the `n`th shape of [`write_util::unindexable_shapes`], so a row
+    /// can carry one through the real embed -> classify -> store path.
+    fn unindexable_text(n: usize) -> String {
+        format!("\u{1}shape:{n}")
+    }
+
+    /// Resolve [`unindexable_text`] back to its vector, so the fixture cannot cover a
+    /// narrower set than the classifier's own test does.
+    fn unindexable_shape(text: &str) -> Option<Vec<f32>> {
+        let n: usize = text.strip_prefix("\u{1}shape:")?.parse().ok()?;
+        let dim = usize::try_from(DIM).expect("DIM is positive");
+        write_util::unindexable_shapes(dim)
+            .into_iter()
+            .nth(n)
+            .map(|(_, vector, _)| vector)
     }
 
     fn memory_index() -> MemoryVectorIndex {
@@ -1026,5 +1067,170 @@ mod tests {
             }
         }
         None
+    }
+
+    /// A memory index shaped as the inner index of a [`ChunkedSearchIndex`]: keyed by the
+    /// source row's `id` plus the chunk id, one stored row per chunk.
+    fn chunked_memory_index() -> Arc<MemoryVectorIndex> {
+        Arc::new(
+            MemoryVectorIndex::try_new(
+                "content".to_string(),
+                ChunkedSearchIndex::augment_primary_key(vec![Field::new(
+                    "id",
+                    DataType::Int64,
+                    false,
+                )]),
+                MetadataColumns::none(),
+                Arc::new(ByteEmbed),
+                embed_udf(),
+                "model_name".to_string(),
+                MemoryDistanceMetric::Cosine,
+            )
+            .expect("valid memory index"),
+        )
+    }
+
+    /// The chunk ids the store holds for source row `id`, ascending.
+    fn stored_chunk_ids(index: &MemoryVectorIndex, id: i64) -> Vec<u64> {
+        let store = index.store.read();
+        let mut chunk_ids = Vec::new();
+        for b in store.batches() {
+            let ids = b
+                .column_by_name("id")
+                .expect("the stored schema carries the base key")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+            let chunks = b
+                .column_by_name(CHUNKED_INDEX_CHUNK_KEY)
+                .expect("the stored schema carries the chunk id")
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("the chunk id is UInt64");
+            for row in 0..b.num_rows() {
+                if ids.value(row) == id {
+                    chunk_ids.push(chunks.value(row));
+                }
+            }
+        }
+        chunk_ids.sort_unstable();
+        chunk_ids
+    }
+
+    /// Source rows as the chunking layer receives them: the base key and the text to chunk.
+    fn content_rows(rows: &[(i64, &str)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("valid test batch")
+    }
+
+    /// A row rewritten to text that chunks into *fewer* pieces than before names only the chunk
+    /// ids it still produces, so the upsert in the store overwrites those and leaves every
+    /// higher chunk id from the superseded text in place — the row stays searchable by a word
+    /// its current text does not contain.
+    ///
+    /// Regression test for #13717, over the real memory index rather than a test double: the
+    /// chunking layer has to tell the store which chunks of the row survive, and the store has
+    /// to drop the rest of that row's group.
+    #[tokio::test]
+    async fn a_chunked_index_drops_the_chunks_a_shorter_text_no_longer_produces() {
+        let inner = chunked_memory_index();
+        let idx = ChunkedSearchIndex::new(
+            Arc::clone(&inner) as Arc<dyn SearchIndex>,
+            Arc::new(DelimChunker { delim: ' ' }),
+        );
+
+        idx.write(content_rows(&[(1, "aaa bbb"), (2, "ddd eee")]))
+            .await
+            .expect("the first write lands");
+        assert_eq!(stored_chunk_ids(&inner, 1), vec![0, 1]);
+        assert_eq!(stored_chunk_ids(&inner, 2), vec![0, 1]);
+
+        idx.write(content_rows(&[(1, "ccc")]))
+            .await
+            .expect("the rewrite lands");
+
+        assert_eq!(
+            stored_chunk_ids(&inner, 1),
+            vec![0],
+            "the chunk 'bbb' produced goes with the text that produced it"
+        );
+        assert_eq!(
+            stored_chunk_ids(&inner, 2),
+            vec![0, 1],
+            "a row the write did not touch keeps every chunk"
+        );
+    }
+
+    /// Regression test for #13872. One batch carries id=1 twice and the row that *decides*
+    /// it embeds to a vector the index cannot use. Before the shared classifier, only the
+    /// all-zero / all-NaN shapes were a rejection here, so a partially non-finite deciding
+    /// row evicted nothing: search kept answering id=1 at the vector its previous text
+    /// produced, and the unusable vector was stored beside it.
+    #[tokio::test]
+    async fn every_unindexable_shape_evicts_its_key_and_stores_nothing() {
+        let dim = usize::try_from(DIM).expect("DIM is positive");
+        for (n, (name, _, _)) in write_util::unindexable_shapes(dim).into_iter().enumerate() {
+            let index = memory_index();
+            let deciding = unindexable_text(n);
+            write_batch(
+                &index,
+                batch_with_contents(
+                    &[1, 2, 1],
+                    &[Some("first"), Some("other"), Some(deciding.as_str())],
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                indexed_ids(&index),
+                vec![2],
+                "id=1's deciding row embeds to a {name} vector, so no vector for it may \
+                 remain searchable"
+            );
+            assert_eq!(
+                stored_vector(&index, 1),
+                None,
+                "the vector of the text the same batch replaced is exactly what must not \
+                 survive"
+            );
+        }
+    }
+
+    /// The fixture is only meaningful if the sentinel texts really embed to the shapes the
+    /// classifier rejects — otherwise the guard above passes for the wrong reason.
+    #[test]
+    fn the_unindexable_fixture_really_embeds_to_a_rejected_vector() {
+        let dim = usize::try_from(DIM).expect("DIM is positive");
+        for (n, (name, vector, expected)) in
+            write_util::unindexable_shapes(dim).into_iter().enumerate()
+        {
+            let embedded = byte_vector(&unindexable_text(n));
+            // `total_cmp` rather than `==`, so `NaN` compares equal to itself and the two
+            // vectors are held to the bit patterns they actually carry. Lengths first,
+            // because `zip` would otherwise pass a prefix off as the whole shape.
+            assert_eq!(embedded.len(), vector.len());
+            assert!(
+                embedded
+                    .iter()
+                    .zip(vector.iter())
+                    .all(|(a, b)| a.total_cmp(b) == std::cmp::Ordering::Equal),
+                "the sentinel text for {name} must embed to that shape"
+            );
+            assert_eq!(write_util::classify_vector(&embedded), Some(expected));
+        }
     }
 }

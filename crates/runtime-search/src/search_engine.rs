@@ -667,7 +667,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
                     Ok((tbl.clone(), agg_result))
                 }
-            }).collect::<Vec<_>>()).await?.into_iter().filter_map(|(tbl, result)| Some((tbl, result?))).collect();
+            })).await?.into_iter().filter_map(|(tbl, result)| Some((tbl, result?))).collect();
 
             Ok(response)
 

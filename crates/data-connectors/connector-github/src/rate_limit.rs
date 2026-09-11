@@ -209,6 +209,7 @@ impl RateLimiter for GitHubRateLimiter {
 mod tests {
     use super::*;
     use chrono::Duration;
+    use futures::{FutureExt, poll};
     use reqwest::header::HeaderValue;
     use std::collections::HashMap;
 
@@ -227,11 +228,11 @@ mod tests {
         s.to_string()
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_rate_limiter_api_limits() {
         let rate_limiter = GitHubRateLimiter::new();
 
-        let wait_duration = Duration::seconds(2);
+        let wait_duration = Duration::hours(1);
         let reset_time = Utc::now() + wait_duration;
 
         // Set up API headers indicating rate limit exceeded
@@ -245,18 +246,20 @@ mod tests {
 
         rate_limiter.update_from_headers(&headers).await;
 
-        let start = tokio::time::Instant::now();
-        rate_limiter
-            .check_rate_limit()
-            .await
-            .expect("rate limit check failed");
-        let elapsed = start.elapsed();
-
+        let mut wait = std::pin::pin!(rate_limiter.check_rate_limit());
         assert!(
-            elapsed.as_millis() >= 1000,
-            "Expected to wait at least 1000ms, but only waited {}ms",
-            elapsed.as_millis()
+            poll!(&mut wait).is_pending(),
+            "an exhausted quota must wait"
         );
+        tokio::time::advance(std::time::Duration::from_mins(30)).await;
+        assert!(
+            poll!(&mut wait).is_pending(),
+            "quota reset is still in the future"
+        );
+        tokio::time::advance(std::time::Duration::from_mins(30)).await;
+        wait.now_or_never()
+            .expect("quota reset must release the request")
+            .expect("rate limit check failed");
     }
 
     #[tokio::test]
@@ -278,14 +281,11 @@ mod tests {
         rate_limiter.update_from_headers(&headers).await;
 
         // Should proceed without waiting
-        let start = std::time::Instant::now();
         rate_limiter
             .check_rate_limit()
-            .await
+            .now_or_never()
+            .expect("a healthy quota must not schedule a wait")
             .expect("rate limit check failed");
-        let elapsed = start.elapsed();
-
-        assert!(elapsed.as_millis() < 100);
     }
 
     #[tokio::test]
@@ -305,57 +305,50 @@ mod tests {
 
         rate_limiter.update_from_headers(&headers).await;
 
-        let start = std::time::Instant::now();
         rate_limiter
             .check_rate_limit()
-            .await
+            .now_or_never()
+            .expect("a healthy small public quota must not schedule a wait")
             .expect("rate limit check failed");
-        let elapsed = start.elapsed();
-
-        assert!(
-            elapsed.as_millis() < 100,
-            "Expected no wait for a healthy small public quota, but waited {}ms",
-            elapsed.as_millis()
-        );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_secondary_rate_limit() {
         let rate_limiter = GitHubRateLimiter::new();
 
         // Set up headers indicating secondary rate limit
-        let headers = create_test_headers(HashMap::from([
-            ("retry-after", s("2")), // 2 second retry-after
-        ]));
+        let headers = create_test_headers(HashMap::from([("retry-after", s("3600"))]));
 
         rate_limiter.update_from_headers(&headers).await;
 
-        let start = tokio::time::Instant::now();
-        rate_limiter
-            .check_rate_limit()
-            .await
+        let mut wait = std::pin::pin!(rate_limiter.check_rate_limit());
+        assert!(
+            poll!(&mut wait).is_pending(),
+            "Retry-After must schedule a wait"
+        );
+        tokio::time::advance(std::time::Duration::from_mins(30)).await;
+        assert!(
+            poll!(&mut wait).is_pending(),
+            "Retry-After is still in the future"
+        );
+        tokio::time::advance(std::time::Duration::from_mins(30)).await;
+        wait.now_or_never()
+            .expect("Retry-After must release the request")
             .expect("rate limit check failed");
-        let elapsed = start.elapsed();
-
-        // Should have waited at least until retry-after time
-        assert!(elapsed.as_millis() >= 1900); // slightly less than 2000 to account for timing variations
     }
 
     #[test]
     fn test_secondary_rate_limit_parsing() {
         let headers = create_test_headers(HashMap::from([("retry-after", s("30"))]));
 
+        let before = Utc::now() + Duration::seconds(30);
         let rate_limit = RateLimitInfo::from_headers(&headers);
+        let after = Utc::now() + Duration::seconds(30);
         match rate_limit {
             Some(RateLimitInfo::Secondary(info)) => {
-                let expected_retry_after = Utc::now() + Duration::seconds(30);
-                // Allow for small timing differences during test execution
-                let difference = (info.retry_after - expected_retry_after)
-                    .abs()
-                    .num_seconds();
                 assert!(
-                    difference <= 1,
-                    "Retry-after time should be approximately 30 seconds from now"
+                    (before..=after).contains(&info.retry_after),
+                    "Retry-After must be relative to the header parsing time"
                 );
             }
             _ => panic!("Expected Secondary rate limit info"),
@@ -405,12 +398,8 @@ mod tests {
                 assert_eq!(info.used, 10);
                 assert_eq!(info.resource, "graphql");
 
-                // Allow for small timing differences during test execution
-                let difference = (info.reset_time - reset_time).abs().num_seconds();
-                assert!(
-                    difference <= 1,
-                    "Reset time should match the provided timestamp"
-                );
+                assert_eq!(info.reset_time.timestamp(), reset_time.timestamp());
+                assert_eq!(info.reset_time.timestamp_subsec_nanos(), 0);
             }
             _ => panic!("Expected Primary rate limit info"),
         }

@@ -110,7 +110,7 @@ impl RuntimeServer {
     async fn all_tools(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         let tools = self.tools.read().await;
         let mut result = Vec::new();
-        for (_, tooling) in tools.iter() {
+        for tooling in tools.values() {
             match tooling {
                 Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
                     result.push(Arc::clone(tool));
