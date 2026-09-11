@@ -1634,16 +1634,6 @@ mod tests {
 
     const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
     const SMB2_FLAGS_RESPONSE: u32 = 0x0000_0001;
-
-    #[test]
-    fn status_error_names_the_share_root_for_an_empty_path() {
-        let err = smb_status_to_io_error(0xC000_000D, "");
-        assert_eq!(err.kind(), io::ErrorKind::Other);
-        assert_eq!(err.to_string(), "SMB error 0xC000000D for <share root>");
-
-        let err = smb_status_to_io_error(0xC000_000D, "sub");
-        assert_eq!(err.to_string(), "SMB error 0xC000000D for sub");
-    }
     const TEST_USERNAME: &str = "spicetester";
     const TEST_PASSWORD: &str = "s3cret-pw!";
     const TEST_DOMAIN: &str = "WORKGROUP";
@@ -1909,6 +1899,16 @@ mod tests {
         let result = client.tree_connect("data").await;
         let client_sig_ok = server.await.expect("mock server task");
         (result, client_sig_ok)
+    }
+
+    #[test]
+    fn status_error_names_the_share_root_for_an_empty_path() {
+        let err = smb_status_to_io_error(0xC000_000D, "");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "SMB error 0xC000000D for <share root>");
+
+        let err = smb_status_to_io_error(0xC000_000D, "sub");
+        assert_eq!(err.to_string(), "SMB error 0xC000000D for sub");
     }
 
     /// Regression test for #11148: the signing key must be derived from a

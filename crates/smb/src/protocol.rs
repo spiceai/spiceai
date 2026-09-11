@@ -414,8 +414,9 @@ pub const CREATE_OPTION_DELETE_ON_CLOSE: u32 = 0x0000_1000;
 /// size declares that at least one byte of dynamic data follows the fixed
 /// part, so an empty buffer still has to carry one zero byte: Samba's
 /// `smbd_smb2_request_verify_sizes` answers a frame with no dynamic bytes
-/// with `STATUS_INVALID_PARAMETER` (0xC000000D), while Windows accepts it.
-/// The share root is the common case: its path is the empty string.
+/// with `STATUS_INVALID_PARAMETER` (0xC000000D); servers that do not enforce
+/// the minimum accept the shorter frame, so the gap only shows against
+/// Samba. The share root is the common case: its path is the empty string.
 fn put_variable_buffer(buf: &mut BytesMut, bytes: &[u8]) {
     if bytes.is_empty() {
         buf.put_u8(0);
@@ -1011,13 +1012,11 @@ mod tests {
     fn encode_create_request_with_name_has_no_padding() {
         let mut buf = BytesMut::new();
         encode_create_request(&mut buf, "sub", 0, 0, 0, 0);
-        let name_len = "sub".encode_utf16().count() * 2;
-        assert_eq!(buf.len(), 56 + name_len);
+        // "sub" is 3 UTF-16 code units: 6 dynamic bytes, so no padding byte.
+        assert_eq!(buf.len(), 56 + 6);
         assert_eq!(
-            usize::from(u16::from_le_bytes(
-                buf[46..48].try_into().expect("test fixture")
-            )),
-            name_len
+            u16::from_le_bytes(buf[46..48].try_into().expect("test fixture")),
+            6
         );
     }
 
