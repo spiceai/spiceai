@@ -732,25 +732,88 @@ fn mcp_server_config(mcp_config: Option<&McpConfig>) -> StreamableHttpServerConf
 /// Rebuilds [`StreamableHttpService`] when [`McpSchemaSnapshot::epoch`]
 /// changes so rmcp cannot keep a cached `get_tool == None` after a tool
 /// is registered.
+///
+/// Tower clones share this state (via [`Arc`]) so concurrent `/v1/mcp`
+/// requests cannot fork `inner` and `loaded_epoch`. Reloads recheck the
+/// epoch, rebuild, publish the service, and store the counter under the
+/// same write lock; splitting those updates lets a stale rebuild overwrite
+/// a newer service and then lose the epoch store (`inner=S1`, `loaded=2`).
 #[cfg(feature = "mcp")]
-struct EpochReloadingMcpService {
-    inner: StdRwLock<StreamableHttpService<RuntimeServer, LocalSessionManager>>,
-    schemas: Arc<McpSchemaSnapshot>,
+struct EpochReloading<T> {
+    inner: StdRwLock<T>,
+    epoch: Arc<dyn Fn() -> u64 + Send + Sync>,
     loaded_epoch: AtomicU64,
-    rebuild:
-        Arc<dyn Fn() -> StreamableHttpService<RuntimeServer, LocalSessionManager> + Send + Sync>,
+    rebuild: Arc<dyn Fn() -> T + Send + Sync>,
 }
 
 #[cfg(feature = "mcp")]
-impl Clone for EpochReloadingMcpService {
-    fn clone(&self) -> Self {
+impl<T: Clone> EpochReloading<T> {
+    fn new(
+        initial_epoch: u64,
+        epoch: impl Fn() -> u64 + Send + Sync + 'static,
+        rebuild: impl Fn() -> T + Send + Sync + 'static,
+    ) -> Self {
+        let rebuild = Arc::new(rebuild);
         Self {
-            inner: StdRwLock::new(self.current()),
-            schemas: Arc::clone(&self.schemas),
-            loaded_epoch: AtomicU64::new(self.loaded_epoch.load(Ordering::Acquire)),
-            rebuild: Arc::clone(&self.rebuild),
+            inner: StdRwLock::new(rebuild()),
+            epoch: Arc::new(epoch),
+            loaded_epoch: AtomicU64::new(initial_epoch),
+            rebuild,
         }
     }
+
+    fn current(&self) -> T {
+        let epoch = (self.epoch)();
+        if self.loaded_epoch.load(Ordering::Acquire) == epoch {
+            if let Ok(inner) = self.inner.read() {
+                return inner.clone();
+            }
+            return (self.rebuild)();
+        }
+
+        match self.inner.write() {
+            Ok(mut inner) => {
+                let epoch = (self.epoch)();
+                if self.loaded_epoch.load(Ordering::Acquire) != epoch {
+                    *inner = (self.rebuild)();
+                    self.loaded_epoch.store(epoch, Ordering::Release);
+                }
+                inner.clone()
+            }
+            Err(_) => (self.rebuild)(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_initial(
+        initial: T,
+        initial_epoch: u64,
+        epoch: impl Fn() -> u64 + Send + Sync + 'static,
+        rebuild: impl Fn() -> T + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner: StdRwLock::new(initial),
+            epoch: Arc::new(epoch),
+            loaded_epoch: AtomicU64::new(initial_epoch),
+            rebuild: Arc::new(rebuild),
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> (u64, T) {
+        let inner = self
+            .inner
+            .read()
+            .expect("epoch reload lock is not poisoned in tests");
+        let loaded = self.loaded_epoch.load(Ordering::Acquire);
+        (loaded, inner.clone())
+    }
+}
+
+#[cfg(feature = "mcp")]
+#[derive(Clone)]
+struct EpochReloadingMcpService {
+    state: Arc<EpochReloading<StreamableHttpService<RuntimeServer, LocalSessionManager>>>,
 }
 
 #[cfg(feature = "mcp")]
@@ -762,28 +825,18 @@ impl EpochReloadingMcpService {
         + Sync
         + 'static,
     ) -> Self {
-        let initial = rebuild();
+        let epoch_schemas = Arc::clone(&schemas);
         Self {
-            inner: StdRwLock::new(initial),
-            loaded_epoch: AtomicU64::new(schemas.epoch()),
-            schemas,
-            rebuild: Arc::new(rebuild),
+            state: Arc::new(EpochReloading::new(
+                schemas.epoch(),
+                move || epoch_schemas.epoch(),
+                rebuild,
+            )),
         }
     }
 
     fn current(&self) -> StreamableHttpService<RuntimeServer, LocalSessionManager> {
-        let epoch = self.schemas.epoch();
-        if self.loaded_epoch.load(Ordering::Acquire) != epoch {
-            let rebuilt = (self.rebuild)();
-            if let Ok(mut inner) = self.inner.write() {
-                *inner = rebuilt.clone();
-            }
-            self.loaded_epoch.store(epoch, Ordering::Release);
-            return rebuilt;
-        }
-        self.inner
-            .read()
-            .map_or_else(|_| (self.rebuild)(), |inner| inner.clone())
+        self.state.current()
     }
 }
 
@@ -1133,5 +1186,162 @@ mod tests {
             debug.contains("MirrorRequest"),
             "CorsLayer must mirror Access-Control-Request-Headers so Mcp-Param-* is not dropped, got {debug}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod epoch_reload_tests {
+    use super::EpochReloading;
+    use std::sync::{
+        Arc, Barrier, RwLock,
+        atomic::{AtomicU64, Ordering},
+    };
+    use std::thread;
+
+    /// Reproduction of the previous `current()` that wrote `inner` and
+    /// `loaded_epoch` in separate steps. Epoch 2 publishes first, epoch 1
+    /// overwrites `inner`, epoch 2 stores last → `inner=S1`, `loaded=2`,
+    /// later calls skip rebuild.
+    #[test]
+    fn split_reload_updates_can_mark_stale_service_current() {
+        let inner = Arc::new(RwLock::new("S0".to_string()));
+        let loaded = Arc::new(AtomicU64::new(0));
+        let schemas = 2u64;
+
+        let after_rebuild = Arc::new(Barrier::new(2));
+        let after_e2_write = Arc::new(Barrier::new(2));
+        let after_e1_write = Arc::new(Barrier::new(2));
+        let after_e1_store = Arc::new(Barrier::new(2));
+
+        let t1_inner = Arc::clone(&inner);
+        let t1_loaded = Arc::clone(&loaded);
+        let t1_after_rebuild = Arc::clone(&after_rebuild);
+        let t1_after_e2_write = Arc::clone(&after_e2_write);
+        let t1_after_e1_write = Arc::clone(&after_e1_write);
+        let t1_after_e1_store = Arc::clone(&after_e1_store);
+        let h1 = thread::spawn(move || {
+            let epoch = 1u64;
+            let rebuilt = format!("S{epoch}");
+            t1_after_rebuild.wait();
+            t1_after_e2_write.wait();
+            *t1_inner.write().expect("epoch 1 write lock") = rebuilt.clone();
+            t1_after_e1_write.wait();
+            t1_loaded.store(epoch, Ordering::Release);
+            t1_after_e1_store.wait();
+            rebuilt
+        });
+
+        let t2_inner = Arc::clone(&inner);
+        let t2_loaded = Arc::clone(&loaded);
+        let t2_after_rebuild = Arc::clone(&after_rebuild);
+        let t2_after_e2_write = Arc::clone(&after_e2_write);
+        let t2_after_e1_write = Arc::clone(&after_e1_write);
+        let t2_after_e1_store = Arc::clone(&after_e1_store);
+        let h2 = thread::spawn(move || {
+            let epoch = 2u64;
+            let rebuilt = format!("S{epoch}");
+            t2_after_rebuild.wait();
+            *t2_inner.write().expect("epoch 2 write lock") = rebuilt.clone();
+            t2_after_e2_write.wait();
+            t2_after_e1_write.wait();
+            t2_after_e1_store.wait();
+            t2_loaded.store(epoch, Ordering::Release);
+            rebuilt
+        });
+
+        h1.join().expect("epoch 1 thread");
+        h2.join().expect("epoch 2 thread");
+
+        let loaded_v = loaded.load(Ordering::Acquire);
+        let inner_v = inner.read().expect("read published service").clone();
+        let next_call_rebuilds = loaded_v != schemas;
+        assert_eq!(
+            (schemas, loaded_v, inner_v.as_str(), next_call_rebuilds),
+            (2, 2, "S1", false),
+            "split updates retain a stale service as current"
+        );
+    }
+
+    #[test]
+    fn epoch_reloading_current_skips_rebuild_when_epoch_matches() {
+        let rebuilds = Arc::new(AtomicU64::new(0));
+        let rebuilds_for_fn = Arc::clone(&rebuilds);
+        let reloader = EpochReloading::new(
+            0,
+            || 0,
+            move || {
+                rebuilds_for_fn.fetch_add(1, Ordering::Relaxed);
+                "S0".to_string()
+            },
+        );
+        assert_eq!(reloader.current(), "S0");
+        assert_eq!(reloader.current(), "S0");
+        assert_eq!(
+            rebuilds.load(Ordering::Relaxed),
+            1,
+            "construction rebuilds once; matching epoch must not rebuild again"
+        );
+    }
+
+    #[test]
+    fn epoch_reloading_current_publishes_new_epoch() {
+        let epoch = Arc::new(AtomicU64::new(0));
+        let epoch_for_src = Arc::clone(&epoch);
+        let epoch_for_rebuild = Arc::clone(&epoch);
+        let reloader = EpochReloading::new(
+            0,
+            move || epoch_for_src.load(Ordering::Acquire),
+            move || format!("S{}", epoch_for_rebuild.load(Ordering::Acquire)),
+        );
+        epoch.store(2, Ordering::Release);
+        assert_eq!(reloader.current(), "S2");
+        let (loaded, inner) = reloader.snapshot();
+        assert_eq!(loaded, 2);
+        assert_eq!(inner, "S2");
+    }
+
+    #[test]
+    fn epoch_reloading_overlapping_reloads_cannot_publish_stale_inner() {
+        for iteration in 0..64 {
+            let epoch = Arc::new(AtomicU64::new(1));
+            let epoch_for_src = Arc::clone(&epoch);
+            let epoch_for_rebuild = Arc::clone(&epoch);
+            let reloader = Arc::new(EpochReloading::with_initial(
+                "S0".to_string(),
+                0,
+                move || epoch_for_src.load(Ordering::Acquire),
+                move || {
+                    thread::yield_now();
+                    format!("S{}", epoch_for_rebuild.load(Ordering::Acquire))
+                },
+            ));
+
+            let first = Arc::clone(&reloader);
+            let first_epoch = Arc::clone(&epoch);
+            let h1 = thread::spawn(move || {
+                let _ = first.current();
+                first_epoch.store(2, Ordering::Release);
+                let _ = first.current();
+            });
+            let second = Arc::clone(&reloader);
+            let second_epoch = Arc::clone(&epoch);
+            let h2 = thread::spawn(move || {
+                second_epoch.store(2, Ordering::Release);
+                second.current()
+            });
+
+            h1.join().expect("first reloader thread should finish");
+            h2.join().expect("second reloader thread should finish");
+
+            let pinned = reloader.current();
+            let (loaded, inner) = reloader.snapshot();
+            let schema = epoch.load(Ordering::Acquire);
+            assert_eq!(schema, 2, "iteration {iteration}: schema settled at 2");
+            assert_eq!(
+                (loaded, inner.as_str(), pinned.as_str()),
+                (2, "S2", "S2"),
+                "iteration {iteration}: overlapping reloads must not retain inner=S1 with loaded=2"
+            );
+        }
     }
 }
