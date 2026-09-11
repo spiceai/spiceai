@@ -123,6 +123,17 @@ struct ListRefresh {
     publish: StdMutex<()>,
 }
 
+/// Inputs for one listed-cache publish. Grouped so
+/// [`ListRefresh::publish_listed`] stays under the argument limit.
+struct ListedPublish<'a> {
+    tool_cache: &'a StdRwLock<ToolListCache>,
+    schemas: &'a StdRwLock<Option<Arc<McpSchemaSnapshot>>>,
+    catalog_name: &'a str,
+    tools: &'a [rmcp::model::Tool],
+    replace: bool,
+    ttl_ms: u64,
+}
+
 impl ListRefresh {
     fn next_gen(&self) -> u64 {
         self.generation.fetch_add(1, Ordering::AcqRel) + 1
@@ -153,33 +164,25 @@ impl ListRefresh {
     /// publish lock and then `try_all` (a cache read). Holding the
     /// cache write across the snapshot publish would deadlock with
     /// that path.
-    fn publish_listed(
-        &self,
-        my_gen: u64,
-        tool_cache: &StdRwLock<ToolListCache>,
-        schemas: &StdRwLock<Option<Arc<McpSchemaSnapshot>>>,
-        catalog_name: &str,
-        tools: &[rmcp::model::Tool],
-        replace: bool,
-        ttl_ms: u64,
-    ) {
+    fn publish_listed(&self, my_gen: u64, listed: ListedPublish<'_>) {
         let Some(_refresh) = self.lock_if_current(my_gen) else {
             return;
         };
         let cached = {
-            let Ok(mut cache) = tool_cache.write() else {
+            let Ok(mut cache) = listed.tool_cache.write() else {
                 return;
             };
-            apply_tool_cache(&mut cache, tools, replace, ttl_ms);
+            apply_tool_cache(&mut cache, listed.tools, listed.replace, listed.ttl_ms);
             cache.tools.clone()
         };
-        let Ok(slot) = schemas.read() else {
+        let Ok(slot) = listed.schemas.read() else {
             return;
         };
         let Some(snapshot) = slot.as_ref() else {
             return;
         };
-        let changed = apply_listed_catalog_cache(snapshot, catalog_name, &cached, replace);
+        let changed =
+            apply_listed_catalog_cache(snapshot, listed.catalog_name, &cached, listed.replace);
         snapshot.bump_if(changed);
     }
 }
@@ -261,12 +264,14 @@ impl McpToolCatalog {
                         if let Ok((listed, complete, ttl_ms)) = listed {
                             refresh_clone.publish_listed(
                                 my_gen,
-                                &tool_cache_clone,
-                                &schemas_clone,
-                                &name_clone,
-                                &listed,
-                                complete,
-                                ttl_ms,
+                                ListedPublish {
+                                    tool_cache: &tool_cache_clone,
+                                    schemas: &schemas_clone,
+                                    catalog_name: &name_clone,
+                                    tools: &listed,
+                                    replace: complete,
+                                    ttl_ms,
+                                },
                             );
                         }
                         tracing::info!("Successfully reconnected MCP client for {}", name_clone);
@@ -302,12 +307,14 @@ impl McpToolCatalog {
     fn remember_tools(&self, tools: &[rmcp::model::Tool], replace: bool, ttl_ms: u64, my_gen: u64) {
         self.refresh.publish_listed(
             my_gen,
-            &self.tool_cache,
-            &self.schemas,
-            &self.name,
-            tools,
-            replace,
-            ttl_ms,
+            ListedPublish {
+                tool_cache: &self.tool_cache,
+                schemas: &self.schemas,
+                catalog_name: &self.name,
+                tools,
+                replace,
+                ttl_ms,
+            },
         );
     }
 
@@ -1025,21 +1032,25 @@ mod tests {
         let gen2 = refresh.next_gen();
         refresh.publish_listed(
             gen2,
-            &tool_cache,
-            &schemas,
-            "srv",
-            &[listed_deploy_with_header("Zone")],
-            true,
-            0,
+            ListedPublish {
+                tool_cache: &tool_cache,
+                schemas: &schemas,
+                catalog_name: "srv",
+                tools: &[listed_deploy_with_header("Zone")],
+                replace: true,
+                ttl_ms: 0,
+            },
         );
         refresh.publish_listed(
             gen1,
-            &tool_cache,
-            &schemas,
-            "srv",
-            &[listed_deploy_with_header("Region")],
-            true,
-            0,
+            ListedPublish {
+                tool_cache: &tool_cache,
+                schemas: &schemas,
+                catalog_name: "srv",
+                tools: &[listed_deploy_with_header("Region")],
+                replace: true,
+                ttl_ms: 0,
+            },
         );
 
         let cache = tool_cache
