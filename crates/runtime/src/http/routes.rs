@@ -1605,7 +1605,8 @@ mod mcp_origin_tests {
     #[test]
     fn mcp_origin_cors_falls_back_to_app_without_override() {
         let app_cors = allowlist_cors();
-        let cors = mcp_origin_cors(&Config::new(), &app_cors);
+        let config = Config::new();
+        let cors = mcp_origin_cors(&config, &app_cors);
         assert_eq!(
             cors.allowed_origins, app_cors.allowed_origins,
             "without Config.runtime, MCP Origin must keep the app CORS list"
