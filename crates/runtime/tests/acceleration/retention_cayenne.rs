@@ -268,6 +268,38 @@ async fn cayenne_memory_mode_does_not_apply_retention_sql() -> Result<(), anyhow
             }
             runtime_ready_check(&rt).await;
 
+            // Give retention a real chance to run before concluding it does not.
+            // Cayenne arms retention from its own post-write maintenance, which is
+            // debounced and asynchronous, so checking straight after load would pass
+            // whether the rows are immune or merely not yet visited — and would keep
+            // passing after #14045 is fixed, which is the opposite of what a pin is
+            // for. Refreshing arms that maintenance again, then this waits for the
+            // rows to disappear and asserts they never do.
+            trigger_refresh(&rt, MEM_TABLE).await?;
+
+            let survivors = i64::try_from(
+                INITIAL_ROWS
+                    .iter()
+                    .filter(|(_, score)| *score >= SCORE_FLOOR)
+                    .count(),
+            )?;
+            let matching = INITIAL_ROWS.len() - usize::try_from(survivors)?;
+            assert!(
+                matching > 0,
+                "the fixture must contain rows the retention predicate matches, or this \
+                 test asserts nothing"
+            );
+
+            let retention_applied = wait_until_true(std::time::Duration::from_secs(15), || {
+                let rt = Arc::clone(&rt);
+                async move {
+                    row_count(&rt, MEM_TABLE)
+                        .await
+                        .is_ok_and(|n| n == survivors)
+                }
+            })
+            .await;
+
             let rows = run_query(
                 &rt,
                 &format!("SELECT id, score FROM {MEM_TABLE} ORDER BY id"),
@@ -275,33 +307,29 @@ async fn cayenne_memory_mode_does_not_apply_retention_sql() -> Result<(), anyhow
             .await?;
             let below_floor = run_query(
                 &rt,
-                &format!(
-                    "SELECT COUNT(*) AS n FROM {MEM_TABLE} WHERE score < {SCORE_FLOOR}"
-                ),
+                &format!("SELECT COUNT(*) AS n FROM {MEM_TABLE} WHERE score < {SCORE_FLOOR}"),
             )
             .await?;
             eprintln!(
-                "[mode: memory] retention_sql `score < {SCORE_FLOOR}`; rows still served:\n{}\nof which below the floor:\n{}",
+                "[mode: memory] retention_sql `score < {SCORE_FLOOR}` after a refresh and a 15s \
+                 window; rows still served:\n{}\nof which below the floor:\n{}",
                 arrow::util::pretty::pretty_format_batches(&rows)?,
                 arrow::util::pretty::pretty_format_batches(&below_floor)?
             );
 
-            // Every source row is still served, retention predicate or not.
-            let all_rows = i64::try_from(INITIAL_ROWS.len())?;
-            let served = row_count(&rt, MEM_TABLE).await?;
-            assert_eq!(
-                served, all_rows,
-                "current behavior: retention_sql does not remove rows from a mode: memory \
-                 acceleration, so all {all_rows} source rows are still served"
+            assert!(
+                !retention_applied,
+                "retention_sql now removes rows from a `mode: memory` acceleration — \
+                 #14045 appears fixed, so this test has served its purpose and should be \
+                 inverted to assert the {matching} matching rows are gone"
             );
 
-            let matching = INITIAL_ROWS
-                .iter()
-                .filter(|(_, score)| *score < SCORE_FLOOR)
-                .count();
-            assert!(
-                matching > 0,
-                "fixture must contain rows the retention predicate matches, or this asserts nothing"
+            let all_rows = i64::try_from(INITIAL_ROWS.len())?;
+            assert_eq!(
+                row_count(&rt, MEM_TABLE).await?,
+                all_rows,
+                "current behavior: retention_sql does not remove rows from a mode: memory \
+                 acceleration, so all {all_rows} source rows are still served"
             );
 
             Ok(())
