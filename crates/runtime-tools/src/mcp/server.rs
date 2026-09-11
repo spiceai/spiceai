@@ -53,9 +53,9 @@ use util::security::{MAX_SAFE_JSON_DEPTH, get_json_depth};
 pub struct McpSchemaSnapshot {
     tools: StdRwLock<HashMap<String, Tool>>,
     epoch: AtomicU64,
-    /// Serializes [`Self::replace_from_map`] with catalog publications so
-    /// a full replace cannot overwrite a newer TTL/reconnect schema
-    /// (and still bump the epoch).
+    /// Serializes [`Self::replace_from_map`] and [`Self::merge_from_map`]
+    /// with catalog publications so a full-map update cannot overwrite
+    /// a newer TTL/reconnect schema (and still bump the epoch).
     publish: StdMutex<()>,
 }
 
@@ -115,6 +115,11 @@ impl McpSchemaSnapshot {
     }
 
     fn merge_from_map(&self, tools: &HashMap<String, Tooling>) -> bool {
+        // Collect under `publish` so a concurrent catalog TTL/reconnect
+        // write waits, then applies after this merge — the same protocol
+        // as [`Self::replace_from_map`]. Computing `next` first lets a
+        // stale Region page overwrite a Zone that already published.
+        let _publish = self.lock_publish();
         let next = mcp_schemas_from_map(tools);
         let Ok(mut schemas) = self.tools.write() else {
             return false;
@@ -609,6 +614,12 @@ fn schema_maps_changed(current: &HashMap<String, Tool>, next: &HashMap<String, T
 }
 
 /// Collect MCP tool definitions that catalogs can expose without I/O.
+///
+/// Two passes so a catalog tool deterministically overwrites a
+/// top-level name that collides with `encode_tool_name` — the same
+/// preference as gateway `tools/call` dispatch. A single `HashMap`
+/// walk would let iteration order pick the schema `tools/list` and
+/// `Mcp-Param-*` validate against.
 #[must_use]
 #[expect(clippy::implicit_hasher)]
 pub fn mcp_schemas_from_map(tools: &HashMap<String, Tooling>) -> HashMap<String, Tool> {
@@ -621,12 +632,15 @@ pub fn mcp_schemas_from_map(tools: &HashMap<String, Tooling>) -> HashMap<String,
                     mcp_tool_from_spice(name.clone(), tool.as_ref()),
                 );
             }
-            Tooling::Catalog { tools: catalog, .. } => {
-                let catalog_name = catalog.name();
-                for tool in catalog.try_all() {
-                    let exposed = encode_tool_name(catalog_name, &tool.name());
-                    schemas.insert(exposed.clone(), mcp_tool_from_spice(exposed, tool.as_ref()));
-                }
+            Tooling::Catalog { .. } => {}
+        }
+    }
+    for tooling in tools.values() {
+        if let Tooling::Catalog { tools: catalog, .. } = tooling {
+            let catalog_name = catalog.name();
+            for tool in catalog.try_all() {
+                let exposed = encode_tool_name(catalog_name, &tool.name());
+                schemas.insert(exposed.clone(), mcp_tool_from_spice(exposed, tool.as_ref()));
             }
         }
     }
@@ -1071,6 +1085,81 @@ mod tests {
         );
     }
 
+    /// `merge_from_map` used to compute `next` (Region) outside
+    /// [`McpSchemaSnapshot::publish`], so a concurrent catalog publish
+    /// of Zone was overwritten (`newer_catalog_publish=Zone
+    /// final_schema=Region stale_overwrite=True`). Collecting under
+    /// that lock lets the catalog write land last.
+    #[test]
+    fn merge_from_map_does_not_overwrite_a_newer_catalog_publish() {
+        let snapshot = Arc::new(McpSchemaSnapshot::default());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let catalog = Arc::new(GatedTryAllCatalog {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+        });
+        let mut tools = HashMap::new();
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::clone(&catalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+
+        let merge_snapshot = Arc::clone(&snapshot);
+        let merger = std::thread::spawn(move || {
+            let changed = merge_snapshot.merge_from_map(&tools);
+            merge_snapshot.bump_if(changed);
+        });
+
+        started_rx
+            .recv()
+            .expect("merge_from_map must enter try_all before the catalog publishes");
+
+        let publish_snapshot = Arc::clone(&snapshot);
+        let publisher = std::thread::spawn(move || {
+            let mut listed = HashMap::new();
+            listed.insert(
+                "deploy".to_string(),
+                mcp_tool_from_spice("deploy", &ZoneAnnotatedTool),
+            );
+            let changed = apply_listed_catalog_cache(&publish_snapshot, "srv", &listed, true);
+            publish_snapshot.bump_if(changed);
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let exposed = encode_tool_name("srv", "deploy");
+        assert_ne!(
+            snapshot
+                .get(&exposed)
+                .as_ref()
+                .and_then(x_mcp_header_region),
+            Some("Zone"),
+            "catalog publish must wait for merge_from_map; Zone already present means a stale overwrite can follow"
+        );
+
+        release_tx
+            .send(())
+            .expect("merge_from_map is waiting in try_all");
+        merger
+            .join()
+            .expect("merge_from_map thread should finish");
+        publisher
+            .join()
+            .expect("catalog publish thread should finish");
+
+        assert_eq!(
+            snapshot
+                .get(&exposed)
+                .as_ref()
+                .and_then(x_mcp_header_region),
+            Some("Zone"),
+            "final_schema must be Zone after the catalog publish; Region after Zone is the stale overwrite"
+        );
+    }
+
     #[test]
     fn listed_tools_result_emits_explicit_non_cacheable_private_hints() {
         let default_json = serde_json::to_value(ListToolsResult::default())
@@ -1192,6 +1281,65 @@ mod tests {
         let from_catalog = ServerHandler::get_tool(&server, &exposed)
             .expect("catalog try_get must supply the schema for Mcp-Param validation");
         assert_eq!(x_mcp_header_region(&from_catalog), Some("Region"));
+    }
+
+    /// A top-level tool named `srv__deploy` collides with catalog `srv`
+    /// tool `deploy`. Dispatch prefers the catalog; the snapshot must
+    /// too. A single-pass `HashMap` walk let iteration order pick
+    /// `top_schema_wins` (~half the time in Copilot's harness).
+    #[test]
+    fn mcp_schemas_from_map_lets_catalog_overwrite_colliding_top_level() {
+        struct ZoneCatalog;
+
+        #[async_trait::async_trait]
+        impl SpiceToolCatalog for ZoneCatalog {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn name(&self) -> &'static str {
+                "srv"
+            }
+            async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                self.try_all()
+            }
+            async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                self.try_get(name)
+            }
+            fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                (name == "deploy").then(|| Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>)
+            }
+            fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                vec![Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>]
+            }
+        }
+
+        let exposed = encode_tool_name("srv", "deploy");
+        let mut tools = HashMap::new();
+        tools.insert(
+            exposed.clone(),
+            Tooling::Tool(Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>),
+        );
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(ZoneCatalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+
+        let schemas = mcp_schemas_from_map(&tools);
+        assert_eq!(
+            schemas.get(&exposed).and_then(x_mcp_header_region),
+            Some("Zone"),
+            "top_schema_wins leaves Region; catalogs must overwrite to match get_tool"
+        );
+        assert_eq!(
+            RuntimeServer::definition_from_map(&tools, &exposed)
+                .as_ref()
+                .and_then(x_mcp_header_region),
+            Some("Zone"),
+            "tools/call dispatch prefers the catalog; the snapshot must describe the same tool"
+        );
     }
 
     #[test]
