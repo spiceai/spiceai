@@ -119,13 +119,13 @@ pub(crate) struct McpToolCatalog {
 /// so last-writer-wins cannot roll `Mcp-Param-*` validation back to an
 /// older schema.
 struct ListRefresh {
-    gen: AtomicU64,
+    generation: AtomicU64,
     publish: StdMutex<()>,
 }
 
 impl ListRefresh {
     fn next_gen(&self) -> u64 {
-        self.gen.fetch_add(1, Ordering::AcqRel) + 1
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     /// Hold this guard across cache write and snapshot publish so two
@@ -135,7 +135,7 @@ impl ListRefresh {
             .publish
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.gen.load(Ordering::Acquire) == my_gen {
+        if self.generation.load(Ordering::Acquire) == my_gen {
             Some(guard)
         } else {
             None
@@ -183,7 +183,7 @@ impl McpToolCatalog {
         let schemas = Arc::new(StdRwLock::new(None::<Arc<McpSchemaSnapshot>>));
         let schemas_clone = Arc::clone(&schemas);
         let refresh = Arc::new(ListRefresh {
-            gen: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
             publish: StdMutex::new(()),
         });
         let refresh_clone = Arc::clone(&refresh);
@@ -1017,7 +1017,7 @@ mod tests {
         let tool_cache = StdRwLock::new(ToolListCache::default());
         let schemas = StdRwLock::new(Some(Arc::clone(&snapshot)));
         let refresh = ListRefresh {
-            gen: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
             publish: StdMutex::new(()),
         };
 
