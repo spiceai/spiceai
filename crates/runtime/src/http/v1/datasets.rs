@@ -180,19 +180,18 @@ pub(crate) async fn get(
     }
 }
 
-/// The `/v1/datasets` rows for every valid dataset of `app`, with each
-/// dataset's status when `include_status` is set.
+/// The `GET /v1/datasets?status=true` document for the app `rt` serves: every
+/// valid dataset with its status.
 ///
-/// Shared with the Cloud Connect `GetDatasets` command, so the control plane
-/// reads the same document as `GET /v1/datasets?status=true`.
-pub fn app_dataset_infos(
-    rt: Arc<Runtime>,
-    df: &DataFusion,
-    app: &Arc<App>,
-    include_status: bool,
-) -> Vec<DatasetResponseItem> {
-    let datasets = rt.get_valid_datasets(app, LogErrors(false));
-    dataset_infos(df, &datasets, include_status)
+/// Answers the Cloud Connect `GetDatasets` command, so the control plane reads
+/// the same rows a local operator does. No loaded app is an empty list, not an
+/// error: there is nothing to list.
+pub async fn dataset_infos_with_status(rt: &Arc<Runtime>) -> Vec<DatasetResponseItem> {
+    let Some(app) = rt.read_app().await else {
+        return Vec::new();
+    };
+    let datasets = Arc::clone(rt).get_valid_datasets(&app, LogErrors(false));
+    dataset_infos(&rt.datafusion(), &datasets, true)
 }
 
 fn dataset_infos(

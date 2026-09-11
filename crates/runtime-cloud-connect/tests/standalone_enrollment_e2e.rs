@@ -3678,16 +3678,17 @@ async fn remove_clears_identity_and_exits() {
 // that cannot list neither advertises `get_datasets` nor is asked for one.
 // --------------------------------------------------------------------------
 
+/// A handle with a dataset list to answer, or none: the capability and the
+/// answer come from the same field, so the two cannot disagree.
 struct DatasetsRuntime {
-    can_list: bool,
-    document: serde_json::Value,
+    document: Option<serde_json::Value>,
 }
 
 #[async_trait]
 impl RuntimeHandle for DatasetsRuntime {
     fn supports(&self, capability: Capability) -> bool {
         match capability {
-            Capability::GetDatasets => self.can_list,
+            Capability::GetDatasets => self.document.is_some(),
             // GetRuntimeInfo needs no capability, so this keeps the handle to
             // exactly the one command under test.
             _ => false,
@@ -3698,18 +3699,13 @@ impl RuntimeHandle for DatasetsRuntime {
     async fn clear_cloud_delivered_secrets(&self) {}
 
     async fn datasets_json(&self) -> Result<serde_json::Value, CommandError> {
-        if self.can_list {
-            Ok(self.document.clone())
-        } else {
-            Err(CommandError::unsupported(
+        match &self.document {
+            Some(document) => Ok(document.clone()),
+            None => Err(CommandError::unsupported(
                 "this test handle has no dataset list",
-            ))
+            )),
         }
     }
-}
-
-fn get_datasets() -> proto::control_message::Body {
-    proto::control_message::Body::GetDatasets(proto::GetDatasets {})
 }
 
 /// The list comes back on the `json` arm exactly as the runtime produced it:
@@ -3724,8 +3720,7 @@ async fn get_datasets_returns_the_runtime_document_on_the_json_arm() {
           "error_message": "connection refused" }
     ]);
     let runtime = Arc::new(DatasetsRuntime {
-        can_list: true,
-        document: document.clone(),
+        document: Some(document.clone()),
     });
     let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
 
@@ -3736,12 +3731,10 @@ async fn get_datasets_returns_the_runtime_document_on_the_json_arm() {
         "a runtime that lists must advertise get_datasets: {advertised:?}"
     );
 
-    harness
-        .gateway
-        .outbound
-        .lock()
-        .await
-        .push_back(ctrl_id("cmd-datasets", get_datasets()));
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        "cmd-datasets",
+        proto::control_message::Body::GetDatasets(proto::GetDatasets {}),
+    ));
 
     let result = await_result(&captured, "cmd-datasets")
         .await
@@ -3769,10 +3762,7 @@ async fn get_datasets_returns_the_runtime_document_on_the_json_arm() {
 #[tokio::test]
 async fn get_datasets_is_unsupported_when_the_runtime_cannot_list() {
     let harness = Harness::new(24 * 60 * 60).await;
-    let runtime = Arc::new(DatasetsRuntime {
-        can_list: false,
-        document: serde_json::Value::Null,
-    });
+    let runtime = Arc::new(DatasetsRuntime { document: None });
     let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
 
     let captured = Arc::clone(&harness.gateway.captured);
@@ -3782,12 +3772,10 @@ async fn get_datasets_is_unsupported_when_the_runtime_cannot_list() {
         "a runtime that cannot list must not advertise get_datasets: {advertised:?}"
     );
 
-    harness
-        .gateway
-        .outbound
-        .lock()
-        .await
-        .push_back(ctrl_id("cmd-nolist", get_datasets()));
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        "cmd-nolist",
+        proto::control_message::Body::GetDatasets(proto::GetDatasets {}),
+    ));
 
     let result = await_result(&captured, "cmd-nolist")
         .await

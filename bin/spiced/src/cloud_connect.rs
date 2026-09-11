@@ -1644,13 +1644,8 @@ impl RuntimeHandle for SpicedRuntimeHandle {
     /// The `/v1/datasets?status=true` document for the app this instance
     /// serves: the same rows the local HTTP endpoint answers, so `spice cloud
     /// datasets` shows a self-hosted instance the way it shows a managed one.
-    /// No loaded app is an empty list, not an error: there is nothing to list.
     async fn datasets_json(&self) -> Result<serde_json::Value, CommandError> {
-        let Some(app) = self.runtime.read_app().await else {
-            return Ok(serde_json::Value::Array(Vec::new()));
-        };
-        let df = self.runtime.datafusion();
-        let infos = runtime::app_dataset_infos(Arc::clone(&self.runtime), &df, &app, true);
+        let infos = runtime::dataset_infos_with_status(&self.runtime).await;
         serde_json::to_value(infos).map_err(|source| {
             CommandError::internal(format!("Failed to encode the dataset list: {source}"))
         })
