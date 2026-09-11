@@ -925,6 +925,13 @@ const CORS_ALLOWED_HEADERS: &[&str] = &[
     "x-api-key",
 ];
 
+/// Closed-set `Access-Control-Allow-Headers` when a requested name is
+/// not a valid [`HeaderValue`]. Must stay aligned with
+/// [`CORS_ALLOWED_HEADERS`].
+const CORS_ALLOWED_HEADERS_VALUE: HeaderValue = HeaderValue::from_static(
+    "accept, content-type, authorization, mcp-protocol-version, mcp-method, mcp-name, mcp-session-id, x-api-key",
+);
+
 fn is_allowed_cors_request_header(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
     CORS_ALLOWED_HEADERS.contains(&lower.as_str()) || lower.starts_with("mcp-param-")
@@ -951,8 +958,7 @@ fn cors_allow_headers_value(requested: Option<&str>) -> HeaderValue {
             }
         }
     }
-    HeaderValue::from_str(&names.join(", "))
-        .unwrap_or_else(|_| HeaderValue::from_static("accept, content-type, authorization"))
+    HeaderValue::from_str(&names.join(", ")).unwrap_or_else(|_| CORS_ALLOWED_HEADERS_VALUE)
 }
 
 async fn allow_mcp_param_cors_headers(req: Request<Body>, next: Next) -> axum::response::Response {
@@ -1049,7 +1055,8 @@ async fn require_auth_configured(
 #[cfg(test)]
 mod tests {
     use super::{
-        Body, CorsConfig, allow_mcp_param_cors_headers, cors_allow_headers_value, cors_layer,
+        Body, CORS_ALLOWED_HEADERS, CORS_ALLOWED_HEADERS_VALUE, CorsConfig,
+        allow_mcp_param_cors_headers, cors_allow_headers_value, cors_layer,
         is_allowed_cors_request_header,
     };
     use axum::{Router, middleware, routing::post};
@@ -1086,6 +1093,36 @@ mod tests {
         assert!(allowed.contains("mcp-param-region"));
         assert!(allowed.contains("mcp-param-count"));
         assert!(!allowed.contains("x-evil"));
+    }
+
+    #[test]
+    fn cors_allow_headers_fallback_matches_closed_set() {
+        let closed = cors_allow_headers_value(None);
+        assert_eq!(
+            closed.to_str().expect("closed allow-headers is ascii"),
+            CORS_ALLOWED_HEADERS.join(", "),
+            "None requested must emit the closed set"
+        );
+        assert_eq!(
+            closed, CORS_ALLOWED_HEADERS_VALUE,
+            "static fallback must stay aligned with CORS_ALLOWED_HEADERS"
+        );
+
+        let fallback = cors_allow_headers_value(Some("mcp-param-\0region"));
+        assert_eq!(
+            fallback, CORS_ALLOWED_HEADERS_VALUE,
+            "an invalid requested name must not shrink the allow-list to accept, content-type, authorization"
+        );
+        let allowed = fallback
+            .to_str()
+            .expect("fallback allow-headers is ascii")
+            .to_ascii_lowercase();
+        assert!(allowed.contains("mcp-protocol-version"));
+        assert!(allowed.contains("x-api-key"));
+        assert!(
+            !allowed.contains("mcp-param-"),
+            "fallback is the closed set, not the invalid requested name"
+        );
     }
 
     fn enabled_cors() -> CorsConfig {

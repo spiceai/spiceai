@@ -306,18 +306,19 @@ params:
         )
         .await?;
 
+        let status = resp.status();
+        let minted_session = resp.headers().get("mcp-session-id").cloned();
+        let body = resp.text().await?;
         assert!(
-            resp.status().is_success(),
-            "server/discover returned non-success status: {} body={}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
+            status.is_success(),
+            "server/discover returned non-success status: {status} body={body}"
         );
         assert!(
-            resp.headers().get("mcp-session-id").is_none(),
+            minted_session.is_none(),
             "2026-07-28 discover must not mint Mcp-Session-Id"
         );
 
-        let v = parse_jsonrpc_body(&resp.text().await?)?;
+        let v = parse_jsonrpc_body(&body)?;
         let result = v
             .get("result")
             .expect("server/discover response missing 'result'");
