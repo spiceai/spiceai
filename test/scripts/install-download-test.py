@@ -12,14 +12,17 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
-def archive_bytes(filename="spiced"):
+def archive_bytes(filename="spiced", member_type=tarfile.REGTYPE):
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w:gz") as archive:
         content = b"installer download fixture\n"
         entry = tarfile.TarInfo(filename)
+        entry.type = member_type
         entry.mode = 0o755
-        entry.size = len(content)
-        archive.addfile(entry, io.BytesIO(content))
+        if member_type in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+            entry.linkname = "missing-runtime"
+        entry.size = len(content) if member_type == tarfile.REGTYPE else 0
+        archive.addfile(entry, io.BytesIO(content) if entry.size else None)
     return output.getvalue()
 
 
@@ -69,6 +72,9 @@ downloadWithRetry "$2" "$3"
             if success:
                 with tarfile.open(output, "r:gz") as archive:
                     assert [name.removeprefix("./") for name in archive.getnames()] == ["spiced"], "Unexpected archive contents"
+                    assert all(member.isreg() for member in archive.getmembers()), "Runtime is not a regular file"
+            else:
+                assert not output.exists(), "Failed download was not removed"
             return {"requests": Handler.requests, "exit_code": result.returncode}
     finally:
         server.shutdown()
@@ -106,6 +112,16 @@ def main():
         ),
         "invalid_archive_exhausts_retries": ([(200, b"invalid")], 3, False),
     }
+    for kind, member_type in {
+        "symlink": tarfile.SYMTYPE,
+        "hardlink": tarfile.LNKTYPE,
+        "directory": tarfile.DIRTYPE,
+    }.items():
+        invalid = archive_bytes(member_type=member_type)
+        cases[f"{kind}_then_archive"] = (
+            [(200, invalid), (200, invalid), (200, valid)], 3, True,
+        )
+        cases[f"{kind}_exhausts_retries"] = ([(200, invalid)], 3, False)
     for name, (responses, requests, success) in cases.items():
         result = run_case(preamble, args.client, responses, requests, success)
         print(json.dumps({"client": args.client, "case": name, **result}), flush=True)

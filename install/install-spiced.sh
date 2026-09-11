@@ -171,31 +171,46 @@ getLatestRelease() {
     ret_val=$latest_release
 }
 
+validateRuntimeArchive() {
+    local archive_contents archive_member archive_entry
+
+    archive_contents=$(tar -tzf "$1" 2>/dev/null) || return 1
+    archive_member=$(printf '%s\n' "$archive_contents" | grep -Fx -e "$SPICED_FILENAME" -e "./$SPICED_FILENAME") || return 1
+    # Require exactly one executable entry at the archive root.
+    case "$archive_member" in
+        "$SPICED_FILENAME"|"./$SPICED_FILENAME") ;;
+        *) return 1 ;;
+    esac
+
+    archive_entry=$(tar -tvzf "$1" "$archive_member" 2>/dev/null) || return 1
+    # GNU tar and BSD tar prefix regular files with '-', links with 'l' or 'h'.
+    [[ "$archive_entry" == -* && "$archive_entry" != *$'\n'* ]]
+}
+
 downloadWithRetry() {
     local url="$1"
     local output="$2"
     local attempt=1
-    local archive_contents
     
     while [ $attempt -le $MAX_RETRIES ]; do
         echo "Download attempt $attempt of $MAX_RETRIES..."
         
         if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
             if curl --fail -H "Accept:application/octet-stream" -SsL "$url" -o "$output" 2>/dev/null; then
-                if [ -f "$output" ] && archive_contents=$(tar -tzf "$output" 2>/dev/null) &&
-                    printf '%s\n' "$archive_contents" | grep -Fxq -e "$SPICED_FILENAME" -e "./$SPICED_FILENAME"; then
+                if [ -f "$output" ] && validateRuntimeArchive "$output"; then
                     return 0
                 fi
             fi
         else
             if wget -q --auth-no-challenge --header='Accept:application/octet-stream' "$url" -O "$output" 2>/dev/null; then
-                if [ -f "$output" ] && archive_contents=$(tar -tzf "$output" 2>/dev/null) &&
-                    printf '%s\n' "$archive_contents" | grep -Fxq -e "$SPICED_FILENAME" -e "./$SPICED_FILENAME"; then
+                if [ -f "$output" ] && validateRuntimeArchive "$output"; then
                     return 0
                 fi
             fi
         fi
         
+        rm -f "$output"
+
         if [ $attempt -lt $MAX_RETRIES ]; then
             echo "Download failed, retrying in ${RETRY_DELAY} seconds..."
             sleep $RETRY_DELAY

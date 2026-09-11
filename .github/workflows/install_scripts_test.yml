@@ -25,9 +25,6 @@ on:
 permissions:
   contents: read
 
-env:
-  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}
   cancel-in-progress: true
@@ -80,6 +77,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zsh
 
       - name: Run install script tests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           chmod +x test/scripts/install-scripts-test.sh
           bash test/scripts/install-scripts-test.sh --live
@@ -135,6 +134,7 @@ jobs:
 
       - name: Test install.sh with shell detection
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHELL: /bin/${{ matrix.shell }}
         run: |
           chmod +x install/install.sh
@@ -153,6 +153,7 @@ jobs:
           fi
 
           # Verify it runs
+          unset GITHUB_TOKEN
           "$HOME/.spice/bin/spice" version
 
       - name: Verify PATH instructions
@@ -198,6 +199,8 @@ jobs:
           persist-credentials: false
 
       - name: Test install.sh with custom directory
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           export SPICE_CLI_INSTALL_DIR="${{ github.workspace }}/custom-spice-bin"
           mkdir -p "$SPICE_CLI_INSTALL_DIR"
@@ -211,10 +214,12 @@ jobs:
             exit 1
           fi
 
+          unset GITHUB_TOKEN
           "$SPICE_CLI_INSTALL_DIR/spice" version
 
       - name: Test install-spiced.sh with custom directory
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_INSTALL_DIR: ${{ github.workspace }}/custom-spiced-bin
         run: |
           mkdir -p "$SPICED_INSTALL_DIR"
@@ -228,6 +233,7 @@ jobs:
             exit 1
           fi
 
+          unset GITHUB_TOKEN
           "$SPICED_INSTALL_DIR/spiced" --version
 
   # Test all spiced variants across architectures
@@ -261,12 +267,14 @@ jobs:
 
       - name: Test install-spiced.sh with variant '${{ matrix.variant }}'
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VARIANT: ${{ matrix.variant }}
           SPICED_INSTALL_DIR: ${{ runner.temp }}/spiced-bin
         run: |
           mkdir -p "$SPICED_INSTALL_DIR"
           chmod +x install/install-spiced.sh
           ./install/install-spiced.sh
+          unset GITHUB_TOKEN
           "$SPICED_INSTALL_DIR/spiced" --version
 
   # Test specific version installation
@@ -291,6 +299,8 @@ jobs:
 
       - name: Get a known release version
         id: get_version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Get the latest release tag and strip the 'v' prefix (scripts add it back)
           VERSION=$(gh api repos/spiceai/spiceai/releases/latest --jq '.tag_name')
@@ -301,22 +311,26 @@ jobs:
 
       - name: Test install.sh with specific version
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_CLI_INSTALL_DIR: ${{ github.workspace }}/bin-cli
           RELEASE_VERSION: ${{ steps.get_version.outputs.version }}
         run: |
           mkdir -p "$SPICE_CLI_INSTALL_DIR"
           chmod +x install/install.sh
           ./install/install.sh "$RELEASE_VERSION"
+          unset GITHUB_TOKEN
           "$SPICE_CLI_INSTALL_DIR/spice" version
 
       - name: Test install-spiced.sh with specific version
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_INSTALL_DIR: ${{ github.workspace }}/bin-spiced
           RELEASE_VERSION: ${{ steps.get_version.outputs.version }}
         run: |
           mkdir -p "$SPICED_INSTALL_DIR"
           chmod +x install/install-spiced.sh
           ./install/install-spiced.sh "$RELEASE_VERSION"
+          unset GITHUB_TOKEN
           "$SPICED_INSTALL_DIR/spiced" --version
 
   # Test HTTP client fallback (curl vs wget)
@@ -366,11 +380,13 @@ jobs:
 
       - name: Test install.sh with ${{ matrix.client }}
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_CLI_INSTALL_DIR: ${{ runner.temp }}/spice-bin
         run: |
           mkdir -p "$SPICE_CLI_INSTALL_DIR"
           chmod +x install/install.sh
           ./install/install.sh
+          unset GITHUB_TOKEN
           "$SPICE_CLI_INSTALL_DIR/spice" version
 
       - name: Reject invalid release credentials with ${{ matrix.client }}
@@ -389,10 +405,12 @@ jobs:
 
       - name: Test install-spiced.sh with ${{ matrix.client }}
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_INSTALL_DIR: ${{ runner.temp }}/spiced-bin
         run: |
           mkdir -p "$SPICED_INSTALL_DIR"
           bash install/install-spiced.sh
+          unset GITHUB_TOKEN
           "$SPICED_INSTALL_DIR/spiced" --version
 
       - name: Restore HTTP clients
@@ -475,12 +493,16 @@ jobs:
 
       - name: Run install script tests in WSL
         shell: wsl-bash {0}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           chmod +x test/scripts/install-scripts-test.sh
           ./test/scripts/install-scripts-test.sh --live
 
       - name: Test install.sh in WSL
         shell: wsl-bash {0}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           chmod +x install/install.sh
           export SPICE_CLI_INSTALL_DIR="$HOME/.spice/bin"
@@ -491,10 +513,13 @@ jobs:
             exit 1
           fi
 
+          unset GITHUB_TOKEN
           "$SPICE_CLI_INSTALL_DIR/spice" version
 
       - name: Test install-spiced.sh in WSL
         shell: wsl-bash {0}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           chmod +x install/install-spiced.sh
           export SPICED_INSTALL_DIR="$HOME/bin"
@@ -506,6 +531,7 @@ jobs:
             exit 1
           fi
 
+          unset GITHUB_TOKEN
           "$SPICED_INSTALL_DIR/spiced" --version
 
   # Test native Windows with PowerShell
@@ -520,6 +546,8 @@ jobs:
 
       - name: Test Install.ps1
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Run the PowerShell installer
           .\install\Install.ps1
@@ -532,6 +560,7 @@ jobs:
           }
 
           # Verify it runs
+          Remove-Item Env:GITHUB_TOKEN
           & $spicePath version
 
       - name: Verify PATH was updated
@@ -559,6 +588,8 @@ jobs:
 
       - name: Test Install.ps1 with custom directory
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Create custom install directory
           $customDir = Join-Path $env:GITHUB_WORKSPACE "custom-spice-bin"
@@ -581,6 +612,7 @@ jobs:
           }
 
           # Verify it runs
+          Remove-Item Env:GITHUB_TOKEN
           & $spicePath version
 
   # Test Windows PowerShell error handling
