@@ -306,6 +306,25 @@ struct ResolvedTool {
     catalog: Option<String>,
 }
 
+/// Result of pinning `tools/call` dispatch to the schema generation
+/// Streamable HTTP used for `Mcp-Param-*` validation.
+enum ResolveOutcome {
+    Ready(ResolvedTool),
+    /// The tool was not in the snapshot the transport validated.
+    /// The schema has been published; the caller must retry.
+    Retry,
+    Missing,
+}
+
+impl ResolveOutcome {
+    fn into_ready(self) -> Option<ResolvedTool> {
+        match self {
+            Self::Ready(resolved) => Some(resolved),
+            Self::Retry | Self::Missing => None,
+        }
+    }
+}
+
 impl ResolvedTool {
     /// The `task_history` labels for a call on this tool: the `task` override,
     /// and the MCP server to attribute the call to.
@@ -355,41 +374,78 @@ impl RuntimeServer {
     /// call must label it with the returned canonical name — labelling with the
     /// requested one splits a single tool's `task_history` rows by whichever
     /// spelling each caller happened to send.
-    async fn get_tool(&self, tool_name: &str) -> Option<ResolvedTool> {
+    async fn get_tool(&self, tool_name: &str) -> ResolveOutcome {
         let tools = self.tools.read().await;
         if let Some((catalog_name, name)) = decode_tool_name(tool_name)
             && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
         {
-            // Prefer `try_get` — the same spec `ServerHandler::get_tool`
+            let exposed_name = encode_tool_name(&catalog_name, &name);
+            // Capture *before* any `get` / `remember_tool`. The transport
+            // validated `Mcp-Param-*` against this snapshot generation
+            // (or skipped the check when it was empty). Executing a tool
+            // discovered after that sample is `validated_schema=None
+            // executed=True`.
+            let validated = self.snapshot_tool(&exposed_name).is_some()
+                || self.snapshot_tool(tool_name).is_some();
+
+            // Prefer `try_get` — the listed spec `ServerHandler::get_tool`
             // used for `Mcp-Param-*`. `get` may refresh an expired TTL
-            // (`validated=Region executed=Zone`). A cache miss still
-            // falls through to `get` so an unlisted tool can load.
-            let tool = if let Some(tool) = catalog.try_get(&name) {
-                Some(tool)
-            } else {
-                catalog.get(&name).await
-            };
-            if let Some(tool) = tool {
-                return Some(ResolvedTool {
+            // (`validated=Region executed=Zone`).
+            if let Some(tool) = catalog.try_get(&name) {
+                return self.resolved_if_validated(
+                    validated,
                     tool,
-                    exposed_name: encode_tool_name(&catalog_name, &name),
-                    catalog: Some(catalog_name),
-                });
+                    exposed_name,
+                    Some(catalog_name),
+                );
             }
+
+            // Expired `try_get`: `get` returns the listed spec the
+            // snapshot already described. A name that was never in the
+            // snapshot is a first-seen discovery — publish and retry.
+            if let Some(tool) = catalog.get(&name).await {
+                return self.resolved_if_validated(
+                    validated,
+                    tool,
+                    exposed_name,
+                    Some(catalog_name),
+                );
+            }
+            return ResolveOutcome::Missing;
         }
         // Fall back to a direct (non-catalog) lookup. This covers top-level
         // tools whose names legitimately contain the `__` catalog separator.
         // Such a tool is exposed under its own name, so that name is already
         // canonical and must not be re-encoded — and it belongs to no catalog,
         // however much its name may look like one qualified by the separator.
-        match tools.get(tool_name)? {
-            Tooling::Tool(tool) | Tooling::FunctionTool(tool) => Some(ResolvedTool {
-                tool: Arc::clone(tool),
-                exposed_name: tool_name.to_string(),
-                catalog: None,
-            }),
-            Tooling::Catalog { .. } => None,
+        match tools.get(tool_name) {
+            Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) => {
+                ResolveOutcome::Ready(ResolvedTool {
+                    tool: Arc::clone(tool),
+                    exposed_name: tool_name.to_string(),
+                    catalog: None,
+                })
+            }
+            Some(Tooling::Catalog { .. }) | None => ResolveOutcome::Missing,
         }
+    }
+
+    fn resolved_if_validated(
+        &self,
+        validated: bool,
+        tool: Arc<dyn SpiceModelTool>,
+        exposed_name: String,
+        catalog: Option<String>,
+    ) -> ResolveOutcome {
+        if validated {
+            return ResolveOutcome::Ready(ResolvedTool {
+                tool,
+                exposed_name,
+                catalog,
+            });
+        }
+        self.remember_tool(mcp_tool_from_spice(exposed_name, tool.as_ref()));
+        ResolveOutcome::Retry
     }
 
     async fn all_tools(&self) -> Vec<Arc<dyn SpiceModelTool>> {
@@ -534,10 +590,21 @@ impl ServerHandler for RuntimeServer {
                 ));
             }
 
-            let Some(resolved) = self.get_tool(tool_name.as_ref()).await else {
-                return Err(McpError::method_not_found::<
-                    rmcp::model::CallToolRequestMethod,
-                >());
+            let resolved = match self.get_tool(tool_name.as_ref()).await {
+                ResolveOutcome::Ready(resolved) => resolved,
+                ResolveOutcome::Retry => {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "Tool '{tool_name}' was not in the schema used to validate this request, so it was not executed. Retry the call so `Mcp-Param-*` headers can be checked."
+                        ),
+                        None,
+                    ));
+                }
+                ResolveOutcome::Missing => {
+                    return Err(McpError::method_not_found::<
+                        rmcp::model::CallToolRequestMethod,
+                    >());
+                }
             };
 
             // If possible, we pass the call through to the MCP server.
@@ -899,6 +966,7 @@ mod tests {
             let resolved = server
                 .get_tool(requested)
                 .await
+                .into_ready()
                 .unwrap_or_else(|| panic!("{requested} should resolve"));
             assert_eq!(
                 resolved.exposed_name, canonical,
@@ -926,6 +994,7 @@ mod tests {
         let resolved = server
             .get_tool("top__level")
             .await
+            .into_ready()
             .expect("a top-level tool resolves by its own name");
         assert_eq!(resolved.exposed_name, "top__level");
 
@@ -2617,6 +2686,145 @@ mod tests {
     /// `try_get` keeps the expired Region schema; `get` refreshes to
     /// Zone. rmcp validates via `try_get`/snapshot, then dispatch used
     /// to call `get` (`validated=Region executed=Zone accepted=True`).
+    /// A catalog `get()` discovery after `try_get` / snapshot miss used
+    /// to execute in the same request (`validated_schema=None
+    /// executed=Region`). Publish the schema and require retry instead.
+    /// regression test for #14043
+    #[tokio::test]
+    async fn cache_miss_must_not_dispatch_unvalidated_tool() {
+        struct CacheMissUntilGetCatalog;
+
+        #[async_trait::async_trait]
+        impl SpiceToolCatalog for CacheMissUntilGetCatalog {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn name(&self) -> &'static str {
+                "srv"
+            }
+            async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                vec![Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>]
+            }
+            async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                (name == "deploy").then(|| Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>)
+            }
+            fn try_get(&self, _name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                None
+            }
+            fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                Vec::new()
+            }
+        }
+
+        let exposed = encode_tool_name("srv", "deploy");
+        let mut tools = HashMap::new();
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(CacheMissUntilGetCatalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+        let tools = Arc::new(RwLock::new(tools));
+        let schemas = McpSchemaSnapshot::new();
+        let first_epoch = schemas.epoch();
+        let server = RuntimeServer::with_schema_snapshot(Arc::clone(&tools), Arc::clone(&schemas));
+        assert!(
+            ServerHandler::get_tool(&server, &exposed).is_none(),
+            "first-call snapshot must have no schema so transport validation is skipped"
+        );
+
+        let factory_tools = Arc::clone(&tools);
+        let factory_schemas = Arc::clone(&schemas);
+        let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(true)
+            .disable_allowed_hosts()
+            .with_json_response(true);
+        let sessions = Arc::new(
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+        );
+        let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            {
+                let factory_tools = Arc::clone(&factory_tools);
+                let factory_schemas = Arc::clone(&factory_schemas);
+                move || {
+                    Ok(RuntimeServer::with_schema_snapshot(
+                        Arc::clone(&factory_tools),
+                        Arc::clone(&factory_schemas),
+                    ))
+                }
+            },
+            Arc::clone(&sessions),
+            config.clone(),
+        );
+
+        let (status, json) =
+            post_tools_call(&service, &exposed, Some("us-east-1"), "us-east-1").await;
+        assert_eq!(
+            json.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32602),
+            "unvalidated discovery must reject instead of execute: {status} {json}"
+        );
+        let message = json
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            message.contains("retry") && message.contains(&format!("'{exposed}'")),
+            "retry error must name the tool and tell the client to retry: {message}"
+        );
+        assert!(
+            json.pointer("/result").is_none(),
+            "first-call discovery must not return a tools/call result: {json}"
+        );
+        assert!(
+            schemas.get(&exposed).is_some(),
+            "discovery must publish the refreshed schema so the next request can validate"
+        );
+        assert!(
+            schemas.epoch() > first_epoch,
+            "publish must bump the epoch so Streamable HTTP drops the cached None"
+        );
+
+        let rebuilt = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            move || {
+                Ok(RuntimeServer::with_schema_snapshot(
+                    Arc::clone(&factory_tools),
+                    Arc::clone(&factory_schemas),
+                ))
+            },
+            sessions,
+            config,
+        );
+        let rebuilt_server =
+            RuntimeServer::with_schema_snapshot(Arc::clone(&tools), Arc::clone(&schemas));
+        assert!(
+            ServerHandler::get_tool(&rebuilt_server, &exposed).is_some(),
+            "rebuilt transport must see the published schema"
+        );
+
+        let (status, json) =
+            post_tools_call(&rebuilt, &exposed, Some("us-east-1"), "us-east-1").await;
+        assert!(
+            status.is_success(),
+            "retry after publish must validate and execute: {status} {json}"
+        );
+        let executed = json
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .and_then(|body| {
+                body.get("executed")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            });
+        assert_eq!(
+            executed.as_deref(),
+            Some("Region"),
+            "retry after publish must execute the discovered tool: {json}"
+        );
+    }
+
     #[tokio::test]
     async fn expired_try_get_schema_must_not_dispatch_refreshed_tool() {
         struct ExpiredThenRefreshCatalog;
