@@ -199,6 +199,44 @@ impl DuckDbDatasetCheckpointer {
         Ok(())
     }
 
+    /// Blocking: takes the pool's write gate. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
+    fn set_schema_duckdb(
+        dataset_name: &str,
+        create_snapshot: bool,
+        pool: &Arc<DuckDbConnectionPool>,
+        schema: &SchemaRef,
+    ) -> Result<(), CheckpointError> {
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(store_error)?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(store_error)?
+            .get_underlying_conn_mut();
+
+        let schema_json = serialize_schema(schema).map_err(store_error)?;
+        // Not an upsert: an absent row must stay absent rather than gain a fresh
+        // `updated_at`, which is the deferral this exists to avoid.
+        let update =
+            format!("UPDATE {CHECKPOINT_TABLE_NAME} SET schema_json = ? WHERE dataset_name = ?");
+        let rows_changed = duckdb_conn
+            .execute(&update, duckdb::params![&schema_json, dataset_name])
+            .map_err(store_error)?;
+
+        // A repair that only reached the WAL is invisible to a snapshot: the upload path
+        // copies the database file alone, and `DuckDBSnapshotEngine` inherits the no-op
+        // `SnapshotEngine::checkpoint_live`, so nothing else flushes it. Gate on the row
+        // count so an absent checkpoint stays untouched, as above.
+        if create_snapshot && rows_changed > 0 {
+            duckdb_conn.execute("CHECKPOINT", []).map_err(store_error)?;
+        }
+
+        Ok(())
+    }
+
     fn migrate_duckdb(pool: &Arc<DuckDbConnectionPool>) -> Result<(), CheckpointError> {
         let write_gate = pool.write_gate();
         let _write_guard = write_gate
@@ -325,6 +363,21 @@ impl DatasetCheckpointer for DuckDbDatasetCheckpointer {
                 &schema,
                 refresh_sql.as_deref(),
             )
+        })
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn set_schema(
+        &self,
+        schema: &SchemaRef,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
+        let pool = Arc::clone(&self.pool);
+        let dataset_name = self.dataset_name.clone();
+        let create_snapshot = self.snapshot_behavior.create_enabled();
+        let schema = Arc::clone(schema);
+        spawn_checkpoint_blocking(move || {
+            Self::set_schema_duckdb(&dataset_name, create_snapshot, &pool, &schema)
         })
         .await
         .map_err(Into::into)
@@ -783,5 +836,187 @@ mod tests {
             .await
             .expect("the checkpoint task should not panic")
             .expect("the checkpoint should succeed once the gate is released");
+    }
+
+    /// A schema repair must correct the recorded schema without telling the refresh
+    /// scheduler the data was just refreshed. Regression test for #13817.
+    #[tokio::test]
+    async fn set_schema_rewrites_the_schema_without_touching_the_freshness_clock() {
+        let (checkpoint, pool) = create_in_memory_duckdb_checkpoint();
+
+        let original = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        // What a repair writes back: the same columns, `name` no longer nullable.
+        let repaired = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        checkpoint
+            .checkpoint(&original, Some("SELECT 1"))
+            .await
+            .expect("seed checkpoint");
+
+        backdate_checkpoint_by_seven_days(&pool);
+
+        let before = checkpoint
+            .last_checkpoint_time()
+            .await
+            .expect("read checkpoint time")
+            .expect("checkpoint time present");
+
+        checkpoint
+            .set_schema(&repaired)
+            .await
+            .expect("schema-only write");
+
+        // Read back through a fresh checkpointer over the same store: acceptance is what
+        // the row holds, not what the call returned.
+        let reader = DuckDbDatasetCheckpointer::new(
+            Arc::clone(&pool),
+            "test_dataset".to_string(),
+            SnapshotBehavior::Disabled,
+        );
+
+        let after = reader
+            .last_checkpoint_time()
+            .await
+            .expect("read checkpoint time")
+            .expect("checkpoint time present");
+        assert_eq!(
+            after, before,
+            "a schema-only write must leave the freshness clock alone"
+        );
+
+        assert_eq!(
+            reader
+                .get_schema()
+                .await
+                .expect("read schema")
+                .expect("schema present"),
+            repaired,
+            "the repaired schema must be the one stored"
+        );
+
+        assert_eq!(
+            reader.get_refresh_sql().await.expect("read refresh sql"),
+            Some("SELECT 1".to_string()),
+            "a schema-only write must preserve the stored refresh SQL"
+        );
+    }
+
+    /// A dataset with no checkpoint must not gain one — a row created here would carry a
+    /// fresh `updated_at`, which is the deferral the schema-only write exists to avoid.
+    #[tokio::test]
+    async fn set_schema_leaves_an_absent_checkpoint_absent() {
+        let (checkpoint, _pool) = create_in_memory_duckdb_checkpoint();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        checkpoint
+            .set_schema(&schema)
+            .await
+            .expect("schema-only write on an absent checkpoint");
+
+        assert!(
+            !checkpoint.exists().await,
+            "a schema-only write must not create a checkpoint row"
+        );
+        assert!(
+            checkpoint
+                .last_checkpoint_time()
+                .await
+                .expect("read checkpoint time")
+                .is_none(),
+            "an absent checkpoint must not gain a freshness timestamp"
+        );
+    }
+
+    /// Backdates the checkpoint's recorded refresh by seven days, as a dataset
+    /// bootstrapping from a legacy snapshot would be.
+    fn backdate_checkpoint_by_seven_days(pool: &Arc<DuckDbConnectionPool>) {
+        let mut db_conn = Arc::clone(pool).connect_sync().expect("Failed to connect");
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .expect("Failed to get conn")
+            .get_underlying_conn_mut();
+        duckdb_conn
+            .execute(
+                &format!("UPDATE {CHECKPOINT_TABLE_NAME} SET updated_at = now() - INTERVAL 7 DAY"),
+                [],
+            )
+            .expect("backdate updated_at");
+    }
+
+    /// A schema repair on a snapshot-enabled store must reach the database file, not just
+    /// the WAL: the upload path copies that file alone and `DuckDBSnapshotEngine` inherits
+    /// the no-op `SnapshotEngine::checkpoint_live`, so a WAL-resident repair would ship a
+    /// snapshot carrying the schema the repair replaced. Raised by Copilot on #13894.
+    #[tokio::test]
+    async fn set_schema_reaches_the_database_file_when_snapshots_are_enabled() {
+        use duckdb::AccessMode;
+        use spicepod::acceleration::SnapshotsCompaction;
+        use spicepod::component::snapshot::Snapshots;
+        use std::sync::Weak;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("acceleration.db");
+        let db_path = db.to_string_lossy().to_string();
+
+        let pool = Arc::new(
+            DuckDbConnectionPool::new_file(&db_path, &AccessMode::ReadWrite).expect("file pool"),
+        );
+        DuckDbDatasetCheckpointer::init_duckdb(&pool).expect("Failed to initialize DuckDB");
+        DuckDbDatasetCheckpointer::migrate_duckdb(&pool).expect("Failed to migrate DuckDB");
+
+        let checkpoint = DuckDbDatasetCheckpointer::new(
+            Arc::clone(&pool),
+            "test_dataset".to_string(),
+            SnapshotBehavior::Enabled(
+                Arc::new(Snapshots::default()),
+                Weak::new(),
+                tokio::runtime::Handle::current(),
+                SnapshotsCompaction::Disabled,
+            ),
+        );
+
+        let original = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let repaired = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        checkpoint
+            .checkpoint(&original, Some("SELECT 1"))
+            .await
+            .expect("seed checkpoint");
+        checkpoint
+            .set_schema(&repaired)
+            .await
+            .expect("schema-only write");
+
+        // Exactly what the snapshot upload does before uploading: copy the live file alone.
+        let copied = dir.path().join("snapshot.db");
+        std::fs::copy(&db, &copied).expect("copy the database file");
+
+        let reader = DuckDbDatasetCheckpointer::new(
+            Arc::new(
+                DuckDbConnectionPool::new_file(&copied.to_string_lossy(), &AccessMode::ReadOnly)
+                    .expect("read the copied database"),
+            ),
+            "test_dataset".to_string(),
+            SnapshotBehavior::Disabled,
+        );
+
+        assert_eq!(
+            reader
+                .get_schema()
+                .await
+                .expect("read schema")
+                .expect("schema present"),
+            repaired,
+            "a snapshot taken after the repair must carry the repaired schema"
+        );
     }
 }

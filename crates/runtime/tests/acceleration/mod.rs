@@ -21,6 +21,7 @@ use spicepod::{acceleration::Mode, param::Params};
 use std::sync::Arc;
 
 mod caching_mode;
+mod caching_mode_constraints;
 #[cfg(feature = "duckdb")]
 mod caching_mode_per_principal;
 #[cfg(feature = "duckdb")]
@@ -43,6 +44,8 @@ mod checkpoint_sqlite;
 mod checkpoint_turso;
 #[cfg(feature = "duckdb")]
 mod cron;
+#[cfg(feature = "duckdb")]
+mod duckdb_builtin_pushdown;
 #[cfg(feature = "duckdb")]
 mod file_create_duckdb;
 #[cfg(feature = "duckdb")]
@@ -75,6 +78,8 @@ mod single_instance_duckdb;
 mod snapshot_lock_contention;
 #[cfg(feature = "snapshots")]
 mod snapshot_mutex;
+#[cfg(feature = "sqlite")]
+mod user_function_pushdown;
 
 /// Queue a refresh of `table`. Callers poll for the result rather than waiting on the
 /// returned notifier: completion signals with `notify_waiters`, which stores no permit,

@@ -45,16 +45,32 @@ use std::sync::{Arc, LazyLock};
 /// at these cardinalities: ~0.3% collision odds at the same scale.)
 #[inline]
 pub(crate) fn pk_digest(key: &OwnedRow) -> u128 {
-    hash_key_128(key.as_ref())
+    pk_digest_bytes(key.as_ref())
+}
+
+/// [`pk_digest`] over an encoded key that is still borrowed from a [`Rows`]
+/// batch, so the conflict loop can compute a row's identity without first
+/// copying it into an [`OwnedRow`].
+///
+/// Both spellings must stay one function: the digest a row is filed under has
+/// to equal the digest it is later probed by, and `insert_with_digest` only
+/// checks that under `debug_assert`. Hashing the bytes directly at a borrowed
+/// call site would leave two definitions of primary-key identity that a change
+/// to the seed or the hash could silently pull apart in release builds.
+///
+/// [`Rows`]: crate::row_converter::Rows
+#[inline]
+pub(crate) fn pk_digest_bytes(key: &[u8]) -> u128 {
+    hash_key_128(key)
 }
 
 /// A set of primary-key [`OwnedRow`]s identified by their [`pk_digest`] and
 /// fronted by [`PrehashedBuildHasher`]. Presents a `HashSet`-like API while
-/// keying on the 128-bit digest, so the per-apply accumulators
-/// (`incoming_keys` / `kept_keys` / bloom-MISS keys) share the conflict loop's
-/// single hash pass. The `OwnedRow` is retained (as the map value) because
-/// downstream consumers — the keyset insert, bloom rebuild, deletion lists, and
-/// shard routing — need the raw key bytes, never the digest.
+/// keying on the 128-bit digest, so the per-apply accumulators (`kept_keys` and
+/// the bloom-MISS keys) share the conflict loop's single hash pass. The
+/// `OwnedRow` is retained (as the map value) because downstream consumers — the
+/// keyset insert, bloom rebuild, deletion lists, and shard routing — need the
+/// raw key bytes, never the digest.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PkDigestSet {
     inner: HashMap<u128, OwnedRow, PrehashedBuildHasher>,
@@ -109,12 +125,9 @@ impl PkDigestSet {
         self.inner.extend(other.inner);
     }
 
-    /// Copy every key of `other` into `self`, reusing its stored digests.
-    pub(crate) fn extend_ref(&mut self, other: &PkDigestSet) {
-        self.inner.reserve(other.inner.len());
-        for (&digest, key) in &other.inner {
-            self.inner.insert(digest, key.clone());
-        }
+    /// Iterate key identities without copying the retained key bytes.
+    pub(crate) fn digests(&self) -> impl Iterator<Item = u128> {
+        self.inner.keys().copied()
     }
 
     /// Iterate `(digest, key)` pairs, so a consumer rebuilding another
@@ -750,6 +763,14 @@ impl PkBloom {
         }
     }
 
+    /// `(inserted keys, allocated bits)` for this filter.
+    pub(crate) fn density(&self) -> (u64, u64) {
+        (
+            u64::try_from(self.inserted_keys).unwrap_or(u64::MAX),
+            u64::try_from(self.size_bytes()).unwrap_or(u64::MAX / 8) * 8,
+        )
+    }
+
     /// The frame version this filter serializes as.
     #[cfg(test)]
     pub(crate) fn frame_version(&self) -> u32 {
@@ -1187,6 +1208,20 @@ impl CachedPkIndex {
             Self::Bloom(bloom) => bloom.size_bytes(),
         }
     }
+
+    /// `(inserted keys, allocated bits)` when this index is a bloom, `None` when
+    /// it is still an exact keyset.
+    ///
+    /// Their ratio is the filter's density. It is worth exporting because a
+    /// filter can be resident at many times the bits-per-key the sizing code
+    /// asks for, and nothing else makes that visible: the bytes alone look like
+    /// a large table, and the key count alone looks correct.
+    pub(crate) fn bloom_density(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Exact(_) => None,
+            Self::Bloom(bloom) => Some(bloom.density()),
+        }
+    }
 }
 
 /// One committed key batch held while a PK existence index was checked out of
@@ -1336,6 +1371,8 @@ impl PendingPkKeys {
         let restored = RestoredPkKeys {
             batches: std::mem::take(&mut self.batches),
             discard_index: self.overflowed || self.invalidated,
+            overflowed: self.overflowed,
+            invalidated: self.invalidated,
         };
         self.approx_bytes = 0;
         self.outstanding = self.outstanding.saturating_sub(1);
@@ -1398,6 +1435,18 @@ impl PendingPkKeys {
 /// open a window it does not also own.
 pub(crate) struct PkCheckoutGuard {
     pending: Arc<ParkingMutex<PendingPkKeys>>,
+    /// Republishes the resident-byte accounting of the cache this window covers.
+    /// Keys recorded while the window is open are accounted against that cache's
+    /// published bytes as they land (`record_pending_pk_keys`), on top of the bytes
+    /// the checked-out index itself still holds. A restore overwrites both with the
+    /// stored index's size; an abandoned window restores nothing, so without this
+    /// the bytes of an index that no longer exists and of keys that were just
+    /// dropped would stay reserved against the table's memory account until an
+    /// unrelated publish happened to overwrite them.
+    ///
+    /// Run by [`Drop`] on the abandon path only — [`Self::close`] hands the window
+    /// to a restore, which publishes the truth itself.
+    release_accounting: Option<Box<dyn FnOnce() + Send>>,
     /// Set by [`Self::close`], which has already closed the window and owns the
     /// keys it handed back, so [`Drop`] must not close it a second time.
     closed: bool,
@@ -1405,10 +1454,18 @@ pub(crate) struct PkCheckoutGuard {
 
 impl PkCheckoutGuard {
     /// Open a checkout window over `pending`.
-    pub(crate) fn open(pending: &Arc<ParkingMutex<PendingPkKeys>>) -> Self {
+    ///
+    /// `release_accounting` is what an *abandoned* window must do to the published
+    /// resident bytes of the cache it covers (see the field); the table passes a
+    /// closure that republishes what the cache cell actually holds.
+    pub(crate) fn open(
+        pending: &Arc<ParkingMutex<PendingPkKeys>>,
+        release_accounting: impl FnOnce() + Send + 'static,
+    ) -> Self {
         pending.lock().begin_checkout();
         Self {
             pending: Arc::clone(pending),
+            release_accounting: Some(Box::new(release_accounting)),
             closed: false,
         }
     }
@@ -1433,6 +1490,11 @@ impl Drop for PkCheckoutGuard {
         // stays cold — the next validation rebuilds from the table and sees every
         // committed key.
         let _ = self.pending.lock().end_checkout();
+        // The pending lock is released before this runs: the release takes the
+        // cache cell's lock and the publish lock, never the pending log's.
+        if let Some(release) = self.release_accounting.take() {
+            release();
+        }
     }
 }
 
@@ -1473,6 +1535,12 @@ impl CheckedOutShardedPkIndex {
 pub(crate) struct RestoredPkKeys {
     batches: Vec<PendingPkKeyBatch>,
     discard_index: bool,
+    /// The log stopped recording, so keys committed during the checkout are
+    /// unrecoverable. Retained separately from `discard_index` so the discard
+    /// counter can name which condition fired.
+    overflowed: bool,
+    /// The cache was invalidated while the index was out.
+    invalidated: bool,
 }
 
 impl RestoredPkKeys {
@@ -1482,6 +1550,23 @@ impl RestoredPkKeys {
     /// answer "absent" for a live key, which reads as a new primary key.
     pub(crate) fn index_must_be_discarded(&self) -> bool {
         self.discard_index
+    }
+
+    /// Which of the two conditions forced the discard, as a metric label.
+    ///
+    /// They are different problems: `overflowed` means the pending-key log's
+    /// byte cap is too small for the commit rate during a validation, while
+    /// `invalidated` means something superseded the table state (a delete, a
+    /// compaction, a recovery, or a second concurrent checkout). Collapsing them
+    /// into one counter hides which lever to reach for — and an `invalidated`
+    /// rate on a table doing neither is how a checkout-time guard firing on
+    /// indexes that needed no invalidating becomes visible.
+    pub(crate) const fn discard_reason(&self) -> Option<&'static str> {
+        match (self.overflowed, self.invalidated) {
+            (true, _) => Some("overflowed"),
+            (false, true) => Some("invalidated"),
+            (false, false) => None,
+        }
     }
 
     /// Replay every held batch, oldest first, so a key committed twice ends on its
@@ -1719,6 +1804,39 @@ impl ShardedPkIndex {
                 .iter()
                 .map(PkBloom::size_bytes)
                 .fold(0, usize::saturating_add),
+        }
+    }
+
+    /// Live keys across all shards: exact entries, or inserted keys in bloom
+    /// mode.
+    pub(crate) fn key_count(&self) -> usize {
+        match self {
+            Self::Exact(keysets) => keysets
+                .iter()
+                .map(CachedPkKeyset::len)
+                .fold(0, usize::saturating_add),
+            Self::Bloom(blooms) => blooms
+                .iter()
+                .map(|bloom| bloom.inserted_keys)
+                .fold(0, usize::saturating_add),
+        }
+    }
+
+    /// `(inserted keys, allocated bits)` summed over the per-shard filters when
+    /// this index is in bloom mode, `None` while it is still exact. See
+    /// [`CachedPkIndex::bloom_density`] for why the ratio matters.
+    pub(crate) fn bloom_density(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Exact(_) => None,
+            Self::Bloom(blooms) => Some(blooms.iter().map(PkBloom::density).fold(
+                (0_u64, 0_u64),
+                |(keys, bits), (shard_keys, shard_bits)| {
+                    (
+                        keys.saturating_add(shard_keys),
+                        bits.saturating_add(shard_bits),
+                    )
+                },
+            )),
         }
     }
 
@@ -2877,15 +2995,47 @@ mod tests {
     ///
     /// [`PkCheckoutGuard`] is what makes the window impossible to abandon; this
     /// pins the behaviour it buys.
+    /// The accounting release runs only when a window is abandoned. A restore
+    /// closes the window and publishes the stored index's size itself, so running
+    /// the release there too would publish a stale figure over the true one.
+    #[test]
+    fn only_an_abandoned_checkout_runs_its_accounting_release() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pending = Arc::new(ParkingMutex::new(PendingPkKeys::default()));
+        let released = Arc::new(AtomicUsize::new(0));
+        let release = |released: &Arc<AtomicUsize>| {
+            let released = Arc::clone(released);
+            move || {
+                released.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+
+        let closed = PkCheckoutGuard::open(&pending, release(&released));
+        drop(closed.close());
+        assert_eq!(
+            released.load(Ordering::Relaxed),
+            0,
+            "a restore publishes the truth itself, so a closed window must not release"
+        );
+
+        drop(PkCheckoutGuard::open(&pending, release(&released)));
+        assert_eq!(
+            released.load(Ordering::Relaxed),
+            1,
+            "an abandoned window must release the accounting it grew"
+        );
+    }
+
     #[test]
     fn an_abandoned_checkout_leaves_the_next_one_usable() {
         let pending = Arc::new(ParkingMutex::new(PendingPkKeys::default()));
 
         // A validation that fails, panics, or is cancelled part-way: the window
         // opened, nothing restored an index, and the guard closed it on the way out.
-        drop(PkCheckoutGuard::open(&pending));
+        drop(PkCheckoutGuard::open(&pending, || {}));
 
-        let checkout = PkCheckoutGuard::open(&pending);
+        let checkout = PkCheckoutGuard::open(&pending, || {});
         let mut keys = PkDigestSet::with_capacity(1);
         let k = owned_key(&key(7));
         keys.insert_with_digest(pk_digest(&k), k.clone());
@@ -2922,8 +3072,8 @@ mod tests {
     fn closing_a_checkout_does_not_also_close_it_on_drop() {
         let pending = Arc::new(ParkingMutex::new(PendingPkKeys::default()));
 
-        let outer = PkCheckoutGuard::open(&pending);
-        let inner = PkCheckoutGuard::open(&pending);
+        let outer = PkCheckoutGuard::open(&pending, || {});
+        let inner = PkCheckoutGuard::open(&pending, || {});
         assert_eq!(pending.lock().outstanding, 2, "two windows are open");
 
         drop(inner.close());
@@ -2952,8 +3102,8 @@ mod tests {
     fn two_concurrent_checkouts_are_both_discarded() {
         let pending = Arc::new(ParkingMutex::new(PendingPkKeys::default()));
 
-        let first = PkCheckoutGuard::open(&pending);
-        let second = PkCheckoutGuard::open(&pending);
+        let first = PkCheckoutGuard::open(&pending, || {});
+        let second = PkCheckoutGuard::open(&pending, || {});
 
         assert!(
             second.close().index_must_be_discarded(),
@@ -2966,7 +3116,7 @@ mod tests {
 
         // ...and the flags clear once the last window closes, so the NEXT
         // checkout is trusted again.
-        let third = PkCheckoutGuard::open(&pending);
+        let third = PkCheckoutGuard::open(&pending, || {});
         assert!(
             !third.close().index_must_be_discarded(),
             "the discard must not outlive the overlap that caused it"

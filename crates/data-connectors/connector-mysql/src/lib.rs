@@ -34,9 +34,9 @@ use mysql_async::{Metrics, prelude::Queryable};
 use opentelemetry::KeyValue;
 use runtime_api_types::v1::ComponentType;
 use runtime_component::dataset::DatasetSpec;
+use runtime_datafusion::function_support::deny_spice_functions_for_mysql_table_providers;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ParameterSpec, Parameters};
-use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use secrecy::{ExposeSecret, SecretBox};
 use snafu::prelude::*;
 use std::any::Any;
@@ -364,7 +364,7 @@ impl DataConnectorFactory for MySQLFactory {
             // those functions don't exist and the query would fail with an
             // "unknown function" error. See issue #10703.
             let mysql_factory = MySQLTableFactory::new(Arc::clone(&pool))
-                .with_function_support(deny_spice_functions_for_table_providers());
+                .with_function_support(deny_spice_functions_for_mysql_table_providers());
 
             Ok(Arc::new(MySQL {
                 mysql_factory,

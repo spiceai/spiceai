@@ -23,6 +23,7 @@ limitations under the License.
 use super::metadata::{
     ColdTierFile, CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
     PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
+    TableStorageStats,
 };
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -840,6 +841,19 @@ pub trait MetadataCatalog: Send + Sync {
     /// tombstones, in one round trip. See [`InlinedDataStats`] for why the
     /// checkpoint needs both.
     async fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats>;
+
+    /// Aggregate the table's disk and metastore footprint from the metastore's
+    /// own file accounting.
+    ///
+    /// Answers "how large is this dataset, and which layer is growing" — the
+    /// live data files, the deletion vectors shadowing them, the cold tier, the
+    /// inline tier, and the metastore rows each of those costs — without
+    /// listing a single directory.
+    ///
+    /// Read-only aggregates intended for the background maintenance tick, never
+    /// a write path: a table with thousands of files scans thousands of index
+    /// rows here.
+    async fn table_storage_stats(&self, table_id: &str) -> CatalogResult<TableStorageStats>;
 
     /// Remove all inlined data for a table (called after checkpoint flushes to Vortex).
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()>;

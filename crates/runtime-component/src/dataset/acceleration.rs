@@ -17,8 +17,9 @@ limitations under the License.
 // Re-export everything from runtime-acceleration so existing import paths continue to work.
 pub use runtime_acceleration::Engine;
 pub use runtime_acceleration::acceleration::{
-    Acceleration, IndexType, Mode, OnConflictBehavior, ParseError, RefreshMode, RefreshOnStartup,
-    StaleIfError, StorageProfile, ZeroResultsAction,
+    Acceleration, DurableWriteBackKey, IndexType, Mode, OnConflictBehavior, ParseError,
+    RefreshMode, RefreshOnStartup, StaleIfError, StorageProfile, ZeroResultsAction,
+    classify_durable_write_back_key,
 };
 
 pub mod constraints;

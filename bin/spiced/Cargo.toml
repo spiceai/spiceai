@@ -89,13 +89,8 @@ zeroize = "1.8"
 snmalloc-rs = { version = "0.3.6" }
 spice-cloud = { path = "../../crates/spice_cloud" }
 telemetry = { path = "../../crates/telemetry" }
-# `profiling` builds jemalloc with `--enable-prof`, without which the heap
-# profiler cannot be turned on at all and `MALLOC_CONF=prof:true,prof_prefix=…`
-# is silently ignored. Costs a sample check in the allocator fast path even while
-# prof is inactive, so this opt-in `alloc-jemalloc` build is for heap
-# investigations, not for allocator throughput comparisons against the default
-# snmalloc build.
-tikv-jemallocator = { version = "0.6.0", optional = true, features = ["profiling"] }
+# No `profiling` feature here: `--enable-prof` belongs to `alloc-jemalloc-profiling`.
+tikv-jemallocator = { version = "0.7.0", optional = true }
 tokio.workspace = true
 # `CancellationToken` for the latches the connection report waits on.
 tokio-util.workspace = true
@@ -128,6 +123,9 @@ tempfile.workspace = true
 [features]
 adbc = ["dep:connector-adbc", "runtime/adbc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
+# Builds jemalloc with `--enable-prof`, without which `_RJEM_MALLOC_CONF=prof:true`
+# is silently ignored. Reports as `jemalloc-profiling`, not `jemalloc`.
+alloc-jemalloc-profiling = ["alloc-jemalloc", "tikv-jemallocator/profiling"]
 alloc-mimalloc = ["dep:mimalloc"]
 alloc-snmalloc = []
 alloc-system = []

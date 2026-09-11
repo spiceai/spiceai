@@ -366,6 +366,42 @@ async fn create_table(
     Ok(())
 }
 
+/// Drives one non-blocking poll past the bootstrap boundary, so the
+/// `bootstrap_finished` link runs.
+///
+/// The stream a member yields is `snapshot.chain(boundary).chain(bootstrap_finished)`
+/// chained onto the live receiver. `bootstrap_finished` is the link that calls
+/// `snapshot_finished` and marks the member live, and it is only reached on the
+/// poll *after* the boundary: committing the boundary envelope does not reach it,
+/// because that poll returned as soon as `boundary` yielded. A caller that drops
+/// the stream there leaves the member `SNAPSHOTTING`, so its detach tears the
+/// table back out of the publication and the next start re-snapshots instead of
+/// resuming on the position it recorded. For a case whose whole subject is what
+/// the *rejoin* decides, that silently substitutes a different fixture.
+///
+/// One poll is enough and one poll is all this does. `Chain` consumes
+/// `boundary`'s `None` and polls `bootstrap_finished` within the same call, so
+/// the hook has fired by the time this returns. It must not `await` the stream's
+/// next item: past the hook the chain continues into the live receiver, which
+/// stays open and yields `Pending` until WAL traffic or a keepalive arrives.
+/// Anything the receiver could produce — `Pending`, a heartbeat, an envelope —
+/// happens strictly after the hook, so all of them mean "the hook ran". Only a
+/// stream error is worth failing on, since it says the member did not survive its
+/// own bootstrap.
+async fn finish_bootstrap(stream: &mut ChangesStream, what: &str) -> Result<(), anyhow::Error> {
+    let polled =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(stream.poll_next_unpin(cx))).await;
+
+    if let std::task::Poll::Ready(Some(Err(e))) = polled {
+        anyhow::bail!(
+            "the bootstrap stream for {what} errored on the poll that runs its \
+             snapshot-finished hook: {e}"
+        );
+    }
+
+    Ok(())
+}
+
 async fn next_envelope(
     stream: &mut ChangesStream,
     what: &str,
@@ -518,6 +554,28 @@ async fn wait_for_walsender_count(
     }
     Err(anyhow::anyhow!(
         "expected {expected} walsender(s) for slot {SLOT}, last saw {last}"
+    ))
+}
+
+/// Poll until the store holds a recorded position.
+///
+/// The watermark is published by the snapshot-boundary envelope's committer
+/// (`SnapshotWatermarkCommitter`), which hands it to the store to write rather
+/// than writing it inline — so the position lands shortly after that commit
+/// returns, not within it. Reading once races that write.
+async fn wait_for_recorded_position(
+    store: &Arc<InMemoryAppliedLsnStore>,
+    what: &str,
+) -> Result<(), anyhow::Error> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if matches!(store.load().await, Ok(RecordedPosition::At(_))) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err(anyhow::anyhow!(
+        "{what} recorded no position, so this case would not exercise a surviving one"
     ))
 }
 
@@ -1602,6 +1660,200 @@ async fn an_empty_acceleration_is_still_loaded_when_no_snapshot_runs() -> Result
     Ok(())
 }
 
+/// An acceleration that comes back **empty while its recorded position survived**
+/// must be loaded, not resumed — the shape a `mode: file_update` recreate leaves
+/// behind (#13546).
+///
+/// The recreate drops the accelerated table because the source schema changed
+/// incompatibly, while the watermark sidecar lives in the same accelerator and is
+/// not dropped with it. So the next start finds no rows and a position the slot
+/// can still stream from, and every arm of the resume decision is individually
+/// satisfied: the slot is valid, retention is intact, the position is this
+/// source's. Resuming on it succeeds and the rows committed before that position
+/// are never loaded by anything.
+///
+/// Distinct from [`an_empty_acceleration_is_still_loaded_when_no_snapshot_runs`],
+/// which reaches the same "must be loaded" conclusion from a *missing* record. Here
+/// the record is present and usable, which is the reason a resume looks safe.
+///
+/// The two rows written before the first start are what the assertion is about:
+/// they precede the recorded position, so no reachable WAL carries them and only a
+/// rebuild or a snapshot can put them back.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_acceleration_with_a_surviving_position_is_loaded_not_resumed()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "recreated", &[(1, "alice"), (2, "bob")]).await?;
+
+    // First start: creates the slot and publication, and commits so a real
+    // position is recorded in the store.
+    let store = InMemoryAppliedLsnStore::shared();
+    let mut first = start_replication_stream(input_with_contents(
+        port,
+        "recreated",
+        &store,
+        AccelerationContents::Empty,
+    ));
+    next_envelope(&mut first, "first-start bootstrap")
+        .await?
+        .commit()
+        .await?;
+    // The bootstrap stream is `snapshot.chain(boundary).chain(bootstrap_finished)`,
+    // and it is the zero-row boundary — not the data envelope above — whose
+    // committer publishes the watermark. Both rows fit one batch, so without
+    // polling this second envelope the stream is dropped before any position is
+    // recorded.
+    next_envelope(&mut first, "first-start snapshot boundary")
+        .await?
+        .commit()
+        .await?;
+    // And one poll further, so the member is left live rather than snapshotting —
+    // see `finish_bootstrap`. Without it the rejoin below re-snapshots and never
+    // reaches the arm this case is about.
+    finish_bootstrap(&mut first, "the first start").await?;
+    drop(first);
+    wait_for_walsender_count(&source, 0).await?;
+
+    // The recorded position is the whole point of this case: without it the
+    // rejoin below is the already-covered missing-record case.
+    wait_for_recorded_position(&store, "the first start").await?;
+
+    // Rejoin on the SAME store — the position survived — while the acceleration
+    // is observed empty, which is what the recreate left behind.
+    let input = input_with_contents(port, "recreated", &store, AccelerationContents::Empty);
+    let metrics = ReplicationMetrics::new(Arc::clone(&input.metrics));
+    let mut rejoined = start_replication_stream(input);
+
+    let envelope = next_envelope(&mut rejoined, "first envelope after the recreate").await?;
+    let loaded = envelope.history_unavailable() || metrics.bootstrap_rows_total() > 0;
+    anyhow::ensure!(
+        loaded,
+        "an emptied acceleration resumed from the position it recorded before it was emptied, so \
+         every row committed below that position is missing from it for good. A recorded position \
+         means those changes will never be resent — it does not mean the rows are here"
+    );
+    // Being loaded does not say *this* arm decided it. Every other rebuild cause
+    // loads too, so a fixture that drifted into an `acknowledged_past` or
+    // `retention_lost` shape — the slot advancing or trimming under the pause
+    // above — would keep this case green with the arm it exists for removed.
+    // `RebuildCause::label` is documented as the stable identifier, so pinning it
+    // here is not a wording dependency.
+    let cause = metrics.rebuild_cause();
+    anyhow::ensure!(
+        cause == Some("empty_with_usable_position"),
+        "the emptied acceleration was loaded, but not by the arm this case covers: the rebuild \
+         cause was {cause:?}, and only \"empty_with_usable_position\" is the recreate shape — \
+         another cause means the fixture stopped reaching the decision under test"
+    );
+    envelope.commit().await?;
+
+    drop(rejoined);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// The same surviving position as
+/// [`an_empty_acceleration_with_a_surviving_position_is_loaded_not_resumed`], but
+/// reached with the acceleration's contents **unproven** rather than observed
+/// empty — the shape a failed probe leaves behind.
+///
+/// `probe_acceleration_contents` never fails the start: a scan it cannot run
+/// returns [`AccelerationContents::Unknown`]. That is not evidence the table
+/// holds rows, so it cannot license the resume — if the probe failed on a table a
+/// recreate had just emptied, resuming on the surviving position would leave every
+/// row below it missing exactly as it would in the case above, and the probe
+/// failure would be the only trace.
+///
+/// Covering it end-to-end is what stops the unsafe mapping from coming back
+/// silently. The decision is a `match` on all three states, so restoring
+/// `Unknown => resume` is a visible edit — and this case proves the live attach
+/// path honours `Unknown` across a real slot, publication and rejoin, which no
+/// unit test on the decision function alone can show.
+///
+/// It does *not* cover the seam above it. The contents are handed to
+/// `ReplicationStreamInput` directly, so nothing here exercises
+/// `datafusion::handle_schema_difference` calling `probe_acceleration_contents`
+/// and forwarding that answer into the connector; a regression in the forwarding
+/// would leave this case green. Tracked in #13752.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unprovable_acceleration_with_a_surviving_position_is_loaded_not_resumed()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "unprobed", &[(1, "alice"), (2, "bob")]).await?;
+
+    // First start: records a real position, exactly as the empty-contents case
+    // does — the two differ only in what the rejoin below knows about the table.
+    let store = InMemoryAppliedLsnStore::shared();
+    let mut first = start_replication_stream(input_with_contents(
+        port,
+        "unprobed",
+        &store,
+        AccelerationContents::Empty,
+    ));
+    next_envelope(&mut first, "first-start bootstrap")
+        .await?
+        .commit()
+        .await?;
+    next_envelope(&mut first, "first-start snapshot boundary")
+        .await?
+        .commit()
+        .await?;
+    finish_bootstrap(&mut first, "the first start").await?;
+    drop(first);
+    wait_for_walsender_count(&source, 0).await?;
+
+    wait_for_recorded_position(&store, "the first start").await?;
+
+    // Rejoin on the SAME store with the probe's failure answer.
+    let input = input_with_contents(port, "unprobed", &store, AccelerationContents::Unknown);
+    let metrics = ReplicationMetrics::new(Arc::clone(&input.metrics));
+    let mut rejoined = start_replication_stream(input);
+
+    let envelope = next_envelope(&mut rejoined, "first envelope after the failed probe").await?;
+    let loaded = envelope.history_unavailable() || metrics.bootstrap_rows_total() > 0;
+    anyhow::ensure!(
+        loaded,
+        "an acceleration whose contents could not be read resumed from a position recorded before \
+         it may have been emptied. An unanswered probe is not proof the rows are still here, and \
+         the changes below that position will never be resent"
+    );
+    // Pinned to its own cause, not merely to "some rebuild happened": reporting
+    // this as `empty_with_usable_position` would attribute the rebuild to an
+    // observation nobody made and hide the probe failure worth investigating.
+    let cause = metrics.rebuild_cause();
+    anyhow::ensure!(
+        cause == Some("unproven_contents_with_usable_position"),
+        "the unreadable acceleration was loaded, but not by the arm this case covers: the rebuild \
+         cause was {cause:?}. Only \"unproven_contents_with_usable_position\" says the probe \
+         failed — \"empty_with_usable_position\" would claim the table was seen to be empty"
+    );
+    envelope.commit().await?;
+
+    drop(rejoined);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
 /// The other side of [`an_empty_acceleration_bootstraps_rather_than_rebuilding`]:
 /// an acceleration that holds rows it cannot place must still be rebuilt.
 ///
@@ -1905,7 +2157,19 @@ async fn a_quiet_dataset_resumes_across_a_restart_rather_than_rebuilding()
          every idle member of every shared slot"
     );
 
-    let mut restarted = start_replication_stream(input_with_watermark(port, "quiet", &store));
+    // The first load left rows in the acceleration. Production probes before
+    // rebuild_cause (`probe_acceleration_contents` in datafusion) and would
+    // pass NonEmpty here. The default Unknown is "probe failed, or nobody
+    // asked" — feeding it on a path that never probed is not a failed probe,
+    // and would fire UnprovenContentsWithUsablePosition on every quiet restart.
+    // The dedicated Unknown case is
+    // `an_unprovable_acceleration_with_a_surviving_position_is_loaded_not_resumed`.
+    let mut restarted = start_replication_stream(input_with_contents(
+        port,
+        "quiet",
+        &store,
+        AccelerationContents::NonEmpty,
+    ));
     let envelope = next_envelope(&mut restarted, "first envelope after the restart").await?;
     anyhow::ensure!(
         !envelope.history_unavailable(),

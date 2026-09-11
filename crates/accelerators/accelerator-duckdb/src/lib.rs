@@ -55,7 +55,7 @@ use datafusion_table_providers::{
         self as db_connection_pool,
         duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
     },
-    util::{column_reference::ColumnReference, indexes::IndexType},
+    util::indexes::IndexType,
 };
 use duckdb::AccessMode;
 use futures::StreamExt;
@@ -1770,9 +1770,7 @@ fn duckdb_unique_index_columns(cmd: &CreateExternalTable) -> Vec<Vec<String>> {
             if index_type != IndexType::Unique {
                 return None;
             }
-            ColumnReference::try_from(columns.as_str())
-                .ok()
-                .map(|columns| columns.iter().map(str::to_string).collect())
+            util::column_reference::parse(&columns).ok()
         })
         .collect()
 }
@@ -3816,5 +3814,214 @@ mod tests {
             nearest.abs() < f32::EPSILON,
             "the nearest neighbour of a stored vector is itself, at distance 0, not {nearest}"
         );
+    }
+
+    /// `trim(...)` resolves to `DataFusion`'s `btrim`, which is the name the
+    /// unparser emits — and `DuckDB` has no function called `btrim`, so a
+    /// federated call into the accelerated store failed outright with
+    /// `Catalog Error: Scalar Function with name btrim does not exist!`
+    /// (issue #13794).
+    ///
+    /// The dialect rewrites it to `DuckDB`'s `trim`. A rewrite is only correct
+    /// if the accelerator answers what `DataFusion` answers, so this evaluates
+    /// the *same* expression both ways — through a real in-memory `DuckDB` and
+    /// through `DataFusion` — and asserts the two results are equal. That
+    /// equality is what a plausible-looking but unfaithful rename trips: the
+    /// remote SQL is valid and `DuckDB` runs it happily, so nothing else here
+    /// would notice. It is how the one-argument `Zs` divergence below was
+    /// caught.
+    #[test]
+    fn duckdb_trim_rewrite_agrees_with_datafusion_btrim() {
+        use arrow::array::Array as _;
+        use datafusion::logical_expr::expr::ScalarFunction;
+        use datafusion::prelude::Expr;
+        use datafusion::sql::unparser::Unparser;
+        use runtime_datafusion::dialect::new_duckdb_dialect;
+
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let duck = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let ctx = SessionContext::new();
+
+        // Spaces on both sides, a character set, both together, an empty trim
+        // set, a string that trims away entirely, and multi-byte characters —
+        // the shapes where a trim implementation can disagree.
+        let cases: &[(&str, Option<&str>)] = &[
+            ("  padded  ", None),
+            ("nopad", None),
+            ("", None),
+            ("   ", None),
+            ("xyhelloyx", Some("xy")),
+            ("x hello x", Some("xy")),
+            ("xxx", Some("x")),
+            ("nopad", Some("")),
+            ("", Some("x")),
+            ("  \u{e9}\u{e9}  ", None),
+            ("\u{e9}\u{e9}u\u{e9}\u{e9}", Some("\u{e9}")),
+            // Unicode Zs separators. DataFusion's one-argument `btrim` strips
+            // ASCII U+0020 and nothing else; a `trim` that strips every Zs
+            // would silently disagree here rather than fail.
+            ("\u{a0}x\u{a0}", None),
+            ("\u{2003}x\u{2003}", None),
+            ("\u{3000}x\u{3000}", None),
+            ("\u{a0} x \u{a0}", None),
+            ("\u{a0}x\u{a0}", Some(" ")),
+            ("\u{a0}x\u{a0}", Some("\u{a0}")),
+            ("\tx\n", None),
+        ];
+
+        for (input, trim_chars) in cases {
+            let mut args = vec![lit(*input)];
+            if let Some(chars) = trim_chars {
+                args.push(lit(*chars));
+            }
+            let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+                datafusion::functions::string::btrim(),
+                args,
+            ));
+
+            let sql = unparser
+                .expr_to_sql(&call)
+                .expect("btrim unparses for DuckDB")
+                .to_string();
+            assert!(
+                sql.starts_with("trim("),
+                "DuckDB has no `btrim`; the dialect must emit `trim`, got {sql}"
+            );
+
+            let from_duckdb: Option<String> = duck
+                .query_row(&format!("SELECT {sql}"), [], |row| row.get(0))
+                .unwrap_or_else(|e| panic!("DuckDB rejected `SELECT {sql}`: {e}"));
+
+            let batches = tokio_rt
+                .block_on(async {
+                    ctx.read_empty()?
+                        .select(vec![call.alias("v")])?
+                        .collect()
+                        .await
+                })
+                .expect("DataFusion evaluates btrim");
+            let column = batches
+                .first()
+                .expect("one batch")
+                .column_by_name("v")
+                .expect("column v")
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("btrim returns Utf8 for a Utf8 literal");
+            let from_datafusion = if column.is_null(0) {
+                None
+            } else {
+                Some(column.value(0).to_string())
+            };
+
+            assert_eq!(
+                from_duckdb, from_datafusion,
+                "DuckDB `{sql}` and DataFusion btrim({input:?}, {trim_chars:?}) must agree"
+            );
+        }
+    }
+
+    /// `concat` is rendered as `||` because the `concat` a Spice query
+    /// resolves is `datafusion-spark`'s, which propagates NULL, while
+    /// `DuckDB`'s own `concat` skips a NULL argument. Rendering the function
+    /// name verbatim made an accelerated dataset answer `'z'` where the same
+    /// query answered NULL unaccelerated (issue #13849).
+    ///
+    /// Like the `btrim` case above, a rename or an operator swap is only
+    /// correct if the accelerator answers what `DataFusion` answers, so this
+    /// evaluates the same expression through a real in-memory `DuckDB` and
+    /// through the registered Spark `concat`, and asserts they agree. The
+    /// NULL and empty-argument rows are the ones a plausible-looking
+    /// rendering gets wrong while still producing valid SQL that `DuckDB`
+    /// runs happily.
+    #[test]
+    fn duckdb_concat_rewrite_agrees_with_the_registered_spark_concat() {
+        use arrow::array::Array as _;
+        use datafusion::logical_expr::expr::ScalarFunction;
+        use datafusion::prelude::Expr;
+        use datafusion::scalar::ScalarValue;
+        use datafusion::sql::unparser::Unparser;
+        use runtime_datafusion::dialect::new_duckdb_dialect;
+
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let duck = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let ctx = SessionContext::new();
+
+        let spark_concat = datafusion_spark::all_default_scalar_functions()
+            .into_iter()
+            .find(|udf| udf.name() == "concat")
+            .expect("datafusion-spark provides a concat");
+
+        let null = || Expr::Literal(ScalarValue::Utf8(None), None);
+
+        // Zero arguments, a NULL among non-NULLs, all-NULL, and the empty
+        // string — the differential cases issue #13849 turns on.
+        let cases: Vec<(&str, Vec<Expr>)> = vec![
+            ("zero arguments", vec![]),
+            ("plain", vec![lit("a"), lit("b")]),
+            ("trailing NULL", vec![lit("a"), null()]),
+            ("leading NULL", vec![null(), lit("b")]),
+            ("all NULL", vec![null(), null()]),
+            ("empty string", vec![lit(""), lit("b")]),
+            ("only empty strings", vec![lit(""), lit("")]),
+            ("single NULL", vec![null()]),
+            ("single value", vec![lit("solo")]),
+            ("NULL between values", vec![lit("a"), null(), lit("c")]),
+        ];
+
+        for (label, args) in cases {
+            let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+                Arc::clone(&spark_concat),
+                args.clone(),
+            ));
+
+            let sql = unparser
+                .expr_to_sql(&call)
+                .expect("concat unparses for DuckDB")
+                .to_string();
+            assert!(
+                !sql.contains("concat("),
+                "the dialect must not emit DuckDB's NULL-skipping `concat`, got {sql} ({label})"
+            );
+
+            let from_duckdb: Option<String> = duck
+                .query_row(&format!("SELECT {sql}"), [], |row| row.get(0))
+                .unwrap_or_else(|e| panic!("DuckDB rejected `SELECT {sql}` ({label}): {e}"));
+
+            let batches = tokio_rt
+                .block_on(async {
+                    ctx.read_empty()?
+                        .select(vec![call.alias("v")])?
+                        .collect()
+                        .await
+                })
+                .unwrap_or_else(|e| panic!("DataFusion evaluates concat ({label}): {e}"));
+            let column = batches
+                .first()
+                .expect("one batch")
+                .column_by_name("v")
+                .expect("column v")
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("concat returns Utf8 for Utf8 arguments");
+            let from_datafusion = if column.is_null(0) {
+                None
+            } else {
+                Some(column.value(0).to_string())
+            };
+
+            assert_eq!(
+                from_duckdb, from_datafusion,
+                "DuckDB `{sql}` and the registered Spark concat must agree ({label})"
+            );
+        }
     }
 }

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::github::{Error as GithubError, GithubRestClient};
+use crate::identity::push_identity_fields;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
@@ -247,6 +248,8 @@ impl WorkflowRunsTableProvider {
                 true,
             ));
         }
+
+        push_identity_fields(&mut fields, true);
 
         let schema = Arc::new(Schema::new(fields));
         let component = ConnectorComponent::from(dataset);

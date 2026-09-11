@@ -615,6 +615,7 @@ impl<
 #[cfg(test)]
 mod tests {
     use crate::CacheKey;
+    use crate::metrics::{InvalidationMode, StaleRejectionReason};
     use crate::result::query::CachedQueryResult;
     use crate::result::search::{CachedAggregationResult, CachedSearchResult};
 
@@ -656,6 +657,12 @@ mod tests {
         .expect("Failed to create cached result")
     }
 
+    fn cache_intern_schema(
+        schema: arrow::datatypes::SchemaRef,
+    ) -> crate::intern::Interned<arrow::datatypes::Schema> {
+        crate::intern::schema::intern(schema)
+    }
+
     fn create_test_cached_search_result() -> CachedSearchResult {
         let mut results = HashMap::new();
         let record_batch = create_test_record_batch();
@@ -665,7 +672,7 @@ mod tests {
             primary_keys: Vec::new(),
             data_columns: Vec::new(),
             matches: HashMap::new(),
-            schema,
+            schema: cache_intern_schema(schema),
         };
 
         results.insert(
@@ -675,12 +682,12 @@ mod tests {
             cached_aggregation_result,
         );
 
-        CachedSearchResult {
-            results: Arc::new(results),
-            input_tables: Arc::new(HashSet::from([TableReference::Bare {
+        CachedSearchResult::new(
+            Arc::new(results),
+            Arc::new(HashSet::from([TableReference::Bare {
                 table: Arc::from("test_table"),
             }])),
-        }
+        )
     }
 
     #[rstest]
@@ -1372,7 +1379,8 @@ mod tests {
         fn record_size(_size: u64) {}
         fn record_max_size(_size: u64) {}
         fn record_eviction(_reason: EvictionReason) {}
-        fn record_stale_rejection() {}
+        fn record_stale_rejection(_reason: StaleRejectionReason) {}
+        fn record_table_invalidation(_mode: InvalidationMode) {}
         fn update_hit_ratio(_hits: u64, _total: u64) {}
         fn publish_counters_at_zero() {}
     }
@@ -1691,7 +1699,8 @@ mod tests {
                 fn record_item_count(_count: u64) {}
                 fn record_size(_size: u64) {}
                 fn record_max_size(_size: u64) {}
-                fn record_stale_rejection() {}
+                fn record_stale_rejection(_reason: StaleRejectionReason) {}
+                fn record_table_invalidation(_mode: InvalidationMode) {}
                 fn update_hit_ratio(_hits: u64, _total: u64) {}
                 fn publish_counters_at_zero() {}
 

@@ -43,6 +43,38 @@ use arrow_tools::schema::schema_difference;
 
 use super::Query;
 
+pub mod sort_order;
+
+pub use sort_order::{
+    SortKeyColumn, SortKeyResolution, SortOrderViolation, has_top_level_limit,
+    has_top_level_order_by, resolve_sort_key,
+};
+
+// Not re-exported: the outcome type is plumbing between this module and
+// `sort_order`. Callers consume the reasons via `SortCheckedComparison`.
+use sort_order::SortCheck;
+
+/// A content comparison plus what the row-order check could and could not cover.
+///
+/// `unchecked` exists so a coverage hole cannot masquerade as a pass. A skipped
+/// or partial sort check leaves `result` at whatever the content comparison said
+/// — the rows really were compared — while naming the part of the `ORDER BY`
+/// nobody verified, for the caller to count and report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortCheckedComparison {
+    pub result: QueryValidationResult,
+    /// One entry per side whose `ORDER BY` was not fully verified.
+    pub unchecked: Vec<String>,
+}
+
+impl SortCheckedComparison {
+    /// True when the content matched *and* the whole `ORDER BY` was verified.
+    #[must_use]
+    pub fn is_fully_verified_pass(&self) -> bool {
+        self.result == QueryValidationResult::Pass && self.unchecked.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryValidationFailReason {
     NoExpectedAnswer,
@@ -67,6 +99,13 @@ pub enum QueryValidationFailReason {
         column_name: String,
         left_len: usize,
         right_len: usize,
+    },
+    /// One engine returned rows that do not honor the query's own top-level
+    /// `ORDER BY`. Reported per side, because it is a property of that engine's
+    /// output rather than of the two results' relationship.
+    SortOrderViolation {
+        side: String,
+        violation: SortOrderViolation,
     },
 }
 
@@ -857,7 +896,10 @@ pub fn row_order_from_sql(sql: &str) -> RowOrder {
 ///
 /// When `row_order` is [`RowOrder::Multiset`], both sides are concatenated and
 /// sorted into a canonical order so differing physical scan orders do not
-/// produce false mismatches.
+/// produce false mismatches — which means this function says **nothing about the
+/// order an engine returned rows in**. Engine-parity callers want
+/// [`compare_query_result_batches_with_sort_check`], which adds that check; this
+/// one is the content half, kept separate so its own behavior stays testable.
 pub fn compare_query_result_batches(
     query_name: &str,
     left_batches: &[RecordBatch],
@@ -945,6 +987,103 @@ pub fn compare_query_result_batches(
         println!("Query '{query_name}' content mismatch: {reason:?}");
     }
     Ok(result)
+}
+
+/// Content equality **plus** a per-side check that each engine honored the
+/// query's own top-level `ORDER BY`.
+///
+/// [`compare_query_result_batches`] under [`RowOrder::Multiset`] canonically
+/// sorts both sides before comparing, so it establishes that the two engines
+/// returned the same rows and nothing about the order they returned them in.
+/// Most of the suite corpus sorts without a `LIMIT` and is compared that way, so
+/// without this check an engine whose sort is wrong compares equal.
+///
+/// A side that breaks its own `ORDER BY` is reported as that, in preference to
+/// the content difference it also causes. Under [`RowOrder::Preserved`] —
+/// `ORDER BY … LIMIT`, where the set of rows depends on the order — the same
+/// rows in the wrong order fail as a content mismatch, which says the two
+/// results differ without naming the side that is wrong on its own terms. A
+/// caller adjudicating a disagreement between engines needs that distinction:
+/// a content difference may come from dialect or arithmetic, a sort violation
+/// cannot. When no side violates, the content result stands.
+///
+/// A tie under the sort key is never a violation, so the check adds no
+/// sensitivity to the engine-dependent ordering of equal rows that
+/// [`RowOrder::Multiset`] exists to absorb.
+///
+/// **A sort check that could not run is returned, not swallowed.** Whatever the
+/// check could not cover lands in [`SortCheckedComparison::unchecked`], because
+/// a hole that reads as a pass is the failure this check exists to remove. A
+/// caller that ignores that field is back to reporting unverified order as
+/// verified. The field is populated even when the content comparison failed, for
+/// the caller that recovers from that failure and would otherwise pass an order
+/// nothing verified.
+///
+/// `sql` must be the statement that produced *both* result sets. Where the two
+/// engines run textually different SQL, pass the form whose projection matches
+/// the compared results.
+///
+/// # Errors
+/// Returns an error if the batches cannot be concatenated or compared.
+pub fn compare_query_result_batches_with_sort_check(
+    query_name: &str,
+    sql: &str,
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    row_order: RowOrder,
+) -> Result<SortCheckedComparison> {
+    let content = compare_query_result_batches(query_name, left_batches, right_batches, row_order)?;
+    let content_passed = content == QueryValidationResult::Pass;
+
+    // Parsed once for both sides: the AST does not depend on which engine's rows
+    // are being checked, and the corpus carries multi-kilobyte statements.
+    let statement = sort_order::parse_one_statement(sql);
+    let mut unchecked = Vec::new();
+
+    for (side, batches) in [("left", left_batches), ("right", right_batches)] {
+        let Some(schema) = batches.first().map(RecordBatch::schema) else {
+            continue;
+        };
+        let batch = arrow::compute::concat_batches(&schema, batches)?;
+        match sort_order::check_sort_order_parsed(statement.as_ref(), &batch)? {
+            SortCheck::Ordered => {}
+            SortCheck::PartiallyOrdered { unchecked: reason } | SortCheck::Skipped { reason } => {
+                println!("Query '{query_name}' ({side}) sort order unchecked: {reason}");
+                unchecked.push(format!("{side}: {reason}"));
+            }
+            SortCheck::Violation(v) => {
+                println!(
+                    "Query '{query_name}' ({side}) violates its own ORDER BY on column '{}' at row {}: {} then {}",
+                    v.column, v.row_number, v.previous, v.current
+                );
+                return Ok(SortCheckedComparison {
+                    result: QueryValidationResult::Fail(
+                        QueryValidationFailReason::SortOrderViolation {
+                            side: side.to_string(),
+                            violation: v,
+                        },
+                    ),
+                    unchecked,
+                });
+            }
+        }
+    }
+
+    if !content_passed {
+        // The hole is carried even though the comparison failed, because not
+        // every caller treats that failure as final: one that recovers from it
+        // — the chDB lane retries a schema mismatch as string rows — would
+        // otherwise turn an order that was never verified into a clean pass.
+        return Ok(SortCheckedComparison {
+            result: content,
+            unchecked,
+        });
+    }
+
+    Ok(SortCheckedComparison {
+        result: QueryValidationResult::Pass,
+        unchecked,
+    })
 }
 
 /// Canonical row order for multiset equality: sort by stringified cell values

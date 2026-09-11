@@ -2098,6 +2098,92 @@ pub struct InlinedData {
     pub created_at: String,
 }
 
+/// One Cayenne table's disk and metastore footprint, read from the metastore's
+/// own accounting rather than by walking the table directory.
+///
+/// The manifest (`cayenne_snapshot_file`), the deletion-vector catalog, and the
+/// cold-tier manifest already record every file's size and row count, so a
+/// handful of aggregate queries answer "how big is this dataset, and which
+/// layer is growing" without a LIST per snapshot. That matters because the
+/// tables this is sampled on are exactly the ones with thousands of files.
+///
+/// Every field is `i64` because that is what the metastore returns; the callers
+/// that publish these as gauges saturate to `u64` at the boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TableStorageStats {
+    /// Data-file paths the current snapshot references.
+    ///
+    /// PATHS, not inodes: a manifest `file_path` is resolved against its own
+    /// snapshot's directory, so a filename appearing under two snapshots is two
+    /// files as far as every reader is concerned, and subset compaction gets a
+    /// live snapshot its own path by hard-linking. Two paths sharing one inode
+    /// are therefore counted twice — which is also how a `du`-style walk
+    /// (`cayenne_data_dir_bytes`) reads the same directory.
+    pub current_files: i64,
+    /// On-disk bytes of the current snapshot's data files.
+    pub current_bytes: i64,
+    /// Rows in the current snapshot's data files, before deletions apply.
+    pub current_rows: i64,
+    /// Data-file paths referenced by a live protected snapshot — one whose
+    /// sequence is registered and which is not the current snapshot (see
+    /// [`Self::current_files`] for the path-versus-inode rule).
+    pub protected_files: i64,
+    /// On-disk bytes of the protected snapshots' data files.
+    pub protected_bytes: i64,
+    /// Rows in the protected snapshots' data files, before deletions apply.
+    pub protected_rows: i64,
+    /// Manifest rows naming a snapshot that is no longer live — dead weight in
+    /// the metastore until a compaction or overwrite prunes them.
+    pub unreachable_manifest_rows: i64,
+    /// Manifest rows naming a snapshot that is still live.
+    ///
+    /// A row is a `(snapshot, file)` pair, and each pair is one path on disk, so
+    /// this equals [`Self::current_files`] + [`Self::protected_files`]. It is
+    /// published beside the unreachable count because the remainder only means
+    /// something taken against the live rows.
+    pub reachable_manifest_rows: i64,
+    /// Files promoted to the cold object-store tier.
+    pub cold_files: i64,
+    /// Bytes of the cold-tier files.
+    pub cold_bytes: i64,
+    /// Rows in the cold-tier files.
+    pub cold_rows: i64,
+    /// Live deletion-vector files.
+    pub delete_files: i64,
+    /// On-disk bytes of the deletion-vector files.
+    pub delete_file_bytes: i64,
+    /// Tombstones recorded across those deletion-vector files.
+    pub delete_file_tombstones: i64,
+    /// Registered snapshot sequences (the durable protected-snapshot set).
+    pub snapshot_sequences: i64,
+    /// Per-file pruning-statistics rows.
+    pub file_statistics_rows: i64,
+    /// Re-insert records held in the metastore.
+    pub insert_records: i64,
+    /// Inline (level-0) data entries not yet checkpointed to Vortex files.
+    pub inlined_entries: i64,
+    /// Rows held in those inline entries.
+    pub inlined_rows: i64,
+    /// Serialized Arrow IPC bytes held inline.
+    pub inlined_bytes: i64,
+    /// Inline tombstone entries not yet flushed to deletion vectors.
+    pub inlined_delete_entries: i64,
+    /// Tombstones held in those inline entries.
+    pub inlined_delete_rows: i64,
+}
+
+impl TableStorageStats {
+    /// Bytes the live data-file paths describe across the warm tiers.
+    ///
+    /// Safe to add because the tiers partition the live manifest rows. Not a
+    /// physical figure where hard links are in play — see
+    /// [`Self::current_files`].
+    #[must_use]
+    pub const fn live_data_bytes(&self) -> i64 {
+        self.current_bytes + self.protected_bytes
+    }
+}
+
 /// Aggregate size information for the metastore's two inline tables.
 ///
 /// Both are reported together because the inline checkpoint clears both together

@@ -451,8 +451,7 @@ mod tests {
     }
 
     fn exists_scan(name: &str) -> LogicalPlanBuilder {
-        LogicalPlanBuilder::scan(name, table_source(exists_fetch_fields()), None)
-            .expect("scan should build")
+        scan_named(name, exists_fetch_fields())
     }
 
     /// The same correlation still pushes down when there is no bound to scope,
@@ -555,36 +554,196 @@ mod tests {
         assert_unbounded_exists_pushdown(&a_correlation_naming_two_build_inputs(None));
     }
 
-    /// Regression test for #13277: the sibling shape, where the correlation's
-    /// only qualifier is one the probe side also answers to. Naming the scope
-    /// anything else rebinds those references to the probe, turning the
-    /// correlation into a comparison of the outer row with itself.
-    ///
-    /// Both readings are wrong — the subquery's own `FROM` already shadows the
-    /// outer relation, so the correlation is lost whatever the bound does — and
-    /// that unscoped output binds and runs. The `EXISTS` then reduces to "this
-    /// table has a row", so the semi join this builds keeps every probe row,
-    /// including the rows that match nothing (an anti join over the same SQL
-    /// drops every row instead). Emitting these correctly needs the
-    /// correlation's qualifiers rewritten to the derived scope, tracked by
-    /// #12840.
-    #[test]
-    fn a_bounded_exists_refuses_a_correlation_qualified_by_the_probe() {
-        let err = federated_sql_result(&a_correlation_qualified_by_the_probe(Some(5)))
-            .expect_err("a correlation qualified by the probe side must be refused");
+    /// The refusal every capture below is reported through. Asserted by one
+    /// helper so a reword upstream is a one-place edit here, and matched on the
+    /// whole sentence so a message that merely mentions `EXISTS` cannot pass for
+    /// it.
+    fn assert_captured_correlation_refused(plan: &LogicalPlan, context: &str) {
+        let err = federated_sql_result(plan).expect_err(context);
         assert!(
             err.to_string().contains(
-                "not supported when the correlation's only qualifier is one the probe side also answers to"
+                "Unparsing an EXISTS-style join is not supported when a FROM the emitted SQL \
+                 introduces would capture the correlation"
             ),
-            "expected the refusal to name the probe-qualified correlation, got: {err}"
+            "{context}, got: {err}"
         );
+    }
 
-        // The unbounded sibling is deliberately left unpinned. Unlike the
-        // multi-relation shape, its rendering is *itself* wrong — the inner
-        // `FROM` shadows the outer relation, so the `EXISTS` reduces to "this
-        // table has a row" with or without a bound — so asserting that it still
-        // unparses would pin a defect and stand in the way of #12840's rewrite,
-        // which should be free to refuse this shape at any bound.
+    /// The keep direction, mirroring [`assert_captured_correlation_refused`]: the
+    /// correlation is not captured, so the join still renders as a pushed-down
+    /// `EXISTS`. Named for what it pins rather than asserted inline, so the two
+    /// directions read as one pair.
+    fn assert_exists_pushdown_kept(plan: &LogicalPlan, context: &str) {
+        let sql = federated_sql(plan);
+        assert!(sql.contains("EXISTS"), "{context}, got: {sql}");
+    }
+
+    /// Scan `name` with the given schema. [`exists_scan`] is this with
+    /// [`exists_fetch_fields`]; the shapes whose relations need a schema of
+    /// their own call it directly.
+    fn scan_named(name: &str, fields: Vec<Field>) -> LogicalPlanBuilder {
+        LogicalPlanBuilder::scan(name, table_source(fields), None).expect("scan should build")
+    }
+
+    /// Regression test for #13277 and #12840: the correlation's only qualifier is
+    /// one the subquery's own `FROM` also answers to, so the reference binds
+    /// inside the body instead of to the query it was written against.
+    ///
+    /// `"t"."c" = "t"."c"` is then an inner tautology: `EXISTS` degenerates to
+    /// "this relation has a row", so the semi join this builds keeps every probe
+    /// row — including rows that match nothing — while an anti join over the same
+    /// SQL drops every row instead. That is valid SQL, so the remote engine runs
+    /// it and answers from the wrong rows rather than failing.
+    ///
+    /// **The bound is not what decides this.** SQL's name scoping captures the
+    /// reference on its own, so both the bounded and unbounded plans have to be
+    /// refused, and asserting both is the point of this test: the refusal used to
+    /// live in `exists_scope_name`, which the caller consults only when a row
+    /// bound has to be moved into a scope of its own, so the unbounded plan kept
+    /// emitting the shadowed SQL. Refusing costs the pushdown — and, because
+    /// `datafusion-federation` wraps the plan before unparsing it, costs the
+    /// query — instead of returning wrong rows.
+    ///
+    /// Refusing is not repairing. Emitting these correctly needs the correlated
+    /// qualifiers rewritten onto the scope a derived table introduces, which is
+    /// what #12840 still tracks.
+    #[test]
+    fn an_exists_refuses_a_correlation_the_probe_qualifier_captures_at_any_bound() {
+        assert_captured_correlation_refused(
+            &a_correlation_qualified_by_the_probe(Some(5)),
+            "a bounded correlation qualified by the probe side must be refused",
+        );
+        assert_captured_correlation_refused(
+            &a_correlation_qualified_by_the_probe(None),
+            "an unbounded correlation qualified by the probe side must be refused too, \
+             because the capture is decided by name scoping rather than by the bound",
+        );
+    }
+
+    /// The probe side for the unqualified-correlation guards: `p`, projected so
+    /// both of its outputs carry a bare name. That projection is what leaves the
+    /// join key unqualified.
+    fn an_unqualified_correlation_semi_join(build_columns: &[&str]) -> LogicalPlan {
+        let probe = exists_scan("p")
+            .project(vec![col("p.c").alias("c"), col("p.d").alias("d")])
+            .expect("project probe")
+            .build()
+            .expect("build probe");
+        let build = scan_named(
+            "b",
+            build_columns
+                .iter()
+                .map(|name| Field::new(*name, DataType::Int32, false))
+                .collect(),
+        )
+        .build()
+        .expect("build build side");
+
+        LogicalPlanBuilder::from(probe)
+            .join(
+                build,
+                JoinType::LeftSemi,
+                (vec!["c"], vec![build_columns[0]]),
+                None,
+            )
+            .expect("semi join")
+            .build()
+            .expect("build plan")
+    }
+
+    /// Regression test for #12840: a capture needs no shared relation name. An
+    /// unqualified reference names no relation to disagree with, so it binds to
+    /// whichever relation the innermost scope exposes the *column* on.
+    ///
+    /// `p` and `b` share no name here, but the probe projects its key to a bare
+    /// `c` and `b` has a column called `c`, so the body's own `FROM "b"` answers
+    /// to the reference and both halves of `("c" = "c")` bind to `b.c` — the same
+    /// inner tautology the self-join reaches, arrived at without either side
+    /// naming the other.
+    #[test]
+    fn an_exists_refuses_an_unqualified_correlation_the_body_exposes() {
+        assert_captured_correlation_refused(
+            &an_unqualified_correlation_semi_join(&["c", "d"]),
+            "an unqualified correlation the build side exposes a column for must be refused",
+        );
+    }
+
+    /// The keep direction for the same mechanism, which is what stops the guard
+    /// above from being satisfied by refusing everything: an unqualified
+    /// reference to a name the body does *not* expose binds outward, so it keeps
+    /// its pushdown.
+    ///
+    /// Identical to the test above except for `b`'s column names. The name has to
+    /// be absent from the *relation* rather than merely unprojected, because `b`
+    /// is emitted bare and `FROM "b"` exposes every column it has whatever the
+    /// plan projects — hence a different relation rather than the same one
+    /// projected differently.
+    #[test]
+    fn an_exists_keeps_an_unqualified_correlation_the_body_lacks() {
+        assert_exists_pushdown_kept(
+            &an_unqualified_correlation_semi_join(&["e", "f"]),
+            "a correlation no relation in the body exposes must keep its pushdown",
+        );
+    }
+
+    /// The keep direction for the qualifier mechanism, and the reason it is here
+    /// rather than left to upstream: this is the shape the federated TPC-H and
+    /// TPC-DS benchmarks push down. A refusal reaches those as a query *failure*
+    /// rather than a fallback, because `datafusion-federation` wraps the plan in
+    /// a `FederatedPlanNode` before it tries to unparse it.
+    ///
+    /// TPC-H Q22 is `NOT EXISTS (SELECT * FROM orders WHERE o_custkey =
+    /// c_custkey)`: the correlated reference is qualified by `customer`, the
+    /// body's only relation is `orders`, and no column name is shared. Nothing
+    /// about that is captured, so it has to keep rendering.
+    #[test]
+    fn an_exists_keeps_a_correlation_no_relation_in_the_body_answers_to() {
+        let build = scan_named(
+            "orders",
+            vec![
+                Field::new("o_orderkey", DataType::Int32, false),
+                Field::new("o_custkey", DataType::Int32, false),
+            ],
+        )
+        .build()
+        .expect("build orders");
+
+        let plan = scan_named(
+            "customer",
+            vec![
+                Field::new("c_custkey", DataType::Int32, false),
+                Field::new("c_phone", DataType::Utf8, false),
+            ],
+        )
+        .project(vec![col("customer.c_phone")])
+        .expect("project")
+        .join_on(
+            build,
+            JoinType::LeftAnti,
+            [col("customer.c_custkey").eq(col("orders.o_custkey"))],
+        )
+        .expect("anti join")
+        .build()
+        .expect("build plan");
+
+        assert_exists_pushdown_kept(
+            &plan,
+            "a correlation the body neither answers to nor exposes a column for must keep \
+             its pushdown",
+        );
+    }
+
+    /// The build relation in this self-join answers to the outer reference's
+    /// qualifier. Emitting it as a correlated `EXISTS` would therefore bind the
+    /// reference to the inner relation and silently return wrong rows. The
+    /// capture guard from `DataFusion` fork PR #207 must refuse the shape even
+    /// without a row bound.
+    #[test]
+    fn an_unbounded_exists_refuses_a_correlation_shadowed_by_its_build_relation() {
+        assert_captured_correlation_refused(
+            &a_correlation_qualified_by_the_probe(None),
+            "a build relation that shadows the correlation must be refused",
+        );
     }
 
     /// The unparser dialects this workspace hands to the unparser, plus a
@@ -807,6 +966,100 @@ mod tests {
                 paren_depth_at(&sql, first_offset_of(&sql, "count(")) == 0,
                 "{dialect_name}: the outer aggregate has to stay in the enclosing SELECT, over the \
                  grouped scope: {sql}"
+            );
+        }
+    }
+
+    /// The `Projection` over `Aggregate` shape a grouped dashboard card plans to:
+    /// group by a truncated timestamp, then project a *wrapped* form of that same
+    /// grouping expression. The projection reads the aggregate's own output columns,
+    /// whose names come from the schema rather than being spelled here, so this shape
+    /// survives a rename of how `DataFusion` names an unaliased group expression.
+    fn projection_wrapping_a_grouping_expression() -> LogicalPlan {
+        let grouped = LogicalPlanBuilder::scan(
+            "advances",
+            table_source(vec![Field::new(
+                "funded_ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            )]),
+            None,
+        )
+        .expect("scan advances")
+        .aggregate(
+            vec![date_trunc(lit("week"), col("advances.funded_ts"))],
+            vec![count(lit(1u8))],
+        )
+        .expect("aggregate")
+        .build()
+        .expect("build aggregate");
+
+        let mut outputs = grouped.schema().columns().into_iter();
+        let group_output = outputs
+            .next()
+            .expect("the group expression's output column");
+        let count_output = outputs.next().expect("the aggregate's output column");
+
+        LogicalPlanBuilder::from(grouped)
+            .project(vec![
+                cast(
+                    cast(Expr::Column(group_output), DataType::Date32),
+                    DataType::Utf8,
+                )
+                .alias("week_start"),
+                Expr::Column(count_output).alias("advances_funded"),
+            ])
+            .expect("projection over the aggregate")
+            .build()
+            .expect("build projection")
+    }
+
+    /// Regression test for the projection-over-aggregate fix: a `SELECT` list that
+    /// *wraps* a grouping expression needs the `Aggregate` in a scope of its own for
+    /// any dialect that resolves `GROUP BY` against whole select items only.
+    ///
+    /// `GoogleSQL` is such a dialect. Flattening the two nodes into one `SELECT`
+    /// leaves the grouping expression bare in `GROUP BY` and wrapped in the select
+    /// list, and `BigQuery` rejects the statement outright with "SELECT list
+    /// expression references column `funded_ts` which is neither grouped nor
+    /// aggregated" — the whole statement fails, not one row of it.
+    ///
+    /// The two cheaper renderings are both wrong rather than merely different:
+    /// `GROUP BY <output alias>` and `GROUP BY <ordinal>` group by the *wrapped*
+    /// value, so a wrapper that is not injective over the grouping expression merges
+    /// groups and sums their aggregates — fewer rows than the plan asked for, with no
+    /// error. Only a derived table reproduces the plan's grouping for every wrapper,
+    /// which is why this guard asserts the scope and not just that the statement
+    /// parses.
+    #[test]
+    fn a_projection_wrapping_a_grouping_expression_keeps_the_aggregate_scoped() {
+        let plan = projection_wrapping_a_grouping_expression();
+
+        for (dialect_name, dialect) in federation_dialects() {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+            let grouping_at = first_offset_of(&sql, "GROUP BY");
+
+            if dialect.group_by_matches_select_subexpressions() {
+                // The dialect binds the wrapped select item against the grouping
+                // expression it contains, so one SELECT is a faithful rendering.
+                continue;
+            }
+
+            assert!(
+                paren_depth_at(&sql, grouping_at) >= 1,
+                "{dialect_name}: this dialect matches GROUP BY against whole select items, so the \
+                 grouping has to be a scope of its own — flattened, the select list references \
+                 columns the statement never grouped: {sql}"
+            );
+            // Asserted on the rendered grouping call rather than on the base column:
+            // a dialect may sanitise the derived output's alias out of the schema
+            // name, which spells the base column inside it.
+            let outer_select = &sql[..first_offset_of(&sql, "FROM")];
+            assert!(
+                !outer_select.contains("TIMESTAMP_TRUNC") && !outer_select.contains("date_trunc("),
+                "{dialect_name}: the outer select list still re-derives the grouping expression \
+                 instead of reading the grouped scope's output, which is the reference this \
+                 dialect cannot bind: {sql}"
             );
         }
     }
@@ -1180,15 +1433,12 @@ mod tests {
             ),
             (
                 // Reached through a relation alias, so the enclosing reference is
-                // qualified — and the alias carries no column list, so it names the
-                // relation without naming any of its columns. An alias that *does* carry
-                // one already names every output and must be left alone; that half is
-                // reachable only from parsed SQL, so the fork's own round-trip tests are
-                // what guard it. The scan here carries no projection, which is the half of
-                // the alias class the naming repairs — with one pushed down the output
-                // cannot be named at all, which
-                // `a_projected_scan_under_an_alias_does_not_name_the_output_its_scope_references`
-                // pins.
+                // qualified. The scan here carries no projection, which is the half of
+                // the alias class the #206 naming walk repairs. A scan projection
+                // pushed down under the alias is named by a column list on the alias
+                // itself (fork PR #221), which
+                // `a_projected_scan_under_an_alias_names_the_output_its_scope_references`
+                // guards.
                 "aliased",
                 projected()
                     .alias("x")
@@ -1220,32 +1470,13 @@ mod tests {
         &list[..end]
     }
 
-    /// The derived table's own `SELECT` list — what it exposes to the scope that
-    /// encloses it.
-    ///
-    /// Narrower than "everything after the derived table starts", because `AS`
-    /// introduces relation aliases as well as column aliases (`FROM t AS s`, `) AS s`)
-    /// and those are emitted whether or not the outputs are named. A guard that reads
-    /// the wider region cannot tell a named output from an unnamed one.
-    fn derived_select_list(sql: &str) -> &str {
-        let opens = "FROM (SELECT ";
-        let list = &sql[first_offset_of(sql, opens) + opens.len()..];
-        let Some(end) = list.find(" FROM ") else {
-            panic!("expected the derived table's own FROM clause in: {sql}");
-        };
-        &list[..end]
-    }
-
     /// Everything the enclosing `SELECT` list draws from — the derived table and the
     /// alias it is attached to.
     ///
-    /// Deliberately wider than `derived_select_list`: the repair for the remaining
-    /// half of #12751 names the *relation's* columns on the alias it attaches
-    /// (`) AS s ("t.a + t.b")`), which lands after the derived table closes and so
-    /// falls outside the derived `SELECT` list entirely. A guard that reads only that
-    /// list cannot see that repair land. Searching for a specific column is what makes
-    /// the wider region safe here — the reason `derived_select_list` is narrow is that
-    /// a bare `AS` matches the relation aliases too.
+    /// Wider than the derived `SELECT` list: fork PR #221 names the *relation's*
+    /// columns on the alias it attaches (`) AS s ("t.a + t.b")`), which lands after
+    /// the derived table closes. Searching for a specific column is what makes the
+    /// wider region safe — a bare `AS` would also match the relation aliases.
     fn from_clause(sql: &str) -> &str {
         let Some(start) = sql.find(" FROM ") else {
             panic!("expected a FROM clause after the SELECT list: {sql}");
@@ -1295,8 +1526,8 @@ mod tests {
     /// computed expression, a literal, a literal whose logical name carries each
     /// dialect's own quote character, and a volatile call — across every enclosing
     /// shape the naming walk handles (`derived_scope_shapes`) — every shape it can
-    /// repair, which is not every shape #12751 reports: a projected scan under a
-    /// relation alias still cannot be named, and the test below this one pins that.
+    /// repair. A projected scan under a relation alias is named by a column list
+    /// on the alias (fork PR #221), which the test below this one guards.
     /// The volatile output is
     /// the one the flattened-`SELECT` repair (#12599) cannot help: inlining a
     /// volatile expression evaluates it a second time in a clause that can observe a
@@ -1389,30 +1620,211 @@ mod tests {
         }
     }
 
-    /// The half of #12751 that fork PR #206 does not fix, pinned so the repair is
-    /// noticed rather than quietly leaving this shape unguarded.
+    /// The identifier a `DISTINCT ON` groups by, taken from the emitted
+    /// `DISTINCT ON (<key>)` rather than from the plan, so a guard reads the key the
+    /// remote engine will resolve rather than the one the plan meant.
+    fn distinct_on_key(sql: &str) -> &str {
+        let open = first_offset_of(sql, "DISTINCT ON (") + "DISTINCT ON (".len();
+        let Some(close) = sql[open..].find(')') else {
+            panic!("expected the DISTINCT ON key list to close in: {sql}");
+        };
+        &sql[open..open + close]
+    }
+
+    /// An identifier with whatever quoting a dialect wrapped it in removed, so two
+    /// spellings of the same name compare equal.
+    fn unquoted(identifier: &str) -> &str {
+        identifier
+            .trim()
+            .trim_matches('"')
+            .trim_matches('`')
+            .trim_matches(['[', ']'])
+    }
+
+    /// Every `AS <identifier>` binding emitted at `depth`, as the bare identifiers
+    /// they bind. Depth is what separates the `DISTINCT ON`'s own select list from
+    /// the derived table beneath it, which legitimately binds the same name.
+    fn as_bindings_at_depth(sql: &str, depth: usize) -> Vec<&str> {
+        sql.match_indices(" AS ")
+            .filter(|(at, _)| paren_depth_at(sql, *at) == depth)
+            .map(|(at, keyword)| {
+                let rest = &sql[at + keyword.len()..];
+                let end = rest
+                    .find([',', ')'])
+                    .unwrap_or(rest.len())
+                    .min(rest.find(" FROM ").unwrap_or(rest.len()));
+                unquoted(&rest[..end])
+            })
+            .collect()
+    }
+
+    /// The plan shape that lets a `DISTINCT ON` output alias capture the key: an
+    /// input column whose name is also the logical name of the computed output, so
+    /// naming that output rebinds the key to it.
     ///
-    /// A scan projection pushed down under a relation alias is requalified onto the
-    /// alias before the derived table is built, so the only name the derived table can
-    /// report for the output — `s.a + s.b` — is not the one the enclosing scope holds
-    /// for it, `t.a + t.b`:
+    /// The enclosing projection is what makes the `DISTINCT ON` a derived table
+    /// whose outputs another scope binds, which is the only shape the naming pass
+    /// runs on at all.
+    fn distinct_on_over_key_named_output(
+        key: Expr,
+        input_alias: &str,
+        select_expr: Expr,
+        output_reference: &str,
+        relation_alias: Option<&str>,
+    ) -> LogicalPlan {
+        let scanned = LogicalPlanBuilder::scan(
+            "t",
+            table_source(vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("b", DataType::Int32, false),
+                Field::new("c", DataType::Int32, false),
+            ]),
+            None,
+        )
+        .expect("scan")
+        .project(vec![
+            col("t.a").alias("a"),
+            col("t.b").alias("b"),
+            col("t.c").alias(input_alias),
+        ])
+        .expect("projection naming an input column after the computed output");
+        let scanned = match relation_alias {
+            Some(alias) => scanned.alias(alias).expect("relation alias"),
+            None => scanned,
+        };
+        scanned
+            .distinct_on(
+                vec![key.clone()],
+                vec![select_expr],
+                Some(vec![key.sort(true, false)]),
+            )
+            .expect("distinct on")
+            .limit(0, Some(5))
+            .expect("limit")
+            .project(vec![Expr::Column(Column::new_unqualified(
+                output_reference,
+            ))])
+            .expect("enclosing projection")
+            .build()
+            .expect("build")
+    }
+
+    /// Naming a `DISTINCT ON`'s computed output must not change which key it groups
+    /// by. `PostgreSQL` resolves a bare name in `DISTINCT ON` and `ORDER BY` against
+    /// the output list before the input columns, so aliasing the output to the name
+    /// the key already spells rebinds the key from the input column to the output —
+    /// the same rows grouped by a different key, in valid SQL with an unchanged
+    /// reported schema, which is the worst shape this can take.
+    ///
+    /// Only a Spice patch to the `spiceai/datafusion` fork declines that alias (fork
+    /// PR #209). Its three arms are the three ways the key reaches the remote engine
+    /// as a bare name: spelled exactly, spelled in another case (quoting does not say
+    /// how an engine compares identifiers — `DuckDB` folds even quoted ones), and
+    /// carried by an `OuterReferenceColumn`, which unparses through the same path as
+    /// a column and so cannot be told apart from one.
+    ///
+    /// Leaving the output unnamed keeps the enclosing scope's reference unbound,
+    /// which is #13444 — the pre-existing bug, not a new wrong answer. This guard is
+    /// for the wrong answer.
+    #[test]
+    fn a_distinct_on_output_is_not_named_over_its_own_key() {
+        for (arm, key, input_alias) in [
+            (
+                "bare",
+                Expr::Column(Column::new_unqualified("a + b")),
+                "a + b",
+            ),
+            (
+                "case-folded",
+                Expr::Column(Column::new_unqualified("A + B")),
+                "A + B",
+            ),
+            (
+                "correlated",
+                Expr::OuterReferenceColumn(
+                    Arc::new(Field::new("a + b", DataType::Int32, false)),
+                    Column::new_unqualified("a + b"),
+                ),
+                "a + b",
+            ),
+        ] {
+            let plan = distinct_on_over_key_named_output(
+                key,
+                input_alias,
+                col("a") + col("b"),
+                "a + b",
+                None,
+            );
+            for (dialect_name, dialect) in federation_dialects() {
+                let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+                let key = unquoted(distinct_on_key(&sql)).to_lowercase();
+                let depth = paren_depth_at(&sql, first_offset_of(&sql, "DISTINCT ON ("));
+
+                let captured = as_bindings_at_depth(&sql, depth)
+                    .into_iter()
+                    .find(|binding| binding.to_lowercase() == key);
+                assert!(
+                    captured.is_none(),
+                    "{dialect_name}/{arm}: the DISTINCT ON output is named {}, which is the identifier its own key spells, so the remote engine groups by the output instead of by the input column: {sql}",
+                    captured.unwrap_or_default()
+                );
+            }
+        }
+    }
+
+    /// The assumption that keeps the refusal above narrow, and the reason it is not
+    /// simply "never name a `DISTINCT ON` output": only a *bare* key can be captured.
+    /// A qualified key resolves to the relation in both clauses whatever the output
+    /// list holds, so naming still applies there — and has to, or the enclosing
+    /// scope's reference goes unbound for a shape that was never at risk.
+    #[test]
+    fn a_distinct_on_output_is_named_over_a_qualified_key() {
+        let plan = distinct_on_over_key_named_output(
+            Expr::Column(Column::new(Some(TableReference::bare("d")), "a + b")),
+            "a + b",
+            col("d.a") + col("d.b"),
+            "d.a + d.b",
+            Some("d"),
+        );
+        for (dialect_name, dialect) in federation_dialects() {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+            let key = unquoted(distinct_on_key(&sql)).to_lowercase();
+            let depth = paren_depth_at(&sql, first_offset_of(&sql, "DISTINCT ON ("));
+
+            // The `DISTINCT ON` emits one select item, so any binding at its own depth
+            // is that item's alias. Asserted by presence rather than by spelling: a
+            // dialect may sanitise the identifier it derives from the logical name —
+            // `BigQuery` renders `d.a + d.b` as `d_46a + d_46b` — and which name it
+            // picks is not what this guard is about.
+            let bindings = as_bindings_at_depth(&sql, depth);
+            assert!(
+                !bindings.is_empty(),
+                "{dialect_name}: the output of a DISTINCT ON with a qualified key is unnamed, so the enclosing scope's reference does not bind: {sql}"
+            );
+            assert!(
+                !bindings.iter().any(|b| b.to_lowercase() == key),
+                "{dialect_name}: the qualified key and the output alias are the same identifier, so naming the output captured the key: {sql}"
+            );
+        }
+    }
+
+    /// Regression test for the remaining half of #12751, fixed by fork PR #221
+    /// (refs #13140): a scan projection pushed down under a relation alias is
+    /// requalified onto the alias before the derived table is built, so the
+    /// derived `SELECT` list cannot report the name the enclosing scope holds.
+    /// The repair names the relation's columns on the alias it attaches:
     ///
     /// ```sql
-    /// SELECT s."t.a + t.b" FROM (SELECT (s.a + s.b) AS "s.a + s.b" FROM t AS s) AS s
+    /// SELECT s."t.a + t.b" FROM (SELECT (s.a + s.b) FROM t AS s) AS s ("t.a + t.b")
     /// ```
     ///
-    /// Naming the output cannot close that gap, which is why the fix above does not
-    /// try: both names are right for their own scope, and the repair is for the
-    /// enclosing scope to name the relation's columns on the alias it attaches. The
-    /// fork pins the same rendering in `test_subquery_alias_over_pushed_down_scan_
-    /// still_unbindable`; this is the repo-side canary for it.
-    ///
-    /// Projection pushdown is an ordinary optimized shape, so this is a live defect on
-    /// the federated pushdown path, and it is what keeps #12751 open. This test fails
-    /// once the gap is repaired: move the shape into `derived_scope_shapes` and close
-    /// #12751, rather than re-pinning the rendering below.
+    /// Asked of the whole `FROM` clause rather than of the derived `SELECT`
+    /// list, because that is where the column list lands — after the derived
+    /// table closes. A dialect that inlines instead (`BigQuery`) still has to
+    /// expose the same identifier somewhere in that clause, or the outer
+    /// reference cannot bind.
     #[test]
-    fn a_projected_scan_under_an_alias_does_not_name_the_output_its_scope_references() {
+    fn a_projected_scan_under_an_alias_names_the_output_its_scope_references() {
         let plan = LogicalPlanBuilder::scan("t", two_column_source(), Some(vec![0, 1]))
             .expect("scan t with a pushed-down projection")
             .project(vec![col("t.a") + col("t.b")])
@@ -1425,38 +1837,20 @@ mod tests {
             .expect("build");
         for (dialect_name, dialect) in federation_dialects() {
             let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
-            let list = derived_select_list(&sql);
-
-            // The derived table does name an output — this is the requalified name, not
-            // the absence of naming that preceded the fix — so the pin below is about
-            // *which* name it reports, not about whether it reports one. Read from the
-            // derived SELECT list alone: `AS` also introduces the relation aliases
-            // (`FROM t AS s`, `) AS s`), which are present either way, so a search over
-            // the whole statement would hold on the pre-#206 rendering too and this
-            // assertion would distinguish nothing.
             assert!(
-                list.contains(" AS "),
-                "{dialect_name}: the derived table names no output at all, which is the \
-                 pre-#206 behaviour rather than the gap this pins: {sql}"
+                sql.contains("FROM (SELECT "),
+                "{dialect_name}: the projection flattened into one SELECT, so this guard is \
+                 not looking at the derived-table shape it is for: {sql}"
             );
 
             // `column_of` panics unless the enclosing reference is qualified by `s`,
             // which is what makes the requalification the subject of this guard.
-            //
-            // Asked of the whole `FROM` clause rather than of the derived `SELECT`
-            // list, because the two ways a pin bump can close this gap land in
-            // different places: naming the derived output puts the name inside the
-            // list, while naming the relation's columns on the alias — the repair the
-            // comment above says this shape actually needs — puts it after the derived
-            // table closes. Reading only the list would leave this sentinel green
-            // through exactly the fix it exists to catch. Today the enclosing scope is
-            // the one place the name appears at all.
             let column = column_of(outer_reference(&sql), Some("s"));
             assert!(
-                !from_clause(&sql).contains(column),
-                "{dialect_name}: the derived table now exposes {column}, so this shape binds and \
-                 the remaining half of #12751 is repaired — move it into \
-                 `derived_scope_shapes` and close the issue instead of re-pinning this: {sql}"
+                from_clause(&sql).contains(column),
+                "{dialect_name}: the alias does not expose {column}, which is the identifier \
+                 the enclosing scope references, so the remote engine cannot bind the \
+                 statement: {sql}"
             );
         }
     }
@@ -1907,7 +2301,7 @@ mod tests {
 
         let postgres = unparse_with("postgres", &PostgreSqlDialect {}, &plan);
         assert!(
-            postgres.contains("(key)"),
+            postgres.contains(r#"("key")"#) || postgres.contains("(key)"),
             "this plan no longer unparses to a column alias list on any dialect, so there \
              is nothing for the BigQuery arms above to have inlined: {postgres}"
         );
