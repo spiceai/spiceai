@@ -199,14 +199,15 @@ fn get_os_version_internal() -> Result<String, GenericError> {
     Ok(version)
 }
 
+/// Windows has no `uname`; `winver` reads the version from the registry and
+/// reports `None` when it cannot. That is a detection failure, surfaced as an
+/// `Err` so both arms share one contract: the caller decides the fallback.
 #[cfg(target_family = "windows")]
 fn get_os_version_internal() -> Result<String, GenericError> {
     use winver::WindowsVersion;
-    if let Some(version) = WindowsVersion::detect() {
-        Ok(version.to_string())
-    } else {
-        Ok("unknown".to_string())
-    }
+    WindowsVersion::detect()
+        .map(|version| version.to_string())
+        .ok_or_else(|| GenericError::from("could not detect the Windows version"))
 }
 
 #[must_use]
@@ -417,6 +418,14 @@ mod tests {
         let parts: Vec<&str> = result.split_whitespace().collect();
         assert_eq!(parts.len(), 2);
         assert!(parts[0].contains('/'));
+
+        // The version segment is the detected release or `unknown`, never empty:
+        // the header this feeds is parsed by position.
+        let version = parts[0]
+            .split_once('/')
+            .map(|(_, version)| version)
+            .unwrap_or_default();
+        assert!(!version.is_empty(), "empty version segment in {result:?}");
     }
 
     #[test]
