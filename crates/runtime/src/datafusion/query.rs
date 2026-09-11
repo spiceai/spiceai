@@ -1755,11 +1755,13 @@ fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataF
         .into_iter()
         .map(|(name, dt)| {
             // If cannot determine datatype, we are assuming UInt64.
-            // This appears to occur for LIMIT parameters such as for:
+            // This occurs for LIMIT/OFFSET parameters such as for:
             // ```sql
             // SELECT * FROM table LIMIT $1
             // ```
-            // Other cases are not known
+            // The plan types such an operand as Int64, but type coercion has already
+            // cast it to Int64 by the time this runs, and the cast is what is left
+            // here in place of the placeholder itself. Other cases are not known.
             (name, dt.unwrap_or(arrow_schema::DataType::UInt64))
         })
         .collect();
@@ -4613,5 +4615,230 @@ mod tests {
             .collect();
 
         assert_eq!(ids, (0..32).rev().collect::<Vec<_>>());
+    }
+}
+
+/// Guards the `spiceai/datafusion` fork's placeholder type-inference patches: fork
+/// PRs #87 (`CASE`), #88 (infer from every operand of an expression) and #89 (stop
+/// the inference failing outright), plus the two the branch carries for `LIMIT` /
+/// `OFFSET` `Int64` operands and for keeping a source field's name and metadata.
+///
+/// Upstream's `Expr::infer_placeholder_types` types a placeholder from the other
+/// operand of a binary expression, from a `BETWEEN`'s `expr`, from an `IN` list's
+/// `expr` and from a `LIKE`'s `expr`, and from nothing else. The fork widens that to
+/// every operand of those expressions and adds `CASE`, `IN (<subquery>)`, `CAST`,
+/// `NOT` / `IS …` and unary minus; it stops the whole inference erroring when no
+/// operand carries a type; and it types a placeholder used directly as `LIMIT` or
+/// `OFFSET` as `Int64`.
+///
+/// The fork branch is re-cut per `DataFusion` major, and a patch not carried across is
+/// lost silently — two of these needed re-porting by hand during the `DataFusion` 53
+/// carry-forward, which is why the guard has to live here rather than in the fork.
+/// What a client sees when one goes missing is either a parameterised query that
+/// will not plan at all, or `$1` advertised as the `UInt64` fallback
+/// [`parameter_schema_for_plan`] applies to a parameter it cannot type — so the value
+/// the client binds is coerced to something other than the column it is compared
+/// against.
+#[cfg(test)]
+mod placeholder_type_inference {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+
+    use super::{DataFusionError, parameter_schema_for_plan};
+
+    /// An extension type is the metadata a placeholder inferred from `tagged` has to
+    /// keep: the storage type alone does not identify it.
+    const EXTENSION_TYPE_NAME_KEY: &str = "ARROW:extension:name";
+    const UUID_EXTENSION_TYPE: &str = "arrow.uuid";
+
+    /// One table with a column of each type the shapes below infer from. `tagged`
+    /// carries an extension type so the field-metadata carry is observable.
+    fn session() -> SessionContext {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("tagged", DataType::Utf8, true).with_metadata(HashMap::from([(
+                EXTENSION_TYPE_NAME_KEY.to_string(),
+                UUID_EXTENSION_TYPE.to_string(),
+            )])),
+        ]));
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "t",
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("empty mem table")),
+        )
+        .expect("register t");
+        ctx
+    }
+
+    /// Plans `sql` the way `Query::get_schema` does — logical plan, then the
+    /// analyzer — and returns the parameter schema the `FlightSQL` prepared-statement
+    /// path advertises for it.
+    async fn parameter_types(sql: &str) -> Result<Vec<(String, DataType)>, DataFusionError> {
+        let ctx = session();
+        let state = ctx.state();
+        let plan = state.create_logical_plan(sql).await?;
+        let analyzed =
+            state
+                .analyzer()
+                .execute_and_check(plan, state.config_options(), |_, _| {})?;
+        Ok(parameter_schema_for_plan(&analyzed)?
+            .map(|schema| {
+                schema
+                    .fields()
+                    .iter()
+                    .map(|field| (field.name().clone(), field.data_type().clone()))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// The parameter types of `sql` as planned, before the analyzer runs.
+    ///
+    /// `LIMIT` and `OFFSET` operands are typed here and only here: type coercion
+    /// casts such an operand to `Int64`, and the cast is what
+    /// [`parameter_schema_for_plan`] then sees instead of the placeholder itself.
+    async fn planned_parameter_types(
+        sql: &str,
+    ) -> Result<Vec<(String, Option<DataType>)>, DataFusionError> {
+        let ctx = session();
+        let plan = ctx.state().create_logical_plan(sql).await?;
+        let mut types: Vec<(String, Option<DataType>)> =
+            plan.get_parameter_types()?.into_iter().collect();
+        types.sort();
+        Ok(types)
+    }
+
+    /// Every shape one of the fork patches added inference for. A missing patch
+    /// leaves the placeholder untyped, which reaches the client as the `UInt64`
+    /// fallback rather than the column's own type.
+    #[tokio::test]
+    async fn every_shape_the_fork_patches_cover_infers_its_parameter_type() {
+        for (sql, expected) in [
+            // A searched `CASE`'s WHEN operand is Boolean; its THEN and ELSE
+            // operands take the type of the `CASE` (fork PR #87).
+            (
+                "SELECT CASE WHEN $1 THEN 1 ELSE 0 END FROM t",
+                DataType::Boolean,
+            ),
+            (
+                "SELECT CASE name WHEN $1 THEN 1 ELSE 0 END FROM t",
+                DataType::Utf8,
+            ),
+            (
+                "SELECT CASE WHEN id = 1 THEN name ELSE $1 END FROM t",
+                DataType::Utf8,
+            ),
+            // The operand being bounded, and the operand being tested, are typed
+            // from any sibling that has a type — not only from the one operand
+            // upstream reads (fork PR #88).
+            (
+                "SELECT id FROM t WHERE $1 BETWEEN id AND 100",
+                DataType::Int64,
+            ),
+            ("SELECT id FROM t WHERE $1 IN (name, 'x')", DataType::Utf8),
+            ("SELECT id FROM t WHERE $1 LIKE name", DataType::Utf8),
+            // An `IN (<subquery>)` types its probe from the subquery's single
+            // output column.
+            (
+                "SELECT id FROM t WHERE $1 IN (SELECT id FROM t)",
+                DataType::Int64,
+            ),
+            // A cast names the type outright; `NOT` and the `IS …` predicates
+            // constrain their operand to Boolean; unary minus to `Int64`.
+            ("SELECT CAST($1 AS BIGINT) FROM t", DataType::Int64),
+            ("SELECT id FROM t WHERE NOT $1", DataType::Boolean),
+            ("SELECT id FROM t WHERE ($1) IS TRUE", DataType::Boolean),
+            ("SELECT -$1 FROM t", DataType::Int64),
+        ] {
+            let inferred = parameter_types(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql} must plan: {e}"));
+            assert_eq!(
+                inferred,
+                vec![("$1".to_string(), expected.clone())],
+                "{sql} must infer $1 as {expected}"
+            );
+        }
+    }
+
+    /// A `LIMIT` or `OFFSET` operand is always `Int64`, and carries no surrounding
+    /// type context for the expression-level inference to work from, so the plan
+    /// types it from the operand position itself.
+    #[tokio::test]
+    async fn a_limit_and_an_offset_placeholder_are_both_int64() {
+        let inferred = planned_parameter_types("SELECT id FROM t LIMIT $1 OFFSET $2")
+            .await
+            .expect("limit and offset placeholders plan");
+        assert_eq!(
+            inferred,
+            vec![
+                ("$1".to_string(), Some(DataType::Int64)),
+                ("$2".to_string(), Some(DataType::Int64)),
+            ]
+        );
+    }
+
+    /// Two placeholders compared against each other give the inference nothing to
+    /// work from. That has to leave them untyped rather than fail the plan or
+    /// resolve them to something: the all-operand inference of fork PR #88 returned
+    /// the "no operand has a type" case as an error, which fork PR #89 turned back
+    /// into leaving the placeholder alone. Upstream, which has neither patch, types
+    /// both operands `Null` from each other.
+    #[tokio::test]
+    async fn a_comparison_of_two_placeholders_still_plans() {
+        let inferred = parameter_types("SELECT id FROM t WHERE $1 = $2")
+            .await
+            .expect("a comparison of two untypeable placeholders must still plan");
+        // Untyped parameters reach the client as the schema's `UInt64` fallback.
+        assert_eq!(
+            inferred,
+            vec![
+                ("$1".to_string(), DataType::UInt64),
+                ("$2".to_string(), DataType::UInt64),
+            ]
+        );
+    }
+
+    /// A placeholder inferred from a column keeps that column's field, not just its
+    /// storage type: an extension type lives in the field metadata, and dropping it
+    /// makes an `arrow.uuid` parameter indistinguishable from a bare `Utf8` one —
+    /// which is what `PREPARE` then rejects when the bound value carries the
+    /// extension.
+    ///
+    /// This one guards against a fork-side regression rather than an upstream gap.
+    /// Upstream carries the field through; the fork's own all-operand inference
+    /// carried only the `DataType` for a while, and `fix: preserve field
+    /// name/metadata in placeholder type inference` restored it.
+    #[tokio::test]
+    async fn a_placeholder_inferred_from_a_column_keeps_the_columns_metadata() {
+        let ctx = session();
+        let state = ctx.state();
+        let plan = state
+            .create_logical_plan("SELECT id FROM t WHERE tagged = $1")
+            .await
+            .expect("plan");
+        let fields = plan.get_parameter_fields().expect("parameter fields");
+        let field = fields
+            .get("$1")
+            .expect("$1 is a parameter of this plan")
+            .as_ref()
+            .expect("$1 is typed from the column it is compared against");
+
+        assert_eq!(field.data_type(), &DataType::Utf8);
+        assert_eq!(
+            field
+                .metadata()
+                .get(EXTENSION_TYPE_NAME_KEY)
+                .map(String::as_str),
+            Some(UUID_EXTENSION_TYPE),
+            "the extension type of `tagged` has to reach the parameter"
+        );
+        // A bound parameter may be NULL whatever the column says.
+        assert!(field.is_nullable());
     }
 }

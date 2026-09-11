@@ -2451,8 +2451,11 @@ mod function_support_tests {
     //! SQL sent to the remote database (e.g. `BigQuery`), which cannot
     //! evaluate them.
 
-    use std::collections::HashSet;
+    mod bigquery_corpus;
+
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use adbc_core::error::{Error as AdbcError, Result as AdbcResult, Status};
     use adbc_core::options::{
@@ -2497,12 +2500,30 @@ mod function_support_tests {
     /// Minimal in-process ADBC driver: enough for the connection pool to hand
     /// out connections and for `AdbcTableFactory::table_provider` to resolve
     /// the table schema. Everything else reports `NotImplemented`.
-    struct StubDatabase;
-    struct StubConnection;
+    struct StubDatabase {
+        schemas: Arc<HashMap<TableReference, Schema>>,
+        statement_attempts: Arc<AtomicUsize>,
+    }
+
+    impl Default for StubDatabase {
+        fn default() -> Self {
+            Self {
+                schemas: Arc::new([(TableReference::bare("t"), table_schema())].into()),
+                statement_attempts: Arc::default(),
+            }
+        }
+    }
+
+    struct StubConnection {
+        schemas: Arc<HashMap<TableReference, Schema>>,
+        statement_attempts: Arc<AtomicUsize>,
+    }
     // Clonable because cancelling a running query needs a second handle to the
     // same statement, which the ADBC table factory requires of every driver.
     #[derive(Clone)]
-    struct StubStatement;
+    struct StubStatement {
+        statement_attempts: Arc<AtomicUsize>,
+    }
 
     impl Optionable for StubDatabase {
         type Option = OptionDatabase;
@@ -2527,14 +2548,17 @@ mod function_support_tests {
         type ConnectionType = StubConnection;
 
         fn new_connection(&self) -> AdbcResult<StubConnection> {
-            Ok(StubConnection)
+            Ok(StubConnection {
+                schemas: Arc::clone(&self.schemas),
+                statement_attempts: Arc::clone(&self.statement_attempts),
+            })
         }
 
         fn new_connection_with_opts(
             &self,
             _opts: impl IntoIterator<Item = (OptionConnection, OptionValue)>,
         ) -> AdbcResult<StubConnection> {
-            Ok(StubConnection)
+            self.new_connection()
         }
     }
 
@@ -2561,7 +2585,9 @@ mod function_support_tests {
         type StatementType = StubStatement;
 
         fn new_statement(&mut self) -> AdbcResult<StubStatement> {
-            Ok(StubStatement)
+            Ok(StubStatement {
+                statement_attempts: Arc::clone(&self.statement_attempts),
+            })
         }
 
         fn cancel(&mut self) -> AdbcResult<()> {
@@ -2589,11 +2615,22 @@ mod function_support_tests {
 
         fn get_table_schema(
             &self,
-            _catalog: Option<&str>,
-            _db_schema: Option<&str>,
-            _table_name: &str,
+            catalog: Option<&str>,
+            db_schema: Option<&str>,
+            table_name: &str,
         ) -> AdbcResult<Schema> {
-            Ok(table_schema())
+            let table = match (catalog, db_schema) {
+                (Some(catalog), Some(schema)) => TableReference::full(catalog, schema, table_name),
+                (None, Some(schema)) => TableReference::partial(schema, table_name),
+                (None, None) => TableReference::bare(table_name),
+                (Some(_), None) => return Err(not_implemented("catalog without schema")),
+            };
+            self.schemas.get(&table).cloned().ok_or_else(|| {
+                AdbcError::with_message_and_status(
+                    format!("No saved schema for {table}"),
+                    Status::NotFound,
+                )
+            })
         }
 
         fn get_table_types(&self) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
@@ -2704,7 +2741,8 @@ mod function_support_tests {
         }
 
         fn set_sql_query(&mut self, _query: impl AsRef<str>) -> AdbcResult<()> {
-            Err(not_implemented("set_sql_query"))
+            self.statement_attempts.fetch_add(1, Ordering::SeqCst);
+            Err(not_implemented("offline fixture statement execution"))
         }
 
         fn set_substrait_plan(&mut self, _plan: impl AsRef<[u8]>) -> AdbcResult<()> {
@@ -2745,7 +2783,9 @@ mod function_support_tests {
         federation_enabled: bool,
         driver_name: &str,
     ) -> Arc<dyn TableProvider> {
-        let pool = Arc::new(ADBCPool::new(StubDatabase, None).expect("build the stub ADBC pool"));
+        let pool = Arc::new(
+            ADBCPool::new(StubDatabase::default(), None).expect("build the stub ADBC pool"),
+        );
         AdbcTableFactoryWithPolicy::new(pool, federation_enabled, driver_name)
             .table_provider(TableReference::bare("t"), dialect_for_driver(driver_name))
             .await
@@ -3470,7 +3510,9 @@ mod function_support_tests {
     /// in-process stub ADBC driver above already lives; the code under test is
     /// `runtime::catalogconnector::adbc::build_table_factory`.
     async fn stub_catalog_table_provider(federation_enabled: bool) -> Arc<dyn TableProvider> {
-        let pool = Arc::new(ADBCPool::new(StubDatabase, None).expect("build the stub ADBC pool"));
+        let pool = Arc::new(
+            ADBCPool::new(StubDatabase::default(), None).expect("build the stub ADBC pool"),
+        );
         runtime::catalogconnector::adbc::build_table_factory(pool, federation_enabled)
             .table_provider(TableReference::bare("t"), None)
             .await
