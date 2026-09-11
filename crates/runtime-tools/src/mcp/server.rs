@@ -130,10 +130,32 @@ impl McpSchemaSnapshot {
     }
 
     fn replace_listed(&self, tools: &[Tool]) -> bool {
+        let _publish = self.lock_publish();
+        self.install_listed(tools)
+    }
+
+    /// Replace the snapshot from the live tool map under [`Self::publish`].
+    ///
+    /// A precomputed `tools/list` page collected before this lock can
+    /// be older than a concurrent catalog TTL/reconnect publish. Reading
+    /// `try_all` here means that refresh either waits and applies after
+    /// this write, or this write already sees the refreshed cache.
+    fn replace_listed_from_map(&self, tools: &HashMap<String, Tooling>) -> (Vec<Tool>, bool) {
+        let _publish = self.lock_publish();
+        let next = mcp_schemas_from_map(tools);
+        let listed: Vec<Tool> = next.values().cloned().collect();
+        (listed, self.install_listed_map(next))
+    }
+
+    fn install_listed(&self, tools: &[Tool]) -> bool {
         let next: HashMap<String, Tool> = tools
             .iter()
             .map(|tool| (tool.name.to_string(), tool.clone()))
             .collect();
+        self.install_listed_map(next)
+    }
+
+    fn install_listed_map(&self, next: HashMap<String, Tool>) -> bool {
         let Ok(mut schemas) = self.tools.write() else {
             return false;
         };
@@ -546,15 +568,13 @@ impl ServerHandler for RuntimeServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         Box::pin(async move {
-            let all = self.all_tools().await;
-            let tools = all
-                .into_iter()
-                .map(|t| {
-                    let name = t.name().into_owned();
-                    mcp_tool_from_spice(name, t.as_ref())
-                })
-                .collect::<Vec<_>>();
-            let changed = self.schemas.replace_listed(&tools);
+            // Warm catalog caches so `try_all` is populated, then
+            // snapshot under the publish lock from the live map. A
+            // page collected here and installed later can be older
+            // than a concurrent TTL/reconnect publish.
+            let _warm = self.all_tools().await;
+            let map = self.tools.read().await;
+            let (tools, changed) = self.schemas.replace_listed_from_map(&map);
             self.schemas.bump_if(changed);
             Ok(listed_tools_result(tools))
         })
@@ -967,6 +987,85 @@ mod tests {
         assert!(
             snapshot.epoch() >= 2,
             "both the full replace and the catalog publish bump the epoch"
+        );
+    }
+
+    /// `replace_listed` used to install a precomputed Region page
+    /// without [`McpSchemaSnapshot::publish`], so a concurrent catalog
+    /// publish of Zone was overwritten (`final_schema=Region epoch=2`).
+    /// Production `tools/list` recomputes from the live map under that
+    /// lock.
+    #[test]
+    fn replace_listed_from_map_does_not_overwrite_a_newer_catalog_publish() {
+        let snapshot = Arc::new(McpSchemaSnapshot::default());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let catalog = Arc::new(GatedTryAllCatalog {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+        });
+        let mut tools = HashMap::new();
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::clone(&catalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+
+        let replace_snapshot = Arc::clone(&snapshot);
+        let replacer = std::thread::spawn(move || {
+            let (_listed, changed) = replace_snapshot.replace_listed_from_map(&tools);
+            replace_snapshot.bump_if(changed);
+        });
+
+        started_rx
+            .recv()
+            .expect("replace_listed_from_map must enter try_all before the catalog publishes");
+
+        let publish_snapshot = Arc::clone(&snapshot);
+        let publisher = std::thread::spawn(move || {
+            let mut listed = HashMap::new();
+            listed.insert(
+                "deploy".to_string(),
+                mcp_tool_from_spice("deploy", &ZoneAnnotatedTool),
+            );
+            let changed = apply_listed_catalog_cache(&publish_snapshot, "srv", &listed, true);
+            publish_snapshot.bump_if(changed);
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let exposed = encode_tool_name("srv", "deploy");
+        assert_ne!(
+            snapshot
+                .get(&exposed)
+                .as_ref()
+                .and_then(x_mcp_header_region),
+            Some("Zone"),
+            "catalog publish must wait for replace_listed_from_map; Zone already present means a stale overwrite can follow"
+        );
+
+        release_tx
+            .send(())
+            .expect("replace_listed_from_map is waiting in try_all");
+        replacer
+            .join()
+            .expect("replace_listed_from_map thread should finish");
+        publisher
+            .join()
+            .expect("catalog publish thread should finish");
+
+        assert_eq!(
+            snapshot
+                .get(&exposed)
+                .as_ref()
+                .and_then(x_mcp_header_region),
+            Some("Zone"),
+            "final_schema must be Zone after the catalog publish; Region after Zone is the stale overwrite"
+        );
+        assert!(
+            snapshot.epoch() >= 2,
+            "both the listed replace and the catalog publish bump the epoch"
         );
     }
 
