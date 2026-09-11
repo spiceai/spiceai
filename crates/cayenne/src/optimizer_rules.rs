@@ -114,7 +114,7 @@ limitations under the License.
 //! spillable or pruned execution paths more often.
 
 use arrow::compute::SortOptions;
-use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
+use arrow::datatypes::{DataType, IntervalUnit, Schema, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{JoinType, NullEquality, extensions_options};
 use datafusion::config::{ConfigExtension, ConfigOptions};
@@ -848,9 +848,9 @@ fn try_rewrite_oversized_join(
             // N-way SMJ of the fact-return file scans *or* of the aggregated
             // `ss`/`ws`/`cs` bodies is 20 ExternalSorters per side and fills
             // the spillable cap at SF-100 so a new sorter with 0 bytes cannot
-            // allocate (regression for #13918). The parent of these joins is
-            // also rewritten to sort-merge, so RoundRobin restore after
-            // coalesce is not fed into a Partitioned hash join.
+            // allocate (regression for #13918). A parent Inner hash join is
+            // *not* rewritten, so restore after coalesce must be Hash on the
+            // original join keys, not RoundRobin.
             if matches!(*hash_join.join_type(), JoinType::Left | JoinType::Right)
                 && should_spill_oracle_outer_join(hash_join)
             {
@@ -1020,7 +1020,11 @@ fn finish_sort_merge_rewrite(
         return Ok(None);
     };
     let join = if coalesce_sorts {
-        restore_hash_join_partitioning(join, &output_partitioning)?
+        let Some(join) = restore_hash_join_partitioning(join, &output_partitioning, hash_join)?
+        else {
+            return Ok(None);
+        };
+        join
     } else {
         join
     };
@@ -1190,18 +1194,79 @@ fn coalesce_for_spillable_sort(
 fn restore_hash_join_partitioning(
     plan: Arc<dyn ExecutionPlan>,
     partitioning: &Partitioning,
-) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    hash_join: &HashJoinExec,
+) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
     let n = partitioning.partition_count();
     if n <= 1 || plan.output_partitioning().partition_count() == n {
-        return Ok(plan);
+        return Ok(Some(plan));
     }
-    // Round-robin restores N without cloning the hash-join's hash
-    // expressions. Those `Column`s can be `UnKnownColumn` after the
-    // sort-merge wrap (TPC-DS Q30/Q34/Q73/Q78/Q81 at SF-1).
-    Ok(Arc::new(RepartitionExec::try_new(
+    // This rule runs after `EnforceDistribution`. A parent `Partitioned`
+    // `HashJoinExec` already expects Hash(join keys) on both children.
+    // Round-robin restores the count but not the key distribution, so the
+    // parent silently drops matches (inner join of a coalesced left-outer
+    // child: 100 rows vs 24).
+    let schema = plan.schema();
+    let exprs = match partitioning {
+        Partitioning::Hash(exprs, _) => remap_partition_hash_exprs(exprs, schema.as_ref()),
+        _ => hash_exprs_from_join_keys(hash_join, schema.as_ref()),
+    };
+    let Some(exprs) = exprs else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(RepartitionExec::try_new(
         plan,
-        Partitioning::RoundRobinBatch(n),
-    )?))
+        Partitioning::Hash(exprs, n),
+    )?)))
+}
+
+fn remap_partition_hash_exprs(
+    exprs: &[Arc<dyn PhysicalExpr>],
+    schema: &Schema,
+) -> Option<Vec<Arc<dyn PhysicalExpr>>> {
+    let mut remapped = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        remapped.push(column_expr_on_schema(
+            expr.downcast_ref::<Column>()?,
+            schema,
+        )?);
+    }
+    Some(remapped)
+}
+
+fn hash_exprs_from_join_keys(
+    hash_join: &HashJoinExec,
+    schema: &Schema,
+) -> Option<Vec<Arc<dyn PhysicalExpr>>> {
+    let mut exprs = Vec::with_capacity(hash_join.on().len());
+    for (left_key, _) in hash_join.on() {
+        // Left-key indices are into the left *input* schema, not the join
+        // output, so look up by name.
+        exprs.push(column_expr_by_name(
+            left_key.downcast_ref::<Column>()?.name(),
+            schema,
+        )?);
+    }
+    Some(exprs)
+}
+
+/// Prefer the original index when that slot still has the same name, so a
+/// self-join with duplicate field names (TPC-DS Q75) does not bind the first
+/// unused match. Fall back to lookup-by-name when the index is stale
+/// (`UnKnownColumn` after an SMJ wrap).
+fn column_expr_on_schema(column: &Column, schema: &Schema) -> Option<Arc<dyn PhysicalExpr>> {
+    if schema
+        .fields()
+        .get(column.index())
+        .is_some_and(|field| field.name() == column.name())
+    {
+        return Some(Arc::new(Column::new(column.name(), column.index())) as Arc<dyn PhysicalExpr>);
+    }
+    column_expr_by_name(column.name(), schema)
+}
+
+fn column_expr_by_name(name: &str, schema: &Schema) -> Option<Arc<dyn PhysicalExpr>> {
+    let index = schema.index_of(name).ok()?;
+    Some(Arc::new(Column::new(name, index)) as Arc<dyn PhysicalExpr>)
 }
 
 /// Whether an input is an `AggregateExec` (or a unary wrapper over one).
@@ -3238,6 +3303,133 @@ mod tests {
             "rewrite must preserve the build-side partition count under a mode=Partitioned parent \
              (got {left_partitions} != {right_partitions})",
         );
+        assert!(
+            matches!(
+                parent_hj.left().output_partitioning(),
+                Partitioning::Hash(_, n) if *n == partitions
+            ),
+            "rewritten child under a Partitioned parent must restore Hash distribution, not RoundRobin: {:?}",
+            parent_hj.left().output_partitioning()
+        );
+    }
+
+    fn keyed_schema(id: &str, val: &str) -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new(id, DataType::Int64, false),
+            Field::new(val, DataType::Int64, false),
+        ]))
+    }
+
+    fn keyed_memory_exec_partitioned(
+        schema: &Arc<Schema>,
+        ids: impl IntoIterator<Item = i64>,
+        partitions: usize,
+    ) -> Arc<dyn ExecutionPlan> {
+        let mut per_partition: Vec<Vec<i64>> = vec![Vec::new(); partitions];
+        for id in ids {
+            let slot = usize::try_from(id).expect("non-negative fixture key") % partitions;
+            per_partition[slot].push(id);
+        }
+        let batches: Vec<Vec<RecordBatch>> = per_partition
+            .into_iter()
+            .map(|ids| {
+                let vals = ids.clone();
+                let batch = RecordBatch::try_new(
+                    Arc::clone(schema),
+                    vec![
+                        Arc::new(Int64Array::from(ids)),
+                        Arc::new(Int64Array::from(vals)),
+                    ],
+                )
+                .expect("keyed batch should be valid");
+                vec![batch]
+            })
+            .collect();
+        MemorySourceConfig::try_new_exec(&batches, Arc::clone(schema), None)
+            .expect("partitioned memory exec should be valid")
+    }
+
+    async fn collect_plan_rows(
+        plan: Arc<dyn ExecutionPlan>,
+        task: Arc<datafusion::execution::TaskContext>,
+    ) -> RecordBatch {
+        // Sequential per-partition execute, matching DataFusion's own
+        // `HashJoinExec` tests. Concurrent `collect`/`collect_partitioned`
+        // re-executes `RepartitionExec` partitions (`partition not used yet`).
+        let n = plan.output_partitioning().partition_count();
+        let mut batches = Vec::new();
+        for i in 0..n {
+            let stream = plan
+                .execute(i, Arc::clone(&task))
+                .expect("execute partition");
+            let part = datafusion::physical_plan::common::collect(stream)
+                .await
+                .expect("collect partition stream");
+            batches.extend(part);
+        }
+        let schema = batches
+            .first()
+            .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
+        arrow::compute::concat_batches(&schema, &batches).expect("concat collected batches")
+    }
+
+    /// A coalesced left-outer child under an unchanged Partitioned inner
+    /// parent must keep Hash(join keys). `RoundRobin` of the child used to
+    /// drop matches (100 vs 24) without error.
+    #[tokio::test]
+    async fn coalesced_outer_child_under_partitioned_inner_parent_preserves_rows() {
+        let partitions = 4usize;
+        let keys = 0_i64..100;
+        let schema_a = keyed_schema("a_id", "a_val");
+        let schema_b = keyed_schema("b_id", "b_val");
+        let schema_c = keyed_schema("c_id", "c_val");
+        let left_outer: Arc<dyn ExecutionPlan> = Arc::new(hash_join_with_join_type(
+            hash_repartition(
+                keyed_memory_exec_partitioned(&schema_a, keys.clone(), 1),
+                "a_id",
+                partitions,
+            ),
+            hash_repartition(
+                keyed_memory_exec_partitioned(&schema_b, keys.clone().filter(|id| id % 2 == 0), 1),
+                "b_id",
+                partitions,
+            ),
+            "a_id",
+            "b_id",
+            JoinType::Left,
+            NullEquality::NullEqualsNothing,
+        ));
+        let probe = hash_repartition(
+            keyed_memory_exec_partitioned(&schema_c, keys, 1),
+            "c_id",
+            partitions,
+        );
+        let parent: Arc<dyn ExecutionPlan> = Arc::new(hash_join_with_join_type(
+            Arc::clone(&left_outer),
+            probe,
+            "a_id",
+            "c_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let task = datafusion::execution::context::SessionContext::new().task_ctx();
+        let optimized = optimize_anti_join_sort_merge_with_config(Arc::clone(&parent), &config);
+        let optimized_hj = optimized
+            .downcast_ref::<HashJoinExec>()
+            .expect("inner parent must stay a hash join");
+        assert_coalesced_oracle_file_scan_sort_merge(optimized_hj.left(), partitions);
+        // Execute the restored child (Hash Repartition over coalesced SMJ),
+        // not the nested parent: `HashJoinExec` of `RepartitionExec` inputs
+        // panics `partition not used yet` in this unit-test TaskContext.
+        let rewritten = collect_plan_rows(Arc::clone(optimized_hj.left()), task).await;
+        assert_eq!(
+            rewritten.num_rows(),
+            100,
+            "restored Hash child must emit every left-outer row"
+        );
     }
 
     #[test]
@@ -3889,6 +4081,14 @@ mod tests {
             optimized.output_partitioning().partition_count(),
             partitions,
             "coalesced sort-merge must restore the original partition count"
+        );
+        assert!(
+            matches!(
+                optimized.output_partitioning(),
+                Partitioning::Hash(_, n) if *n == partitions
+            ),
+            "restore must be Hash(join keys), not RoundRobin: {:?}",
+            optimized.output_partitioning()
         );
         let wrapper_children = optimized.children();
         let smj_node = if optimized.is::<SortMergeJoinExec>() {

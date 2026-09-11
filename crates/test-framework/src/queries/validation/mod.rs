@@ -1134,9 +1134,11 @@ pub fn validate_against_reference_batches(
 /// cell equality then fails even though both honor the `ORDER BY`.
 ///
 /// Complete tie-groups (a run of equal sort keys followed by a greater key)
-/// must still match as a multiset. The last run is the cutoff: if it contains
-/// more than one row it may be truncated, so only the sort keys are required
-/// to match. A unique last row is compared in full.
+/// must still match as a multiset. The last run is a cutoff only when the
+/// result filled the `LIMIT` *and* that run has more than one row — then a
+/// leftover tied row past the boundary may exist, so only the sort keys are
+/// required to match. A unique last row, or a result shorter than `LIMIT`,
+/// is compared in full: those groups were not truncated.
 fn compare_limit_results_allowing_cutoff_ties(
     query_name: &str,
     sql: &str,
@@ -1241,7 +1243,13 @@ fn compare_limit_results_allowing_cutoff_ties(
             run_end += 1;
         }
         let is_last_run = run_end == n;
-        let truncated_cutoff = is_last_run && (run_end - run_start) > 1;
+        // A multi-row last group is not itself proof of LIMIT truncation:
+        // `LIMIT 100` of two tied rows still has room for both, and skipping
+        // the non-key compare would let a wrong `revenue` pass. Only a result
+        // that filled the literal `LIMIT` can have cut a tie (TPC-DS Q65).
+        let truncated_cutoff = is_last_run
+            && (run_end - run_start) > 1
+            && sort_order::top_level_limit_count(sql).is_some_and(|limit| n == limit);
         if !truncated_cutoff {
             let left_run = left.slice(run_start, run_end - run_start);
             let right_run = right.slice(run_start, run_end - run_start);
@@ -1941,11 +1949,10 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_validate_against_reference_accepts_tied_limit_subsets() {
-        // TPC-DS Q65: ORDER BY store name + item desc is not unique — many
-        // items share description "A". LIMIT 100 may pick different members
-        // of that tie class; both answers are SQL-correct.
+    fn q65_tied_batches(
+        left_revenue: [&str; 2],
+        right_revenue: [&str; 2],
+    ) -> (RecordBatch, RecordBatch) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("s_store_name", arrow::datatypes::DataType::Utf8, false),
             Field::new("i_item_desc", arrow::datatypes::DataType::Utf8, false),
@@ -1956,7 +1963,10 @@ mod test {
             vec![
                 Arc::new(arrow::array::StringArray::from(vec!["able", "able"])),
                 Arc::new(arrow::array::StringArray::from(vec!["A", "A"])),
-                Arc::new(arrow::array::StringArray::from(vec!["4.63", "8.64"])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    left_revenue[0],
+                    left_revenue[1],
+                ])),
             ],
         )
         .expect("actual");
@@ -1965,10 +1975,21 @@ mod test {
             vec![
                 Arc::new(arrow::array::StringArray::from(vec!["able", "able"])),
                 Arc::new(arrow::array::StringArray::from(vec!["A", "A"])),
-                Arc::new(arrow::array::StringArray::from(vec!["4.40", "1.74"])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    right_revenue[0],
+                    right_revenue[1],
+                ])),
             ],
         )
         .expect("reference");
+        (actual, reference)
+    }
+
+    #[test]
+    fn test_validate_against_reference_rejects_tied_rows_when_limit_is_not_filled() {
+        // LIMIT 100 of two rows cannot have truncated a tie group, so a
+        // different `revenue` is a real mismatch — not a legal LIMIT subset.
+        let (actual, reference) = q65_tied_batches(["4.63", "8.64"], ["4.40", "1.74"]);
         let query = Query::new(
             "tpcds_q65".into(),
             "SELECT s_store_name, i_item_desc, revenue FROM t \
@@ -1978,10 +1999,35 @@ mod test {
         );
         let result =
             validate_against_reference_batches(&query, &[actual], &[reference]).expect("compare");
+        assert!(
+            matches!(
+                result,
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            ),
+            "a short result under LIMIT 100 must still compare non-key cells: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_against_reference_accepts_tied_limit_subsets() {
+        // TPC-DS Q65: ORDER BY store name + item desc is not unique — many
+        // items share description "A". When the result fills LIMIT, the last
+        // tie group may be truncated and two engines may keep different
+        // members; both answers are SQL-correct.
+        let (actual, reference) = q65_tied_batches(["4.63", "8.64"], ["4.40", "1.74"]);
+        let query = Query::new(
+            "tpcds_q65".into(),
+            "SELECT s_store_name, i_item_desc, revenue FROM t \
+             ORDER BY s_store_name, i_item_desc LIMIT 2"
+                .into(),
+            false,
+        );
+        let result =
+            validate_against_reference_batches(&query, &[actual], &[reference]).expect("compare");
         assert_eq!(
             result,
             QueryValidationResult::Pass,
-            "tied ORDER BY + LIMIT subsets must pass: {result:?}"
+            "tied ORDER BY + filled LIMIT subsets must pass: {result:?}"
         );
     }
 
