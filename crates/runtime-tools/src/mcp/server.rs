@@ -585,14 +585,17 @@ mod tests {
         RuntimeServer::new(Arc::new(RwLock::new(tools)))
     }
 
-    async fn post_tools_call(
+    async fn post_tools_call<S>(
         service: &rmcp::transport::streamable_http_server::StreamableHttpService<
-            RuntimeServer,
+            S,
             rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
         >,
         region_header: Option<&str>,
         region_body: &str,
-    ) -> (http::StatusCode, Value) {
+    ) -> (http::StatusCode, Value)
+    where
+        S: ServerHandler,
+    {
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -641,6 +644,49 @@ mod tests {
         let json: Value = serde_json::from_str(json_payload)
             .unwrap_or_else(|e| panic!("JSON-RPC body ({status}): {e}: {json_str:?}"));
         (status, json)
+    }
+
+    /// rmcp 3.3.0's default `get_tool` returns `None` and skips `Mcp-Param-*`
+    /// checks. This is the Streamable HTTP failure #13792 requires us to close.
+    #[derive(Clone, Copy)]
+    struct SchemaLessServer;
+
+    impl ServerHandler for SchemaLessServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+                .with_protocol_version(ProtocolVersion::V_2026_07_28)
+        }
+
+        fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
+            std::future::ready(Ok(
+                CallToolResult::success(vec![ContentBlock::text("ok")]).into()
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn default_get_tool_skips_mcp_param_mismatch() {
+        let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            || Ok(SchemaLessServer),
+            Arc::new(
+                rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+            ),
+            rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(true)
+                .disable_allowed_hosts()
+                .with_json_response(true),
+        );
+
+        let (status, json) = post_tools_call(&service, Some("us-west1"), "eu-west1").await;
+        assert_ne!(
+            json.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32020),
+            "default get_tool must skip HeaderMismatch so RuntimeServer's override is load-bearing: {status} {json}"
+        );
     }
 
     #[tokio::test]

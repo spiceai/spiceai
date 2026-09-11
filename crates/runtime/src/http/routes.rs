@@ -34,10 +34,7 @@ use runtime_request_context::{Protocol, RequestContext};
 
 use app::App;
 use axum::{extract::State, routing::patch};
-use http::header::{
-    ACCEPT, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_REQUEST_HEADERS, AUTHORIZATION,
-    CONTENT_TYPE, HeaderName,
-};
+use http::header::{ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_REQUEST_HEADERS, HeaderName};
 use opentelemetry::KeyValue;
 #[cfg(feature = "mcp")]
 use rmcp::transport::streamable_http_server::{
@@ -76,7 +73,7 @@ use axum::{
 };
 use runtime_auth::{AuthRequestContext, layer::http::AuthLayer};
 use tokio::time::Instant;
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowOrigin, Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 
 #[cfg(feature = "openapi")]
@@ -578,9 +575,11 @@ pub(crate) fn routes(
         .layer(Extension(Arc::clone(&rt.app)))
         .layer(cors_layer(cors_config));
 
-    // tower-http has no prefix AllowHeaders predicate. When CORS is on,
-    // rewrite `Access-Control-Allow-Headers` so a preflight that asks for
-    // `Mcp-Param-*` is accepted without mirroring every requested header.
+    // tower-http 0.6 has no prefix `AllowHeaders` predicate. `cors_layer`
+    // mirrors `Access-Control-Request-Headers` so a preflight that asks for
+    // `Mcp-Param-*` is not answered with a closed list that omits them. This
+    // rewrite then replaces `Access-Control-Allow-Headers` with the closed
+    // MCP set plus requested `Mcp-Param-*` names — not every requested header.
     if cors_config.enabled {
         router.layer(middleware::from_fn(allow_mcp_param_cors_headers))
     } else {
@@ -735,16 +734,9 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
         Method::DELETE,
         Method::OPTIONS,
     ])
-    .allow_headers([
-        ACCEPT,
-        CONTENT_TYPE,
-        AUTHORIZATION,
-        HeaderName::from_static("mcp-protocol-version"),
-        HeaderName::from_static("mcp-method"),
-        HeaderName::from_static("mcp-name"),
-        HeaderName::from_static("mcp-session-id"),
-        HeaderName::from_static("x-api-key"),
-    ])
+    // Mirror requested names so `Mcp-Param-*` survives preflight. The outer
+    // `allow_mcp_param_cors_headers` layer is the allow-list.
+    .allow_headers(AllowHeaders::mirror_request())
     .expose_headers([
         HeaderName::from_static("mcp-session-id"),
         HeaderName::from_static("mcp-protocol-version"),
@@ -887,7 +879,21 @@ async fn require_auth_configured(
 
 #[cfg(test)]
 mod tests {
-    use super::{cors_allow_headers_value, is_allowed_cors_request_header};
+    use super::{
+        Body, CorsConfig, allow_mcp_param_cors_headers, cors_allow_headers_value, cors_layer,
+        is_allowed_cors_request_header,
+    };
+    use axum::{Router, middleware, routing::post};
+    use http::{
+        Method, Request, StatusCode,
+        header::{
+            ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_ORIGIN,
+            ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD, AUTHORIZATION,
+            CONTENT_TYPE, HeaderName, ORIGIN,
+        },
+    };
+    use tower::ServiceExt;
+    use tower_http::cors::{Any, CorsLayer};
 
     #[test]
     fn cors_allows_closed_set_and_mcp_param_prefix() {
@@ -911,5 +917,110 @@ mod tests {
         assert!(allowed.contains("mcp-param-region"));
         assert!(allowed.contains("mcp-param-count"));
         assert!(!allowed.contains("x-evil"));
+    }
+
+    fn enabled_cors() -> CorsConfig {
+        CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["https://app.example.com".to_string()],
+        }
+    }
+
+    async fn preflight(
+        app: Router,
+        request_headers: &str,
+    ) -> (StatusCode, Option<String>, Option<String>) {
+        let request = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/v1/mcp")
+            .header(ORIGIN, "https://app.example.com")
+            .header(ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(ACCESS_CONTROL_REQUEST_HEADERS, request_headers)
+            .body(Body::empty())
+            .expect("valid CORS preflight");
+        let response = app
+            .oneshot(request)
+            .await
+            .expect("preflight should complete");
+        let allow_headers = response
+            .headers()
+            .get(ACCESS_CONTROL_ALLOW_HEADERS)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_ascii_lowercase);
+        let allow_origin = response
+            .headers()
+            .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        (response.status(), allow_headers, allow_origin)
+    }
+
+    #[tokio::test]
+    async fn closed_cors_allow_list_omits_mcp_param() {
+        // Reproduction of the 2026-07-28 browser preflight failure: a closed
+        // `allow_headers` list answers `Access-Control-Allow-Headers` without
+        // `mcp-param-region`, so the browser reports it as not allowed.
+        let cors = CorsLayer::new()
+            .allow_methods([Method::POST, Method::OPTIONS])
+            .allow_headers([
+                CONTENT_TYPE,
+                AUTHORIZATION,
+                HeaderName::from_static("mcp-protocol-version"),
+                HeaderName::from_static("mcp-method"),
+                HeaderName::from_static("mcp-name"),
+                HeaderName::from_static("mcp-session-id"),
+                HeaderName::from_static("x-api-key"),
+            ])
+            .allow_origin(Any);
+        let app = Router::new()
+            .route("/v1/mcp", post(|| async { "ok" }))
+            .layer(cors);
+        let (status, allow_headers, _) = preflight(app, "content-type, mcp-param-region").await;
+        assert_eq!(status, StatusCode::OK);
+        let allow_headers =
+            allow_headers.expect("CorsLayer always emits Access-Control-Allow-Headers");
+        assert!(
+            !allow_headers.contains("mcp-param-region"),
+            "closed list must omit mcp-param-region (the browser failure): {allow_headers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_allows_mcp_param_and_rejects_unknown() {
+        let cors_config = enabled_cors();
+        let app = Router::new()
+            .route("/v1/mcp", post(|| async { "ok" }))
+            .layer(cors_layer(&cors_config))
+            .layer(middleware::from_fn(allow_mcp_param_cors_headers));
+        let (status, allow_headers, allow_origin) =
+            preflight(app, "content-type, mcp-param-region, mcp-method, x-evil").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            allow_origin.as_deref(),
+            Some("https://app.example.com"),
+            "preflight must keep Access-Control-Allow-Origin"
+        );
+        let allow_headers = allow_headers.expect("Access-Control-Allow-Headers after rewrite");
+        assert!(
+            allow_headers.contains("mcp-param-region"),
+            "Mcp-Param-* must be allowed: {allow_headers}"
+        );
+        assert!(
+            allow_headers.contains("mcp-method"),
+            "closed MCP headers stay: {allow_headers}"
+        );
+        assert!(
+            !allow_headers.contains("x-evil"),
+            "unknown headers must not be mirrored: {allow_headers}"
+        );
+    }
+
+    #[test]
+    fn cors_layer_mirrors_request_headers() {
+        let debug = format!("{:?}", cors_layer(&enabled_cors()));
+        assert!(
+            debug.contains("MirrorRequest"),
+            "CorsLayer must mirror Access-Control-Request-Headers so Mcp-Param-* is not dropped, got {debug}"
+        );
     }
 }
