@@ -23,8 +23,8 @@ use rmcp::{
     ClientLifecycleMode, ClientServiceExt, RoleClient,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities, ClientRequest,
-        Implementation, InitializeRequestParams, ListToolsResult, PaginatedRequestParams,
-        PingRequest, ProtocolVersion, ServerResult,
+        Implementation, InitializeRequestParams, ListToolsRequest, ListToolsResult,
+        PaginatedRequestParams, PingRequest, ProtocolVersion, ServerResult,
     },
     service::{RunningService, ServiceError},
     transport::{
@@ -552,16 +552,55 @@ impl McpClient {
     /// Liveness check that works for both protocol eras.
     ///
     /// `ping` is not part of `2026-07-28`. A modern peer still answers
-    /// `tools/list`, so a failed ping is retried as a list before the catalog
-    /// treats the connection as dead.
+    /// `tools/list`, so a failed ping is retried as an uncached list
+    /// before the catalog treats the connection as dead.
+    ///
+    /// Do not call [`Self::list_tools`] here. rmcp 3.3.0 `Peer::list_tools`
+    /// returns a fresh cached page without I/O, and a stale cached page
+    /// after transport failure (`fresh_cached_page_is_served_without_transport_io`
+    /// in rmcp). A disconnected 2026 peer would then keep passing heartbeat.
     pub async fn heartbeat(&self) -> Result<(), ServiceError> {
-        match self.ping().await {
-            Ok(()) => Ok(()),
-            Err(ping_err) => match self.list_tools(None).await {
-                Ok(_) => Ok(()),
-                Err(_) => Err(ping_err),
-            },
+        let ping_ok = self.ping().await.is_ok();
+        if ping_ok {
+            return Ok(());
         }
+        heartbeat_after_probes(ping_ok, self.list_tools_uncached().await.map(|_| ()))
+    }
+
+    /// `tools/list` that always hits the transport.
+    ///
+    /// [`Self::list_tools`] is `Peer::list_tools`, which is a cache. Heartbeat
+    /// uses [`Peer::send_request`] so a dead peer cannot succeed from TTL.
+    async fn list_tools_uncached(&self) -> Result<ListToolsResult, ServiceError> {
+        let result = match self {
+            McpClient::Stdio(s) => {
+                s.peer()
+                    .send_request(ClientRequest::ListToolsRequest(ListToolsRequest::default()))
+                    .await?
+            }
+            McpClient::Http(s) => {
+                s.peer()
+                    .send_request(ClientRequest::ListToolsRequest(ListToolsRequest::default()))
+                    .await?
+            }
+        };
+        match result {
+            ServerResult::ListToolsResult(result) => Ok(result),
+            _ => Err(ServiceError::UnexpectedResponse),
+        }
+    }
+}
+
+/// Combine a `ping` probe with the modern-era fallback.
+///
+/// A successful ping is liveness. A failed ping is not: `2026-07-28` has
+/// no `ping`, so the uncached `tools/list` result is the one that counts
+/// — including its error, which names the transport failure `ping` hides.
+fn heartbeat_after_probes<E>(ping_ok: bool, uncached_list: Result<(), E>) -> Result<(), E> {
+    if ping_ok {
+        Ok(())
+    } else {
+        uncached_list
     }
 }
 
@@ -889,6 +928,33 @@ mod tests {
             .get(&exposed)
             .expect("snapshot should still hold deploy after the rewrite");
         assert_eq!(x_mcp_header(&rewritten), Some("Zone"));
+    }
+
+    #[test]
+    fn heartbeat_propagates_the_uncached_list_error_not_the_ping_error() {
+        assert_eq!(
+            heartbeat_after_probes(false, Err("transport closed")),
+            Err("transport closed"),
+            "when both probes fail, the list/transport error is the one to report"
+        );
+    }
+
+    #[test]
+    fn heartbeat_accepts_an_uncached_list_when_ping_is_absent() {
+        assert_eq!(
+            heartbeat_after_probes(false, Ok::<(), &str>(())),
+            Ok(()),
+            "2026-07-28 has no ping; a live uncached tools/list is liveness"
+        );
+    }
+
+    #[test]
+    fn heartbeat_does_not_need_list_when_ping_succeeds() {
+        assert_eq!(
+            heartbeat_after_probes(true, Err("should be ignored")),
+            Ok(()),
+            "a successful ping is enough; the fallback must not run"
+        );
     }
 
     #[test]
