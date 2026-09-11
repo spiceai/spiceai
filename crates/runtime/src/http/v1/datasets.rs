@@ -21,7 +21,7 @@ use crate::{
     accelerated::refresh::RefreshOverrides,
     component::dataset::Dataset,
     datafusion::{
-        SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA,
+        DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA,
         request_context_extension::get_current_datafusion,
     },
 };
@@ -166,11 +166,45 @@ pub(crate) async fn get(
         None => valid_datasets,
     };
 
-    let resp: Vec<_> = datasets
+    let resp = dataset_infos(&df, &datasets, params.status);
+
+    match params.format {
+        Format::Json => (status::StatusCode::OK, Json(resp)).into_response(),
+        Format::Csv => match convert_entry_to_csv(&resp) {
+            Ok(csv) => (status::StatusCode::OK, csv).into_response(),
+            Err(e) => {
+                tracing::error!("Error converting to CSV: {e}");
+                (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        },
+    }
+}
+
+/// The `/v1/datasets` rows for every valid dataset of `app`, with each
+/// dataset's status when `include_status` is set.
+///
+/// Shared with the Cloud Connect `GetDatasets` command, so the control plane
+/// reads the same document as `GET /v1/datasets?status=true`.
+pub fn app_dataset_infos(
+    rt: Arc<Runtime>,
+    df: &DataFusion,
+    app: &Arc<App>,
+    include_status: bool,
+) -> Vec<DatasetResponseItem> {
+    let datasets = rt.get_valid_datasets(app, LogErrors(false));
+    dataset_infos(df, &datasets, include_status)
+}
+
+fn dataset_infos(
+    df: &DataFusion,
+    datasets: &[Arc<Dataset>],
+    include_status: bool,
+) -> Vec<DatasetResponseItem> {
+    datasets
         .iter()
         .map(|d| {
-            let status = if params.status {
-                Some(dataset_status(&df, d))
+            let status = if include_status {
+                Some(dataset_status(df, d))
             } else {
                 None
             };
@@ -198,18 +232,7 @@ pub(crate) async fn get(
                 error_message,
             }
         })
-        .collect();
-
-    match params.format {
-        Format::Json => (status::StatusCode::OK, Json(resp)).into_response(),
-        Format::Csv => match convert_entry_to_csv(&resp) {
-            Ok(csv) => (status::StatusCode::OK, csv).into_response(),
-            Err(e) => {
-                tracing::error!("Error converting to CSV: {e}");
-                (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-            }
-        },
-    }
+        .collect()
 }
 
 #[derive(Debug, Serialize, Deserialize)]

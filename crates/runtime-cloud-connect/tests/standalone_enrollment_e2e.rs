@@ -3672,3 +3672,145 @@ async fn remove_clears_identity_and_exits() {
     // shutdown() returns promptly because the task already exited on Remove.
     handle.shutdown().await;
 }
+
+// --------------------------------------------------------------------------
+// GetDatasets: the dataset list rides the json arm unchanged, and a handle
+// that cannot list neither advertises `get_datasets` nor is asked for one.
+// --------------------------------------------------------------------------
+
+struct DatasetsRuntime {
+    can_list: bool,
+    document: serde_json::Value,
+}
+
+#[async_trait]
+impl RuntimeHandle for DatasetsRuntime {
+    fn supports(&self, capability: Capability) -> bool {
+        match capability {
+            Capability::GetDatasets => self.can_list,
+            // GetRuntimeInfo needs no capability, so this keeps the handle to
+            // exactly the one command under test.
+            _ => false,
+        }
+    }
+
+    // This list-only test handle cannot hold delivered secrets.
+    async fn clear_cloud_delivered_secrets(&self) {}
+
+    async fn datasets_json(&self) -> Result<serde_json::Value, CommandError> {
+        if self.can_list {
+            Ok(self.document.clone())
+        } else {
+            Err(CommandError::unsupported(
+                "this test handle has no dataset list",
+            ))
+        }
+    }
+}
+
+fn get_datasets() -> proto::control_message::Body {
+    proto::control_message::Body::GetDatasets(proto::GetDatasets {})
+}
+
+/// The list comes back on the `json` arm exactly as the runtime produced it:
+/// the client is a courier for the `/v1/datasets?status=true` document, not a
+/// re-shaper of it.
+#[tokio::test]
+async fn get_datasets_returns_the_runtime_document_on_the_json_arm() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let document = serde_json::json!([
+        { "from": "s3://bucket/taxi/", "name": "taxi_trips", "status": "Ready" },
+        { "from": "postgres:orders", "name": "orders", "status": "Error",
+          "error_message": "connection refused" }
+    ]);
+    let runtime = Arc::new(DatasetsRuntime {
+        can_list: true,
+        document: document.clone(),
+    });
+    let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
+
+    let captured = Arc::clone(&harness.gateway.captured);
+    let advertised = advertised_capabilities(&captured).await;
+    assert!(
+        advertised.contains(&"get_datasets".to_string()),
+        "a runtime that lists must advertise get_datasets: {advertised:?}"
+    );
+
+    harness
+        .gateway
+        .outbound
+        .lock()
+        .await
+        .push_back(ctrl_id("cmd-datasets", get_datasets()));
+
+    let result = await_result(&captured, "cmd-datasets")
+        .await
+        .expect("the client must answer a GetDatasets");
+    assert_eq!(
+        result.code,
+        proto::ResultCode::Ok as i32,
+        "listing must succeed: {}",
+        result.message
+    );
+    let Some(proto::command_result::Payload::Json(json)) = result.payload else {
+        panic!(
+            "the dataset list must ride on the json arm: {:?}",
+            result.payload
+        );
+    };
+    let decoded: serde_json::Value = serde_json::from_str(&json).expect("the payload is JSON");
+    assert_eq!(decoded, document);
+
+    handle.shutdown().await;
+}
+
+/// A handle that cannot list is answered UNSUPPORTED without being asked, and
+/// the refusal leaves the session serving other commands.
+#[tokio::test]
+async fn get_datasets_is_unsupported_when_the_runtime_cannot_list() {
+    let harness = Harness::new(24 * 60 * 60).await;
+    let runtime = Arc::new(DatasetsRuntime {
+        can_list: false,
+        document: serde_json::Value::Null,
+    });
+    let (handle, _dir) = enroll_query_runtime(&harness, runtime).await;
+
+    let captured = Arc::clone(&harness.gateway.captured);
+    let advertised = advertised_capabilities(&captured).await;
+    assert!(
+        !advertised.contains(&"get_datasets".to_string()),
+        "a runtime that cannot list must not advertise get_datasets: {advertised:?}"
+    );
+
+    harness
+        .gateway
+        .outbound
+        .lock()
+        .await
+        .push_back(ctrl_id("cmd-nolist", get_datasets()));
+
+    let result = await_result(&captured, "cmd-nolist")
+        .await
+        .expect("an unsupported GetDatasets must still be answered");
+    assert_eq!(
+        result.code,
+        proto::ResultCode::Unsupported as i32,
+        "an unsupported listing must be typed unsupported: {}",
+        result.message
+    );
+    assert!(
+        result.payload.is_none(),
+        "an unsupported listing carries no payload"
+    );
+
+    harness.gateway.outbound.lock().await.push_back(ctrl_id(
+        "cmd-after-nolist",
+        proto::control_message::Body::GetRuntimeInfo(proto::GetRuntimeInfo {}),
+    ));
+    let after = await_result(&captured, "cmd-after-nolist")
+        .await
+        .expect("the session must keep answering after an unsupported command");
+    assert_eq!(after.code, proto::ResultCode::Ok as i32);
+
+    handle.shutdown().await;
+}

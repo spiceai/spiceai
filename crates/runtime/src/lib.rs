@@ -106,6 +106,7 @@ pub mod extension;
 pub use runtime_table::federated;
 pub mod flight;
 mod http;
+pub use http::v1::datasets::app_dataset_infos;
 
 pub mod http_types {
     pub use crate::http::v1::queries::SubmitQueryRequest;
