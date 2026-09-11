@@ -29,7 +29,7 @@ use rmcp::{
 use serde_json::{Map, Value, json};
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     sync::{
         Arc, RwLock as StdRwLock,
@@ -126,11 +126,78 @@ impl McpSchemaSnapshot {
         changed
     }
 
-    fn bump_if(&self, changed: bool) {
+    /// Merge or replace gateway-exposed schemas for one proxied catalog.
+    ///
+    /// Catalog TTL / reconnect refreshes mutate the catalog cache, not this
+    /// snapshot. rmcp caches `get_tool` per name, so a same-name rewrite
+    /// (`Region` → `Zone`) must land here and bump [`Self::epoch`] or
+    /// Streamable HTTP keeps validating the stale header until a later
+    /// gateway `tools/list`.
+    ///
+    /// `tools` are already named with [`encode_tool_name`]. A complete list
+    /// (`replace`) drops snapshot entries that decode to `catalog` and are
+    /// no longer advertised.
+    fn apply_catalog_tools(&self, catalog: &str, tools: &[Tool], replace: bool) -> bool {
+        let advertised: HashSet<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
+        let Ok(mut schemas) = self.tools.write() else {
+            return false;
+        };
+        let mut changed = false;
+        if replace {
+            let stale: Vec<String> = schemas
+                .keys()
+                .filter(|name| {
+                    decode_tool_name(name)
+                        .is_some_and(|(owner, _)| owner == catalog && !advertised.contains(*name))
+                })
+                .cloned()
+                .collect();
+            for name in stale {
+                schemas.remove(&name);
+                changed = true;
+            }
+        }
+        for tool in tools {
+            let name = tool.name.to_string();
+            if schemas.get(&name).is_none_or(|existing| existing != tool) {
+                schemas.insert(name, tool.clone());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub(crate) fn bump_if(&self, changed: bool) {
         if changed {
             self.epoch.fetch_add(1, Ordering::Release);
         }
     }
+}
+
+/// Push a proxied catalog's `tools/list` cache into the shared snapshot.
+///
+/// Returns whether any stored schema identity changed so the caller can
+/// bump [`McpSchemaSnapshot::epoch`].
+pub(crate) fn apply_listed_catalog_cache(
+    snapshot: &McpSchemaSnapshot,
+    catalog: &str,
+    listed: &HashMap<String, Tool>,
+    replace: bool,
+) -> bool {
+    let tools: Vec<Tool> = listed
+        .values()
+        .map(|spec| mcp_tool_from_upstream(catalog, spec))
+        .collect();
+    snapshot.apply_catalog_tools(catalog, &tools, replace)
+}
+
+fn mcp_tool_from_upstream(catalog: &str, spec: &Tool) -> Tool {
+    let exposed = encode_tool_name(catalog, spec.name.as_ref());
+    Tool::new_with_raw(
+        Cow::Owned(exposed),
+        spec.description.clone(),
+        Arc::clone(&spec.input_schema),
+    )
 }
 
 #[derive(Clone)]
@@ -992,6 +1059,52 @@ mod tests {
         }
     }
 
+    struct SwappableHeaderCatalog {
+        use_zone: std::sync::atomic::AtomicBool,
+    }
+
+    impl SwappableHeaderCatalog {
+        fn new() -> Self {
+            Self {
+                use_zone: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn use_zone(&self) {
+            self.use_zone.store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        fn current_tool(&self) -> Arc<dyn SpiceModelTool> {
+            if self.use_zone.load(std::sync::atomic::Ordering::Acquire) {
+                Arc::new(ZoneAnnotatedTool)
+            } else {
+                Arc::new(HeaderAnnotatedTool)
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SpiceToolCatalog for SwappableHeaderCatalog {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &'static str {
+            "srv"
+        }
+        async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+            vec![self.current_tool()]
+        }
+        async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+            (name == "deploy").then(|| self.current_tool())
+        }
+        fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+            (name == "deploy").then(|| self.current_tool())
+        }
+        fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+            vec![self.current_tool()]
+        }
+    }
+
     fn header_annotated_catalog_server() -> RuntimeServer {
         let mut tools = HashMap::new();
         tools.insert(
@@ -1477,6 +1590,108 @@ mod tests {
         assert!(
             json.pointer("/result/content").is_none(),
             "Complete would carry content; input_required must not: {json}"
+        );
+    }
+
+    /// A proxied catalog TTL refresh used to update only the catalog
+    /// cache. Streamable HTTP kept validating `mcp-param-region` until a
+    /// gateway `tools/list`. Publishing the cache into the snapshot and
+    /// rebuilding the service validates `mcp-param-zone` without that list.
+    #[tokio::test]
+    async fn rebuilt_service_validates_after_catalog_cache_schema_identity_change() {
+        let exposed = encode_tool_name("srv", "deploy");
+        let catalog = Arc::new(SwappableHeaderCatalog::new());
+        let mut tools = HashMap::new();
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::clone(&catalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+        let tools = Arc::new(RwLock::new(tools));
+        let schemas = McpSchemaSnapshot::new();
+        schemas.replace_from_map(&*tools.read().await);
+        let first_epoch = schemas.epoch();
+
+        let factory_tools = Arc::clone(&tools);
+        let factory_schemas = Arc::clone(&schemas);
+        let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(true)
+            .disable_allowed_hosts()
+            .with_json_response(true);
+        let sessions = Arc::new(
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+        );
+        let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            {
+                let factory_tools = Arc::clone(&factory_tools);
+                let factory_schemas = Arc::clone(&factory_schemas);
+                move || {
+                    Ok(RuntimeServer::with_schema_snapshot(
+                        Arc::clone(&factory_tools),
+                        Arc::clone(&factory_schemas),
+                    ))
+                }
+            },
+            Arc::clone(&sessions),
+            config.clone(),
+        );
+
+        let (status, json) =
+            post_tools_call(&service, &exposed, Some("us-west1"), "us-west1").await;
+        assert!(
+            status.is_success(),
+            "matching Mcp-Param-Region must be accepted before the catalog rewrite: {status} {json}"
+        );
+
+        catalog.use_zone();
+        let mut listed = HashMap::new();
+        listed.insert(
+            "deploy".to_string(),
+            mcp_tool_from_spice("deploy", &ZoneAnnotatedTool),
+        );
+        let changed = apply_listed_catalog_cache(&schemas, "srv", &listed, true);
+        schemas.bump_if(changed);
+        assert!(
+            changed,
+            "Region → Zone on the catalog tool must count as a schema change"
+        );
+        assert!(
+            schemas.epoch() > first_epoch,
+            "catalog cache identity change must bump the snapshot epoch without a gateway tools/list"
+        );
+
+        let (status, json) =
+            post_tools_call_param(&service, &exposed, "zone", Some("us-west1"), "us-west1").await;
+        assert_eq!(
+            json.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32020),
+            "existing StreamableHttpService must still validate mcp-param-region: {status} {json}"
+        );
+
+        let rebuilt = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            move || {
+                Ok(RuntimeServer::with_schema_snapshot(
+                    Arc::clone(&factory_tools),
+                    Arc::clone(&factory_schemas),
+                ))
+            },
+            sessions,
+            config,
+        );
+        let (status, json) =
+            post_tools_call_param(&rebuilt, &exposed, "zone", Some("us-west1"), "us-west1").await;
+        assert!(
+            status.is_success(),
+            "rebuilt service must validate mcp-param-zone after the catalog cache rewrite: {status} {json}"
+        );
+        assert!(
+            json.get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_i64)
+                != Some(-32020),
+            "matching Zone header must not raise HeaderMismatch: {json}"
         );
     }
 }

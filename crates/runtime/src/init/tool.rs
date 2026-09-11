@@ -75,7 +75,10 @@ impl Runtime {
             },
         );
         #[cfg(feature = "mcp")]
-        self.refresh_mcp_tool_schemas(&tools_map);
+        {
+            runtime_tools::mcp::attach_mcp_schema_snapshot(t.as_ref(), &self.mcp_schemas);
+            self.refresh_mcp_tool_schemas(&tools_map);
+        }
         tracing::trace!("Tool catalog {} ready to use", name.clone());
         metrics::tools::COUNT.add(1, &[KeyValue::new("tool_catalog", name.clone())]);
         self.status
@@ -88,7 +91,12 @@ impl Runtime {
 
         tools_map.insert(name.clone(), t);
         #[cfg(feature = "mcp")]
-        self.refresh_mcp_tool_schemas(&tools_map);
+        {
+            if let Some(Tooling::Catalog { tools: catalog, .. }) = tools_map.get(&name) {
+                runtime_tools::mcp::attach_mcp_schema_snapshot(catalog.as_ref(), &self.mcp_schemas);
+            }
+            self.refresh_mcp_tool_schemas(&tools_map);
+        }
         tracing::trace!("Tool {} ready to use", name.clone());
         metrics::tools::COUNT.add(1, &[KeyValue::new("tool", name.clone())]);
         self.status

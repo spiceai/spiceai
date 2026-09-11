@@ -48,7 +48,11 @@ use tokio::{
 use crate::catalog::SpiceToolCatalog;
 use tools::SpiceModelTool;
 
-use super::{Error, MCPConfig, Result, UnderlyingTransportSnafu, tool::McpToolWrapper};
+use super::{
+    Error, MCPConfig, Result, UnderlyingTransportSnafu,
+    server::{McpSchemaSnapshot, apply_listed_catalog_cache},
+    tool::McpToolWrapper,
+};
 
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 30; // 30 seconds
 
@@ -95,6 +99,10 @@ pub(crate) struct McpToolCatalog {
     /// without taking the async client lock. Freshness follows the list
     /// result's `ttlMs` (SEP-2549): omitted or zero means immediately stale.
     tool_cache: Arc<StdRwLock<ToolListCache>>,
+    /// Shared gateway snapshot. TTL / reconnect refreshes write through
+    /// here and bump the epoch so Streamable HTTP drops rmcp's per-name
+    /// `get_tool` cache. Attached after the catalog is registered.
+    schemas: Arc<StdRwLock<Option<Arc<McpSchemaSnapshot>>>>,
 }
 
 #[derive(Default)]
@@ -102,6 +110,20 @@ struct ToolListCache {
     tools: HashMap<String, rmcp::model::Tool>,
     /// `None` means the list is already stale.
     expires_at: Option<Instant>,
+}
+
+/// Wire a proxied MCP catalog to the gateway schema snapshot.
+///
+/// No-op for non-MCP catalogs. After attach, TTL and reconnect refreshes
+/// write through to the snapshot and bump its epoch so Streamable HTTP
+/// rebuilds without waiting for a gateway `tools/list`.
+pub fn attach_mcp_schema_snapshot(
+    catalog: &dyn SpiceToolCatalog,
+    snapshot: &Arc<McpSchemaSnapshot>,
+) {
+    if let Some(mcp) = catalog.as_any().downcast_ref::<McpToolCatalog>() {
+        mcp.attach_schema_snapshot(snapshot);
+    }
 }
 
 impl Drop for McpToolCatalog {
@@ -120,6 +142,8 @@ impl McpToolCatalog {
         let name_clone = name.to_string();
         let tool_cache = Arc::new(StdRwLock::new(ToolListCache::default()));
         let tool_cache_clone = Arc::clone(&tool_cache);
+        let schemas = Arc::new(StdRwLock::new(None::<Arc<McpSchemaSnapshot>>));
+        let schemas_clone = Arc::clone(&schemas);
 
         let heartbeat_task = tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS));
@@ -150,6 +174,17 @@ impl McpToolCatalog {
                             && let Ok(mut cache) = tool_cache_clone.write()
                         {
                             apply_tool_cache(&mut cache, &listed, complete, ttl_ms);
+                            if let Ok(slot) = schemas_clone.read()
+                                && let Some(snapshot) = slot.as_ref()
+                            {
+                                let changed = apply_listed_catalog_cache(
+                                    snapshot,
+                                    &name_clone,
+                                    &cache.tools,
+                                    complete,
+                                );
+                                snapshot.bump_if(changed);
+                            }
                         }
                         tracing::info!("Successfully reconnected MCP client for {}", name_clone);
                     }
@@ -162,6 +197,7 @@ impl McpToolCatalog {
             name: name.to_string(),
             heartbeat_task,
             tool_cache,
+            schemas,
         };
         // Fill the sync schema cache before the catalog is registered so
         // Streamable HTTP `get_tool` can validate `Mcp-Param-*` on the first
@@ -184,6 +220,27 @@ impl McpToolCatalog {
             return;
         };
         apply_tool_cache(&mut cache, tools, replace, ttl_ms);
+        self.publish_cache_to_snapshot(&cache, replace);
+    }
+
+    fn attach_schema_snapshot(&self, snapshot: &Arc<McpSchemaSnapshot>) {
+        if let Ok(mut slot) = self.schemas.write() {
+            *slot = Some(Arc::clone(snapshot));
+        }
+        if let Ok(cache) = self.tool_cache.read() {
+            self.publish_cache_to_snapshot(&cache, true);
+        }
+    }
+
+    fn publish_cache_to_snapshot(&self, cache: &ToolListCache, replace: bool) {
+        let Ok(slot) = self.schemas.read() else {
+            return;
+        };
+        let Some(snapshot) = slot.as_ref() else {
+            return;
+        };
+        let changed = apply_listed_catalog_cache(snapshot, &self.name, &cache.tools, replace);
+        snapshot.bump_if(changed);
     }
 
     fn cache_is_fresh(&self) -> bool {
@@ -593,6 +650,7 @@ impl SpiceToolCatalog for McpToolCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_dangerous_patterns_reject_parent_traversal() {
@@ -751,6 +809,86 @@ mod tests {
         assert_eq!(fold_page_ttl(5_000, Some(0), true), 0);
         assert_eq!(fold_page_ttl(5_000, None, true), 0);
         assert_eq!(fold_page_ttl(0, None, false), 0);
+    }
+
+    fn listed_deploy_with_header(header: &str) -> rmcp::model::Tool {
+        let mut schema = serde_json::Map::new();
+        schema.insert("type".into(), json!("object"));
+        schema.insert(
+            "properties".into(),
+            json!({
+                "region": { "type": "string", "x-mcp-header": header }
+            }),
+        );
+        rmcp::model::Tool::new_with_raw(
+            "deploy",
+            Some(std::borrow::Cow::Borrowed("deploy a thing")),
+            schema,
+        )
+    }
+
+    fn x_mcp_header(tool: &rmcp::model::Tool) -> Option<&str> {
+        tool.input_schema
+            .get("properties")
+            .and_then(|properties| properties.get("region"))
+            .and_then(|region| region.get("x-mcp-header"))
+            .and_then(serde_json::Value::as_str)
+    }
+
+    /// Catalog TTL / reconnect used to rewrite only `tool_cache`. The
+    /// gateway snapshot (and therefore Streamable HTTP) kept `Region`
+    /// until a later `tools/list`. Publishing the cache identity change
+    /// bumps the snapshot without that intervening list.
+    #[test]
+    fn catalog_cache_refresh_publishes_schema_identity_change_to_snapshot() {
+        use tools::naming::encode_tool_name;
+
+        let snapshot = McpSchemaSnapshot::new();
+        let mut cache = ToolListCache::default();
+        apply_tool_cache(
+            &mut cache,
+            &[listed_deploy_with_header("Region")],
+            true,
+            0,
+        );
+        let changed = apply_listed_catalog_cache(&snapshot, "srv", &cache.tools, true);
+        snapshot.bump_if(changed);
+        let epoch = snapshot.epoch();
+        let exposed = encode_tool_name("srv", "deploy");
+        let first = snapshot
+            .get(&exposed)
+            .expect("snapshot should hold the catalog tool after the first publish");
+        assert_eq!(x_mcp_header(&first), Some("Region"));
+
+        apply_tool_cache(&mut cache, &[listed_deploy_with_header("Zone")], true, 0);
+        assert_eq!(
+            cache.tools.get("deploy").and_then(x_mcp_header),
+            Some("Zone"),
+            "catalog cache after upstream refresh: Zone"
+        );
+        let still_region = snapshot
+            .get(&exposed)
+            .expect("snapshot still holds the pre-publish schema");
+        assert_eq!(
+            x_mcp_header(&still_region),
+            Some("Region"),
+            "direct call schema after cache-only refresh: Region"
+        );
+
+        let changed = apply_listed_catalog_cache(&snapshot, "srv", &cache.tools, true);
+        assert!(
+            changed,
+            "Region → Zone on the same catalog tool must count as a schema change"
+        );
+        snapshot.bump_if(changed);
+        assert!(
+            snapshot.epoch() > epoch,
+            "catalog cache identity change must bump the snapshot epoch without a gateway tools/list"
+        );
+        let rewritten = snapshot
+            .get(&exposed)
+            .expect("snapshot should still hold deploy after the rewrite");
+        assert_eq!(x_mcp_header(&rewritten), Some("Zone"));
     }
 
     #[test]

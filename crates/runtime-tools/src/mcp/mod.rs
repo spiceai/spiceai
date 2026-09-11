@@ -25,6 +25,8 @@ pub mod factory;
 pub mod server;
 pub mod tool;
 
+pub use catalog::attach_mcp_schema_snapshot;
+
 use std::{collections::HashMap, str::FromStr};
 
 use http::{HeaderName, HeaderValue, header::AUTHORIZATION};
