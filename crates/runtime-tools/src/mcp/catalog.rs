@@ -141,6 +141,47 @@ impl ListRefresh {
             None
         }
     }
+
+    /// Write the listed tools into the sync cache, then publish to the
+    /// gateway snapshot after dropping the cache write lock.
+    ///
+    /// Applies only when `my_gen` is still the latest refresh
+    /// generation, so a slower earlier fetch cannot overwrite a later
+    /// one.
+    ///
+    /// [`McpSchemaSnapshot::replace_from_map`] takes the snapshot
+    /// publish lock and then `try_all` (a cache read). Holding the
+    /// cache write across the snapshot publish would deadlock with
+    /// that path.
+    fn publish_listed(
+        &self,
+        my_gen: u64,
+        tool_cache: &StdRwLock<ToolListCache>,
+        schemas: &StdRwLock<Option<Arc<McpSchemaSnapshot>>>,
+        catalog_name: &str,
+        tools: &[rmcp::model::Tool],
+        replace: bool,
+        ttl_ms: u64,
+    ) {
+        let Some(_refresh) = self.lock_if_current(my_gen) else {
+            return;
+        };
+        let cached = {
+            let Ok(mut cache) = tool_cache.write() else {
+                return;
+            };
+            apply_tool_cache(&mut cache, tools, replace, ttl_ms);
+            cache.tools.clone()
+        };
+        let Ok(slot) = schemas.read() else {
+            return;
+        };
+        let Some(snapshot) = slot.as_ref() else {
+            return;
+        };
+        let changed = apply_listed_catalog_cache(snapshot, catalog_name, &cached, replace);
+        snapshot.bump_if(changed);
+    }
 }
 
 #[derive(Default)]
@@ -218,15 +259,14 @@ impl McpToolCatalog {
                         // Clearing it would make `try_get` miss and let rmcp
                         // cache `get_tool == None` for that name forever.
                         if let Ok((listed, complete, ttl_ms)) = listed {
-                            publish_listed_cache(
+                            refresh_clone.publish_listed(
+                                my_gen,
                                 &tool_cache_clone,
                                 &schemas_clone,
                                 &name_clone,
                                 &listed,
                                 complete,
                                 ttl_ms,
-                                &refresh_clone,
-                                my_gen,
                             );
                         }
                         tracing::info!("Successfully reconnected MCP client for {}", name_clone);
@@ -260,15 +300,14 @@ impl McpToolCatalog {
     }
 
     fn remember_tools(&self, tools: &[rmcp::model::Tool], replace: bool, ttl_ms: u64, my_gen: u64) {
-        publish_listed_cache(
+        self.refresh.publish_listed(
+            my_gen,
             &self.tool_cache,
             &self.schemas,
             &self.name,
             tools,
             replace,
             ttl_ms,
-            &self.refresh,
-            my_gen,
         );
     }
 
@@ -438,45 +477,6 @@ impl McpToolCatalog {
             Err(e) => self.cached_tool(name).map_or(Err(e), |tool| Ok(Some(tool))),
         }
     }
-}
-
-/// Write the listed tools into the sync cache, then publish to the
-/// gateway snapshot after dropping the cache write lock.
-///
-/// Applies only when `my_gen` is still the latest refresh generation,
-/// so a slower earlier fetch cannot overwrite a later one.
-///
-/// [`McpSchemaSnapshot::replace_from_map`] takes the snapshot publish
-/// lock and then `try_all` (a cache read). Holding the cache write
-/// across the snapshot publish would deadlock with that path.
-fn publish_listed_cache(
-    tool_cache: &StdRwLock<ToolListCache>,
-    schemas: &StdRwLock<Option<Arc<McpSchemaSnapshot>>>,
-    catalog_name: &str,
-    tools: &[rmcp::model::Tool],
-    replace: bool,
-    ttl_ms: u64,
-    refresh: &ListRefresh,
-    my_gen: u64,
-) {
-    let Some(_refresh) = refresh.lock_if_current(my_gen) else {
-        return;
-    };
-    let cached = {
-        let Ok(mut cache) = tool_cache.write() else {
-            return;
-        };
-        apply_tool_cache(&mut cache, tools, replace, ttl_ms);
-        cache.tools.clone()
-    };
-    let Ok(slot) = schemas.read() else {
-        return;
-    };
-    let Some(snapshot) = slot.as_ref() else {
-        return;
-    };
-    let changed = apply_listed_catalog_cache(snapshot, catalog_name, &cached, replace);
-    snapshot.bump_if(changed);
 }
 
 /// Page through `tools/list`. `complete` is true only when the peer
@@ -1023,25 +1023,23 @@ mod tests {
 
         let gen1 = refresh.next_gen();
         let gen2 = refresh.next_gen();
-        publish_listed_cache(
+        refresh.publish_listed(
+            gen2,
             &tool_cache,
             &schemas,
             "srv",
             &[listed_deploy_with_header("Zone")],
             true,
             0,
-            &refresh,
-            gen2,
         );
-        publish_listed_cache(
+        refresh.publish_listed(
+            gen1,
             &tool_cache,
             &schemas,
             "srv",
             &[listed_deploy_with_header("Region")],
             true,
             0,
-            &refresh,
-            gen1,
         );
 
         let cache = tool_cache
