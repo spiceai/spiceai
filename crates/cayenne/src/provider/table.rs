@@ -59101,6 +59101,76 @@ mod tests {
         (provider, catalog, temp_dir)
     }
 
+    /// Key-completeness guard for the demand scan-view cache on the one strategy that
+    /// cannot express a deletion in the key: a POSITION-based table has no PK deletion
+    /// index, so `ScanViewKey::deletion_index_ptr` is permanently `None`
+    /// (`PkDeletionSnapshot::PositionBased => None`) and a DELETE cannot move it. If no
+    /// OTHER key component moved either, a scan after the DELETE would be served the
+    /// bundle captured before it and would return deleted rows.
+    #[tokio::test]
+    async fn scan_after_position_based_delete_is_not_served_a_pre_delete_view() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_position_based_table("position_delete_scan_view", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30]),
+        )
+        .await;
+        assert!(
+            provider.pk_deletion_strategy().is_position_based(),
+            "precondition: a table with no primary key must use the position-based strategy"
+        );
+
+        // Populate and promote a completed bundle, so a pre-delete view EXISTS to be
+        // wrongly served. The reuse itself is the precondition under test.
+        let first = provider
+            .scan_view_at_current_input(Duration::ZERO)
+            .await
+            .expect("build");
+        let second = provider
+            .scan_view_at_current_input(Duration::ZERO)
+            .await
+            .expect("reuse");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "precondition: an unchanged table must reuse its bundle, otherwise this test \
+             cannot observe a stale serve"
+        );
+
+        let delete_plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("id").eq(datafusion_expr::lit(2_i64))],
+            )
+            .await
+            .expect("delete plan");
+        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("delete executed");
+
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(1, 10), (3, 30)],
+            "a scan after a position-based DELETE must not be served the pre-delete view"
+        );
+
+        // ... and pin WHY it is safe, so a change that makes the DELETE invisible to the
+        // key fails here rather than in a query result: the delete commits a new
+        // snapshot id, which is the component that carries it once `deletion_index_ptr`
+        // cannot.
+        let after_delete = provider
+            .scan_view_at_current_input(Duration::ZERO)
+            .await
+            .expect("scan view after delete");
+        assert!(
+            !Arc::ptr_eq(&second, &after_delete),
+            "a position-based DELETE must move some ScanViewKey component, or the cache \
+             would serve the pre-delete bundle"
+        );
+    }
+
     /// Position-based tables have no PK and never apply inline deletion filtering,
     /// so `add_inlined_tombstone` must early-return `Ok(false)` and write NOTHING
     /// (the `is_position_based()` guard). Drives the real metastore: asserts the
