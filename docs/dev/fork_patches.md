@@ -85,7 +85,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | Fork | Pinned revision | Branch |
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `34a465e97fb529075f953adf40bc2e02de755bec` | `spiceai` |
-| [arrow-rs](#arrow-rs) | `471a7c5aebf76f8f127076d78d9d3661ebe065af` | `spiceai-58` |
+| [arrow-rs](#arrow-rs) | `51624e0989ce553867f0f681ba62d9cf9cbb9ac7` | `spiceai-58` |
 | [async-openai](#async-openai) | `6bda5533dd118afcf80aa6f5ef59ad35277627a7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `efbb9a72e92789eafed0806c3e16f14640c504f6` | `lukim/spiceai-0.11.0` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
@@ -233,8 +233,9 @@ catch.
 Upstream [apache/arrow-rs](https://github.com/apache/arrow-rs), branch
 `spiceai-58`. The pin lives in the object-store Parquet reader
 (`parquet/src/arrow/async_reader/store.rs`), in the push-decoder short-read
-path (`parquet/src/util/push_buffers.rs` and its callers), and in
-`arrow-buffer/src/buffer/immutable.rs`.
+path (`parquet/src/util/push_buffers.rs` and its callers), in
+`arrow-buffer/src/buffer/immutable.rs`, and in the cast kernel
+(`arrow-cast/src/cast/mod.rs`).
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
@@ -243,6 +244,7 @@ path (`parquet/src/util/push_buffers.rs` and its callers), and in
 | `get_byte_ranges` override — coalesce ranges through `get_opts` rather than `ObjectStore::get_ranges` | Version pinning is dropped for the data reads specifically (the metadata read keeps it), and range coalescing is lost, so a scan issues one request per column chunk | silent | as above |
 | `Buffer::has_custom_allocation` — expose whether a buffer's memory is freed by its own owner rather than by the buffer ([spiceai/arrow-rs#25](https://github.com/spiceai/arrow-rs/pull/25)) | The results cache can no longer tell that a batch rests on memory it does not own, so it shares the producer's arrays instead of copying them. `capacity` reports the size the producer declared, so such an entry looks compact and is billed as if it were: a DuckDB- or ADBC-imported result pins the driver's chunk, a Flight-decoded one pins the whole IPC message body, and `max_size` bounds none of it. Measured at ~4.5 KB per entry unbilled on a one-row DuckDB result, flat as the result widened to 10 rows | build (the predicate) + silent (the accounting, if the call is dropped rather than the function) | `crates/arrow_tools/src/record_batch.rs::a_batch_resting_on_foreign_memory_is_copied_even_with_nothing_to_reclaim` |
 | `PushBuffers::push_range` returns `ParquetError` on a short read instead of asserting (apache/arrow-rs#10564) | A footer prefetch that races an in-place shrink panics the reader thread (`Range length must match buffer length`) instead of a retriable decode error | silent (panic) | `crates/data-connector-api/src/listing/connector.rs::a_short_range_body_is_a_parquet_error_and_not_a_panic`, driven through `ParquetMetaDataPushDecoder`, which is the public surface `push_range` sits behind. The listing/overwrite harness cannot reach it: it 412s a pinned `If-Match` before a short *successful* range body is ever decoded |
+| `Decimal` → floating-point cast rounds from the exact decimal digits instead of widening the coefficient to `f64` and dividing by `10^scale` ([spiceai/arrow-rs#26](https://github.com/spiceai/arrow-rs/pull/26)) | A coefficient past 2^53 loses precision before the divide, so a decimal read back as a float is off in the low digits. Measured: a pushed-down Postgres `avg` read as `Decimal128(38, 20)` returned `47.50000000000001` instead of `47.5` ([#13978](https://github.com/spiceai/spiceai/issues/13978)) | silent (wrong data) | `crates/arrow_tools/src/record_batch.rs::test::decimal_to_float_cast_is_correctly_rounded` |
 
 ## datafusion-ballista
 
