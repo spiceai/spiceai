@@ -37,8 +37,8 @@ use snafu::ResultExt;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, LazyLock, Mutex as StdMutex, RwLock as StdRwLock,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -206,6 +206,38 @@ impl ListRefresh {
             apply_listed_catalog_cache(snapshot, listed.catalog_name, &cached, listed.replace);
         snapshot.bump_if(changed);
     }
+
+    /// Install `snapshot` as this catalog's write-through target and
+    /// publish the current cache under the same lock as
+    /// [`Self::publish_listed`].
+    ///
+    /// Exposing the slot, copying the cache, and applying that copy
+    /// without this lock lets a concurrent TTL/reconnect publish
+    /// `Zone` and then be overwritten by the copied `Region` page
+    /// (`cache=Zone snapshot=Region`).
+    fn attach_snapshot(
+        &self,
+        snapshot: &Arc<McpSchemaSnapshot>,
+        schemas: &StdRwLock<Option<Arc<McpSchemaSnapshot>>>,
+        tool_cache: &StdRwLock<ToolListCache>,
+        catalog_name: &str,
+    ) {
+        let _publish = self
+            .publish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Ok(mut slot) = schemas.write() {
+            *slot = Some(Arc::clone(snapshot));
+        }
+        let tools = {
+            let Ok(cache) = tool_cache.read() else {
+                return;
+            };
+            cache.tools.clone()
+        };
+        let changed = apply_listed_catalog_cache(snapshot, catalog_name, &tools, true);
+        snapshot.bump_if(changed);
+    }
 }
 
 #[derive(Default)]
@@ -343,17 +375,8 @@ impl McpToolCatalog {
     }
 
     fn attach_schema_snapshot(&self, snapshot: &Arc<McpSchemaSnapshot>) {
-        if let Ok(mut slot) = self.schemas.write() {
-            *slot = Some(Arc::clone(snapshot));
-        }
-        let tools = {
-            let Ok(cache) = self.tool_cache.read() else {
-                return;
-            };
-            cache.tools.clone()
-        };
-        let changed = apply_listed_catalog_cache(snapshot, &self.name, &tools, true);
-        snapshot.bump_if(changed);
+        self.refresh
+            .attach_snapshot(snapshot, &self.schemas, &self.tool_cache, &self.name);
     }
 
     fn cache_is_fresh(&self) -> bool {
@@ -970,7 +993,10 @@ mod tests {
         let mut cache = ToolListCache::default();
         apply_tool_cache_with_cap(
             &mut cache,
-            &[listed_deploy_with_header("Region"), sample_listed_tool("a1")],
+            &[
+                listed_deploy_with_header("Region"),
+                sample_listed_tool("a1"),
+            ],
             false,
             5_000,
             CAP,
@@ -1183,6 +1209,197 @@ mod tests {
             Some("Zone"),
             "snapshot=Region after Zone published first is the last-writer-wins overwrite"
         );
+    }
+
+    /// Old `attach_schema_snapshot`: copy the cache, then apply that
+    /// copy without `ListRefresh::publish`. A concurrent listed
+    /// publish writes Zone, then attach applies the copied Region →
+    /// `cache=Zone snapshot=Region`.
+    #[test]
+    fn attach_without_publish_lock_can_overwrite_newer_schema() {
+        use tools::naming::encode_tool_name;
+
+        let snapshot = McpSchemaSnapshot::new();
+        let tool_cache = StdRwLock::new(ToolListCache::default());
+        let schemas = StdRwLock::new(None::<Arc<McpSchemaSnapshot>>);
+        let refresh = ListRefresh {
+            generation: AtomicU64::new(0),
+            published: AtomicU64::new(0),
+            publish: StdMutex::new(()),
+        };
+        apply_tool_cache(
+            &mut tool_cache
+                .write()
+                .expect("attach race test must write the starting cache"),
+            &[listed_deploy_with_header("Region")],
+            true,
+            0,
+        );
+        if let Ok(mut slot) = schemas.write() {
+            *slot = Some(Arc::clone(&snapshot));
+        }
+        let copied = tool_cache
+            .read()
+            .expect("attach race test must copy the cache")
+            .tools
+            .clone();
+
+        refresh.publish_listed(
+            refresh.next_gen(),
+            &ListedPublish {
+                tool_cache: &tool_cache,
+                schemas: &schemas,
+                catalog_name: "srv",
+                tools: &[listed_deploy_with_header("Zone")],
+                replace: true,
+                ttl_ms: 0,
+            },
+        );
+
+        let changed = apply_listed_catalog_cache(&snapshot, "srv", &copied, true);
+        snapshot.bump_if(changed);
+
+        let cache = tool_cache
+            .read()
+            .expect("attach race test must read the catalog cache");
+        assert_eq!(
+            cache.tools.get("deploy").and_then(x_mcp_header),
+            Some("Zone")
+        );
+        drop(cache);
+        let exposed = encode_tool_name("srv", "deploy");
+        assert_eq!(
+            snapshot.get(&exposed).as_ref().and_then(x_mcp_header),
+            Some("Region"),
+            "cache=Zone snapshot=Region is the attach-after-publish overwrite"
+        );
+    }
+
+    #[test]
+    fn attach_snapshot_does_not_overwrite_a_newer_listed_publish() {
+        use tools::naming::encode_tool_name;
+
+        let snapshot = McpSchemaSnapshot::new();
+        let tool_cache = StdRwLock::new(ToolListCache::default());
+        let schemas = StdRwLock::new(None::<Arc<McpSchemaSnapshot>>);
+        let refresh = ListRefresh {
+            generation: AtomicU64::new(0),
+            published: AtomicU64::new(0),
+            publish: StdMutex::new(()),
+        };
+        apply_tool_cache(
+            &mut tool_cache
+                .write()
+                .expect("attach snapshot test must write the starting cache"),
+            &[listed_deploy_with_header("Region")],
+            true,
+            0,
+        );
+
+        refresh.publish_listed(
+            refresh.next_gen(),
+            &ListedPublish {
+                tool_cache: &tool_cache,
+                schemas: &schemas,
+                catalog_name: "srv",
+                tools: &[listed_deploy_with_header("Zone")],
+                replace: true,
+                ttl_ms: 0,
+            },
+        );
+        refresh.attach_snapshot(&snapshot, &schemas, &tool_cache, "srv");
+
+        let cache = tool_cache
+            .read()
+            .expect("attach snapshot test must read the catalog cache");
+        assert_eq!(
+            cache.tools.get("deploy").and_then(x_mcp_header),
+            Some("Zone")
+        );
+        drop(cache);
+        let exposed = encode_tool_name("srv", "deploy");
+        assert_eq!(
+            snapshot.get(&exposed).as_ref().and_then(x_mcp_header),
+            Some("Zone"),
+            "attach after a Zone publish must not restore Region"
+        );
+    }
+
+    #[test]
+    fn attach_snapshot_and_listed_publish_keep_cache_and_snapshot_aligned() {
+        use std::thread;
+        use tools::naming::encode_tool_name;
+
+        for iteration in 0..32 {
+            let snapshot = McpSchemaSnapshot::new();
+            let tool_cache = Arc::new(StdRwLock::new(ToolListCache::default()));
+            let schemas = Arc::new(StdRwLock::new(None::<Arc<McpSchemaSnapshot>>));
+            let refresh = Arc::new(ListRefresh {
+                generation: AtomicU64::new(0),
+                published: AtomicU64::new(0),
+                publish: StdMutex::new(()),
+            });
+            apply_tool_cache(
+                &mut tool_cache
+                    .write()
+                    .expect("concurrent attach test must write the starting cache"),
+                &[listed_deploy_with_header("Region")],
+                true,
+                0,
+            );
+
+            let attach_refresh = Arc::clone(&refresh);
+            let attach_snapshot = Arc::clone(&snapshot);
+            let attach_schemas = Arc::clone(&schemas);
+            let attach_cache = Arc::clone(&tool_cache);
+            let attach = thread::spawn(move || {
+                attach_refresh.attach_snapshot(
+                    &attach_snapshot,
+                    &attach_schemas,
+                    &attach_cache,
+                    "srv",
+                );
+            });
+            let publish_refresh = Arc::clone(&refresh);
+            let publish_cache = Arc::clone(&tool_cache);
+            let publish_schemas = Arc::clone(&schemas);
+            let publish = thread::spawn(move || {
+                publish_refresh.publish_listed(
+                    publish_refresh.next_gen(),
+                    &ListedPublish {
+                        tool_cache: &publish_cache,
+                        schemas: &publish_schemas,
+                        catalog_name: "srv",
+                        tools: &[listed_deploy_with_header("Zone")],
+                        replace: true,
+                        ttl_ms: 0,
+                    },
+                );
+            });
+            attach.join().expect("attach snapshot thread should finish");
+            publish.join().expect("listed publish thread should finish");
+
+            let cache_header = tool_cache
+                .read()
+                .expect("concurrent attach test must read the catalog cache")
+                .tools
+                .get("deploy")
+                .and_then(x_mcp_header)
+                .map(ToString::to_string);
+            let exposed = encode_tool_name("srv", "deploy");
+            let snapshot_header = snapshot
+                .get(&exposed)
+                .as_ref()
+                .and_then(x_mcp_header)
+                .map(ToString::to_string);
+            if cache_header.as_deref() == Some("Zone") {
+                assert_eq!(
+                    snapshot_header.as_deref(),
+                    Some("Zone"),
+                    "iteration {iteration}: cache=Zone snapshot=Region is the attach overwrite"
+                );
+            }
+        }
     }
 
     /// Comparing against the newest *started* generation drops a
