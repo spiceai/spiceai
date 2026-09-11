@@ -85,7 +85,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | Fork | Pinned revision | Branch |
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `34a465e97fb529075f953adf40bc2e02de755bec` | `spiceai` |
-| [arrow-rs](#arrow-rs) | `ccb268d61bd49a0a42ba229a2af397d78bce7beb` | `spiceai-58` |
+| [arrow-rs](#arrow-rs) | `2d11f43741f7349510ef70285f0ac1ed27e1f790` | `spiceai-58` |
 | [async-openai](#async-openai) | `6bda5533dd118afcf80aa6f5ef59ad35277627a7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `efbb9a72e92789eafed0806c3e16f14640c504f6` | `lukim/spiceai-0.11.0` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
@@ -214,6 +214,7 @@ path (`parquet/src/util/push_buffers.rs` and its callers).
 | `get_byte_ranges` override — coalesce ranges through `get_opts` rather than `ObjectStore::get_ranges` | Version pinning is dropped for the data reads specifically (the metadata read keeps it), and range coalescing is lost, so a scan issues one request per column chunk | silent | as above |
 
 | `PushBuffers::push_range` returns `ParquetError` on a short read instead of asserting (apache/arrow-rs#10564) | A footer prefetch that races an in-place shrink panics the reader thread (`Range length must match buffer length`) instead of a retriable decode error | silent (panic) | **GAP** — the listing/overwrite harness 412s a pinned `If-Match` before a short successful range body reaches `PushBuffers`, so that test stays green if only this patch is dropped |
+| Decimal→Float cast rounds from the value's exact decimal digits instead of widening the coefficient to float before dividing (fork PR #26) | A coefficient outside the float's exact-integer range (`\|coefficient\| > 2^53`) is rounded once on the widen and again on the divide, landing the cast result up to a couple of ULP off (spiceai/spiceai#13978) | silent (wrong data) | **GAP** |
 
 ## datafusion-ballista
 
@@ -500,7 +501,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**38 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**39 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -530,42 +531,45 @@ They are not equal in consequence; this is the order to close them in.
 11. `mistral.rs` `tool_calls` chat-template handling.
 12. `text-embeddings-inference` pooling and model-loading fixes — embeddings
     differ from the reference implementation.
+13. `arrow-rs` Decimal→Float cast rounding (fork PR #26) — a coefficient outside
+    the float's exact-integer range is rounded twice, landing the cast result up
+    to a couple of ULP off (spiceai/spiceai#13978).
 
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-13. `arrow-rs` `PushBuffers::push_range` asserts instead of returning an error
+14. `arrow-rs` `PushBuffers::push_range` asserts instead of returning an error
     on a short read — a footer prefetch racing an in-place shrink panics the
     reader thread rather than surfacing a retriable decode error. The
     listing/overwrite harness 412s before a short body reaches it; runtime
     #13847 carries the scan-path guards for the rest of this revision.
-14. `vortex` session lock re-entry in writer init (fork PR #29).
-15. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+15. `vortex` session lock re-entry in writer init (fork PR #29).
+16. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
     resilience (fork PRs #61–#63).
-16. `async-openai` null-suppression in requests.
-17. `spark-connect-rs` `http` scheme when `use_ssl` is false.
-18. `model2vec-rs` optional `config.json`.
-19. `snowflake-rs` async query response support — long-running queries time out.
+17. `async-openai` null-suppression in requests.
+18. `spark-connect-rs` `http` scheme when `use_ssl` is false.
+19. `model2vec-rs` optional `config.json`.
+20. `snowflake-rs` async query response support — long-running queries time out.
 
 **Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
 being honoured:
 
-20. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
+21. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
     the sink's own honouring of `target_file_size_mb` is not, so the writer can emit
     one file per flush regardless of size.
-21. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
+22. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
     cannot silently drop the limit, the single-node scan can.
-22. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
+23. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
     misconfigured warehouse produces an opaque error instead of an actionable one.
-23. `model2vec-rs` HF cache directory read from the environment — models are
+24. `model2vec-rs` HF cache directory read from the environment — models are
     re-downloaded instead of reusing the shared cache.
-24. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
+25. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
     installs a global subscriber and hijacks `spiced`'s logging.
 
 **Security posture.** No correctness effect, but a silent downgrade:
 
-25. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
-26. `graph-rs-sdk` tower middleware application.
+26. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
+27. `graph-rs-sdk` tower middleware application.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
@@ -573,7 +577,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-27. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+28. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
