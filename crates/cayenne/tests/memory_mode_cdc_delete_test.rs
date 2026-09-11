@@ -29,8 +29,14 @@ limitations under the License.
 //!
 //! Before the mem-tier rebuild landed in that sink, it scanned only the durable
 //! tiers, which in memory mode are permanently empty: it reported the delete as
-//! HANDLED while removing nothing, so a row deleted at the source stayed served
-//! forever.
+//! HANDLED while removing nothing. Neutering the rebuild turns the assertion below
+//! from `Some(1)` back into `Some(0)`, so this test does exercise it.
+//!
+//! What is NOT established is which production configuration reaches this function
+//! on a memory-resident table. A `cdc:` (Debezium push) source does not — see
+//! `cdc_ingest_delete_removes_a_cayenne_memory_mode_row`, which stays green with
+//! the rebuild neutered. This covers the function and its contract; the routing
+//! that would make it reachable is unproven.
 //!
 //! End-to-end coverage of the client `DELETE`/`UPDATE`/`INSERT` statements lives
 //! in `crates/runtime/tests/acceleration/cayenne_memory.rs`. This path needs a

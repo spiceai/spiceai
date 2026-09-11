@@ -29929,6 +29929,24 @@ impl CayenneTableProvider {
         // rebuild that dropped only superseded rows still swapped the tier, and
         // every scan-view cache keyed on its version has to re-key.
         if raw_removed > 0 {
+            // Re-sync the resident-row counter from the tier rather than
+            // subtracting from it, exactly as `purge_mem_tier_all` does. Subtracting
+            // is not safe here: the position-based arm of `delete_from` runs
+            // `checkpoint_inlined_data_if_present_for_delete` first, which re-syncs
+            // this counter from the DURABLE inline corpus alone and so zeroes the
+            // mem-tier's contribution — a subtraction on top of that drives it
+            // NEGATIVE, and it gates the `> 0` branch that decides whether a scan
+            // consults the inline corpus at all.
+            //
+            // In memory-resident mode the tier IS the table (the inline corpus is
+            // disabled), so its row count is the whole truth. It counts superseded
+            // versions a scan does not serve, which over-reports rather than under-
+            // reports — the safe direction for a value served as an INEXACT estimate
+            // and as a "might have rows" gate.
+            self.inlined_row_count.store(
+                i64::try_from(self.mem_tier.total_rows()).unwrap_or(i64::MAX),
+                Ordering::Relaxed,
+            );
             self.notify_scan_input_change();
             self.clear_scan_file_statistics_cache();
         }
@@ -39764,6 +39782,72 @@ mod tests {
         assert!(
             provider.mem_tier.is_empty(),
             "the mem-tier must be fully purged after the delete-all"
+        );
+    }
+
+    /// A filtered delete must take the rows it removed off the live-row counter.
+    ///
+    /// `inlined_row_count` gates whether a scan consults the inline corpus at all
+    /// and, with no persisted statistics, is served as the table's inexact row
+    /// estimate. Left unreconciled it only ever grows: a memory-mode table that
+    /// deletes as much as it inserts would report a count that climbs forever.
+    #[tokio::test]
+    async fn filtered_delete_takes_its_rows_off_the_live_row_count() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            memory_mode: true,
+            cdc_mem_tier_shards: 1,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "filtered_delete_live_row_count",
+            Arc::clone(&schema),
+            vortex_config,
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let batch = int64_id_batch(&[1, 2, 3, 4, 5]);
+        let bytes = batch.get_array_memory_size() as u64;
+        provider
+            .write_batches_memory_mode(
+                vec![batch],
+                bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
+            .await
+            .expect("memory-mode append");
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            5,
+            "precondition: the append counted its five rows as live"
+        );
+
+        let delete_plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("id").gt(datafusion_expr::lit(3_i64))],
+            )
+            .await
+            .expect("filtered delete plan");
+        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("filtered delete executed");
+
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3],
+            "precondition: the delete removed the two matching rows"
+        );
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            3,
+            "the live-row count must drop by what the delete removed"
         );
     }
 

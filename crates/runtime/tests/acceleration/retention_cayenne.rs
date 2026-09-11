@@ -123,6 +123,23 @@ async fn assert_retention_left(
     Ok(())
 }
 
+/// The `mode: memory` twin of [`make_dataset`]. A memory acceleration builds its
+/// data and metastore in RAM, so it takes no `cayenne_file_path`.
+fn make_memory_dataset(source: &std::path::Path, table: &str) -> Dataset {
+    let mut dataset = Dataset::new(format!("file://{}", source.display()), table);
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("cayenne".to_string()),
+        mode: Mode::Memory,
+        refresh_mode: Some(RefreshMode::Full),
+        retention_sql: Some(format!("DELETE FROM {table} WHERE score < {SCORE_FLOOR}")),
+        retention_check_enabled: false,
+        retention_check_interval: None,
+        ..Acceleration::default()
+    });
+    dataset
+}
+
 fn make_dataset(source: &std::path::Path, data_path: &std::path::Path) -> Dataset {
     let mut dataset = Dataset::new(format!("file://{}", source.display()), TABLE);
     dataset.acceleration = Some(Acceleration {
@@ -198,6 +215,92 @@ async fn cayenne_full_refresh_applies_retention_sql_on_every_refresh() -> Result
             let mut expected = survivors;
             expected.push(ADDED_ROW);
             assert_retention_left(&rt, "second", &expected).await?;
+
+            Ok(())
+        })
+        .await
+}
+
+/// `retention_sql` does NOT reach a `mode: memory` acceleration's rows.
+///
+/// This test asserts the CURRENT behavior, which is a known gap rather than the
+/// intended one: the accelerator warns at registration that `retention_sql` "is not
+/// applied to a `mode: memory` acceleration, so rows matching that predicate stay
+/// queryable", and this is what that warning is describing.
+///
+/// The cause is one line of sink composition. `apply_retention_filters` is the only
+/// `build_deletion_vector_sink` caller that passes the table `write_lock` INTO the
+/// sink instead of holding it, and the wrapper that carries the mem-tier arm
+/// (`InlineAwareDeletionSink`) takes that same non-reentrant lock itself — so
+/// retention cannot compose it. Every other caller passes `None`, wraps, and
+/// therefore reaches the tier. A client `DELETE` on the same table DOES remove
+/// these rows (see `crates/runtime/tests/acceleration/cayenne_memory.rs`), which is
+/// what makes this an asymmetry rather than a property of memory mode.
+///
+/// When retention is routed through that wrapper, this test inverts and the
+/// registration warning must be retired in the same change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(not(target_os = "windows"))]
+async fn cayenne_memory_mode_does_not_apply_retention_sql() -> Result<(), anyhow::Error> {
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            crate::configure_test_datafusion();
+
+            const MEM_TABLE: &str = "cayenne_retention_sql_memory_it";
+            let temp_dir = tempfile::tempdir()?;
+            let source = temp_dir.path().join("scores.csv");
+            write_source(&source, &INITIAL_ROWS.to_vec())?;
+
+            let app = AppBuilder::new("test_cayenne_retention_sql_memory")
+                .with_dataset(make_memory_dataset(&source, MEM_TABLE))
+                .build();
+
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::Error::msg("Timeout waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+
+            let rows = run_query(
+                &rt,
+                &format!("SELECT id, score FROM {MEM_TABLE} ORDER BY id"),
+            )
+            .await?;
+            let below_floor = run_query(
+                &rt,
+                &format!(
+                    "SELECT COUNT(*) AS n FROM {MEM_TABLE} WHERE score < {SCORE_FLOOR}"
+                ),
+            )
+            .await?;
+            eprintln!(
+                "[mode: memory] retention_sql `score < {SCORE_FLOOR}`; rows still served:\n{}\nof which below the floor:\n{}",
+                arrow::util::pretty::pretty_format_batches(&rows)?,
+                arrow::util::pretty::pretty_format_batches(&below_floor)?
+            );
+
+            // Every source row is still served, retention predicate or not.
+            let all_rows = i64::try_from(INITIAL_ROWS.len())?;
+            let served = row_count(&rt, MEM_TABLE).await?;
+            assert_eq!(
+                served, all_rows,
+                "current behavior: retention_sql does not remove rows from a mode: memory \
+                 acceleration, so all {all_rows} source rows are still served"
+            );
+
+            let matching = INITIAL_ROWS
+                .iter()
+                .filter(|(_, score)| *score < SCORE_FLOOR)
+                .count();
+            assert!(
+                matching > 0,
+                "fixture must contain rows the retention predicate matches, or this asserts nothing"
+            );
 
             Ok(())
         })

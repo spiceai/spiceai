@@ -321,12 +321,14 @@ mod dml {
          is_memory_resident_mode() == {is_memory}, got {}",
             cayenne.is_memory_resident_mode()
         );
-        // Premise: writes go to the accelerator, so the statements below are
-        // Cayenne's and not the file connector's.
+        // Premise: client writes go to the accelerator, so the statements below are
+        // Cayenne's and not the file connector's. `on_conflict` is what buys that
+        // routing (`select_accelerated_write_mode`); without it a client write is
+        // sent WriteThrough to the source and never reaches this code at all.
         ensure!(
             accelerated_table.is_accelerator_only(),
-            "precondition: on_conflict must route writes to the accelerator alone, \
-         otherwise the statement never reaches Cayenne"
+            "precondition: on_conflict must route client writes to the accelerator alone, \
+             otherwise the statements below never reach Cayenne"
         );
 
         Ok((temp_dir, rt))
