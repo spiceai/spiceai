@@ -134,8 +134,20 @@ impl McpToolCatalog {
                     if let Ok(new_client_rwlock) = Self::create_client(&cfg_clone).await {
                         let mut client_lock = client_clone.write().await;
                         *client_lock = new_client_rwlock;
-                        if let Ok(mut cache) = tool_cache_clone.write() {
-                            cache.clear();
+                        match client_lock.list_tools(None).await {
+                            Ok(listed) => {
+                                if let Ok(mut cache) = tool_cache_clone.write() {
+                                    cache.clear();
+                                    for tool in listed.tools {
+                                        cache.insert(tool.name.to_string(), tool);
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                if let Ok(mut cache) = tool_cache_clone.write() {
+                                    cache.clear();
+                                }
+                            }
                         }
                         tracing::info!("Successfully reconnected MCP client for {}", name_clone);
                     }
@@ -143,12 +155,17 @@ impl McpToolCatalog {
             }
         });
 
-        Ok(Self {
+        let catalog = Self {
             client,
             name: name.to_string(),
             heartbeat_task,
             tool_cache,
-        })
+        };
+        // Fill the sync schema cache before the catalog is registered so
+        // Streamable HTTP `get_tool` can validate `Mcp-Param-*` on the first
+        // `tools/call` without waiting for a later `tools/list`.
+        let _ = catalog.list_tools().await;
+        Ok(catalog)
     }
 
     fn remember_tools(&self, tools: &[rmcp::model::Tool]) {
@@ -499,6 +516,22 @@ impl SpiceToolCatalog for McpToolCatalog {
             spec,
             self.name.clone(),
         )))
+    }
+
+    fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+        let Ok(cache) = self.tool_cache.read() else {
+            return Vec::new();
+        };
+        cache
+            .values()
+            .map(|spec| {
+                Arc::new(McpToolWrapper::new(
+                    Arc::clone(&self.client),
+                    spec.clone(),
+                    self.name.clone(),
+                )) as Arc<dyn SpiceModelTool>
+            })
+            .collect()
     }
 }
 

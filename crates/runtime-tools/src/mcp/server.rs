@@ -27,7 +27,12 @@ use rmcp::{
     service::RequestContext,
 };
 use serde_json::{Map, Value, json};
-use std::{borrow::Cow, collections::HashMap, future::Future, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    future::Future,
+    sync::{Arc, RwLock as StdRwLock},
+};
 use tokio::sync::RwLock;
 use tools::SpiceModelTool;
 use tools::naming::{decode_tool_name, encode_tool_name};
@@ -38,6 +43,11 @@ use util::security::{MAX_SAFE_JSON_DEPTH, get_json_depth};
 #[derive(Clone)]
 pub struct RuntimeServer {
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
+    /// Sync copy of MCP tool definitions. rmcp caches `get_tool`'s `Option`
+    /// per name, including `None`, so a transient miss would disable
+    /// `Mcp-Param-*` checks for every later call. This map is the source
+    /// `get_tool` consults first and is shared across HTTP service clones.
+    schemas: Arc<StdRwLock<HashMap<String, Tool>>>,
 }
 
 /// A tool resolved from a request name, with the identity to record it under.
@@ -68,7 +78,24 @@ impl ResolvedTool {
 
 impl RuntimeServer {
     pub fn new(tools: Arc<RwLock<HashMap<String, Tooling>>>) -> Self {
-        Self { tools }
+        Self::with_schema_snapshot(tools, Arc::new(StdRwLock::new(HashMap::new())))
+    }
+
+    /// Build a server that shares `schemas` with other factory clones.
+    ///
+    /// Streamable HTTP constructs a new [`RuntimeServer`] per request; the
+    /// snapshot must outlive that so a successful `tools/list` (or lookup)
+    /// is visible to the next `tools/call`.
+    #[must_use]
+    pub fn with_schema_snapshot(
+        tools: Arc<RwLock<HashMap<String, Tooling>>>,
+        schemas: Arc<StdRwLock<HashMap<String, Tool>>>,
+    ) -> Self {
+        let server = Self { tools, schemas };
+        if let Ok(guard) = server.tools.try_read() {
+            server.remember_from_map(&guard);
+        }
+        server
     }
 
     /// Resolve `tool_name` to a tool and the canonical name that tool is exposed
@@ -130,13 +157,44 @@ impl RuntimeServer {
         result
     }
 
-    /// Sync tool definition for Streamable HTTP `Mcp-Param-*` validation.
-    ///
-    /// Uses `try_read` so a tools-map write (reload) skips param-schema
-    /// checks rather than blocking the HTTP thread. `Mcp-Method` and
-    /// `Mcp-Name` are still validated when this returns `None`.
-    fn mcp_tool_definition(&self, tool_name: &str) -> Option<Tool> {
-        let tools = self.tools.try_read().ok()?;
+    fn snapshot_tool(&self, name: &str) -> Option<Tool> {
+        self.schemas
+            .read()
+            .ok()
+            .and_then(|schemas| schemas.get(name).cloned())
+    }
+
+    fn remember_tool(&self, name: String, tool: Tool) {
+        if let Ok(mut schemas) = self.schemas.write() {
+            schemas.insert(name, tool);
+        }
+    }
+
+    fn remember_from_map(&self, tools: &HashMap<String, Tooling>) {
+        let Ok(mut schemas) = self.schemas.write() else {
+            return;
+        };
+        for (name, tooling) in tools {
+            match tooling {
+                Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
+                    schemas.insert(
+                        name.clone(),
+                        mcp_tool_from_spice(name.clone(), tool.as_ref()),
+                    );
+                }
+                Tooling::Catalog { tools: catalog, .. } => {
+                    let catalog_name = catalog.name();
+                    for tool in catalog.try_all() {
+                        let exposed = encode_tool_name(catalog_name, &tool.name());
+                        schemas
+                            .insert(exposed.clone(), mcp_tool_from_spice(exposed, tool.as_ref()));
+                    }
+                }
+            }
+        }
+    }
+
+    fn definition_from_map(tools: &HashMap<String, Tooling>, tool_name: &str) -> Option<Tool> {
         if let Some((catalog_name, name)) = decode_tool_name(tool_name)
             && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
             && let Some(tool) = catalog.try_get(&name)
@@ -152,6 +210,27 @@ impl RuntimeServer {
             }
             Tooling::Catalog { .. } => None,
         }
+    }
+
+    /// Sync tool definition for Streamable HTTP `Mcp-Param-*` validation.
+    ///
+    /// Consults the shared schema snapshot first. rmcp caches `get_tool`'s
+    /// `Option` per name, including `None`, so this must not return a
+    /// transient miss for a tool that still exists.
+    fn mcp_tool_definition(&self, tool_name: &str) -> Option<Tool> {
+        if let Some(tool) = self.snapshot_tool(tool_name) {
+            return Some(tool);
+        }
+        let tools = match self.tools.try_read() {
+            Ok(guard) => guard,
+            Err(_) => self.tools.blocking_read(),
+        };
+        self.remember_from_map(&tools);
+        let Some(tool) = Self::definition_from_map(&tools, tool_name) else {
+            return self.snapshot_tool(tool_name);
+        };
+        self.remember_tool(tool_name.to_string(), tool.clone());
+        Some(tool)
     }
 }
 
@@ -318,6 +397,11 @@ impl ServerHandler for RuntimeServer {
                     mcp_tool_from_spice(name, t.as_ref())
                 })
                 .collect::<Vec<_>>();
+            if let Ok(mut schemas) = self.schemas.write() {
+                for tool in &tools {
+                    schemas.insert(tool.name.to_string(), tool.clone());
+                }
+            }
             Ok(ListToolsResult {
                 tools,
                 ..ListToolsResult::default()
@@ -400,6 +484,10 @@ mod tests {
 
         fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
             (name == self.tool).then(|| Arc::new(StubTool(self.tool)) as Arc<dyn SpiceModelTool>)
+        }
+
+        fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+            vec![Arc::new(StubTool(self.tool)) as Arc<dyn SpiceModelTool>]
         }
     }
 
@@ -559,6 +647,9 @@ mod tests {
             fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
                 (name == "deploy").then(|| Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>)
             }
+            fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                vec![Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>]
+            }
         }
 
         let mut tools = HashMap::new();
@@ -574,6 +665,35 @@ mod tests {
         let from_catalog = ServerHandler::get_tool(&server, &exposed)
             .expect("catalog try_get must supply the schema for Mcp-Param validation");
         assert_eq!(x_mcp_header_region(&from_catalog), Some("Region"));
+    }
+
+    #[test]
+    fn get_tool_survives_tools_map_write_lock_after_snapshot() {
+        // rmcp 3.3.0 `tool_schema` caches `get_tool`'s Option, including None.
+        // A contended try_read that returned None would disable Mcp-Param-*
+        // checks for every later call of that name.
+        let mut tools = HashMap::new();
+        tools.insert(
+            "deploy".to_string(),
+            Tooling::Tool(Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>),
+        );
+        let tools = Arc::new(RwLock::new(tools));
+        let server = RuntimeServer::new(Arc::clone(&tools));
+        assert!(
+            ServerHandler::get_tool(&server, "deploy").is_some(),
+            "snapshot must be populated before contention"
+        );
+
+        let _write = tools.blocking_write();
+        let under_contention = ServerHandler::get_tool(&server, "deploy");
+        assert!(
+            under_contention.is_some(),
+            "write-lock contention must not return None after the snapshot is warm"
+        );
+        assert_eq!(
+            x_mcp_header_region(&under_contention.expect("schema under contention")),
+            Some("Region")
+        );
     }
 
     fn header_annotated_server() -> RuntimeServer {

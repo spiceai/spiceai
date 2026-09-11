@@ -126,4 +126,11 @@ impl SpiceToolCatalog for MemoryToolCatalog {
     fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
         self.get_tool(name, None, None)
     }
+
+    fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+        ["load", "store"]
+            .iter()
+            .filter_map(|id| self.get_tool(id, None, None))
+            .collect()
+    }
 }

@@ -54,8 +54,14 @@ pub trait SpiceToolCatalog: Send + Sync {
     /// Synchronous lookup used by the MCP gateway to validate `Mcp-Param-*`
     /// headers before the async `tools/call` path runs.
     ///
-    /// Return `None` when the catalog cannot resolve the tool without I/O.
-    /// A miss skips `Mcp-Param-*` validation for that request; `Mcp-Method`
-    /// and `Mcp-Name` are still checked.
+    /// Return `None` only when the catalog cannot resolve the tool without I/O.
+    /// rmcp caches that miss per tool name, so catalogs that can answer
+    /// synchronously must do so here (see [`Self::try_all`]).
     fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>>;
+
+    /// Synchronous listing used to keep the MCP schema snapshot populated.
+    ///
+    /// Return every tool the catalog can expose without I/O. Empty means the
+    /// snapshot cannot yet name this catalog's tools.
+    fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>>;
 }

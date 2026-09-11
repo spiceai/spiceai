@@ -46,7 +46,11 @@ use spicepod::component::runtime::CorsConfig;
 #[cfg(feature = "mcp")]
 use spicepod::component::runtime::McpConfig;
 use std::borrow::Cow;
+#[cfg(feature = "mcp")]
+use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(feature = "mcp")]
+use std::sync::RwLock as StdRwLock;
 use tokio::sync::RwLock;
 
 #[cfg(feature = "openapi")]
@@ -506,8 +510,18 @@ pub(crate) fn routes(
         // legacy initialize clients still get sessions via `legacy_session_mode`.
         let runtime_arc = Arc::clone(rt);
         let mcp_config = mcp_server_config(mcp_config);
+        // Shared across the per-request `RuntimeServer` factory. rmcp caches
+        // `get_tool`'s Option per name (including None); the snapshot is what
+        // stops a transient miss from disabling `Mcp-Param-*` forever.
+        let schema_snapshot = Arc::new(StdRwLock::new(HashMap::<String, rmcp::model::Tool>::new()));
+        let tools = Arc::clone(&runtime_arc.tools);
         let mcp_service = StreamableHttpService::new(
-            move || Ok(RuntimeServer::new(Arc::clone(&runtime_arc.tools))),
+            move || {
+                Ok(RuntimeServer::with_schema_snapshot(
+                    Arc::clone(&tools),
+                    Arc::clone(&schema_snapshot),
+                ))
+            },
             Arc::new(LocalSessionManager::default()),
             mcp_config,
         );
