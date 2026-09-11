@@ -114,12 +114,17 @@ pub(crate) struct McpToolCatalog {
 
 /// Serializes listed-cache publishes and discards superseded fetches.
 ///
-/// `list_tools` increments [`Self::next_gen`] at the start of each
-/// fetch. Reconnect lists the replacement first, then reserves via
+/// `list_tools` reserves via [`Self::reserve_with_read`] *after*
+/// `client.read()`, so a caller queued behind reconnect's write lock
+/// takes a generation only once it holds the newly swapped client.
+/// Reserving before that read lets the waiter take an older generation
+/// and then list the new client; reconnect's pre-swap page has the
+/// higher generation and overwrites that newer schema (`Region` over
+/// `Zone`).
+///
+/// Reconnect lists the replacement first, then reserves via
 /// [`Self::swap_and_reserve`] while publishing the client swap, after
-/// existing `client.read()` holders have drained. Reserving before
-/// that list lets a concurrent `list_tools` take a newer generation
-/// while still holding the old client and discard the new schema.
+/// existing `client.read()` holders have drained.
 ///
 /// Apply a result only when it is not older than the highest
 /// generation already published. Tracking started generations as
@@ -157,6 +162,21 @@ impl ListRefresh {
         let mut guard = client.write().await;
         *guard = new_client;
         self.next_gen()
+    }
+
+    /// Take `client.read()` and then reserve this fetch's generation.
+    ///
+    /// Reserving first lets a `list_tools` queued behind reconnect's
+    /// writer receive an older generation and then list the newly
+    /// swapped client. Reconnect's pre-swap list has the higher
+    /// generation and overwrites that page.
+    async fn reserve_with_read<'a, T>(
+        &self,
+        client: &'a RwLock<T>,
+    ) -> (tokio::sync::RwLockReadGuard<'a, T>, u64) {
+        let guard = client.read().await;
+        let my_gen = self.next_gen();
+        (guard, my_gen)
     }
 
     /// Hold this guard across cache write and snapshot publish so two
@@ -511,8 +531,7 @@ impl McpToolCatalog {
         if self.cache_is_fresh() {
             return Ok(self.cached_tools());
         }
-        let my_gen = self.refresh.next_gen();
-        let client = self.client.read().await;
+        let (client, my_gen) = self.refresh.reserve_with_read(&self.client).await;
         let (tools, complete, ttl_ms) = list_tools_from_client(&client).await?;
         drop(client);
         self.remember_tools(&tools, complete, ttl_ms, my_gen);
@@ -1638,11 +1657,12 @@ mod tests {
         assert_eq!(*slot.read().await, 1);
     }
 
-    /// Concurrent `list_tools` holds the old client and has already
-    /// reserved a generation. Reconnect listed the replacement without
-    /// reserving, then [`ListRefresh::swap_and_reserve`] waits for that
-    /// reader to drain. The old-client Region publish cannot supersede
-    /// the new client's Zone (`final_client=new expected_schema=Zone`).
+    /// Concurrent `list_tools` holds the old client and reserved via
+    /// [`ListRefresh::reserve_with_read`]. Reconnect listed the
+    /// replacement without reserving, then [`ListRefresh::swap_and_reserve`]
+    /// waits for that reader to drain. The old-client Region publish
+    /// cannot supersede the new client's Zone
+    /// (`final_client=new expected_schema=Zone`).
     ///
     /// The reported reserve-before-list order produced
     /// `reconnect_publish=discarded`, `old_publish=applied`,
@@ -1669,8 +1689,7 @@ mod tests {
         let old_cache = Arc::clone(&tool_cache);
         let old_schemas = Arc::clone(&schemas);
         let old_list = tokio::spawn(async move {
-            let old_gen = old_refresh.next_gen();
-            let guard = old_client.read().await;
+            let (guard, old_gen) = old_refresh.reserve_with_read(&old_client).await;
             assert_eq!(
                 *guard, "old",
                 "list_tools must still hold the old client when it reserves"
@@ -1756,6 +1775,210 @@ mod tests {
             snapshot.get(&exposed).as_ref().and_then(x_mcp_header),
             Some("Zone"),
             "expected_schema=Zone after reconnect reserves at the client swap"
+        );
+    }
+
+    /// Reserve-before-read generation order (the reported race):
+    /// `list_tools` takes gen 1, then lists the swapped client (`Zone`).
+    /// Reconnect's pre-swap page (`Region`) reserved at swap as gen 2
+    /// overwrites it (`stale_overwrite=True`, `schema=Region`).
+    #[test]
+    fn reserve_before_read_lets_reconnect_pre_swap_overwrite_newer_schema() {
+        use tools::naming::encode_tool_name;
+
+        let snapshot = McpSchemaSnapshot::new();
+        let tool_cache = StdRwLock::new(ToolListCache::default());
+        let schemas = StdRwLock::new(Some(Arc::clone(&snapshot)));
+        let refresh = ListRefresh {
+            generation: AtomicU64::new(0),
+            published: AtomicU64::new(0),
+            publish: StdMutex::new(()),
+        };
+
+        let list_gen = refresh.next_gen();
+        let reconnect_gen = refresh.next_gen();
+        refresh.publish_listed(
+            list_gen,
+            &ListedPublish {
+                tool_cache: &tool_cache,
+                schemas: &schemas,
+                catalog_name: "srv",
+                tools: &[listed_deploy_with_header("Zone")],
+                replace: true,
+                ttl_ms: 0,
+            },
+        );
+        refresh.publish_listed(
+            reconnect_gen,
+            &ListedPublish {
+                tool_cache: &tool_cache,
+                schemas: &schemas,
+                catalog_name: "srv",
+                tools: &[listed_deploy_with_header("Region")],
+                replace: true,
+                ttl_ms: 0,
+            },
+        );
+
+        let cache = tool_cache
+            .read()
+            .expect("reserve-before-read test must read the catalog cache");
+        assert_eq!(
+            cache.tools.get("deploy").and_then(x_mcp_header),
+            Some("Region"),
+            "stale_overwrite=True schema=Region when list reserves before the client read"
+        );
+        drop(cache);
+        let exposed = encode_tool_name("srv", "deploy");
+        assert_eq!(
+            snapshot.get(&exposed).as_ref().and_then(x_mcp_header),
+            Some("Region"),
+            "stale_overwrite=True also lands on the gateway snapshot"
+        );
+    }
+
+    /// Production `reserve_with_read` generation order: reconnect's
+    /// pre-swap page is gen 1 (`Region`); the queued list reserves
+    /// after the swap as gen 2 and publishes `Zone`
+    /// (`stale_overwrite=False`).
+    #[test]
+    fn reserve_after_read_keeps_newer_schema_over_reconnect_pre_swap() {
+        use tools::naming::encode_tool_name;
+
+        let snapshot = McpSchemaSnapshot::new();
+        let tool_cache = StdRwLock::new(ToolListCache::default());
+        let schemas = StdRwLock::new(Some(Arc::clone(&snapshot)));
+        let refresh = ListRefresh {
+            generation: AtomicU64::new(0),
+            published: AtomicU64::new(0),
+            publish: StdMutex::new(()),
+        };
+
+        let reconnect_gen = refresh.next_gen();
+        let list_gen = refresh.next_gen();
+        refresh.publish_listed(
+            reconnect_gen,
+            &ListedPublish {
+                tool_cache: &tool_cache,
+                schemas: &schemas,
+                catalog_name: "srv",
+                tools: &[listed_deploy_with_header("Region")],
+                replace: true,
+                ttl_ms: 0,
+            },
+        );
+        refresh.publish_listed(
+            list_gen,
+            &ListedPublish {
+                tool_cache: &tool_cache,
+                schemas: &schemas,
+                catalog_name: "srv",
+                tools: &[listed_deploy_with_header("Zone")],
+                replace: true,
+                ttl_ms: 0,
+            },
+        );
+
+        let cache = tool_cache
+            .read()
+            .expect("reserve-after-read test must read the catalog cache");
+        assert_eq!(
+            cache.tools.get("deploy").and_then(x_mcp_header),
+            Some("Zone"),
+            "stale_overwrite=False expected_schema=Zone when list reserves after the client read"
+        );
+        drop(cache);
+        let exposed = encode_tool_name("srv", "deploy");
+        assert_eq!(
+            snapshot.get(&exposed).as_ref().and_then(x_mcp_header),
+            Some("Zone"),
+            "expected_schema=Zone after reserve_with_read sorts past the pre-swap page"
+        );
+    }
+
+    /// A `list_tools` queued behind reconnect's writer must not reserve
+    /// until it holds the swapped client. [`ListRefresh::reserve_with_read`]
+    /// takes the generation after `client.read()`, so the queued Zone
+    /// page sorts after reconnect's pre-swap Region publish.
+    #[tokio::test]
+    async fn reserve_with_read_after_reconnect_swap_keeps_newer_schema() {
+        use tools::naming::encode_tool_name;
+
+        let client = Arc::new(RwLock::new("old"));
+        let snapshot = McpSchemaSnapshot::new();
+        let tool_cache = Arc::new(StdRwLock::new(ToolListCache::default()));
+        let schemas = Arc::new(StdRwLock::new(Some(Arc::clone(&snapshot))));
+        let refresh = Arc::new(ListRefresh {
+            generation: AtomicU64::new(0),
+            published: AtomicU64::new(0),
+            publish: StdMutex::new(()),
+        });
+
+        let mut write = client.write().await;
+
+        let list_client = Arc::clone(&client);
+        let list_refresh = Arc::clone(&refresh);
+        let list_cache = Arc::clone(&tool_cache);
+        let list_schemas = Arc::clone(&schemas);
+        let mut list = tokio::spawn(async move {
+            let (guard, my_gen) = list_refresh.reserve_with_read(&list_client).await;
+            assert_eq!(
+                *guard, "new",
+                "queued list_tools must see the swapped client"
+            );
+            drop(guard);
+            list_refresh.publish_listed(
+                my_gen,
+                &ListedPublish {
+                    tool_cache: &list_cache,
+                    schemas: &list_schemas,
+                    catalog_name: "srv",
+                    tools: &[listed_deploy_with_header("Zone")],
+                    replace: true,
+                    ttl_ms: 0,
+                },
+            );
+        });
+
+        let still_waiting = tokio::time::timeout(Duration::from_millis(50), &mut list).await;
+        assert!(
+            still_waiting.is_err(),
+            "reserve_with_read must wait for the reconnect write lock"
+        );
+
+        *write = "new";
+        let rec_gen = refresh.next_gen();
+        drop(write);
+
+        refresh.publish_listed(
+            rec_gen,
+            &ListedPublish {
+                tool_cache: &tool_cache,
+                schemas: &schemas,
+                catalog_name: "srv",
+                tools: &[listed_deploy_with_header("Region")],
+                replace: true,
+                ttl_ms: 0,
+            },
+        );
+
+        list.await
+            .expect("queued list_tools should finish after the swap");
+
+        let cache = tool_cache
+            .read()
+            .expect("reserve_with_read swap test must read the catalog cache");
+        assert_eq!(
+            cache.tools.get("deploy").and_then(x_mcp_header),
+            Some("Zone"),
+            "stale_overwrite=False expected_schema=Zone after reserve_with_read"
+        );
+        drop(cache);
+        let exposed = encode_tool_name("srv", "deploy");
+        assert_eq!(
+            snapshot.get(&exposed).as_ref().and_then(x_mcp_header),
+            Some("Zone"),
+            "expected_schema=Zone after the queued list reserves past the swap"
         );
     }
 }
