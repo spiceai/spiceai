@@ -6,22 +6,23 @@
 //
 //     https://www.apache.org/licenses/LICENSE-2.0
 
-//! Scan-view reuse at 1000 QPS across every production reuse mode.
+//! Scan-view reuse at 10K QPS across every production refresh mode.
 //!
 //! Lanes (same file-backed table, no writes during the load):
 //! * `recapture_every_scan` — [`ScanViewReuse::WithinLag(Duration::ZERO)`].
-//!   Capture on every scan (`CAYENNE_SCAN_VIEW_FRESHNESS_MS=0`).
-//! * `until_invalidated` — [`ScanViewReuse::UntilInvalidated`]. `full` /
-//!   `append` / `snapshot` / `caching`, and writable `changes`.
-//! * `changes_within_lag` — [`ScanViewReuse::WithinLag(1s)`]. Read-only
-//!   `refresh_mode: changes`. On a quiet table this should match
-//!   `until_invalidated` (cache hits, no recapture).
+//!   Capture on every scan (`CAYENNE_SCAN_VIEW_FRESHNESS_MS=0`). Baseline.
+//! * `full` — [`ScanViewReuse::UntilInvalidated`]. Production `refresh_mode: full`.
+//! * `append` — [`ScanViewReuse::UntilInvalidated`]. Production `refresh_mode: append`.
+//! * `changes` — [`ScanViewReuse::WithinLag(1s)`]. Production read-only
+//!   `refresh_mode: changes`. On a quiet table this should match `full`/`append`
+//!   (cache hits, no recapture).
 //!
 //! Workloads (both on `WHERE id = ?`, file-backed, no SQL parse):
 //! * `scan_plan` — `TableProvider::scan` only. Isolates scan-view capture /
-//!   cache (the metastore-bypass). Headline 1000 QPS arm.
+//!   cache (the metastore-bypass). Headline 10K QPS arm.
 //! * `scan_collect` — scan + execute. End-to-end query including Vortex.
 //! * Closed-loop max QPS (3 s, 32 workers) for both shapes.
+//! * Each arm reports `metastore_queries` (must stay 0 on a warm reuse hit).
 //! * Criterion per-query latency of both shapes.
 //!
 //! `cargo bench -p cayenne --bench scan_view_reuse_qps`
@@ -60,7 +61,7 @@ use tokio::sync::Semaphore;
 const ROWS: usize = 131_072;
 
 /// Offer rate for the open-loop load.
-const TARGET_QPS: u64 = 1000;
+const TARGET_QPS: u64 = 10_000;
 
 /// How long each load arm runs.
 const LOAD_DURATION: Duration = Duration::from_secs(3);
@@ -116,6 +117,7 @@ async fn cayenne_insert(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -
 
 struct ReuseFixture {
     _temp_dir: tempfile::TempDir,
+    catalog: Arc<CayenneCatalog>,
     table: Arc<CayenneTableProvider>,
     ctx: Arc<SessionContext>,
     target_id: i64,
@@ -131,6 +133,7 @@ struct LoadReport {
     p50_us: u64,
     p99_us: u64,
     p999_us: u64,
+    metastore_queries: u64,
 }
 
 async fn setup_reuse_table(reuse: ScanViewReuse) -> ReuseFixture {
@@ -177,6 +180,7 @@ async fn setup_reuse_table(reuse: ScanViewReuse) -> ReuseFixture {
 
     ReuseFixture {
         _temp_dir: temp_dir,
+        catalog,
         table,
         ctx,
         target_id,
@@ -229,6 +233,7 @@ fn finish_report(
     errors: u64,
     duration: Duration,
     mut latencies_us: Vec<u64>,
+    metastore_queries: u64,
 ) -> LoadReport {
     latencies_us.sort_unstable();
     let secs = duration.as_secs_f64().max(1e-9);
@@ -242,6 +247,7 @@ fn finish_report(
         p50_us: percentile_us(&latencies_us, 0.50),
         p99_us: percentile_us(&latencies_us, 0.99),
         p999_us: percentile_us(&latencies_us, 0.999),
+        metastore_queries,
     }
 }
 
@@ -259,11 +265,12 @@ async fn run_one(
 }
 
 /// Open-loop: launch lookups at `TARGET_QPS`, cap in-flight at `CONCURRENCY`.
-async fn open_loop_1000qps(
+async fn open_loop_qps(
     fixture: &ReuseFixture,
     lane: &'static str,
     collect_rows: bool,
 ) -> LoadReport {
+    let queries_before = fixture.catalog.metastore_query_count();
     let sem = Arc::new(Semaphore::new(CONCURRENCY));
     let interval = Duration::from_nanos(1_000_000_000 / TARGET_QPS);
     let start = Instant::now();
@@ -303,17 +310,22 @@ async fn open_loop_1000qps(
     }
 
     let latencies_us = latencies.lock().expect("latencies").clone();
+    let metastore_queries = fixture
+        .catalog
+        .metastore_query_count()
+        .saturating_sub(queries_before);
     finish_report(
         lane,
         if collect_rows {
-            "open_loop_1000qps_collect"
+            "open_loop_10kqps_collect"
         } else {
-            "open_loop_1000qps_scan_plan"
+            "open_loop_10kqps_scan_plan"
         },
         latencies_us.len() as u64,
         errors.load(Ordering::Relaxed),
         start.elapsed(),
         latencies_us,
+        metastore_queries,
     )
 }
 
@@ -323,6 +335,7 @@ async fn closed_loop_max_qps(
     lane: &'static str,
     collect_rows: bool,
 ) -> LoadReport {
+    let queries_before = fixture.catalog.metastore_query_count();
     let stop_at = Instant::now() + LOAD_DURATION;
     let latencies = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
     let errors = Arc::new(AtomicU64::new(0));
@@ -353,6 +366,10 @@ async fn closed_loop_max_qps(
     }
 
     let latencies_us = latencies.lock().expect("latencies").clone();
+    let metastore_queries = fixture
+        .catalog
+        .metastore_query_count()
+        .saturating_sub(queries_before);
     finish_report(
         lane,
         if collect_rows {
@@ -364,12 +381,13 @@ async fn closed_loop_max_qps(
         errors.load(Ordering::Relaxed),
         start.elapsed(),
         latencies_us,
+        metastore_queries,
     )
 }
 
 fn print_report(report: &LoadReport) {
     eprintln!(
-        "scan_view_reuse_qps  lane={:<22} kind={:<28} qps={:>8.1}  p50={:>7}µs  p99={:>7}µs  p999={:>7}µs  n={}  errors={}  dur_ms={}",
+        "scan_view_reuse_qps  lane={:<22} kind={:<28} qps={:>8.1}  p50={:>7}µs  p99={:>7}µs  p999={:>7}µs  n={}  errors={}  metastore_queries={}  dur_ms={}",
         report.lane,
         report.kind,
         report.achieved_qps,
@@ -378,6 +396,7 @@ fn print_report(report: &LoadReport) {
         report.p999_us,
         report.completed,
         report.errors,
+        report.metastore_queries,
         report.duration.as_millis()
     );
 }
@@ -391,14 +410,16 @@ fn bench_scan_view_reuse_qps(c: &mut Criterion) {
     );
 
     let recapture = rt.block_on(setup_reuse_table(ScanViewReuse::WithinLag(Duration::ZERO)));
-    let cached = rt.block_on(setup_reuse_table(ScanViewReuse::UntilInvalidated));
-    let changes_lag = rt.block_on(setup_reuse_table(ScanViewReuse::WithinLag(
+    let full = rt.block_on(setup_reuse_table(ScanViewReuse::UntilInvalidated));
+    let append = rt.block_on(setup_reuse_table(ScanViewReuse::UntilInvalidated));
+    let changes = rt.block_on(setup_reuse_table(ScanViewReuse::WithinLag(
         Duration::from_secs(1),
     )));
-    let lanes: [(&str, &ReuseFixture); 3] = [
+    let lanes: [(&str, &ReuseFixture); 4] = [
         ("recapture_every_scan", &recapture),
-        ("until_invalidated", &cached),
-        ("changes_within_lag", &changes_lag),
+        ("full", &full),
+        ("append", &append),
+        ("changes", &changes),
     ];
 
     // Headline loads — printed so a `cargo bench` log is the before/after
@@ -408,21 +429,25 @@ fn bench_scan_view_reuse_qps(c: &mut Criterion) {
         let label = if collect_rows { "collect" } else { "scan_plan" };
         let mut closed_qps = Vec::new();
         for (lane, fixture) in lanes {
-            let open = rt.block_on(open_loop_1000qps(fixture, lane, collect_rows));
+            let open = rt.block_on(open_loop_qps(fixture, lane, collect_rows));
             print_report(&open);
             let closed = rt.block_on(closed_loop_max_qps(fixture, lane, collect_rows));
             print_report(&closed);
-            closed_qps.push((lane, closed.achieved_qps));
+            closed_qps.push((lane, closed.achieved_qps, closed.metastore_queries));
         }
-        if let (Some((_, recapture_qps)), Some((_, until_qps)), Some((_, lag_qps))) = (
-            closed_qps.first().copied(),
-            closed_qps.get(1).copied(),
-            closed_qps.get(2).copied(),
-        ) {
+        if closed_qps.len() == 4 {
+            let recapture_qps = closed_qps[0].1;
             eprintln!(
-                "scan_view_reuse_qps  closed_loop_max_qps/{label}  recapture={recapture_qps:.1}  until_invalidated={until_qps:.1} ({:.2}x)  changes_within_lag={lag_qps:.1} ({:.2}x)",
-                until_qps / recapture_qps.max(1e-9),
-                lag_qps / recapture_qps.max(1e-9)
+                "scan_view_reuse_qps  closed_loop_max_qps/{label}  recapture={recapture_qps:.1}  full={:.1} ({:.2}x, meta={})  append={:.1} ({:.2}x, meta={})  changes={:.1} ({:.2}x, meta={})",
+                closed_qps[1].1,
+                closed_qps[1].1 / recapture_qps.max(1e-9),
+                closed_qps[1].2,
+                closed_qps[2].1,
+                closed_qps[2].1 / recapture_qps.max(1e-9),
+                closed_qps[2].2,
+                closed_qps[3].1,
+                closed_qps[3].1 / recapture_qps.max(1e-9),
+                closed_qps[3].2,
             );
         }
     }

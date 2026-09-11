@@ -7940,7 +7940,7 @@ mod tests {
     /// [`scan_view_reuse_for`]: `WithinLag` only for read-only `refresh_mode: changes`.
     /// Every other refresh mode, plus writable `changes` (write-back), invalidates
     /// on write. Unset `refresh_mode` and no acceleration configured are the same
-    /// as UntilInvalidated.
+    /// as `UntilInvalidated`.
     #[test]
     fn scan_view_reuse_for_all_refresh_modes_and_writability() {
         let modes = [
