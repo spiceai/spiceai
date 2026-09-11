@@ -52,6 +52,15 @@ use util::security::{MAX_SAFE_JSON_DEPTH, get_json_depth};
 #[derive(Default)]
 pub struct McpSchemaSnapshot {
     tools: StdRwLock<HashMap<String, Tool>>,
+    /// Top-level / function-tool schemas keyed by exposed name.
+    ///
+    /// A catalog publication overwrites [`Self::tools`] on a colliding
+    /// [`encode_tool_name`] key. A later complete catalog list that
+    /// drops that tool must restore this schema: deleting the key
+    /// leaves `get_tool` empty under tools-map contention and rmcp
+    /// caches that `None`, disabling `Mcp-Param-*` for the live tool
+    /// (`dispatched=top:Region validated_schema=None`).
+    direct: StdRwLock<HashMap<String, Tool>>,
     epoch: AtomicU64,
     /// Serializes [`Self::replace_from_map`] and [`Self::merge_from_map`]
     /// with catalog publications so a full-map update cannot overwrite
@@ -85,6 +94,7 @@ impl McpSchemaSnapshot {
     /// catalog schema while the epoch still advances.
     pub fn replace_from_map(&self, tools: &HashMap<String, Tooling>) {
         let _publish = self.lock_publish();
+        self.replace_direct_from_map(tools);
         let next = mcp_schemas_from_map(tools);
         if let Ok(mut schemas) = self.tools.write() {
             *schemas = next;
@@ -102,7 +112,24 @@ impl McpSchemaSnapshot {
         if let Ok(mut schemas) = self.tools.write() {
             schemas.clear();
         }
+        if let Ok(mut direct) = self.direct.write() {
+            direct.clear();
+        }
         self.epoch.fetch_add(1, Ordering::Release);
+    }
+
+    fn replace_direct_from_map(&self, tools: &HashMap<String, Tooling>) {
+        let next = mcp_direct_schemas_from_map(tools);
+        if let Ok(mut direct) = self.direct.write() {
+            *direct = next;
+        }
+    }
+
+    fn direct_schema(&self, name: &str) -> Option<Tool> {
+        self.direct
+            .read()
+            .ok()
+            .and_then(|direct| direct.get(name).cloned())
     }
 
     fn insert(&self, name: String, tool: Tool) -> bool {
@@ -120,6 +147,7 @@ impl McpSchemaSnapshot {
         // as [`Self::replace_from_map`]. Computing `next` first lets a
         // stale Region page overwrite a Zone that already published.
         let _publish = self.lock_publish();
+        self.replace_direct_from_map(tools);
         let next = mcp_schemas_from_map(tools);
         let Ok(mut schemas) = self.tools.write() else {
             return false;
@@ -148,6 +176,7 @@ impl McpSchemaSnapshot {
     /// this write, or this write already sees the refreshed cache.
     fn replace_listed_from_map(&self, tools: &HashMap<String, Tooling>) -> (Vec<Tool>, bool) {
         let _publish = self.lock_publish();
+        self.replace_direct_from_map(tools);
         let next = mcp_schemas_from_map(tools);
         let listed = tools_listed_by_name(&next);
         (listed, self.install_listed_map(next))
@@ -181,7 +210,9 @@ impl McpSchemaSnapshot {
     ///
     /// `tools` are already named with [`encode_tool_name`]. A complete list
     /// (`replace`) drops snapshot entries that decode to `catalog` and are
-    /// no longer advertised.
+    /// no longer advertised, except a colliding top-level / function tool
+    /// recorded in [`Self::direct`] — dispatch falls back to that tool,
+    /// so its schema must stay visible to `get_tool`.
     fn apply_catalog_tools(&self, catalog: &str, tools: &[Tool], replace: bool) -> bool {
         let advertised: HashSet<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
         let _publish = self.lock_publish();
@@ -199,8 +230,18 @@ impl McpSchemaSnapshot {
                 .cloned()
                 .collect();
             for name in stale {
-                schemas.remove(&name);
-                changed = true;
+                if let Some(direct) = self.direct_schema(&name) {
+                    if schemas
+                        .get(&name)
+                        .is_none_or(|existing| existing != &direct)
+                    {
+                        schemas.insert(name, direct);
+                        changed = true;
+                    }
+                } else {
+                    schemas.remove(&name);
+                    changed = true;
+                }
             }
         }
         for tool in tools {
@@ -622,7 +663,7 @@ fn schema_maps_changed(current: &HashMap<String, Tool>, next: &HashMap<String, T
 /// `Mcp-Param-*` validate against.
 #[must_use]
 #[expect(clippy::implicit_hasher)]
-pub fn mcp_schemas_from_map(tools: &HashMap<String, Tooling>) -> HashMap<String, Tool> {
+pub fn mcp_direct_schemas_from_map(tools: &HashMap<String, Tooling>) -> HashMap<String, Tool> {
     let mut schemas = HashMap::new();
     for (name, tooling) in tools {
         match tooling {
@@ -635,6 +676,13 @@ pub fn mcp_schemas_from_map(tools: &HashMap<String, Tooling>) -> HashMap<String,
             Tooling::Catalog { .. } => {}
         }
     }
+    schemas
+}
+
+#[must_use]
+#[expect(clippy::implicit_hasher)]
+pub fn mcp_schemas_from_map(tools: &HashMap<String, Tooling>) -> HashMap<String, Tool> {
+    let mut schemas = mcp_direct_schemas_from_map(tools);
     for tooling in tools.values() {
         if let Tooling::Catalog { tools: catalog, .. } = tooling {
             let catalog_name = catalog.name();
@@ -1439,6 +1487,166 @@ mod tests {
                 .and_then(x_mcp_header_region),
             Some("Zone"),
             "tools/call dispatch prefers the catalog; the snapshot must describe the same tool"
+        );
+    }
+
+    /// A complete catalog list that drops `deploy` used to delete
+    /// `srv__deploy` even when a live top-level tool still owns that
+    /// name. Dispatch falls back to `top:Region`; `get_tool` under
+    /// tools-map contention then returned `None` and rmcp cached the
+    /// miss (`validated_schema=None mismatch=True`).
+    #[test]
+    fn complete_catalog_refresh_restores_colliding_top_level_schema() {
+        struct ZoneCatalog;
+
+        #[async_trait::async_trait]
+        impl SpiceToolCatalog for ZoneCatalog {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn name(&self) -> &'static str {
+                "srv"
+            }
+            async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                self.try_all()
+            }
+            async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                self.try_get(name)
+            }
+            fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                (name == "deploy").then(|| Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>)
+            }
+            fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                vec![Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>]
+            }
+        }
+
+        struct EmptyCatalog;
+
+        #[async_trait::async_trait]
+        impl SpiceToolCatalog for EmptyCatalog {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn name(&self) -> &'static str {
+                "srv"
+            }
+            async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                Vec::new()
+            }
+            async fn get(&self, _name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                None
+            }
+            fn try_get(&self, _name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                None
+            }
+            fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                Vec::new()
+            }
+        }
+
+        let exposed = encode_tool_name("srv", "deploy");
+        let mut tools = HashMap::new();
+        tools.insert(
+            exposed.clone(),
+            Tooling::Tool(Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>),
+        );
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(ZoneCatalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+
+        let tools = Arc::new(RwLock::new(tools));
+        let server = RuntimeServer::new(Arc::clone(&tools));
+        assert_eq!(
+            ServerHandler::get_tool(&server, &exposed)
+                .as_ref()
+                .and_then(x_mcp_header_region),
+            Some("Zone"),
+            "catalog must overwrite the colliding top-level schema while it advertises deploy"
+        );
+
+        let changed = apply_listed_catalog_cache(&server.schemas, "srv", &HashMap::new(), true);
+        server.schemas.bump_if(changed);
+        {
+            let mut live = tools.blocking_write();
+            live.insert(
+                "srv".to_string(),
+                Tooling::Catalog {
+                    tools: Arc::new(EmptyCatalog) as Arc<dyn SpiceToolCatalog>,
+                    default_catalog_names: vec![],
+                },
+            );
+        }
+
+        assert_eq!(
+            RuntimeServer::definition_from_map(&tools.blocking_read(), &exposed)
+                .as_ref()
+                .and_then(x_mcp_header_region),
+            Some("Region"),
+            "dispatched=top:Region after the catalog drops deploy"
+        );
+
+        let _write = tools.blocking_write();
+        let validated = ServerHandler::get_tool(&server, &exposed);
+        assert_eq!(
+            validated.as_ref().and_then(x_mcp_header_region),
+            Some("Region"),
+            "dispatched=top:Region validated_schema=None mismatch=True is the reported collision delete"
+        );
+    }
+
+    #[test]
+    fn complete_catalog_refresh_drops_schema_when_no_colliding_top_level() {
+        struct ZoneCatalog;
+
+        #[async_trait::async_trait]
+        impl SpiceToolCatalog for ZoneCatalog {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn name(&self) -> &'static str {
+                "srv"
+            }
+            async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                self.try_all()
+            }
+            async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                self.try_get(name)
+            }
+            fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                (name == "deploy").then(|| Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>)
+            }
+            fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                vec![Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>]
+            }
+        }
+
+        let exposed = encode_tool_name("srv", "deploy");
+        let mut tools = HashMap::new();
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(ZoneCatalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+        let snapshot = McpSchemaSnapshot::default();
+        assert!(snapshot.merge_from_map(&tools));
+        snapshot.bump_if(true);
+        assert!(
+            snapshot.get(&exposed).is_some(),
+            "catalog deploy must land in the snapshot"
+        );
+
+        let changed = apply_listed_catalog_cache(&snapshot, "srv", &HashMap::new(), true);
+        snapshot.bump_if(changed);
+        assert!(
+            snapshot.get(&exposed).is_none(),
+            "a complete catalog drop with no colliding top-level tool must remove the schema"
         );
     }
 
