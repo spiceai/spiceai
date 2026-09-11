@@ -34,7 +34,10 @@ use runtime_request_context::{Protocol, RequestContext};
 
 use app::App;
 use axum::{extract::State, routing::patch};
-use http::header::{ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_REQUEST_HEADERS, HeaderName};
+use http::{
+    HeaderValue,
+    header::{ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_REQUEST_HEADERS, HeaderName},
+};
 use opentelemetry::KeyValue;
 #[cfg(feature = "mcp")]
 use rmcp::transport::streamable_http_server::{
@@ -71,7 +74,7 @@ use axum::{
     Extension,
     body::Body,
     extract::MatchedPath,
-    http::{HeaderValue, Method, Request},
+    http::{Method, Request},
     middleware::{self, Next},
     response::IntoResponse,
     routing::{Router, get, post},
