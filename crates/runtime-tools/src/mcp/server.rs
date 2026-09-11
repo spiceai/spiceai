@@ -587,7 +587,11 @@ impl ServerHandler for RuntimeServer {
                     tracing::info!(target: "task_history", parent: &span, mcp_server = %mcp_server, "labels");
                 }
 
-                return match mcp_proxy.call_tool(request).instrument(span.clone()).await {
+                return match mcp_proxy
+                    .call_tool_once(request)
+                    .instrument(span.clone())
+                    .await
+                {
                     Ok(response) => {
                         if let CallToolResponse::Complete(result) = &response
                             && let Ok(captured_output) = serde_json::to_string(&result.content)
@@ -2444,6 +2448,13 @@ mod tests {
     impl McpProxy for InputRequiredProxyTool {
         async fn call_tool(
             &self,
+            _arguments: Option<rmcp::model::JsonObject>,
+        ) -> Result<CallToolResult, ServiceError> {
+            Ok(CallToolResult::success(vec![ContentBlock::text("ok")]))
+        }
+
+        async fn call_tool_once(
+            &self,
             _request: CallToolRequestParams,
         ) -> Result<CallToolResponse, ServiceError> {
             Ok(CallToolResponse::InputRequired(
@@ -2760,7 +2771,7 @@ mod tests {
     }
 
     /// rmcp's empty `allowed_origins` accepts every `Origin`. That is the
-    /// encoding of CORS `"*"`.
+    /// pre-fix gap this PR closes for Spice's default CORS `"*"`.
     #[tokio::test]
     async fn unconfigured_origin_policy_accepts_disallowed_origin() {
         let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
@@ -2832,10 +2843,10 @@ mod tests {
         );
     }
 
-    /// Default `runtime.cors.allowed_origins: ["*"]` disables the MCP
-    /// Origin check (CORS allow-all), matching Host `["*"]`.
+    /// Default `runtime.cors.allowed_origins: ["*"]` expands to localhost
+    /// so `https://evil.example` is 403.
     #[tokio::test]
-    async fn spice_default_cors_wildcard_accepts_any_origin_post() {
+    async fn spice_default_cors_rejects_disallowed_origin_post() {
         let rmcp_default =
             rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default();
         let origins = CorsConfig::default().mcp_allowed_origins();
@@ -2853,14 +2864,15 @@ mod tests {
             rmcp_default.allowed_origins
         );
         assert!(
-            origins.is_empty(),
-            "default CORS * must leave MCP origins empty (allow-all), got {origins:?}"
+            !origins.is_empty(),
+            "default CORS * must expand to a non-empty MCP Origin list, got {origins:?}"
         );
 
         let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
             .with_legacy_session_mode(true)
             .disable_allowed_hosts()
-            .with_json_response(true);
+            .with_json_response(true)
+            .with_allowed_origins(origins);
         let status =
             post_tools_call_with_origin(&origin_service(config), Some("https://evil.example"))
                 .await;
@@ -2868,10 +2880,10 @@ mod tests {
             "origin_https_evil_example_accepted={}",
             status != http::StatusCode::FORBIDDEN
         );
-        assert_ne!(
+        assert_eq!(
             status,
             http::StatusCode::FORBIDDEN,
-            "default CORS * must accept Origin https://evil.example (allow-all), got {status}"
+            "default CORS * must 403 Origin https://evil.example, got {status}"
         );
     }
 }
