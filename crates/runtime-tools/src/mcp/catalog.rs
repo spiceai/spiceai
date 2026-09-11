@@ -311,7 +311,11 @@ impl McpToolCatalog {
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
             loop {
-                interval.tick().await;
+                let expires_at = tool_cache_clone
+                    .read()
+                    .ok()
+                    .and_then(|cache| cache.expires_at);
+                wait_for_heartbeat_or_ttl(&mut interval, expires_at).await;
 
                 // The read lock is held during the heartbeat call. The underlying
                 // McpClient wraps a RunningService which is not Clone, so we cannot
@@ -352,6 +356,19 @@ impl McpToolCatalog {
                         }
                         tracing::info!("Successfully reconnected MCP client for {}", name_clone);
                     }
+                } else if listed_cache_is_stale(&tool_cache_clone) {
+                    // `try_get` will not serve an expired page. Republish
+                    // before the next Streamable HTTP `Mcp-Param-*` check
+                    // so validation cannot keep Region while dispatch
+                    // later sees Zone (`validated=Region executed=Zone`).
+                    publish_live_list(
+                        &client_clone,
+                        &refresh_clone,
+                        &tool_cache_clone,
+                        &schemas_clone,
+                        &name_clone,
+                    )
+                    .await;
                 }
             }
         });
@@ -629,6 +646,70 @@ fn list_cache_is_fresh(expires_at: Option<Instant>, now: Instant) -> bool {
     expires_at.is_some_and(|deadline| now < deadline)
 }
 
+fn listed_cache_is_stale(cache: &StdRwLock<ToolListCache>) -> bool {
+    !cache
+        .read()
+        .ok()
+        .is_some_and(|cache| list_cache_is_fresh(cache.expires_at, Instant::now()))
+}
+
+/// `try_get` must not return a listed spec after `ttlMs` expires.
+/// The last page stays in `cache.tools` for snapshot / dispatch until
+/// a refresh publishes the replacement.
+fn try_get_cached_spec<'a>(
+    cache: &'a ToolListCache,
+    name: &str,
+    now: Instant,
+) -> Option<&'a rmcp::model::Tool> {
+    if !list_cache_is_fresh(cache.expires_at, now) {
+        return None;
+    }
+    cache.tools.get(name)
+}
+
+/// Wake at the next heartbeat tick or when the list TTL elapses,
+/// whichever is sooner, so an expired cache is republished before
+/// Streamable HTTP validates `Mcp-Param-*`.
+async fn wait_for_heartbeat_or_ttl(
+    interval: &mut tokio::time::Interval,
+    expires_at: Option<Instant>,
+) {
+    let ttl_wait = expires_at.and_then(|deadline| deadline.checked_duration_since(Instant::now()));
+    if let Some(wait) = ttl_wait {
+        tokio::select! {
+            _ = interval.tick() => {}
+            () = tokio::time::sleep(wait) => {}
+        }
+    } else {
+        interval.tick().await;
+    }
+}
+
+async fn publish_live_list(
+    client: &RwLock<McpClient>,
+    refresh: &ListRefresh,
+    tool_cache: &StdRwLock<ToolListCache>,
+    schemas: &StdRwLock<Option<Arc<McpSchemaSnapshot>>>,
+    catalog_name: &str,
+) {
+    let (guard, my_gen) = refresh.reserve_with_read(client).await;
+    let listed = list_tools_from_client(&guard).await;
+    drop(guard);
+    if let Ok((listed, complete, ttl_ms)) = listed {
+        refresh.publish_listed(
+            my_gen,
+            &ListedPublish {
+                tool_cache,
+                schemas,
+                catalog_name,
+                tools: &listed,
+                replace: complete,
+                ttl_ms,
+            },
+        );
+    }
+}
+
 fn apply_tool_cache(
     cache: &mut ToolListCache,
     tools: &[rmcp::model::Tool],
@@ -840,7 +921,15 @@ impl SpiceToolCatalog for McpToolCatalog {
     }
 
     fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
-        let spec = self.cached_tool(name)?;
+        // Expired pages are not a validation contract. Serving them
+        // lets rmcp accept `Mcp-Param-Region` while `get` refreshes
+        // and executes Zone. The heartbeat / TTL waiter republishes
+        // first; `cached_tool` still holds the last spec for dispatch
+        // until that publish lands.
+        let spec = {
+            let cache = self.tool_cache.read().ok()?;
+            try_get_cached_spec(&cache, name, Instant::now())?.clone()
+        };
         Some(Arc::new(McpToolWrapper::new(
             Arc::clone(&self.client),
             spec,
@@ -1075,14 +1164,65 @@ mod tests {
     fn expired_cache_still_dispatches_the_listed_spec() {
         let mut cache = ToolListCache::default();
         apply_tool_cache(&mut cache, &[listed_deploy_with_header("Region")], true, 0);
+        let now = Instant::now();
         assert!(
-            !list_cache_is_fresh(cache.expires_at, Instant::now()),
+            !list_cache_is_fresh(cache.expires_at, now),
             "ttlMs 0 is immediately stale"
+        );
+        assert!(
+            try_get_cached_spec(&cache, "deploy", now).is_none(),
+            "try_get must not serve an expired Region page for Mcp-Param validation"
         );
         assert_eq!(
             cache.tools.get("deploy").and_then(x_mcp_header),
             Some("Region"),
-            "try_get / get_tool keep Region after expiry so dispatch cannot run Zone"
+            "get_tool keeps the last listed spec so dispatch cannot run Zone first"
+        );
+    }
+
+    /// After `ttlMs` elapses, `try_get` must not keep Region while a
+    /// later list has published Zone (`validated=Region executed=Zone`).
+    #[test]
+    fn try_get_uses_zone_after_ttl_refresh_not_expired_region() {
+        let mut cache = ToolListCache::default();
+        apply_tool_cache(
+            &mut cache,
+            &[listed_deploy_with_header("Region")],
+            true,
+            5_000,
+        );
+        let after_expiry = Instant::now() + Duration::from_secs(6);
+        assert!(
+            try_get_cached_spec(&cache, "deploy", after_expiry).is_none(),
+            "expired Region must not validate Mcp-Param-*"
+        );
+        apply_tool_cache(
+            &mut cache,
+            &[listed_deploy_with_header("Zone")],
+            true,
+            5_000,
+        );
+        assert_eq!(
+            try_get_cached_spec(&cache, "deploy", Instant::now()).and_then(x_mcp_header),
+            Some("Zone"),
+            "validated=Region executed=Zone must not happen after the TTL publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn ttl_wait_wakes_before_the_heartbeat_interval() {
+        let mut interval = interval(Duration::from_secs(30));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        interval.tick().await;
+        let started = Instant::now();
+        wait_for_heartbeat_or_ttl(
+            &mut interval,
+            Some(Instant::now() + Duration::from_millis(20)),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "TTL expiry must republish without waiting for the 30s heartbeat"
         );
     }
 
