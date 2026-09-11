@@ -4077,6 +4077,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "criterion 0.7.0",
  "snafu",
+ "tempfile",
  "text-splitter",
  "tiktoken-rs 0.9.1",
  "tokenizers 0.21.4",
