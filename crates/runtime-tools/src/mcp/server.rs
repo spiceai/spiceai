@@ -316,15 +316,6 @@ enum ResolveOutcome {
     Missing,
 }
 
-impl ResolveOutcome {
-    fn into_ready(self) -> Option<ResolvedTool> {
-        match self {
-            Self::Ready(resolved) => Some(resolved),
-            Self::Retry | Self::Missing => None,
-        }
-    }
-}
-
 impl ResolvedTool {
     /// The `task_history` labels for a call on this tool: the `task` override,
     /// and the MCP server to attribute the call to.
@@ -963,11 +954,9 @@ mod tests {
         assert_eq!(canonical, "srv__tool_-_name");
 
         for requested in [canonical.as_str(), "srv__tool__name"] {
-            let resolved = server
-                .get_tool(requested)
-                .await
-                .into_ready()
-                .unwrap_or_else(|| panic!("{requested} should resolve"));
+            let ResolveOutcome::Ready(resolved) = server.get_tool(requested).await else {
+                panic!("{requested} should resolve");
+            };
             assert_eq!(
                 resolved.exposed_name, canonical,
                 "request {requested} was not canonicalized"
@@ -991,11 +980,9 @@ mod tests {
         );
         let server = RuntimeServer::new(Arc::new(RwLock::new(tools)));
 
-        let resolved = server
-            .get_tool("top__level")
-            .await
-            .into_ready()
-            .expect("a top-level tool resolves by its own name");
+        let ResolveOutcome::Ready(resolved) = server.get_tool("top__level").await else {
+            panic!("a top-level tool resolves by its own name");
+        };
         assert_eq!(resolved.exposed_name, "top__level");
 
         let (task_name, mcp_server) = resolved.task_history_labels();
@@ -2770,7 +2757,7 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            message.contains("retry") && message.contains(&format!("'{exposed}'")),
+            message.contains("Retry") && message.contains(&format!("'{exposed}'")),
             "retry error must name the tool and tell the client to retry: {message}"
         );
         assert!(
