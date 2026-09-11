@@ -140,9 +140,8 @@ async fn setup_reuse_table(reuse: ScanViewReuse) -> ReuseFixture {
         .await
         .expect("data dir");
     let db_path = temp_dir.path().join("catalog.db");
-    let catalog = Arc::new(
-        CayenneCatalog::new(format!("sqlite://{}", db_path.display())).expect("catalog"),
-    );
+    let catalog =
+        Arc::new(CayenneCatalog::new(format!("sqlite://{}", db_path.display())).expect("catalog"));
     catalog.init().await.expect("catalog init");
     let runtime_env = Arc::new(RuntimeEnv::default());
 
@@ -189,11 +188,7 @@ fn pk_filters(target_id: i64) -> [datafusion_expr::Expr; 1] {
 }
 
 /// Plan-only PK lookup. Times scan-view capture vs cache; no Vortex execute.
-async fn pk_scan_plan(
-    table: &Arc<CayenneTableProvider>,
-    ctx: &SessionContext,
-    target_id: i64,
-) {
+async fn pk_scan_plan(table: &Arc<CayenneTableProvider>, ctx: &SessionContext, target_id: i64) {
     let filters = pk_filters(target_id);
     let projection = vec![2];
     let plan = table
@@ -280,10 +275,7 @@ async fn open_loop_1000qps(
     let mut next_launch = start;
 
     while start.elapsed() < LOAD_DURATION {
-        let permit = Arc::clone(&sem)
-            .acquire_owned()
-            .await
-            .expect("semaphore");
+        let permit = Arc::clone(&sem).acquire_owned().await.expect("semaphore");
         let table = Arc::clone(&fixture.table);
         let ctx = Arc::clone(&fixture.ctx);
         let target_id = fixture.target_id;
@@ -398,9 +390,7 @@ fn bench_scan_view_reuse_qps(c: &mut Criterion) {
         LOAD_DURATION.as_secs()
     );
 
-    let recapture = rt.block_on(setup_reuse_table(ScanViewReuse::WithinLag(
-        Duration::ZERO,
-    )));
+    let recapture = rt.block_on(setup_reuse_table(ScanViewReuse::WithinLag(Duration::ZERO)));
     let cached = rt.block_on(setup_reuse_table(ScanViewReuse::UntilInvalidated));
     let changes_lag = rt.block_on(setup_reuse_table(ScanViewReuse::WithinLag(
         Duration::from_secs(1),
