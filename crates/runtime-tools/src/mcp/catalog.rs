@@ -134,20 +134,13 @@ impl McpToolCatalog {
                     if let Ok(new_client_rwlock) = Self::create_client(&cfg_clone).await {
                         let mut client_lock = client_clone.write().await;
                         *client_lock = new_client_rwlock;
-                        match client_lock.list_tools(None).await {
-                            Ok(listed) => {
-                                if let Ok(mut cache) = tool_cache_clone.write() {
-                                    cache.clear();
-                                    for tool in listed.tools {
-                                        cache.insert(tool.name.to_string(), tool);
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                if let Ok(mut cache) = tool_cache_clone.write() {
-                                    cache.clear();
-                                }
-                            }
+                        // Keep the last successful cache on list failure.
+                        // Clearing it would make `try_get` miss and let rmcp
+                        // cache `get_tool == None` for that name forever.
+                        if let Ok((listed, complete)) = list_tools_from_client(&client_lock).await
+                            && let Ok(mut cache) = tool_cache_clone.write()
+                        {
+                            apply_tool_cache(&mut cache, &listed, complete);
                         }
                         tracing::info!("Successfully reconnected MCP client for {}", name_clone);
                     }
@@ -163,18 +156,25 @@ impl McpToolCatalog {
         };
         // Fill the sync schema cache before the catalog is registered so
         // Streamable HTTP `get_tool` can validate `Mcp-Param-*` on the first
-        // `tools/call` without waiting for a later `tools/list`.
-        let _ = catalog.list_tools().await;
+        // `tools/call` without waiting for a later `tools/list`. A failed
+        // list leaves the cache empty; fail construction so the existing
+        // component-load retry rebuilds the catalog instead of registering
+        // one that would make rmcp cache `get_tool == None`.
+        catalog
+            .list_tools()
+            .await
+            .map_err(|e| Error::CouldNotConstructTool {
+                name: name.to_string(),
+                e: e.to_string(),
+            })?;
         Ok(catalog)
     }
 
-    fn remember_tools(&self, tools: &[rmcp::model::Tool]) {
+    fn remember_tools(&self, tools: &[rmcp::model::Tool], replace: bool) {
         let Ok(mut cache) = self.tool_cache.write() else {
             return;
         };
-        for tool in tools {
-            cache.insert(tool.name.to_string(), tool.clone());
-        }
+        apply_tool_cache(&mut cache, tools, replace);
     }
 
     fn remember_tool(&self, tool: &rmcp::model::Tool) {
@@ -291,49 +291,10 @@ impl McpToolCatalog {
     }
 
     async fn list_tools(&self) -> std::result::Result<Vec<rmcp::model::Tool>, ServiceError> {
-        // Security: Limit pagination to prevent infinite loops and memory exhaustion
-        const MAX_PAGINATION_ITERATIONS: usize = 100;
-        const MAX_TOTAL_TOOLS: usize = 10000;
-
-        let mut cursor: Option<String> = None;
-        let mut tools: Vec<rmcp::model::Tool> = vec![];
-        let mut iterations = 0;
-
-        loop {
-            iterations += 1;
-            if iterations > MAX_PAGINATION_ITERATIONS {
-                tracing::warn!(
-                    "MCP tool listing exceeded maximum pagination iterations ({MAX_PAGINATION_ITERATIONS}), stopping iteration"
-                );
-                break;
-            }
-
-            let response = self
-                .client
-                .read()
-                .await
-                .list_tools(Some(
-                    PaginatedRequestParams::default().with_cursor(cursor.clone()),
-                ))
-                .await?;
-
-            // Security: Validate total tools count to prevent memory exhaustion
-            if tools.len().saturating_add(response.tools.len()) > MAX_TOTAL_TOOLS {
-                tracing::warn!(
-                    "MCP tool listing exceeded maximum tools count ({MAX_TOTAL_TOOLS}), limiting results"
-                );
-                let remaining = MAX_TOTAL_TOOLS - tools.len();
-                tools.extend(response.tools.into_iter().take(remaining));
-                break;
-            }
-
-            tools.extend(response.tools);
-            cursor = response.next_cursor;
-            if cursor.is_none() {
-                break;
-            }
-        }
-        self.remember_tools(&tools);
+        let client = self.client.read().await;
+        let (tools, complete) = list_tools_from_client(&client).await?;
+        drop(client);
+        self.remember_tools(&tools, complete);
         Ok(tools)
     }
 
@@ -380,6 +341,65 @@ impl McpToolCatalog {
             }
         }
         Ok(None)
+    }
+}
+
+/// Page through `tools/list`. `complete` is true only when the peer
+/// finished (no cursor) before the pagination or total-tool caps.
+async fn list_tools_from_client(
+    client: &McpClient,
+) -> std::result::Result<(Vec<rmcp::model::Tool>, bool), ServiceError> {
+    // Security: Limit pagination to prevent infinite loops and memory exhaustion
+    const MAX_PAGINATION_ITERATIONS: usize = 100;
+    const MAX_TOTAL_TOOLS: usize = 10000;
+
+    let mut cursor: Option<String> = None;
+    let mut tools: Vec<rmcp::model::Tool> = vec![];
+    let mut iterations = 0;
+
+    loop {
+        iterations += 1;
+        if iterations > MAX_PAGINATION_ITERATIONS {
+            tracing::warn!(
+                "MCP tool listing exceeded maximum pagination iterations ({MAX_PAGINATION_ITERATIONS}), stopping iteration"
+            );
+            return Ok((tools, false));
+        }
+
+        let response = client
+            .list_tools(Some(
+                PaginatedRequestParams::default().with_cursor(cursor.clone()),
+            ))
+            .await?;
+
+        // Security: Validate total tools count to prevent memory exhaustion
+        if tools.len().saturating_add(response.tools.len()) > MAX_TOTAL_TOOLS {
+            tracing::warn!(
+                "MCP tool listing exceeded maximum tools count ({MAX_TOTAL_TOOLS}), limiting results"
+            );
+            let remaining = MAX_TOTAL_TOOLS - tools.len();
+            tools.extend(response.tools.into_iter().take(remaining));
+            return Ok((tools, false));
+        }
+
+        tools.extend(response.tools);
+        cursor = response.next_cursor;
+        if cursor.is_none() {
+            return Ok((tools, true));
+        }
+    }
+}
+
+fn apply_tool_cache(
+    cache: &mut HashMap<String, rmcp::model::Tool>,
+    tools: &[rmcp::model::Tool],
+    replace: bool,
+) {
+    if replace {
+        cache.clear();
+    }
+    for tool in tools {
+        cache.insert(tool.name.to_string(), tool.clone());
     }
 }
 
@@ -631,6 +651,43 @@ mod tests {
         assert!(is_localhost("[::1]"));
         assert!(!is_localhost("::2"));
         assert!(!is_localhost("2001:db8::1"));
+    }
+
+    fn sample_listed_tool(name: &'static str) -> rmcp::model::Tool {
+        rmcp::model::Tool::new_with_raw(name, None, serde_json::Map::new())
+    }
+
+    #[test]
+    fn complete_list_replaces_removed_tools() {
+        let mut cache = HashMap::new();
+        apply_tool_cache(
+            &mut cache,
+            &[sample_listed_tool("keep"), sample_listed_tool("drop")],
+            true,
+        );
+        apply_tool_cache(
+            &mut cache,
+            &[sample_listed_tool("keep"), sample_listed_tool("new")],
+            true,
+        );
+        assert!(cache.contains_key("keep"));
+        assert!(cache.contains_key("new"));
+        assert!(
+            !cache.contains_key("drop"),
+            "a complete tools/list must drop tools the peer no longer advertises"
+        );
+    }
+
+    #[test]
+    fn incomplete_list_keeps_existing_tools() {
+        let mut cache = HashMap::new();
+        apply_tool_cache(&mut cache, &[sample_listed_tool("keep")], true);
+        apply_tool_cache(&mut cache, &[sample_listed_tool("page")], false);
+        assert!(
+            cache.contains_key("keep"),
+            "a truncated page must not wipe tools from an earlier complete list"
+        );
+        assert!(cache.contains_key("page"));
     }
 
     #[test]

@@ -217,13 +217,18 @@ impl RuntimeServer {
     /// Consults the shared schema snapshot first. rmcp caches `get_tool`'s
     /// `Option` per name, including `None`, so this must not return a
     /// transient miss for a tool that still exists.
+    ///
+    /// Never waits on the Tokio tools map. rmcp 3.3.0 calls `get_tool`
+    /// synchronously from async `handle_post`, and
+    /// [`tokio::sync::RwLock::blocking_read`] panics in that context.
+    /// An uncontended `try_read` refreshes the snapshot; a contended
+    /// map falls back to whatever the snapshot already holds.
     fn mcp_tool_definition(&self, tool_name: &str) -> Option<Tool> {
         if let Some(tool) = self.snapshot_tool(tool_name) {
             return Some(tool);
         }
-        let tools = match self.tools.try_read() {
-            Ok(guard) => guard,
-            Err(_) => self.tools.blocking_read(),
+        let Ok(tools) = self.tools.try_read() else {
+            return self.snapshot_tool(tool_name);
         };
         self.remember_from_map(&tools);
         let Some(tool) = Self::definition_from_map(&tools, tool_name) else {
@@ -398,6 +403,7 @@ impl ServerHandler for RuntimeServer {
                 })
                 .collect::<Vec<_>>();
             if let Ok(mut schemas) = self.schemas.write() {
+                schemas.clear();
                 for tool in &tools {
                     schemas.insert(tool.name.to_string(), tool.clone());
                 }
@@ -696,6 +702,55 @@ mod tests {
         );
     }
 
+    /// `RwLock::blocking_read` panics when called from an async context.
+    /// A cold snapshot plus a held write lock used to take that path.
+    #[tokio::test]
+    async fn get_tool_does_not_block_on_tokio_rwlock_from_async() {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "deploy".to_string(),
+            Tooling::Tool(Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>),
+        );
+        let tools = Arc::new(RwLock::new(tools));
+        let _write = tools.write().await;
+        let server = RuntimeServer::with_schema_snapshot(
+            Arc::clone(&tools),
+            Arc::new(StdRwLock::new(HashMap::new())),
+        );
+
+        let looked_up = ServerHandler::get_tool(&server, "deploy");
+        assert!(
+            looked_up.is_none(),
+            "cold snapshot + contended map must miss without waiting on the Tokio lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_tool_uses_snapshot_under_async_write_lock() {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "deploy".to_string(),
+            Tooling::Tool(Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>),
+        );
+        let tools = Arc::new(RwLock::new(tools));
+        let server = RuntimeServer::new(Arc::clone(&tools));
+        assert!(
+            ServerHandler::get_tool(&server, "deploy").is_some(),
+            "constructor must warm the snapshot"
+        );
+
+        let _write = tools.write().await;
+        let under_contention = ServerHandler::get_tool(&server, "deploy");
+        assert!(
+            under_contention.is_some(),
+            "a warm snapshot must answer get_tool from async handle_post without the Tokio lock"
+        );
+        assert_eq!(
+            x_mcp_header_region(&under_contention.expect("schema under async contention")),
+            Some("Region")
+        );
+    }
+
     fn header_annotated_server() -> RuntimeServer {
         let mut tools = HashMap::new();
         tools.insert(
@@ -705,11 +760,48 @@ mod tests {
         RuntimeServer::new(Arc::new(RwLock::new(tools)))
     }
 
+    struct HeaderAnnotatedCatalog;
+
+    #[async_trait::async_trait]
+    impl SpiceToolCatalog for HeaderAnnotatedCatalog {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &'static str {
+            "srv"
+        }
+        async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+            vec![Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>]
+        }
+        async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+            (name == "deploy").then(|| Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>)
+        }
+        fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+            (name == "deploy").then(|| Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>)
+        }
+        fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+            vec![Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>]
+        }
+    }
+
+    fn header_annotated_catalog_server() -> RuntimeServer {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(HeaderAnnotatedCatalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+        RuntimeServer::new(Arc::new(RwLock::new(tools)))
+    }
+
     async fn post_tools_call<S>(
         service: &rmcp::transport::streamable_http_server::StreamableHttpService<
             S,
             rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
         >,
+        tool_name: &str,
         region_header: Option<&str>,
         region_body: &str,
     ) -> (http::StatusCode, Value)
@@ -721,7 +813,7 @@ mod tests {
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "deploy",
+                "name": tool_name,
                 "arguments": { "region": region_body },
                 "_meta": {
                     "io.modelcontextprotocol/protocolVersion": "2026-07-28",
@@ -741,7 +833,7 @@ mod tests {
             .header("accept", "application/json, text/event-stream")
             .header("mcp-protocol-version", "2026-07-28")
             .header("mcp-method", "tools/call")
-            .header("mcp-name", "deploy");
+            .header("mcp-name", tool_name);
         if let Some(region) = region_header {
             builder = builder.header("mcp-param-region", region);
         }
@@ -801,7 +893,8 @@ mod tests {
                 .with_json_response(true),
         );
 
-        let (status, json) = post_tools_call(&service, Some("us-west1"), "eu-west1").await;
+        let (status, json) =
+            post_tools_call(&service, "deploy", Some("us-west1"), "eu-west1").await;
         assert_ne!(
             json.pointer("/error/code").and_then(Value::as_i64),
             Some(-32020),
@@ -822,7 +915,8 @@ mod tests {
                 .with_json_response(true),
         );
 
-        let (status, json) = post_tools_call(&service, Some("us-west1"), "eu-west1").await;
+        let (status, json) =
+            post_tools_call(&service, "deploy", Some("us-west1"), "eu-west1").await;
         assert_eq!(
             status,
             http::StatusCode::BAD_REQUEST,
@@ -848,7 +942,8 @@ mod tests {
                 .with_json_response(true),
         );
 
-        let (status, json) = post_tools_call(&service, Some("us-west1"), "us-west1").await;
+        let (status, json) =
+            post_tools_call(&service, "deploy", Some("us-west1"), "us-west1").await;
         assert!(
             status.is_success(),
             "matching Mcp-Param-Region must not be rejected: {status} {json}"
@@ -859,6 +954,36 @@ mod tests {
                 .and_then(Value::as_i64)
                 != Some(-32020),
             "matching headers must not raise HeaderMismatch: {json}"
+        );
+    }
+
+    /// Direct `tools/call` before `tools/list` must still see a catalog
+    /// `try_all` schema. rmcp caches the first `get_tool` result.
+    #[tokio::test]
+    async fn mismatched_mcp_param_header_is_rejected_for_catalog_tool() {
+        let exposed = encode_tool_name("srv", "deploy");
+        let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            || Ok(header_annotated_catalog_server()),
+            Arc::new(
+                rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+            ),
+            rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(true)
+                .disable_allowed_hosts()
+                .with_json_response(true),
+        );
+
+        let (status, json) =
+            post_tools_call(&service, &exposed, Some("us-west1"), "eu-west1").await;
+        assert_eq!(
+            status,
+            http::StatusCode::BAD_REQUEST,
+            "catalog tool Mcp-Param mismatch must be HTTP 400 before tools/list, got {status}: {json}"
+        );
+        assert_eq!(
+            json.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32020),
+            "expected HeaderMismatch (-32020) for catalog tool, got {json}"
         );
     }
 }
