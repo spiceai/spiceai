@@ -36,7 +36,6 @@ use secrecy::ExposeSecret;
 use snafu::ResultExt;
 use std::{
     collections::HashMap,
-    future::Future,
     sync::{Arc, LazyLock, RwLock as StdRwLock},
     time::{Duration, Instant},
 };
@@ -169,9 +168,8 @@ impl McpToolCatalog {
                         // lock. Holding `client.write()` across that await
                         // stalls every concurrent `client.read()` (tool call)
                         // for the full upstream RTT.
-                        let listed =
-                            fetch_then_publish(&client_clone, new_client, list_tools_from_client)
-                                .await;
+                        let listed = list_tools_from_client(&new_client).await;
+                        *client_clone.write().await = new_client;
                         // Keep the last successful cache on list failure.
                         // Clearing it would make `try_get` miss and let rmcp
                         // cache `get_tool == None` for that name forever.
@@ -390,20 +388,6 @@ impl McpToolCatalog {
             Err(e) => self.cached_tool(name).map_or(Err(e), |tool| Ok(Some(tool))),
         }
     }
-}
-
-/// Await `fetch` without the write lock, then publish `new_value`.
-///
-/// Tool calls take `client.read()`. Fetching the reconnect list under
-/// `client.write()` would stall those readers for the upstream RTT.
-async fn fetch_then_publish<T, F, Fut, R>(slot: &RwLock<T>, new_value: T, fetch: F) -> R
-where
-    F: FnOnce(&T) -> Fut,
-    Fut: Future<Output = R>,
-{
-    let fetched = fetch(&new_value).await;
-    *slot.write().await = new_value;
-    fetched
 }
 
 /// Write the listed tools into the sync cache, then publish to the
@@ -1036,9 +1020,22 @@ mod tests {
         writer.await.expect("writer should finish after release");
     }
 
-    /// Production reconnect uses [`fetch_then_publish`]: the list await
-    /// runs *before* the write lock, so a reader succeeds while fetch is
-    /// still in flight.
+    /// Await `fetch` without the write lock, then publish `new_value`.
+    ///
+    /// This is the reconnect publish order: list the new client, then
+    /// take `client.write()` only to swap it in.
+    async fn fetch_then_publish<T, F, Fut, R>(slot: &RwLock<T>, new_value: T, fetch: F) -> R
+    where
+        F: FnOnce(&T) -> Fut,
+        Fut: std::future::Future<Output = R>,
+    {
+        let fetched = fetch(&new_value).await;
+        *slot.write().await = new_value;
+        fetched
+    }
+
+    /// Production reconnect lists the new client *before* the write
+    /// lock, so a reader succeeds while fetch is still in flight.
     #[tokio::test]
     async fn fetch_then_publish_does_not_hold_write_lock_across_fetch_await() {
         let slot = Arc::new(RwLock::new(0_u32));
