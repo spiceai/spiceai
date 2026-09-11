@@ -64,7 +64,7 @@ use super::pk_index::{
     CheckedOutShardedPkIndex, ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence,
     PendingPkKeys, PkBloom, PkCheckoutGuard, PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome,
     RowLocation, ShardedPkIndex, approx_captured_file_bytes, deserialize_pk_bloom_sidecar,
-    pk_digest, serialize_pk_bloom_sidecar, shard_of_pk,
+    pk_digest, pk_digest_bytes, serialize_pk_bloom_sidecar, shard_of_pk,
 };
 use super::pk_validation::null_primary_key_message;
 use super::streaming::StreamingExec;
@@ -81,13 +81,13 @@ use crate::provider::scan::{
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, InternalSnafu, Result};
 use crate::resource_starvation::ResourceStarvationTracker;
-use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, Int64Array};
+use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, BooleanBufferBuilder, Int64Array};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef};
 use hash_index::PrehashedBuildHasher;
 use snafu::ensure;
 
-use crate::row_converter::{OwnedRow, RowConverter, SortField};
+use crate::row_converter::{RowConverter, SortField};
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use async_trait::async_trait;
 use data_components::delete::{DeletionExec, DeletionSink};
@@ -4262,6 +4262,47 @@ impl std::fmt::Debug for CayenneTableProvider {
         f.debug_struct("CayenneTableProvider")
             .field("table_metadata", &self.table_metadata)
             .finish_non_exhaustive()
+    }
+}
+
+/// The two resident-byte components of a table's PK caches and the slot they are
+/// published into as a sum. Every publish goes through here so the sum is read
+/// and written under one lock (see [`Self::publish_total`]); the provider hands one
+/// to each [`PkCheckoutGuard`] it opens so an abandoned window can restate the
+/// cache's true residency from wherever the guard is dropped.
+struct PkKeysetBytesPublisher {
+    single: Arc<AtomicUsize>,
+    sharded: Arc<AtomicUsize>,
+    publish_lock: Arc<ParkingMutex<()>>,
+    table_memory: Arc<CayenneMemoryAccount>,
+}
+
+impl PkKeysetBytesPublisher {
+    /// Publish the table-wide PK cache's resident bytes and refresh the sum.
+    fn publish_single(&self, bytes: usize) {
+        self.single.store(bytes, Ordering::Relaxed);
+        self.publish_total();
+    }
+
+    /// Publish the sharded PK cache's resident bytes and refresh the sum.
+    fn publish_sharded(&self, bytes: usize) {
+        self.sharded.store(bytes, Ordering::Relaxed);
+        self.publish_total();
+    }
+
+    fn publish_total(&self) {
+        // Read both components AND publish under one lock. The components are
+        // stored before this point, so whichever publisher holds the lock last
+        // reads every completed store and publishes the true sum; splitting the
+        // read from the publish lets a stale total land last and under-report.
+        let _guard = self.publish_lock.lock();
+        let total = self
+            .single
+            .load(Ordering::Relaxed)
+            .saturating_add(self.sharded.load(Ordering::Relaxed));
+        // `set_keyset_bytes` also restates this table's share of the fleet
+        // ceiling, and releases it on drop.
+        self.table_memory.set_keyset_bytes(total);
     }
 }
 
@@ -10502,7 +10543,14 @@ impl CayenneTableProvider {
     /// table and every key committed after it must still reach the restored index.
     fn take_cached_pk_index(&self) -> (Option<CachedPkIndex>, PkCheckoutGuard) {
         let mut guard = self.pk_keyset_cache.lock();
-        let checkout = PkCheckoutGuard::open(&self.pk_keyset_pending);
+        let checkout = PkCheckoutGuard::open(&self.pk_keyset_pending, {
+            let cache = Arc::clone(&self.pk_keyset_cache);
+            let publisher = self.pk_keyset_bytes_publisher();
+            move || {
+                publisher
+                    .publish_single(cache.lock().as_ref().map_or(0, CachedPkIndex::approx_bytes));
+            }
+        });
         (guard.take(), checkout)
     }
 
@@ -10568,29 +10616,28 @@ impl CayenneTableProvider {
 
     /// Publish the table-wide PK cache's resident bytes and refresh the sum.
     fn publish_single_keyset_bytes(&self, bytes: usize) {
-        self.pk_keyset_bytes_single.store(bytes, Ordering::Relaxed);
-        self.publish_keyset_bytes_total();
+        self.pk_keyset_bytes_publisher().publish_single(bytes);
     }
 
     /// Publish the sharded PK cache's resident bytes and refresh the sum.
     fn publish_sharded_keyset_bytes(&self, bytes: usize) {
-        self.pk_keyset_bytes_sharded.store(bytes, Ordering::Relaxed);
-        self.publish_keyset_bytes_total();
+        self.pk_keyset_bytes_publisher().publish_sharded(bytes);
     }
 
     fn publish_keyset_bytes_total(&self) {
-        // Read both components AND publish under one lock. The components are
-        // stored before this point, so whichever publisher holds the lock last
-        // reads every completed store and publishes the true sum; splitting the
-        // read from the publish lets a stale total land last and under-report.
-        let _guard = self.pk_keyset_publish_lock.lock();
-        let total = self
-            .pk_keyset_bytes_single
-            .load(Ordering::Relaxed)
-            .saturating_add(self.pk_keyset_bytes_sharded.load(Ordering::Relaxed));
-        // `set_keyset_bytes` also restates this table's share of the fleet
-        // ceiling, and releases it on drop.
-        self.table_memory.set_keyset_bytes(total);
+        self.pk_keyset_bytes_publisher().publish_total();
+    }
+
+    /// The PK-cache byte accounting, detached from the provider so a
+    /// [`PkCheckoutGuard`] can carry it to wherever the checked-out index ends up
+    /// and republish on the abandon path (see `take_cached_pk_index`).
+    fn pk_keyset_bytes_publisher(&self) -> PkKeysetBytesPublisher {
+        PkKeysetBytesPublisher {
+            single: Arc::clone(&self.pk_keyset_bytes_single),
+            sharded: Arc::clone(&self.pk_keyset_bytes_sharded),
+            publish_lock: Arc::clone(&self.pk_keyset_publish_lock),
+            table_memory: Arc::clone(&self.table_memory),
+        }
     }
 
     /// Deferred cross-partition appends carry their on-conflict metadata and
@@ -11676,16 +11723,21 @@ impl CayenneTableProvider {
             .map(|&idx| Arc::clone(batch.column(idx)))
             .collect();
         let rows = converter.convert_columns(&pk_columns)?;
-        // Per-shard order-preserving selection masks: scatter each row's index
-        // into its computed shard's mask (`masks[shard][row_idx]`).
-        let mut masks: Vec<Vec<bool>> = vec![vec![false; batch.num_rows()]; n];
+        // Each shard's order-preserving selection mask uses one bit per row.
+        let mut masks: Vec<_> = (0..n)
+            .map(|_| {
+                let mut mask = BooleanBufferBuilder::new(batch.num_rows());
+                mask.append_n(batch.num_rows(), false);
+                mask
+            })
+            .collect();
         for (row_idx, row) in rows.iter().enumerate() {
             let shard = shard_of_pk(row.as_ref(), n);
-            masks[shard][row_idx] = true;
+            masks[shard].set_bit(row_idx, true);
         }
         let mut shards = Vec::with_capacity(n);
-        for mask in masks {
-            let predicate = BooleanArray::from(mask);
+        for mut mask in masks {
+            let predicate = BooleanArray::new(mask.finish(), None);
             shards.push(arrow::compute::filter_record_batch(batch, &predicate)?);
         }
         Ok(shards)
@@ -13043,7 +13095,18 @@ impl CayenneTableProvider {
         // exit between here and `store_sharded_pk_index` — close it.
         let (cached, checkout) = {
             let mut guard = self.sharded_pk_keyset_cache.lock();
-            let checkout = PkCheckoutGuard::open(&self.sharded_pk_keyset_pending);
+            let checkout = PkCheckoutGuard::open(&self.sharded_pk_keyset_pending, {
+                let cache = Arc::clone(&self.sharded_pk_keyset_cache);
+                let publisher = self.pk_keyset_bytes_publisher();
+                move || {
+                    publisher.publish_sharded(
+                        cache
+                            .lock()
+                            .as_ref()
+                            .map_or(0, ShardedPkIndex::approx_bytes),
+                    );
+                }
+            });
             (guard.take(), checkout)
         };
         if let Some(cached) = cached {
@@ -13207,7 +13270,7 @@ impl CayenneTableProvider {
         // none). A no-op (no tombstone snapshot, or key not tombstoned).
         let probe_reinsert_over_tombstone =
             |row_idx: usize,
-             key: &OwnedRow,
+             key: &[u8],
              deleted_pk_i64: &mut Vec<i64>,
              deleted_inlined_pk_i64: &mut Vec<i64>,
              deleted_row_keys: &mut Vec<Box<[u8]>>,
@@ -13228,9 +13291,9 @@ impl CayenneTableProvider {
                         }
                     }
                     PkDeletionSnapshot::RowConverterBased { tombstones } => {
-                        if tombstones.get(key.as_ref()).is_some() {
+                        if tombstones.get(key).is_some() {
                             // Box::from once, then clone for the dual-list push (file + inline).
-                            let row_key = bytes_key(key.as_ref());
+                            let row_key = bytes_key(key);
                             deleted_row_keys.push(row_key.clone());
                             deleted_inlined_row_keys.push(row_key);
                             *reinserted_over_tombstone += 1;
@@ -13256,7 +13319,7 @@ impl CayenneTableProvider {
         // mirroring `probe_reinsert_over_tombstone`.
         let push_key_supersede =
             |row_idx: usize,
-             key: &OwnedRow,
+             key: &[u8],
              deleted_pk_i64: &mut Vec<i64>,
              deleted_inlined_pk_i64: &mut Vec<i64>,
              deleted_row_keys: &mut Vec<Box<[u8]>>,
@@ -13270,7 +13333,7 @@ impl CayenneTableProvider {
                         }
                     }
                     PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                        let row_key = bytes_key(key.as_ref());
+                        let row_key = bytes_key(key);
                         deleted_row_keys.push(row_key.clone());
                         deleted_inlined_row_keys.push(row_key);
                     }
@@ -13287,27 +13350,22 @@ impl CayenneTableProvider {
         // scan from every coalesced batch (16K+ envelopes).
         let any_pk_nullable = pk_columns.iter().any(|col| col.null_count() > 0);
 
-        // Build each row's PK key once, then run an IN-BATCH dedup pre-pass:
-        // `ctx.incoming_keys` only covers PRIOR batches, so duplicate PKs WITHIN
-        // this batch must be collapsed here. The survivor per distinct PK is the
-        // single row that runs the conflict/delete logic — Upsert (last_write_wins)
-        // keeps the LAST occurrence, DoNothing* (remove_duplicates) the FIRST.
-        // Non-survivors are dropped BEFORE the loop body so they push no (otherwise
-        // double-counted) delete and are not kept. Composite PKs are handled
-        // natively: the key is the RowConverter encoding over all PK columns. Keys
-        // are hoisted out of the loop (the same per-row `.owned()` clone, just
-        // computed up front) so the pre-pass can borrow them and the loop consume them.
-        let row_pk_keys: Vec<OwnedRow> =
-            (0..batch.num_rows()).map(|i| rows.row(i).owned()).collect();
+        // Deduplicate borrowed row encodings before conflict/delete work. Upsert
+        // (last_write_wins) keeps the last occurrence; DoNothing with duplicate
+        // removal keeps the first. Only retained survivors acquire owned keys
+        // for the downstream keyset and bloom updates.
         // Hash each row's key bytes ONCE into a seeded XXH3-128 digest; this digest
         // is the key's identity for all three probes below (dedup pre-pass,
         // cross-batch `incoming_keys`, and the `existing_keys` keyset), so the
         // per-row hashing cost is paid a single time and the maps reuse it via
         // `PrehashedBuildHasher`.
-        let row_digests: Vec<u128> = row_pk_keys.iter().map(pk_digest).collect();
+        let row_digests: Vec<u128> = rows
+            .iter()
+            .map(|row| pk_digest_bytes(row.as_ref()))
+            .collect();
         let is_survivor: Vec<bool> = if deduplicate_batch {
             let mut survivor: HashMap<u128, usize, PrehashedBuildHasher> =
-                HashMap::with_capacity_and_hasher(row_pk_keys.len(), PrehashedBuildHasher);
+                HashMap::with_capacity_and_hasher(batch.num_rows(), PrehashedBuildHasher);
             for (idx, &digest) in row_digests.iter().enumerate() {
                 if ctx.upsert_options.last_write_wins {
                     survivor.insert(digest, idx); // a later duplicate supersedes
@@ -13315,7 +13373,7 @@ impl CayenneTableProvider {
                     survivor.entry(digest).or_insert(idx); // keep the first
                 }
             }
-            let mut mask = vec![false; row_pk_keys.len()];
+            let mut mask = vec![false; batch.num_rows()];
             for &idx in survivor.values() {
                 mask[idx] = true;
             }
@@ -13324,16 +13382,13 @@ impl CayenneTableProvider {
             Vec::new()
         };
 
-        for (row_idx, key) in row_pk_keys.into_iter().enumerate() {
+        for (row_idx, &digest) in row_digests.iter().enumerate() {
             if any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx)) {
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
                     message: null_primary_key_message(&batch, ctx.pk_indices),
                 });
             }
-
-            // This row's precomputed key identity, reused across all three probes.
-            let digest = row_digests[row_idx];
 
             // Drop in-batch duplicate non-survivors before any conflict/delete work,
             // so exactly one row per PK records a delete and is kept.
@@ -13342,7 +13397,7 @@ impl CayenneTableProvider {
                 continue;
             }
 
-            if ctx.incoming_keys.contains_digest(digest) {
+            if ctx.incoming_keys.contains(&digest) {
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
                     message: "Incoming data contains duplicate primary key across batches"
@@ -13350,6 +13405,7 @@ impl CayenneTableProvider {
                 });
             }
 
+            let key = rows.row(row_idx);
             let keep_row = match ctx.existing {
                 PkExistenceRef::Exact(existing_keys) => {
                     // A key committed by another writer since this keyset was checked
@@ -13377,12 +13433,8 @@ impl CayenneTableProvider {
                                         }
                                     }
                                     PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                                        // Convert the OwnedRow's byte view into a `Box<[u8]>` for the
-                                        // delete-list — `deleted_row_keys` and `deleted_inlined_row_keys`
-                                        // are typed `Vec<Box<[u8]>>` so they can be forwarded to the
-                                        // `commit_on_conflict_deletions` catalog call without a second
-                                        // re-encoding. This is one allocation per conflict row; the
-                                        // arena-indexed key design discussed in iter 3 would amortize it.
+                                        // Delete lists retain their own copy of the encoded key
+                                        // until the catalog commit.
                                         let row_key = bytes_key(key.as_ref());
                                         if is_inlined_conflict {
                                             deleted_inlined_row_keys.push(row_key);
@@ -13440,7 +13492,7 @@ impl CayenneTableProvider {
                         // the uncertainty ends with this batch).
                         push_key_supersede(
                             row_idx,
-                            &key,
+                            key.as_ref(),
                             &mut deleted_pk_i64,
                             &mut deleted_inlined_pk_i64,
                             &mut deleted_row_keys,
@@ -13454,7 +13506,7 @@ impl CayenneTableProvider {
                         // it (otherwise it stays permanently hidden).
                         probe_reinsert_over_tombstone(
                             row_idx,
-                            &key,
+                            key.as_ref(),
                             &mut deleted_pk_i64,
                             &mut deleted_inlined_pk_i64,
                             &mut deleted_row_keys,
@@ -13509,7 +13561,7 @@ impl CayenneTableProvider {
                         // (same shape as the warm bloom HIT above).
                         push_key_supersede(
                             row_idx,
-                            &key,
+                            key.as_ref(),
                             &mut deleted_pk_i64,
                             &mut deleted_inlined_pk_i64,
                             &mut deleted_row_keys,
@@ -13526,7 +13578,7 @@ impl CayenneTableProvider {
                         // fallback.
                         probe_reinsert_over_tombstone(
                             row_idx,
-                            &key,
+                            key.as_ref(),
                             &mut deleted_pk_i64,
                             &mut deleted_inlined_pk_i64,
                             &mut deleted_row_keys,
@@ -13539,7 +13591,7 @@ impl CayenneTableProvider {
             };
 
             if keep_row {
-                kept_keys.insert_with_digest(digest, key);
+                kept_keys.insert_with_digest(digest, key.owned());
             }
             keep_mask.push(keep_row);
         }
@@ -13590,7 +13642,7 @@ impl CayenneTableProvider {
         pending_existence: Option<&PendingPkExistence>,
         pk_indices: &[usize],
         converter: &RowConverter,
-        incoming_keys: &PkDigestSet,
+        incoming_keys: &HashSet<u128, PrehashedBuildHasher>,
     ) -> Result<(Option<RecordBatch>, Option<RecordBatch>, PkDigestSet)> {
         let pk_columns: Vec<_> = pk_indices
             .iter()
@@ -13609,7 +13661,7 @@ impl CayenneTableProvider {
         let mut miss_keys: PkDigestSet = PkDigestSet::with_capacity(batch.num_rows());
         for row_idx in 0..batch.num_rows() {
             let null_pk = any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx));
-            let key = rows.row(row_idx).owned();
+            let key = rows.row(row_idx);
             // A datalake (cold) file MAY hold the key — route it to the HIT path
             // so `apply_on_conflict_to_batch` records the cold supersede. Without
             // this a cold-resident key would fast-path as brand-new and its cold
@@ -13617,7 +13669,7 @@ impl CayenneTableProvider {
             // negatives, so a cold MISS here is safely fast-pathed).
             let cold_hit = cold_existence.is_some_and(|c| c.maybe_contains(key.as_ref()));
             // One hash per row, reused for both existence-set probes below.
-            let digest = pk_digest(&key);
+            let digest = pk_digest_bytes(key.as_ref());
             // A concurrent writer committed this key after the index was checked
             // out, so the bloom cannot hold it — route it to the HIT path, which
             // supersedes the row it committed. Fast-pathing it as brand-new would
@@ -13630,10 +13682,10 @@ impl CayenneTableProvider {
                 && !cold_hit
                 && !pending_hit
                 && !bloom.maybe_contains(key.as_ref())
-                && !incoming_keys.contains_digest(digest)
+                && !incoming_keys.contains(&digest)
                 && !miss_keys.contains_digest(digest);
             if is_miss {
-                miss_keys.insert_with_digest(digest, key);
+                miss_keys.insert_with_digest(digest, key.owned());
             }
             miss_mask.push(is_miss);
         }
@@ -13704,7 +13756,7 @@ impl CayenneTableProvider {
         // Table-global like the cold view: a key routes to exactly one shard, so a
         // shard only ever matches its own keys here.
         let pending_existence = self.pending_sharded_pk_existence();
-        let mut incoming_keys: PkDigestSet = PkDigestSet::default();
+        let mut incoming_keys = HashSet::with_hasher(PrehashedBuildHasher);
         let mut delete_specs: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
         let mut deleted_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
@@ -13769,7 +13821,7 @@ impl CayenneTableProvider {
                     if let Some(miss) = miss
                         && miss.num_rows() > 0
                     {
-                        incoming_keys.extend_ref(&miss_keys);
+                        incoming_keys.extend(miss_keys.digests());
                         kept_keys.absorb(miss_keys);
                         filtered_batches.push(miss);
                     }
@@ -13803,7 +13855,7 @@ impl CayenneTableProvider {
             deleted_inlined_pk_i64.extend(result.deleted_inlined_pk_i64);
             deleted_inlined_row_keys.extend(result.deleted_inlined_row_keys);
             reinserted_over_tombstone += result.reinserted_over_tombstone;
-            incoming_keys.extend_ref(&result.kept_keys);
+            incoming_keys.extend(result.kept_keys.digests());
             kept_keys.absorb(result.kept_keys);
             if let Some(fb) = result.filtered_batch
                 && fb.num_rows() > 0
@@ -41923,7 +41975,7 @@ mod tests {
         )
         .await;
         let pk_indices = vec![0_usize];
-        let rows: i64 = 200;
+        let rows: i64 = 208;
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
@@ -41932,6 +41984,8 @@ mod tests {
             ],
         )
         .expect("batch built");
+        // Exercise a sliced input and a partial final bitmap byte.
+        let batch = batch.slice(7, 201);
         let converter = provider.build_pk_converter(&pk_indices).expect("converter");
 
         // n=1 is the unsharded fast path: the batch comes back unchanged.
@@ -41956,11 +42010,25 @@ mod tests {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .expect("id column");
+            let values = shard_batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value column");
+            assert!(
+                ids.values().windows(2).all(|pair| pair[0] < pair[1]),
+                "shard selection must preserve input order"
+            );
             let id_rows = converter
                 .convert_columns(&[Arc::clone(shard_batch.column(0))])
                 .expect("convert");
             for row_idx in 0..shard_batch.num_rows() {
                 let id = ids.value(row_idx);
+                assert_eq!(
+                    values.value(row_idx),
+                    id * 10,
+                    "row values must stay aligned"
+                );
                 assert!(seen.insert(id), "id {id} appeared in more than one shard");
                 assert_eq!(
                     shard_of_pk(id_rows.row(row_idx).as_ref(), n),
@@ -60383,7 +60451,7 @@ mod tests {
             ]),
         );
         let upsert_options = on_conflict.get_upsert_options();
-        let incoming_keys = PkDigestSet::default();
+        let incoming_keys = HashSet::with_hasher(PrehashedBuildHasher);
         let mut validation_ctx = OnConflictContext {
             pk_indices: &pk_indices,
             converter: &converter,
@@ -60598,6 +60666,111 @@ mod tests {
                 other.is_some()
             ),
         }
+    }
+
+    /// An abandoned checkout must release the resident-byte accounting its window
+    /// grew — regression test for #13668. Keys committed while the keyset is checked
+    /// out are accounted against the published residency as they land, and only a
+    /// restore overwrites that figure; a validation that is dropped or cancelled
+    /// restores nothing, so the bytes of keys that were just discarded stayed
+    /// reserved against the table's memory account and narrowed every sibling's
+    /// keyset budget.
+    #[tokio::test]
+    async fn an_abandoned_checkout_releases_the_keyset_bytes_its_window_grew() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "pk_checkout_abandoned_bytes",
+            ctx.runtime_env(),
+            VortexConfig::default(),
+        )
+        .await;
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        // A validation checks the (cold) keyset out; while its window is open a
+        // concurrent commit lands three keys, which the log holds for the replay.
+        let (cached, checkout) = provider.take_cached_pk_index();
+        assert!(cached.is_none(), "a fresh table has no cached keyset");
+        provider.record_file_pk_keys(&pk_digest_set_for_ids(&converter, &[7, 8, 9]), 11);
+
+        let held = provider.pk_keyset_bytes_single.load(Ordering::Relaxed);
+        assert!(
+            held > 0,
+            "keys held for the replay are accounted while the window is open"
+        );
+        assert_eq!(
+            provider.table_memory.snapshot().keyset,
+            held,
+            "the held bytes reach the table's memory account"
+        );
+
+        // The validation is dropped without storing an index back.
+        drop(checkout);
+
+        assert_eq!(
+            provider.pk_keyset_bytes_single.load(Ordering::Relaxed),
+            0,
+            "an abandoned window releases the bytes of the keys it discarded"
+        );
+        assert_eq!(
+            provider.table_memory.snapshot().keyset,
+            0,
+            "the memory account no longer carries the phantom reservation"
+        );
+    }
+
+    /// The per-shard index has the same window and the same accounting — the
+    /// sharded twin of the test above (#13668).
+    #[tokio::test]
+    async fn an_abandoned_sharded_checkout_releases_the_keyset_bytes_its_window_grew() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_sharded_checkout_abandoned_bytes",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+        provider.maybe_install_warm_pk_caches().await;
+
+        // An apply checks the per-shard index out; a concurrent commit lands while
+        // the window is open and is held for the replay.
+        let checked_out = provider
+            .build_sharded_pk_index(&pk_indices, &converter, 4)
+            .await
+            .expect("the warm per-shard index is checked out");
+        let before = provider.pk_keyset_bytes_sharded.load(Ordering::Relaxed);
+        provider.record_file_pk_keys(&pk_digest_set_for_ids(&converter, &[7, 8, 9]), 11);
+        assert!(
+            provider.pk_keyset_bytes_sharded.load(Ordering::Relaxed) > before,
+            "keys held for the replay are accounted while the per-shard window is open"
+        );
+
+        // The apply is abandoned without restoring the index.
+        drop(checked_out);
+
+        assert_eq!(
+            provider.pk_keyset_bytes_sharded.load(Ordering::Relaxed),
+            0,
+            "the per-shard cell is empty after the abandon, so its published residency is zero"
+        );
+        assert_eq!(
+            provider.table_memory.snapshot().keyset,
+            provider.pk_keyset_bytes_single.load(Ordering::Relaxed),
+            "the memory account carries only the table-wide keyset's bytes"
+        );
     }
 
     /// The table-wide keyset has the same window and the same latch — regression

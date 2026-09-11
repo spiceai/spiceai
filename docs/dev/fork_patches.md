@@ -85,7 +85,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | Fork | Pinned revision | Branch |
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `34a465e97fb529075f953adf40bc2e02de755bec` | `spiceai` |
-| [arrow-rs](#arrow-rs) | `471a7c5aebf76f8f127076d78d9d3661ebe065af` | `spiceai-58` |
+| [arrow-rs](#arrow-rs) | `51624e0989ce553867f0f681ba62d9cf9cbb9ac7` | `spiceai-58` |
 | [async-openai](#async-openai) | `6bda5533dd118afcf80aa6f5ef59ad35277627a7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `efbb9a72e92789eafed0806c3e16f14640c504f6` | `lukim/spiceai-0.11.0` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
@@ -93,11 +93,11 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
-| [datafusion](#datafusion) | `c2fbafe20cbc1d65aadedb2626a3ad4f37c5ff55` | `spiceai-54` |
+| [datafusion](#datafusion) | `11624fb82dc5460d201d0379d269a4613e82f9c7` | `spiceai-54` |
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `3af703dba0accdff5fdb0ae92ef12588e1dfe88a` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `ae32853c9b122ac3e48d6fa87c740113379c0aa3` | `spiceai-54` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `96c361a7c8d0d29c7a76b0e92acf64268da3e2a2` | `spiceai-54` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `9d7be742f060d70066fc041319af787772716e0d` | `spiceai-1.4.4` |
@@ -107,7 +107,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
-| [sea-query](#sea-query) | `213b6b876068f58159ebdd5852604a021afaebf9` | `spiceai` |
+| [sea-query](#sea-query) | `ae75baef819513fb8d19af014972dcfa324e201a` | `spiceai` |
 | [snowflake-rs](#snowflake-rs) | `744ffd77fe82171a805562ce001a341a94d52541` | `spiceai-58` |
 | [spark-connect-rs](#spark-connect-rs) | `5f7c2452d4202d7496abac0a6f2eaa4bef46a5ad` | `spiceai` |
 | [text-embeddings-inference](#mistralrs-and-text-embeddings-inference) | `ac4e457936bc11c9b4fee453f2be33133d3146d8` | `spiceai` |
@@ -191,7 +191,7 @@ catch.
 | BigQuery dialect: emit the required `DISTINCT` quantifier for distinct unions | A federated distinct union reaches BigQuery as bare `UNION`, which BigQuery rejects before executing either branch | silent (query failure) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_emits_valid_bigquery_set_and_window_syntax`; real-engine guard: `test/scripts/bigquery-pushdown.sh` |
 | BigQuery dialect: omit frames from numbering functions while retaining aggregate frames | BigQuery rejects `ROW_NUMBER`, `RANK`, and the other numbering functions when DataFusion's normalized frame is emitted; dropping aggregate frames instead changes which rows contribute | silent (query failure / wrong data) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_emits_valid_bigquery_set_and_window_syntax`; real-engine guard: `test/scripts/bigquery-pushdown.sh` |
 | Unparser: `Dialect::range_window_default_nulls_first`, and the leading `IS NULL` key a dialect that reports one needs | A federated query with an aggregate window function fails outright: BigQuery accepts no NULL placement but its own inside a `RANGE` clause, and an `ORDER BY` with no explicit frame implies `RANGE` for an aggregate, so the plain `SUM(x) OVER (ORDER BY x)` a plan normalizes to `ASC NULLS LAST` is refused. Dropping the clause instead is worse than the failure: BigQuery defaults to NULLs *first* ascending where DataFusion defaults to last, so the NULL rows move to the other end of the ordering and every frame covers different rows — measured on real BigQuery as `(NULL,42) (1,10) (2,30) (3,35)` becoming `(NULL,7) (1,17) (2,37) (3,42)` | build (flag), then silent (query failure; wrong data if "fixed" by dropping the clause) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the RANGE-window arm), and in the fork `plan_to_sql.rs::test_range_window_nulls_placement_becomes_a_leading_key` with `::test_range_window_nulls_placement_left_alone_where_it_binds` as its controls; real-engine guard: `test/scripts/bigquery-pushdown.sh::aggregate-window-range-frame` |
-| Unparser: a `DISTINCT ON` output alias does not capture its own key (fork PR #209) | Naming a `DISTINCT ON`'s computed output changes which key it groups by where the name the output takes is also spelled as a bare column by `on_expr` or `sort_expr`: PostgreSQL resolves a bare name in both clauses against the output list first, so the new alias captures those references and the statement groups by the projected expression instead of the input column. Valid SQL, unchanged reported schema name, wrong rows | silent (wrong data) | **GAP** in this repo. The existing `…::a_derived_projection_names_the_output_its_scope_references` `distinct-on` arms assert the output *is* named, which still holds if this patch is lost, so they do not catch it; the fork's own `plan_to_sql.rs` `DISTINCT ON` tests are what guard it today. Carried in by the pin move for the two rows below rather than for itself |
+| Unparser: a `DISTINCT ON` output alias does not capture its own key (fork PR #209) | Naming a `DISTINCT ON`'s computed output changes which key it groups by where the name the output takes is also spelled as a bare column by `on_expr` or `sort_expr`: PostgreSQL resolves a bare name in both clauses against the output list first, so the new alias captures those references and the statement groups by the projected expression instead of the input column. Valid SQL, unchanged reported schema name, wrong rows | silent (wrong data) | `crates/data_components/src/federation.rs::a_distinct_on_output_is_not_named_over_its_own_key`, with `…::a_distinct_on_output_is_named_over_a_qualified_key` as the control for the qualified key an output alias cannot capture. The fork's own `plan_to_sql.rs` `DISTINCT ON` tests cover the same shapes; these are what survive the next re-cut. Note the `distinct-on` arms of `…::a_derived_projection_names_the_output_its_scope_references` do not catch this — they assert the output *is* named, which still holds when the patch is lost |
 | Unparser: `Dialect::group_by_matches_select_subexpressions`, and the aggregate scope a dialect that answers `false` needs | A `Projection` over an `Aggregate` is flattened into one `SELECT`, leaving the grouping expression bare in `GROUP BY` and wrapped inside a select item. BigQuery matches a whole select item and a column reference and nothing in between, so it refuses the statement outright. The two cheaper renderings are worse than the failure: `GROUP BY <output alias>` and `GROUP BY <ordinal>` group by the value the projection computes, so a projection that is not injective over the grouping expression collapses distinct groups and sums their aggregates, with no error | build (flag), then silent (query failure) | `crates/data_components/src/federation.rs::a_projection_wrapping_a_grouping_expression_keeps_the_aggregate_scoped`, which reads the flag, so losing the patch fails `cargo check` before it can fail the assertion; real-engine guard: `test/scripts/bigquery-pushdown.sh::group-by-expr-nested-in-select` |
 | Unparser: a subquery in a join predicate is routed out of `ON` — to `WHERE` on an inner join, and into the non-preserved input's own scope on an outer one (replaces the `supports_subquery_in_join_predicate` flag of fork PR #151) | A subquery is emitted inside a `JOIN … ON`, which several engines reject outright. No dialect opts in: both destinations select the same rows as `ON` does, so the routing needs no flag — which is what kept the flag disappearing, twice, on an upstream merge | silent (query failure) | in the fork, `plan_to_sql.rs::test_a_subquery_in_an_inner_join_predicate_moves_to_where` and `::test_a_pushed_down_subquery_filter_stays_in_the_null_extended_input`; both fail on the previous rendering |
 | Unparser: a call's return type is read through `return_field_from_args` | A function that reads a literal argument — a `date_trunc` granularity — answers only through that entry point and its `return_type` reports an internal error, so the call's type is unreadable and every rendering that needs it declines. A comparison against such a call is then pushed down uncoerced, and a dialect that spells an instant and a civil timestamp as different types refuses the pair | silent (query failure) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the truncated-date-comparison arm); in the fork, `plan_to_sql.rs::test_bigquery_agrees_a_schemaless_comparison_against_a_truncated_date` |
@@ -208,10 +208,13 @@ catch.
 | Metadata columns (`_location`, `_last_modified`, `_size`) on `ListingOptions`/`FileScanConfig`, and their projection, pushdown and statistics handling | Datasets that select file metadata columns lose them, or project the wrong column | build | `crates/data-connector-api/src/listing/connector.rs` (metadata-column tests) |
 | Object-version pinning on `ListingOptions` (`with_object_versioning_type`), forwarded through `DFParquetMetadata` and `CachedParquetFileReader` on the **scan** path; `HEAD` when the listing has no version id, kept only when HEAD's ETag matches the listed ETag. Schema/statistics inference (`ParquetFormat::{infer_schema,infer_stats,infer_stats_and_ordering}`) does not forward the pin | A scan stops pinning the object version, so a file replaced mid-scan is read half-old and half-new. Losing only the metadata-path forward is enough: the scan footer is unpinned while the pages stay pinned. Losing the `HEAD` leaves versioned buckets pinning by ETag, so a replace 412s instead of reading the listed generation | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version`, `…::a_versioned_parquet_read_pins_by_etag_when_the_listing_has_no_version_id`, `crates/runtime/tests/s3_parquet_overwrite/mod.rs::listing_table_scan_does_not_decode_a_replaced_object` (listing/overwrite **scan** race). Planning-time schema/statistics footer reads are a remaining unpinned gap, unreproduced as a product failure |
 | Bloom-filter replacement readers reuse the version discovered on the listing-table scan | A predicate scan whose bloom-filter reader is built separately still sends the listed ETag as `If-Match`. A replaced object therefore 412s instead of mixing generations; the query retries or fails | silent (query failure / extra retry) | **GAP** — the scan/overwrite harness has no predicate and writes no bloom data; the fork's own bloom-filter reader tests are what cover this today |
-| Placeholder type inference (`Expr::infer_placeholder_types`, incl. `CASE`, `LIMIT`/`OFFSET` `Int64`, name/metadata preservation) (fork PRs #87, #88, #89) | A parameterised query fails to plan, or infers the wrong type for `$1` | silent (query failure) | **GAP** |
+| Placeholder type inference (`Expr::infer_placeholder_types`, incl. `CASE`, `LIMIT`/`OFFSET` `Int64`, name/metadata preservation) (fork PRs #87, #88, #89, #167, and commit `d37a426e`) | A parameterised query fails to plan, or infers the wrong type for `$1` | silent (query failure) | `crates/runtime/src/datafusion/query.rs::every_shape_the_fork_patches_cover_infers_its_parameter_type`, `…::a_limit_and_an_offset_placeholder_are_both_int64`, `…::a_comparison_of_two_placeholders_still_plans`, `…::a_placeholder_inferred_from_a_column_keeps_the_columns_metadata` |
 | BigQuery dialect: temporal typing and naming — a tz-naive timestamp cast is `DATETIME` not `TIMESTAMP`, a timestamp literal's cast target follows the offset it renders with, sub-second digits are truncated to six, a comparison BigQuery has no supertype for is brought to one, `date - date` is `DATE_DIFF`, `CAST(date AS INT64)` is `UNIX_DATE`, `btrim`/`now`/`to_unixtime`/`unix_seconds`/`to_timestamp` are renamed or type-directed, `median`/`approx_percentile_cont` are rendered by ordering the group, a constant `GROUP BY` key is cast to its own type, and `array_element` subscripts with `SAFE_ORDINAL` (fork PR #212) | BigQuery puts no timezone qualifier on a timestamp type, so a tz-naive value typed `TIMESTAMP` becomes an instant with no supertype against a `DATETIME` column and the statement is refused; the name and cast rows are refused outright too. Two are quieter: `array_element` is 1-based where a bare BigQuery subscript is 0-based, so the neighbouring element is read with no error, and dropping a constant grouping key turns a grouped aggregate into a global one, returning one row of zeros where the grouped form returns none | silent (query failure; wrong data for the subscript and the dropped grouping key) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the four `#212` arms: `DATE_DIFF`, `UNIX_DATE`, `DATETIME`, cast `GROUP BY`) and `::array_element_federates_only_for_a_non_negative_integer_index`; in the fork, the per-rendering tests in `plan_to_sql.rs` and, restored by fork PR #214 after #212 deleted them, `rewrite.rs`'s own; real-engine guard: `test/scripts/bigquery-pushdown.sh` |
 | Spark concat coerces an untyped NULL argument to a string type (fork PR #217) | A string array concatenated with an untyped NULL reaches an unsupported kernel branch | silent (panic) | `crates/runtime/src/datafusion/builder.rs::tests::the_built_session_concatenates_an_untyped_null` |
-| Substrait VarChar literals decode as UTF-8 strings (fork PR #215) | Plans containing VarChar literals fail to decode | silent (query failure) | `crates/runtime/src/flight/flightsql/statement_substrait_plan.rs::tests::decode_plan_executes_a_varchar_literal` |
+| Substrait VarChar literals decode as UTF-8 strings (fork PR #215) | Plans containing VarChar literals fail to decode | silent (query failure) | `crates/runtime/src/flight/flightsql/statement_substrait_plan.rs::tests::decode_plan_executes_a_varchar_literal`; `tools/substrait-compliance/src/mode_a.rs::varchar_literal_lowers_to_utf8` (Isthmus TPC-H plans emit `VarChar` literals such as `EUROPE`, length 25; the Mode A harness `spice-substrait-compliance` exercises them on q02/q03/q05/q11/q12/q16/q17/q19–q22) |
+| Substrait `extract` enum arguments lower to `date_part` cast to the plan's declared output type (fork PR #220) | Isthmus TPC-H q07/q08/q09 emit `extract:req_date` with `FunctionArgument { enum: "YEAR" }`; without the patch `from_substrait_plan` errors (`Function argument non-Value type not supported`) and Mode A reports ERROR for all three | silent (query failure) | `tools/substrait-compliance/src/mode_a.rs::enum_function_argument_lowers_to_date_part`, `::registered_extract_udf_takes_precedence_over_date_part` (a UDF registered as `extract` wins over the mapping), `::extract_indexing_option_is_an_offset_from_date_part` (`MONTH ZERO` and `SUNDAY_DAY_OF_WEEK ONE` on 1998-09-01 give 8 and 3), `::unmapped_extract_component_is_rejected_by_name` (`MILLISECOND` fails as an unsupported component, not as an unsupported argument); Mode A harness (`spice-substrait-compliance`) on q07/q08/q09 |
+| Unparser names a subquery alias's columns when the scan pushdown renames them (fork PR #221, refs spiceai/spiceai#13140) | A `SubqueryAlias` over a projection the alias pushdown requalifies exposes outputs named after the requalified expression while the enclosing scope refers to them by the name the alias's schema reports, so the reference binds to nothing and the remote engine rejects the statement | silent (query failure) | `crates/data_components/src/federation.rs::a_projected_scan_under_an_alias_names_the_output_its_scope_references` (a pushed-down scan projection under alias `s` unparses so the `FROM` clause exposes the enclosing identifier; without the patch the derived table cannot report that name). Also the fork's own `plan_to_sql.rs` tests (`test_subquery_alias_over_pushed_down_scan_is_named_by_the_alias`, `…_keeps_a_named_output_unaliased`, `…_on_dialect_without_column_list`, `…_column_list_escapes_a_quote_in_an_output_name`) |
+| Substrait subquery scans of a table the enclosing scope also reads get their own qualifier; a scan's own `ReadRel.filter` binds to the Substrait base schema and sits above the scan whenever it holds an outer reference, aliased or not; joins, intersects and excepts requalified inside a subquery keep clear of the enclosing scope's `left`/`right` (fork PR #226) | SQL names such a scan (`lineitem l2`); Substrait cannot, so both scans were `LINEITEM` and decorrelation resolved `LINEITEM.L_ORDERKEY = outer_ref(LINEITEM.L_ORDERKEY)` to the inner scan alone: the semi/anti join lost its condition and `L_SUPPKEY != L_SUPPKEY` stayed behind, so TPC-H q21 returned no rows where the SQL returns one. Without the follow-ups, a correlated predicate carried as `ReadRel.filter` was consumed against the provider's schema (field 0 bound to a provider's extra leading column: `Cannot cast string 'x' to value of Int64 type`), and a self-join inside a subquery took the fixed `left`/`right` that an enclosing self-join already used, collapsing the correlation to no rows | silent (wrong data) | `tools/substrait-compliance/src/mode_a.rs::correlated_subquery_over_the_same_table_keeps_its_rows` (same-table correlated EXISTS over three rows returns two; empty without the patch), `::correlated_read_filter_binds_to_the_substrait_schema` (the predicate as `ReadRel.filter` against a provider with an extra leading column; the fork's own test failed with the cast error before the follow-up), `::requalified_join_inside_a_subquery_keeps_its_correlation` (self-joins in both scopes return six rows; empty on the pin before the follow-up), `::intersect_inside_a_subquery_keeps_its_correlation` (a self-intersect in the subquery; empty on the pin before the follow-up), `::correlated_read_filter_on_another_table_keeps_its_rows` (the predicate as `ReadRel.filter` on a table no enclosing scope reads; unexecutable on the pin before the follow-up), `::subquery_scan_alias_skips_a_taken_name` (the enclosing scope reads `t` and a table named `t_1`, so the inner scan of `t` becomes `t_2`; six rows); Mode A harness (`spice-substrait-compliance`) on q21 |
 | BigQuery renders integer-typed division with `DIV` (fork PR #222) | Fractional division followed by an integer cast rounds cohort cutoff hours instead of preserving the logical plan's integer quotient | silent (wrong data) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the integer cohort hours arm) |
 | Unparser isolates standalone expression state and qualifies filtered recursive join inputs (fork PR #219) | A refused recursive expression poisons a reused unparser, or a filtered recursive self-join renders ambiguous columns | silent (query failure) | `crates/runtime-datafusion/src/dialect/bigquery.rs::filtered_recursive_join_inputs_keep_their_qualified_columns` and `::a_recursive_cte_renders_through_the_wrapper_only_where_it_is_supported`; real-engine control: `test/scripts/bigquery_pushdown.py::filtered-recursive-self-join` |
 | Unparser preserves a recursive CTE column-list projection through a join alias (fork PR #225) | A recursive hour generator with an explicit column list fails SQL generation when joined to a remote table | silent (query failure) | `crates/runtime-datafusion/src/dialect/bigquery.rs::recursive_column_list_survives_a_join_alias`; real-engine guard: `test/scripts/bigquery_pushdown.py::recursive-cte-joined-to-a-table` |
@@ -223,8 +226,9 @@ catch.
 Upstream [apache/arrow-rs](https://github.com/apache/arrow-rs), branch
 `spiceai-58`. The pin lives in the object-store Parquet reader
 (`parquet/src/arrow/async_reader/store.rs`), in the push-decoder short-read
-path (`parquet/src/util/push_buffers.rs` and its callers), and in
-`arrow-buffer/src/buffer/immutable.rs`.
+path (`parquet/src/util/push_buffers.rs` and its callers), in
+`arrow-buffer/src/buffer/immutable.rs`, and in the cast kernel
+(`arrow-cast/src/cast/mod.rs`).
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
@@ -233,6 +237,7 @@ path (`parquet/src/util/push_buffers.rs` and its callers), and in
 | `get_byte_ranges` override — coalesce ranges through `get_opts` rather than `ObjectStore::get_ranges` | Version pinning is dropped for the data reads specifically (the metadata read keeps it), and range coalescing is lost, so a scan issues one request per column chunk | silent | as above |
 | `Buffer::has_custom_allocation` — expose whether a buffer's memory is freed by its own owner rather than by the buffer ([spiceai/arrow-rs#25](https://github.com/spiceai/arrow-rs/pull/25)) | The results cache can no longer tell that a batch rests on memory it does not own, so it shares the producer's arrays instead of copying them. `capacity` reports the size the producer declared, so such an entry looks compact and is billed as if it were: a DuckDB- or ADBC-imported result pins the driver's chunk, a Flight-decoded one pins the whole IPC message body, and `max_size` bounds none of it. Measured at ~4.5 KB per entry unbilled on a one-row DuckDB result, flat as the result widened to 10 rows | build (the predicate) + silent (the accounting, if the call is dropped rather than the function) | `crates/arrow_tools/src/record_batch.rs::a_batch_resting_on_foreign_memory_is_copied_even_with_nothing_to_reclaim` |
 | `PushBuffers::push_range` returns `ParquetError` on a short read instead of asserting (apache/arrow-rs#10564) | A footer prefetch that races an in-place shrink panics the reader thread (`Range length must match buffer length`) instead of a retriable decode error | silent (panic) | **GAP** — the listing/overwrite harness 412s a pinned `If-Match` before a short successful range body reaches `PushBuffers`, so that test stays green if only this patch is dropped |
+| `Decimal` → floating-point cast rounds from the exact decimal digits instead of widening the coefficient to `f64` and dividing by `10^scale` ([spiceai/arrow-rs#26](https://github.com/spiceai/arrow-rs/pull/26)) | A coefficient past 2^53 loses precision before the divide, so a decimal read back as a float is off in the low digits. Measured: a pushed-down Postgres `avg` read as `Decimal128(38, 20)` returned `47.50000000000001` instead of `47.5` ([#13978](https://github.com/spiceai/spiceai/issues/13978)) | silent (wrong data) | `crates/arrow_tools/src/record_batch.rs::test::decimal_to_float_cast_is_correctly_rounded` |
 
 ## datafusion-ballista
 
@@ -248,7 +253,7 @@ so the rows below name the contracts, not every commit.
 | In-memory shuffle storage with remote-fetch fallback (fork PRs #7, #8) | Every shuffle round-trips through storage | silent (perf) | `crates/runtime/tests/cluster/in_memory_shuffle.rs` |
 | Shuffle-fetch resilience: retry on a fresh connection, h2 receive-window sizing, bounded read inactivity, unordered stream consumption (fork PRs #61, #62, #63) | A transient fetch failure fails the whole query; large shuffles stall | silent | **GAP** |
 | Scheduler lock hygiene across persists and awaits (fork PR #60) | Cluster wedge / runtime freeze under load | silent (hang) | **GAP** |
-| Don't swap null-aware anti joins in `JoinSelection` (fork PR #58) | A distributed anti-join returns wrong rows | silent (wrong data) | **GAP** |
+| Don't swap null-aware anti joins in `JoinSelection` (fork PR #58) | A distributed anti-join returns wrong rows | silent (wrong data) | `crates/runtime/src/cluster/datafusion/mod.rs::a_null_among_the_values_leaves_no_row_selected`, `…::a_null_among_the_values_leaves_no_row_selected_where_no_swap_is_profitable`, `…::values_without_a_null_select_every_probe_absent_from_them`, `…::the_rule_neither_swaps_the_sides_nor_drops_the_flag` — these drive the scheduler's own rule rather than a live cluster, because a distributed `NOT IN` currently fails before it can return rows (the rule forces `CollectLeft` on a stage whose left input is already hash-partitioned, and `to_resolved` cannot repartition) |
 | Vortex columnar shuffle format (fork PR #7) | Shuffles fall back to Arrow IPC | build | compile-guarded |
 | Stuck-query detection and stale `TaskStatus` rejection (fork PRs #39, #53) | A reset partition's stale status is accepted, corrupting the execution graph | silent | **GAP** |
 
@@ -355,9 +360,9 @@ Upstream [apache/iceberg-rust](https://github.com/apache/iceberg-rust), branch
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | `RowDeltaAction` for row-level deletes via delete files (fork PR #28) | `DELETE` against an Iceberg table has no commit path | build | `crates/data_components/src/iceberg/delete.rs` calls `tx.row_delta()` |
-| SigV4 signing middleware for REST catalogs on AWS Glue | Glue-backed Iceberg catalogs fail to authenticate | build (module) + silent (signing) | `crates/runtime/src/catalogconnector/iceberg.rs` wires `rest.sigv4-enabled`; end-to-end signing is a **GAP** |
-| Limit push-down for `IcebergTableProvider` (fork PR #19) | `SELECT … LIMIT n` scans the whole table | silent (perf) | partial: `crates/runtime/src/cluster/datafusion/codec/spice_physical_codec.rs` refuses to serialise a scan whose limit it cannot carry, so the distributed path cannot silently drop it. That the single-node scan *applies* the limit is a **GAP** |
-| Pinned snapshot reads in `IcebergTableProvider` (fork PR #45) | A scan reads the current snapshot instead of the pinned one — time-travel and repeatable reads silently return live data | silent (wrong data) | **GAP** |
+| SigV4 signing middleware for REST catalogs on AWS Glue (commits `c9f1c85`, `f67e44c`; no fork PR) | Glue-backed Iceberg catalogs fail to authenticate | build (module) + silent (signing) | `crates/runtime/src/catalogconnector/iceberg.rs` wires `rest.sigv4-enabled`; the signing itself is guarded by `crates/data_components/src/iceberg/catalog/rest/catalog.rs::a_sigv4_catalog_signs_every_request_it_sends`, with `…::a_catalog_without_sigv4_sends_no_signature` as its control |
+| Limit push-down for `IcebergTableProvider` (fork PR #19) | `SELECT … LIMIT n` scans the whole table | silent (perf) | `crates/data_components/src/iceberg/provider.rs::a_scan_given_a_limit_reads_no_more_rows_than_it_asked_for` for the single-node scan, counted at the provider because a `GlobalLimitExec` above it returns the right rows either way; the distributed path is covered by `crates/runtime/src/cluster/datafusion/codec/spice_physical_codec.rs`, which refuses to serialise a scan whose limit it cannot carry |
+| Pinned snapshot reads in `IcebergTableProvider` (fork PR #45) | A scan reads the current snapshot instead of the pinned one — time-travel and repeatable reads silently return live data | silent (wrong data) | `crates/data_components/src/iceberg/provider.rs::a_scan_pinned_to_a_snapshot_reads_that_snapshot_not_the_current_one` |
 | Parallel file scanning with eager task bucketing (fork PR #43) | Iceberg scans lose file-level parallelism | silent (perf) | **GAP** |
 | `IcebergTableProvider::try_new` made public; extended file metadata | No construction path from Spice | build | compile-guarded |
 
@@ -370,7 +375,7 @@ Upstream [64bit/async-openai](https://github.com/64bit/async-openai).
 | `reasoning_content` on `ChatCompletionResponseMessage` | Reasoning models' output is dropped from responses | build | every provider in `crates/llms` constructs the field |
 | Azure Entra token auth in `config.rs` | Azure OpenAI with Entra credentials cannot authenticate | build | compile-guarded |
 | `post`/`post_stream` and the GET operation made public | Non-OpenAI providers built on the same client lose their entry point | build | compile-guarded |
-| Don't serialize nulls; hide `usage` when null | Requests carry explicit `null`s that some OpenAI-compatible servers reject | silent (request failure) | **GAP** |
+| Don't serialize nulls; hide `usage` when null (fork PR #32) | Requests carry explicit `null`s that some OpenAI-compatible servers reject | silent (request failure) | `crates/runtime/src/model/wrapper/mod.rs::a_streamed_request_carries_no_null_stream_option`, with `…::unset_stream_options_serialize_to_an_empty_object` pinning the same property at the type |
 | `Eq`/`Hash` on `EmbeddingInput` and `CreateEmbeddingRequest` | Embedding request caching cannot key on the request | build | compile-guarded |
 | Aggregated rate-limit retry logging; `retry-after` honoured from the response header (fork PRs #37, #38) | One `WARN` per retried request instead of one per burst; retries ignore the server's back-off hint | silent (log noise, throughput) | **GAP** |
 
@@ -401,6 +406,7 @@ Upstream [SeaQL/sea-query](https://github.com/SeaQL/sea-query).
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | SQLite backend emits a decimal declared type rather than panicking above 16 digits | `CREATE TABLE` for a `Decimal256(40, 4)` column panics; below that the declared type changes, and the SQLite reader keys value decoding off the declared type | silent (panic / wrong decode) | `crates/accelerators/accelerator-sqlite/src/lib.rs::test_sqlite_decimal_round_trip` |
+| Chrono fractional seconds in SQL literals | Timestamp writeback loses microseconds for timezone-aware values rendered through `InsertBuilder` | silent (wrong data) | `crates/runtime/tests/postgres/write_back_delivery.rs::timestamp_microseconds_survive_write_back_and_echo` |
 
 ## snowflake-rs
 
@@ -524,7 +530,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**37 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**30 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -532,42 +538,31 @@ They are not equal in consequence; this is the order to close them in.
 
 **Wrong data or wrong text, silently.** These change what a user gets back:
 
-1. `datafusion` placeholder type inference (fork PRs #87, #88, #89).
-2. `datafusion` `DISTINCT ON` output alias capture (fork PR #209) — the alias
-   captures the key, so the statement groups by the projected expression instead of
-   the input column. The fork's own `plan_to_sql.rs` tests cover it; what is missing
-   is a repo-side guard, and the existing `distinct-on` arms of
-   `a_derived_projection_names_the_output_its_scope_references` do not catch it
-   because they assert the output *is* named, which still holds if the patch is
-   lost.
-3. `iceberg-rust` pinned snapshot reads (fork PR #45) — time travel silently reads live data.
-4. `datafusion-ballista` null-aware anti-join swap (fork PR #58).
-5. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
+1. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
    PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
-6. `snowflake-rs` chunked JSON responses and record-batch ordering.
-7. `clickhouse-rs` `Date32` range.
-8. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
+2. `snowflake-rs` chunked JSON responses and record-batch ordering.
+3. `clickhouse-rs` `Date32` range.
+4. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
    change the text that gets embedded.
-9. `mistral.rs` `tool_calls` chat-template handling.
-10. `text-embeddings-inference` pooling and model-loading fixes — embeddings
+5. `mistral.rs` `tool_calls` chat-template handling.
+6. `text-embeddings-inference` pooling and model-loading fixes — embeddings
     differ from the reference implementation.
 
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-11. `datafusion` bloom-filter replacement readers sharing the listed object
+7. `datafusion` bloom-filter replacement readers sharing the listed object
     version — a predicate scan whose bloom-filter reader is built separately
     falls back to stale `If-Match`, so a replaced object 412s; the query retries
     or fails rather than mixing generations. The overwrite harness has no
     bloom data.
-12. `vortex` session lock re-entry in writer init (fork PR #29).
-13. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+8. `vortex` session lock re-entry in writer init (fork PR #29).
+9. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
     resilience (fork PRs #61–#63).
-14. `async-openai` null-suppression in requests.
-15. `spark-connect-rs` `http` scheme when `use_ssl` is false.
-16. `model2vec-rs` optional `config.json`.
-17. `snowflake-rs` async query response support — long-running queries time out.
-18. `arrow-rs` `PushBuffers::push_range` asserts instead of returning an error
+10. `spark-connect-rs` `http` scheme when `use_ssl` is false.
+11. `model2vec-rs` optional `config.json`.
+12. `snowflake-rs` async query response support — long-running queries time out.
+13. `arrow-rs` `PushBuffers::push_range` asserts instead of returning an error
     on a short read — a footer prefetch racing an in-place shrink panics the
     reader thread rather than surfacing a retriable decode error. The
     listing/overwrite harness 412s before a short successful range body
@@ -576,22 +571,19 @@ They are not equal in consequence; this is the order to close them in.
 **Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
 being honoured:
 
-19. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
+14. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
     the sink's own honouring of `target_file_size_mb` is not, so the writer can emit
     one file per flush regardless of size.
-20. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
-    cannot silently drop the limit, the single-node scan can.
-21. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
+15. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
     misconfigured warehouse produces an opaque error instead of an actionable one.
-22. `model2vec-rs` HF cache directory read from the environment — models are
+16. `model2vec-rs` HF cache directory read from the environment — models are
     re-downloaded instead of reusing the shared cache.
-23. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
+17. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
     installs a global subscriber and hijacks `spiced`'s logging.
 
 **Security posture.** No correctness effect, but a silent downgrade:
 
-24. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
-25. `graph-rs-sdk` tower middleware application.
+18. `graph-rs-sdk` tower middleware application.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
@@ -599,7 +591,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-26. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+19. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
