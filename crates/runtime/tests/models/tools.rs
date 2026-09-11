@@ -198,7 +198,9 @@ params:
     /// Test the MCP Streamable HTTP server endpoint directly via JSON-RPC,
     /// without going through the rmcp client. This verifies the wire format
     /// (`POST /v1/mcp` with `Accept: application/json, text/event-stream`)
-    /// and the legacy `initialize` handshake (dual-era).
+    /// and the full legacy `initialize` session (dual-era): mint
+    /// `Mcp-Session-Id`, send `notifications/initialized`, then
+    /// `tools/list` on that session.
     #[tokio::test]
     async fn test_mcp_streamable_http_initialize() -> Result<(), anyhow::Error> {
         let http_server_url = start_spiced_with_mcp_config(McpConfig {
@@ -243,10 +245,12 @@ params:
             "initialize returned non-success status: {}",
             resp.status()
         );
-        assert!(
-            resp.headers().get("mcp-session-id").is_some(),
-            "initialize response missing Mcp-Session-Id header"
-        );
+        let session_id = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+            .expect("initialize response missing Mcp-Session-Id header");
 
         // Response may be SSE-framed or plain JSON depending on server policy.
         let body = resp.text().await?;
@@ -271,6 +275,65 @@ params:
                 .and_then(|c| c.get("tools"))
                 .is_some(),
             "initialize result missing tools capability: {result}"
+        );
+
+        let initialized_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        });
+        let initialized_resp = post_mcp(
+            &client,
+            &http_server_url,
+            &[
+                ("MCP-Protocol-Version", protocol_version.as_str()),
+                ("mcp-session-id", session_id.as_str()),
+            ],
+            &initialized_body,
+        )
+        .await?;
+        assert_eq!(
+            initialized_resp.status(),
+            reqwest::StatusCode::ACCEPTED,
+            "notifications/initialized should be HTTP 202, got {}",
+            initialized_resp.status()
+        );
+
+        let list_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {},
+        });
+        let list_resp = post_mcp(
+            &client,
+            &http_server_url,
+            &[
+                ("MCP-Protocol-Version", protocol_version.as_str()),
+                ("mcp-session-id", session_id.as_str()),
+            ],
+            &list_body,
+        )
+        .await?;
+        let list_status = list_resp.status();
+        let list_text = list_resp.text().await?;
+        assert!(
+            list_status.is_success(),
+            "legacy tools/list with Mcp-Session-Id failed: {list_status} body={list_text}"
+        );
+        let list_json = parse_jsonrpc_body(&list_text)?;
+        assert!(
+            list_json.get("error").is_none(),
+            "session-bound tools/list returned an error: {list_json}"
+        );
+        let tools = list_json
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .expect("session-bound tools/list missing result.tools");
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.get("name").and_then(Value::as_str) == Some("get_readiness")),
+            "session-bound tools/list should include get_readiness: {tools:?}"
         );
 
         Ok(())
