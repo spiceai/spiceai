@@ -1506,11 +1506,9 @@ mod tests {
             still_blocked.is_err(),
             "old-client reader must block the reconnect swap until it drains"
         );
-        assert_eq!(
-            *client.read().await,
-            "old",
-            "final_client must still be old while the reader holds it"
-        );
+        // Do not `client.read()` here. Tokio's `RwLock` is write-preferring:
+        // `reconnect` is already queued on `write()`, so a new reader would
+        // wait behind it and never send `release_old`.
 
         release_old_tx
             .send(())
