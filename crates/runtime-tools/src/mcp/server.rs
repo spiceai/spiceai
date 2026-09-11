@@ -149,7 +149,7 @@ impl McpSchemaSnapshot {
     fn replace_listed_from_map(&self, tools: &HashMap<String, Tooling>) -> (Vec<Tool>, bool) {
         let _publish = self.lock_publish();
         let next = mcp_schemas_from_map(tools);
-        let listed: Vec<Tool> = next.values().cloned().collect();
+        let listed = tools_listed_by_name(&next);
         (listed, self.install_listed_map(next))
     }
 
@@ -660,13 +660,27 @@ fn mcp_tool_from_spice(name: impl Into<Cow<'static, str>>, tool: &dyn SpiceModel
 /// omits on the wire. Omitted or zero `ttlMs` is immediately stale
 /// (SEP-2549); emitting `0` + `private` is an explicit non-cacheable
 /// private result instead of a legacy-compatible omission.
+///
+/// The spec also requires a deterministic tool order when the set is
+/// unchanged so clients can keep a stable prompt-cache prefix. Collecting
+/// a `HashMap` via `values()` is not that order.
 fn listed_tools_result(tools: Vec<Tool>) -> ListToolsResult {
     ListToolsResult {
-        tools,
+        tools: tools_listed_by_name_vec(tools),
         ..ListToolsResult::default()
     }
     .with_ttl_ms(0)
     .with_cache_scope(CacheScope::Private)
+}
+
+/// Sort listed tools by name so repeated `tools/list` pages match.
+fn tools_listed_by_name(schemas: &HashMap<String, Tool>) -> Vec<Tool> {
+    tools_listed_by_name_vec(schemas.values().cloned().collect())
+}
+
+fn tools_listed_by_name_vec(mut tools: Vec<Tool>) -> Vec<Tool> {
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    tools
 }
 
 #[cfg(test)]
@@ -1143,9 +1157,7 @@ mod tests {
         release_tx
             .send(())
             .expect("merge_from_map is waiting in try_all");
-        merger
-            .join()
-            .expect("merge_from_map thread should finish");
+        merger.join().expect("merge_from_map thread should finish");
         publisher
             .join()
             .expect("catalog publish thread should finish");
@@ -1191,6 +1203,94 @@ mod tests {
             json.get("cacheScope"),
             Some(&json!("private")),
             "2026-07-28 tools/list must emit cacheScope, got {json}"
+        );
+    }
+
+    #[test]
+    fn listed_tools_result_orders_tools_by_name() {
+        let tools = ["search", "sql", "memory", "web", "get_readiness"]
+            .into_iter()
+            .map(|name| mcp_tool_from_spice(name, &StubTool(name)))
+            .collect();
+        let result = listed_tools_result(tools);
+        let names: Vec<&str> = result.tools.iter().map(|tool| tool.name.as_ref()).collect();
+        assert_eq!(
+            names,
+            ["get_readiness", "memory", "search", "sql", "web"],
+            "2026-07-28 tools/list must be name-sorted for prompt-cache stability"
+        );
+    }
+
+    /// A fresh `HashMap` collected via `values()` is the production page
+    /// before `tools_listed_by_name`. A rustc harness of that pattern
+    /// printed `distinct_orders=78` over 128 runs.
+    #[test]
+    fn hashmap_values_list_order_varies_until_sorted() {
+        let labels = ["search", "sql", "memory", "web", "get_readiness"];
+        let mut unsorted = HashSet::new();
+        let mut sorted = HashSet::new();
+        for _ in 0..128 {
+            let mut next = HashMap::new();
+            for name in labels {
+                next.insert(name.to_string(), mcp_tool_from_spice(name, &StubTool(name)));
+            }
+            let listed: Vec<Tool> = next.values().cloned().collect();
+            unsorted.insert(
+                listed
+                    .iter()
+                    .map(|tool| tool.name.to_string())
+                    .collect::<Vec<_>>(),
+            );
+            let names: Vec<String> = listed_tools_result(listed)
+                .tools
+                .iter()
+                .map(|tool| tool.name.to_string())
+                .collect();
+            sorted.insert(names);
+        }
+        assert!(
+            unsorted.len() > 1,
+            "distinct_orders={} — HashMap values() must vary to witness the 2026 list shuffle",
+            unsorted.len()
+        );
+        assert_eq!(
+            sorted.len(),
+            1,
+            "listed_tools_result must collapse HashMap iteration to one order, got {sorted:?}"
+        );
+        let only = sorted
+            .iter()
+            .next()
+            .expect("listed_tools_result must produce one sorted order");
+        assert_eq!(
+            only.as_slice(),
+            ["get_readiness", "memory", "search", "sql", "web"],
+            "expected_order=get_readiness,memory,search,sql,web"
+        );
+    }
+
+    #[test]
+    fn replace_listed_from_map_returns_name_sorted_tools_list() {
+        let mut tools = HashMap::new();
+        for name in ["search", "sql", "memory", "web", "get_readiness"] {
+            tools.insert(
+                name.to_string(),
+                Tooling::Tool(Arc::new(StubTool(name)) as Arc<dyn SpiceModelTool>),
+            );
+        }
+        let snapshot = McpSchemaSnapshot::default();
+        let (listed, _) = snapshot.replace_listed_from_map(&tools);
+        let names: Vec<&str> = listed.iter().map(|tool| tool.name.as_ref()).collect();
+        assert_eq!(
+            names,
+            ["get_readiness", "memory", "search", "sql", "web"],
+            "replace_listed_from_map must not return HashMap values() order"
+        );
+        let result = listed_tools_result(listed);
+        let result_names: Vec<&str> = result.tools.iter().map(|tool| tool.name.as_ref()).collect();
+        assert_eq!(
+            result_names,
+            ["get_readiness", "memory", "search", "sql", "web"]
         );
     }
 
