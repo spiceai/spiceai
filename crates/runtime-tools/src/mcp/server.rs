@@ -405,11 +405,21 @@ impl RuntimeServer {
     }
 
     fn snapshot_tool(&self, name: &str) -> Option<Tool> {
+        // `decode_tool_name` accepts `srv__tool__name` as an alias of
+        // canonical `srv__tool_-_name`. Prefer the canonical snapshot
+        // key so an incomplete catalog refresh cannot leave the alias
+        // on `Region` while dispatch runs `Zone`.
+        if let Some((catalog, tool)) = decode_tool_name(name) {
+            let canonical = encode_tool_name(&catalog, &tool);
+            if let Some(schema) = self.schemas.get(&canonical) {
+                return Some(schema);
+            }
+        }
         self.schemas.get(name)
     }
 
-    fn remember_tool(&self, name: String, tool: Tool) {
-        let added = self.schemas.insert(name, tool);
+    fn remember_tool(&self, tool: Tool) {
+        let added = self.schemas.insert(tool.name.to_string(), tool);
         self.schemas.bump_if(added);
     }
 
@@ -458,7 +468,7 @@ impl RuntimeServer {
         let Some(tool) = Self::definition_from_map(&tools, tool_name) else {
             return self.snapshot_tool(tool_name);
         };
-        self.remember_tool(tool_name.to_string(), tool.clone());
+        self.remember_tool(tool.clone());
         Some(tool)
     }
 }
@@ -1647,6 +1657,142 @@ mod tests {
         assert!(
             snapshot.get(&exposed).is_none(),
             "a complete catalog drop with no colliding top-level tool must remove the schema"
+        );
+    }
+
+    /// `decode_tool_name("srv__tool__name")` is `("srv", "tool__name")`,
+    /// whose canonical encoding is `srv__tool_-_name`. Caching the
+    /// alias leaves a second snapshot entry; an incomplete catalog
+    /// refresh updates only the canonical key
+    /// (`canonical_schema=Zone alias_schema=Region stale_alias=True`).
+    #[test]
+    fn get_tool_uses_canonical_schema_not_stale_alias() {
+        struct UnderscoreNamedTool(&'static str);
+
+        #[async_trait::async_trait]
+        impl SpiceModelTool for UnderscoreNamedTool {
+            fn name(&self) -> Cow<'_, str> {
+                Cow::Borrowed("tool__name")
+            }
+            fn description(&self) -> Option<Cow<'_, str>> {
+                None
+            }
+            fn parameters(&self) -> Option<Value> {
+                Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "region": { "type": "string", "x-mcp-header": self.0 }
+                    }
+                }))
+            }
+            async fn call(
+                &self,
+                _arg: &str,
+            ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(Value::Null)
+            }
+        }
+
+        struct UnderscoreCatalog(&'static str);
+
+        #[async_trait::async_trait]
+        impl SpiceToolCatalog for UnderscoreCatalog {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn name(&self) -> &'static str {
+                "srv"
+            }
+            async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                self.try_all()
+            }
+            async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                self.try_get(name)
+            }
+            fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                (name == "tool__name")
+                    .then(|| Arc::new(UnderscoreNamedTool(self.0)) as Arc<dyn SpiceModelTool>)
+            }
+            fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                vec![Arc::new(UnderscoreNamedTool(self.0)) as Arc<dyn SpiceModelTool>]
+            }
+        }
+
+        let canonical = encode_tool_name("srv", "tool__name");
+        let alias = "srv__tool__name";
+        assert_ne!(
+            canonical.as_str(),
+            alias,
+            "the lax alias must differ from the encoded name"
+        );
+        assert_eq!(
+            decode_tool_name(alias),
+            Some(("srv".to_string(), "tool__name".to_string()))
+        );
+
+        let mut tools = HashMap::new();
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(UnderscoreCatalog("Zone")) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+        let tools = Arc::new(RwLock::new(tools));
+        let server = RuntimeServer::new(Arc::clone(&tools));
+
+        let from_alias = ServerHandler::get_tool(&server, alias)
+            .expect("alias must resolve through the catalog");
+        assert_eq!(from_alias.name.as_ref(), canonical.as_str());
+        assert!(
+            server.schemas.get(alias).is_none(),
+            "remember_tool must not store the caller alias"
+        );
+        assert_eq!(
+            server
+                .schemas
+                .get(&canonical)
+                .as_ref()
+                .and_then(x_mcp_header_region),
+            Some("Zone")
+        );
+
+        server.schemas.insert(
+            alias.to_string(),
+            mcp_tool_from_spice(alias, &HeaderAnnotatedTool),
+        );
+        let mut listed = HashMap::new();
+        listed.insert(
+            "tool__name".to_string(),
+            mcp_tool_from_spice("tool__name", &UnderscoreNamedTool("Zone")),
+        );
+        let changed = apply_listed_catalog_cache(&server.schemas, "srv", &listed, false);
+        server.schemas.bump_if(changed);
+
+        assert_eq!(
+            server
+                .schemas
+                .get(&canonical)
+                .as_ref()
+                .and_then(x_mcp_header_region),
+            Some("Zone"),
+            "canonical_schema=Zone after the incomplete refresh"
+        );
+        assert_eq!(
+            server
+                .schemas
+                .get(alias)
+                .as_ref()
+                .and_then(x_mcp_header_region),
+            Some("Region"),
+            "alias_schema=Region is the leftover key an incomplete refresh does not touch"
+        );
+        assert_eq!(
+            ServerHandler::get_tool(&server, alias)
+                .as_ref()
+                .and_then(x_mcp_header_region),
+            Some("Zone"),
+            "canonical_schema=Zone alias_schema=Region stale_alias=True is the reported miss"
         );
     }
 
