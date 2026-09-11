@@ -133,7 +133,7 @@ license-file = "LICENSE"
 publish = false
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.97.1"
-version = "2.3.0-unstable"
+version = "2.4.0-unstable"
 
 # Clippy lint levels for the workspace. Each member crate opts in with
 # `[lints]\nworkspace = true` so scoped `cargo clippy -p <crate>` and rust-analyzer
@@ -586,22 +586,22 @@ iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev 
 # a duplicate-key error.
 
 # arrow-rs 58 with spice patches (spiceai-58, merged PRs #24 and #25)
-arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "471a7c5aebf76f8f127076d78d9d3661ebe065af" }        # branch: spiceai-58 (merged PRs #24, #25)
-arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "471a7c5aebf76f8f127076d78d9d3661ebe065af" }  # branch: spiceai-58 (merged PRs #24, #25)
-arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "471a7c5aebf76f8f127076d78d9d3661ebe065af" }  # branch: spiceai-58 (merged PRs #24, #25)
-arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "471a7c5aebf76f8f127076d78d9d3661ebe065af" } # branch: spiceai-58 (merged PRs #24, #25)
-arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "471a7c5aebf76f8f127076d78d9d3661ebe065af" }   # branch: spiceai-58 (merged PRs #24, #25)
-arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "471a7c5aebf76f8f127076d78d9d3661ebe065af" }    # branch: spiceai-58 (merged PRs #24, #25)
-arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "471a7c5aebf76f8f127076d78d9d3661ebe065af" }   # branch: spiceai-58 (merged PRs #24, #25)
-arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "471a7c5aebf76f8f127076d78d9d3661ebe065af" } # branch: spiceai-58 (merged PRs #24, #25)
-arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "471a7c5aebf76f8f127076d78d9d3661ebe065af" }    # branch: spiceai-58 (merged PRs #24, #25)
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "471a7c5aebf76f8f127076d78d9d3661ebe065af" }   # branch: spiceai-58 (merged PRs #24, #25)
-arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "471a7c5aebf76f8f127076d78d9d3661ebe065af" }    # branch: spiceai-58 (merged PRs #24, #25)
-arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "471a7c5aebf76f8f127076d78d9d3661ebe065af" }    # branch: spiceai-58 (merged PRs #24, #25)
-arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "471a7c5aebf76f8f127076d78d9d3661ebe065af" } # branch: spiceai-58 (merged PRs #24, #25)
-arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "471a7c5aebf76f8f127076d78d9d3661ebe065af" } # branch: spiceai-58 (merged PRs #24, #25)
-arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "471a7c5aebf76f8f127076d78d9d3661ebe065af" } # branch: spiceai-58 (merged PRs #24, #25)
-parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "471a7c5aebf76f8f127076d78d9d3661ebe065af" }      # branch: spiceai-58 (merged PRs #24, #25)
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "51624e0989ce553867f0f681ba62d9cf9cbb9ac7" }        # branch: spiceai-58 (+ Decimal->Float correct rounding, spiceai/arrow-rs#26, spiceai/spiceai#13978)
+arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "51624e0989ce553867f0f681ba62d9cf9cbb9ac7" }  # branch: spiceai-58 (+ Decimal->Float correct rounding, spiceai/arrow-rs#26, spiceai/spiceai#13978)
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "51624e0989ce553867f0f681ba62d9cf9cbb9ac7" }  # branch: spiceai-58 (+ Decimal->Float correct rounding, spiceai/arrow-rs#26, spiceai/spiceai#13978)
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "51624e0989ce553867f0f681ba62d9cf9cbb9ac7" } # branch: spiceai-58 (+ Decimal->Float correct rounding, spiceai/arrow-rs#26, spiceai/spiceai#13978)
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "51624e0989ce553867f0f681ba62d9cf9cbb9ac7" }   # branch: spiceai-58 (+ Decimal->Float correct rounding, spiceai/arrow-rs#26, spiceai/spiceai#13978)
+arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "51624e0989ce553867f0f681ba62d9cf9cbb9ac7" }    # branch: spiceai-58 (+ Decimal->Float correct rounding, spiceai/arrow-rs#26, spiceai/spiceai#13978)
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "51624e0989ce553867f0f681ba62d9cf9cbb9ac7" }   # branch: spiceai-58 (+ Decimal->Float correct rounding, spiceai/arrow-rs#26, spiceai/spiceai#13978)
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "51624e0989ce553867f0f681ba62d9cf9cbb9ac7" } # branch: spiceai-58 (+ Decimal->Float correct rounding, spiceai/arrow-rs#26, spiceai/spiceai#13978)
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "51624e0989ce553867f0f681ba62d9cf9cbb9ac7" }    # branch: spiceai-58 (+ Decimal->Float correct rounding, spiceai/arrow-rs#26, spiceai/spiceai#13978)
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "51624e0989ce553867f0f681ba62d9cf9cbb9ac7" }   # branch: spiceai-58 (+ Decimal->Float correct rounding, spiceai/arrow-rs#26, spiceai/spiceai#13978)
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "51624e0989ce553867f0f681ba62d9cf9cbb9ac7" }    # branch: spiceai-58 (+ Decimal->Float correct rounding, spiceai/arrow-rs#26, spiceai/spiceai#13978)
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "51624e0989ce553867f0f681ba62d9cf9cbb9ac7" }    # branch: spiceai-58 (+ Decimal->Float correct rounding, spiceai/arrow-rs#26, spiceai/spiceai#13978)
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "51624e0989ce553867f0f681ba62d9cf9cbb9ac7" } # branch: spiceai-58 (+ Decimal->Float correct rounding, spiceai/arrow-rs#26, spiceai/spiceai#13978)
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "51624e0989ce553867f0f681ba62d9cf9cbb9ac7" } # branch: spiceai-58 (+ Decimal->Float correct rounding, spiceai/arrow-rs#26, spiceai/spiceai#13978)
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "51624e0989ce553867f0f681ba62d9cf9cbb9ac7" } # branch: spiceai-58 (+ Decimal->Float correct rounding, spiceai/arrow-rs#26, spiceai/spiceai#13978)
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "51624e0989ce553867f0f681ba62d9cf9cbb9ac7" }      # branch: spiceai-58 (+ Decimal->Float correct rounding, spiceai/arrow-rs#26, spiceai/spiceai#13978)
 
 vortex = { git = "https://github.com/spiceai/vortex.git", rev = "3c5246867e627158211e8eafab7be55b0dc559f8" } # branch: spiceai-54 (vortex 0.79.0)
 vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "3c5246867e627158211e8eafab7be55b0dc559f8" } # branch: spiceai-54 (vortex 0.79.0)
