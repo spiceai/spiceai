@@ -639,7 +639,7 @@ reclaiming space is then the remedy that fixes both. Unlike disk there is no
 after-the-fact backstop: the endpoint may well be answering again by the time the
 run ends, so the only evidence is what the build said while it was failing.
 
-### "The linker crashed on the runner, so nothing was built"
+### "The linker crashed on the runner, so the build did not finish"
 
 The compiler driver can lose the linker to a signal — a crash in `ld` itself, or
 the kernel killing it for memory — and reports it in its own words, with a crash
@@ -652,19 +652,26 @@ clang: note: diagnostic msg: /var/folders/…/T/linker-crash-122a1e
 error: could not compile `cayenne` (test "result_correctness_vs_sqlite_test") due to 1 previous error
 ```
 
-**Re-dispatch it.** Nothing was linked, so no test ran and no lint verdict was
-reached; the run is not a statement about your branch. The hedge is the same as
-for an unloadable test binary: if it recurs on this branch alone, or names a
-crate whose build this branch changes — a new build script, a dependency whose
-objects the linker cannot digest — the diff is worth suspecting.
+**Re-dispatch it.** The binary being linked was never produced, so the sign-off
+stopped there: whatever passed before it stands (the run above had already cleared
+lint), and nothing after it ran. None of that is a statement about your branch.
+The hedge is the same as for an unloadable test binary: if it recurs on this
+branch alone, or names a crate whose build this branch changes — a new build
+script, a dependency whose objects the linker cannot digest — the diff is worth
+suspecting.
 
-The same watcher reads this signature, and both halves are required: the driver
-reporting a signal *and* cargo's `could not compile` line. This repo's own suites
-assert on error strings, so a test that quotes the driver's wording and then
-fails stays a verdict about the branch, and cargo's line alone is every ordinary
-compile error. Disk, cache, and an unloadable artifact all outrank it when they
-appear alongside, because each of those names a cause with its own remedy where
-this one only names the symptom.
+The same watcher reads this signature, and both halves are required: the
+compiler driver reporting a signal under its own `<driver>: error:` prefix at the
+start of the line (`clang`, `cc`, `gcc`, `g++`, `collect2` and their C++ spellings),
+*and* cargo's `could not compile` line. This repo's own suites assert on error
+strings, so a test that quotes the driver's wording and then fails stays a
+verdict about the branch; a `compile_error!` or build script whose text reads
+like a crash — prefix included — lands behind rustc's own `error:` rather than at
+the start of the line, and stays one too; and cargo's line alone is every
+ordinary compile error. Disk,
+cache, and an unloadable artifact all outrank it when they appear alongside,
+because each of those names a cause with its own remedy where this one only
+names the symptom.
 
 ### External contributors (forks)
 

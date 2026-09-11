@@ -1140,6 +1140,32 @@ assert_recorder "leaves an ordinary compile failure unmarked despite cargo's sum
    echo "error: could not compile \`runtime\` (lib) due to 1 previous error"
    exit 101' \
   101 no "E0308" no no no
+# The words alone, under rustc's own `error:` rather than the driver's, are a
+# defect the branch wrote — a `compile_error!` or a build script quoting them —
+# and cargo's summary follows a defect just as it follows a crash. Only the
+# driver's prefix tells the two apart.
+assert_recorder "leaves a compile error worded like a crash unmarked" \
+  'echo "error: linker command failed due to signal"
+   echo "  --> crates/runtime/build.rs:1:1"
+   echo "error: could not compile \`runtime\` (build script) due to 1 previous error"
+   exit 101' \
+  101 no "build.rs" no no no
+# The complete driver diagnostic, prefix included, quoted under rustc's own
+# `error:` — a `compile_error!` that copied the wording, or a build script that
+# echoed it and then failed for its own reasons. The driver itself never prints
+# behind another prefix, so only a line-start anchor tells this from the real one.
+assert_recorder "leaves a quoted driver diagnostic under rustc's error prefix unmarked" \
+  'echo "error: clang: error: linker command failed due to signal (use -v to see invocation)"
+   echo "  --> crates/runtime/build.rs:3:5"
+   echo "error: could not compile \`runtime\` (build script) due to 1 previous error"
+   exit 101' \
+  101 no "build.rs" no no no
+# GNU's driver reports the same death through collect2.
+assert_recorder "records the GNU driver's spelling of a linker killed by a signal" \
+  'echo "collect2: error: ld terminated with signal 11 [Segmentation fault]"
+   echo "error: could not compile \`cayenne\` (lib) due to 1 previous error"
+   exit 101' \
+  101 no "collect2" no no yes
 # Disk wins over a crash, as it wins over the other two: a volume at zero can
 # take the linker down too, and reclaiming space is the remedy that fixes both.
 assert_recorder "reports disk, not the crash, when the volume filled as well" \
@@ -1622,7 +1648,7 @@ assert_describe "tells the author to re-dispatch rather than to read the log" 10
 # name the remedy: run 33041791988 published "Sign-off checks failed after
 # 5975s" for a crash on a crate the branch never touched (#13614).
 assert_describe "says a crashed linker could not complete, not that checks failed" 101 \
-  "Sign-off could not complete after 21195s — the linker crashed on the runner, so nothing was built; re-dispatch (triggered by someone)" \
+  "Sign-off could not complete after 21195s — the linker crashed on the runner, so the build did not finish; re-dispatch (triggered by someone)" \
   "the checks did not complete" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 assert_describe_lacks "does not call a crashed linker a check failure" 101 \
