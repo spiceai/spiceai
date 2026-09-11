@@ -410,7 +410,11 @@ impl RuntimeBuilder {
         let cayenne_segment_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_SEGMENT_CACHE_MB_PARAM);
         log_applied_cayenne_param(CAYENNE_SEGMENT_CACHE_MB_PARAM, cayenne_segment_cache_mb);
-        install_segment_cache(cayenne_segment_cache_mb);
+        // The cache decision must exist before a Cayenne table added through DDL can
+        // initialize, but an initially non-Cayenne Spicepod has no user-visible
+        // Cayenne cache to report at startup.
+        let cayenne_configured = cayenne_workload(self.app.as_ref()).is_configured();
+        install_segment_cache(cayenne_segment_cache_mb, cayenne_configured);
         let cayenne_filter_propagation = parse_cayenne_filter_propagation(&spicepod_rt.params);
 
         // Process-global SQLite metastore pragma tuning (cache, mmap, busy
@@ -1081,7 +1085,7 @@ fn segment_cache_budget_bytes(configured_mb: Option<usize>) -> u64 {
 /// nothing until something inserts into it, so installing costs nothing, while
 /// reserving against the query pool for a cache no table can read would shrink
 /// every other query's budget for nothing.
-fn install_segment_cache(configured_mb: Option<usize>) {
+fn install_segment_cache(configured_mb: Option<usize>, cayenne_configured: bool) {
     // `runtime.params.cayenne_segment_cache_mb` is the only input. Per-table values
     // sized a per-table cache; there is no conversion from them to a shared budget
     // that is not invented, and a single dataset's setting must not decide the
@@ -1095,7 +1099,7 @@ fn install_segment_cache(configured_mb: Option<usize>) {
         vortex_datafusion::install_process_segment_cache(0);
         return;
     }
-    if vortex_datafusion::install_process_segment_cache(bytes) {
+    if vortex_datafusion::install_process_segment_cache(bytes) && cayenne_configured {
         tracing::info!(
             "Vortex segment cache installed: {} MB shared across all Cayenne tables",
             bytes / (1024 * 1024)
