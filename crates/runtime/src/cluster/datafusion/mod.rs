@@ -274,3 +274,114 @@ mod null_aware_anti_join {
         assert!(join.null_aware);
     }
 }
+
+/// Guards the reset-partition status handling the `spiceai/datafusion-ballista`
+/// fork carries (fork PR #53).
+///
+/// An executor that is lost — or merely heartbeat-timed-out — has its stages reset,
+/// and a reset clears the per-partition task info. Its status updates are already
+/// on the wire when that happens, so the scheduler receives a status for a
+/// partition it no longer has a task for. Upstream
+/// `RunningStage::update_task_info` unwraps that `None`, and the panic lands on
+/// the scheduler event-loop worker: the event channel closes, and from then on
+/// every job submission and every executor heartbeat fails with `Fail to send
+/// event due to channel closed`. One late packet wedges the whole cluster, and
+/// nothing in the failure names the query that caused it.
+///
+/// Asserted against the patched function directly, on a stage in exactly the state
+/// a reset leaves behind — `RunningStage::new` initialises `task_infos` to all
+/// `None`, which is what "no task scheduled on this partition" is. Driving the
+/// real `reset_stages_on_lost_executor` would be closer to the incident, but the
+/// scheduler's task-issuing API (`ExecutionGraph::pop_next_task`) is `#[cfg(test)]`
+/// on the fork, so it is unreachable from here — and being `#[cfg(test)]` is also
+/// why the fork's own coverage of this leaves with the branch that gets re-cut.
+///
+/// What this cannot check is the other half of the same function: nothing public
+/// constructs a `TaskInfo`, so there is no way from here to put a partition into
+/// the scheduled state and assert that an ordinary status is still accepted. A
+/// regression that refused *every* status would pass this guard; it would not
+/// survive a cluster run, which is where that half is covered.
+#[cfg(test)]
+mod stale_status_for_a_reset_partition {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use ballista_core::extension::SessionConfigExt;
+    use ballista_core::serde::protobuf::{
+        ShuffleWritePartition, SuccessfulTask, TaskStatus, task_status,
+    };
+    use ballista_scheduler::state::execution_stage::RunningStage;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::execution::context::SessionConfig;
+    use datafusion::physical_plan::empty::EmptyExec;
+
+    /// The status an executor sends when a task finishes.
+    fn completed(partition_id: u32, executor_id: &str) -> TaskStatus {
+        TaskStatus {
+            task_id: 7,
+            job_id: "job".to_string(),
+            stage_id: 1,
+            stage_attempt_num: 0,
+            partition_id,
+            launch_time: 0,
+            start_exec_time: 0,
+            end_exec_time: 0,
+            metrics: vec![],
+            status: Some(task_status::Status::Successful(SuccessfulTask {
+                executor_id: executor_id.to_owned(),
+                partitions: vec![ShuffleWritePartition {
+                    partition_id: u64::from(partition_id),
+                    path: format!("/job/1/{partition_id}"),
+                    num_batches: 1,
+                    num_rows: 1,
+                    num_bytes: 1,
+                }],
+            })),
+        }
+    }
+
+    fn reset_stage(partitions: usize) -> RunningStage {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        RunningStage::new(
+            1,
+            0,
+            Arc::new(EmptyExec::new(schema)),
+            partitions,
+            vec![],
+            HashMap::new(),
+            Arc::new(SessionConfig::new_with_ballista()),
+        )
+    }
+
+    /// A status for a partition that has no task scheduled on it must be refused,
+    /// and the stage must be left as it was.
+    #[test]
+    fn a_status_for_a_partition_with_no_scheduled_task_is_refused() {
+        let mut stage = reset_stage(2);
+        assert_eq!(
+            stage.available_tasks(),
+            2,
+            "a freshly reset stage has no task scheduled on any partition",
+        );
+
+        let accepted = stage.update_task_info(0, completed(0, "executor-that-is-lost"));
+
+        assert!(
+            !accepted,
+            "a status for a partition whose task was reset must be refused; unwrapping the \
+             missing task info panics on the scheduler's event-loop worker and closes the event \
+             channel, after which no job submission or executor heartbeat is accepted at all"
+        );
+        assert_eq!(
+            stage.available_tasks(),
+            2,
+            "the refused status still marked the partition scheduled, so a packet from an \
+             executor that is gone partly undid the reset",
+        );
+        assert_eq!(
+            stage.scheduled_tasks(),
+            0,
+            "the refused status was recorded as a scheduled task",
+        );
+    }
+}
