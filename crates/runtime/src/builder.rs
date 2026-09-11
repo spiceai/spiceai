@@ -413,7 +413,7 @@ impl RuntimeBuilder {
         // The cache decision must exist before a Cayenne table added through DDL can
         // initialize, but an initially non-Cayenne Spicepod has no user-visible
         // Cayenne cache to report at startup.
-        let cayenne_configured = cayenne_workload(self.app.as_ref()).is_configured();
+        let cayenne_configured = cayenne_configured_for_startup_log(self.app.as_ref());
         install_segment_cache(cayenne_segment_cache_mb, cayenne_configured);
         let cayenne_filter_propagation = parse_cayenne_filter_propagation(&spicepod_rt.params);
 
@@ -1454,6 +1454,24 @@ fn reads_from_cayenne_catalog(app: &Arc<app::App>) -> bool {
             .next()
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cayenne"))
     })
+}
+
+/// Whether the pod has anything a user would call "Cayenne" at startup — the
+/// same union [`estimate_cayenne_reservation_bytes`] uses to decide whether the
+/// pod draws on the shared segment cache. A `from: cayenne` catalog declares no
+/// acceleration of its own (see [`reads_from_cayenne_catalog`]), so gating the
+/// startup log on [`CayenneWorkload::is_configured`] alone would suppress it for
+/// a catalog-only pod even though that pod installs and uses the cache.
+#[cfg(not(windows))]
+fn cayenne_configured_for_startup_log(app: Option<&Arc<app::App>>) -> bool {
+    cayenne_workload(app).is_configured() || app.is_some_and(reads_from_cayenne_catalog)
+}
+
+/// Cayenne is not compiled on Windows (`accelerator-cayenne` is a
+/// `cfg(not(windows))` dependency), so no catalog can read from it either.
+#[cfg(windows)]
+fn cayenne_configured_for_startup_log(app: Option<&Arc<app::App>>) -> bool {
+    cayenne_workload(app).is_configured()
 }
 
 /// Every enabled Cayenne acceleration in `app`, paired with its RESOLVED write
