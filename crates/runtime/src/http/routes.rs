@@ -537,7 +537,7 @@ pub(crate) fn routes(
                 )
             }
         };
-        let mcp_service = EpochReloadingMcpService::new(schema_snapshot, rebuild);
+        let mcp_service = EpochReloadingMcpService::new(&schema_snapshot, rebuild);
 
         tracing::debug!(
             "MCP request body size limit set to {} bytes",
@@ -801,12 +801,17 @@ impl<T: Clone> EpochReloading<T> {
 
     #[cfg(test)]
     fn snapshot(&self) -> (u64, T) {
-        let inner = self
-            .inner
-            .read()
-            .expect("epoch reload lock is not poisoned in tests");
-        let loaded = self.loaded_epoch.load(Ordering::Acquire);
-        (loaded, inner.clone())
+        match self.inner.read() {
+            Ok(inner) => {
+                let loaded = self.loaded_epoch.load(Ordering::Acquire);
+                (loaded, inner.clone())
+            }
+            Err(poisoned) => {
+                let inner = poisoned.into_inner();
+                let loaded = self.loaded_epoch.load(Ordering::Acquire);
+                (loaded, inner.clone())
+            }
+        }
     }
 }
 
@@ -819,13 +824,13 @@ struct EpochReloadingMcpService {
 #[cfg(feature = "mcp")]
 impl EpochReloadingMcpService {
     fn new(
-        schemas: Arc<McpSchemaSnapshot>,
+        schemas: &Arc<McpSchemaSnapshot>,
         rebuild: impl Fn() -> StreamableHttpService<RuntimeServer, LocalSessionManager>
         + Send
         + Sync
         + 'static,
     ) -> Self {
-        let epoch_schemas = Arc::clone(&schemas);
+        let epoch_schemas = Arc::clone(schemas);
         Self {
             state: Arc::new(EpochReloading::new(
                 schemas.epoch(),
