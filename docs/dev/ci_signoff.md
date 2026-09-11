@@ -639,11 +639,12 @@ reclaiming space is then the remedy that fixes both. Unlike disk there is no
 after-the-fact backstop: the endpoint may well be answering again by the time the
 run ends, so the only evidence is what the build said while it was failing.
 
-### "The linker crashed on the runner, so the build did not finish"
+### "A compiler subprocess crashed on the runner, so the build did not finish"
 
-The compiler driver can lose the linker to a signal — a crash in `ld` itself, or
-the kernel killing it for memory — and reports it in its own words, with a crash
-snapshot beside them; cargo then stops the build at that crate:
+The compiler driver can lose a subprocess to a signal — a crash in `ld` itself,
+the kernel killing it for memory, or the driver's own frontend going down the
+same way — and reports it in its own words, with a crash snapshot beside them;
+cargo then stops the build at that crate:
 
 ```
 clang: error: unable to execute command: Segmentation fault: 11
@@ -652,7 +653,16 @@ clang: note: diagnostic msg: /var/folders/…/T/linker-crash-122a1e
 error: could not compile `cayenne` (test "result_correctness_vs_sqlite_test") due to 1 previous error
 ```
 
-**Re-dispatch it.** The binary being linked was never produced, so the sign-off
+The driver words a crash in its own frontend the same way, so the status names
+the class rather than the tool:
+
+```
+clang: error: unable to execute command: Segmentation fault: 11
+clang: error: clang frontend command failed due to signal (use -v to see invocation)
+error: could not compile `spiced` (lib) due to 1 previous error
+```
+
+**Re-dispatch it.** The artifact being produced never appeared, so the sign-off
 stopped there: whatever passed before it stands (the run above had already cleared
 lint), and nothing after it ran. None of that is a statement about your branch.
 The hedge is the same as for an unloadable test binary: if it recurs on this

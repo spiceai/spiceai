@@ -899,11 +899,13 @@ readonly CORRUPT_ARTIFACT_PATTERN='Malformed Mach-o file|Exec format error'
 # which is where a corrupt artifact is met first (#13518).
 readonly TEST_LIST_FAILURE_PATTERN='error: creating test list failed'
 
-# The compiler driver reporting that a tool it ran — the linker, on every run
-# seen so far — died of a signal rather than returning a diagnostic. `clang`
-# prints the first form with the signal's name and the second on its way out;
-# both are its own words for its own crash, and it writes a crash snapshot
-# beside them. GNU's driver says it through `collect2`, whose signal path is a
+# The compiler driver reporting that a subprocess it ran died of a signal
+# rather than returning a diagnostic — the linker on every run seen so far,
+# but the driver words a crash in its own frontend identically (`clang: error:
+# unable to execute command: Segmentation fault: 11`), so this names the class
+# and not the tool. `clang` prints the first form with the signal's name and
+# the second on its way out; both are its own words for its own crash, and it
+# writes a crash snapshot beside them. GNU's driver says it through `collect2`, whose signal path is a
 # `fatal error:` rather than an `error:`. `Killed: 9` is the same class from
 # the other side: the kernel taking the linker for memory.
 #
@@ -1376,9 +1378,12 @@ describe_check_failure() {
       SIGNOFF_FAILURE_MESSAGE="sign-off aborted: a test binary on the runner would not load, so nextest never ran the suite (the checks did not complete) — re-dispatch"
       ;;
     toolchain-crash)
-      # The compiler driver reported that the linker died of a signal, and cargo
-      # stopped the build at that crate: the binary it was linking was never
-      # produced, so the step that needed it never ran. Whatever passed before
+      # The compiler driver reported that a subprocess it ran died of a signal,
+      # and cargo stopped the build at that crate: the artifact it was producing
+      # never appeared, so the step that needed it never ran. The wording says
+      # "a compiler subprocess" rather than "the linker" because the driver's
+      # `unable to execute command: <signal>` line covers a frontend crash too,
+      # and naming the wrong tool sends the author looking in the wrong place. Whatever passed before
       # that point stands — run 33041791988 had already cleared lint — which is
       # why this says "did not complete" and not "nothing ran". Worded like the
       # other kinds that reached no verdict, because the generic "checks
@@ -1391,9 +1396,9 @@ describe_check_failure() {
       # whose objects the linker cannot digest — and this cannot tell. A
       # recurrence on this branch alone, or on a crate whose build this branch
       # changes, is worth suspecting the diff for.
-      SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not complete after ${elapsed}s — the linker crashed on the runner, so the build did not finish; re-dispatch (triggered by ${user})"
-      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — the compiler driver reported that the linker died of a signal (a crash or an out-of-memory kill, not a diagnostic), and cargo stopped the build at that crate, so **the checks did not complete**: the binary being linked was never produced and nothing after it ran, while whatever passed before it stands. That is the runner's toolchain failing on its own, not a statement about the branch. Re-dispatch the sign-off. If it recurs on this branch alone, or names a crate whose build this branch changes, the diff is worth suspecting."$'\n'
-      SIGNOFF_FAILURE_MESSAGE="sign-off aborted: the linker crashed on the runner, so the build did not finish (the checks did not complete) — re-dispatch"
+      SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not complete after ${elapsed}s — a compiler subprocess crashed on the runner, so the build did not finish; re-dispatch (triggered by ${user})"
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — the compiler driver reported that a subprocess it ran died of a signal (a crash or an out-of-memory kill, not a diagnostic) — the linker on every run seen so far, though the driver words a frontend crash the same way — and cargo stopped the build at that crate, so **the checks did not complete**: the binary being linked was never produced and nothing after it ran, while whatever passed before it stands. That is the runner's toolchain failing on its own, not a statement about the branch. Re-dispatch the sign-off. If it recurs on this branch alone, or names a crate whose build this branch changes, the diff is worth suspecting."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off aborted: a compiler subprocess crashed on the runner, so the build did not finish (the checks did not complete) — re-dispatch"
       ;;
     missing-target)
       # Neither of the two readings above: the runner is fine and the code was

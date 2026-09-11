@@ -1119,6 +1119,18 @@ assert_recorder "records a linker that died of a signal" \
    echo "make: *** [nextest] Error 101"
    exit 101' \
   101 no "Segmentation fault" no no yes
+# The driver words a crash in its own frontend identically — `unable to execute
+# command: <signal>` names the subprocess only by its signal — so this signature
+# is the same no-verdict class one step earlier, with no linker involved at all.
+# Recorded rather than excluded: narrowing to the linker would send a frontend
+# crash back to the generic "checks failed" this kind exists to replace, and the
+# published wording therefore names the class and not the tool.
+assert_recorder "records the driver's own frontend dying of a signal, not just the linker" \
+  'echo "clang: error: unable to execute command: Segmentation fault: 11"
+   echo "clang: error: clang frontend command failed due to signal (use -v to see invocation)"
+   echo "error: could not compile \`spiced\` (lib) due to 1 previous error"
+   exit 101' \
+  101 no "Segmentation fault" no no yes
 # The same pool has killed a linker for memory, which the driver reports in the
 # same channel with the kernel's wording.
 assert_recorder "records a linker the kernel killed" \
@@ -1408,7 +1420,7 @@ assert_failure_kind "ignores an artifact flag when nothing watched the build" 10
 # and cargo stopped there, and none of the three causes above went past. Distinct
 # from "checks" for the same reason as every kind above — nothing about the
 # branch was judged (#13614).
-assert_failure_kind "calls a linker that died of a signal its own kind, not a check failure" 101 "toolchain-crash" \
+assert_failure_kind "calls a compiler subprocess that died of a signal its own kind, not a check failure" 101 "toolchain-crash" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 # The three named causes outrank the symptom, because each carries its own remedy.
 assert_failure_kind "reports disk when the volume filled and the linker died" 101 "disk" \
@@ -1645,14 +1657,16 @@ assert_describe "tells the author to re-dispatch rather than to read the log" 10
   "Sign-off could not complete after 21195s — a test binary on the runner would not load; re-dispatch (triggered by someone)" \
   "re-dispatch" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_ARTIFACT_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
-# A linker that died of a signal has to say so in the commit status too, and
-# name the remedy: run 33041791988 published "Sign-off checks failed after
-# 5975s" for a crash on a crate the branch never touched (#13614).
-assert_describe "says a crashed linker could not complete, not that checks failed" 101 \
-  "Sign-off could not complete after 21195s — the linker crashed on the runner, so the build did not finish; re-dispatch (triggered by someone)" \
+# A compiler subprocess that died of a signal has to say so in the commit status
+# too, and name the remedy: run 33041791988 published "Sign-off checks failed
+# after 5975s" for a crash on a crate the branch never touched (#13614). The
+# status names the class, not the tool, because the driver's signature does not
+# distinguish its frontend from the linker.
+assert_describe "says a crashed compiler subprocess could not complete, not that checks failed" 101 \
+  "Sign-off could not complete after 21195s — a compiler subprocess crashed on the runner, so the build did not finish; re-dispatch (triggered by someone)" \
   "the checks did not complete" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
-assert_describe_lacks "does not call a crashed linker a check failure" 101 \
+assert_describe_lacks "does not call a crashed compiler subprocess a check failure" 101 \
   "checks failed" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 assert_describe "still publishes a genuine check failure" 101 \
