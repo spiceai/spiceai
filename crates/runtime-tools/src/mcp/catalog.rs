@@ -542,8 +542,11 @@ impl McpToolCatalog {
         &self,
         name: &str,
     ) -> std::result::Result<Option<rmcp::model::Tool>, ServiceError> {
-        if self.cache_is_fresh() {
-            return Ok(self.cached_tool(name));
+        // A listed spec is what `try_get` validated. Refreshing on TTL
+        // expiry here lets dispatch execute Zone while Streamable HTTP
+        // still authorized Region (`validated=Region executed=Zone`).
+        if let Some(tool) = self.cached_tool(name) {
+            return Ok(Some(tool));
         }
         match self.list_tools().await {
             Ok(_) => Ok(self.cached_tool(name)),
@@ -1065,6 +1068,21 @@ mod tests {
         assert!(
             !cache.tools.contains_key("b0"),
             "the accompanying new name must still be refused at the cap"
+        );
+    }
+
+    #[test]
+    fn expired_cache_still_dispatches_the_listed_spec() {
+        let mut cache = ToolListCache::default();
+        apply_tool_cache(&mut cache, &[listed_deploy_with_header("Region")], true, 0);
+        assert!(
+            !list_cache_is_fresh(cache.expires_at, Instant::now()),
+            "ttlMs 0 is immediately stale"
+        );
+        assert_eq!(
+            cache.tools.get("deploy").and_then(x_mcp_header),
+            Some("Region"),
+            "try_get / get_tool keep Region after expiry so dispatch cannot run Zone"
         );
     }
 

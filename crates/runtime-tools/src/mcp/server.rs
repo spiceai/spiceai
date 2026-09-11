@@ -359,13 +359,23 @@ impl RuntimeServer {
         let tools = self.tools.read().await;
         if let Some((catalog_name, name)) = decode_tool_name(tool_name)
             && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
-            && let Some(tool) = catalog.get(&name).await
         {
-            return Some(ResolvedTool {
-                tool,
-                exposed_name: encode_tool_name(&catalog_name, &name),
-                catalog: Some(catalog_name),
-            });
+            // Prefer `try_get` — the same spec `ServerHandler::get_tool`
+            // used for `Mcp-Param-*`. `get` may refresh an expired TTL
+            // (`validated=Region executed=Zone`). A cache miss still
+            // falls through to `get` so an unlisted tool can load.
+            let tool = if let Some(tool) = catalog.try_get(&name) {
+                Some(tool)
+            } else {
+                catalog.get(&name).await
+            };
+            if let Some(tool) = tool {
+                return Some(ResolvedTool {
+                    tool,
+                    exposed_name: encode_tool_name(&catalog_name, &name),
+                    catalog: Some(catalog_name),
+                });
+            }
         }
         // Fall back to a direct (non-catalog) lookup. This covers top-level
         // tools whose names legitimately contain the `__` catalog separator.
@@ -823,7 +833,7 @@ mod tests {
             &self,
             _arg: &str,
         ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(json!({ "ok": true }))
+            Ok(json!({ "executed": "Zone" }))
         }
     }
 
@@ -849,7 +859,7 @@ mod tests {
             &self,
             _arg: &str,
         ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(json!({ "ok": true }))
+            Ok(json!({ "executed": "Region" }))
         }
     }
 
@@ -2589,6 +2599,100 @@ mod tests {
                 .and_then(Value::as_i64)
                 != Some(-32020),
             "matching Zone header must not raise HeaderMismatch: {json}"
+        );
+    }
+
+    /// `try_get` keeps the expired Region schema; `get` refreshes to
+    /// Zone. rmcp validates via `try_get`/snapshot, then dispatch used
+    /// to call `get` (`validated=Region executed=Zone accepted=True`).
+    #[tokio::test]
+    async fn expired_try_get_schema_must_not_dispatch_refreshed_tool() {
+        struct ExpiredThenRefreshCatalog;
+
+        #[async_trait::async_trait]
+        impl SpiceToolCatalog for ExpiredThenRefreshCatalog {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn name(&self) -> &'static str {
+                "srv"
+            }
+            async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                vec![Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>]
+            }
+            async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                (name == "deploy").then(|| Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>)
+            }
+            fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                (name == "deploy").then(|| Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>)
+            }
+            fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                vec![Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>]
+            }
+        }
+
+        let exposed = encode_tool_name("srv", "deploy");
+        let mut tools = HashMap::new();
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(ExpiredThenRefreshCatalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+        let tools = Arc::new(RwLock::new(tools));
+        let schemas = McpSchemaSnapshot::new();
+        schemas.replace_from_map(&*tools.read().await);
+
+        let validated = ServerHandler::get_tool(
+            &RuntimeServer::with_schema_snapshot(Arc::clone(&tools), Arc::clone(&schemas)),
+            &exposed,
+        );
+        assert_eq!(
+            validated.as_ref().and_then(x_mcp_header_region),
+            Some("Region"),
+            "validated=Region from the expired try_get/snapshot"
+        );
+
+        let factory_tools = Arc::clone(&tools);
+        let factory_schemas = Arc::clone(&schemas);
+        let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(true)
+            .disable_allowed_hosts()
+            .with_json_response(true);
+        let sessions = Arc::new(
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+        );
+        let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            move || {
+                Ok(RuntimeServer::with_schema_snapshot(
+                    Arc::clone(&factory_tools),
+                    Arc::clone(&factory_schemas),
+                ))
+            },
+            sessions,
+            config,
+        );
+
+        let (status, json) =
+            post_tools_call(&service, &exposed, Some("us-west1"), "us-west1").await;
+        assert!(
+            status.is_success(),
+            "Region header matches the validated schema: {status} {json}"
+        );
+        let executed = json
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .and_then(|body| {
+                body.get("executed")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            });
+        assert_eq!(
+            executed.as_deref(),
+            Some("Region"),
+            "validated=Region executed=Zone accepted=True is the reported miss: {json}"
         );
     }
 }
