@@ -21,7 +21,28 @@ use tracing_log::{
     log::{self, Level, LevelFilter, Log, Metadata, Record, SetLoggerError},
 };
 
-const OPENDAL_RETRY_TARGET: &str = "opendal::layers::retry";
+static DEFAULT_RULES: &[&dyn LogTransformRule] = &[&OpenDalS3ReadRetryRule];
+
+/// Recognizes a dependency diagnostic and supplies its replacement message.
+///
+/// Rules are tried in registration order until one returns a transformation.
+/// Return `None` for unsupported records so later rules can try them, or the
+/// original record can pass through unchanged if no rule matches.
+trait LogTransformRule: Send + Sync {
+    fn transform(&self, record: &Record<'_>) -> Option<LogTransform>;
+}
+
+/// Replaces the message while preserving the record's level and source metadata.
+struct LogTransform {
+    message: String,
+    diagnostic: Option<LogDiagnostic>,
+}
+
+/// Optional detail emitted at DEBUG, with the message escaped onto one line.
+struct LogDiagnostic {
+    label: &'static str,
+    message: String,
+}
 
 pub(super) fn init() -> Result<(), SetLoggerError> {
     log::set_boxed_logger(Box::new(DependencyLogTracer::default()))?;
@@ -29,9 +50,18 @@ pub(super) fn init() -> Result<(), SetLoggerError> {
     Ok(())
 }
 
-#[derive(Default)]
 struct DependencyLogTracer {
     inner: LogTracer,
+    rules: &'static [&'static dyn LogTransformRule],
+}
+
+impl Default for DependencyLogTracer {
+    fn default() -> Self {
+        Self {
+            inner: LogTracer::default(),
+            rules: DEFAULT_RULES,
+        }
+    }
 }
 
 impl DependencyLogTracer {
@@ -59,29 +89,53 @@ impl Log for DependencyLogTracer {
             return;
         }
 
-        if record.target() == OPENDAL_RETRY_TARGET && record.level() == Level::Warn {
-            // OpenDAL's default retry interceptor formats its error into the
-            // log record. Recognize only the supported diagnostic; a different
-            // error or dependency format must still reach the normal bridge.
-            let diagnostic = record.args().to_string();
-            if let Some(message) = s3_read_retry_message(&diagnostic) {
-                // Forward directly to preserve source locations and the current
-                // span, and avoid re-entering the global dependency logger.
-                self.forward(record, Level::Warn, format_args!("{message}"));
-                self.forward(
-                    record,
-                    Level::Debug,
-                    format_args!("S3 read retry diagnostic: {diagnostic:?}"),
-                );
-                return;
-            }
-        }
+        let Some(transform) = self.rules.iter().find_map(|rule| rule.transform(record)) else {
+            self.inner.log(record);
+            return;
+        };
 
-        self.inner.log(record);
+        // Forward directly to preserve source locations and the current span,
+        // and avoid re-entering the global dependency logger.
+        self.forward(
+            record,
+            record.level(),
+            format_args!("{}", transform.message),
+        );
+        if let Some(diagnostic) = transform.diagnostic {
+            self.forward(
+                record,
+                Level::Debug,
+                format_args!("{}: {:?}", diagnostic.label, diagnostic.message),
+            );
+        }
     }
 
     fn flush(&self) {
         self.inner.flush();
+    }
+}
+
+const OPENDAL_RETRY_TARGET: &str = "opendal::layers::retry";
+
+struct OpenDalS3ReadRetryRule;
+
+impl LogTransformRule for OpenDalS3ReadRetryRule {
+    fn transform(&self, record: &Record<'_>) -> Option<LogTransform> {
+        if record.target() != OPENDAL_RETRY_TARGET || record.level() != Level::Warn {
+            return None;
+        }
+
+        // OpenDAL's default retry interceptor formats its error into the log
+        // record. Recognize only the supported diagnostic; a different error
+        // or dependency format must still reach the normal bridge.
+        let diagnostic = record.args().to_string();
+        Some(LogTransform {
+            message: s3_read_retry_message(&diagnostic)?,
+            diagnostic: Some(LogDiagnostic {
+                label: "S3 read retry diagnostic",
+                message: diagnostic,
+            }),
+        })
     }
 }
 
@@ -250,6 +304,22 @@ mod tests {
     }
 
     fn output(filter: &str, target: &str, level: Level, message: &str) -> String {
+        output_with_tracer(
+            &DependencyLogTracer::default(),
+            filter,
+            target,
+            level,
+            message,
+        )
+    }
+
+    fn output_with_tracer(
+        tracer: &DependencyLogTracer,
+        filter: &str,
+        target: &str,
+        level: Level,
+        message: &str,
+    ) -> String {
         let writer = Writer::default();
         let subscriber = tracing_subscriber::registry()
             .with(EnvFilter::new(filter))
@@ -260,7 +330,7 @@ mod tests {
                     .with_writer(writer.clone()),
             );
         tracing::subscriber::with_default(subscriber, || {
-            DependencyLogTracer::default().log(
+            tracer.log(
                 &Record::builder()
                     .target(target)
                     .level(level)
@@ -269,6 +339,104 @@ mod tests {
             );
         });
         String::from_utf8(writer.0.lock().expect("writer lock").clone()).expect("UTF-8 log output")
+    }
+
+    struct ReplacementRule {
+        target: &'static str,
+        message: &'static str,
+        diagnostic: Option<&'static str>,
+    }
+
+    impl LogTransformRule for ReplacementRule {
+        fn transform(&self, record: &Record<'_>) -> Option<LogTransform> {
+            (record.target() == self.target).then(|| LogTransform {
+                message: self.message.to_string(),
+                diagnostic: self.diagnostic.map(|message| LogDiagnostic {
+                    label: "Dependency diagnostic",
+                    message: message.to_string(),
+                }),
+            })
+        }
+    }
+
+    #[test]
+    fn registered_rules_use_the_first_matching_transform() {
+        let tracer = DependencyLogTracer {
+            rules: &[
+                &OpenDalS3ReadRetryRule,
+                &ReplacementRule {
+                    target: "another_dependency",
+                    message: "First matching rule",
+                    diagnostic: None,
+                },
+                &ReplacementRule {
+                    target: "another_dependency",
+                    message: "Later matching rule",
+                    diagnostic: None,
+                },
+            ],
+            ..DependencyLogTracer::default()
+        };
+        let output = output_with_tracer(
+            &tracer,
+            "debug",
+            "another_dependency",
+            Level::Error,
+            "Original error",
+        );
+        assert_eq!(output, "ERROR another_dependency: First matching rule\n");
+    }
+
+    #[test]
+    fn rules_can_supply_debug_diagnostics() {
+        let tracer = DependencyLogTracer {
+            rules: &[&ReplacementRule {
+                target: "another_dependency",
+                message: "Friendly message",
+                diagnostic: Some("Original error\nDetails"),
+            }],
+            ..DependencyLogTracer::default()
+        };
+        for (filter, expected) in [
+            ("warn", " WARN another_dependency: Friendly message\n"),
+            (
+                "debug",
+                " WARN another_dependency: Friendly message\nDEBUG another_dependency: Dependency diagnostic: \"Original error\\nDetails\"\n",
+            ),
+        ] {
+            assert_eq!(
+                output_with_tracer(
+                    &tracer,
+                    filter,
+                    "another_dependency",
+                    Level::Warn,
+                    "Original error",
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn records_pass_through_when_no_rule_matches_or_no_rules_are_registered() {
+        let rules: &[&'static [&'static dyn LogTransformRule]] = &[
+            &[],
+            &[&ReplacementRule {
+                target: "another_dependency",
+                message: "Replacement message",
+                diagnostic: None,
+            }],
+        ];
+        for rules in rules {
+            let tracer = DependencyLogTracer {
+                rules,
+                ..DependencyLogTracer::default()
+            };
+            assert_eq!(
+                output_with_tracer(&tracer, "debug", "unmatched", Level::Warn, "Original error"),
+                " WARN unmatched: Original error\n"
+            );
+        }
     }
 
     #[test]
