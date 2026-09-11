@@ -36,6 +36,7 @@ use secrecy::ExposeSecret;
 use snafu::ResultExt;
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{Arc, LazyLock, RwLock as StdRwLock},
     time::{Duration, Instant},
 };
@@ -163,28 +164,26 @@ impl McpToolCatalog {
                 if let Err(ref e) = heartbeat_result {
                     tracing::warn!("MCP client heartbeat failed, attempting reconnection");
                     tracing::debug!("MCP client heartbeat failed with error: {e}");
-                    if let Ok(new_client_rwlock) = Self::create_client(&cfg_clone).await {
-                        let mut client_lock = client_clone.write().await;
-                        *client_lock = new_client_rwlock;
+                    if let Ok(new_client) = Self::create_client(&cfg_clone).await {
+                        // List from the new client *before* taking the write
+                        // lock. Holding `client.write()` across that await
+                        // stalls every concurrent `client.read()` (tool call)
+                        // for the full upstream RTT.
+                        let listed =
+                            fetch_then_publish(&client_clone, new_client, list_tools_from_client)
+                                .await;
                         // Keep the last successful cache on list failure.
                         // Clearing it would make `try_get` miss and let rmcp
                         // cache `get_tool == None` for that name forever.
-                        if let Ok((listed, complete, ttl_ms)) =
-                            list_tools_from_client(&client_lock).await
-                            && let Ok(mut cache) = tool_cache_clone.write()
-                        {
-                            apply_tool_cache(&mut cache, &listed, complete, ttl_ms);
-                            if let Ok(slot) = schemas_clone.read()
-                                && let Some(snapshot) = slot.as_ref()
-                            {
-                                let changed = apply_listed_catalog_cache(
-                                    snapshot,
-                                    &name_clone,
-                                    &cache.tools,
-                                    complete,
-                                );
-                                snapshot.bump_if(changed);
-                            }
+                        if let Ok((listed, complete, ttl_ms)) = listed {
+                            publish_listed_cache(
+                                &tool_cache_clone,
+                                &schemas_clone,
+                                &name_clone,
+                                &listed,
+                                complete,
+                                ttl_ms,
+                            );
                         }
                         tracing::info!("Successfully reconnected MCP client for {}", name_clone);
                     }
@@ -216,30 +215,27 @@ impl McpToolCatalog {
     }
 
     fn remember_tools(&self, tools: &[rmcp::model::Tool], replace: bool, ttl_ms: u64) {
-        let Ok(mut cache) = self.tool_cache.write() else {
-            return;
-        };
-        apply_tool_cache(&mut cache, tools, replace, ttl_ms);
-        self.publish_cache_to_snapshot(&cache, replace);
+        publish_listed_cache(
+            &self.tool_cache,
+            &self.schemas,
+            &self.name,
+            tools,
+            replace,
+            ttl_ms,
+        );
     }
 
     fn attach_schema_snapshot(&self, snapshot: &Arc<McpSchemaSnapshot>) {
         if let Ok(mut slot) = self.schemas.write() {
             *slot = Some(Arc::clone(snapshot));
         }
-        if let Ok(cache) = self.tool_cache.read() {
-            self.publish_cache_to_snapshot(&cache, true);
-        }
-    }
-
-    fn publish_cache_to_snapshot(&self, cache: &ToolListCache, replace: bool) {
-        let Ok(slot) = self.schemas.read() else {
-            return;
+        let tools = {
+            let Ok(cache) = self.tool_cache.read() else {
+                return;
+            };
+            cache.tools.clone()
         };
-        let Some(snapshot) = slot.as_ref() else {
-            return;
-        };
-        let changed = apply_listed_catalog_cache(snapshot, &self.name, &cache.tools, replace);
+        let changed = apply_listed_catalog_cache(snapshot, &self.name, &tools, true);
         snapshot.bump_if(changed);
     }
 
@@ -394,6 +390,51 @@ impl McpToolCatalog {
             Err(e) => self.cached_tool(name).map_or(Err(e), |tool| Ok(Some(tool))),
         }
     }
+}
+
+/// Await `fetch` without the write lock, then publish `new_value`.
+///
+/// Tool calls take `client.read()`. Fetching the reconnect list under
+/// `client.write()` would stall those readers for the upstream RTT.
+async fn fetch_then_publish<T, F, Fut, R>(slot: &RwLock<T>, new_value: T, fetch: F) -> R
+where
+    F: FnOnce(&T) -> Fut,
+    Fut: Future<Output = R>,
+{
+    let fetched = fetch(&new_value).await;
+    *slot.write().await = new_value;
+    fetched
+}
+
+/// Write the listed tools into the sync cache, then publish to the
+/// gateway snapshot after dropping the cache write lock.
+///
+/// [`McpSchemaSnapshot::replace_from_map`] takes the snapshot publish
+/// lock and then `try_all` (a cache read). Holding the cache write
+/// across the snapshot publish would deadlock with that path.
+fn publish_listed_cache(
+    tool_cache: &StdRwLock<ToolListCache>,
+    schemas: &StdRwLock<Option<Arc<McpSchemaSnapshot>>>,
+    catalog_name: &str,
+    tools: &[rmcp::model::Tool],
+    replace: bool,
+    ttl_ms: u64,
+) {
+    let cached = {
+        let Ok(mut cache) = tool_cache.write() else {
+            return;
+        };
+        apply_tool_cache(&mut cache, tools, replace, ttl_ms);
+        cache.tools.clone()
+    };
+    let Ok(slot) = schemas.read() else {
+        return;
+    };
+    let Some(snapshot) = slot.as_ref() else {
+        return;
+    };
+    let changed = apply_listed_catalog_cache(snapshot, catalog_name, &cached, replace);
+    snapshot.bump_if(changed);
 }
 
 /// Page through `tools/list`. `complete` is true only when the peer
@@ -597,11 +638,7 @@ impl McpClient {
 /// no `ping`, so the uncached `tools/list` result is the one that counts
 /// — including its error, which names the transport failure `ping` hides.
 fn heartbeat_after_probes<E>(ping_ok: bool, uncached_list: Result<(), E>) -> Result<(), E> {
-    if ping_ok {
-        Ok(())
-    } else {
-        uncached_list
-    }
+    if ping_ok { Ok(()) } else { uncached_list }
 }
 
 #[async_trait]
@@ -884,12 +921,7 @@ mod tests {
 
         let snapshot = McpSchemaSnapshot::new();
         let mut cache = ToolListCache::default();
-        apply_tool_cache(
-            &mut cache,
-            &[listed_deploy_with_header("Region")],
-            true,
-            0,
-        );
+        apply_tool_cache(&mut cache, &[listed_deploy_with_header("Region")], true, 0);
         let changed = apply_listed_catalog_cache(&snapshot, "srv", &cache.tools, true);
         snapshot.bump_if(changed);
         let epoch = snapshot.epoch();
@@ -969,5 +1001,76 @@ mod tests {
             }
             other => panic!("expected Auto lifecycle, got {other:?}"),
         }
+    }
+
+    /// The reconnect write-lock-across-await bug: a 50 ms timeout is
+    /// not enough for a reader while the writer is still in its awaited
+    /// probe.
+    #[tokio::test]
+    async fn write_lock_held_across_await_blocks_readers() {
+        let slot = Arc::new(RwLock::new(0_u32));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let slot_writer = Arc::clone(&slot);
+        let writer = tokio::spawn(async move {
+            let mut guard = slot_writer.write().await;
+            started_tx
+                .send(())
+                .expect("reader is waiting for the write lock to be held");
+            release_rx
+                .await
+                .expect("test must release the held write lock");
+            *guard = 1;
+        });
+        started_rx
+            .await
+            .expect("writer must take the write lock before the reader races");
+        let blocked = tokio::time::timeout(Duration::from_millis(50), slot.read()).await;
+        assert!(
+            blocked.is_err(),
+            "reader_wait: a write lock held across await must block concurrent readers"
+        );
+        release_tx
+            .send(())
+            .expect("writer is waiting to drop the write lock");
+        writer.await.expect("writer should finish after release");
+    }
+
+    /// Production reconnect uses [`fetch_then_publish`]: the list await
+    /// runs *before* the write lock, so a reader succeeds while fetch is
+    /// still in flight.
+    #[tokio::test]
+    async fn fetch_then_publish_does_not_hold_write_lock_across_fetch_await() {
+        let slot = Arc::new(RwLock::new(0_u32));
+        let (fetch_started_tx, fetch_started_rx) = tokio::sync::oneshot::channel();
+        let (release_fetch_tx, release_fetch_rx) = tokio::sync::oneshot::channel();
+        let slot_writer = Arc::clone(&slot);
+        let writer = tokio::spawn(async move {
+            fetch_then_publish(&slot_writer, 1_u32, |_| async move {
+                fetch_started_tx
+                    .send(())
+                    .expect("reader is waiting for fetch to start");
+                release_fetch_rx
+                    .await
+                    .expect("test must finish the fetch after the reader succeeds");
+                "listed"
+            })
+            .await
+        });
+        fetch_started_rx
+            .await
+            .expect("fetch must start before the reader races");
+        let guard = tokio::time::timeout(Duration::from_millis(50), slot.read())
+            .await
+            .expect("reader must not wait for the fetch await");
+        drop(guard);
+        release_fetch_tx
+            .send(())
+            .expect("fetch is waiting to publish");
+        assert_eq!(
+            writer.await.expect("fetch_then_publish should finish"),
+            "listed"
+        );
+        assert_eq!(*slot.read().await, 1);
     }
 }

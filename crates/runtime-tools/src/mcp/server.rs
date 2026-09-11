@@ -20,9 +20,9 @@ use crate::tooling::Tooling;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
-        Tool,
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+        Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+        ServerCapabilities, ServerInfo, Tool,
     },
     service::RequestContext,
 };
@@ -32,7 +32,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     sync::{
-        Arc, RwLock as StdRwLock,
+        Arc, Mutex as StdMutex, RwLock as StdRwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -53,6 +53,10 @@ use util::security::{MAX_SAFE_JSON_DEPTH, get_json_depth};
 pub struct McpSchemaSnapshot {
     tools: StdRwLock<HashMap<String, Tool>>,
     epoch: AtomicU64,
+    /// Serializes [`Self::replace_from_map`] with catalog publications so
+    /// a full replace cannot overwrite a newer TTL/reconnect schema
+    /// (and still bump the epoch).
+    publish: StdMutex<()>,
 }
 
 impl McpSchemaSnapshot {
@@ -74,12 +78,24 @@ impl McpSchemaSnapshot {
     }
 
     /// Replace the snapshot from the live tool map and bump [`Self::epoch`].
+    ///
+    /// Computes `next` under [`Self::publish`] so a concurrent catalog
+    /// TTL/reconnect publish waits, then applies after this write.
+    /// A precomputed map taken outside that lock can overwrite a newer
+    /// catalog schema while the epoch still advances.
     pub fn replace_from_map(&self, tools: &HashMap<String, Tooling>) {
+        let _publish = self.lock_publish();
         let next = mcp_schemas_from_map(tools);
         if let Ok(mut schemas) = self.tools.write() {
             *schemas = next;
         }
         self.epoch.fetch_add(1, Ordering::Release);
+    }
+
+    fn lock_publish(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.publish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn clear(&self) {
@@ -139,6 +155,7 @@ impl McpSchemaSnapshot {
     /// no longer advertised.
     fn apply_catalog_tools(&self, catalog: &str, tools: &[Tool], replace: bool) -> bool {
         let advertised: HashSet<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
+        let _publish = self.lock_publish();
         let Ok(mut schemas) = self.tools.write() else {
             return false;
         };
@@ -539,10 +556,7 @@ impl ServerHandler for RuntimeServer {
                 .collect::<Vec<_>>();
             let changed = self.schemas.replace_listed(&tools);
             self.schemas.bump_if(changed);
-            Ok(ListToolsResult {
-                tools,
-                ..ListToolsResult::default()
-            })
+            Ok(listed_tools_result(tools))
         })
     }
 }
@@ -602,6 +616,21 @@ fn mcp_tool_from_spice(name: impl Into<Cow<'static, str>>, tool: &dyn SpiceModel
         tool.description().map(|s| Cow::Owned(s.into_owned()));
     let schema = to_map(tool.parameters().unwrap_or_else(empty_input_schema));
     Tool::new_with_raw(name.into(), description, schema)
+}
+
+/// `2026-07-28` requires `ttlMs` and `cacheScope` on `tools/list`.
+///
+/// [`ListToolsResult::default`] leaves both `None`, which rmcp 3.3.0
+/// omits on the wire. Omitted or zero `ttlMs` is immediately stale
+/// (SEP-2549); emitting `0` + `private` is an explicit non-cacheable
+/// private result instead of a legacy-compatible omission.
+fn listed_tools_result(tools: Vec<Tool>) -> ListToolsResult {
+    ListToolsResult {
+        tools,
+        ..ListToolsResult::default()
+    }
+    .with_ttl_ms(0)
+    .with_cache_scope(CacheScope::Private)
 }
 
 #[cfg(test)]
@@ -861,6 +890,120 @@ mod tests {
         assert_eq!(x_mcp_header_region(&tool), Some("Zone"));
     }
 
+    /// `replace_from_map` used to compute `next` (Region) and then take
+    /// the snapshot lock, so a concurrent catalog publish of Zone was
+    /// overwritten and the epoch still advanced (`final_schema=Region
+    /// epoch=2`). Computing under the publish lock lets the catalog
+    /// write land last.
+    #[test]
+    fn replace_from_map_does_not_overwrite_a_newer_catalog_publish() {
+        let snapshot = Arc::new(McpSchemaSnapshot::default());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let catalog = Arc::new(GatedTryAllCatalog {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+        });
+        let mut tools = HashMap::new();
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::clone(&catalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+
+        let replace_snapshot = Arc::clone(&snapshot);
+        let replacer = std::thread::spawn(move || {
+            replace_snapshot.replace_from_map(&tools);
+        });
+
+        started_rx
+            .recv()
+            .expect("replace_from_map must enter try_all before the catalog publishes");
+
+        let publish_snapshot = Arc::clone(&snapshot);
+        let publisher = std::thread::spawn(move || {
+            let mut listed = HashMap::new();
+            listed.insert(
+                "deploy".to_string(),
+                mcp_tool_from_spice("deploy", &ZoneAnnotatedTool),
+            );
+            let changed = apply_listed_catalog_cache(&publish_snapshot, "srv", &listed, true);
+            publish_snapshot.bump_if(changed);
+        });
+
+        // Give the publisher time to block on the publish lock (or, on
+        // the unsynchronized path, to write Zone before we release).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let exposed = encode_tool_name("srv", "deploy");
+        assert_ne!(
+            snapshot
+                .get(&exposed)
+                .as_ref()
+                .and_then(x_mcp_header_region),
+            Some("Zone"),
+            "catalog publish must wait for replace_from_map; Zone already present means a stale overwrite can follow"
+        );
+
+        release_tx
+            .send(())
+            .expect("replace_from_map is waiting in try_all");
+        replacer
+            .join()
+            .expect("replace_from_map thread should finish");
+        publisher
+            .join()
+            .expect("catalog publish thread should finish");
+
+        assert_eq!(
+            snapshot
+                .get(&exposed)
+                .as_ref()
+                .and_then(x_mcp_header_region),
+            Some("Zone"),
+            "final_schema must be Zone after the catalog publish; Region after Zone is the stale overwrite"
+        );
+        assert!(
+            snapshot.epoch() >= 2,
+            "both the full replace and the catalog publish bump the epoch"
+        );
+    }
+
+    #[test]
+    fn listed_tools_result_emits_explicit_non_cacheable_private_hints() {
+        let default_json = serde_json::to_value(ListToolsResult::default())
+            .expect("ListToolsResult::default should serialize");
+        assert!(
+            default_json.get("ttlMs").is_none() || default_json.get("ttlMs") == Some(&Value::Null),
+            "rmcp 3.3.0 default omits ttlMs; that omission is the 2026 wire bug: {default_json}"
+        );
+        assert!(
+            default_json.get("cacheScope").is_none()
+                || default_json.get("cacheScope") == Some(&Value::Null),
+            "rmcp 3.3.0 default omits cacheScope; that omission is the 2026 wire bug: {default_json}"
+        );
+
+        let result = listed_tools_result(Vec::new());
+        assert_eq!(result.ttl_ms, Some(0), "zero ttlMs is immediately stale");
+        assert_eq!(
+            result.cache_scope,
+            Some(CacheScope::Private),
+            "gateway tools/list is explicitly private, not an omitted public default"
+        );
+        let json = serde_json::to_value(&result).expect("listed tools result should serialize");
+        assert_eq!(
+            json.get("ttlMs"),
+            Some(&json!(0)),
+            "2026-07-28 tools/list must emit ttlMs, got {json}"
+        );
+        assert_eq!(
+            json.get("cacheScope"),
+            Some(&json!("private")),
+            "2026-07-28 tools/list must emit cacheScope, got {json}"
+        );
+    }
+
     #[test]
     fn insert_and_merge_treat_same_name_schema_identity_change_as_a_change() {
         let snapshot = McpSchemaSnapshot::default();
@@ -1059,6 +1202,56 @@ mod tests {
         }
     }
 
+    /// `try_all` blocks until the test releases it so
+    /// [`McpSchemaSnapshot::replace_from_map`] can be held on the
+    /// publish lock while a catalog publish is spawned.
+    struct GatedTryAllCatalog {
+        started: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SpiceToolCatalog for GatedTryAllCatalog {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &'static str {
+            "srv"
+        }
+        async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+            self.try_all()
+        }
+        async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+            self.try_get(name)
+        }
+        fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+            (name == "deploy").then(|| Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>)
+        }
+        fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+            if let Some(started) = self
+                .started
+                .lock()
+                .expect("gated catalog start lock")
+                .take()
+            {
+                started
+                    .send(())
+                    .expect("replace_from_map test is waiting for try_all");
+            }
+            if let Some(release) = self
+                .release
+                .lock()
+                .expect("gated catalog release lock")
+                .take()
+            {
+                release
+                    .recv()
+                    .expect("test must release try_all after spawning the catalog publish");
+            }
+            vec![Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>]
+        }
+    }
+
     struct SwappableHeaderCatalog {
         use_zone: std::sync::atomic::AtomicBool,
     }
@@ -1071,7 +1264,8 @@ mod tests {
         }
 
         fn use_zone(&self) {
-            self.use_zone.store(true, std::sync::atomic::Ordering::Release);
+            self.use_zone
+                .store(true, std::sync::atomic::Ordering::Release);
         }
 
         fn current_tool(&self) -> Arc<dyn SpiceModelTool> {
