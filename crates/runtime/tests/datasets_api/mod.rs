@@ -236,7 +236,18 @@ async fn test_datasets_api_returns_correct_status() -> Result<(), anyhow::Error>
                 "API should return success status"
             );
 
-            let datasets: Vec<DatasetResponse> = response.json().await?;
+            let datasets_json: Value = response.json().await?;
+
+            // The Cloud Connect `GetDatasets` command answers this same
+            // document through `dataset_infos_with_status`, so the two are
+            // compared here, against a real runtime, on every status this test
+            // drives the dataset through.
+            assert_eq!(
+                serde_json::to_value(runtime::dataset_infos_with_status(&rt).await)?,
+                datasets_json,
+                "GetDatasets must answer the /v1/datasets?status=true document (Ready)"
+            );
+            let datasets: Vec<DatasetResponse> = serde_json::from_value(datasets_json)?;
 
             // Find our test dataset
             let test_dataset = datasets
@@ -266,7 +277,13 @@ async fn test_datasets_api_returns_correct_status() -> Result<(), anyhow::Error>
                 "API should return success status"
             );
 
-            let datasets: Vec<DatasetResponse> = response.json().await?;
+            let datasets_json: Value = response.json().await?;
+            assert_eq!(
+                serde_json::to_value(runtime::dataset_infos_with_status(&rt).await)?,
+                datasets_json,
+                "GetDatasets must answer the /v1/datasets?status=true document (Error)"
+            );
+            let datasets: Vec<DatasetResponse> = serde_json::from_value(datasets_json)?;
 
             let test_dataset = datasets
                 .iter()
