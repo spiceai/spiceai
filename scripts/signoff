@@ -899,6 +899,23 @@ readonly CORRUPT_ARTIFACT_PATTERN='Malformed Mach-o file|Exec format error'
 # which is where a corrupt artifact is met first (#13518).
 readonly TEST_LIST_FAILURE_PATTERN='error: creating test list failed'
 
+# The compiler driver reporting that a tool it ran — the linker, on every run
+# seen so far — died of a signal rather than returning a diagnostic. `clang`
+# prints the first form with the signal's name and the second on its way out;
+# both are its own words for its own crash, and it writes a crash snapshot
+# beside them. `Killed: 9` is the same class from the other side: the kernel
+# taking the linker for memory. Anchored on the driver's prefix so the bare
+# words, which a test can print, are not enough on their own (#13614).
+readonly TOOLCHAIN_CRASH_PATTERN='unable to execute command: (Segmentation fault|Bus error|Illegal instruction|Abort trap|Killed: 9)|linker command failed due to signal'
+
+# The line that says the crash above stopped a compilation, rather than being
+# quoted by a test that ran to completion. cargo prints it once per crate whose
+# build did not finish; a genuine test failure never reaches it, because a test
+# only runs once its crate compiled. Both halves are required, for the same
+# reason as the artifact pair above: this repo's own suites assert on error
+# strings, and excusing a real failure as infrastructure is the costlier mistake.
+readonly COMPILE_ABORTED_PATTERN='error: could not compile `[^`]+`.* due to '
+
 # Set to 1 on remote runs, where run_make_step watches build output for the
 # out-of-disk and unusable-cache signatures. Separates "watched, and it was
 # neither" from "nothing watched at all", which failure_kind answers differently.
@@ -931,6 +948,13 @@ SIGNOFF_CACHE_HIT="${SIGNOFF_CACHE_HIT:-}"
 # can set up a classification without running a build.
 SIGNOFF_ARTIFACT_HIT="${SIGNOFF_ARTIFACT_HIT:-}"
 
+# Set to 1 by run_make_step when the step it ran lost a compilation to a tool
+# that crashed — the linker taking a signal — rather than to a diagnostic. Same
+# mechanism and the same reason for being a variable rather than a file as the
+# three above, and likewise seeded from the environment so a test can set up a
+# classification without running a build.
+SIGNOFF_TOOLCHAIN_HIT="${SIGNOFF_TOOLCHAIN_HIT:-}"
+
 # The statuses the watcher exits with to report each signature. Deliberately
 # not 1 or 2: awk uses those for its own errors, and a watcher that itself died
 # must not be read as a volume that filled. Reserving distinct statuses is also
@@ -939,6 +963,7 @@ SIGNOFF_ARTIFACT_HIT="${SIGNOFF_ARTIFACT_HIT:-}"
 readonly DISK_WATCH_HIT_STATUS=3
 readonly CACHE_WATCH_HIT_STATUS=4
 readonly ARTIFACT_WATCH_HIT_STATUS=5
+readonly TOOLCHAIN_WATCH_HIT_STATUS=6
 
 # The watcher itself, held in one place so the probe below runs exactly the
 # program that will read the build output — a probe of anything else predicts
@@ -958,11 +983,14 @@ readonly DISK_WATCH_PROGRAM='
     $0 ~ cache_pat { cache_hit = 1 }
     $0 ~ artifact_pat { artifact_hit = 1 }
     $0 ~ list_pat { list_failed = 1 }
+    $0 ~ crash_pat { crash_hit = 1 }
+    $0 ~ compile_pat { compile_aborted = 1 }
     { print; fflush() }
     END {
       if (hit) exit (hit_status + 0)
       if (cache_hit) exit (cache_status + 0)
       if (artifact_hit && list_failed) exit (artifact_status + 0)
+      if (crash_hit && compile_aborted) exit (crash_status + 0)
     }
   '
 
@@ -975,6 +1003,8 @@ disk_watch_probe() {
     -v cache_pat="$CACHE_UNUSABLE_PATTERN" -v cache_status="$CACHE_WATCH_HIT_STATUS" \
     -v artifact_pat="$CORRUPT_ARTIFACT_PATTERN" -v list_pat="$TEST_LIST_FAILURE_PATTERN" \
     -v artifact_status="$ARTIFACT_WATCH_HIT_STATUS" \
+    -v crash_pat="$TOOLCHAIN_CRASH_PATTERN" -v compile_pat="$COMPILE_ABORTED_PATTERN" \
+    -v crash_status="$TOOLCHAIN_WATCH_HIT_STATUS" \
     "$DISK_WATCH_PROGRAM" </dev/null >/dev/null 2>&1
 }
 
@@ -1004,6 +1034,7 @@ run_make_step() {
   SIGNOFF_DISK_HIT=""
   SIGNOFF_CACHE_HIT=""
   SIGNOFF_ARTIFACT_HIT=""
+  SIGNOFF_TOOLCHAIN_HIT=""
   # Ask whether the watcher runs before make writes a byte to it, because the
   # only other place to find out is downstream of make — where a watcher that
   # exits at once closes the pipe under a still-writing make, make dies of
@@ -1023,6 +1054,8 @@ run_make_step() {
       -v cache_pat="$CACHE_UNUSABLE_PATTERN" -v cache_status="$CACHE_WATCH_HIT_STATUS" \
       -v artifact_pat="$CORRUPT_ARTIFACT_PATTERN" -v list_pat="$TEST_LIST_FAILURE_PATTERN" \
       -v artifact_status="$ARTIFACT_WATCH_HIT_STATUS" \
+      -v crash_pat="$TOOLCHAIN_CRASH_PATTERN" -v compile_pat="$COMPILE_ABORTED_PATTERN" \
+      -v crash_status="$TOOLCHAIN_WATCH_HIT_STATUS" \
       "$DISK_WATCH_PROGRAM"
   # Copy the whole array in one statement: reading PIPESTATUS is itself a command,
   # so a second `x="${PIPESTATUS[1]}"` would be reading the *assignment's* status
@@ -1036,6 +1069,8 @@ run_make_step() {
     SIGNOFF_CACHE_HIT=1
   elif [[ "$watch_status" -eq "$ARTIFACT_WATCH_HIT_STATUS" ]]; then
     SIGNOFF_ARTIFACT_HIT=1
+  elif [[ "$watch_status" -eq "$TOOLCHAIN_WATCH_HIT_STATUS" ]]; then
+    SIGNOFF_TOOLCHAIN_HIT=1
   elif [[ "$watch_status" -ne 0 ]]; then
     # The watcher started, so the probe cleared it, and then died part-way
     # through: killed for memory, or a signal that reached the whole group. Its
@@ -1087,6 +1122,13 @@ build_hit_cache_unusable() {
 # in the same shell that ran the step, for the same reason as its two siblings.
 build_hit_corrupt_artifact() {
   [[ -n "$SIGNOFF_ARTIFACT_HIT" ]]
+}
+
+# True when the step that failed lost a compilation to a crashing tool rather
+# than to a diagnostic. Read in the same shell that ran the step, for the same
+# reason as its three siblings.
+build_hit_toolchain_crash() {
+  [[ -n "$SIGNOFF_TOOLCHAIN_HIT" ]]
 }
 
 # Free space in GiB on the volume holding "$1" (default: the working tree).
@@ -1160,8 +1202,10 @@ watch_for_signals() {
 # Names what broke in a check run that did not pass, given run_checks' exit
 # status: "signalled" when nothing judged the branch at all, "disk" when the work
 # volume is the cause, "cache" when sccache could not reach its storage and so
-# nothing was compiled, "missing-target" and "stale-lockfile" when a preflight
-# refused to start, "checks" for everything else, which is the branch. Three
+# nothing was compiled, "corrupt-artifact" when the runner could not load a test
+# binary it built, "toolchain-crash" when a tool the build ran died of a signal,
+# "missing-target" and "stale-lockfile" when a preflight refused to start,
+# "checks" for everything else, which is the branch. Three
 # ways to reach "disk", in falling order of authority: the preflight refused to
 # start, the build said so itself, or the volume is at ~0 now. The last is a
 # backstop for a build whose output we did not record — a local run, or a remote
@@ -1237,6 +1281,14 @@ failure_kind() {
       # signatures went past, i.e. the artifact is unloadable for a reason this
       # run cannot see.
       echo "corrupt-artifact"
+    elif build_hit_toolchain_crash; then
+      # Last, because the three above each name a cause with its own remedy,
+      # while this one only names the symptom: a tool the build ran died of a
+      # signal, and nothing here can say why. A volume that fills mid-link
+      # kills the linker with ENOSPC rather than a signal, so disk and this do
+      # not normally coincide — but when both signatures go past, reclaiming
+      # space is the remedy that fixes both.
+      echo "toolchain-crash"
     else
       echo "checks"
     fi
@@ -1313,6 +1365,23 @@ describe_check_failure() {
       SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not complete after ${elapsed}s — a test binary on the runner would not load; re-dispatch (triggered by ${user})"
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — \`nextest\` could not execute a test binary while listing tests, because the runner's copy is not a loadable executable, so **the checks did not complete**. That is a truncated or clobbered artifact on the shared \`target/\` volume rather than a statement about the branch. Re-dispatch the sign-off. If it recurs on this branch alone, or names a crate whose build script this branch changes, the diff is worth suspecting."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off aborted: a test binary on the runner would not load, so nextest never ran the suite (the checks did not complete) — re-dispatch"
+      ;;
+    toolchain-crash)
+      # The compiler driver reported that the linker died of a signal, and cargo
+      # stopped the build there: nothing was linked, so no test ran and no lint
+      # verdict was reached. Worded like the other kinds that reached no
+      # verdict, because the generic "checks failed" sends the author into a
+      # log several thousand lines long to look for a defect in a diff nothing
+      # judged (#13614, and #12813 before it).
+      #
+      # Hedged rather than asserted, like corrupt-artifact: a crash can be the
+      # branch's own doing — a build script it changes, a dependency it adds
+      # whose objects the linker cannot digest — and this cannot tell. A
+      # recurrence on this branch alone, or on a crate whose build this branch
+      # changes, is worth suspecting the diff for.
+      SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not complete after ${elapsed}s — the linker crashed on the runner, so nothing was built; re-dispatch (triggered by ${user})"
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — the compiler driver reported that the linker died of a signal (a crash or an out-of-memory kill, not a diagnostic), and cargo stopped the build there, so **the checks did not complete**. That is the runner's toolchain failing on its own, not a statement about the branch. Re-dispatch the sign-off. If it recurs on this branch alone, or names a crate whose build this branch changes, the diff is worth suspecting."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off aborted: the linker crashed on the runner, so the build never finished (the checks did not complete) — re-dispatch"
       ;;
     missing-target)
       # Neither of the two readings above: the runner is fine and the code was
