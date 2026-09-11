@@ -14849,11 +14849,19 @@ impl CayenneTableProvider {
     ///
     /// This is the **append-only** invalidation: the structural epoch is left
     /// unchanged, so the next miss may extend the cached view with the delta
-    /// instead of rebuilding it. Use [`Self::bump_inlined_structural_epoch`] for
-    /// any mutation that can change an already-materialized entry (rewrite,
-    /// removal, tombstone, checkpoint, overwrite, recovery).
+    /// instead of rebuilding it. Also advances `scan_input_version` so
+    /// [`ScanViewReuse::UntilInvalidated`] recaptures rather than serving a
+    /// [`ScanView`] whose inlined batches predate the append. Use
+    /// [`Self::bump_inlined_structural_epoch`] for any mutation that can change
+    /// an already-materialized entry (rewrite, removal, tombstone, checkpoint,
+    /// overwrite, recovery).
     fn bump_inlined_generation(&self) {
         self.inlined_generation.fetch_add(1, Ordering::Release);
+        // A pure inline append is baked into the captured ScanView's inlined
+        // batches. Without this bump, `UntilInvalidated` keeps serving the
+        // pre-append view (the structural epoch is unchanged) and a subsequent
+        // PK lookup misses the new row.
+        self.notify_scan_input_change();
     }
 
     /// Invalidate the inline cache AND mark the change structural so the next
@@ -55424,6 +55432,83 @@ mod tests {
             .metastore_query_count()
     }
 
+    fn collect_i64_column(batches: &[RecordBatch], column: usize) -> Vec<i64> {
+        let mut values = Vec::new();
+        for batch in batches {
+            let array = batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 column");
+            for i in 0..array.len() {
+                assert!(
+                    !array.is_null(i),
+                    "PK lookup / scan result must not contain NULL"
+                );
+                values.push(array.value(i));
+            }
+        }
+        values
+    }
+
+    /// Execute `WHERE id = ?` through the `DataFusion` planner (`read_table` +
+    /// filter + project). Direct [`TableProvider::scan`] + collect does not
+    /// apply data-column filters: pushdown is
+    /// [`TableProviderFilterPushDown::Inexact`], so a post-scan `FilterExec`
+    /// (added by the planner, then pushed into Vortex) is required for
+    /// correct rows.
+    async fn query_pk_i64(
+        table: Arc<dyn TableProvider>,
+        ctx: &SessionContext,
+        id: i64,
+        column: &str,
+    ) -> Vec<i64> {
+        let batches = ctx
+            .read_table(table)
+            .expect("read_table")
+            .filter(col("id").eq(lit_i64(id)))
+            .expect("pk filter")
+            .select_columns(&[column])
+            .expect("project")
+            .collect()
+            .await
+            .expect("pk collect");
+        collect_i64_column(&batches, 0)
+    }
+
+    /// `WHERE id = ?` projecting `value` — the QPS-bench lookup, via the
+    /// planner so the predicate actually filters rows.
+    async fn pk_lookup_projected_value(
+        table: &Arc<CayenneTableProvider>,
+        ctx: &SessionContext,
+        id: i64,
+    ) -> Vec<i64> {
+        query_pk_i64(
+            Arc::clone(table) as Arc<dyn TableProvider>,
+            ctx,
+            id,
+            "value",
+        )
+        .await
+    }
+
+    /// `WHERE id = ?` returning `(id, value)` pairs, via the planner.
+    async fn query_id_value_where_id(
+        table: Arc<dyn TableProvider>,
+        ctx: &SessionContext,
+        id: i64,
+    ) -> Vec<(i64, i64)> {
+        let batches = ctx
+            .read_table(table)
+            .expect("read_table")
+            .filter(col("id").eq(lit_i64(id)))
+            .expect("pk filter")
+            .collect()
+            .await
+            .expect("pk collect");
+        collect_id_value_pairs_from_batches(&batches)
+    }
+
     /// A cache hit of `scan_view_at_current_input` must not round-trip the
     /// metastore. Covers both production reuse modes (`UntilInvalidated` for
     /// `full`/`append`, `WithinLag` for read-only `changes`).
@@ -55461,6 +55546,11 @@ mod tests {
                 .scan_view_at_current_input(reuse)
                 .await
                 .expect("warmup capture");
+            assert_eq!(
+                collect_segment_pairs(&first.visible_segments),
+                vec![(1, 10), (2, 20)],
+                "{mode}: first capture must return the seeded rows"
+            );
             let before = catalog_query_count(&catalog);
             for _ in 0..32 {
                 let reused = provider
@@ -55470,6 +55560,21 @@ mod tests {
                 assert!(
                     Arc::ptr_eq(&first, &reused),
                     "{mode}: reuse must serve the same cached ScanView"
+                );
+                assert_eq!(
+                    collect_segment_pairs(&reused.visible_segments),
+                    vec![(1, 10), (2, 20)],
+                    "{mode}: reused view must still return the seeded rows"
+                );
+                assert_eq!(
+                    query_id_value_where_id(
+                        Arc::new(provider.clone_for_write()) as Arc<dyn TableProvider>,
+                        &ctx,
+                        2,
+                    )
+                    .await,
+                    vec![(2, 20)],
+                    "{mode}: query WHERE id = 2 must return (2, 20), not the whole table"
                 );
             }
             let after = catalog_query_count(&catalog);
@@ -55572,16 +55677,181 @@ mod tests {
                     .await
                     .expect("reuse scan");
                 let rows = collect(plan, ctx.task_ctx()).await.expect("reuse collect");
-                let n: usize = rows.iter().map(RecordBatch::num_rows).sum();
+                let mut ids = collect_i64_column(&rows, 0);
+                ids.sort_unstable();
                 assert_eq!(
-                    n, 64,
-                    "{mode}: reuse scan must still return the inserted rows"
+                    ids,
+                    (0..64).collect::<Vec<i64>>(),
+                    "{mode}: reuse scan must return the seeded id set, not a stale or partial snapshot"
+                );
+                assert_eq!(
+                    query_pk_i64(Arc::clone(&table) as Arc<dyn TableProvider>, &ctx, 32, "id",)
+                        .await,
+                    vec![32],
+                    "{mode}: query WHERE id = 32 must return that one row, not the whole table"
                 );
             }
             let after = catalog.metastore_query_count();
             assert_eq!(
                 before, after,
                 "{mode}: production scan reuse queried the metastore ({before} -> {after})"
+            );
+        }
+    }
+
+    /// File-backed PK lookup through the `DataFusion` planner — the same executed
+    /// query the 10K QPS bench times. `full` / `append` (`UntilInvalidated`)
+    /// must return the seeded `value = id * 100` on a cache hit, and must see
+    /// a row appended after the cache was warm. Read-only `changes`
+    /// (`WithinLag`) is checked for the seeded lookup only: a write may lag
+    /// until the freshness window expires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_reuse_pk_lookup_returns_correct_value_for_full_and_append() {
+        // 256 rows is below `DEFAULT_INLINE_MAX_ROWS` (1024), so the seed and
+        // the post-warmup append stay in the inline corpus — this is the path
+        // that must bump `scan_input_version` on a pure inline append, otherwise
+        // `UntilInvalidated` serves the pre-append view and the new PK is missing.
+        // `full_file` forces the file-backed path the QPS bench uses (131k rows).
+        let file_only = VortexConfig {
+            inline_max_rows: 0,
+            ..VortexConfig::default()
+        };
+        let cases: [(&str, ScanViewReuse, bool, VortexConfig); 4] = [
+            (
+                "full",
+                ScanViewReuse::UntilInvalidated,
+                true,
+                VortexConfig::default(),
+            ),
+            (
+                "append",
+                ScanViewReuse::UntilInvalidated,
+                true,
+                VortexConfig::default(),
+            ),
+            (
+                "full_file",
+                ScanViewReuse::UntilInvalidated,
+                true,
+                file_only,
+            ),
+            (
+                "changes",
+                ScanViewReuse::WithinLag(Duration::from_secs(1)),
+                false,
+                VortexConfig::default(),
+            ),
+        ];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        const ROWS: i64 = 256;
+        let target_id = ROWS / 2;
+        let expected_value = target_id * 100;
+
+        for (mode, reuse, sees_write_immediately, vortex_config) in cases {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let data_path = temp_dir.path().join("data");
+            tokio::fs::create_dir_all(&data_path)
+                .await
+                .expect("data dir");
+            let catalog = Arc::new(
+                CayenneCatalog::new(format!("sqlite://{}/catalog.db", temp_dir.path().display()))
+                    .expect("catalog"),
+            );
+            catalog.init().await.expect("catalog init");
+            let ctx = SessionContext::new();
+            let table = Arc::new(
+                CayenneTableProviderBuilder::new(
+                    Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                    Arc::clone(&ctx.runtime_env()),
+                )
+                .with_scan_view_reuse(reuse)
+                .create(CreateTableOptions {
+                    table_name: format!("pk_lookup_{mode}"),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: data_path.to_string_lossy().to_string(),
+                    partition_column: None,
+                    vortex_config,
+                })
+                .await
+                .expect("create table"),
+            );
+            table.init_scan_view_cache();
+
+            let ids: Vec<i64> = (0..ROWS).collect();
+            let names: Vec<String> = ids.iter().map(|id| format!("name_{id}")).collect();
+            let values: Vec<i64> = ids.iter().map(|id| id * 100).collect();
+            let seed = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(arrow::array::StringArray::from(names)),
+                    Arc::new(Int64Array::from(values)),
+                ],
+            )
+            .expect("seed batch");
+            let input =
+                MemorySourceConfig::try_new_exec(&[vec![seed.clone()]], seed.schema(), None)
+                    .expect("memory exec");
+            let insert_plan = table
+                .insert_into(&ctx.state(), input, InsertOp::Append)
+                .await
+                .expect("insert plan");
+            let _ = collect(insert_plan, ctx.task_ctx())
+                .await
+                .expect("insert collect");
+
+            for _ in 0..16 {
+                assert_eq!(
+                    pk_lookup_projected_value(&table, &ctx, target_id).await,
+                    vec![expected_value],
+                    "{mode}: reused PK lookup for id={target_id} must return value={expected_value}"
+                );
+            }
+
+            if !sees_write_immediately {
+                continue;
+            }
+
+            // Append a new PK. UntilInvalidated must recapture and return it.
+            let new_id = ROWS;
+            let new_value = new_id * 100;
+            let extra = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![new_id])),
+                    Arc::new(arrow::array::StringArray::from(vec![format!(
+                        "name_{new_id}"
+                    )])),
+                    Arc::new(Int64Array::from(vec![new_value])),
+                ],
+            )
+            .expect("extra batch");
+            let extra_input =
+                MemorySourceConfig::try_new_exec(&[vec![extra.clone()]], extra.schema(), None)
+                    .expect("extra exec");
+            let extra_plan = table
+                .insert_into(&ctx.state(), extra_input, InsertOp::Append)
+                .await
+                .expect("extra insert plan");
+            let _ = collect(extra_plan, ctx.task_ctx())
+                .await
+                .expect("extra insert");
+
+            assert_eq!(
+                pk_lookup_projected_value(&table, &ctx, new_id).await,
+                vec![new_value],
+                "{mode}: after an append, PK lookup must see the new row (not a stale cached view)"
+            );
+            assert_eq!(
+                pk_lookup_projected_value(&table, &ctx, target_id).await,
+                vec![expected_value],
+                "{mode}: the previously looked-up row must still be correct after the append"
             );
         }
     }
