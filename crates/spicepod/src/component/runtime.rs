@@ -551,7 +551,14 @@ pub fn validate_metric_prefix(prefix: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Configuration for the MCP (Model Context Protocol) HTTP endpoint.
+/// Configuration for the MCP (Model Context Protocol) HTTP endpoint (`POST /v1/mcp`).
+///
+/// Spice is dual-era: it serves the [`2026-07-28`](https://modelcontextprotocol.io/specification/2026-07-28/)
+/// revision (stateless `server/discover`, per-request `_meta`, Streamable HTTP
+/// `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` headers) and still
+/// answers legacy `initialize` so existing Cursor/Claude clients keep working.
+/// Unsupported versions return JSON-RPC `-32022` listing the versions this
+/// runtime supports.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]

@@ -34,7 +34,7 @@ use runtime_request_context::{Protocol, RequestContext};
 
 use app::App;
 use axum::{extract::State, routing::patch};
-use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderName};
 use opentelemetry::KeyValue;
 #[cfg(feature = "mcp")]
 use rmcp::transport::streamable_http_server::{
@@ -138,7 +138,31 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
             .name("Mcp-Session-Id")
             .parameter_in(ParameterIn::Header)
             .description(Some(
-                "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+                "Legacy-era only (`2025-11-25` and earlier). Session identifier returned on `initialize` and required on subsequent requests in that session. Ignored for `2026-07-28` requests, which are sessionless.",
+            ))
+            .required(Required::False)
+            .build();
+        let protocol_version_header = Parameter::builder()
+            .name("MCP-Protocol-Version")
+            .parameter_in(ParameterIn::Header)
+            .description(Some(
+                "Required for `2026-07-28` requests. Must match `_meta['io.modelcontextprotocol/protocolVersion']` in the JSON-RPC body. Spice serves `2026-07-28` and remains dual-era for legacy `initialize` clients.",
+            ))
+            .required(Required::False)
+            .build();
+        let method_header = Parameter::builder()
+            .name("Mcp-Method")
+            .parameter_in(ParameterIn::Header)
+            .description(Some(
+                "Required for `2026-07-28` requests. Must match the JSON-RPC `method` (e.g. `server/discover`, `tools/list`, `tools/call`). Header/body mismatches are rejected with HTTP 400 and JSON-RPC `-32020`.",
+            ))
+            .required(Required::False)
+            .build();
+        let name_header = Parameter::builder()
+            .name("Mcp-Name")
+            .parameter_in(ParameterIn::Header)
+            .description(Some(
+                "Required for `2026-07-28` `tools/call` (and `resources/read` / `prompts/get`) requests. Must match `params.name` or `params.uri`.",
             ))
             .required(Required::False)
             .build();
@@ -152,9 +176,14 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
                 .summary(Some("Send a Model Context Protocol message"))
                 .description(Some(
                     "Send a JSON-RPC message to the Spice MCP server using the MCP Streamable HTTP transport. \
+Spice is dual-era: `2026-07-28` clients call `server/discover` and tools without a session; \
+legacy clients may still `initialize` and use `Mcp-Session-Id`. \
 The response is either a single JSON-RPC response (`application/json`) or an SSE stream (`text/event-stream`), \
-selected via the `Accept` header. Session continuity is carried via the `Mcp-Session-Id` header.",
+selected via the `Accept` header.",
                 ))
+                .parameter(protocol_version_header)
+                .parameter(method_header)
+                .parameter(name_header)
                 .parameter(session_header.clone())
                 .response(
                     "200",
@@ -175,14 +204,16 @@ selected via the `Accept` header. Session continuity is carried via the `Mcp-Ses
                 .response(
                     "400",
                     utoipa::openapi::ResponseBuilder::new()
-                        .description("Malformed JSON-RPC payload.")
+                        .description(
+                            "Malformed JSON-RPC payload, unsupported protocol version (`-32022` lists supported versions), or Streamable HTTP header/body mismatch (`-32020`).",
+                        )
                         .build(),
                 )
                 .response(
                     "404",
                     utoipa::openapi::ResponseBuilder::new()
                         .description(
-                            "Unknown or expired `Mcp-Session-Id`.",
+                            "Unknown method, or unknown/expired `Mcp-Session-Id` on a legacy-era request.",
                         )
                         .build(),
                 )
@@ -220,8 +251,9 @@ Configure an API key provider in your Spicepod and retry with credentials.",
                 .tag("mcp")
                 .summary(Some("Open an MCP server-to-client SSE stream"))
                 .description(Some(
-                    "Open a long-lived server-to-client SSE stream for the current MCP session as defined by the Streamable HTTP transport. \
-The `Mcp-Session-Id` header must identify an existing session created via `POST /v1/mcp`.",
+                    "Legacy-era only (`2025-11-25` and earlier). Open a long-lived server-to-client SSE stream for an MCP session created via `POST /v1/mcp`. \
+`2026-07-28` clients do not use GET; they POST `subscriptions/listen` instead. \
+The `Mcp-Session-Id` header must identify an existing legacy session.",
                 ))
                 .parameter(session_header.clone())
                 .response(
@@ -263,7 +295,8 @@ Configure an API key provider in your Spicepod and retry with credentials.",
                 .tag("mcp")
                 .summary(Some("Terminate an MCP Streamable HTTP session"))
                 .description(Some(
-                    "Terminate the MCP session identified by the `Mcp-Session-Id` header. Subsequent requests bearing the same session id will receive `404 Not Found`.",
+                    "Legacy-era only (`2025-11-25` and earlier). Terminate the MCP session identified by the `Mcp-Session-Id` header. \
+`2026-07-28` requests are sessionless and do not use DELETE. Subsequent legacy requests bearing the same session id will receive `404 Not Found`.",
                 ))
                 .parameter(session_header)
                 .response(
@@ -458,8 +491,8 @@ pub(crate) fn routes(
 
     #[cfg(feature = "mcp")]
     {
-        // Streamable HTTP transport endpoint per MCP 2025-11-25 spec.
-        // This replaces the legacy SSE transport that was removed in rmcp 1.x.
+        // Streamable HTTP transport. Dual-era: 2026-07-28 is sessionless;
+        // legacy initialize clients still get sessions via `legacy_session_mode`.
         let runtime_arc = Arc::clone(rt);
         let mcp_config = mcp_server_config(mcp_config);
         let mcp_service = StreamableHttpService::new(
@@ -633,9 +666,13 @@ async fn track_metrics(
 /// - If `runtime.mcp.allowed_hosts` contains `"*"`, host checking is disabled entirely
 ///   (matches how `runtime.cors.allowed_origins: ["*"]` works).
 /// - Otherwise the provided list replaces the defaults entirely.
+///
+/// `legacy_session_mode` stays on so `initialize` clients still get
+/// `Mcp-Session-Id` sessions. `2026-07-28` requests are always served
+/// statelessly regardless of this flag.
 #[cfg(feature = "mcp")]
 fn mcp_server_config(mcp_config: Option<&McpConfig>) -> StreamableHttpServerConfig {
-    let config = StreamableHttpServerConfig::default();
+    let config = StreamableHttpServerConfig::default().with_legacy_session_mode(true);
     match mcp_config.and_then(|c| c.allowed_hosts.as_deref()) {
         Some(hosts) if hosts.iter().any(|h| h == "*") => config.disable_allowed_hosts(),
         Some(hosts) => config.with_allowed_hosts(hosts.iter().map(String::as_str)),
@@ -668,9 +705,28 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
         cors_config.allowed_origins
     );
 
-    cors.allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
-        .allow_headers([ACCEPT, CONTENT_TYPE, AUTHORIZATION])
-        .allow_origin(allowed_origins)
+    cors.allow_methods([
+        Method::GET,
+        Method::POST,
+        Method::PATCH,
+        Method::DELETE,
+        Method::OPTIONS,
+    ])
+    .allow_headers([
+        ACCEPT,
+        CONTENT_TYPE,
+        AUTHORIZATION,
+        HeaderName::from_static("mcp-protocol-version"),
+        HeaderName::from_static("mcp-method"),
+        HeaderName::from_static("mcp-name"),
+        HeaderName::from_static("mcp-session-id"),
+        HeaderName::from_static("x-api-key"),
+    ])
+    .expose_headers([
+        HeaderName::from_static("mcp-session-id"),
+        HeaderName::from_static("mcp-protocol-version"),
+    ])
+    .allow_origin(allowed_origins)
 }
 
 /// Map common HTTP methods to static metric labels (avoids per-request allocation).

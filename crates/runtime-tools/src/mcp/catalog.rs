@@ -20,13 +20,12 @@ use async_openai::types::chat::{ChatCompletionTool, FunctionObject};
 use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
-    RoleClient, ServiceExt,
+    ClientLifecycleMode, ClientServiceExt, RoleClient,
     model::{
         CallToolRequestParams, CallToolResult, ClientCapabilities, ClientRequest, Implementation,
         InitializeRequestParams, ListToolsResult, PaginatedRequestParams, PingRequest,
         ProtocolVersion, ServerResult,
     },
-    serve_client,
     service::{RunningService, ServiceError},
     transport::{
         ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess,
@@ -114,13 +113,13 @@ impl McpToolCatalog {
             loop {
                 interval.tick().await;
 
-                // Perform the heartbeat ping. The read lock is held during the ping call.
-                // Note: The underlying McpClient wraps a RunningService which is not Clone,
-                // so we cannot clone the client to release the lock before the network call.
-                // This is acceptable because the ping timeout is bounded.
+                // The read lock is held during the heartbeat call. The underlying
+                // McpClient wraps a RunningService which is not Clone, so we cannot
+                // clone the client to release the lock before the network call.
+                // This is acceptable because the call timeout is bounded.
                 let heartbeat_result = {
                     let client_guard = client_clone.read().await;
-                    client_guard.ping().await
+                    client_guard.heartbeat().await
                 };
                 if let Err(ref e) = heartbeat_result {
                     tracing::warn!("MCP client heartbeat failed, attempting reconnection");
@@ -182,18 +181,18 @@ impl McpToolCatalog {
                     }
                 }
 
+                let transport =
+                    TokioChildProcess::new(Command::new(command.as_str()).configure(|c| {
+                        c.envs(env).args(args);
+                    }))
+                    .boxed()
+                    .context(UnderlyingTransportSnafu)?;
+
                 Ok(McpClient::Stdio(
-                    serve_client(
-                        (),
-                        TokioChildProcess::new(Command::new(command.as_str()).configure(|c| {
-                            c.envs(env).args(args);
-                        }))
+                    ().serve_with_lifecycle(transport, client_lifecycle())
+                        .await
                         .boxed()
                         .context(UnderlyingTransportSnafu)?,
-                    )
-                    .await
-                    .boxed()
-                    .context(UnderlyingTransportSnafu)?,
                 ))
             }
             MCPConfig::StreamableHttp {
@@ -234,11 +233,11 @@ impl McpToolCatalog {
                     ClientCapabilities::default(),
                     Implementation::new("Spice.ai Open Source", env!("CARGO_PKG_VERSION")),
                 )
-                .with_protocol_version(ProtocolVersion::default());
+                .with_protocol_version(ProtocolVersion::V_2026_07_28);
 
                 Ok(McpClient::Http(
                     client_info
-                        .serve(transport)
+                        .serve_with_lifecycle(transport, client_lifecycle())
                         .await
                         .boxed()
                         .context(UnderlyingTransportSnafu)?,
@@ -332,6 +331,15 @@ impl McpToolCatalog {
     }
 }
 
+/// Dual-era client startup: prefer `server/discover` + `2026-07-28`, and fall
+/// back to the legacy `initialize` handshake when the peer is pre-2026.
+fn client_lifecycle() -> ClientLifecycleMode {
+    ClientLifecycleMode::Auto {
+        preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+        legacy_version: Some(ProtocolVersion::V_2025_03_26),
+    }
+}
+
 pub enum McpClient {
     Stdio(RunningService<RoleClient, ()>),
     Http(RunningService<RoleClient, InitializeRequestParams>),
@@ -373,6 +381,21 @@ impl McpClient {
         match result {
             ServerResult::EmptyResult(_) => Ok(()),
             _ => Err(ServiceError::UnexpectedResponse),
+        }
+    }
+
+    /// Liveness check that works for both protocol eras.
+    ///
+    /// `ping` is not part of `2026-07-28`. A modern peer still answers
+    /// `tools/list`, so a failed ping is retried as a list before the catalog
+    /// treats the connection as dead.
+    pub async fn heartbeat(&self) -> Result<(), ServiceError> {
+        match self.ping().await {
+            Ok(()) => Ok(()),
+            Err(ping_err) => match self.list_tools(None).await {
+                Ok(_) => Ok(()),
+                Err(_) => Err(ping_err),
+            },
         }
     }
 }
@@ -529,5 +552,19 @@ mod tests {
         assert!(is_localhost("[::1]"));
         assert!(!is_localhost("::2"));
         assert!(!is_localhost("2001:db8::1"));
+    }
+
+    #[test]
+    fn client_lifecycle_prefers_2026_07_28_with_legacy_fallback() {
+        match client_lifecycle() {
+            ClientLifecycleMode::Auto {
+                preferred_versions,
+                legacy_version,
+            } => {
+                assert_eq!(preferred_versions, vec![ProtocolVersion::V_2026_07_28]);
+                assert_eq!(legacy_version, Some(ProtocolVersion::V_2025_03_26));
+            }
+            other => panic!("expected Auto lifecycle, got {other:?}"),
+        }
     }
 }

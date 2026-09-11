@@ -14,6 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! MCP client and server wrappers.
+//!
+//! Spice is dual-era: the server prefers [`rmcp::model::ProtocolVersion::V_2026_07_28`]
+//! (`server/discover`, sessionless Streamable HTTP) and still answers legacy
+//! `initialize` so existing clients keep working until that handshake is dropped.
+
 pub mod catalog;
 pub mod factory;
 pub mod server;

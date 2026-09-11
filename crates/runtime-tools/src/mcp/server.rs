@@ -20,8 +20,9 @@ use crate::tooling::Tooling;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
-        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+        ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
+        Tool,
     },
     service::RequestContext,
 };
@@ -137,14 +138,17 @@ impl ServerHandler for RuntimeServer {
                 "Spice.ai Open Source",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_protocol_version(ProtocolVersion::LATEST)
+            // Prefer the 2026-07-28 revision. Dual-era clients that still send
+            // `initialize` negotiate any version advertised by the default
+            // `supported_protocol_versions()` (every revision this SDK knows).
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
     }
 
     fn call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+    ) -> impl Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
         let tool_name = request.name.clone();
         let arguments = request.arguments.clone();
         Box::pin(async move {
@@ -236,7 +240,7 @@ impl ServerHandler for RuntimeServer {
                         if let Ok(captured_output) = serde_json::to_string(&result.content) {
                             tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
                         }
-                        Ok(result)
+                        Ok(result.into())
                     }
                     Err(e) => {
                         tracing::error!(target: "task_history", parent: &span, "{e}");
@@ -268,7 +272,7 @@ impl ServerHandler for RuntimeServer {
             let text = serde_json::to_string(&result)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-            Ok(CallToolResult::success(vec![Content::text(text)]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
         })
     }
 
@@ -297,8 +301,7 @@ impl ServerHandler for RuntimeServer {
                 .collect::<Vec<_>>();
             Ok(ListToolsResult {
                 tools,
-                next_cursor: None,
-                meta: None,
+                ..ListToolsResult::default()
             })
         })
     }
@@ -427,5 +430,21 @@ mod tests {
         // one — so the call carries no `mcp_server` label at all, rather than a
         // phantom `top` or a server named after the tool itself.
         assert_eq!(mcp_server, None);
+    }
+
+    #[test]
+    fn advertises_2026_07_28_and_keeps_legacy_initialize_versions() {
+        let server = RuntimeServer::new(Arc::new(RwLock::new(HashMap::new())));
+        let info = server.get_info();
+        assert_eq!(info.protocol_version, ProtocolVersion::V_2026_07_28);
+        let supported = server.supported_protocol_versions();
+        assert!(
+            supported.contains(&ProtocolVersion::V_2026_07_28),
+            "modern clients must be able to negotiate 2026-07-28: {supported:?}"
+        );
+        assert!(
+            supported.contains(&ProtocolVersion::V_2025_03_26),
+            "legacy initialize clients on 2025-03-26 must still negotiate: {supported:?}"
+        );
     }
 }
