@@ -24,6 +24,14 @@ re-cut. This file is the ledger of what that protection covers.
 
 ## How to use this
 
+**Pinning at a pull request's branch.** A change that spans this repository and a
+fork is reviewed with the pin on the fork's pull request branch. That is fine to
+open and must not land: the branch is deleted when the fork's pull request
+merges, so trunk would name a revision no branch reaches. Mark such a row
+`(TEMPORARY: <the pull request that has to merge first>)` in its branch cell;
+`scripts/check_fork_patches.py` fails while the marker is present, so the pin
+cannot land by being forgotten. Remove it when you repoint at the merge commit.
+
 **At every fork pin bump**, for the fork you moved:
 
 1. Diff the new revision against its upstream merge base and enumerate the Spice
@@ -114,7 +122,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [text-splitter](#text-splitter) | `58f9c21006e01e5e968c5de80a0398b3f5ec439a` | `spiceai` |
 | [tiberius](#dependency-only-forks) | `9ae93c65222b51b0579945ffce5cba053cb23cca` | `spiceai` |
 | [tokio-rusqlite](#rusqlite-and-tokio-rusqlite) | `b10df82e3bbc4f4700562a14a3a00714cbc2f0c7` | `spiceai` |
-| [vortex](#vortex) | `2f1a22ada71507c9d23a96845e7e6fa21e1008e5` | `in-list-hashed-probe` |
+| [vortex](#vortex) | `2f1a22ada71507c9d23a96845e7e6fa21e1008e5` | `in-list-hashed-probe` (TEMPORARY: spiceai/vortex#95) |
 
 `spiceai/spice-rs` and `spiceai/spicebench` are also pinned as git dependencies but
 are not forks — they are Spice repositories with no upstream, so nothing can drop a
