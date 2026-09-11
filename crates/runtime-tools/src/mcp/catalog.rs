@@ -37,7 +37,7 @@ use snafu::ResultExt;
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock, RwLock as StdRwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     process::Command,
@@ -92,8 +92,16 @@ pub(crate) struct McpToolCatalog {
     heartbeat_task: tokio::task::JoinHandle<()>,
     /// Schemas from the last successful `tools/list` / `tools/get`, used by
     /// [`SpiceToolCatalog::try_get`] so Streamable HTTP can validate `Mcp-Param-*`
-    /// without taking the async client lock.
-    tool_cache: Arc<StdRwLock<HashMap<String, rmcp::model::Tool>>>,
+    /// without taking the async client lock. Freshness follows the list
+    /// result's `ttlMs` (SEP-2549): omitted or zero means immediately stale.
+    tool_cache: Arc<StdRwLock<ToolListCache>>,
+}
+
+#[derive(Default)]
+struct ToolListCache {
+    tools: HashMap<String, rmcp::model::Tool>,
+    /// `None` means the list is already stale.
+    expires_at: Option<Instant>,
 }
 
 impl Drop for McpToolCatalog {
@@ -110,7 +118,7 @@ impl McpToolCatalog {
         let client_clone = Arc::clone(&client);
         let cfg_clone = cfg.clone();
         let name_clone = name.to_string();
-        let tool_cache = Arc::new(StdRwLock::new(HashMap::new()));
+        let tool_cache = Arc::new(StdRwLock::new(ToolListCache::default()));
         let tool_cache_clone = Arc::clone(&tool_cache);
 
         let heartbeat_task = tokio::spawn(async move {
@@ -137,10 +145,11 @@ impl McpToolCatalog {
                         // Keep the last successful cache on list failure.
                         // Clearing it would make `try_get` miss and let rmcp
                         // cache `get_tool == None` for that name forever.
-                        if let Ok((listed, complete)) = list_tools_from_client(&client_lock).await
+                        if let Ok((listed, complete, ttl_ms)) =
+                            list_tools_from_client(&client_lock).await
                             && let Ok(mut cache) = tool_cache_clone.write()
                         {
-                            apply_tool_cache(&mut cache, &listed, complete);
+                            apply_tool_cache(&mut cache, &listed, complete, ttl_ms);
                         }
                         tracing::info!("Successfully reconnected MCP client for {}", name_clone);
                     }
@@ -170,18 +179,33 @@ impl McpToolCatalog {
         Ok(catalog)
     }
 
-    fn remember_tools(&self, tools: &[rmcp::model::Tool], replace: bool) {
+    fn remember_tools(&self, tools: &[rmcp::model::Tool], replace: bool, ttl_ms: u64) {
         let Ok(mut cache) = self.tool_cache.write() else {
             return;
         };
-        apply_tool_cache(&mut cache, tools, replace);
+        apply_tool_cache(&mut cache, tools, replace, ttl_ms);
     }
 
-    fn remember_tool(&self, tool: &rmcp::model::Tool) {
-        let Ok(mut cache) = self.tool_cache.write() else {
-            return;
-        };
-        cache.insert(tool.name.to_string(), tool.clone());
+    fn cache_is_fresh(&self) -> bool {
+        self.tool_cache
+            .read()
+            .ok()
+            .is_some_and(|cache| list_cache_is_fresh(cache.expires_at, Instant::now()))
+    }
+
+    fn cached_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        self.tool_cache
+            .read()
+            .ok()
+            .and_then(|cache| cache.tools.get(name).cloned())
+    }
+
+    fn cached_tools(&self) -> Vec<rmcp::model::Tool> {
+        self.tool_cache
+            .read()
+            .ok()
+            .map(|cache| cache.tools.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     async fn create_client(cfg: &MCPConfig) -> Result<McpClient> {
@@ -291,10 +315,13 @@ impl McpToolCatalog {
     }
 
     async fn list_tools(&self) -> std::result::Result<Vec<rmcp::model::Tool>, ServiceError> {
+        if self.cache_is_fresh() {
+            return Ok(self.cached_tools());
+        }
         let client = self.client.read().await;
-        let (tools, complete) = list_tools_from_client(&client).await?;
+        let (tools, complete, ttl_ms) = list_tools_from_client(&client).await?;
         drop(client);
-        self.remember_tools(&tools, complete);
+        self.remember_tools(&tools, complete, ttl_ms);
         Ok(tools)
     }
 
@@ -302,45 +329,13 @@ impl McpToolCatalog {
         &self,
         name: &str,
     ) -> std::result::Result<Option<rmcp::model::Tool>, ServiceError> {
-        // Security: Limit pagination to prevent infinite loops
-        const MAX_PAGINATION_ITERATIONS: usize = 100;
-
-        if let Ok(cache) = self.tool_cache.read()
-            && let Some(tool) = cache.get(name)
-        {
-            return Ok(Some(tool.clone()));
+        if self.cache_is_fresh() {
+            return Ok(self.cached_tool(name));
         }
-
-        let mut cursor: Option<String> = None;
-        let mut iterations = 0;
-
-        loop {
-            iterations += 1;
-            if iterations > MAX_PAGINATION_ITERATIONS {
-                tracing::warn!(
-                    "MCP get_tool pagination exceeded maximum iterations ({MAX_PAGINATION_ITERATIONS}), stopping iteration"
-                );
-                break;
-            }
-
-            let response = self
-                .client
-                .read()
-                .await
-                .list_tools(Some(
-                    PaginatedRequestParams::default().with_cursor(cursor.clone()),
-                ))
-                .await?;
-            if let Some(t) = response.tools.iter().find(|t| t.name == name) {
-                self.remember_tool(t);
-                return Ok(Some(t.clone()));
-            }
-            cursor = response.next_cursor;
-            if cursor.is_none() {
-                break;
-            }
+        match self.list_tools().await {
+            Ok(_) => Ok(self.cached_tool(name)),
+            Err(e) => self.cached_tool(name).map_or(Err(e), |tool| Ok(Some(tool))),
         }
-        Ok(None)
     }
 }
 
@@ -348,7 +343,7 @@ impl McpToolCatalog {
 /// finished (no cursor) before the pagination or total-tool caps.
 async fn list_tools_from_client(
     client: &McpClient,
-) -> std::result::Result<(Vec<rmcp::model::Tool>, bool), ServiceError> {
+    ) -> std::result::Result<(Vec<rmcp::model::Tool>, bool, u64), ServiceError> {
     // Security: Limit pagination to prevent infinite loops and memory exhaustion
     const MAX_PAGINATION_ITERATIONS: usize = 100;
     const MAX_TOTAL_TOOLS: usize = 10000;
@@ -356,6 +351,8 @@ async fn list_tools_from_client(
     let mut cursor: Option<String> = None;
     let mut tools: Vec<rmcp::model::Tool> = vec![];
     let mut iterations = 0;
+    let mut ttl_ms: u64 = 0;
+    let mut seen_page = false;
 
     loop {
         iterations += 1;
@@ -363,7 +360,7 @@ async fn list_tools_from_client(
             tracing::warn!(
                 "MCP tool listing exceeded maximum pagination iterations ({MAX_PAGINATION_ITERATIONS}), stopping iteration"
             );
-            return Ok((tools, false));
+            return Ok((tools, false, ttl_ms));
         }
 
         let response = client
@@ -371,6 +368,8 @@ async fn list_tools_from_client(
                 PaginatedRequestParams::default().with_cursor(cursor.clone()),
             ))
             .await?;
+        ttl_ms = fold_page_ttl(ttl_ms, response.ttl_ms, seen_page);
+        seen_page = true;
 
         // Security: Validate total tools count to prevent memory exhaustion
         if tools.len().saturating_add(response.tools.len()) > MAX_TOTAL_TOOLS {
@@ -379,28 +378,50 @@ async fn list_tools_from_client(
             );
             let remaining = MAX_TOTAL_TOOLS - tools.len();
             tools.extend(response.tools.into_iter().take(remaining));
-            return Ok((tools, false));
+            return Ok((tools, false, ttl_ms));
         }
 
         tools.extend(response.tools);
         cursor = response.next_cursor;
         if cursor.is_none() {
-            return Ok((tools, true));
+            return Ok((tools, true, ttl_ms));
         }
     }
 }
 
+fn fold_page_ttl(acc: u64, page: Option<u64>, seen_page: bool) -> u64 {
+    let page = page.unwrap_or(0);
+    if !seen_page {
+        return page;
+    }
+    if acc == 0 || page == 0 {
+        0
+    } else {
+        acc.min(page)
+    }
+}
+
+fn expires_at_from_ttl_ms(ttl_ms: u64, now: Instant) -> Option<Instant> {
+    (ttl_ms > 0).then(|| now.checked_add(Duration::from_millis(ttl_ms)))?
+}
+
+fn list_cache_is_fresh(expires_at: Option<Instant>, now: Instant) -> bool {
+    expires_at.is_some_and(|deadline| now < deadline)
+}
+
 fn apply_tool_cache(
-    cache: &mut HashMap<String, rmcp::model::Tool>,
+    cache: &mut ToolListCache,
     tools: &[rmcp::model::Tool],
     replace: bool,
+    ttl_ms: u64,
 ) {
     if replace {
-        cache.clear();
+        cache.tools.clear();
     }
     for tool in tools {
-        cache.insert(tool.name.to_string(), tool.clone());
+        cache.tools.insert(tool.name.to_string(), tool.clone());
     }
+    cache.expires_at = expires_at_from_ttl_ms(ttl_ms, Instant::now());
 }
 
 /// Dual-era client startup: prefer `server/discover` + `2026-07-28`, and fall
@@ -528,9 +549,7 @@ impl SpiceToolCatalog for McpToolCatalog {
     }
 
     fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
-        let cache = self.tool_cache.read().ok()?;
-        let spec = cache.get(name)?.clone();
-        drop(cache);
+        let spec = self.cached_tool(name)?;
         Some(Arc::new(McpToolWrapper::new(
             Arc::clone(&self.client),
             spec,
@@ -543,6 +562,7 @@ impl SpiceToolCatalog for McpToolCatalog {
             return Vec::new();
         };
         cache
+            .tools
             .values()
             .map(|spec| {
                 Arc::new(McpToolWrapper::new(
@@ -659,35 +679,60 @@ mod tests {
 
     #[test]
     fn complete_list_replaces_removed_tools() {
-        let mut cache = HashMap::new();
+        let mut cache = ToolListCache::default();
         apply_tool_cache(
             &mut cache,
             &[sample_listed_tool("keep"), sample_listed_tool("drop")],
             true,
+            5_000,
         );
         apply_tool_cache(
             &mut cache,
             &[sample_listed_tool("keep"), sample_listed_tool("new")],
             true,
+            5_000,
         );
-        assert!(cache.contains_key("keep"));
-        assert!(cache.contains_key("new"));
+        assert!(cache.tools.contains_key("keep"));
+        assert!(cache.tools.contains_key("new"));
         assert!(
-            !cache.contains_key("drop"),
+            !cache.tools.contains_key("drop"),
             "a complete tools/list must drop tools the peer no longer advertises"
         );
     }
 
     #[test]
     fn incomplete_list_keeps_existing_tools() {
-        let mut cache = HashMap::new();
-        apply_tool_cache(&mut cache, &[sample_listed_tool("keep")], true);
-        apply_tool_cache(&mut cache, &[sample_listed_tool("page")], false);
+        let mut cache = ToolListCache::default();
+        apply_tool_cache(&mut cache, &[sample_listed_tool("keep")], true, 5_000);
+        apply_tool_cache(&mut cache, &[sample_listed_tool("page")], false, 5_000);
         assert!(
-            cache.contains_key("keep"),
+            cache.tools.contains_key("keep"),
             "a truncated page must not wipe tools from an earlier complete list"
         );
-        assert!(cache.contains_key("page"));
+        assert!(cache.tools.contains_key("page"));
+    }
+
+    #[test]
+    fn omitted_or_zero_ttl_is_immediately_stale() {
+        let now = Instant::now();
+        assert!(
+            !list_cache_is_fresh(expires_at_from_ttl_ms(0, now), now),
+            "omitted or zero ttlMs is immediately stale"
+        );
+        let later = now + Duration::from_millis(1);
+        assert!(list_cache_is_fresh(expires_at_from_ttl_ms(5_000, now), later));
+        assert!(!list_cache_is_fresh(
+            expires_at_from_ttl_ms(5_000, now),
+            now + Duration::from_secs(6)
+        ));
+    }
+
+    #[test]
+    fn a_zero_ttl_page_makes_the_whole_list_stale() {
+        assert_eq!(fold_page_ttl(0, Some(5_000), false), 5_000);
+        assert_eq!(fold_page_ttl(5_000, Some(0), true), 0);
+        assert_eq!(fold_page_ttl(5_000, None, true), 0);
+        assert_eq!(fold_page_ttl(0, None, false), 0);
     }
 
     #[test]

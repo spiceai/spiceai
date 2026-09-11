@@ -41,16 +41,17 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager, tower::StreamableHttpServerConfig,
 };
 #[cfg(feature = "mcp")]
-use runtime_tools::mcp::server::RuntimeServer;
+use runtime_tools::mcp::server::{McpSchemaSnapshot, RuntimeServer};
 use spicepod::component::runtime::CorsConfig;
 #[cfg(feature = "mcp")]
 use spicepod::component::runtime::McpConfig;
 use std::borrow::Cow;
-#[cfg(feature = "mcp")]
-use std::collections::HashMap;
 use std::sync::Arc;
 #[cfg(feature = "mcp")]
-use std::sync::RwLock as StdRwLock;
+use std::sync::{
+    RwLock as StdRwLock,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::RwLock;
 
 #[cfg(feature = "openapi")]
@@ -510,21 +511,33 @@ pub(crate) fn routes(
         // legacy initialize clients still get sessions via `legacy_session_mode`.
         let runtime_arc = Arc::clone(rt);
         let mcp_config = mcp_server_config(mcp_config);
-        // Shared across the per-request `RuntimeServer` factory. rmcp caches
-        // `get_tool`'s Option per name (including None); the snapshot is what
-        // stops a transient miss from disabling `Mcp-Param-*` forever.
-        let schema_snapshot = Arc::new(StdRwLock::new(HashMap::<String, rmcp::model::Tool>::new()));
+        // Shared with tool registration. rmcp caches `get_tool`'s Option per
+        // name (including None); the snapshot epoch rebuilds this service so
+        // a miss during startup cannot disable `Mcp-Param-*` after the tool
+        // appears.
+        let schema_snapshot = Arc::clone(&runtime_arc.mcp_schemas);
         let tools = Arc::clone(&runtime_arc.tools);
-        let mcp_service = StreamableHttpService::new(
+        let sessions = Arc::new(LocalSessionManager::default());
+        let rebuild = {
+            let schema_snapshot = Arc::clone(&schema_snapshot);
+            let tools = Arc::clone(&tools);
+            let sessions = Arc::clone(&sessions);
             move || {
-                Ok(RuntimeServer::with_schema_snapshot(
-                    Arc::clone(&tools),
-                    Arc::clone(&schema_snapshot),
-                ))
-            },
-            Arc::new(LocalSessionManager::default()),
-            mcp_config,
-        );
+                let schema_snapshot = Arc::clone(&schema_snapshot);
+                let tools = Arc::clone(&tools);
+                StreamableHttpService::new(
+                    move || {
+                        Ok(RuntimeServer::with_schema_snapshot(
+                            Arc::clone(&tools),
+                            Arc::clone(&schema_snapshot),
+                        ))
+                    },
+                    Arc::clone(&sessions),
+                    mcp_config.clone(),
+                )
+            }
+        };
+        let mcp_service = EpochReloadingMcpService::new(schema_snapshot, rebuild);
 
         tracing::debug!(
             "MCP request body size limit set to {} bytes",
@@ -713,6 +726,90 @@ fn mcp_server_config(mcp_config: Option<&McpConfig>) -> StreamableHttpServerConf
         Some(hosts) if hosts.iter().any(|h| h == "*") => config.disable_allowed_hosts(),
         Some(hosts) => config.with_allowed_hosts(hosts.iter().map(String::as_str)),
         None => config,
+    }
+}
+
+/// Rebuilds [`StreamableHttpService`] when [`McpSchemaSnapshot::epoch`]
+/// changes so rmcp cannot keep a cached `get_tool == None` after a tool
+/// is registered.
+#[cfg(feature = "mcp")]
+struct EpochReloadingMcpService {
+    inner: StdRwLock<StreamableHttpService<RuntimeServer, LocalSessionManager>>,
+    schemas: Arc<McpSchemaSnapshot>,
+    loaded_epoch: AtomicU64,
+    rebuild:
+        Arc<dyn Fn() -> StreamableHttpService<RuntimeServer, LocalSessionManager> + Send + Sync>,
+}
+
+#[cfg(feature = "mcp")]
+impl Clone for EpochReloadingMcpService {
+    fn clone(&self) -> Self {
+        Self {
+            inner: StdRwLock::new(self.current()),
+            schemas: Arc::clone(&self.schemas),
+            loaded_epoch: AtomicU64::new(self.loaded_epoch.load(Ordering::Acquire)),
+            rebuild: Arc::clone(&self.rebuild),
+        }
+    }
+}
+
+#[cfg(feature = "mcp")]
+impl EpochReloadingMcpService {
+    fn new(
+        schemas: Arc<McpSchemaSnapshot>,
+        rebuild: impl Fn() -> StreamableHttpService<RuntimeServer, LocalSessionManager>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        let initial = rebuild();
+        Self {
+            inner: StdRwLock::new(initial),
+            loaded_epoch: AtomicU64::new(schemas.epoch()),
+            schemas,
+            rebuild: Arc::new(rebuild),
+        }
+    }
+
+    fn current(&self) -> StreamableHttpService<RuntimeServer, LocalSessionManager> {
+        let epoch = self.schemas.epoch();
+        if self.loaded_epoch.load(Ordering::Acquire) != epoch {
+            let rebuilt = (self.rebuild)();
+            if let Ok(mut inner) = self.inner.write() {
+                *inner = rebuilt.clone();
+            }
+            self.loaded_epoch.store(epoch, Ordering::Release);
+            return rebuilt;
+        }
+        self.inner
+            .read()
+            .map_or_else(|_| (self.rebuild)(), |inner| inner.clone())
+    }
+}
+
+#[cfg(feature = "mcp")]
+impl<B> tower::Service<http::Request<B>> for EpochReloadingMcpService
+where
+    B: http_body::Body + Send + 'static,
+    B::Data: Send + 'static,
+    B::Error: std::fmt::Display,
+{
+    type Response = <StreamableHttpService<RuntimeServer, LocalSessionManager> as tower::Service<
+        http::Request<B>,
+    >>::Response;
+    type Error = std::convert::Infallible;
+    type Future = futures::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+        let service = self.current();
+        Box::pin(async move { Ok(service.handle(req).await) })
     }
 }
 

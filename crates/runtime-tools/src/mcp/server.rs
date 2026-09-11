@@ -31,7 +31,10 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     future::Future,
-    sync::{Arc, RwLock as StdRwLock},
+    sync::{
+        Arc, RwLock as StdRwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use tokio::sync::RwLock;
 use tools::SpiceModelTool;
@@ -40,6 +43,97 @@ use tools::rename::with_name;
 use tracing_futures::Instrument;
 use util::security::{MAX_SAFE_JSON_DEPTH, get_json_depth};
 
+/// Shared MCP tool schemas plus a generation counter.
+///
+/// rmcp 3.3.0 `StreamableHttpService::tool_schema` caches `get_tool`'s
+/// `Option` per name, including `None`. When the registry mutates, bump
+/// [`Self::epoch`] so the HTTP layer can rebuild that service and drop
+/// stale misses.
+#[derive(Default)]
+pub struct McpSchemaSnapshot {
+    tools: StdRwLock<HashMap<String, Tool>>,
+    epoch: AtomicU64,
+}
+
+impl McpSchemaSnapshot {
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    pub fn get(&self, name: &str) -> Option<Tool> {
+        self.tools
+            .read()
+            .ok()
+            .and_then(|schemas| schemas.get(name).cloned())
+    }
+
+    /// Replace the snapshot from the live tool map and bump [`Self::epoch`].
+    pub fn replace_from_map(&self, tools: &HashMap<String, Tooling>) {
+        let next = mcp_schemas_from_map(tools);
+        if let Ok(mut schemas) = self.tools.write() {
+            *schemas = next;
+        }
+        self.epoch.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut schemas) = self.tools.write() {
+            schemas.clear();
+        }
+        self.epoch.fetch_add(1, Ordering::Release);
+    }
+
+    fn insert(&self, name: String, tool: Tool) -> bool {
+        let Ok(mut schemas) = self.tools.write() else {
+            return false;
+        };
+        let added = !schemas.contains_key(&name);
+        schemas.insert(name, tool);
+        added
+    }
+
+    fn merge_from_map(&self, tools: &HashMap<String, Tooling>) -> bool {
+        let next = mcp_schemas_from_map(tools);
+        let Ok(mut schemas) = self.tools.write() else {
+            return false;
+        };
+        let mut added = false;
+        for (name, tool) in next {
+            if let std::collections::hash_map::Entry::Vacant(entry) = schemas.entry(name) {
+                entry.insert(tool);
+                added = true;
+            }
+        }
+        added
+    }
+
+    fn replace_listed(&self, tools: &[Tool]) -> bool {
+        let next: HashMap<String, Tool> = tools
+            .iter()
+            .map(|tool| (tool.name.to_string(), tool.clone()))
+            .collect();
+        let Ok(mut schemas) = self.tools.write() else {
+            return false;
+        };
+        let changed =
+            schemas.len() != next.len() || next.keys().any(|name| !schemas.contains_key(name));
+        *schemas = next;
+        changed
+    }
+
+    fn bump_if(&self, changed: bool) {
+        if changed {
+            self.epoch.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimeServer {
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
@@ -47,7 +141,7 @@ pub struct RuntimeServer {
     /// per name, including `None`, so a transient miss would disable
     /// `Mcp-Param-*` checks for every later call. This map is the source
     /// `get_tool` consults first and is shared across HTTP service clones.
-    schemas: Arc<StdRwLock<HashMap<String, Tool>>>,
+    schemas: Arc<McpSchemaSnapshot>,
 }
 
 /// A tool resolved from a request name, with the identity to record it under.
@@ -78,7 +172,7 @@ impl ResolvedTool {
 
 impl RuntimeServer {
     pub fn new(tools: Arc<RwLock<HashMap<String, Tooling>>>) -> Self {
-        Self::with_schema_snapshot(tools, Arc::new(StdRwLock::new(HashMap::new())))
+        Self::with_schema_snapshot(tools, McpSchemaSnapshot::new())
     }
 
     /// Build a server that shares `schemas` with other factory clones.
@@ -89,7 +183,7 @@ impl RuntimeServer {
     #[must_use]
     pub fn with_schema_snapshot(
         tools: Arc<RwLock<HashMap<String, Tooling>>>,
-        schemas: Arc<StdRwLock<HashMap<String, Tool>>>,
+        schemas: Arc<McpSchemaSnapshot>,
     ) -> Self {
         let server = Self { tools, schemas };
         if let Ok(guard) = server.tools.try_read() {
@@ -158,40 +252,17 @@ impl RuntimeServer {
     }
 
     fn snapshot_tool(&self, name: &str) -> Option<Tool> {
-        self.schemas
-            .read()
-            .ok()
-            .and_then(|schemas| schemas.get(name).cloned())
+        self.schemas.get(name)
     }
 
     fn remember_tool(&self, name: String, tool: Tool) {
-        if let Ok(mut schemas) = self.schemas.write() {
-            schemas.insert(name, tool);
-        }
+        let added = self.schemas.insert(name, tool);
+        self.schemas.bump_if(added);
     }
 
     fn remember_from_map(&self, tools: &HashMap<String, Tooling>) {
-        let Ok(mut schemas) = self.schemas.write() else {
-            return;
-        };
-        for (name, tooling) in tools {
-            match tooling {
-                Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
-                    schemas.insert(
-                        name.clone(),
-                        mcp_tool_from_spice(name.clone(), tool.as_ref()),
-                    );
-                }
-                Tooling::Catalog { tools: catalog, .. } => {
-                    let catalog_name = catalog.name();
-                    for tool in catalog.try_all() {
-                        let exposed = encode_tool_name(catalog_name, &tool.name());
-                        schemas
-                            .insert(exposed.clone(), mcp_tool_from_spice(exposed, tool.as_ref()));
-                    }
-                }
-            }
-        }
+        let added = self.schemas.merge_from_map(tools);
+        self.schemas.bump_if(added);
     }
 
     fn definition_from_map(tools: &HashMap<String, Tooling>, tool_name: &str) -> Option<Tool> {
@@ -402,12 +473,8 @@ impl ServerHandler for RuntimeServer {
                     mcp_tool_from_spice(name, t.as_ref())
                 })
                 .collect::<Vec<_>>();
-            if let Ok(mut schemas) = self.schemas.write() {
-                schemas.clear();
-                for tool in &tools {
-                    schemas.insert(tool.name.to_string(), tool.clone());
-                }
-            }
+            let changed = self.schemas.replace_listed(&tools);
+            self.schemas.bump_if(changed);
             Ok(ListToolsResult {
                 tools,
                 ..ListToolsResult::default()
@@ -431,6 +498,31 @@ fn empty_input_schema() -> Value {
         "required": [],
         "properties": {}
     })
+}
+
+/// Collect MCP tool definitions that catalogs can expose without I/O.
+#[must_use]
+#[expect(clippy::implicit_hasher)]
+pub fn mcp_schemas_from_map(tools: &HashMap<String, Tooling>) -> HashMap<String, Tool> {
+    let mut schemas = HashMap::new();
+    for (name, tooling) in tools {
+        match tooling {
+            Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
+                schemas.insert(
+                    name.clone(),
+                    mcp_tool_from_spice(name.clone(), tool.as_ref()),
+                );
+            }
+            Tooling::Catalog { tools: catalog, .. } => {
+                let catalog_name = catalog.name();
+                for tool in catalog.try_all() {
+                    let exposed = encode_tool_name(catalog_name, &tool.name());
+                    schemas.insert(exposed.clone(), mcp_tool_from_spice(exposed, tool.as_ref()));
+                }
+            }
+        }
+    }
+    schemas
 }
 
 fn mcp_tool_from_spice(name: impl Into<Cow<'static, str>>, tool: &dyn SpiceModelTool) -> Tool {
@@ -713,10 +805,8 @@ mod tests {
         );
         let tools = Arc::new(RwLock::new(tools));
         let _write = tools.write().await;
-        let server = RuntimeServer::with_schema_snapshot(
-            Arc::clone(&tools),
-            Arc::new(StdRwLock::new(HashMap::new())),
-        );
+        let server =
+            RuntimeServer::with_schema_snapshot(Arc::clone(&tools), McpSchemaSnapshot::new());
 
         let looked_up = ServerHandler::get_tool(&server, "deploy");
         assert!(
@@ -984,6 +1074,91 @@ mod tests {
             json.pointer("/error/code").and_then(Value::as_i64),
             Some(-32020),
             "expected HeaderMismatch (-32020) for catalog tool, got {json}"
+        );
+    }
+
+    /// rmcp caches `get_tool == None`. A later registry update is invisible
+    /// until Streamable HTTP is rebuilt (the HTTP layer watches snapshot epoch).
+    #[tokio::test]
+    async fn rebuilt_service_validates_after_tool_registers_following_a_miss() {
+        let tools = Arc::new(RwLock::new(HashMap::new()));
+        let schemas = McpSchemaSnapshot::new();
+        let factory_tools = Arc::clone(&tools);
+        let factory_schemas = Arc::clone(&schemas);
+        let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(true)
+            .disable_allowed_hosts()
+            .with_json_response(true);
+        let sessions = Arc::new(
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+        );
+        let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            {
+                let factory_tools = Arc::clone(&factory_tools);
+                let factory_schemas = Arc::clone(&factory_schemas);
+                move || {
+                    Ok(RuntimeServer::with_schema_snapshot(
+                        Arc::clone(&factory_tools),
+                        Arc::clone(&factory_schemas),
+                    ))
+                }
+            },
+            Arc::clone(&sessions),
+            config.clone(),
+        );
+
+        let (status, json) =
+            post_tools_call(&service, "deploy", Some("us-west1"), "eu-west1").await;
+        assert_ne!(
+            json.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32020),
+            "a miss must skip HeaderMismatch so the cached None is load-bearing: {status} {json}"
+        );
+        let epoch_after_miss = schemas.epoch();
+
+        {
+            let mut map = tools.write().await;
+            map.insert(
+                "deploy".to_string(),
+                Tooling::Tool(Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>),
+            );
+            schemas.replace_from_map(&map);
+        }
+        assert_ne!(
+            schemas.epoch(),
+            epoch_after_miss,
+            "registering a tool must bump the snapshot epoch"
+        );
+
+        let (status, json) =
+            post_tools_call(&service, "deploy", Some("us-west1"), "eu-west1").await;
+        assert_ne!(
+            json.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32020),
+            "the same StreamableHttpService must keep the cached miss: {status} {json}"
+        );
+
+        let rebuilt = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            move || {
+                Ok(RuntimeServer::with_schema_snapshot(
+                    Arc::clone(&factory_tools),
+                    Arc::clone(&factory_schemas),
+                ))
+            },
+            sessions,
+            config,
+        );
+        let (status, json) =
+            post_tools_call(&rebuilt, "deploy", Some("us-west1"), "eu-west1").await;
+        assert_eq!(
+            status,
+            http::StatusCode::BAD_REQUEST,
+            "rebuilt service must validate Mcp-Param after the tool appears: {status} {json}"
+        );
+        assert_eq!(
+            json.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32020),
+            "expected HeaderMismatch (-32020) after rebuild, got {json}"
         );
     }
 }

@@ -74,6 +74,8 @@ impl Runtime {
                     .collect(),
             },
         );
+        #[cfg(feature = "mcp")]
+        self.refresh_mcp_tool_schemas(&tools_map);
         tracing::trace!("Tool catalog {} ready to use", name.clone());
         metrics::tools::COUNT.add(1, &[KeyValue::new("tool_catalog", name.clone())]);
         self.status
@@ -85,6 +87,8 @@ impl Runtime {
         let mut tools_map = self.tools.write().await;
 
         tools_map.insert(name.clone(), t);
+        #[cfg(feature = "mcp")]
+        self.refresh_mcp_tool_schemas(&tools_map);
         tracing::trace!("Tool {} ready to use", name.clone());
         metrics::tools::COUNT.add(1, &[KeyValue::new("tool", name.clone())]);
         self.status
