@@ -25951,9 +25951,23 @@ impl CayenneTableProvider {
         (cached.generation == current_gen).then(|| Arc::clone(&cached.view))
     }
 
+    /// The inline view for a scan capture, or `None` when the cached view is not
+    /// generation-current (the caller rebuilds and retries).
+    ///
+    /// "This table has no inline data" is ONE state and must have ONE identity:
+    /// [`ScanViewKey`] keys on the inline view's ADDRESS (see [`RawScanInput::key`]),
+    /// so handing back a freshly allocated empty `Vec` would re-key every capture of an
+    /// empty inline corpus and no two scans could ever key alike — the demand
+    /// [`ScanViewCache`] would then miss unconditionally on any table whose inline
+    /// corpus is empty, which is the steady state of a file-mode table. The shared
+    /// empty view below is immutable and never freed, so it is also ABA-safe as a key
+    /// component. It is process-wide rather than per-table because the cache it feeds
+    /// is per-table: only captures of the same table are ever compared.
     fn try_read_inlined_view_for_scan(&self) -> Option<Arc<Vec<InlinedViewEntry>>> {
         if self.cached_inlined_row_count() <= 0 {
-            return Some(Arc::new(Vec::new()));
+            static EMPTY_INLINED_VIEW: LazyLock<Arc<Vec<InlinedViewEntry>>> =
+                LazyLock::new(|| Arc::new(Vec::new()));
+            return Some(Arc::clone(&EMPTY_INLINED_VIEW));
         }
         self.try_read_inlined_view_cached()
     }
@@ -54959,6 +54973,72 @@ mod tests {
             collect_segment_pairs(&rebuilt.visible_segments),
             vec![(1, 10), (2, 20)],
             "a scan after eviction rebuilds and still returns the correct rows"
+        );
+    }
+
+    /// A table whose inline corpus is EMPTY — the steady state of a file-mode table —
+    /// must serve a second scan the view the first one built: nothing about the
+    /// scan-visible state moved between them, so the two captures have to key alike.
+    ///
+    /// The empty inline view is part of [`ScanViewKey`] by ADDRESS, so allocating a
+    /// fresh one per capture re-keys every scan and the demand cache misses
+    /// unconditionally — every scan rebuilds, and concurrent scans cannot even dedup
+    /// onto one build.
+    #[tokio::test]
+    async fn scan_view_cache_reuses_view_when_inline_corpus_is_empty() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_append_only_table("scan_view_empty_inline", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, 64),
+        )
+        .await;
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            0,
+            "fixture must leave the inline corpus empty (inlining disabled) — that is the state under test"
+        );
+
+        let first = provider
+            .scan_view_at_current_input(Duration::ZERO)
+            .await
+            .expect("first scan builds a view");
+        let second = provider
+            .scan_view_at_current_input(Duration::ZERO)
+            .await
+            .expect("second scan");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged table must serve the cached view rather than rebuilding it"
+        );
+
+        // Reuse must not cost read-your-writes. An append into the CURRENT snapshot
+        // moves no key component — it mints no snapshot id and touches neither the
+        // deletion snapshot, the protected map, the inline corpus nor the mem tier —
+        // so the capture legitimately keys the same and the bundle is reused. That is
+        // correct because the bundle carries no file list: scan planning resolves the
+        // listing eagerly against the pinned snapshot id on every scan. Assert the
+        // BEHAVIOUR (the rows), not the bundle's identity.
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 64, 64),
+        )
+        .await;
+        let scan_ctx = SessionContext::new();
+        let plan = provider
+            .scan(&scan_ctx.state(), Some(&vec![0]), &[], None)
+            .await
+            .expect("scan plan after write");
+        let batches = datafusion::physical_plan::collect(plan, scan_ctx.task_ctx())
+            .await
+            .expect("collect rows after write");
+        let scanned: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            scanned, 128,
+            "a scan after an append must read its own write (64 + 64 rows), whether or \
+             not the cached scan-view bundle was reused"
         );
     }
 
