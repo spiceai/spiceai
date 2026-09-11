@@ -170,24 +170,89 @@ impl McpProxy for McpToolWrapper {
         request: CallToolRequestParams,
     ) -> Result<CallToolResponse, ServiceError> {
         let inner = self.client.read().await;
-        let mut req = CallToolRequestParams::new(self.internal_name());
-        if let Some(args) = request.arguments {
-            req = req.with_arguments(args);
-        }
-        if let Some(responses) = request.input_responses {
-            req = req.with_input_responses(responses);
-        }
-        if let Some(state) = request.request_state {
-            req = req.with_request_state(state);
-        }
-        inner.call_tool_once(req).await
+        inner
+            .call_tool_once(rename_proxied_call(request, self.internal_name()))
+            .await
     }
+}
+
+/// Rewrite the gateway-exposed name to the upstream tool name.
+///
+/// Rebuilding via [`CallToolRequestParams::new`] drops `request.meta`
+/// (`incoming_meta={"com.example/traceId":"trace-42"} forwarded_meta=null`)
+/// while still copying MRTR continuation fields. Rename in place so
+/// `_meta` and any later request fields are relayed.
+fn rename_proxied_call(
+    mut request: CallToolRequestParams,
+    internal_name: impl Into<Cow<'static, str>>,
+) -> CallToolRequestParams {
+    request.name = internal_name.into();
+    request
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::model::RequestMetaObject;
+    use serde_json::json;
     use tools::naming::decode_tool_name;
+
+    fn request_with_extension_meta() -> CallToolRequestParams {
+        let meta = serde_json::from_value(json!({"com.example/traceId": "trace-42"}))
+            .expect("request _meta object");
+        let mut request =
+            CallToolRequestParams::new("srv__deploy").with_request_state("opaque-server-state");
+        request.meta = Some(meta);
+        request
+    }
+
+    /// The previous rebuild copied MRTR fields onto `CallToolRequestParams::new`
+    /// and dropped `_meta` (`incoming_meta=… forwarded_meta=null`).
+    #[test]
+    fn rebuild_from_new_drops_caller_meta() {
+        let incoming = request_with_extension_meta();
+        let mut req = CallToolRequestParams::new("deploy");
+        if let Some(args) = incoming.arguments.clone() {
+            req = req.with_arguments(args);
+        }
+        if let Some(responses) = incoming.input_responses.clone() {
+            req = req.with_input_responses(responses);
+        }
+        if let Some(state) = incoming.request_state.clone() {
+            req = req.with_request_state(state);
+        }
+        assert_eq!(
+            req.request_state.as_deref(),
+            Some("opaque-server-state"),
+            "MRTR continuation fields survived the rebuild"
+        );
+        assert!(
+            req.meta.is_none(),
+            "incoming_meta={:?} forwarded_meta=null",
+            incoming
+                .meta
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .expect("request meta should serialize")
+        );
+    }
+
+    #[test]
+    fn rename_proxied_call_keeps_caller_meta() {
+        let incoming = request_with_extension_meta();
+        let forwarded = rename_proxied_call(incoming.clone(), "deploy");
+        assert_eq!(forwarded.name.as_ref(), "deploy");
+        assert_eq!(
+            forwarded.meta, incoming.meta,
+            "incoming_meta must be forwarded, not dropped"
+        );
+        assert_eq!(forwarded.request_state, incoming.request_state);
+        let expected: RequestMetaObject =
+            serde_json::from_value(json!({"com.example/traceId": "trace-42"}))
+                .expect("request _meta object");
+        assert_eq!(forwarded.meta, Some(expected));
+    }
 
     fn spec(name: &'static str) -> Tool {
         Tool::new(name, "a proxied tool", Arc::new(serde_json::Map::new()))
