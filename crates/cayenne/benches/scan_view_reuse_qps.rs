@@ -8,6 +8,9 @@
 
 //! Scan-view reuse at 10K QPS across every production refresh mode.
 //!
+//! Table: TPC-H SF-10 class (~10 GiB on disk), loaded once and opened under
+//! each reuse mode. PK lookup is `WHERE id = ?` projecting `value`.
+//!
 //! Lanes (same file-backed table, no writes during the load):
 //! * `recapture_every_scan` — [`ScanViewReuse::WithinLag(Duration::ZERO)`].
 //!   Capture on every scan (`CAYENNE_SCAN_VIEW_FRESHNESS_MS=0`). Baseline.
@@ -37,13 +40,14 @@
 #![allow(clippy::cast_sign_loss)]
 
 use std::hint::black_box;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, BinaryArray, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use cayenne::metadata::CreateTableOptions;
+use cayenne::metadata::{CreateTableOptions, VortexConfig};
 use cayenne::{
     CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
     ScanViewReuse,
@@ -59,9 +63,18 @@ use datafusion_physical_plan::collect;
 use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 
-/// Rows in the file-backed table. Large enough to be a real snapshot, small
-/// enough that a PK lookup is setup-dominated (Vortex prunes to one row).
-const ROWS: usize = 131_072;
+/// TPC-H SF-10 class: fill until the table directory is ~10 GiB on disk.
+/// One table is loaded once and opened under each reuse mode.
+const TARGET_TABLE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Rows per insert. 256 Ki rows × 256 B payload ≈ 64 MiB Arrow per batch.
+const INSERT_BATCH_ROWS: usize = 262_144;
+
+/// Per-row binary payload. High-entropy so Vortex cannot collapse the table
+/// well below the 10 GiB target.
+const PAYLOAD_LEN: usize = 256;
+
+const TABLE_NAME: &str = "scan_view_qps";
 
 /// Offer rate for the open-loop load.
 const TARGET_QPS: u64 = 10_000;
@@ -77,22 +90,60 @@ fn schema() -> Arc<Schema> {
         Field::new("id", DataType::Int64, false),
         Field::new("name", DataType::Utf8, false),
         Field::new("value", DataType::Int64, false),
+        Field::new("payload", DataType::Binary, false),
     ]))
+}
+
+fn payload_bytes(id: i64) -> [u8; PAYLOAD_LEN] {
+    let mut buf = [0_u8; PAYLOAD_LEN];
+    let mut x = (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for b in &mut buf {
+        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        *b = (x >> 33) as u8;
+    }
+    buf
 }
 
 fn make_batch(start_id: i64, rows: usize) -> RecordBatch {
     let ids: Vec<i64> = (0..rows as i64).map(|i| start_id + i).collect();
     let names: Vec<String> = ids.iter().map(|id| format!("name_{id}")).collect();
     let values: Vec<i64> = ids.iter().map(|id| id * 100).collect();
+    let mut payload_flat = Vec::with_capacity(rows.saturating_mul(PAYLOAD_LEN));
+    for id in &ids {
+        payload_flat.extend_from_slice(&payload_bytes(*id));
+    }
+    let payload = BinaryArray::from_iter_values(payload_flat.chunks_exact(PAYLOAD_LEN));
     RecordBatch::try_new(
         schema(),
         vec![
             Arc::new(Int64Array::from(ids)),
             Arc::new(StringArray::from(names)),
             Arc::new(Int64Array::from(values)),
+            Arc::new(payload),
         ],
     )
     .expect("batch")
+}
+
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0_u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
 }
 
 async fn cayenne_insert(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> u64 {
@@ -118,8 +169,15 @@ async fn cayenne_insert(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -
         .map_or(0, |rows| rows.value(0))
 }
 
-struct ReuseFixture {
+struct LoadedTable {
     _temp_dir: tempfile::TempDir,
+    catalog: Arc<CayenneCatalog>,
+    runtime_env: Arc<RuntimeEnv>,
+    rows: u64,
+    bytes: u64,
+}
+
+struct ReuseFixture {
     catalog: Arc<CayenneCatalog>,
     table: Arc<CayenneTableProvider>,
     ctx: Arc<SessionContext>,
@@ -139,7 +197,7 @@ struct LoadReport {
     metastore_queries: u64,
 }
 
-async fn setup_reuse_table(reuse: ScanViewReuse) -> ReuseFixture {
+async fn load_sf10_table() -> LoadedTable {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let data_path = temp_dir.path().join("data");
     tokio::fs::create_dir_all(&data_path)
@@ -154,27 +212,83 @@ async fn setup_reuse_table(reuse: ScanViewReuse) -> ReuseFixture {
     let table = Arc::new(
         CayenneTableProviderBuilder::new(
             Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
-            runtime_env,
+            Arc::clone(&runtime_env),
         )
-        .with_scan_view_reuse(reuse)
+        .with_scan_view_reuse(ScanViewReuse::UntilInvalidated)
         .create(CreateTableOptions {
-            table_name: "scan_view_qps".to_string(),
+            table_name: TABLE_NAME.to_string(),
             schema: schema(),
             primary_key: vec!["id".to_string()],
             on_conflict: None,
             base_path: data_path.to_string_lossy().to_string(),
             partition_column: None,
-            vortex_config: cayenne::metadata::VortexConfig::default(),
+            vortex_config: VortexConfig {
+                // File-backed from the first batch; skip compaction so load is
+                // sequential writes of ~256 MiB files, not rewrite amplification.
+                inline_max_rows: 0,
+                compaction_background_interval_ms: 0,
+                compaction_trigger_files: usize::MAX,
+                compaction_trigger_protected_snapshots: usize::MAX,
+                compaction_trigger_snapshot_age_ms: u64::MAX,
+                ..VortexConfig::default()
+            },
         })
         .await
         .expect("create table"),
     );
+
+    let mut start_id = 0_i64;
+    let mut rows = 0_u64;
+    let mut bytes = 0_u64;
+    let mut last_logged_gib = 0_u64;
+    while bytes < TARGET_TABLE_BYTES {
+        let inserted = cayenne_insert(&table, make_batch(start_id, INSERT_BATCH_ROWS)).await;
+        assert!(
+            inserted > 0,
+            "SF-10 load insert of {INSERT_BATCH_ROWS} rows at id={start_id} wrote nothing"
+        );
+        start_id += i64::try_from(INSERT_BATCH_ROWS).expect("batch fits i64");
+        rows = rows.saturating_add(inserted);
+        bytes = dir_size(&data_path);
+        let gib = bytes / (1024 * 1024 * 1024);
+        if gib > last_logged_gib {
+            last_logged_gib = gib;
+            eprintln!(
+                "scan_view_reuse_qps  load: {rows} rows, {bytes} bytes ({gib} GiB / {} GiB)",
+                TARGET_TABLE_BYTES / (1024 * 1024 * 1024)
+            );
+        }
+    }
+    assert!(
+        rows > 0 && bytes >= TARGET_TABLE_BYTES,
+        "SF-10 load produced {rows} rows / {bytes} bytes; wanted >= {TARGET_TABLE_BYTES}"
+    );
+
+    LoadedTable {
+        _temp_dir: temp_dir,
+        catalog,
+        runtime_env,
+        rows,
+        bytes,
+    }
+}
+
+async fn open_reuse_lane(loaded: &LoadedTable, reuse: ScanViewReuse) -> ReuseFixture {
+    let table = Arc::new(
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&loaded.catalog) as Arc<dyn MetadataCatalog>,
+            Arc::clone(&loaded.runtime_env),
+        )
+        .with_scan_view_reuse(reuse)
+        .open(TABLE_NAME)
+        .await
+        .expect("open table"),
+    );
     // Production path: offload ScanView builds and run the idle evictor.
     table.init_scan_view_cache();
 
-    let _ = cayenne_insert(&table, make_batch(0, ROWS)).await;
     let ctx = Arc::new(SessionContext::new());
-    let target_id = (ROWS / 2) as i64;
+    let target_id = i64::try_from(loaded.rows / 2).expect("row count fits i64");
 
     // Populate the scan-view cache (and Vortex footer cache) before any timed load.
     // Fail setup if the seeded PK lookup is already wrong — a throughput number
@@ -190,8 +304,7 @@ async fn setup_reuse_table(reuse: ScanViewReuse) -> ReuseFixture {
     }
 
     ReuseFixture {
-        _temp_dir: temp_dir,
-        catalog,
+        catalog: Arc::clone(&loaded.catalog),
         table,
         ctx,
         target_id,
@@ -459,17 +572,24 @@ fn print_report(report: &LoadReport) {
 fn bench_scan_view_reuse_qps(c: &mut Criterion) {
     let rt = Runtime::new().expect("runtime");
 
+    let loaded = rt.block_on(load_sf10_table());
     eprintln!(
-        "scan_view_reuse_qps  setup: {ROWS} rows, target {TARGET_QPS} QPS, {CONCURRENCY} in-flight, {}s arms",
+        "scan_view_reuse_qps  setup: SF-10 ~10GiB table, {} rows, {} bytes on disk, target {TARGET_QPS} QPS, {CONCURRENCY} in-flight, {}s arms",
+        loaded.rows,
+        loaded.bytes,
         LOAD_DURATION.as_secs()
     );
 
-    let recapture = rt.block_on(setup_reuse_table(ScanViewReuse::WithinLag(Duration::ZERO)));
-    let full = rt.block_on(setup_reuse_table(ScanViewReuse::UntilInvalidated));
-    let append = rt.block_on(setup_reuse_table(ScanViewReuse::UntilInvalidated));
-    let changes = rt.block_on(setup_reuse_table(ScanViewReuse::WithinLag(
-        Duration::from_secs(1),
-    )));
+    let recapture = rt.block_on(open_reuse_lane(
+        &loaded,
+        ScanViewReuse::WithinLag(Duration::ZERO),
+    ));
+    let full = rt.block_on(open_reuse_lane(&loaded, ScanViewReuse::UntilInvalidated));
+    let append = rt.block_on(open_reuse_lane(&loaded, ScanViewReuse::UntilInvalidated));
+    let changes = rt.block_on(open_reuse_lane(
+        &loaded,
+        ScanViewReuse::WithinLag(Duration::from_secs(1)),
+    ));
     let lanes: [(&str, &ReuseFixture); 4] = [
         ("recapture_every_scan", &recapture),
         ("full", &full),

@@ -55711,7 +55711,7 @@ mod tests {
         // the post-warmup append stay in the inline corpus — this is the path
         // that must bump `scan_input_version` on a pure inline append, otherwise
         // `UntilInvalidated` serves the pre-append view and the new PK is missing.
-        // `full_file` forces the file-backed path the QPS bench uses (131k rows).
+        // `full_file` forces the file-backed path the QPS bench uses (~10 GiB).
         let file_only = VortexConfig {
             inline_max_rows: 0,
             ..VortexConfig::default()
