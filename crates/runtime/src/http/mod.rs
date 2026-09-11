@@ -136,11 +136,12 @@ where
         Some(app) => Cow::Borrowed(&app.runtime.cors),
         None => Cow::Owned(CorsConfig::default()),
     };
-    // Resolve effective MCP config following the same pattern as builder.rs (L208-212):
+    // Resolve effective MCP config following the same pattern as builder.rs:
     // Config.runtime, if present, replaces the whole runtime — read .mcp from that.
-    // Otherwise fall back to the app's runtime .mcp. This mirrors how all other runtime
-    // fields are resolved: one effective SpicepodRuntime is chosen, then fields are read
-    // from it, rather than merging individual fields from both sources.
+    // Otherwise fall back to the app's runtime .mcp. MCP Origin CORS is resolved
+    // from the same override in `routes::mcp_origin_cors` so hosts and origins
+    // cannot diverge. HTTP CORS stays on the app spicepod (a cache-only
+    // Config.runtime override must not disable browser CORS).
     #[cfg(feature = "mcp")]
     let mcp_config: Option<spicepod::component::runtime::McpConfig> =
         config.runtime.as_ref().map_or_else(

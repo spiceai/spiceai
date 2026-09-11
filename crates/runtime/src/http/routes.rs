@@ -242,7 +242,7 @@ selected via the `Accept` header.",
                         .description(
                             "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list, \
 or the `Origin` header is not in `runtime.cors.allowed_origins`. \
-Configure `runtime.mcp.allowed_hosts` or `runtime.cors.allowed_origins`. Host `[\"*\"]` disables the Host check. Origin `[\"*\"]` expands to localhost defaults — it does not accept every Origin.",
+Configure `runtime.mcp.allowed_hosts` or `runtime.cors.allowed_origins`. Host `[\"*\"]` disables the Host check. Origin `[\"*\"]` disables the Origin check (CORS allow-all). A concrete Origin list 403s a mismatched `Origin`.",
                         )
                         .build(),
                 )
@@ -302,7 +302,7 @@ Configure an API key provider in your Spicepod and retry with credentials.",
                     utoipa::openapi::ResponseBuilder::new()
                         .description(
                             "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list, \
-or the `Origin` header is not in `runtime.cors.allowed_origins`.",
+or the `Origin` header is not in `runtime.cors.allowed_origins`. Host `[\"*\"]` disables the Host check. Origin `[\"*\"]` disables the Origin check (CORS allow-all).",
                         )
                         .build(),
                 )
@@ -346,7 +346,7 @@ Configure an API key provider in your Spicepod and retry with credentials.",
                     utoipa::openapi::ResponseBuilder::new()
                         .description(
                             "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list, \
-or the `Origin` header is not in `runtime.cors.allowed_origins`.",
+or the `Origin` header is not in `runtime.cors.allowed_origins`. Host `[\"*\"]` disables the Host check. Origin `[\"*\"]` disables the Origin check (CORS allow-all).",
                         )
                         .build(),
                 )
@@ -516,7 +516,8 @@ pub(crate) fn routes(
         // Streamable HTTP transport. Dual-era: 2026-07-28 is sessionless;
         // legacy initialize clients still get sessions via `legacy_session_mode`.
         let runtime_arc = Arc::clone(rt);
-        let mcp_config = mcp_server_config(mcp_config, cors_config);
+        let mcp_cors = mcp_origin_cors(config.as_ref(), cors_config);
+        let mcp_config = mcp_server_config(mcp_config, mcp_cors);
         // Shared with tool registration. rmcp caches `get_tool`'s Option per
         // name (including None); the snapshot epoch rebuilds this service so
         // a miss during startup cannot disable `Mcp-Param-*` after the tool
@@ -714,6 +715,20 @@ async fn track_metrics(
     axum::response::Response::from_parts(parts, body)
 }
 
+/// CORS config that feeds the MCP Origin allow-list.
+///
+/// `Config.runtime`, when present, replaces the whole spicepod runtime
+/// (same as `mcp` / `builder.rs`). Hosts and origins both read from that
+/// effective runtime so a programmatic CORS override cannot be ignored
+/// by the MCP transport.
+#[cfg(feature = "mcp")]
+fn mcp_origin_cors<'a>(config: &'a config::Config, app_cors: &'a CorsConfig) -> &'a CorsConfig {
+    config
+        .runtime
+        .as_ref()
+        .map_or(app_cors, |runtime| &runtime.cors)
+}
+
 /// Build the MCP [`StreamableHttpServerConfig`] from `runtime.mcp` and
 /// `runtime.cors`.
 ///
@@ -724,8 +739,10 @@ async fn track_metrics(
 /// - Otherwise the provided list replaces the defaults entirely.
 ///
 /// Origin (`Origin` header), derived from [`CorsConfig::mcp_allowed_origins`]:
-/// - `"*"` or an empty CORS list expands to localhost defaults so the
-///   rmcp allow-list is never empty (empty accepts every `Origin`).
+/// - `"*"` (the CORS default) disables the check — same allow-all
+///   contract as CORS, so default spicepods stay non-breaking.
+/// - An empty CORS list (no `"*"`) expands to localhost defaults so
+///   the rmcp allow-list is never left empty by accident.
 /// - A concrete list is the 2026-07-28 Streamable HTTP origin policy:
 ///   a mismatched `Origin` is 403; a missing `Origin` still passes.
 ///
@@ -744,7 +761,12 @@ fn mcp_server_config(
         None => config,
     };
 
-    config.with_allowed_origins(cors_config.mcp_allowed_origins())
+    let origins = cors_config.mcp_allowed_origins();
+    if origins.is_empty() {
+        config
+    } else {
+        config.with_allowed_origins(origins)
+    }
 }
 
 /// Rebuilds [`StreamableHttpService`] when [`McpSchemaSnapshot::epoch`]
@@ -1410,14 +1432,16 @@ mod epoch_reload_tests {
 #[cfg(all(test, feature = "mcp"))]
 mod mcp_origin_tests {
     use super::{
-        mcp_server_config, CorsConfig, LocalSessionManager, McpConfig, StreamableHttpServerConfig,
-        StreamableHttpService,
+        CorsConfig, LocalSessionManager, McpConfig, StreamableHttpServerConfig,
+        StreamableHttpService, mcp_origin_cors, mcp_server_config,
     };
+    use crate::config::Config;
     use http::StatusCode;
     use rmcp::{
-        model::{ProtocolVersion, ServerCapabilities, ServerInfo},
         ServerHandler,
+        model::{ProtocolVersion, ServerCapabilities, ServerInfo},
     };
+    use spicepod::component::runtime::Runtime as SpicepodRuntime;
     use std::sync::Arc;
 
     fn allowlist_cors() -> CorsConfig {
@@ -1494,7 +1518,7 @@ mod mcp_origin_tests {
     }
 
     #[test]
-    fn mcp_server_config_default_sets_allowed_origins() {
+    fn mcp_server_config_default_wildcard_disables_origin_check() {
         let rmcp_default = StreamableHttpServerConfig::default();
         let config = mcp_server_config(None, &CorsConfig::default());
         eprintln!(
@@ -1511,27 +1535,80 @@ mod mcp_origin_tests {
             rmcp_default.allowed_origins
         );
         assert!(
-            !config.allowed_origins.is_empty(),
-            "spice_mcp_config_sets_allowed_origins=False: default CORS * must still install localhost origins, got {:?}",
+            config.allowed_origins.is_empty(),
+            "default CORS * must leave rmcp allowed_origins empty (allow-all), got {:?}",
             config.allowed_origins
-        );
-        assert_eq!(
-            config.allowed_origins,
-            CorsConfig::default().mcp_allowed_origins()
         );
     }
 
     #[test]
-    fn mcp_server_config_wildcard_cors_sets_localhost_origins() {
+    fn mcp_server_config_wildcard_cors_disables_origin_check() {
         let cors = CorsConfig {
             enabled: true,
             allowed_origins: vec!["*".to_string()],
         };
         let config = mcp_server_config(None, &cors);
+        assert!(
+            config.allowed_origins.is_empty(),
+            "wildcard CORS must disable the MCP Origin check, got {:?}",
+            config.allowed_origins
+        );
+    }
+
+    #[test]
+    fn mcp_origin_cors_uses_config_runtime_override() {
+        let app_cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["https://app.example".to_string()],
+        };
+        let override_runtime = SpicepodRuntime {
+            cors: CorsConfig {
+                enabled: true,
+                allowed_origins: vec!["https://override.example".to_string()],
+            },
+            mcp: Some(McpConfig {
+                allowed_hosts: Some(vec!["override-host".to_string()]),
+            }),
+            ..SpicepodRuntime::default()
+        };
+        let config = Config::new().with_spicepod_runtime(override_runtime);
+        let cors = mcp_origin_cors(&config, &app_cors);
+        eprintln!(
+            "effective_mcp_hosts={:?} effective_mcp_origins={:?} override_ignored={}",
+            config
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.mcp.as_ref())
+                .and_then(|mcp| mcp.allowed_hosts.as_ref()),
+            cors.allowed_origins,
+            cors.allowed_origins == app_cors.allowed_origins
+        );
         assert_eq!(
-            config.allowed_origins,
-            cors.mcp_allowed_origins(),
-            "wildcard CORS must expand to localhost origins, not disable the check"
+            cors.allowed_origins,
+            vec!["https://override.example".to_string()],
+            "MCP Origin must use Config.runtime.cors, not the app spicepod"
+        );
+        let mcp = mcp_server_config(
+            config
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.mcp.as_ref()),
+            cors,
+        );
+        assert_eq!(mcp.allowed_hosts, vec!["override-host".to_string()]);
+        assert_eq!(
+            mcp.allowed_origins,
+            vec!["https://override.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn mcp_origin_cors_falls_back_to_app_without_override() {
+        let app_cors = allowlist_cors();
+        let cors = mcp_origin_cors(&Config::new(), &app_cors);
+        assert_eq!(
+            cors.allowed_origins, app_cors.allowed_origins,
+            "without Config.runtime, MCP Origin must keep the app CORS list"
         );
     }
 
@@ -1548,8 +1625,8 @@ mod mcp_origin_tests {
         );
     }
 
-    /// Pre-fix Spice left `StreamableHttpServerConfig::allowed_origins` at
-    /// rmcp's empty default, so `Origin: https://evil.example` was accepted.
+    /// rmcp's empty `allowed_origins` accepts every `Origin`. That is the
+    /// encoding of CORS `"*"`.
     #[tokio::test]
     async fn unconfigured_rmcp_origin_policy_accepts_any_origin() {
         let config = StreamableHttpServerConfig::default()
@@ -1571,28 +1648,47 @@ mod mcp_origin_tests {
     }
 
     #[tokio::test]
-    async fn default_cors_rejects_disallowed_origin_post() {
+    async fn default_cors_wildcard_accepts_any_origin_post() {
         let config = mcp_server_config(None, &CorsConfig::default());
         let status = post_mcp_with_origin(config, Some("https://evil.example")).await;
         eprintln!(
             "origin_https_evil_example_accepted={}",
             status != StatusCode::FORBIDDEN
         );
-        assert_eq!(
+        assert_ne!(
             status,
             StatusCode::FORBIDDEN,
-            "default CORS * must still 403 Origin https://evil.example, got {status}"
+            "default CORS * must accept Origin https://evil.example (allow-all), got {status}"
         );
     }
 
     #[tokio::test]
-    async fn default_cors_accepts_localhost_origin_post() {
-        let config = mcp_server_config(None, &CorsConfig::default());
+    async fn empty_cors_list_rejects_disallowed_origin_post() {
+        let cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec![],
+        };
+        let config = mcp_server_config(None, &cors);
+        let status = post_mcp_with_origin(config, Some("https://evil.example")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "empty CORS list (no *) must still 403 Origin https://evil.example, got {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_cors_list_accepts_localhost_origin_post() {
+        let cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec![],
+        };
+        let config = mcp_server_config(None, &cors);
         let status = post_mcp_with_origin(config, Some("http://localhost:8090")).await;
         assert_ne!(
             status,
             StatusCode::FORBIDDEN,
-            "localhost Origin must pass the default MCP allow-list, got {status}"
+            "localhost Origin must pass the empty-list MCP allow-list, got {status}"
         );
     }
 

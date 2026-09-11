@@ -561,10 +561,13 @@ pub fn validate_metric_prefix(prefix: &str) -> Result<(), String> {
 /// runtime supports.
 ///
 /// Browser `Origin` validation is not a field here: it uses
-/// [`CorsConfig::mcp_allowed_origins`]. `"*"` (the CORS default) expands
-/// to localhost defaults so the rmcp list is never empty (empty accepts
-/// every `Origin`). A concrete list rejects a mismatched `Origin` with
-/// `HTTP` 403. Requests with no `Origin` still pass.
+/// [`CorsConfig::mcp_allowed_origins`]. `"*"` (the CORS default) disables
+/// the MCP Origin check — the same allow-all contract as CORS — so existing
+/// spicepods and remote browser clients keep working. A concrete list
+/// rejects a mismatched `Origin` with `HTTP` 403. Requests with no
+/// `Origin` still pass. An empty CORS list (no `"*"`) expands to localhost
+/// defaults so an accidental empty rmcp list cannot disable a concrete
+/// policy.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -928,8 +931,9 @@ fn default_allowed_origins() -> Vec<String> {
     vec!["*".to_string()]
 }
 
-/// Localhost origins used when `runtime.cors.allowed_origins` is `"*"` or
-/// empty. Entries omit a port so rmcp matches any port on that host.
+/// Localhost origins used when `runtime.cors.allowed_origins` is empty
+/// (no `"*"`). `"*"` disables the MCP Origin check instead. Entries omit
+/// a port so rmcp matches any port on that host.
 const DEFAULT_MCP_ALLOWED_ORIGINS: &[&str] = &[
     "http://localhost",
     "http://127.0.0.1",
@@ -951,26 +955,27 @@ impl Default for CorsConfig {
 impl CorsConfig {
     /// Origins to install on rmcp Streamable HTTP.
     ///
-    /// `"*"` is not a valid RFC 6454 origin, and an empty rmcp list
-    /// disables the 2026-07-28 check (every `Origin` is accepted). A
-    /// wildcard or empty CORS list therefore expands to the localhost
-    /// defaults. A concrete list is used as-is. Requests with no
-    /// `Origin` still pass.
+    /// `"*"` is not a valid RFC 6454 origin. CORS treats it as allow-all,
+    /// and MCP Origin follows that contract so the default spicepod
+    /// (`allowed_origins: ["*"]`) does not 403 remote browser clients.
+    /// An empty return means "do not call `with_allowed_origins`" — rmcp's
+    /// empty list accepts every `Origin` (including a missing `Origin`).
+    ///
+    /// A concrete list is the 2026-07-28 Streamable HTTP origin policy:
+    /// a mismatched `Origin` is 403. An empty CORS list (no `"*"`) expands
+    /// to the localhost defaults so an accidental empty rmcp list cannot
+    /// disable the check.
     #[must_use]
     pub fn mcp_allowed_origins(&self) -> Vec<String> {
-        let concrete: Vec<String> = self
-            .allowed_origins
-            .iter()
-            .filter(|origin| origin.as_str() != "*")
-            .cloned()
-            .collect();
-        if concrete.is_empty() {
+        if self.allowed_origins.iter().any(|origin| origin == "*") {
+            Vec::new()
+        } else if self.allowed_origins.is_empty() {
             DEFAULT_MCP_ALLOWED_ORIGINS
                 .iter()
                 .map(ToString::to_string)
                 .collect()
         } else {
-            concrete
+            self.allowed_origins.clone()
         }
     }
 }
@@ -3168,31 +3173,41 @@ datasets:
     }
 
     #[test]
-    fn mcp_allowed_origins_default_is_nonempty_localhost() {
+    fn mcp_allowed_origins_default_wildcard_is_allow_all() {
         let origins = CorsConfig::default().mcp_allowed_origins();
         assert!(
-            !origins.is_empty(),
-            "spice_mcp_config_sets_allowed_origins=False: empty rmcp list accepts every Origin"
-        );
-        assert!(
-            origins.iter().any(|origin| origin == "http://localhost"),
-            "default MCP origins must include http://localhost, got {origins:?}"
-        );
-        assert!(
-            !origins.iter().any(|origin| origin == "*"),
-            "rmcp does not treat * as a wildcard Origin, got {origins:?}"
+            origins.is_empty(),
+            "default CORS * must disable the MCP Origin check, got {origins:?}"
         );
     }
 
     #[test]
-    fn mcp_allowed_origins_wildcard_expands_like_default() {
+    fn mcp_allowed_origins_wildcard_is_allow_all() {
         let cors = CorsConfig {
             enabled: true,
             allowed_origins: vec!["*".to_string()],
         };
-        assert_eq!(
-            cors.mcp_allowed_origins(),
-            CorsConfig::default().mcp_allowed_origins()
+        let origins = cors.mcp_allowed_origins();
+        assert!(
+            origins.is_empty(),
+            "CORS * must disable the MCP Origin check, got {origins:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_allowed_origins_empty_list_expands_to_localhost() {
+        let cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec![],
+        };
+        let origins = cors.mcp_allowed_origins();
+        assert!(
+            origins.iter().any(|origin| origin == "http://localhost"),
+            "empty CORS list (no *) must expand to localhost defaults, got {origins:?}"
+        );
+        assert!(
+            !origins.iter().any(|origin| origin == "*"),
+            "rmcp does not treat * as a wildcard Origin, got {origins:?}"
         );
     }
 
