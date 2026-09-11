@@ -796,12 +796,16 @@ impl<T: Clone> EpochReloading<T> {
     }
 
     fn current(&self) -> T {
+        // Recheck source epoch *after* the read lock. Sampling once, then
+        // cloning `inner`, returns the old service when a publish lands in
+        // between (`captured_epoch=0 source_epoch=1 loaded_epoch=0
+        // returned_service=S0`).
         let epoch = (self.epoch)();
-        if self.loaded_epoch.load(Ordering::Acquire) == epoch {
-            if let Ok(inner) = self.inner.read() {
-                return inner.clone();
-            }
-            return (self.rebuild)();
+        if self.loaded_epoch.load(Ordering::Acquire) == epoch
+            && let Ok(inner) = self.inner.read()
+            && self.loaded_epoch.load(Ordering::Acquire) == (self.epoch)()
+        {
+            return inner.clone();
         }
 
         match self.inner.write() {
@@ -1335,6 +1339,68 @@ mod epoch_reload_tests {
             (2, 2, "S1", false),
             "split updates retain a stale service as current"
         );
+    }
+
+    /// Previous `current()` compared `loaded_epoch` to one sample, then
+    /// cloned `inner`. A publish between those steps returns S0 for a
+    /// request that should rebuild (`captured_epoch=0 source_epoch=1
+    /// loaded_epoch=0 returned_service=S0`).
+    #[test]
+    fn fast_path_without_post_lock_recheck_returns_stale_service() {
+        let loaded = AtomicU64::new(0);
+        let source = AtomicU64::new(0);
+        let inner = "S0";
+
+        let captured_epoch = source.load(Ordering::Acquire);
+        let loaded_epoch = loaded.load(Ordering::Acquire);
+        source.store(1, Ordering::Release);
+        let returned = if loaded_epoch == captured_epoch {
+            inner
+        } else {
+            "S1"
+        };
+        assert_eq!(
+            (
+                captured_epoch,
+                source.load(Ordering::Acquire),
+                loaded.load(Ordering::Acquire),
+                returned
+            ),
+            (0, 1, 0, "S0"),
+            "captured_epoch=0 source_epoch=1 loaded_epoch=0 returned_service=S0"
+        );
+    }
+
+    /// The first `epoch()` sample matches `loaded_epoch`; the post-lock
+    /// sample sees the publish and must rebuild rather than return S0.
+    #[test]
+    fn epoch_reloading_fast_path_rechecks_source_epoch_after_lock() {
+        let samples = Arc::new(AtomicU64::new(0));
+        let epoch = Arc::new(AtomicU64::new(0));
+        let samples_for_src = Arc::clone(&samples);
+        let epoch_for_src = Arc::clone(&epoch);
+        let epoch_for_rebuild = Arc::clone(&epoch);
+        let reloader = EpochReloading::with_initial(
+            "S0".to_string(),
+            0,
+            move || {
+                let n = samples_for_src.fetch_add(1, Ordering::AcqRel);
+                if n >= 1 {
+                    epoch_for_src.store(1, Ordering::Release);
+                }
+                epoch_for_src.load(Ordering::Acquire)
+            },
+            move || format!("S{}", epoch_for_rebuild.load(Ordering::Acquire)),
+        );
+
+        let got = reloader.current();
+        eprintln!(
+            "captured_then_bumped_got={got} snapshot={:?}",
+            reloader.snapshot()
+        );
+        assert_eq!(got, "S1", "post-lock recheck must rebuild, not return S0");
+        let (loaded, inner) = reloader.snapshot();
+        assert_eq!((loaded, inner.as_str()), (1, "S1"));
     }
 
     #[test]
