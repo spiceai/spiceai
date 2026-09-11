@@ -305,8 +305,27 @@ async fn cdc_ingest_json_create_update_delete() -> anyhow::Result<()> {
 /// `cdc:` is push-based Debezium over HTTP, so this needs no database, container or
 /// credential — which is what makes the CDC-fed memory case testable end to end at
 /// all.
+///
+/// Deliberately NOT named `orders`. `cdc_ingest`'s push-target registry is
+/// process-wide and keyed by dataset name, so two `#[tokio::test]` cases sharing a
+/// name would have whichever runtime registered last own the handle, and either
+/// server could post events into the other's runtime.
 fn cdc_orders_dataset_cayenne_memory() -> Dataset {
-    let mut dataset = cdc_orders_dataset();
+    let mut dataset = Dataset::new(format!("cdc:{CAYENNE_MEMORY_TABLE}"), CAYENNE_MEMORY_TABLE);
+    dataset.columns = vec![
+        Column {
+            name: "id".to_string(),
+            r#type: Some("int64".to_string()),
+            nullable: Some(true),
+            ..Column::new("id")
+        },
+        Column {
+            name: "name".to_string(),
+            r#type: Some("utf8".to_string()),
+            nullable: Some(true),
+            ..Column::new("name")
+        },
+    ];
     let mut on_conflict = HashMap::new();
     on_conflict.insert("id".to_string(), OnConflictBehavior::Upsert);
     dataset.acceleration = Some(Acceleration {
@@ -320,6 +339,10 @@ fn cdc_orders_dataset_cayenne_memory() -> Dataset {
     });
     dataset
 }
+
+/// The dataset this test owns. See `cdc_orders_dataset_cayenne_memory` for why it
+/// must differ from every other `cdc:` test's.
+const CAYENNE_MEMORY_TABLE: &str = "orders_cayenne_memory";
 
 /// A source DELETE must remove the row from a `mode: memory` Cayenne acceleration
 /// fed by CDC.
@@ -358,9 +381,9 @@ async fn cdc_ingest_delete_removes_a_cayenne_memory_mode_row() -> anyhow::Result
 
             let base = start_http(Arc::clone(&rt)).await;
             let client = reqwest::Client::new();
-            let url = format!("{base}/v1/datasets/orders/cdc");
+            let url = format!("{base}/v1/datasets/{CAYENNE_MEMORY_TABLE}/cdc");
             let registered = wait_until_true(Duration::from_secs(15), || async {
-                runtime::dataconnector::cdc_ingest::lookup("orders").is_some()
+                runtime::dataconnector::cdc_ingest::lookup(CAYENNE_MEMORY_TABLE).is_some()
             })
             .await;
             assert!(registered, "CDC ingest handle never registered");
@@ -387,7 +410,7 @@ async fn cdc_ingest_delete_removes_a_cayenne_memory_mode_row() -> anyhow::Result
 
             let ids = |rt: Arc<Runtime>| async move {
                 rt.datafusion()
-                    .query_builder("SELECT id FROM orders ORDER BY id")
+                    .query_builder(&format!("SELECT id FROM {CAYENNE_MEMORY_TABLE} ORDER BY id"))
                     .build()
                     .run()
                     .await
