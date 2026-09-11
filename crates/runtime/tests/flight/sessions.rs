@@ -189,37 +189,56 @@ async fn two_principals_naming_the_same_id_do_not_share_a_session() -> Result<()
         .await
 }
 
-/// A client that never handshakes and just presents its API key still gets a
-/// session — `spice sql --api-key …` relies on it — but the session is keyed on
-/// the principal, so a second key cannot reach the first one's statements.
+/// A client that neither handshakes nor sends back the id it was given is
+/// given a fresh session every request, so nothing carries between them.
+///
+/// This is the contract, not a defect: the runtime cannot make a client
+/// remember anything. A handshake hands the id over as the bearer token, and
+/// `spice sql` keeps the `session-id` cookie; a client doing neither has no way
+/// to say which session it means.
 #[tokio::test]
-async fn a_client_that_skips_the_handshake_gets_a_session_of_its_own() -> Result<(), anyhow::Error>
-{
+async fn a_client_that_never_names_a_session_gets_a_fresh_one() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
         .scope(async {
             let (channel, _df) = start_spice_test_app(Some(two_key_auth()), None, None).await?;
 
-            let mut first = client_for(&channel, "a", None);
-            run(&mut first, "PREPARE implicit AS SELECT 5 AS n").await?;
+            let mut client = client_for(&channel, "a", None);
+            run(&mut client, "PREPARE adrift AS SELECT 5 AS n").await?;
 
-            // A separate connection with the same key reaches the same session:
-            // the session follows the principal, not the connection.
-            let mut same_key = client_for(&channel, "a", None);
-            let rows = run(&mut same_key, "EXECUTE implicit").await?;
-            let total: usize = rows.iter().map(RecordBatch::num_rows).sum();
-            assert_eq!(total, 1, "the principal comes back to its own session");
-
-            let mut other_key = client_for(&channel, "b", None);
-            let status = run(&mut other_key, "EXECUTE implicit")
+            let status = run(&mut client, "EXECUTE adrift")
                 .await
-                .expect_err("a different principal has its own session");
+                .expect_err("the next request is in a session of its own");
             assert!(
-                status.message().contains("'implicit' does not exist"),
+                status.message().contains("'adrift' does not exist"),
                 "expected a missing statement, got: {}",
                 status.message()
             );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Naming the same id on both requests is all it takes, which is what the
+/// handshake and the cookie each arrange on the client's behalf.
+#[tokio::test]
+async fn naming_the_same_id_carries_prepared_statements() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let (channel, _df) = start_spice_test_app(Some(two_key_auth()), None, None).await?;
+
+            let mut first = client_for(&channel, "a", Some("pinned"));
+            run(&mut first, "PREPARE kept AS SELECT 5 AS n").await?;
+
+            let mut second = client_for(&channel, "a", Some("pinned"));
+            let rows = run(&mut second, "EXECUTE kept").await?;
+
+            let total: usize = rows.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(total, 1, "a separate connection naming the id reaches it");
 
             Ok(())
         })
