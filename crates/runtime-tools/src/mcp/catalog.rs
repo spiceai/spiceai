@@ -107,19 +107,21 @@ pub(crate) struct McpToolCatalog {
     /// `get_tool` cache. Attached after the catalog is registered.
     schemas: Arc<StdRwLock<Option<Arc<McpSchemaSnapshot>>>>,
     /// Generation gate for list/reconnect publishes. A slower earlier
-    /// fetch must not overwrite a later one when `ttlMs` is 0 and every
-    /// `all`/`get` refetches.
+    /// fetch must not overwrite a later successful publish when
+    /// `ttlMs` is 0 and every `all`/`get` refetches.
     refresh: Arc<ListRefresh>,
 }
 
 /// Serializes listed-cache publishes and discards superseded fetches.
 ///
 /// Increment [`Self::next_gen`] at the start of each list/reconnect
-/// fetch. Apply the result only when that generation is still current,
-/// so last-writer-wins cannot roll `Mcp-Param-*` validation back to an
-/// older schema.
+/// fetch. Apply a result only when it is not older than the highest
+/// generation already published. Tracking started generations as
+/// "current" would drop a successful fetch as soon as a later one
+/// starts, even if that later fetch fails and never publishes.
 struct ListRefresh {
     generation: AtomicU64,
+    published: AtomicU64,
     publish: StdMutex<()>,
 }
 
@@ -141,31 +143,31 @@ impl ListRefresh {
 
     /// Hold this guard across cache write and snapshot publish so two
     /// publishes cannot interleave into a split cache/snapshot.
-    fn lock_if_current(&self, my_gen: u64) -> Option<std::sync::MutexGuard<'_, ()>> {
+    fn lock_if_not_superseded(&self, my_gen: u64) -> Option<std::sync::MutexGuard<'_, ()>> {
         let guard = self
             .publish
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.generation.load(Ordering::Acquire) == my_gen {
-            Some(guard)
-        } else {
+        if my_gen < self.published.load(Ordering::Acquire) {
             None
+        } else {
+            Some(guard)
         }
     }
 
     /// Write the listed tools into the sync cache, then publish to the
     /// gateway snapshot after dropping the cache write lock.
     ///
-    /// Applies only when `my_gen` is still the latest refresh
-    /// generation, so a slower earlier fetch cannot overwrite a later
-    /// one.
+    /// Applies only when `my_gen` is not older than the last successful
+    /// publish, so a slower earlier fetch cannot overwrite a later one,
+    /// and a later failed fetch cannot strand a successful earlier one.
     ///
     /// [`McpSchemaSnapshot::replace_from_map`] takes the snapshot
     /// publish lock and then `try_all` (a cache read). Holding the
     /// cache write across the snapshot publish would deadlock with
     /// that path.
     fn publish_listed(&self, my_gen: u64, listed: &ListedPublish<'_>) {
-        let Some(_refresh) = self.lock_if_current(my_gen) else {
+        let Some(_refresh) = self.lock_if_not_superseded(my_gen) else {
             return;
         };
         let cached = {
@@ -175,6 +177,7 @@ impl ListRefresh {
             apply_tool_cache(&mut cache, listed.tools, listed.replace, listed.ttl_ms);
             cache.tools.clone()
         };
+        self.published.store(my_gen, Ordering::Release);
         let Ok(slot) = listed.schemas.read() else {
             return;
         };
@@ -228,6 +231,7 @@ impl McpToolCatalog {
         let schemas_clone = Arc::clone(&schemas);
         let refresh = Arc::new(ListRefresh {
             generation: AtomicU64::new(0),
+            published: AtomicU64::new(0),
             publish: StdMutex::new(()),
         });
         let refresh_clone = Arc::clone(&refresh);
@@ -1025,6 +1029,7 @@ mod tests {
         let schemas = StdRwLock::new(Some(Arc::clone(&snapshot)));
         let refresh = ListRefresh {
             generation: AtomicU64::new(0),
+            published: AtomicU64::new(0),
             publish: StdMutex::new(()),
         };
 
@@ -1068,6 +1073,54 @@ mod tests {
             snapshot.get(&exposed).as_ref().and_then(x_mcp_header),
             Some("Zone"),
             "snapshot=Region after Zone published first is the last-writer-wins overwrite"
+        );
+    }
+
+    /// Comparing against the newest *started* generation drops a
+    /// successful fetch when a later one starts and then fails
+    /// (`older_success_published=False`, cache stays `old`).
+    #[test]
+    fn successful_older_refresh_is_not_dropped_when_a_later_fetch_fails() {
+        let tool_cache = StdRwLock::new(ToolListCache::default());
+        let schemas = StdRwLock::new(None);
+        let refresh = ListRefresh {
+            generation: AtomicU64::new(0),
+            published: AtomicU64::new(0),
+            publish: StdMutex::new(()),
+        };
+        refresh.publish_listed(
+            refresh.next_gen(),
+            &ListedPublish {
+                tool_cache: &tool_cache,
+                schemas: &schemas,
+                catalog_name: "srv",
+                tools: &[listed_deploy_with_header("old")],
+                replace: true,
+                ttl_ms: 0,
+            },
+        );
+
+        let older_success_gen = refresh.next_gen();
+        let _newer_failed_gen = refresh.next_gen();
+        refresh.publish_listed(
+            older_success_gen,
+            &ListedPublish {
+                tool_cache: &tool_cache,
+                schemas: &schemas,
+                catalog_name: "srv",
+                tools: &[listed_deploy_with_header("Zone")],
+                replace: true,
+                ttl_ms: 0,
+            },
+        );
+
+        let cache = tool_cache
+            .read()
+            .expect("list refresh test must read the catalog cache");
+        assert_eq!(
+            cache.tools.get("deploy").and_then(x_mcp_header),
+            Some("Zone"),
+            "older_success_published=False leaves cache_after_newer_failure={{deploy: old}}"
         );
     }
 
