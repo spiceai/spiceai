@@ -1,0 +1,10 @@
+---
+source: crates/vortex/src/persistent/mod.rs
+expression: pretty_format_batches(&filter_result)?
+---
++----+
+| id |
++----+
+| 2  |
+| 4  |
++----+

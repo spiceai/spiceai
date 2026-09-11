@@ -28,6 +28,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
+use data_components::duckdb::with_utc_session_timezone;
 use data_components::ducklake::provider::{DuckLakeCatalogProvider, DuckLakeFederation};
 use data_components::ducklake::{
     DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
@@ -36,7 +37,7 @@ use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbcon
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use runtime_datafusion::dialect::new_duckdb_dialect;
-use runtime_udfs_api::deny_spice_functions_for_table_providers;
+use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_dialect_without_carve_out;
 use snafu::prelude::*;
 use std::any::Any;
 use std::sync::Arc;
@@ -228,7 +229,7 @@ impl CatalogConnector for DuckLakeCatalog {
         let pool =
             tokio::task::spawn_blocking(move || -> super::Result<Arc<DuckDbConnectionPool>> {
                 let pool = if let Some(path) = open_path.as_deref() {
-                    Arc::new(
+                    Arc::new(with_utc_session_timezone(
                         DuckDbConnectionPool::new_file(path, &duckdb_access_mode).map_err(|e| {
                             super::Error::UnableToGetCatalogProvider {
                                 connector: PREFIX.to_string(),
@@ -236,15 +237,17 @@ impl CatalogConnector for DuckLakeCatalog {
                                 source: e,
                             }
                         })?,
-                    )
+                    ))
                 } else {
-                    Arc::new(DuckDbConnectionPool::new_memory().map_err(|e| {
-                        super::Error::UnableToGetCatalogProvider {
-                            connector: PREFIX.to_string(),
-                            connector_component: connector_component_for_pool.clone(),
-                            source: e,
-                        }
-                    })?)
+                    Arc::new(with_utc_session_timezone(
+                        DuckDbConnectionPool::new_memory().map_err(|e| {
+                            super::Error::UnableToGetCatalogProvider {
+                                connector: PREFIX.to_string(),
+                                connector_component: connector_component_for_pool.clone(),
+                                source: e,
+                            }
+                        })?,
+                    ))
                 };
 
                 let conn = Arc::clone(&pool).connect_sync().map_err(|e| {
@@ -344,9 +347,19 @@ impl CatalogConnector for DuckLakeCatalog {
 ///
 /// The dialect is `DuckDB`'s, because `DuckLake` is `DuckDB`: without it the
 /// `DataFusion` `regexp_*` built-ins are unparsed with `DataFusion`'s flag
-/// argument in `DataFusion`'s position, which `DuckDB` reads differently. Those
-/// are built-ins rather than Spice functions, so no deny-list ever withholds
-/// them and only the dialect can make them right.
+/// argument in `DataFusion`'s position, which `DuckDB` reads differently. That
+/// is true of the two the dialect translates — `regexp_like` and
+/// `regexp_replace` — and only the dialect can make those right, since the
+/// deny-list's Spice carve-out has nothing to say about a built-in.
+///
+/// The other three take the opposite route and are **denied** rather than
+/// translated, which a deny-list can do to a built-in: `FunctionSupport` matches
+/// on the name alone, and `SQLExecutor::can_execute_plan` refuses to federate a
+/// whole plan containing an unsupported function — projections included, not just
+/// the filters `supports_filters_pushdown` screens — leaving the call for
+/// `DataFusion` to evaluate locally. See
+/// [`runtime_datafusion::function_support::DUCKDB_DENIED_BUILTINS`] for why each
+/// of the three cannot be rendered faithfully.
 ///
 /// The deny-list is the plain one, **not** the `DuckDB`-flavored
 /// `deny_spice_functions_for_duckdb_table_providers`. That variant carves out the
@@ -357,10 +370,31 @@ impl CatalogConnector for DuckLakeCatalog {
 /// answers twice the local one. Carving it out here would turn today's
 /// unknown-function error into a silently wrong number, so these are denied and
 /// evaluated locally instead. The divergence itself is #13728.
+///
+/// It does take the `DuckDB` built-in denials, though, because the dialect it
+/// installs is the `DuckDB` one: without them `regexp_match` and `regexp_instr`
+/// would be unparsed under their `DataFusion` names and fail remotely as unknown
+/// functions, and `regexp_count` would be pushed down at a rendering that answers
+/// NULL where `DataFusion` answers `0` (issues #13809, #13870).
+///
+/// The accessor also carries the per-call gate, which is a separate layer from
+/// those name denials and composes with them rather than replacing them: those
+/// names are denied, *and* of the names that are allowed, only the calls the
+/// dialect can actually render may be federated. Without it this route keeps the
+/// defect #13900 reports — the dialect refuses a call it has no rendering for
+/// (`regexp_replace(s, p, r, 'U')`), and because federation has already
+/// committed by then, the refusal fails the whole query instead of leaving the
+/// call for `DataFusion`.
+///
+/// The gate has to arrive from inside the accessor rather than being applied to
+/// its result here: `FunctionSupport::with_scalar_call_support` replaces the live
+/// user-function check that `FunctionSupportBuilder::build` installs, so a gate
+/// set at this call site would federate a function registered after this
+/// federation was built (#13726, #13868).
 fn ducklake_federation() -> DuckLakeFederation {
     DuckLakeFederation {
         dialect: new_duckdb_dialect(),
-        function_support: deny_spice_functions_for_table_providers(),
+        function_support: deny_spice_functions_for_duckdb_dialect_without_carve_out(),
     }
 }
 
@@ -404,9 +438,10 @@ mod tests {
 #[cfg(test)]
 mod federation_tests {
     use super::*;
-    use crate::catalogconnector::stub_udf;
-    use datafusion::prelude::col;
+    use crate::catalogconnector::{stub_udf, stub_udf_called_with};
+    use datafusion::prelude::{col, lit};
     use datafusion::sql::unparser::Unparser;
+    use runtime_datafusion::function_support::DUCKDB_DENIED_BUILTINS;
 
     /// A `DuckLake` catalog must deny the Spice-only UDFs `DuckDB` cannot run, so
     /// `DataFusion` evaluates them locally instead of unparsing them into the
@@ -415,11 +450,11 @@ mod federation_tests {
     fn the_catalog_denies_the_spice_functions_duckdb_cannot_run() {
         let support = ducklake_federation().function_support;
         assert!(
-            !support.supports(&stub_udf("json_get_str", 2)),
+            !support.supports(&stub_udf("json_get_str", 2), None),
             "json_get_str must be denied so federation falls back to local DataFusion"
         );
         assert!(
-            support.supports(&stub_udf("upper", 1)),
+            support.supports(&stub_udf("upper", 1), None),
             "a non-Spice function like upper() must still federate"
         );
     }
@@ -440,7 +475,7 @@ mod federation_tests {
         // rewrite is value-preserving.
         for name in ["cosine_distance", "inner_product"] {
             assert!(
-                !support.supports(&stub_udf(name, 2)),
+                !support.supports(&stub_udf(name, 2), None),
                 "{name} must be evaluated locally: its DuckDB equivalent is not established to \
                  be value-preserving, so it is denied pending that parity check rather than \
                  carved out. Verified for cosine_distance; unverified for inner_product (#13728)"
@@ -448,26 +483,19 @@ mod federation_tests {
         }
     }
 
-    /// The dialect half. `DataFusion`'s `regexp_*` built-ins are not Spice
-    /// functions, so no deny-list withholds them and they federate no matter
-    /// what -- only the installed dialect decides whether `DuckDB` receives them
-    /// with the right argument shape.
+    /// The dialect half, for the `regexp_*` built-ins that do federate: the
+    /// stock `DuckDB` dialect spells none of them, so the installed one has to,
+    /// or `DuckDB` receives the `DataFusion` argument shape.
     ///
     /// `scalar_function_to_sql_overrides` answers `Ok(None)` exactly when the
-    /// dialect has no handler for the name, which is what the stock `DuckDB`
-    /// dialect returns for all of these.
+    /// dialect has no handler for the name.
     #[test]
-    fn the_installed_dialect_translates_the_regexp_builtins() {
+    fn the_installed_dialect_translates_the_regexp_builtins_that_federate() {
         let federation = ducklake_federation();
         let unparser = Unparser::new(federation.dialect.as_ref());
         let args = [col("c0"), col("c1")];
 
-        for name in [
-            "regexp_like",
-            "regexp_match",
-            "regexp_replace",
-            "regexp_count",
-        ] {
+        for name in ["regexp_like", "regexp_replace"] {
             let handled = !matches!(
                 federation
                     .dialect
@@ -476,9 +504,90 @@ mod federation_tests {
             );
             assert!(
                 handled,
-                "{name} federates whatever the deny-list says, so the installed dialect must \
-                 translate it -- the stock DuckDB dialect does not"
+                "{name} federates, so the installed dialect must translate it -- the stock \
+                 DuckDB dialect does not"
             );
         }
+    }
+
+    /// The converse, and the reason the list above is not all of them:
+    /// `regexp_match`, `regexp_instr` and `regexp_count` are **denied** rather
+    /// than pushed down. The first two have no handler at all; `regexp_count`
+    /// keeps its handler because the rewrite is right for non-NULL input and
+    /// #13870 is about making it NULL-preserving, so only the deny is asserted
+    /// for it.
+    ///
+    /// A deny-list does withhold a `DataFusion` built-in, contrary to what this
+    /// module used to assert: this catalog hands its `FunctionSupport` to the
+    /// same `DuckDBTableFactory` as the dataset connector and the accelerator,
+    /// and that provider's `can_execute_plan` refuses to federate *any* plan
+    /// containing an unsupported function -- projections included, not only the
+    /// filters `supports_filters_pushdown` screens -- leaving the call for
+    /// `DataFusion` to evaluate locally. See #13809 for what the `regexp_match`
+    /// translation answered instead.
+    #[test]
+    fn the_installed_dialect_does_not_translate_the_denied_regexp_builtins() {
+        let federation = ducklake_federation();
+        let unparser = Unparser::new(federation.dialect.as_ref());
+        let args = [col("c0"), col("c1")];
+
+        for name in ["regexp_match", "regexp_instr"] {
+            assert!(
+                matches!(
+                    federation
+                        .dialect
+                        .scalar_function_to_sql_overrides(&unparser, name, &args),
+                    Ok(None)
+                ),
+                "{name} is denied, so the dialect must not translate it -- a handler would \
+                 render SQL DuckDB answers differently"
+            );
+        }
+
+        // Every denied name must be withheld, whether or not the dialect still
+        // carries a handler for it: `regexp_count` keeps one on purpose (#13870).
+        for name in DUCKDB_DENIED_BUILTINS {
+            assert!(
+                !federation
+                    .function_support
+                    .supports(&stub_udf(name, 2), None),
+                "{name} must be denied so the plan is left for DataFusion to evaluate locally"
+            );
+        }
+    }
+
+    /// Regression guard for #13900 on the *catalog* route. Translating a name is
+    /// not the same as translating a call: `regexp_replace` is handled, but the
+    /// handler has no rendering for the `U` flag and refuses. Federation asks for
+    /// the SQL only after it has committed, so an ungated route turns that refusal
+    /// into a planning error for a query `DataFusion` can answer.
+    ///
+    /// This route pairs the `DuckDB` dialect with the *plain* deny-list, which
+    /// carries no per-call gate of its own -- so it has to be attached here, and
+    /// nothing else in this file would notice if it went missing.
+    #[test]
+    fn an_untranslatable_call_is_not_federated_by_the_catalog_route() {
+        let support = ducklake_federation().function_support;
+
+        assert!(
+            !support.supports(
+                &stub_udf_called_with(
+                    "regexp_replace",
+                    vec![col("s"), lit("a"), lit("X"), lit("U")],
+                ),
+                None,
+            ),
+            "the `U` flag has no DuckDB rendering, so this call must stay local"
+        );
+        assert!(
+            support.supports(
+                &stub_udf_called_with(
+                    "regexp_replace",
+                    vec![col("s"), lit("a"), lit("X"), lit("g")],
+                ),
+                None,
+            ),
+            "a renderable call must keep its pushdown"
+        );
     }
 }

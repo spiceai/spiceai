@@ -1011,12 +1011,11 @@ fn try_decompose_struct_in_list(
         value_expr.downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>()
     {
         sf
-    } else if let Some(cast_expr) = value_expr.downcast_ref::<phys_expr::CastExpr>() {
+    } else {
+        let cast_expr = value_expr.downcast_ref::<phys_expr::CastExpr>()?;
         cast_expr
             .expr()
             .downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>()?
-    } else {
-        return None;
     };
     if struct_fn.name() != "struct" {
         return None;
@@ -1107,12 +1106,11 @@ fn try_decompose_struct_eq(
     let struct_fn =
         if let Some(sf) = lhs.downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>() {
             sf
-        } else if let Some(cast_expr) = lhs.downcast_ref::<phys_expr::CastExpr>() {
+        } else {
+            let cast_expr = lhs.downcast_ref::<phys_expr::CastExpr>()?;
             cast_expr
                 .expr()
                 .downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>()?
-        } else {
-            return None;
         };
     if struct_fn.name() != "struct" {
         return None;

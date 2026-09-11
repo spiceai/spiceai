@@ -44,6 +44,36 @@ pub struct InventoryEntry {
     pub chdb_exclusion: Option<&'static str>,
     /// `None` means compared vs SQLite; `Some(reason)` is a justified exclusion.
     pub sqlite_exclusion: Option<&'static str>,
+    /// `Some(reason)` names why this query's own `ORDER BY` cannot be fully
+    /// verified — an `ORDER BY` term the result columns do not carry, so no
+    /// engine's row order can be checked against it. Reviewed here rather than
+    /// tolerated at the gate: an unverified order that nobody has looked at is
+    /// the outcome the sort check exists to surface, so it fails instead.
+    pub order_unchecked_review: Option<&'static str>,
+}
+
+/// Why a query's `ORDER BY` cannot be verified against its own result columns.
+///
+/// Every entry is an `ORDER BY` over an expression the projection does not
+/// carry, so there is no output column holding the values the engine sorted by.
+/// The mappable leading terms are still enforced where there are any; the list
+/// records what remains unverified so a *new* hole cannot hide among them.
+fn order_unchecked_review(suite: &str, name: &str) -> Option<&'static str> {
+    match (suite, name) {
+        ("tpcds", "tpcds_q36" | "tpcds_q70" | "tpcds_q86") => Some(
+            "ORDER BY over `CASE WHEN lochierarchy = 0 THEN …`, which the projection \
+             does not carry; the leading `lochierarchy` term is still enforced",
+        ),
+        ("tpcds", "tpcds_q47" | "tpcds_q57" | "tpcds_q89") => Some(
+            "ORDER BY over the derived `sum_sales - avg_monthly_sales`, which the \
+             projection does not carry, so no result column holds the sort key",
+        ),
+        ("clickbench", "clickbench_q25" | "clickbench_q27") => Some(
+            "ORDER BY over a `to_timestamp(…)` expression absent from the projection, \
+             so no result column holds the sort key",
+        ),
+        _ => None,
+    }
 }
 
 /// Build the full inventory from suite sources + micro + SQLLancer.
@@ -65,6 +95,7 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
                 "TPC-H SQL uses DataFusion/DuckDB dialect (EXTRACT, INTERVAL, …); \
                  SQLite lane covers SSB + SQLLancer + micro",
             ),
+            order_unchecked_review: order_unchecked_review("tpch", q.name.as_ref()),
         });
     }
 
@@ -73,7 +104,7 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             suite: "tpcds",
             name: q.name.to_string(),
             sql: q.sql.to_string(),
-            duckdb_exclusion: None,
+            duckdb_exclusion: tpcds_duckdb_exclusion(&q),
             chdb_exclusion: Some(
                 "TPC-DS multi-table SQL targets DataFusion/DuckDB dialect; \
                  chDB runs SQLLancer + micro on all three engines",
@@ -82,6 +113,7 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
                 "TPC-DS SQL targets DataFusion/DuckDB dialect; \
                  SQLite lane covers SSB + SQLLancer + micro",
             ),
+            order_unchecked_review: order_unchecked_review("tpcds", q.name.as_ref()),
         });
     }
 
@@ -98,6 +130,7 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
                 "ClickBench hits schema/SQL surface is DataFusion-oriented; \
                  SQLite lane covers SSB + SQLLancer + micro",
             ),
+            order_unchecked_review: order_unchecked_review("clickbench", q.name.as_ref()),
         });
     }
 
@@ -113,6 +146,7 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             sqlite_exclusion: Some(
                 "CH-benCHmark SQL uses mod()/dialect forms; SQLite lane covers SSB + SQLLancer + micro",
             ),
+            order_unchecked_review: order_unchecked_review("chbench", q.name.as_ref()),
         });
     }
 
@@ -127,6 +161,7 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
                  chDB runs SQLLancer + micro",
             ),
             sqlite_exclusion: None,
+            order_unchecked_review: order_unchecked_review("ssb", q.name.as_ref()),
         });
     }
 
@@ -134,6 +169,7 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
     for q in get_tpch_test_queries(None) {
         let name = q.name.replacen("tpch_", "spicebench_", 1);
         let sq = Query::new(name.clone().into(), Arc::clone(&q.sql), false);
+        let review = order_unchecked_review("spicebench", &name);
         entries.push(InventoryEntry {
             suite: "spicebench",
             name,
@@ -145,6 +181,7 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             sqlite_exclusion: Some(
                 "SpiceBench SF1 is TPC-H dialect; SQLite lane covers SSB + SQLLancer + micro",
             ),
+            order_unchecked_review: review,
         });
     }
 
@@ -156,6 +193,7 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             duckdb_exclusion: None,
             chdb_exclusion: sqllancer_chdb_exclusion(&q),
             sqlite_exclusion: sqllancer_sqlite_exclusion(&q),
+            order_unchecked_review: order_unchecked_review("sqllancer", q.name.as_ref()),
         });
     }
 
@@ -167,6 +205,7 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             duckdb_exclusion: None,
             chdb_exclusion: None,
             sqlite_exclusion: None,
+            order_unchecked_review: order_unchecked_review("micro", q.name.as_ref()),
         });
     }
 
@@ -198,6 +237,24 @@ fn sqllancer_sqlite_exclusion(q: &Query) -> Option<&'static str> {
         Some("SQLLancer query uses DataFusion-only SQL not supported by SQLite")
     } else {
         None
+    }
+}
+
+fn tpcds_duckdb_exclusion(q: &Query) -> Option<&'static str> {
+    // Both queries name a column that two relations in scope expose, and leave it
+    // unqualified. DuckDB's binder rejects the ambiguity; DataFusion resolves it.
+    // A property of the SQL, checkable by running either query against DuckDB — not
+    // a disagreement about results.
+    match q.name.as_ref() {
+        "tpcds_q58" => Some(
+            "TPC-DS q58 orders by an unqualified `item_id` that both the `ss_items` and \
+             `cs_items` subqueries expose; DuckDB's binder rejects the ambiguous reference",
+        ),
+        "tpcds_q72" => Some(
+            "TPC-DS q72 references an unqualified `d_week_seq` that both the `d1` and `d2` \
+             aliases of date_dim expose; DuckDB's binder rejects the ambiguous reference",
+        ),
+        _ => None,
     }
 }
 

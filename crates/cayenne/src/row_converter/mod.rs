@@ -172,6 +172,16 @@ impl RowConverter {
         self.codec().convert_columns(columns)
     }
 
+    /// Encode columns using the byte and offset allocations from an earlier batch.
+    /// The caller owns the lifetime and memory budget of the reusable rows.
+    pub(crate) fn convert_columns_reusing(
+        &self,
+        columns: &[ArrayRef],
+        scratch: Option<Rows>,
+    ) -> Result<Rows, ArrowError> {
+        self.codec().convert_columns_reusing(columns, scratch)
+    }
+
     /// Decode previously-encoded `rows` back into their column arrays.
     ///
     /// Cayenne does not decode at runtime; this exists for round-trip validation and future use.

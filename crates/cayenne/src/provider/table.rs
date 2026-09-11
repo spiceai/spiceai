@@ -64,8 +64,9 @@ use super::pk_index::{
     CheckedOutShardedPkIndex, ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence,
     PendingPkKeys, PkBloom, PkCheckoutGuard, PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome,
     RowLocation, ShardedPkIndex, approx_captured_file_bytes, deserialize_pk_bloom_sidecar,
-    pk_digest, serialize_pk_bloom_sidecar, shard_of_pk,
+    pk_digest, pk_digest_bytes, serialize_pk_bloom_sidecar, shard_of_pk,
 };
+use super::pk_validation::null_primary_key_message;
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
@@ -80,13 +81,13 @@ use crate::provider::scan::{
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, InternalSnafu, Result};
 use crate::resource_starvation::ResourceStarvationTracker;
-use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, Int64Array};
+use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, BooleanBufferBuilder, Int64Array};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef};
 use hash_index::PrehashedBuildHasher;
 use snafu::ensure;
 
-use crate::row_converter::{OwnedRow, RowConverter, SortField};
+use crate::row_converter::{RowConverter, SortField};
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use async_trait::async_trait;
 use data_components::delete::{DeletionExec, DeletionSink};
@@ -2246,7 +2247,24 @@ pub struct CayenneTableProvider {
     /// process. `ensure_no_incomplete_write` ignores these WALs so CDC Stage A
     /// can continue while a previous Stage B is pending; after restart the set
     /// is empty, so the same WALs are treated as crash-recovery input.
-    inflight_staging_appends: Arc<ParkingMutex<HashSet<String>>>,
+    ///
+    /// The value carries the primary keys that append validated while its rows
+    /// were still private. `AppendMutationWriter`'s pipelined staged append is
+    /// the one path that records BEFORE publishing, and it does so on BOTH of
+    /// its arms: `stage_on_conflict`, and the `!stage_on_conflict` arm that
+    /// takes purely-new keys into a table holding no tombstones (#13642). Those
+    /// keys exist nowhere a keyset rebuild can read them — the staged files are
+    /// not yet discoverable and the read filter skips the unpublished tombstone
+    /// — so [`Self::fold_inflight_staged_keys_into_keyset`] folds them in, the
+    /// same way [`Self::fold_mem_tier_keys_into_keyset`] folds the
+    /// un-checkpointed RAM tier. Holding them HERE rather than only in the PK
+    /// cache is what makes that sound: [`Self::clear_cached_pk_keyset`] and the
+    /// index-discard paths empty the cache, and their stated premise — the next
+    /// rebuild reads this commit from the table — does not hold while the
+    /// commit is still staged.
+    /// Empty for an inline append, which records after publishing, so the scan
+    /// sees its rows.
+    inflight_staging_appends: Arc<ParkingMutex<HashMap<String, Arc<PkDigestSet>>>>,
     /// Snapshot dirs the catalog no longer references (merged away by a
     /// protected-snapshot subset compaction), awaiting physical deletion:
     /// snapshot id → the instant it was retired. Deletion is deferred
@@ -4247,6 +4265,47 @@ impl std::fmt::Debug for CayenneTableProvider {
     }
 }
 
+/// The two resident-byte components of a table's PK caches and the slot they are
+/// published into as a sum. Every publish goes through here so the sum is read
+/// and written under one lock (see [`Self::publish_total`]); the provider hands one
+/// to each [`PkCheckoutGuard`] it opens so an abandoned window can restate the
+/// cache's true residency from wherever the guard is dropped.
+struct PkKeysetBytesPublisher {
+    single: Arc<AtomicUsize>,
+    sharded: Arc<AtomicUsize>,
+    publish_lock: Arc<ParkingMutex<()>>,
+    table_memory: Arc<CayenneMemoryAccount>,
+}
+
+impl PkKeysetBytesPublisher {
+    /// Publish the table-wide PK cache's resident bytes and refresh the sum.
+    fn publish_single(&self, bytes: usize) {
+        self.single.store(bytes, Ordering::Relaxed);
+        self.publish_total();
+    }
+
+    /// Publish the sharded PK cache's resident bytes and refresh the sum.
+    fn publish_sharded(&self, bytes: usize) {
+        self.sharded.store(bytes, Ordering::Relaxed);
+        self.publish_total();
+    }
+
+    fn publish_total(&self) {
+        // Read both components AND publish under one lock. The components are
+        // stored before this point, so whichever publisher holds the lock last
+        // reads every completed store and publishes the true sum; splitting the
+        // read from the publish lets a stale total land last and under-report.
+        let _guard = self.publish_lock.lock();
+        let total = self
+            .single
+            .load(Ordering::Relaxed)
+            .saturating_add(self.sharded.load(Ordering::Relaxed));
+        // `set_keyset_bytes` also restates this table's share of the fleet
+        // ceiling, and releases it on drop.
+        self.table_memory.set_keyset_bytes(total);
+    }
+}
+
 impl CayenneTableProvider {
     pub(crate) fn metadata_catalog(&self) -> &Arc<dyn MetadataCatalog> {
         &self.catalog
@@ -4504,9 +4563,10 @@ impl CayenneTableProvider {
     }
 
     pub(crate) fn register_inflight_staging_append(&self, staging_snapshot_id: &str) {
-        self.inflight_staging_appends
-            .lock()
-            .insert(staging_snapshot_id.to_string());
+        self.inflight_staging_appends.lock().insert(
+            staging_snapshot_id.to_string(),
+            Arc::new(PkDigestSet::default()),
+        );
     }
 
     pub(crate) fn unregister_inflight_staging_append(&self, staging_snapshot_id: &str) {
@@ -4515,10 +4575,69 @@ impl CayenneTableProvider {
             .remove(staging_snapshot_id);
     }
 
+    /// Attach the primary keys a staged append validated while its rows are
+    /// still private, so a keyset rebuild running before the publish can fold
+    /// them in (see the field's doc comment).
+    ///
+    /// Retired by [`Self::unregister_inflight_staging_append`], which every exit
+    /// path already reaches: the publish path via
+    /// `PreparedStagedAppend::finish` — which runs strictly AFTER
+    /// `apply_under_barrier` has made the files discoverable — the abort path
+    /// via `rollback`, and a cancelled or abandoned append via `Drop`. Retiring
+    /// late is what correctness needs: a rebuild that folds keys the scan has
+    /// already read is a union of the same key, whereas retiring before the
+    /// publish would reopen exactly the window this closes.
+    ///
+    /// This is process-local, and so is the PK cache it backstops: it closes the
+    /// window against a rebuild in *this* process, not against a restart. A
+    /// cancellation whose catalog commit had already landed leaves a durable
+    /// append that no live registration describes, which recovery — not this
+    /// map — has to account for (#13643).
+    ///
+    /// A no-op when the append is no longer registered, which is the caller
+    /// racing its own retirement; the keys are then already covered by the
+    /// table.
+    pub(crate) fn attach_inflight_staged_pk_keys(
+        &self,
+        staging_snapshot_id: &str,
+        keys: &PkDigestSet,
+    ) {
+        if keys.is_empty() {
+            return;
+        }
+        // Copy the batch's keys BEFORE taking the lock. `has_inflight_staging_appends`
+        // polls this mutex from the compaction and rewrite paths, and this runs on the
+        // CDC write path, so a batch-sized clone under it would make those polls wait
+        // on an allocation. Sharing the copy also keeps the rebuild's capture below to
+        // a refcount bump.
+        let keys = Arc::new(keys.clone());
+        if let Some(slot) = self
+            .inflight_staging_appends
+            .lock()
+            .get_mut(staging_snapshot_id)
+        {
+            *slot = keys;
+        }
+    }
+
+    /// The keys of every staged-but-unpublished append, for a keyset rebuild to
+    /// fold in. Callers MUST capture this under `listing_fence.read()` alongside
+    /// the snapshot list, so an append is either still registered here or
+    /// already published into the `current_snapshot_id` the same fence captured
+    /// — never in neither.
+    fn snapshot_inflight_staged_pk_keys(&self) -> Vec<Arc<PkDigestSet>> {
+        self.inflight_staging_appends
+            .lock()
+            .values()
+            .filter(|keys| !keys.is_empty())
+            .map(Arc::clone)
+            .collect()
+    }
+
     pub(crate) fn staging_append_is_inflight(&self, staging_snapshot_id: &str) -> bool {
         self.inflight_staging_appends
             .lock()
-            .contains(staging_snapshot_id)
+            .contains_key(staging_snapshot_id)
     }
 
     pub(crate) fn has_inflight_staging_appends(&self) -> bool {
@@ -8085,7 +8204,7 @@ impl CayenneTableProvider {
             // list when both flags are clear.
             staging_wal_present: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
             staging_may_have_files: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
-            inflight_staging_appends: Arc::new(ParkingMutex::new(HashSet::new())),
+            inflight_staging_appends: Arc::new(ParkingMutex::new(HashMap::new())),
             retired_snapshot_dirs: Arc::new(ParkingMutex::new(HashMap::new())),
             snapshot_last_listed: Arc::new(ParkingMutex::new(HashMap::new())),
             snapshot_scan_refs: Arc::new(ParkingMutex::new(HashMap::new())),
@@ -10424,7 +10543,14 @@ impl CayenneTableProvider {
     /// table and every key committed after it must still reach the restored index.
     fn take_cached_pk_index(&self) -> (Option<CachedPkIndex>, PkCheckoutGuard) {
         let mut guard = self.pk_keyset_cache.lock();
-        let checkout = PkCheckoutGuard::open(&self.pk_keyset_pending);
+        let checkout = PkCheckoutGuard::open(&self.pk_keyset_pending, {
+            let cache = Arc::clone(&self.pk_keyset_cache);
+            let publisher = self.pk_keyset_bytes_publisher();
+            move || {
+                publisher
+                    .publish_single(cache.lock().as_ref().map_or(0, CachedPkIndex::approx_bytes));
+            }
+        });
         (guard.take(), checkout)
     }
 
@@ -10490,29 +10616,28 @@ impl CayenneTableProvider {
 
     /// Publish the table-wide PK cache's resident bytes and refresh the sum.
     fn publish_single_keyset_bytes(&self, bytes: usize) {
-        self.pk_keyset_bytes_single.store(bytes, Ordering::Relaxed);
-        self.publish_keyset_bytes_total();
+        self.pk_keyset_bytes_publisher().publish_single(bytes);
     }
 
     /// Publish the sharded PK cache's resident bytes and refresh the sum.
     fn publish_sharded_keyset_bytes(&self, bytes: usize) {
-        self.pk_keyset_bytes_sharded.store(bytes, Ordering::Relaxed);
-        self.publish_keyset_bytes_total();
+        self.pk_keyset_bytes_publisher().publish_sharded(bytes);
     }
 
     fn publish_keyset_bytes_total(&self) {
-        // Read both components AND publish under one lock. The components are
-        // stored before this point, so whichever publisher holds the lock last
-        // reads every completed store and publishes the true sum; splitting the
-        // read from the publish lets a stale total land last and under-report.
-        let _guard = self.pk_keyset_publish_lock.lock();
-        let total = self
-            .pk_keyset_bytes_single
-            .load(Ordering::Relaxed)
-            .saturating_add(self.pk_keyset_bytes_sharded.load(Ordering::Relaxed));
-        // `set_keyset_bytes` also restates this table's share of the fleet
-        // ceiling, and releases it on drop.
-        self.table_memory.set_keyset_bytes(total);
+        self.pk_keyset_bytes_publisher().publish_total();
+    }
+
+    /// The PK-cache byte accounting, detached from the provider so a
+    /// [`PkCheckoutGuard`] can carry it to wherever the checked-out index ends up
+    /// and republish on the abandon path (see `take_cached_pk_index`).
+    fn pk_keyset_bytes_publisher(&self) -> PkKeysetBytesPublisher {
+        PkKeysetBytesPublisher {
+            single: Arc::clone(&self.pk_keyset_bytes_single),
+            sharded: Arc::clone(&self.pk_keyset_bytes_sharded),
+            publish_lock: Arc::clone(&self.pk_keyset_publish_lock),
+            table_memory: Arc::clone(&self.table_memory),
+        }
     }
 
     /// Deferred cross-partition appends carry their on-conflict metadata and
@@ -10742,7 +10867,8 @@ impl CayenneTableProvider {
     /// safe: `create_table` is create-or-reuse, and an empty install over
     /// existing rows would turn conflict validation into duplicates. The
     /// emptiness proof therefore covers every place a live row can sit:
-    /// mem-tier, inlined, any snapshot's manifest, and the cold tier. Any
+    /// mem-tier, inlined, any snapshot's manifest, the cold tier, and a staged
+    /// append's private staging directory — which no listing here can see. Any
     /// doubt (unreadable listing) keeps the lazy rebuild. Probes once per
     /// cache lifetime; `clear_cached_pk_keyset` re-arms it, so a delete-all's
     /// next write re-installs. Both call sites hold the per-table write
@@ -10801,6 +10927,33 @@ impl CayenneTableProvider {
             return false;
         }
         if self.sharded_pk_keyset_cache.lock().is_some() {
+            return false;
+        }
+        // A staged append holds rows in a private staging directory that no
+        // listing here can see, and its Stage A does not register the target in
+        // `protected_snapshots`, so every other check reads empty while a live
+        // primary key exists. Installing an empty cache over it means validation
+        // answers from that cache and never rebuilds — so neither the mem-tier
+        // fold nor the staged fold runs, and the next write of that key reads it
+        // as new and leaves two live rows for it. This is the emptiness proof's
+        // fifth place a live row can sit; a false `false` only costs the lazy
+        // rebuild the probe exists to skip.
+        //
+        // THIS CHECK MUST PRECEDE the `protected_snapshots` read below, and the
+        // order is the whole of what makes the pair sound without a lock held
+        // across both. These are two separate atomic reads, so a Stage B publish
+        // can land between them — it needs only the visibility lock and the
+        // listing fence, not `write_lock`, so holding `write_lock` here does not
+        // exclude it. Publishing registers the protected snapshot BEFORE it
+        // unregisters the in-flight append (`apply_under_barrier`, then
+        // `finish` → `mark_inflight_complete`), so reading in-flight first means
+        // an empty read here implies that append either has not registered yet
+        // (it cannot publish before it does, and the table is genuinely empty
+        // now) or has already published — in which case its protected snapshot
+        // was registered before this read and the check below sees it. Reading
+        // protected first inverts that: the publish can slip between the two
+        // reads and leave both looking empty over live rows.
+        if self.has_inflight_staging_appends() {
             return false;
         }
         // A registered protected snapshot means rows outside the current manifest.
@@ -11570,16 +11723,21 @@ impl CayenneTableProvider {
             .map(|&idx| Arc::clone(batch.column(idx)))
             .collect();
         let rows = converter.convert_columns(&pk_columns)?;
-        // Per-shard order-preserving selection masks: scatter each row's index
-        // into its computed shard's mask (`masks[shard][row_idx]`).
-        let mut masks: Vec<Vec<bool>> = vec![vec![false; batch.num_rows()]; n];
+        // Each shard's order-preserving selection mask uses one bit per row.
+        let mut masks: Vec<_> = (0..n)
+            .map(|_| {
+                let mut mask = BooleanBufferBuilder::new(batch.num_rows());
+                mask.append_n(batch.num_rows(), false);
+                mask
+            })
+            .collect();
         for (row_idx, row) in rows.iter().enumerate() {
             let shard = shard_of_pk(row.as_ref(), n);
-            masks[shard][row_idx] = true;
+            masks[shard].set_bit(row_idx, true);
         }
         let mut shards = Vec::with_capacity(n);
-        for mask in masks {
-            let predicate = BooleanArray::from(mask);
+        for mut mask in masks {
+            let predicate = BooleanArray::new(mask.finish(), None);
             shards.push(arrow::compute::filter_record_batch(batch, &predicate)?);
         }
         Ok(shards)
@@ -11780,7 +11938,14 @@ impl CayenneTableProvider {
         // together under the WRITE fence, so resolving cold after this block would
         // let the rebuild fold the promoted rows from BOTH the pre-promotion warm
         // snapshot and the post-promotion cold manifest.
-        let (mem_snapshots, protected_snapshots, current_snapshot_id, cold_files, _scan_guard) = {
+        let (
+            mem_snapshots,
+            staged_keys,
+            protected_snapshots,
+            current_snapshot_id,
+            cold_files,
+            _scan_guard,
+        ) = {
             let _fence = self.listing_fence.read().await;
             let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
                 .mem_tier
@@ -11788,6 +11953,12 @@ impl CayenneTableProvider {
                 .iter()
                 .map(ArcSwap::load_full)
                 .collect();
+            // Staged-but-unpublished appends join the same fenced instant, for the
+            // reason the mem-tier snapshot does: a pipelined staged append
+            // publishes its files under the WRITE fence and only then retires its
+            // registration, so reading both here leaves a key in this capture or in
+            // the `current_snapshot_id` scan below — never in neither.
+            let staged_keys = self.snapshot_inflight_staged_pk_keys();
             // Wait-free Arc::clone — the inner HashMap is shared, not cloned.
             let protected_snapshots = self.protected_snapshots.load_full();
             let current_snapshot_id = self.get_current_snapshot_id();
@@ -11833,6 +12004,7 @@ impl CayenneTableProvider {
             };
             (
                 mem_snapshots,
+                staged_keys,
                 protected_snapshots,
                 current_snapshot_id,
                 cold_files,
@@ -12004,6 +12176,9 @@ impl CayenneTableProvider {
         // Finally fold in the un-checkpointed mem-tier keys (snapshotted at the top).
         Self::fold_mem_tier_keys_into_keyset(&mem_snapshots, pk_indices, converter, &mut keyset)?;
 
+        // …and the keys of staged appends whose files this scan could not see.
+        Self::fold_inflight_staged_keys_into_keyset(&staged_keys, &mut keyset);
+
         // Floor every rebuilt entry's per-key OCC sequence at the end-of-scan
         // high-water. A commit that landed during the rebuild may not be
         // reflected in the scanned keys, so any transaction that began before
@@ -12014,6 +12189,50 @@ impl CayenneTableProvider {
         keyset.stamp_all_sequences_min(self.sequence_high_water().await);
 
         Ok(keyset.finish())
+    }
+
+    /// Fold in the keys of staged-but-unpublished appends, so a rebuild does not
+    /// drop a key whose rows exist only in a private staging directory.
+    ///
+    /// The durable scan in [`Self::load_existing_pk_index`] reads the current
+    /// snapshot, and a pipelined staged append's files are deliberately not
+    /// discoverable there until its finalize flips the tombstone and moves them
+    /// in. That append has nonetheless already validated its keys and recorded
+    /// them, so between those two points the key lives ONLY in the PK cache — and
+    /// [`Self::clear_cached_pk_keyset`] and the index-discard paths empty that
+    /// cache on the premise that a rebuild reads the commit back from the table,
+    /// which is not yet true. Without this fold the next upsert of such a key
+    /// false-negatives in [`Self::apply_on_conflict_to_batch`], records NO
+    /// supersede tombstone, and leaves two live rows for one declared primary key.
+    ///
+    /// Exactly the shape of [`Self::fold_mem_tier_keys_into_keyset`], and safe
+    /// for the same reasons: keys already present from the durable scan keep
+    /// their `RowLocation`, and an over-approximation only removes false
+    /// negatives — a key whose append later aborts costs a redundant, correct
+    /// upsert tombstone. `staged_keys` MUST be captured under the same listing
+    /// fence as the snapshot list (see the caller).
+    fn fold_inflight_staged_keys_into_keyset(
+        staged_keys: &[Arc<PkDigestSet>],
+        keyset: &mut BoundedShardedPkIndexBuilder,
+    ) {
+        for keys in staged_keys {
+            for key in keys.iter() {
+                // Single hash lookup, preserving any durable-scan `RowLocation`.
+                keyset.insert_if_absent(key.clone(), RowLocation::FileUnlocated);
+            }
+        }
+    }
+
+    /// [`Self::fold_inflight_staged_keys_into_keyset`] for the persisted-bloom
+    /// fast path, which reconstructs the index without the full-table scan and
+    /// therefore has the same blind spot. Mirrors
+    /// [`Self::fold_mem_tier_keys_into_bloom`].
+    fn fold_inflight_staged_keys_into_bloom(staged_keys: &[Arc<PkDigestSet>], bloom: &mut PkBloom) {
+        for keys in staged_keys {
+            for key in keys.iter() {
+                bloom.insert(key.as_ref());
+            }
+        }
     }
 
     /// Re-add the CURRENT un-checkpointed mem-tier keys to a freshly rebuilt keyset,
@@ -12329,7 +12548,7 @@ impl CayenneTableProvider {
         // The mem-tier snapshot is taken inside the same fence so a concurrent
         // off-`write_lock` checkpoint cannot hide a live key: it is in this snapshot
         // or already durable in the protected/current scan.
-        let (mem_snapshots, protected_snapshots, current_snapshot_id, _scan_guard) = {
+        let (mem_snapshots, staged_keys, protected_snapshots, current_snapshot_id, _scan_guard) = {
             let _fence = self.listing_fence.read().await;
             let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
                 .mem_tier
@@ -12337,6 +12556,9 @@ impl CayenneTableProvider {
                 .iter()
                 .map(ArcSwap::load_full)
                 .collect();
+            // Same fenced instant as the full rebuild captures them in, and for the
+            // same reason — see `load_existing_pk_index`.
+            let staged_keys = self.snapshot_inflight_staged_pk_keys();
             let protected_snapshots = self.protected_snapshots.load_full();
             let current_snapshot_id = self.get_current_snapshot_id();
             // Pin the snapshot dirs this path reads (the protected snapshots folded
@@ -12354,6 +12576,7 @@ impl CayenneTableProvider {
             };
             (
                 mem_snapshots,
+                staged_keys,
                 protected_snapshots,
                 current_snapshot_id,
                 scan_guard,
@@ -12398,6 +12621,8 @@ impl CayenneTableProvider {
         // RAM-only key omitted here would false-negative its next update and leak
         // the prior copy (durable over-count). Mirrors `load_existing_pk_index`.
         Self::fold_mem_tier_keys_into_bloom(&mem_snapshots, pk_indices, converter, &mut bloom)?;
+        // …and the keys of staged appends whose files no scan can see yet.
+        Self::fold_inflight_staged_keys_into_bloom(&staged_keys, &mut bloom);
         tracing::debug!(
             table = self.table_metadata.table_name.as_str(),
             checkpoint_snapshot = checkpoint_snapshot.as_str(),
@@ -12870,7 +13095,18 @@ impl CayenneTableProvider {
         // exit between here and `store_sharded_pk_index` — close it.
         let (cached, checkout) = {
             let mut guard = self.sharded_pk_keyset_cache.lock();
-            let checkout = PkCheckoutGuard::open(&self.sharded_pk_keyset_pending);
+            let checkout = PkCheckoutGuard::open(&self.sharded_pk_keyset_pending, {
+                let cache = Arc::clone(&self.sharded_pk_keyset_cache);
+                let publisher = self.pk_keyset_bytes_publisher();
+                move || {
+                    publisher.publish_sharded(
+                        cache
+                            .lock()
+                            .as_ref()
+                            .map_or(0, ShardedPkIndex::approx_bytes),
+                    );
+                }
+            });
             (guard.take(), checkout)
         };
         if let Some(cached) = cached {
@@ -13034,7 +13270,7 @@ impl CayenneTableProvider {
         // none). A no-op (no tombstone snapshot, or key not tombstoned).
         let probe_reinsert_over_tombstone =
             |row_idx: usize,
-             key: &OwnedRow,
+             key: &[u8],
              deleted_pk_i64: &mut Vec<i64>,
              deleted_inlined_pk_i64: &mut Vec<i64>,
              deleted_row_keys: &mut Vec<Box<[u8]>>,
@@ -13055,9 +13291,9 @@ impl CayenneTableProvider {
                         }
                     }
                     PkDeletionSnapshot::RowConverterBased { tombstones } => {
-                        if tombstones.get(key.as_ref()).is_some() {
+                        if tombstones.get(key).is_some() {
                             // Box::from once, then clone for the dual-list push (file + inline).
-                            let row_key = bytes_key(key.as_ref());
+                            let row_key = bytes_key(key);
                             deleted_row_keys.push(row_key.clone());
                             deleted_inlined_row_keys.push(row_key);
                             *reinserted_over_tombstone += 1;
@@ -13083,7 +13319,7 @@ impl CayenneTableProvider {
         // mirroring `probe_reinsert_over_tombstone`.
         let push_key_supersede =
             |row_idx: usize,
-             key: &OwnedRow,
+             key: &[u8],
              deleted_pk_i64: &mut Vec<i64>,
              deleted_inlined_pk_i64: &mut Vec<i64>,
              deleted_row_keys: &mut Vec<Box<[u8]>>,
@@ -13097,7 +13333,7 @@ impl CayenneTableProvider {
                         }
                     }
                     PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                        let row_key = bytes_key(key.as_ref());
+                        let row_key = bytes_key(key);
                         deleted_row_keys.push(row_key.clone());
                         deleted_inlined_row_keys.push(row_key);
                     }
@@ -13114,27 +13350,22 @@ impl CayenneTableProvider {
         // scan from every coalesced batch (16K+ envelopes).
         let any_pk_nullable = pk_columns.iter().any(|col| col.null_count() > 0);
 
-        // Build each row's PK key once, then run an IN-BATCH dedup pre-pass:
-        // `ctx.incoming_keys` only covers PRIOR batches, so duplicate PKs WITHIN
-        // this batch must be collapsed here. The survivor per distinct PK is the
-        // single row that runs the conflict/delete logic — Upsert (last_write_wins)
-        // keeps the LAST occurrence, DoNothing* (remove_duplicates) the FIRST.
-        // Non-survivors are dropped BEFORE the loop body so they push no (otherwise
-        // double-counted) delete and are not kept. Composite PKs are handled
-        // natively: the key is the RowConverter encoding over all PK columns. Keys
-        // are hoisted out of the loop (the same per-row `.owned()` clone, just
-        // computed up front) so the pre-pass can borrow them and the loop consume them.
-        let row_pk_keys: Vec<OwnedRow> =
-            (0..batch.num_rows()).map(|i| rows.row(i).owned()).collect();
+        // Deduplicate borrowed row encodings before conflict/delete work. Upsert
+        // (last_write_wins) keeps the last occurrence; DoNothing with duplicate
+        // removal keeps the first. Only retained survivors acquire owned keys
+        // for the downstream keyset and bloom updates.
         // Hash each row's key bytes ONCE into a seeded XXH3-128 digest; this digest
         // is the key's identity for all three probes below (dedup pre-pass,
         // cross-batch `incoming_keys`, and the `existing_keys` keyset), so the
         // per-row hashing cost is paid a single time and the maps reuse it via
         // `PrehashedBuildHasher`.
-        let row_digests: Vec<u128> = row_pk_keys.iter().map(pk_digest).collect();
+        let row_digests: Vec<u128> = rows
+            .iter()
+            .map(|row| pk_digest_bytes(row.as_ref()))
+            .collect();
         let is_survivor: Vec<bool> = if deduplicate_batch {
             let mut survivor: HashMap<u128, usize, PrehashedBuildHasher> =
-                HashMap::with_capacity_and_hasher(row_pk_keys.len(), PrehashedBuildHasher);
+                HashMap::with_capacity_and_hasher(batch.num_rows(), PrehashedBuildHasher);
             for (idx, &digest) in row_digests.iter().enumerate() {
                 if ctx.upsert_options.last_write_wins {
                     survivor.insert(digest, idx); // a later duplicate supersedes
@@ -13142,7 +13373,7 @@ impl CayenneTableProvider {
                     survivor.entry(digest).or_insert(idx); // keep the first
                 }
             }
-            let mut mask = vec![false; row_pk_keys.len()];
+            let mut mask = vec![false; batch.num_rows()];
             for &idx in survivor.values() {
                 mask[idx] = true;
             }
@@ -13151,16 +13382,13 @@ impl CayenneTableProvider {
             Vec::new()
         };
 
-        for (row_idx, key) in row_pk_keys.into_iter().enumerate() {
+        for (row_idx, &digest) in row_digests.iter().enumerate() {
             if any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx)) {
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
-                    message: "Primary key values must be non-null".to_string(),
+                    message: null_primary_key_message(&batch, ctx.pk_indices),
                 });
             }
-
-            // This row's precomputed key identity, reused across all three probes.
-            let digest = row_digests[row_idx];
 
             // Drop in-batch duplicate non-survivors before any conflict/delete work,
             // so exactly one row per PK records a delete and is kept.
@@ -13169,7 +13397,7 @@ impl CayenneTableProvider {
                 continue;
             }
 
-            if ctx.incoming_keys.contains_digest(digest) {
+            if ctx.incoming_keys.contains(&digest) {
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
                     message: "Incoming data contains duplicate primary key across batches"
@@ -13177,6 +13405,7 @@ impl CayenneTableProvider {
                 });
             }
 
+            let key = rows.row(row_idx);
             let keep_row = match ctx.existing {
                 PkExistenceRef::Exact(existing_keys) => {
                     // A key committed by another writer since this keyset was checked
@@ -13204,12 +13433,8 @@ impl CayenneTableProvider {
                                         }
                                     }
                                     PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                                        // Convert the OwnedRow's byte view into a `Box<[u8]>` for the
-                                        // delete-list — `deleted_row_keys` and `deleted_inlined_row_keys`
-                                        // are typed `Vec<Box<[u8]>>` so they can be forwarded to the
-                                        // `commit_on_conflict_deletions` catalog call without a second
-                                        // re-encoding. This is one allocation per conflict row; the
-                                        // arena-indexed key design discussed in iter 3 would amortize it.
+                                        // Delete lists retain their own copy of the encoded key
+                                        // until the catalog commit.
                                         let row_key = bytes_key(key.as_ref());
                                         if is_inlined_conflict {
                                             deleted_inlined_row_keys.push(row_key);
@@ -13267,7 +13492,7 @@ impl CayenneTableProvider {
                         // the uncertainty ends with this batch).
                         push_key_supersede(
                             row_idx,
-                            &key,
+                            key.as_ref(),
                             &mut deleted_pk_i64,
                             &mut deleted_inlined_pk_i64,
                             &mut deleted_row_keys,
@@ -13281,7 +13506,7 @@ impl CayenneTableProvider {
                         // it (otherwise it stays permanently hidden).
                         probe_reinsert_over_tombstone(
                             row_idx,
-                            &key,
+                            key.as_ref(),
                             &mut deleted_pk_i64,
                             &mut deleted_inlined_pk_i64,
                             &mut deleted_row_keys,
@@ -13336,7 +13561,7 @@ impl CayenneTableProvider {
                         // (same shape as the warm bloom HIT above).
                         push_key_supersede(
                             row_idx,
-                            &key,
+                            key.as_ref(),
                             &mut deleted_pk_i64,
                             &mut deleted_inlined_pk_i64,
                             &mut deleted_row_keys,
@@ -13353,7 +13578,7 @@ impl CayenneTableProvider {
                         // fallback.
                         probe_reinsert_over_tombstone(
                             row_idx,
-                            &key,
+                            key.as_ref(),
                             &mut deleted_pk_i64,
                             &mut deleted_inlined_pk_i64,
                             &mut deleted_row_keys,
@@ -13366,7 +13591,7 @@ impl CayenneTableProvider {
             };
 
             if keep_row {
-                kept_keys.insert_with_digest(digest, key);
+                kept_keys.insert_with_digest(digest, key.owned());
             }
             keep_mask.push(keep_row);
         }
@@ -13417,7 +13642,7 @@ impl CayenneTableProvider {
         pending_existence: Option<&PendingPkExistence>,
         pk_indices: &[usize],
         converter: &RowConverter,
-        incoming_keys: &PkDigestSet,
+        incoming_keys: &HashSet<u128, PrehashedBuildHasher>,
     ) -> Result<(Option<RecordBatch>, Option<RecordBatch>, PkDigestSet)> {
         let pk_columns: Vec<_> = pk_indices
             .iter()
@@ -13436,7 +13661,7 @@ impl CayenneTableProvider {
         let mut miss_keys: PkDigestSet = PkDigestSet::with_capacity(batch.num_rows());
         for row_idx in 0..batch.num_rows() {
             let null_pk = any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx));
-            let key = rows.row(row_idx).owned();
+            let key = rows.row(row_idx);
             // A datalake (cold) file MAY hold the key — route it to the HIT path
             // so `apply_on_conflict_to_batch` records the cold supersede. Without
             // this a cold-resident key would fast-path as brand-new and its cold
@@ -13444,7 +13669,7 @@ impl CayenneTableProvider {
             // negatives, so a cold MISS here is safely fast-pathed).
             let cold_hit = cold_existence.is_some_and(|c| c.maybe_contains(key.as_ref()));
             // One hash per row, reused for both existence-set probes below.
-            let digest = pk_digest(&key);
+            let digest = pk_digest_bytes(key.as_ref());
             // A concurrent writer committed this key after the index was checked
             // out, so the bloom cannot hold it — route it to the HIT path, which
             // supersedes the row it committed. Fast-pathing it as brand-new would
@@ -13457,10 +13682,10 @@ impl CayenneTableProvider {
                 && !cold_hit
                 && !pending_hit
                 && !bloom.maybe_contains(key.as_ref())
-                && !incoming_keys.contains_digest(digest)
+                && !incoming_keys.contains(&digest)
                 && !miss_keys.contains_digest(digest);
             if is_miss {
-                miss_keys.insert_with_digest(digest, key);
+                miss_keys.insert_with_digest(digest, key.owned());
             }
             miss_mask.push(is_miss);
         }
@@ -13531,7 +13756,7 @@ impl CayenneTableProvider {
         // Table-global like the cold view: a key routes to exactly one shard, so a
         // shard only ever matches its own keys here.
         let pending_existence = self.pending_sharded_pk_existence();
-        let mut incoming_keys: PkDigestSet = PkDigestSet::default();
+        let mut incoming_keys = HashSet::with_hasher(PrehashedBuildHasher);
         let mut delete_specs: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
         let mut deleted_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
@@ -13558,7 +13783,7 @@ impl CayenneTableProvider {
                 {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
-                        message: "Primary key values must be non-null".to_string(),
+                        message: null_primary_key_message(&batch, pk_indices),
                     });
                 }
                 filtered_batches.push(batch);
@@ -13596,7 +13821,7 @@ impl CayenneTableProvider {
                     if let Some(miss) = miss
                         && miss.num_rows() > 0
                     {
-                        incoming_keys.extend_ref(&miss_keys);
+                        incoming_keys.extend(miss_keys.digests());
                         kept_keys.absorb(miss_keys);
                         filtered_batches.push(miss);
                     }
@@ -13630,7 +13855,7 @@ impl CayenneTableProvider {
             deleted_inlined_pk_i64.extend(result.deleted_inlined_pk_i64);
             deleted_inlined_row_keys.extend(result.deleted_inlined_row_keys);
             reinserted_over_tombstone += result.reinserted_over_tombstone;
-            incoming_keys.extend_ref(&result.kept_keys);
+            incoming_keys.extend(result.kept_keys.digests());
             kept_keys.absorb(result.kept_keys);
             if let Some(fb) = result.filtered_batch
                 && fb.num_rows() > 0
@@ -13777,26 +14002,27 @@ impl CayenneTableProvider {
                 // result inline and skips the spawn/join. One entry per shard in
                 // order, so the index alignment steps 3/4 rely on is preserved.
                 std::thread::scope(|scope| {
-                    let handles: Vec<Option<_>> = per_shard_batches
-                        .into_iter()
-                        .enumerate()
-                        .map(|(s, shard_batches)| {
-                            if shard_batches.is_empty() {
-                                None
-                            } else {
-                                Some(scope.spawn(move || {
-                                    self.validate_one_shard(
-                                        s,
-                                        shard_batches,
-                                        index_ref,
-                                        pk_indices,
-                                        converter,
-                                        on_conflict,
-                                    )
-                                }))
-                            }
-                        })
-                        .collect();
+                    // Every shard's thread is spawned before any of them is joined:
+                    // a lazy spawn-then-join iterator chain would start each thread
+                    // only as the join step pulled it, validating the shards one at a
+                    // time instead of together.
+                    let mut handles: Vec<Option<_>> = Vec::with_capacity(n);
+                    for (s, shard_batches) in per_shard_batches.into_iter().enumerate() {
+                        if shard_batches.is_empty() {
+                            handles.push(None);
+                        } else {
+                            handles.push(Some(scope.spawn(move || {
+                                self.validate_one_shard(
+                                    s,
+                                    shard_batches,
+                                    index_ref,
+                                    pk_indices,
+                                    converter,
+                                    on_conflict,
+                                )
+                            })));
+                        }
+                    }
                     handles
                         .into_iter()
                         .map(|handle| match handle {
@@ -14140,7 +14366,7 @@ impl CayenneTableProvider {
                 if pk_array.null_count() > 0 {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
-                        message: "Primary key values must be non-null".to_string(),
+                        message: null_primary_key_message(&batch, &pk_indices[..1]),
                     });
                 }
                 // Bulk values() iteration: the null gate proves the buffer
@@ -14176,7 +14402,7 @@ impl CayenneTableProvider {
                     if pk_columns.iter().any(|column| column.is_null(row_index)) {
                         return Err(Error::DataValidation {
                             table: self.table_metadata.table_name.clone(),
-                            message: "Primary key values must be non-null".to_string(),
+                            message: null_primary_key_message(&batch, pk_indices),
                         });
                     }
                     let should_delete = deleted_row_keys.contains(rows.row(row_index).as_ref());
@@ -26431,7 +26657,7 @@ impl CayenneTableProvider {
                 if pk_array.null_count() > 0 {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
-                        message: "Primary key values must be non-null".to_string(),
+                        message: null_primary_key_message(&batch, std::slice::from_ref(&pk_index)),
                     });
                 }
                 // Column sweep (see `DeletionIndex::get_batch`): bulk PK slice
@@ -26496,7 +26722,7 @@ impl CayenneTableProvider {
                 if pk_has_nulls {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
-                        message: "Primary key values must be non-null".to_string(),
+                        message: null_primary_key_message(&batch, &pk_indices),
                     });
                 }
 
@@ -30365,6 +30591,47 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Materialize the in-memory CDC tier before a scanning delete, the way
+    /// [`Self::checkpoint_inlined_data_if_present_for_delete`] materializes the
+    /// inline corpus: the deletion-vector sink scans durable tiers only, and it
+    /// scans its `ListingTable`s directly rather than under `listing_fence`, so it
+    /// carries no barrier of its own against a checkpoint still in flight.
+    ///
+    /// There is deliberately no empty-tier fast path. An empty tier does not imply
+    /// nothing is in flight: [`Self::purge_mem_tier_all`] clears a captured but
+    /// not-yet-published prefix while holding only `write_lock`, so a checkpoint
+    /// that captured those rows and is still encoding off-lock leaves the tier
+    /// reading empty with its snapshot unpublished. Awaiting `mem_checkpoint_lock`
+    /// unconditionally is what makes that checkpoint's snapshot visible before the
+    /// caller captures its scan sources.
+    ///
+    /// The caller holds `write_lock`; the checkpoint takes `mem_checkpoint_lock`
+    /// itself — the `write -> mem` order every other holder settles on, and the one
+    /// [`Self::acquire_capture_locks_blocking`] yields to rather than invert. On an
+    /// empty tier the checkpoint is a storage no-op that re-fires the last durable
+    /// slot advancer and returns; in memory-resident mode it returns immediately,
+    /// since there the tier is the permanent store.
+    ///
+    /// It deliberately does NOT drain in-flight pipelined publishes the way schema
+    /// evolution and warm-to-cold promotion do before their checkpoints. Those
+    /// drain while holding `write_lock`, and a current-snapshot staged append
+    /// releases that lock after Stage A while staying registered as in flight until
+    /// `finish` — its Stage B re-acquires the lock in
+    /// `lock_current_snapshot_for_apply`. Waiting for that registration to clear
+    /// under the held lock therefore blocks the publish being waited for, and a
+    /// DELETE that raced one could only end in the drain's timeout.
+    async fn checkpoint_mem_tier_for_delete(&self) -> datafusion_common::Result<()> {
+        self.checkpoint_mem_tier_holding_write_lock()
+            .await
+            .map(|_rows| ())
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to delete from dataset '{}': could not make its in-memory CDC rows durable before the delete, so the delete was not applied and the rows are unchanged. Cause: {e}",
+                    self.table_metadata.table_name
+                ))
+            })
+    }
+
     /// Flush inlined rows to Vortex files when pending inline data exists.
     ///
     /// Callers must hold `write_lock` while calling this helper.
@@ -30612,8 +30879,9 @@ impl CayenneTableProvider {
                     })?;
                 if pk_array.null_count() > 0 {
                     return Err(datafusion_common::DataFusionError::Execution(format!(
-                        "Primary key values must be non-null for table {}",
-                        self.table_metadata.table_name
+                        "Data validation failed for table '{}': {}",
+                        self.table_metadata.table_name,
+                        null_primary_key_message(batch, std::slice::from_ref(&pk_index))
                     )));
                 }
                 // Bulk slice copy (~5x over the per-row is_null+value+push
@@ -30641,8 +30909,9 @@ impl CayenneTableProvider {
                 for row_index in 0..batch.num_rows() {
                     if pk_columns.iter().any(|column| column.is_null(row_index)) {
                         return Err(datafusion_common::DataFusionError::Execution(format!(
-                            "Primary key values must be non-null for table {}",
-                            self.table_metadata.table_name
+                            "Data validation failed for table '{}': {}",
+                            self.table_metadata.table_name,
+                            null_primary_key_message(batch, &pk_indices)
                         )));
                     }
                     row_keys.push(bytes_key(rows.row(row_index).as_ref()));
@@ -31950,6 +32219,14 @@ impl CayenneTableProvider {
                 &self.table_metadata.schema,
                 persisted.num_rows,
             )
+            // A blob written before per-column byte sizes were persisted carries no
+            // total, so serving it would report a different size for this file than
+            // the footer does and leave `JoinSelection` picking a build side by which
+            // source happened to answer. Treat it as stale and re-infer from the
+            // footer below, which rewrites the blob with the size in it. A file whose
+            // footer carries no statistics at all re-infers on first touch in each
+            // process and is then held by `scan_file_statistics`.
+            && statistics.total_byte_size != DFPrecision::Absent
         {
             self.scan_file_statistics.put(
                 &TableScopedPath {
@@ -33477,9 +33754,36 @@ impl TableProvider for CayenneTableProvider {
             return self.delete_using_deletion_vectors(&filters).await;
         }
 
-        let file_sink = self
-            .build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
-            .await?;
+        // Key-based deletion-vector path. The sink scans main, the protected
+        // snapshots and the cold tier — every durable tier — and never the
+        // in-memory CDC tier, and its liveness probe reads the durable deletion
+        // index alone. A predicate that matches only a RAM-resident row would
+        // leave it alive, and one that matches the durable version an
+        // un-checkpointed upsert has superseded would tombstone the KEY and take
+        // the live RAM replacement with it — the shape #13574 closed for protected
+        // snapshots, one tier over. Materialize the tier, exactly as the two
+        // branches above materialize inline rows; once durable, the rows are
+        // subject to the sink's own tier-aware liveness rule.
+        //
+        // The checkpoint and the scan-source capture share ONE `write_lock` hold,
+        // so no CDC apply can land between them. They are not separable: a
+        // checkpoint publishes its rows as a PROTECTED snapshot, and
+        // `build_deletion_vector_sink` freezes the protected set the sink will scan
+        // (the sink re-reads only the main listing at execution), so a checkpoint
+        // that lands after the capture is invisible to this delete. Nothing under
+        // the sink builder takes `write_lock`, so holding it across the build
+        // cannot deadlock.
+        //
+        // This lock is released before `DeletionExec` runs the sink, which takes
+        // `write_lock` again; a CDC apply between the two is still invisible to the
+        // scan sources frozen here (#13828). Closing that window means building the
+        // sink inside the execution-time critical section, not here.
+        let file_sink = {
+            let _guard = self.write_lock.lock().await;
+            self.checkpoint_mem_tier_for_delete().await?;
+            self.build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
+                .await?
+        };
         Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
             Arc::new(InlineAwareDeletionSink {
                 table: self.clone_for_write(),
@@ -41671,7 +41975,7 @@ mod tests {
         )
         .await;
         let pk_indices = vec![0_usize];
-        let rows: i64 = 200;
+        let rows: i64 = 208;
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
@@ -41680,6 +41984,8 @@ mod tests {
             ],
         )
         .expect("batch built");
+        // Exercise a sliced input and a partial final bitmap byte.
+        let batch = batch.slice(7, 201);
         let converter = provider.build_pk_converter(&pk_indices).expect("converter");
 
         // n=1 is the unsharded fast path: the batch comes back unchanged.
@@ -41704,11 +42010,25 @@ mod tests {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .expect("id column");
+            let values = shard_batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value column");
+            assert!(
+                ids.values().windows(2).all(|pair| pair[0] < pair[1]),
+                "shard selection must preserve input order"
+            );
             let id_rows = converter
                 .convert_columns(&[Arc::clone(shard_batch.column(0))])
                 .expect("convert");
             for row_idx in 0..shard_batch.num_rows() {
                 let id = ids.value(row_idx);
+                assert_eq!(
+                    values.value(row_idx),
+                    id * 10,
+                    "row values must stay aligned"
+                );
                 assert!(seen.insert(id), "id {id} appeared in more than one shard");
                 assert_eq!(
                     shard_of_pk(id_rows.row(row_idx).as_ref(), n),
@@ -52524,10 +52844,7 @@ mod tests {
         );
 
         // Stage B of a pipelined append: registered as in flight, not yet published.
-        provider
-            .inflight_staging_appends
-            .lock()
-            .insert("staged-snapshot".to_string());
+        provider.register_inflight_staging_append("staged-snapshot");
         assert!(provider.has_inflight_staging_appends(), "precondition");
 
         assert_eq!(
@@ -53516,6 +53833,450 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn keyset_rebuild_after_invalidation_no_overcount_sharded() {
         keyset_rebuild_after_invalidation_no_overcount(4).await;
+    }
+
+    /// Regression test for #13639: the pipelined staged append records its
+    /// validated primary keys BEFORE its rows are discoverable, so a keyset
+    /// rebuild landing in that window reads them from neither the table nor the
+    /// cache — and the paths that drop the cache do so on the stated premise
+    /// that a rebuild reads the commit back from the table, which is not yet
+    /// true. A key known only to the staged write then reads as new on the next
+    /// upsert, records NO supersede tombstone, and leaves two live rows for one
+    /// declared primary key.
+    ///
+    /// Deterministic, no concurrency. Seeding an upsert first is what puts the
+    /// table into `pending_pk_deletions`, which is what routes the later
+    /// all-new-keys batch through the `stage_on_conflict` arm that records early.
+    #[tokio::test]
+    async fn keyset_rebuild_sees_an_unpublished_staged_appends_keys() {
+        const STAGED_KEY: i64 = 4242;
+        let table = "keyset_rebuild_staged_unpublished";
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table(table, ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // 1. Seed a key and upsert it, so the table carries PK tombstones. Every
+        //    later append then takes the staged (`stage_on_conflict`) arm, which
+        //    is the only `record_file_pk_keys` call site that runs before its
+        //    publish.
+        for value in [10_i64, 20] {
+            provider
+                .write_cdc_append_stream(
+                    single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[value])),
+                    &ctx.task_ctx(),
+                )
+                .await
+                .expect("seed write should prepare")
+                .finish()
+                .await
+                .expect("finalize seed write");
+        }
+
+        // 2. Insert a BRAND-NEW key through that arm and HOLD the receipt: its
+        //    keys are recorded, its rows are not yet discoverable, and no other
+        //    tier holds the key. This is the window.
+        let staged = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[STAGED_KEY], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("staged insert should prepare");
+        assert!(
+            staged.has_pending_finalize(),
+            "precondition: the new key must be staged, not published — otherwise \
+             the rebuild below would legitimately read it from the table"
+        );
+
+        // 3. Drop the cached keyset the way a background compaction, a
+        //    pending-log overflow, or an abandoned validation stream does.
+        provider.clear_cached_pk_keyset();
+
+        // 4. UPDATE the staged key. This rebuilds the keyset from the table,
+        //    which cannot see the staged rows; without folding the in-flight
+        //    staged keys the update false-negatives and records no tombstone.
+        let update = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[STAGED_KEY], &[999])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("update of the staged key should prepare");
+
+        // 5. Publish both, oldest first.
+        staged.finish().await.expect("finalize staged insert");
+        update.finish().await.expect("finalize update");
+
+        let pairs = collect_id_value_pairs(&ctx, &provider, table).await;
+        let staged_rows: Vec<i64> = pairs
+            .iter()
+            .filter(|(id, _)| *id == STAGED_KEY)
+            .map(|(_, value)| *value)
+            .collect();
+        assert_eq!(
+            staged_rows.len(),
+            1,
+            "two live rows for one primary key: the rebuild did not see the staged \
+             append's key, so the update recorded no supersede tombstone (rows for \
+             {STAGED_KEY}: {staged_rows:?})"
+        );
+        assert_eq!(
+            query_count_star(&ctx, &provider, table).await,
+            2,
+            "table must hold exactly the seeded key and the staged key"
+        );
+    }
+
+    /// The persisted-bloom fast path reconstructs the index without the
+    /// full-table scan, so it has the same blind spot as the rebuild above and
+    /// needs the same fold. Same window, same failure, different reconstruction:
+    /// persist a checkpoint for the current snapshot first, so the update in
+    /// step 4 is served by `try_load_persisted_pk_index` instead of
+    /// `load_existing_pk_index`.
+    #[tokio::test]
+    async fn persisted_bloom_index_sees_an_unpublished_staged_appends_keys() {
+        const STAGED_KEY: i64 = 5353;
+        let table = "persisted_bloom_staged_unpublished";
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table(table, ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        for value in [10_i64, 20] {
+            provider
+                .write_cdc_append_stream(
+                    single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[value])),
+                    &ctx.task_ctx(),
+                )
+                .await
+                .expect("seed write should prepare")
+                .finish()
+                .await
+                .expect("finalize seed write");
+        }
+
+        let staged = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[STAGED_KEY], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("staged insert should prepare");
+        assert!(
+            staged.has_pending_finalize(),
+            "precondition: key must be staged"
+        );
+
+        // Checkpoint the CURRENT snapshot's keys into the persisted bloom. The
+        // staged append has not flipped the snapshot yet, so the fast path's
+        // snapshot gate holds and the update below takes it.
+        let current_snapshot_id = provider.get_current_snapshot_id();
+        provider
+            .try_persist_pk_bloom_checkpoint(&current_snapshot_id, 2)
+            .await
+            .expect("persist the PK bloom checkpoint");
+        provider.clear_cached_pk_keyset();
+
+        let update = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[STAGED_KEY], &[999])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("update of the staged key should prepare");
+
+        staged.finish().await.expect("finalize staged insert");
+        update.finish().await.expect("finalize update");
+
+        let staged_rows: Vec<i64> = collect_id_value_pairs(&ctx, &provider, table)
+            .await
+            .into_iter()
+            .filter(|(id, _)| *id == STAGED_KEY)
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(
+            staged_rows.len(),
+            1,
+            "two live rows for one primary key: the persisted-bloom index did not \
+             carry the staged append's key (rows for {STAGED_KEY}: {staged_rows:?})"
+        );
+    }
+
+    /// The two guards above seed published rows first, which is what makes the
+    /// rebuild run at all. On an **empty** table the write-path warm-cache probe
+    /// fires instead: `clear_cached_pk_keyset` re-arms it, and a staged append is
+    /// invisible to every branch of its emptiness proof — its files sit in a
+    /// private staging directory and its Stage A does not register the target in
+    /// `protected_snapshots`. The probe would then install an empty exact cache
+    /// over a live primary key, and validation answers from that cache without
+    /// ever rebuilding — so the staged fold never runs and the key reads as new.
+    ///
+    /// Zero seed on purpose: seeding anything is exactly what hides this path.
+    #[tokio::test]
+    async fn warm_empty_cache_probe_defers_to_an_inflight_staged_append() {
+        const STAGED_KEY: i64 = 6464;
+        let table = "warm_empty_probe_staged_unpublished";
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_cdc_upsert_table(table, Arc::clone(&runtime_env)).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let staged = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[STAGED_KEY], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("staged insert should prepare");
+        assert!(
+            staged.has_pending_finalize(),
+            "precondition: the key must be staged, not published"
+        );
+        assert!(
+            provider.protected_snapshots.load().is_empty(),
+            "precondition: Stage A must NOT have registered the target — that is \
+             what leaves the emptiness proof reading empty over a live key"
+        );
+
+        provider.clear_cached_pk_keyset();
+
+        let update = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[STAGED_KEY], &[999])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("update of the staged key should prepare");
+
+        staged.finish().await.expect("finalize staged insert");
+        update.finish().await.expect("finalize update");
+
+        let staged_rows: Vec<i64> = collect_id_value_pairs(&ctx, &provider, table)
+            .await
+            .into_iter()
+            .filter(|(id, _)| *id == STAGED_KEY)
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(
+            staged_rows,
+            vec![999],
+            "two live rows for one primary key: the warm-empty probe installed an \
+             empty cache over a staged append's key, so validation never rebuilt \
+             and recorded no supersede tombstone (rows for {STAGED_KEY}: \
+             {staged_rows:?})"
+        );
+
+        // Durable, not just the live view: an over-count here has no tombstone,
+        // so compaction could never heal it.
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .open(table)
+            .await
+            .expect("reopen");
+        assert_eq!(
+            query_count_star(&ctx, &reopened, table).await,
+            1,
+            "reopened durable state over-counts"
+        );
+    }
+
+    /// The keys of an in-flight staged append are held OUTSIDE the PK cache, so
+    /// `clear_cached_pk_keyset` — which empties every cache on the premise that a
+    /// rebuild re-reads the commit from the table — cannot discard them, and they
+    /// are retired by the same registration the publish already unregisters.
+    ///
+    /// Pins the mechanism directly: the end-to-end guard above can only observe
+    /// it through a row count, so a change that kept the row count while losing
+    /// the survival property would pass there and fail here.
+    #[tokio::test]
+    async fn inflight_staged_pk_keys_survive_a_keyset_clear() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_cdc_upsert_table("staged_pk_keys_survive_clear", ctx.runtime_env()).await;
+
+        let converter = RowConverter::new(vec![SortField::new(DataType::Int64)])
+            .expect("row converter for the Int64 primary key");
+        let rows = converter
+            .convert_columns(&[Arc::new(Int64Array::from(vec![7_i64])) as ArrayRef])
+            .expect("convert the primary key column");
+        let key = rows.row(0).owned();
+        let mut keys = PkDigestSet::default();
+        keys.insert_with_digest(pk_digest(&key), key.clone());
+
+        let staging_snapshot_id = "_staging/inflight-staged-keys";
+        provider.register_inflight_staging_append(staging_snapshot_id);
+        provider.attach_inflight_staged_pk_keys(staging_snapshot_id, &keys);
+
+        provider.clear_cached_pk_keyset();
+        let captured = provider.snapshot_inflight_staged_pk_keys();
+        assert_eq!(
+            captured.len(),
+            1,
+            "clearing the PK cache must not discard an in-flight staged append's keys"
+        );
+        assert!(
+            captured[0].contains_digest(pk_digest(&key)),
+            "the surviving entry must carry the staged key itself"
+        );
+
+        // The publish path's unregister is what retires them, so a rebuild after
+        // it folds nothing and reads the now-discoverable rows from the table.
+        provider.unregister_inflight_staging_append(staging_snapshot_id);
+        assert!(
+            provider.snapshot_inflight_staged_pk_keys().is_empty(),
+            "retiring the registration must release the staged keys"
+        );
+    }
+
+    /// Two pipelined appends of the same new primary key resolve to ONE live row
+    /// under `on_conflict: do_nothing`, even when the second begins its Stage A
+    /// before the first has published.
+    ///
+    /// That overlap is the pipeline's steady state rather than a race to provoke:
+    /// the next Stage A is deliberately allowed to start before the previous
+    /// Stage B publishes. A `DoNothingAll` table whose keys are all new takes the
+    /// `!stage_on_conflict` arm, so this pins that arm's Stage-A key record — the
+    /// only thing that carries the first batch's key into the second batch's
+    /// validation while the staged rows are still undiscoverable.
+    ///
+    /// Regression test for #13642.
+    #[tokio::test]
+    async fn overlapping_pipelined_appends_of_one_new_do_nothing_key_leave_one_row() {
+        let ctx = SessionContext::new();
+        let table = "staged_do_nothing_overlap";
+        let (provider, _catalog, _tmp) = create_cdc_table_with_on_conflict(
+            table,
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+            OnConflict::DoNothingAll,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Stage A of the first append. No tombstones exist, so `stage_on_conflict`
+        // is false and this takes the arm under test.
+        let first = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[77], &[1])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("first staged write should prepare");
+        assert!(
+            first.has_pending_finalize(),
+            "the first append must still be staged when the second runs, or the window under \
+             test never opens"
+        );
+
+        // Drop every cached keyset before the second append, so the first append's
+        // key can only reach the second's validation through the in-flight staged
+        // registration and the rebuild that folds it in. Without this the second
+        // append reads the PK cache that `record_file_pk_keys` just filled, and
+        // that call alone satisfies the row-count assertion below — leaving the
+        // `!stage_on_conflict` arm's `attach_inflight_staged_pk_keys` with no
+        // reachable consumer in this test. `clear_cached_pk_keyset` empties the
+        // cache on the premise that a rebuild re-reads the commit from the table,
+        // which is exactly the premise that does not hold while the staged rows
+        // are still undiscoverable, so it is also the operation this arm has to
+        // survive in production.
+        provider.clear_cached_pk_keyset();
+
+        // Stage A of the second append begins inside that window, carrying the SAME
+        // new key. Whether it stages is an OUTCOME, not a precondition: once the
+        // first append's key is visible to validation the row is dropped as a
+        // conflict and there is nothing left to stage, so asserting
+        // `has_pending_finalize` here would demand the duplicate this test refuses.
+        let second = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[77], &[2])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second staged write should prepare while the first finalize is pending");
+
+        first
+            .finish()
+            .await
+            .expect("finalize the first staged write");
+        second
+            .finish()
+            .await
+            .expect("finalize the second staged write");
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, table).await,
+            vec![(77, 1)],
+            "`on_conflict: do_nothing` must keep exactly the first row for key 77; two live rows \
+             mean the second batch could not see the first's staged key"
+        );
+    }
+
+    /// Pins the mechanism the test above exercises end-to-end: the key reaches the
+    /// PK cache while the staged rows are still private, which is what a second
+    /// pipelined batch probes.
+    ///
+    /// Worth its own test because the row-count assertion cannot distinguish "the
+    /// key was recorded at Stage A" from "the second batch happened to run after
+    /// the publish" — a change that moved the record back to Stage B would keep
+    /// that test green under a fast enough publish and fail here every time.
+    #[tokio::test]
+    async fn a_staged_append_records_its_keys_before_the_publish() {
+        let ctx = SessionContext::new();
+        let table = "staged_record_before_publish";
+        let (provider, _catalog, _tmp) = create_cdc_table_with_on_conflict(
+            table,
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+            OnConflict::DoNothingAll,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let staged = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[5], &[10])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("staged write should prepare");
+        assert!(
+            staged.has_pending_finalize(),
+            "the append must still be staged, or the record under test is just an ordinary \
+             post-publish one"
+        );
+
+        assert!(
+            matches!(
+                &*provider.pk_keyset_cache.lock(),
+                Some(CachedPkIndex::Exact(keyset))
+                    if keyset.location_by_digest(int64_pk_digest(5)).is_some()
+            ),
+            "the staged append must record its key BEFORE the publish, or a second pipelined \
+             batch carrying the same key cannot see it (#13642)"
+        );
+
+        staged.finish().await.expect("finalize the staged write");
+    }
+
+    /// The `u128` PK digest for a single-column `Int64` primary key, as the
+    /// keyset stores it.
+    fn int64_pk_digest(id: i64) -> u128 {
+        let converter = RowConverter::new(vec![SortField::new(DataType::Int64)])
+            .expect("row converter for the Int64 primary key");
+        let rows = converter
+            .convert_columns(&[Arc::new(Int64Array::from(vec![id])) as ArrayRef])
+            .expect("convert the primary key column");
+        pk_digest(&rows.row(0).owned())
     }
 
     /// Concurrent SAME-PK append seq-ordering guard (the `mem_tier_publish_lock`).
@@ -55503,6 +56264,83 @@ mod tests {
              per-snapshot sequence numbers (matching load_protected_snapshots), or \
              scans return different rows before vs after a reload"
         );
+    }
+
+    /// A key-based user `DELETE` must finish planning while a pipelined CDC
+    /// append sits between its stages.
+    ///
+    /// A current-snapshot append releases `write_lock` after Stage A
+    /// (`prepare` drops the guard for that target kind) and stays registered in
+    /// `inflight_staging_appends` until `finish`, while its Stage B RE-ACQUIRES
+    /// `write_lock` in `lock_current_snapshot_for_apply`. So a delete that holds
+    /// `write_lock` and waits for that set to drain blocks the very publish it is
+    /// waiting for, and can only end in the drain's timeout.
+    #[tokio::test]
+    async fn key_delete_does_not_wait_for_an_inflight_current_snapshot_append() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "key_delete_vs_inflight_append",
+            ctx.runtime_env(),
+            VortexConfig {
+                compaction_background_interval_ms: 0,
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[10])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed CDC batch should prepare")
+            .finish()
+            .await
+            .expect("finalize seed CDC batch");
+
+        // A NEW key, so the batch carries no on-conflict deletions and stages
+        // into the CURRENT snapshot — the target kind whose Stage B needs the lock.
+        let pending = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second CDC batch should prepare");
+        assert!(
+            pending.has_pending_finalize(),
+            "precondition: the append must still be mid-flight"
+        );
+        assert!(
+            provider.has_inflight_staging_appends(),
+            "precondition: Stage B has not run yet"
+        );
+        assert!(
+            provider.write_lock.try_lock().is_ok(),
+            "precondition: a current-snapshot append leaves write_lock free between its stages, so a DELETE can take it"
+        );
+
+        let planned = tokio::time::timeout(
+            Duration::from_secs(5),
+            provider.delete_from(
+                &ctx.state(),
+                vec![col("value").eq(datafusion_expr::lit(10_i64))],
+            ),
+        )
+        .await;
+        assert!(
+            planned.is_ok(),
+            "the DELETE did not finish planning within 5s while a staged append was in flight"
+        );
+        planned
+            .expect("delete planning completed")
+            .expect("delete plan builds");
+
+        pending.finish().await.expect("finalize pending append");
     }
 
     #[tokio::test]
@@ -57755,6 +58593,121 @@ mod tests {
         );
     }
 
+    /// PK uniqueness across the inline/staged overlap: an inline-seeded key whose
+    /// staged replacement lands in a private file, upserted a SECOND time while
+    /// that first staged append is still registered and unpublished, and with the
+    /// PK cache dropped in between so the keyset is rebuilt inside that window.
+    ///
+    /// Guards the end-to-end outcome — one live row per key, carrying the latest
+    /// value, and an exact `COUNT(*)`. It deliberately does NOT claim to isolate
+    /// [`Self::fold_inflight_staged_keys_into_keyset`]: these keys are already in
+    /// the keyset from the durable inline scan, so the fold's `insert_if_absent`
+    /// is a no-op for them and the assertions below hold with the fold disabled.
+    /// The keys-only-in-a-staged-append case the fold does carry is covered by
+    /// [`Self::keyset_rebuild_sees_an_unpublished_staged_appends_keys`].
+    #[tokio::test]
+    async fn staged_upsert_over_inline_key_with_cleared_cache_leaves_one_row() {
+        const LINE_COUNT: i64 = 128;
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_order_line_cdc_table_with_inline_max_rows(
+            "inline_staged_cleared_cache",
+            ctx.runtime_env(),
+            usize::try_from(LINE_COUNT).expect("line count fits usize"),
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Seed K inline.
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(order_line_batch(Arc::clone(&schema), 42, LINE_COUNT, 0)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed insert should prepare")
+            .finish()
+            .await
+            .expect("finalize seed insert");
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            LINE_COUNT,
+            "precondition: the seed batch must live inline"
+        );
+
+        // First staged upsert of K -> replacement rows go to a private file.
+        let first = provider
+            .write_cdc_append_stream(
+                single_batch_stream(order_line_batch_with_extra_line(
+                    Arc::clone(&schema),
+                    42,
+                    LINE_COUNT,
+                    1,
+                    43,
+                )),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("first staged upsert should prepare");
+        assert!(
+            first.has_pending_finalize(),
+            "precondition: the first upsert must stage replacement rows on disk"
+        );
+
+        // The rebuild-and-fold path under test: K is still inline-visible while its
+        // staged file replacement is registered but unpublished.
+        provider.clear_cached_pk_keyset();
+
+        // Second staged upsert of the same keys, prepared while the FIRST staged
+        // append is still registered and unpublished -- that window is what makes
+        // the rebuild fold the staged keys over the still-visible inline copies.
+        let second = provider
+            .write_cdc_append_stream(
+                single_batch_stream(order_line_batch_with_extra_line(
+                    Arc::clone(&schema),
+                    42,
+                    LINE_COUNT,
+                    2,
+                    43,
+                )),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second staged upsert should prepare");
+
+        // Publish both, oldest first.
+        first.finish().await.expect("finalize first staged upsert");
+        second
+            .finish()
+            .await
+            .expect("finalize second staged upsert");
+
+        let rows = collect_order_line_rows(&ctx, &provider, "inline_staged_cleared_cache").await;
+        for line_number in 1..=LINE_COUNT {
+            let hits: Vec<_> = rows
+                .iter()
+                .filter(|(w_id, d_id, o_id, ol_number, _)| {
+                    *w_id == 1 && *d_id == 1 && *o_id == 42 && *ol_number == line_number
+                })
+                .collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "line {line_number} must survive exactly once after two staged upserts over an inline seed, got {hits:?}"
+            );
+            assert_eq!(
+                hits[0].4, 2,
+                "line {line_number} must show the LATEST delivery value, got {hits:?}"
+            );
+        }
+        let count_star = query_count_star(&ctx, &provider, "inline_staged_cleared_cache").await;
+        assert_eq!(
+            count_star,
+            LINE_COUNT + 1,
+            "COUNT(*) must not double-count a key whose staged replacement overlapped an inline copy"
+        );
+    }
+
     /// Ch-Bench durable-path regression: the original order lines are small
     /// enough to live in the metastore inline tier, but the delivery update
     /// overflows the inline gate and stages replacement rows on disk. Source
@@ -59498,7 +60451,7 @@ mod tests {
             ]),
         );
         let upsert_options = on_conflict.get_upsert_options();
-        let incoming_keys = PkDigestSet::default();
+        let incoming_keys = HashSet::with_hasher(PrehashedBuildHasher);
         let mut validation_ctx = OnConflictContext {
             pk_indices: &pk_indices,
             converter: &converter,
@@ -59713,6 +60666,111 @@ mod tests {
                 other.is_some()
             ),
         }
+    }
+
+    /// An abandoned checkout must release the resident-byte accounting its window
+    /// grew — regression test for #13668. Keys committed while the keyset is checked
+    /// out are accounted against the published residency as they land, and only a
+    /// restore overwrites that figure; a validation that is dropped or cancelled
+    /// restores nothing, so the bytes of keys that were just discarded stayed
+    /// reserved against the table's memory account and narrowed every sibling's
+    /// keyset budget.
+    #[tokio::test]
+    async fn an_abandoned_checkout_releases_the_keyset_bytes_its_window_grew() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "pk_checkout_abandoned_bytes",
+            ctx.runtime_env(),
+            VortexConfig::default(),
+        )
+        .await;
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        // A validation checks the (cold) keyset out; while its window is open a
+        // concurrent commit lands three keys, which the log holds for the replay.
+        let (cached, checkout) = provider.take_cached_pk_index();
+        assert!(cached.is_none(), "a fresh table has no cached keyset");
+        provider.record_file_pk_keys(&pk_digest_set_for_ids(&converter, &[7, 8, 9]), 11);
+
+        let held = provider.pk_keyset_bytes_single.load(Ordering::Relaxed);
+        assert!(
+            held > 0,
+            "keys held for the replay are accounted while the window is open"
+        );
+        assert_eq!(
+            provider.table_memory.snapshot().keyset,
+            held,
+            "the held bytes reach the table's memory account"
+        );
+
+        // The validation is dropped without storing an index back.
+        drop(checkout);
+
+        assert_eq!(
+            provider.pk_keyset_bytes_single.load(Ordering::Relaxed),
+            0,
+            "an abandoned window releases the bytes of the keys it discarded"
+        );
+        assert_eq!(
+            provider.table_memory.snapshot().keyset,
+            0,
+            "the memory account no longer carries the phantom reservation"
+        );
+    }
+
+    /// The per-shard index has the same window and the same accounting — the
+    /// sharded twin of the test above (#13668).
+    #[tokio::test]
+    async fn an_abandoned_sharded_checkout_releases_the_keyset_bytes_its_window_grew() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_sharded_checkout_abandoned_bytes",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+        provider.maybe_install_warm_pk_caches().await;
+
+        // An apply checks the per-shard index out; a concurrent commit lands while
+        // the window is open and is held for the replay.
+        let checked_out = provider
+            .build_sharded_pk_index(&pk_indices, &converter, 4)
+            .await
+            .expect("the warm per-shard index is checked out");
+        let before = provider.pk_keyset_bytes_sharded.load(Ordering::Relaxed);
+        provider.record_file_pk_keys(&pk_digest_set_for_ids(&converter, &[7, 8, 9]), 11);
+        assert!(
+            provider.pk_keyset_bytes_sharded.load(Ordering::Relaxed) > before,
+            "keys held for the replay are accounted while the per-shard window is open"
+        );
+
+        // The apply is abandoned without restoring the index.
+        drop(checked_out);
+
+        assert_eq!(
+            provider.pk_keyset_bytes_sharded.load(Ordering::Relaxed),
+            0,
+            "the per-shard cell is empty after the abandon, so its published residency is zero"
+        );
+        assert_eq!(
+            provider.table_memory.snapshot().keyset,
+            provider.pk_keyset_bytes_single.load(Ordering::Relaxed),
+            "the memory account carries only the table-wide keyset's bytes"
+        );
     }
 
     /// The table-wide keyset has the same window and the same latch — regression
