@@ -36,7 +36,10 @@ use secrecy::ExposeSecret;
 use snafu::ResultExt;
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock, RwLock as StdRwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, LazyLock, Mutex as StdMutex, RwLock as StdRwLock,
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -103,6 +106,41 @@ pub(crate) struct McpToolCatalog {
     /// here and bump the epoch so Streamable HTTP drops rmcp's per-name
     /// `get_tool` cache. Attached after the catalog is registered.
     schemas: Arc<StdRwLock<Option<Arc<McpSchemaSnapshot>>>>,
+    /// Generation gate for list/reconnect publishes. A slower earlier
+    /// fetch must not overwrite a later one when `ttlMs` is 0 and every
+    /// `all`/`get` refetches.
+    refresh: Arc<ListRefresh>,
+}
+
+/// Serializes listed-cache publishes and discards superseded fetches.
+///
+/// Increment [`Self::next_gen`] at the start of each list/reconnect
+/// fetch. Apply the result only when that generation is still current,
+/// so last-writer-wins cannot roll `Mcp-Param-*` validation back to an
+/// older schema.
+struct ListRefresh {
+    gen: AtomicU64,
+    publish: StdMutex<()>,
+}
+
+impl ListRefresh {
+    fn next_gen(&self) -> u64 {
+        self.gen.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Hold this guard across cache write and snapshot publish so two
+    /// publishes cannot interleave into a split cache/snapshot.
+    fn lock_if_current(&self, my_gen: u64) -> Option<std::sync::MutexGuard<'_, ()>> {
+        let guard = self
+            .publish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.gen.load(Ordering::Acquire) == my_gen {
+            Some(guard)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Default)]
@@ -144,6 +182,11 @@ impl McpToolCatalog {
         let tool_cache_clone = Arc::clone(&tool_cache);
         let schemas = Arc::new(StdRwLock::new(None::<Arc<McpSchemaSnapshot>>));
         let schemas_clone = Arc::clone(&schemas);
+        let refresh = Arc::new(ListRefresh {
+            gen: AtomicU64::new(0),
+            publish: StdMutex::new(()),
+        });
+        let refresh_clone = Arc::clone(&refresh);
 
         let heartbeat_task = tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS));
@@ -168,6 +211,7 @@ impl McpToolCatalog {
                         // lock. Holding `client.write()` across that await
                         // stalls every concurrent `client.read()` (tool call)
                         // for the full upstream RTT.
+                        let my_gen = refresh_clone.next_gen();
                         let listed = list_tools_from_client(&new_client).await;
                         *client_clone.write().await = new_client;
                         // Keep the last successful cache on list failure.
@@ -181,6 +225,8 @@ impl McpToolCatalog {
                                 &listed,
                                 complete,
                                 ttl_ms,
+                                &refresh_clone,
+                                my_gen,
                             );
                         }
                         tracing::info!("Successfully reconnected MCP client for {}", name_clone);
@@ -195,6 +241,7 @@ impl McpToolCatalog {
             heartbeat_task,
             tool_cache,
             schemas,
+            refresh,
         };
         // Fill the sync schema cache before the catalog is registered so
         // Streamable HTTP `get_tool` can validate `Mcp-Param-*` on the first
@@ -212,7 +259,7 @@ impl McpToolCatalog {
         Ok(catalog)
     }
 
-    fn remember_tools(&self, tools: &[rmcp::model::Tool], replace: bool, ttl_ms: u64) {
+    fn remember_tools(&self, tools: &[rmcp::model::Tool], replace: bool, ttl_ms: u64, my_gen: u64) {
         publish_listed_cache(
             &self.tool_cache,
             &self.schemas,
@@ -220,6 +267,8 @@ impl McpToolCatalog {
             tools,
             replace,
             ttl_ms,
+            &self.refresh,
+            my_gen,
         );
     }
 
@@ -369,10 +418,11 @@ impl McpToolCatalog {
         if self.cache_is_fresh() {
             return Ok(self.cached_tools());
         }
+        let my_gen = self.refresh.next_gen();
         let client = self.client.read().await;
         let (tools, complete, ttl_ms) = list_tools_from_client(&client).await?;
         drop(client);
-        self.remember_tools(&tools, complete, ttl_ms);
+        self.remember_tools(&tools, complete, ttl_ms, my_gen);
         Ok(tools)
     }
 
@@ -393,6 +443,9 @@ impl McpToolCatalog {
 /// Write the listed tools into the sync cache, then publish to the
 /// gateway snapshot after dropping the cache write lock.
 ///
+/// Applies only when `my_gen` is still the latest refresh generation,
+/// so a slower earlier fetch cannot overwrite a later one.
+///
 /// [`McpSchemaSnapshot::replace_from_map`] takes the snapshot publish
 /// lock and then `try_all` (a cache read). Holding the cache write
 /// across the snapshot publish would deadlock with that path.
@@ -403,7 +456,12 @@ fn publish_listed_cache(
     tools: &[rmcp::model::Tool],
     replace: bool,
     ttl_ms: u64,
+    refresh: &ListRefresh,
+    my_gen: u64,
 ) {
+    let Some(_refresh) = refresh.lock_if_current(my_gen) else {
+        return;
+    };
     let cached = {
         let Ok(mut cache) = tool_cache.write() else {
             return;
@@ -944,6 +1002,64 @@ mod tests {
             .get(&exposed)
             .expect("snapshot should still hold deploy after the rewrite");
         assert_eq!(x_mcp_header(&rewritten), Some("Zone"));
+    }
+
+    /// Concurrent stale-cache refreshes (`ttlMs` 0) each pass
+    /// `cache_is_fresh` and fetch independently. Without a generation
+    /// check, last-writer-wins lets the slower earlier fetch overwrite
+    /// cache and snapshot (`cache=Region snapshot=Region` after Zone
+    /// published first).
+    #[test]
+    fn later_list_generation_is_not_overwritten_by_a_slower_earlier_fetch() {
+        use tools::naming::encode_tool_name;
+
+        let snapshot = McpSchemaSnapshot::new();
+        let tool_cache = StdRwLock::new(ToolListCache::default());
+        let schemas = StdRwLock::new(Some(Arc::clone(&snapshot)));
+        let refresh = ListRefresh {
+            gen: AtomicU64::new(0),
+            publish: StdMutex::new(()),
+        };
+
+        let gen1 = refresh.next_gen();
+        let gen2 = refresh.next_gen();
+        publish_listed_cache(
+            &tool_cache,
+            &schemas,
+            "srv",
+            &[listed_deploy_with_header("Zone")],
+            true,
+            0,
+            &refresh,
+            gen2,
+        );
+        publish_listed_cache(
+            &tool_cache,
+            &schemas,
+            "srv",
+            &[listed_deploy_with_header("Region")],
+            true,
+            0,
+            &refresh,
+            gen1,
+        );
+
+        let cache = tool_cache
+            .read()
+            .expect("list refresh test must read the catalog cache");
+        assert_eq!(
+            cache.tools.get("deploy").and_then(x_mcp_header),
+            Some("Zone"),
+            "cache=Region after Zone published first is the last-writer-wins overwrite"
+        );
+        drop(cache);
+
+        let exposed = encode_tool_name("srv", "deploy");
+        assert_eq!(
+            snapshot.get(&exposed).as_ref().and_then(x_mcp_header),
+            Some("Zone"),
+            "snapshot=Region after Zone published first is the last-writer-wins overwrite"
+        );
     }
 
     #[test]
