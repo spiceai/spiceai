@@ -330,7 +330,7 @@ async fn databricks_sql_warehouse_foreign_table_test() -> Result<(), anyhow::Err
         .scope(async {
             let app = AppBuilder::new("databricks_sql_warehouse_foreign_test")
                 .with_dataset(make_dataset(
-                    "spiceai_sandbox.integration.foreign_table",
+                    "spice_integration_tests_lakebase.tpch.region",
                     "foreign_table",
                 ))
                 .build();
