@@ -27657,6 +27657,20 @@ impl CayenneTableProvider {
             // bump, so advance the scan-input version (the next capture re-keys over the new tier).
             self.notify_scan_input_change();
         }
+
+        // The replaced tier's keys are gone and the replacement's are not recorded,
+        // so any cached primary-key index now describes rows that no longer exist and
+        // omits every row that does. Drop it; the next append rebuilds it from the
+        // live tier.
+        //
+        // A stale entry is not symmetric. A key the overwrite REMOVED that the cache
+        // still lists only costs a redundant tombstone on re-insert, which masks
+        // nothing — the documented `PkBloom` false-positive invariant. A key the
+        // overwrite INTRODUCED that the cache does not list is the damaging
+        // direction: an upsert reads it as new, supersedes nothing, and leaves two
+        // live rows under one primary key. This path could not produce that before
+        // the memory append started recording keys at all.
+        self.clear_cached_pk_keyset();
         Ok(incoming_rows)
     }
 

@@ -697,6 +697,85 @@ mod dml {
             .await
     }
 
+    /// A full refresh that replaces the tier with a DISJOINT key set must not leave
+    /// a primary-key cache describing the rows it replaced.
+    ///
+    /// The append records the keys it wrote so a later write supersedes them. An
+    /// overwrite replaces the tier wholesale, so those keys are gone and the
+    /// replacement's were never recorded — and the two directions of staleness are
+    /// not symmetric. A key the overwrite REMOVED that the cache still lists costs
+    /// only a redundant tombstone on re-insert, which masks nothing. A key the
+    /// overwrite INTRODUCED that the cache does not list is the damaging one: an
+    /// upsert reads it as new, supersedes nothing, and leaves two live rows under
+    /// one primary key.
+    ///
+    /// Reproduced before the fix: re-inserting the refreshed key returned two rows.
+    async fn overwrite_then_upsert_by_mode(
+        mode: Mode,
+        table_name: &str,
+    ) -> Result<(), anyhow::Error> {
+        let _tracing = crate::init_tracing(Some("integration=debug,info"));
+        no_cache_context()
+            .scope(async {
+                let mode_label = format!("{mode:?}");
+                let (temp_dir, rt) = cayenne_dml_runtime(mode, table_name).await?;
+
+                // A client INSERT records key 99 in the primary-key cache.
+                execute_sql(
+                    &rt,
+                    &format!(
+                        "INSERT INTO {table_name} (id, name, value) VALUES (99, 'ninetynine', 99)"
+                    ),
+                )
+                .await?;
+
+                // Full refresh replaces the tier with keys the cache has never seen.
+                let csv = temp_dir.path().join(format!("{table_name}.csv"));
+                std::fs::write(&csv, "id,name,value\n7,seven,7\n8,eight,8\n")?;
+                refresh(&rt, table_name).await?;
+                let after_refresh =
+                    execute_sql(&rt, &format!("SELECT id FROM {table_name} ORDER BY id")).await?;
+                let expected = ["+----+", "| id |", "+----+", "| 7  |", "| 8  |", "+----+"];
+                assert_batches_eq!(expected, &after_refresh);
+
+                // Re-insert a key the REFRESH introduced. A stale cache does not know
+                // it is resident, so nothing supersedes and both versions stay live.
+                let inserted = execute_sql(
+                    &rt,
+                    &format!("INSERT INTO {table_name} (id, name, value) VALUES (7, 'seven2', 77)"),
+                )
+                .await?;
+                let after = execute_sql(
+                    &rt,
+                    &format!("SELECT id, name FROM {table_name} WHERE id = 7 ORDER BY name"),
+                )
+                .await?;
+                eprintln!(
+                    "[{mode_label}] INSERT over a key the refresh introduced reported:\n{}\nid=7 rows now:\n{}",
+                    pretty_format_batches(&inserted)?,
+                    pretty_format_batches(&after)?
+                );
+                let expected = [
+                    "+----+--------+",
+                    "| id | name   |",
+                    "+----+--------+",
+                    "| 7  | seven2 |",
+                    "+----+--------+",
+                ];
+                assert_batches_eq!(expected, &after);
+
+                let dupes = duplicate_keys(&rt, table_name).await?;
+                eprintln!(
+                    "[{mode_label}] duplicate primary keys after the refresh + insert:\n{}",
+                    pretty_format_batches(&dupes)?
+                );
+                assert_batches_eq!(["++", "++"], &dupes);
+
+                Ok(())
+            })
+            .await
+    }
+
     // ── control arms: `mode: file`, where all three statements work ──
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -724,6 +803,11 @@ mod dml {
         delete_live_version_only_by_mode(Mode::File, "file_mode_live_only_test").await
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_file_mode_overwrite_then_upsert() -> Result<(), anyhow::Error> {
+        overwrite_then_upsert_by_mode(Mode::File, "file_mode_overwrite_test").await
+    }
+
     // ── reproduction arms: `mode: memory` (#12008 and its upsert sibling) ──
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -749,5 +833,10 @@ mod dml {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_cayenne_memory_mode_delete_live_version_only() -> Result<(), anyhow::Error> {
         delete_live_version_only_by_mode(Mode::Memory, "memory_mode_live_only_test").await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_memory_mode_overwrite_then_upsert() -> Result<(), anyhow::Error> {
+        overwrite_then_upsert_by_mode(Mode::Memory, "memory_mode_overwrite_test").await
     }
 }
