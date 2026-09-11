@@ -129,6 +129,7 @@ impl McpSchemaSnapshot {
         changed
     }
 
+    #[cfg(test)]
     fn replace_listed(&self, tools: &[Tool]) -> bool {
         let _publish = self.lock_publish();
         self.install_listed(tools)
@@ -147,6 +148,7 @@ impl McpSchemaSnapshot {
         (listed, self.install_listed_map(next))
     }
 
+    #[cfg(test)]
     fn install_listed(&self, tools: &[Tool]) -> bool {
         let next: HashMap<String, Tool> = tools
             .iter()
