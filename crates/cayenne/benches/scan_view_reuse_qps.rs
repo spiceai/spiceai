@@ -17,10 +17,13 @@
 //!   `refresh_mode: changes`. On a quiet table this should match `full`/`append`
 //!   (cache hits, no recapture).
 //!
-//! Workloads (both on `WHERE id = ?`, file-backed, no SQL parse):
+//! Workloads (both on `WHERE id = ?`, file-backed):
 //! * `scan_plan` — `TableProvider::scan` only. Isolates scan-view capture /
 //!   cache (the metastore-bypass). Headline 10K QPS arm.
-//! * `scan_collect` — scan + execute. End-to-end query including Vortex.
+//! * `scan_collect` — `DataFusion` `read_table` + filter + collect. End-to-end
+//!   executed PK lookup (planner `FilterExec`, Vortex pushdown). Collect
+//!   asserts the returned `value` is `id * 100` — throughput on the wrong
+//!   row is counted as an error, not a QPS result.
 //! * Closed-loop max QPS (3 s, 32 workers) for both shapes.
 //! * Each arm reports `metastore_queries` (must stay 0 on a warm reuse hit).
 //! * Criterion per-query latency of both shapes.
@@ -38,7 +41,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use arrow::array::{Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::CreateTableOptions;
 use cayenne::{
@@ -174,8 +177,16 @@ async fn setup_reuse_table(reuse: ScanViewReuse) -> ReuseFixture {
     let target_id = (ROWS / 2) as i64;
 
     // Populate the scan-view cache (and Vortex footer cache) before any timed load.
+    // Fail setup if the seeded PK lookup is already wrong — a throughput number
+    // on incorrect rows is not a QPS result.
+    let expected = expected_pk_value(target_id);
     for _ in 0..16 {
-        black_box(pk_scan_collect(&table, &ctx, target_id).await);
+        let batches = pk_scan_collect(&table, &ctx, target_id).await;
+        assert!(
+            pk_lookup_value_is(&batches, expected),
+            "warmup PK lookup for id={target_id} must return value={expected}"
+        );
+        black_box(batches);
     }
 
     ReuseFixture {
@@ -202,20 +213,48 @@ async fn pk_scan_plan(table: &Arc<CayenneTableProvider>, ctx: &SessionContext, t
     black_box(plan);
 }
 
-/// PK lookup through `TableProvider::scan` + collect — hits the scan-view
-/// cache, then executes. Skips SQL parse/plan.
+/// Seeded `value` for `id` (`make_batch` writes `id * 100`).
+const fn expected_pk_value(id: i64) -> i64 {
+    id * 100
+}
+
+/// True iff `batches` is exactly one non-null `value` row equal to `expected`.
+/// The scan projects column 2 (`value`), so the result's column 0 is that field.
+fn pk_lookup_value_is(batches: &[RecordBatch], expected: i64) -> bool {
+    let mut rows = 0_usize;
+    for batch in batches {
+        let Some(values) = batch.column(0).as_any().downcast_ref::<Int64Array>() else {
+            return false;
+        };
+        for i in 0..values.len() {
+            if values.is_null(i) || values.value(i) != expected {
+                return false;
+            }
+            rows += 1;
+        }
+    }
+    rows == 1
+}
+
+/// Executed PK lookup through the `DataFusion` planner. Direct
+/// `TableProvider::scan` + collect does not apply data-column filters
+/// (pushdown is Inexact), so a raw scan collect returns every `value` in
+/// the file. `read_table` + filter adds the post-scan `FilterExec` the
+/// physical optimizer then pushes into Vortex.
 async fn pk_scan_collect(
     table: &Arc<CayenneTableProvider>,
     ctx: &SessionContext,
     target_id: i64,
 ) -> Vec<RecordBatch> {
-    let filters = pk_filters(target_id);
-    let projection = vec![2];
-    let plan = table
-        .scan(&ctx.state(), Some(&projection), &filters, None)
+    ctx.read_table(Arc::clone(table) as Arc<dyn TableProvider>)
+        .expect("read_table")
+        .filter(col("id").eq(lit(target_id)))
+        .expect("pk filter")
+        .select_columns(&["value"])
+        .expect("project value")
+        .collect()
         .await
-        .expect("scan");
-    collect(plan, ctx.task_ctx()).await.expect("collect")
+        .expect("collect")
 }
 
 fn percentile_us(sorted: &[u64], p: f64) -> u64 {
@@ -251,16 +290,22 @@ fn finish_report(
     }
 }
 
+/// Returns `false` when a collect returns the wrong row (counted as an error
+/// by the load arms). Plan-only scans have no result to check.
 async fn run_one(
     table: &Arc<CayenneTableProvider>,
     ctx: &SessionContext,
     target_id: i64,
     collect_rows: bool,
-) {
+) -> bool {
     if collect_rows {
-        black_box(pk_scan_collect(table, ctx, target_id).await);
+        let batches = pk_scan_collect(table, ctx, target_id).await;
+        let ok = pk_lookup_value_is(&batches, expected_pk_value(target_id));
+        black_box(&batches);
+        ok
     } else {
         pk_scan_plan(table, ctx, target_id).await;
+        true
     }
 }
 
@@ -287,13 +332,18 @@ async fn open_loop_qps(
         let ctx = Arc::clone(&fixture.ctx);
         let target_id = fixture.target_id;
         let latencies = Arc::clone(&latencies);
+        let errors = Arc::clone(&errors);
         joins.push(tokio::spawn(async move {
             let t0 = Instant::now();
-            run_one(&table, &ctx, target_id, collect_rows).await;
-            latencies
-                .lock()
-                .expect("latencies")
-                .push(u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX));
+            let ok = run_one(&table, &ctx, target_id, collect_rows).await;
+            if ok {
+                latencies
+                    .lock()
+                    .expect("latencies")
+                    .push(u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX));
+            } else {
+                errors.fetch_add(1, Ordering::Relaxed);
+            }
             drop(permit);
         }));
         next_launch += interval;
@@ -346,14 +396,19 @@ async fn closed_loop_max_qps(
         let ctx = Arc::clone(&fixture.ctx);
         let target_id = fixture.target_id;
         let latencies = Arc::clone(&latencies);
+        let errors = Arc::clone(&errors);
         joins.push(tokio::spawn(async move {
             while Instant::now() < stop_at {
                 let t0 = Instant::now();
-                run_one(&table, &ctx, target_id, collect_rows).await;
-                latencies
-                    .lock()
-                    .expect("latencies")
-                    .push(u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX));
+                let ok = run_one(&table, &ctx, target_id, collect_rows).await;
+                if ok {
+                    latencies
+                        .lock()
+                        .expect("latencies")
+                        .push(u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX));
+                } else {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }));
     }
@@ -466,7 +521,10 @@ fn bench_scan_view_reuse_qps(c: &mut Criterion) {
                     let table = Arc::clone(&table);
                     let ctx = Arc::clone(&ctx);
                     async move {
-                        run_one(&table, &ctx, target_id, collect_rows).await;
+                        assert!(
+                            run_one(&table, &ctx, target_id, collect_rows).await,
+                            "PK lookup returned the wrong row"
+                        );
                     }
                 });
             });
@@ -494,7 +552,10 @@ fn bench_scan_view_reuse_qps(c: &mut Criterion) {
                             let table = Arc::clone(&table);
                             let ctx = Arc::clone(&ctx);
                             joins.push(tokio::spawn(async move {
-                                run_one(&table, &ctx, target_id, collect_rows).await;
+                                assert!(
+                                    run_one(&table, &ctx, target_id, collect_rows).await,
+                                    "PK lookup returned the wrong row"
+                                );
                             }));
                         }
                         for join in joins {
