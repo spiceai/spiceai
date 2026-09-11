@@ -515,15 +515,23 @@ impl MemTier {
     /// caller ask which of the rows it is about to drop a scan would have served.
     /// See `delete_mem_tier_rows_matching`, which does exactly that.
     ///
-    /// EVERY SEGMENT IS PRESERVED, even one whose rows are all removed. A segment
-    /// carries its OWN tombstones, which hide rows in OLDER segments; dropping the
-    /// segment would drop those tombstones and RESURRECT the rows they hide. A
-    /// segment left with no batches is skipped by the scan
-    /// (`visible_mem_tier_segments_unpruned` pushes only non-empty batch lists),
-    /// so keeping it costs one empty `Vec` and no data. For the same reason the
-    /// tier-level `tombstones` aggregate is carried over untouched rather than
-    /// re-folded: its inputs are exactly the per-segment tombstones, none of which
-    /// this rebuild changes.
+    /// EVERY SEGMENT IS PRESERVED, even one whose rows are all removed, so the
+    /// per-segment tombstones stay consistent with the tier-level aggregate carried
+    /// over below. Scans do not read the per-segment copies — `mem_tier_deletion_maps`
+    /// serves the aggregate — so dropping an emptied segment would not change what a
+    /// query returns today. What it would corrupt is any consumer that RE-FOLDS the
+    /// aggregate from the segments: `retain_after` and `unsealed_view` both rebuild
+    /// it that way, and a tombstone missing from that fold stops hiding the older
+    /// version it was written for. Neither runs in memory mode, which is the only
+    /// caller today — this keeps the two representations in agreement rather than
+    /// relying on that staying true.
+    ///
+    /// A segment left with no batches is skipped by the scan
+    /// (`visible_mem_tier_segments_unpruned` pushes only non-empty batch lists), so
+    /// keeping it costs one empty `Vec` and no data. The tier-level `tombstones`
+    /// aggregate is carried over untouched rather than re-folded for the same
+    /// reason the segments are kept: its inputs are exactly the per-segment
+    /// tombstones, and this rebuild changes none of them.
     ///
     /// `superseded` is likewise carried per segment: it counts rows this segment's
     /// upsert superseded in OLDER segments, which removing this segment's own rows

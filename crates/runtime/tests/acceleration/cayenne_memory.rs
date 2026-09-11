@@ -617,6 +617,86 @@ mod dml {
         .await
     }
 
+    /// Deleting ONLY the live version of an upserted key must not bring its
+    /// superseded predecessor back.
+    ///
+    /// After `INSERT (3, 'gamma2')` supersedes `(3, 'gamma')`, the tombstone hiding
+    /// `gamma` lives in the SAME segment as `gamma2` — the only row that segment
+    /// holds — so `DELETE WHERE name = 'gamma2'` empties it. That is the shape
+    /// `delete_over_upsert_history_by_mode` never reaches: it removes the hidden
+    /// `gamma` before touching the live row, so its segments never empty with a
+    /// tombstone still owed.
+    ///
+    /// This is NOT a guard for the rebuild's segment-preservation rule, though it
+    /// looks like one. Making `retain_rows` drop emptied segments leaves this test
+    /// green, because scans read the tier-level tombstone aggregate that the
+    /// rebuild carries over whole, not the per-segment copies. Preservation keeps
+    /// those two representations in agreement for consumers that re-fold the
+    /// aggregate from segments, and none of those run in memory mode — so the rule
+    /// has no observable consequence a test at this level can reach.
+    async fn delete_live_version_only_by_mode(
+        mode: Mode,
+        table_name: &str,
+    ) -> Result<(), anyhow::Error> {
+        let _tracing = crate::init_tracing(Some("integration=debug,info"));
+        no_cache_context()
+            .scope(async {
+                let mode_label = format!("{mode:?}");
+                let (_temp_dir, rt) = cayenne_dml_runtime(mode, table_name).await?;
+
+                execute_sql(
+                    &rt,
+                    &format!(
+                        "INSERT INTO {table_name} (id, name, value) VALUES (3, 'gamma2', 3333)"
+                    ),
+                )
+                .await?;
+                let before = execute_sql(
+                    &rt,
+                    &format!("SELECT id, name FROM {table_name} WHERE id = 3 ORDER BY name"),
+                )
+                .await?;
+                // Precondition: exactly one version of key 3 is served, so the delete
+                // below is aimed at the live one and the other is genuinely hidden.
+                let expected = [
+                    "+----+--------+",
+                    "| id | name   |",
+                    "+----+--------+",
+                    "| 3  | gamma2 |",
+                    "+----+--------+",
+                ];
+                assert_batches_eq!(expected, &before);
+
+                let deleted = execute_sql(
+                    &rt,
+                    &format!("DELETE FROM {table_name} WHERE name = 'gamma2'"),
+                )
+                .await?;
+                let after = execute_sql(
+                    &rt,
+                    &format!("SELECT id, name FROM {table_name} WHERE id = 3 ORDER BY name"),
+                )
+                .await?;
+                eprintln!(
+                    "[{mode_label}] DELETE WHERE name = 'gamma2' (the live version only) reported:\n{}\nid=3 rows now:\n{}",
+                    pretty_format_batches(&deleted)?,
+                    pretty_format_batches(&after)?
+                );
+                assert_eq!(
+                    reported_count(&deleted),
+                    1,
+                    "one row is served for name = 'gamma2'"
+                );
+                assert_batches_eq!(
+                    ["++", "++"],
+                    &after
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
     // ── control arms: `mode: file`, where all three statements work ──
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -639,6 +719,11 @@ mod dml {
         delete_over_upsert_history_by_mode(Mode::File, "file_mode_history_test").await
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_file_mode_delete_live_version_only() -> Result<(), anyhow::Error> {
+        delete_live_version_only_by_mode(Mode::File, "file_mode_live_only_test").await
+    }
+
     // ── reproduction arms: `mode: memory` (#12008 and its upsert sibling) ──
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -659,5 +744,10 @@ mod dml {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_cayenne_memory_mode_delete_over_upsert_history() -> Result<(), anyhow::Error> {
         delete_over_upsert_history_by_mode(Mode::Memory, "memory_mode_history_test").await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cayenne_memory_mode_delete_live_version_only() -> Result<(), anyhow::Error> {
+        delete_live_version_only_by_mode(Mode::Memory, "memory_mode_live_only_test").await
     }
 }
