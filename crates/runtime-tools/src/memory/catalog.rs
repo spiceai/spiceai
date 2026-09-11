@@ -122,4 +122,8 @@ impl SpiceToolCatalog for MemoryToolCatalog {
     async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
         self.get_tool(name, None, None)
     }
+
+    fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+        self.get_tool(name, None, None)
+    }
 }

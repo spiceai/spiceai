@@ -84,6 +84,12 @@ mod tests {
                 name: name.to_string(),
             }))
         }
+
+        fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+            Some(Arc::new(MockTool {
+                name: name.to_string(),
+            }))
+        }
     }
 
     #[tokio::test]

@@ -35,7 +35,8 @@ use rmcp::{
 use secrecy::ExposeSecret;
 use snafu::ResultExt;
 use std::{
-    sync::{Arc, LazyLock},
+    collections::HashMap,
+    sync::{Arc, LazyLock, RwLock as StdRwLock},
     time::Duration,
 };
 use tokio::{
@@ -89,6 +90,10 @@ pub(crate) struct McpToolCatalog {
     /// Spicepod defined name & description, not from underlying MCP.
     name: String,
     heartbeat_task: tokio::task::JoinHandle<()>,
+    /// Schemas from the last successful `tools/list` / `tools/get`, used by
+    /// [`SpiceToolCatalog::try_get`] so Streamable HTTP can validate `Mcp-Param-*`
+    /// without taking the async client lock.
+    tool_cache: Arc<StdRwLock<HashMap<String, rmcp::model::Tool>>>,
 }
 
 impl Drop for McpToolCatalog {
@@ -105,6 +110,8 @@ impl McpToolCatalog {
         let client_clone = Arc::clone(&client);
         let cfg_clone = cfg.clone();
         let name_clone = name.to_string();
+        let tool_cache = Arc::new(StdRwLock::new(HashMap::new()));
+        let tool_cache_clone = Arc::clone(&tool_cache);
 
         let heartbeat_task = tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS));
@@ -127,6 +134,9 @@ impl McpToolCatalog {
                     if let Ok(new_client_rwlock) = Self::create_client(&cfg_clone).await {
                         let mut client_lock = client_clone.write().await;
                         *client_lock = new_client_rwlock;
+                        if let Ok(mut cache) = tool_cache_clone.write() {
+                            cache.clear();
+                        }
                         tracing::info!("Successfully reconnected MCP client for {}", name_clone);
                     }
                 }
@@ -137,7 +147,24 @@ impl McpToolCatalog {
             client,
             name: name.to_string(),
             heartbeat_task,
+            tool_cache,
         })
+    }
+
+    fn remember_tools(&self, tools: &[rmcp::model::Tool]) {
+        let Ok(mut cache) = self.tool_cache.write() else {
+            return;
+        };
+        for tool in tools {
+            cache.insert(tool.name.to_string(), tool.clone());
+        }
+    }
+
+    fn remember_tool(&self, tool: &rmcp::model::Tool) {
+        let Ok(mut cache) = self.tool_cache.write() else {
+            return;
+        };
+        cache.insert(tool.name.to_string(), tool.clone());
     }
 
     async fn create_client(cfg: &MCPConfig) -> Result<McpClient> {
@@ -289,6 +316,7 @@ impl McpToolCatalog {
                 break;
             }
         }
+        self.remember_tools(&tools);
         Ok(tools)
     }
 
@@ -298,6 +326,12 @@ impl McpToolCatalog {
     ) -> std::result::Result<Option<rmcp::model::Tool>, ServiceError> {
         // Security: Limit pagination to prevent infinite loops
         const MAX_PAGINATION_ITERATIONS: usize = 100;
+
+        if let Ok(cache) = self.tool_cache.read()
+            && let Some(tool) = cache.get(name)
+        {
+            return Ok(Some(tool.clone()));
+        }
 
         let mut cursor: Option<String> = None;
         let mut iterations = 0;
@@ -320,6 +354,7 @@ impl McpToolCatalog {
                 ))
                 .await?;
             if let Some(t) = response.tools.iter().find(|t| t.name == name) {
+                self.remember_tool(t);
                 return Ok(Some(t.clone()));
             }
             cursor = response.next_cursor;
@@ -451,6 +486,17 @@ impl SpiceToolCatalog for McpToolCatalog {
         Some(Arc::new(McpToolWrapper::new(
             Arc::clone(&self.client),
             tool,
+            self.name.clone(),
+        )))
+    }
+
+    fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+        let cache = self.tool_cache.read().ok()?;
+        let spec = cache.get(name)?.clone();
+        drop(cache);
+        Some(Arc::new(McpToolWrapper::new(
+            Arc::clone(&self.client),
+            spec,
             self.name.clone(),
         )))
     }

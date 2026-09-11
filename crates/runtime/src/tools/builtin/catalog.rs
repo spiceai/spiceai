@@ -247,6 +247,11 @@ impl SpiceToolCatalog for BuiltinToolCatalog {
             .ok()
     }
 
+    fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+        self.construct_builtin(name, None, None, &HashMap::new())
+            .ok()
+    }
+
     fn name(&self) -> &str {
         Self::name()
     }

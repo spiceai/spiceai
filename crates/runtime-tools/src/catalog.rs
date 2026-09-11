@@ -50,4 +50,12 @@ pub trait SpiceToolCatalog: Send + Sync {
     /// Tool will either be built with default parameters, or additional
     /// parameters from the catalog.
     async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>>;
+
+    /// Synchronous lookup used by the MCP gateway to validate `Mcp-Param-*`
+    /// headers before the async `tools/call` path runs.
+    ///
+    /// Return `None` when the catalog cannot resolve the tool without I/O.
+    /// A miss skips `Mcp-Param-*` validation for that request; `Mcp-Method`
+    /// and `Mcp-Name` are still checked.
+    fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>>;
 }

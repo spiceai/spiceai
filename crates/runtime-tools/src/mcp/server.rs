@@ -129,6 +129,30 @@ impl RuntimeServer {
         }
         result
     }
+
+    /// Sync tool definition for Streamable HTTP `Mcp-Param-*` validation.
+    ///
+    /// Uses `try_read` so a tools-map write (reload) skips param-schema
+    /// checks rather than blocking the HTTP thread. `Mcp-Method` and
+    /// `Mcp-Name` are still validated when this returns `None`.
+    fn mcp_tool_definition(&self, tool_name: &str) -> Option<Tool> {
+        let tools = self.tools.try_read().ok()?;
+        if let Some((catalog_name, name)) = decode_tool_name(tool_name)
+            && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
+            && let Some(tool) = catalog.try_get(&name)
+        {
+            return Some(mcp_tool_from_spice(
+                encode_tool_name(&catalog_name, &name),
+                tool.as_ref(),
+            ));
+        }
+        match tools.get(tool_name)? {
+            Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
+                Some(mcp_tool_from_spice(tool_name.to_string(), tool.as_ref()))
+            }
+            Tooling::Catalog { .. } => None,
+        }
+    }
 }
 
 impl ServerHandler for RuntimeServer {
@@ -142,6 +166,10 @@ impl ServerHandler for RuntimeServer {
             // `initialize` negotiate any version advertised by the default
             // `supported_protocol_versions()` (every revision this SDK knows).
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.mcp_tool_definition(name)
     }
 
     fn call_tool(
@@ -286,17 +314,8 @@ impl ServerHandler for RuntimeServer {
             let tools = all
                 .into_iter()
                 .map(|t| {
-                    let name: Cow<'static, str> = t.name().into_owned().into();
-                    let description: Option<Cow<'static, str>> =
-                        t.description().map(|s| Cow::Owned(s.into_owned()));
-                    let schema = to_map(t.parameters().unwrap_or(json!({
-                        "$schema": "http://json-schema.org/draft-07/schema#",
-                        "title": "empty",
-                        "type": "object",
-                        "required": [],
-                        "properties": {}
-                    })));
-                    Tool::new_with_raw(name, description, schema)
+                    let name = t.name().into_owned();
+                    mcp_tool_from_spice(name, t.as_ref())
                 })
                 .collect::<Vec<_>>();
             Ok(ListToolsResult {
@@ -312,6 +331,23 @@ fn to_map(v: Value) -> Map<String, Value> {
         return Map::default();
     };
     m
+}
+
+fn empty_input_schema() -> Value {
+    json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "empty",
+        "type": "object",
+        "required": [],
+        "properties": {}
+    })
+}
+
+fn mcp_tool_from_spice(name: impl Into<Cow<'static, str>>, tool: &dyn SpiceModelTool) -> Tool {
+    let description: Option<Cow<'static, str>> =
+        tool.description().map(|s| Cow::Owned(s.into_owned()));
+    let schema = to_map(tool.parameters().unwrap_or_else(empty_input_schema));
+    Tool::new_with_raw(name.into(), description, schema)
 }
 
 #[cfg(test)]
@@ -360,6 +396,36 @@ mod tests {
         }
         async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
             (name == self.tool).then(|| Arc::new(StubTool(self.tool)) as Arc<dyn SpiceModelTool>)
+        }
+
+        fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+            (name == self.tool).then(|| Arc::new(StubTool(self.tool)) as Arc<dyn SpiceModelTool>)
+        }
+    }
+
+    struct HeaderAnnotatedTool;
+
+    #[async_trait::async_trait]
+    impl SpiceModelTool for HeaderAnnotatedTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed("deploy")
+        }
+        fn description(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed("deploy a thing"))
+        }
+        fn parameters(&self) -> Option<Value> {
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "region": { "type": "string", "x-mcp-header": "Region" }
+                }
+            }))
+        }
+        async fn call(
+            &self,
+            _arg: &str,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(json!({ "ok": true }))
         }
     }
 
@@ -445,6 +511,188 @@ mod tests {
         assert!(
             supported.contains(&ProtocolVersion::V_2025_03_26),
             "legacy initialize clients on 2025-03-26 must still negotiate: {supported:?}"
+        );
+    }
+
+    fn x_mcp_header_region(tool: &Tool) -> Option<&str> {
+        tool.input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get("region"))
+            .and_then(Value::as_object)
+            .and_then(|region| region.get("x-mcp-header"))
+            .and_then(Value::as_str)
+    }
+
+    #[test]
+    fn get_tool_returns_x_mcp_header_schema_for_top_level_tool() {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "deploy".to_string(),
+            Tooling::Tool(Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>),
+        );
+        let server = RuntimeServer::new(Arc::new(RwLock::new(tools)));
+
+        let top = ServerHandler::get_tool(&server, "deploy")
+            .expect("top-level annotated tool must be visible to Streamable HTTP");
+        assert_eq!(x_mcp_header_region(&top), Some("Region"));
+    }
+
+    #[test]
+    fn get_tool_returns_x_mcp_header_schema_for_catalog_tool() {
+        struct AnnotatedCatalog;
+
+        #[async_trait::async_trait]
+        impl SpiceToolCatalog for AnnotatedCatalog {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn name(&self) -> &'static str {
+                "srv"
+            }
+            async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                vec![Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>]
+            }
+            async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                (name == "deploy").then(|| Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>)
+            }
+            fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                (name == "deploy").then(|| Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>)
+            }
+        }
+
+        let mut tools = HashMap::new();
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(AnnotatedCatalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+        let server = RuntimeServer::new(Arc::new(RwLock::new(tools)));
+        let exposed = encode_tool_name("srv", "deploy");
+        let from_catalog = ServerHandler::get_tool(&server, &exposed)
+            .expect("catalog try_get must supply the schema for Mcp-Param validation");
+        assert_eq!(x_mcp_header_region(&from_catalog), Some("Region"));
+    }
+
+    fn header_annotated_server() -> RuntimeServer {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "deploy".to_string(),
+            Tooling::Tool(Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>),
+        );
+        RuntimeServer::new(Arc::new(RwLock::new(tools)))
+    }
+
+    async fn post_tools_call(
+        service: &rmcp::transport::streamable_http_server::StreamableHttpService<
+            RuntimeServer,
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+        >,
+        region_header: Option<&str>,
+        region_body: &str,
+    ) -> (http::StatusCode, Value) {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "deploy",
+                "arguments": { "region": region_body },
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientInfo": {
+                        "name": "runtime-tools-test",
+                        "version": "0.0.0"
+                    },
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+        let mut builder = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "deploy");
+        if let Some(region) = region_header {
+            builder = builder.header("mcp-param-region", region);
+        }
+        let request = builder
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                body.to_string(),
+            )))
+            .expect("valid tools/call request");
+        let response = service.handle(request).await;
+        let status = response.status();
+        let collected = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("response body");
+        let bytes = collected.to_bytes();
+        let json_str = std::str::from_utf8(&bytes).unwrap_or("<non-utf8>");
+        let json_payload = json_str
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap_or(json_str);
+        let json: Value = serde_json::from_str(json_payload)
+            .unwrap_or_else(|e| panic!("JSON-RPC body ({status}): {e}: {json_str:?}"));
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn mismatched_mcp_param_header_is_rejected() {
+        let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            || Ok(header_annotated_server()),
+            Arc::new(
+                rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+            ),
+            rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(true)
+                .disable_allowed_hosts()
+                .with_json_response(true),
+        );
+
+        let (status, json) = post_tools_call(&service, Some("us-west1"), "eu-west1").await;
+        assert_eq!(
+            status,
+            http::StatusCode::BAD_REQUEST,
+            "mismatched Mcp-Param-Region must be HTTP 400, got {status}: {json}"
+        );
+        assert_eq!(
+            json.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32020),
+            "expected HeaderMismatch (-32020), got {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_mcp_param_header_is_accepted() {
+        let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            || Ok(header_annotated_server()),
+            Arc::new(
+                rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+            ),
+            rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(true)
+                .disable_allowed_hosts()
+                .with_json_response(true),
+        );
+
+        let (status, json) = post_tools_call(&service, Some("us-west1"), "us-west1").await;
+        assert!(
+            status.is_success(),
+            "matching Mcp-Param-Region must not be rejected: {status} {json}"
+        );
+        assert!(
+            json.get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_i64)
+                != Some(-32020),
+            "matching headers must not raise HeaderMismatch: {json}"
         );
     }
 }

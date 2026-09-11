@@ -34,7 +34,10 @@ use runtime_request_context::{Protocol, RequestContext};
 
 use app::App;
 use axum::{extract::State, routing::patch};
-use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderName};
+use http::header::{
+    ACCEPT, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_REQUEST_HEADERS, AUTHORIZATION,
+    CONTENT_TYPE, HeaderName,
+};
 use opentelemetry::KeyValue;
 #[cfg(feature = "mcp")]
 use rmcp::transport::streamable_http_server::{
@@ -166,6 +169,16 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
             ))
             .required(Required::False)
             .build();
+        let param_header = Parameter::builder()
+            .name("Mcp-Param-*")
+            .parameter_in(ParameterIn::Header)
+            .description(Some(
+                "For `2026-07-28` `tools/call` requests, one header per tool argument annotated with `x-mcp-header`. \
+The header name is `Mcp-Param-` plus the annotation value (for example `Mcp-Param-Region`). \
+The value must match the corresponding argument in the JSON-RPC body; mismatches are rejected with HTTP 400 and JSON-RPC `-32020`.",
+            ))
+            .required(Required::False)
+            .build();
 
         openai.paths.add_path_operation(
             "/v1/mcp",
@@ -184,6 +197,7 @@ selected via the `Accept` header.",
                 .parameter(protocol_version_header)
                 .parameter(method_header)
                 .parameter(name_header)
+                .parameter(param_header)
                 .parameter(session_header.clone())
                 .response(
                     "200",
@@ -553,7 +567,7 @@ pub(crate) fn routes(
         .layer(Extension(executor_registry))
         .route_layer(RequestBodyLimitLayer::new(HEALTH_REQUEST_BODY_LIMIT));
 
-    unauthenticated_router
+    let router = unauthenticated_router
         .merge(authenticated_router)
         .route_layer(middleware::from_fn(super::mtls::mtls_request_layer))
         .route_layer(middleware::from_fn_with_state(rt.status(), check_shutdown))
@@ -562,7 +576,16 @@ pub(crate) fn routes(
             track_metrics,
         ))
         .layer(Extension(Arc::clone(&rt.app)))
-        .layer(cors_layer(cors_config))
+        .layer(cors_layer(cors_config));
+
+    // tower-http has no prefix AllowHeaders predicate. When CORS is on,
+    // rewrite `Access-Control-Allow-Headers` so a preflight that asks for
+    // `Mcp-Param-*` is accepted without mirroring every requested header.
+    if cors_config.enabled {
+        router.layer(middleware::from_fn(allow_mcp_param_cors_headers))
+    } else {
+        router
+    }
 }
 
 async fn track_metrics(
@@ -729,6 +752,60 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
     .allow_origin(allowed_origins)
 }
 
+/// Closed CORS request-header set, plus any `Mcp-Param-*` name.
+const CORS_ALLOWED_HEADERS: &[&str] = &[
+    "accept",
+    "content-type",
+    "authorization",
+    "mcp-protocol-version",
+    "mcp-method",
+    "mcp-name",
+    "mcp-session-id",
+    "x-api-key",
+];
+
+fn is_allowed_cors_request_header(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    CORS_ALLOWED_HEADERS.contains(&lower.as_str()) || lower.starts_with("mcp-param-")
+}
+
+/// `Access-Control-Allow-Headers` listing the closed set plus requested `Mcp-Param-*`.
+fn cors_allow_headers_value(requested: Option<&str>) -> HeaderValue {
+    let mut names: Vec<String> = CORS_ALLOWED_HEADERS
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    if let Some(requested) = requested {
+        for name in requested.split(',') {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if is_allowed_cors_request_header(trimmed)
+                && !names
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+            {
+                names.push(trimmed.to_string());
+            }
+        }
+    }
+    HeaderValue::from_str(&names.join(", "))
+        .unwrap_or_else(|_| HeaderValue::from_static("accept, content-type, authorization"))
+}
+
+async fn allow_mcp_param_cors_headers(req: Request<Body>, next: Next) -> axum::response::Response {
+    let requested = req.headers().get(ACCESS_CONTROL_REQUEST_HEADERS).cloned();
+    let mut response = next.run(req).await;
+    if let Some(requested) = requested {
+        let value = cors_allow_headers_value(requested.to_str().ok());
+        response
+            .headers_mut()
+            .insert(ACCESS_CONTROL_ALLOW_HEADERS, value);
+    }
+    response
+}
+
 /// Map common HTTP methods to static metric labels (avoids per-request allocation).
 fn http_method_label(method: &Method) -> &'static str {
     match method.as_str() {
@@ -806,4 +883,33 @@ async fn require_auth_configured(
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cors_allow_headers_value, is_allowed_cors_request_header};
+
+    #[test]
+    fn cors_allows_closed_set_and_mcp_param_prefix() {
+        assert!(is_allowed_cors_request_header("MCP-Protocol-Version"));
+        assert!(is_allowed_cors_request_header("mcp-param-region"));
+        assert!(is_allowed_cors_request_header("Mcp-Param-Count"));
+        assert!(!is_allowed_cors_request_header("x-evil"));
+        assert!(!is_allowed_cors_request_header("cookie"));
+    }
+
+    #[test]
+    fn cors_allow_headers_includes_requested_mcp_param() {
+        let value = cors_allow_headers_value(Some(
+            "content-type, mcp-param-region, x-evil, MCP-Param-Count",
+        ));
+        let allowed = value
+            .to_str()
+            .expect("allow-headers is ascii")
+            .to_ascii_lowercase();
+        assert!(allowed.contains("content-type"));
+        assert!(allowed.contains("mcp-param-region"));
+        assert!(allowed.contains("mcp-param-count"));
+        assert!(!allowed.contains("x-evil"));
+    }
 }
