@@ -662,7 +662,8 @@ suspecting.
 
 The same watcher reads this signature, and both halves are required: the
 compiler driver reporting a signal under its own `<driver>: error:` prefix at the
-start of the line (`clang`, `cc`, `gcc`, `g++`, `collect2` and their C++ spellings),
+start of the line (`clang`, `cc`, `gcc`, `g++`, `collect2` and their C++ spellings;
+`collect2` says `fatal error:`),
 *and* cargo's `could not compile` line. This repo's own suites assert on error
 strings, so a test that quotes the driver's wording and then fails stays a
 verdict about the branch; a `compile_error!` or build script whose text reads

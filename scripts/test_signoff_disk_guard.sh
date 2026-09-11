@@ -1160,9 +1160,10 @@ assert_recorder "leaves a quoted driver diagnostic under rustc's error prefix un
    echo "error: could not compile \`runtime\` (build script) due to 1 previous error"
    exit 101' \
   101 no "build.rs" no no no
-# GNU's driver reports the same death through collect2.
+# GNU's driver reports the same death through collect2, whose signal path is a
+# `fatal error:` — the plain `error:` spelling alone would miss every GCC crash.
 assert_recorder "records the GNU driver's spelling of a linker killed by a signal" \
-  'echo "collect2: error: ld terminated with signal 11 [Segmentation fault]"
+  'echo "collect2: fatal error: ld terminated with signal 11 [Segmentation fault]"
    echo "error: could not compile \`cayenne\` (lib) due to 1 previous error"
    exit 101' \
   101 no "collect2" no no yes

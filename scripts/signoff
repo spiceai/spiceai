@@ -903,8 +903,9 @@ readonly TEST_LIST_FAILURE_PATTERN='error: creating test list failed'
 # seen so far — died of a signal rather than returning a diagnostic. `clang`
 # prints the first form with the signal's name and the second on its way out;
 # both are its own words for its own crash, and it writes a crash snapshot
-# beside them. GNU's driver says it through `collect2`. `Killed: 9` is the same
-# class from the other side: the kernel taking the linker for memory.
+# beside them. GNU's driver says it through `collect2`, whose signal path is a
+# `fatal error:` rather than an `error:`. `Killed: 9` is the same class from
+# the other side: the kernel taking the linker for memory.
 #
 # Anchored on the driver's own `<driver>: error: ` prefix AT THE START of the
 # line (after the indentation rustc gives linker output), not on the words
@@ -914,7 +915,7 @@ readonly TEST_LIST_FAILURE_PATTERN='error: creating test list failed'
 # about the branch even once cargo prints its summary (#13614). The driver's
 # own report is never preceded by anything but whitespace.
 # `[+]` rather than `\+` because awk rewrites `\+` in a -v value to a plain `+`.
-readonly TOOLCHAIN_CRASH_PATTERN='^[[:space:]]*(clang|clang[+][+]|cc|c[+][+]|gcc|g[+][+]|collect2): error: (unable to execute command: (Segmentation fault|Bus error|Illegal instruction|Abort trap|Killed: 9)|linker command failed due to signal|ld terminated with signal)'
+readonly TOOLCHAIN_CRASH_PATTERN='^[[:space:]]*(clang|clang[+][+]|cc|c[+][+]|gcc|g[+][+]|collect2): (fatal )?error: (unable to execute command: (Segmentation fault|Bus error|Illegal instruction|Abort trap|Killed: 9)|linker command failed due to signal|ld terminated with signal)'
 
 # The line that says the crash above stopped a compilation, rather than being
 # quoted by a test that ran to completion. cargo prints it once per crate whose
