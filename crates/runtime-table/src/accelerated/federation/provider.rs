@@ -20,32 +20,33 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::OptimizerRule;
 use datafusion_federation::{FederationAnalyzerForLogicalPlan, FederationProvider};
 
+/// A table whose acceleration must not federate publishes no federated source at
+/// all (see `create_federated_table_source`), so every provider that reaches
+/// this type is federating; the only question left is whether its accelerator
+/// holds data yet.
 #[derive(Debug)]
 pub struct AcceleratedTableFederationProvider {
-    enabled: bool,
-    provider: Option<Arc<dyn FederationProvider>>,
+    provider: Arc<dyn FederationProvider>,
     refresher: Arc<crate::accelerated::refresh::Refresher>,
 }
 
 impl AcceleratedTableFederationProvider {
     pub fn new(
-        enabled: bool,
-        provider: Option<Arc<dyn FederationProvider>>,
+        provider: Arc<dyn FederationProvider>,
         refresher: Arc<crate::accelerated::refresh::Refresher>,
     ) -> Self {
         Self {
-            enabled,
             provider,
             refresher,
         }
     }
 
-    fn federation_provider(&self) -> Option<Arc<dyn FederationProvider>> {
-        // If the initial load has completed and this provider is enabled, we can use the accelerated table federation provider.
-        match (self.enabled, self.refresher.initial_load_completed()) {
-            (true, true) => self.provider.clone(),
-            _ => None,
-        }
+    /// The accelerator can only answer a federated sub-plan once its initial
+    /// load has completed; until then the source must serve the query.
+    fn federation_provider(&self) -> Option<&Arc<dyn FederationProvider>> {
+        self.refresher
+            .initial_load_completed()
+            .then_some(&self.provider)
     }
 }
 
@@ -55,16 +56,11 @@ impl FederationProvider for AcceleratedTableFederationProvider {
     }
 
     fn compute_context(&self) -> Option<String> {
-        if !self.enabled {
-            return None;
-        }
-        self.federation_provider().and_then(|x| x.compute_context())
+        self.federation_provider()
+            .and_then(|provider| provider.compute_context())
     }
 
     fn pre_federation_optimizer_rules(&self) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
-        if !self.enabled {
-            return vec![];
-        }
         self.federation_provider()
             .map_or_else(Vec::new, |provider| {
                 provider.pre_federation_optimizer_rules()
@@ -72,9 +68,6 @@ impl FederationProvider for AcceleratedTableFederationProvider {
     }
 
     fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
-        if !self.enabled {
-            return None;
-        }
         self.federation_provider()?.analyzer(plan)
     }
 }
