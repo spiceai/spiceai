@@ -80,11 +80,11 @@ const ROWS_PER_INSERT: usize = 262_144;
 /// cap; neither bounds a user's `IN` list, so the sweep runs past both.
 const LIST_LENS: &[usize] = &[1, 32, 150, 512, 2048, 8192, 32_768];
 
-/// The `utf8`/`f64` arms stop here rather than running the full sweep: `f64` is
-/// deliberately never probed — equality makes `NaN` match nothing while a
-/// value-keyed set would make it match itself — so its kernel stays
-/// O(rows x elements) and the top of the integer sweep would cost minutes per
-/// sample.
+/// The `utf8`/`f64` arms stop here rather than running the full sweep. Every
+/// covered type is probed, so what bounds them is the *baseline*: the form this
+/// is measured against costs one full-length comparison per element, and a
+/// string or float comparison is dear enough that the top of the integer sweep
+/// would spend minutes on a single sample.
 const NON_INTEGER_MAX_LIST_LEN: usize = 8192;
 
 struct Fixture {
@@ -311,9 +311,11 @@ fn bench_in_list_queries(c: &mut Criterion) {
             ids.iter().map(|&id| f(id)).collect::<Vec<_>>().join(", ")
         };
 
-        // `id` and `label` are probed — integers by value, strings by their
-        // bytes. `ratio` is not, so the `f64` arm shows what the falsifier
-        // alone is worth, and what excluding floats from the probe costs.
+        // All three are probed, keyed the way `Operator::Eq` compares them:
+        // integers by value, strings by their bytes, and floats by their bits —
+        // which is what makes `NaN` match itself and the two signed zeros not
+        // match each other. Sweeping all three is what shows the win is not
+        // specific to one key shape.
         let mut arms = vec![
             ("i64", "id".to_string(), rendered(&|id| id.to_string())),
             ("utf8", "label".to_string(), rendered(&|id| format!("'k{id:09}'"))),
