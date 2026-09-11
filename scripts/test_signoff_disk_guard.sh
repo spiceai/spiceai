@@ -1663,7 +1663,7 @@ assert_describe "tells the author to re-dispatch rather than to read the log" 10
 # status names the class, not the tool, because the driver's signature does not
 # distinguish its frontend from the linker.
 assert_describe "says a crashed compiler subprocess could not complete, not that checks failed" 101 \
-  "Sign-off could not complete after 21195s — a compiler subprocess crashed on the runner, so the build did not finish; re-dispatch (triggered by someone)" \
+  "Sign-off could not complete after 21195s — a compiler subprocess crashed on the runner; re-dispatch (triggered by someone)" \
   "the checks did not complete" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 assert_describe_lacks "does not call a crashed compiler subprocess a check failure" 101 \

@@ -1396,7 +1396,10 @@ describe_check_failure() {
       # whose objects the linker cannot digest — and this cannot tell. A
       # recurrence on this branch alone, or on a crate whose build this branch
       # changes, is worth suspecting the diff for.
-      SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not complete after ${elapsed}s — a compiler subprocess crashed on the runner, so the build did not finish; re-dispatch (triggered by ${user})"
+      # Kept to the register of the sibling arms so that, with a five-digit
+      # elapsed, the whole line fits GitHub's 140-character status description
+      # and the attribution suffix survives; the summary carries the detail.
+      SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not complete after ${elapsed}s — a compiler subprocess crashed on the runner; re-dispatch (triggered by ${user})"
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — the compiler driver reported that a subprocess it ran died of a signal (a crash or an out-of-memory kill, not a diagnostic) — the linker on every run seen so far, though the driver words a frontend crash the same way — and cargo stopped the build at that crate, so **the checks did not complete**: the binary being linked was never produced and nothing after it ran, while whatever passed before it stands. That is the runner's toolchain failing on its own, not a statement about the branch. Re-dispatch the sign-off. If it recurs on this branch alone, or names a crate whose build this branch changes, the diff is worth suspecting."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off aborted: a compiler subprocess crashed on the runner, so the build did not finish (the checks did not complete) — re-dispatch"
       ;;
