@@ -46,6 +46,7 @@ use vortex::io::InstrumentedReadAt;
 use vortex::layout::LayoutReader;
 use vortex::layout::scan::scan_builder::ScanBuilder;
 use vortex::layout::scan::split_by::SplitBy;
+use vortex::mask::Mask;
 use vortex::metrics::Label;
 use vortex::metrics::MetricsRegistry;
 use vortex::session::VortexSession;
@@ -408,6 +409,40 @@ impl FileOpener for VortexOpener {
                     }
                 })
                 .transpose()?;
+
+            // Drop a split whose zones cannot satisfy the filter before the scan is
+            // built. Vortex prunes these same zones inside the scan, but only after
+            // `ScanBuilder::build` has optimized the projection and the filter
+            // against the file's dtype — work a split that will read nothing should
+            // not pay for, and which is repeated for every split the file is divided
+            // into. A file is split by byte range for parallelism and each split
+            // inherits the whole file's statistics, so `FilePruner` above cannot
+            // separate them; only the zone map can.
+            //
+            // `pruning_evaluation` returns a mask whose false lanes are *proven*
+            // false for the expression, so an all-false mask is a sound skip. The
+            // zone map it reads is memoized on the layout reader, which
+            // `layout_readers` shares with every other split of this file, so the
+            // read happens once per file rather than once per split.
+            if let Some(predicate) = filter.as_ref() {
+                let prune_range = row_range
+                    .clone()
+                    .unwrap_or_else(|| 0..layout_reader.row_count());
+                let prune_len = usize::try_from(prune_range.end - prune_range.start)
+                    .map_err(|_| exec_datafusion_err!("Vortex split row range exceeds usize"))?;
+                let pruned = layout_reader
+                    .pruning_evaluation(&prune_range, predicate, Mask::new_true(prune_len))
+                    .map_err(|e| {
+                        exec_datafusion_err!("Failed to build Vortex zone pruning: {e}")
+                    })?
+                    .await
+                    .map_err(|e| {
+                        exec_datafusion_err!("Failed to evaluate Vortex zone pruning: {e}")
+                    })?;
+                if pruned.all_false() {
+                    return Ok(stream::empty().boxed());
+                }
+            }
 
             // Built after the filter so we know whether there is one: a filtered scan
             // discards splits whose mask comes back empty, and deferring projection setup
@@ -847,6 +882,65 @@ mod tests {
         let num_batches = data.len();
         let num_rows = data.iter().map(|rb| rb.num_rows()).sum::<usize>();
         assert_eq!((num_batches, num_rows), (0, 0));
+
+        Ok(())
+    }
+
+    /// Zone pruning must never drop a row the filter matches.
+    ///
+    /// A split is skipped before the scan is built when the file's zone map
+    /// proves no row in the split's range can satisfy the filter. That is sound
+    /// only while the range pruned against is the range the scan would have
+    /// read, so this writes enough rows to close several zones (the writer ends
+    /// one every 8192 rows) with ascending values — the layout that gives zones
+    /// disjoint ranges and so actually reaches the skip path. Every value
+    /// present must still come back, including the ones on a zone boundary.
+    #[tokio::test]
+    async fn zone_pruning_keeps_every_matching_row() -> anyhow::Result<()> {
+        const ROWS: i32 = 20_000;
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_path = "zones.vortex";
+        let batch = record_batch!(("a", Int32, (0..ROWS).map(Some).collect::<Vec<_>>()))
+            .expect("ascending test record batch should build");
+        let file_schema = batch.schema();
+        let data_size = write_arrow_to_vortex(object_store.clone(), file_path, batch).await?;
+        let table_schema = TableSchema::from_file_schema(file_schema);
+        let file = PartitionedFile::new(file_path.to_string(), data_size);
+
+        // First row, both sides of a zone boundary, an interior value, last row.
+        for needle in [0, 8_191, 8_192, 12_345, ROWS - 1] {
+            let filter = logical2physical(&col("a").eq(lit(needle)), table_schema.table_schema());
+            let opener = make_opener(object_store.clone(), table_schema.clone(), Some(filter));
+            let rows: usize = opener
+                .open(file.clone())
+                .expect("opener should open the file")
+                .await
+                .expect("opening should produce a stream")
+                .try_collect::<Vec<_>>()
+                .await?
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum();
+            assert_eq!(
+                rows, 1,
+                "value {needle} is present once and must survive pruning"
+            );
+        }
+
+        // Outside every zone's range: nothing to return, and the split is skipped.
+        let filter = logical2physical(&col("a").eq(lit(ROWS + 1)), table_schema.table_schema());
+        let opener = make_opener(object_store.clone(), table_schema.clone(), Some(filter));
+        let rows: usize = opener
+            .open(file)
+            .expect("opener should open the file")
+            .await
+            .expect("opening should produce a stream")
+            .try_collect::<Vec<_>>()
+            .await?
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 0, "a value the file cannot hold must return no rows");
 
         Ok(())
     }
