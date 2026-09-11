@@ -93,9 +93,9 @@ impl McpSchemaSnapshot {
         let Ok(mut schemas) = self.tools.write() else {
             return false;
         };
-        let added = !schemas.contains_key(&name);
+        let changed = schemas.get(&name).is_none_or(|existing| existing != &tool);
         schemas.insert(name, tool);
-        added
+        changed
     }
 
     fn merge_from_map(&self, tools: &HashMap<String, Tooling>) -> bool {
@@ -103,14 +103,14 @@ impl McpSchemaSnapshot {
         let Ok(mut schemas) = self.tools.write() else {
             return false;
         };
-        let mut added = false;
+        let mut changed = false;
         for (name, tool) in next {
-            if let std::collections::hash_map::Entry::Vacant(entry) = schemas.entry(name) {
-                entry.insert(tool);
-                added = true;
+            if schemas.get(&name).is_none_or(|existing| existing != &tool) {
+                schemas.insert(name, tool);
+                changed = true;
             }
         }
-        added
+        changed
     }
 
     fn replace_listed(&self, tools: &[Tool]) -> bool {
@@ -121,8 +121,7 @@ impl McpSchemaSnapshot {
         let Ok(mut schemas) = self.tools.write() else {
             return false;
         };
-        let changed =
-            schemas.len() != next.len() || next.keys().any(|name| !schemas.contains_key(name));
+        let changed = schema_maps_changed(&schemas, &next);
         *schemas = next;
         changed
     }
@@ -500,6 +499,14 @@ fn empty_input_schema() -> Value {
     })
 }
 
+/// True when the snapshot's tool set or any stored schema identity changed.
+///
+/// Name-only comparison would miss an in-place `x-mcp-header` or input-schema
+/// edit, and rmcp would keep validating against the stale cached contract.
+fn schema_maps_changed(current: &HashMap<String, Tool>, next: &HashMap<String, Tool>) -> bool {
+    current != next
+}
+
 /// Collect MCP tool definitions that catalogs can expose without I/O.
 #[must_use]
 #[expect(clippy::implicit_hasher)]
@@ -586,6 +593,32 @@ mod tests {
 
         fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
             vec![Arc::new(StubTool(self.tool)) as Arc<dyn SpiceModelTool>]
+        }
+    }
+
+    struct ZoneAnnotatedTool;
+
+    #[async_trait::async_trait]
+    impl SpiceModelTool for ZoneAnnotatedTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed("deploy")
+        }
+        fn description(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed("deploy a thing"))
+        }
+        fn parameters(&self) -> Option<Value> {
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "region": { "type": "string", "x-mcp-header": "Zone" }
+                }
+            }))
+        }
+        async fn call(
+            &self,
+            _arg: &str,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(json!({ "ok": true }))
         }
     }
 
@@ -708,6 +741,90 @@ mod tests {
             .and_then(Value::as_object)
             .and_then(|region| region.get("x-mcp-header"))
             .and_then(Value::as_str)
+    }
+
+    /// Name-only comparison would miss `x-mcp-header: Region` → `Zone` on
+    /// the same `deploy` key. rmcp caches `get_tool` per name, so the
+    /// snapshot epoch must bump or Streamable HTTP keeps the stale header.
+    #[test]
+    fn schema_maps_changed_when_same_name_x_mcp_header_rewrites() {
+        let region = mcp_tool_from_spice("deploy", &HeaderAnnotatedTool);
+        let zone = mcp_tool_from_spice("deploy", &ZoneAnnotatedTool);
+        let current = HashMap::from([("deploy".to_string(), region.clone())]);
+        let same = HashMap::from([("deploy".to_string(), region)]);
+        let rewritten = HashMap::from([("deploy".to_string(), zone)]);
+        assert!(!schema_maps_changed(&current, &same));
+        assert!(
+            schema_maps_changed(&current, &rewritten),
+            "Region → Zone on the same deploy key must count as a schema change"
+        );
+    }
+
+    #[test]
+    fn replace_listed_treats_same_name_schema_identity_change_as_a_change() {
+        let snapshot = McpSchemaSnapshot::default();
+        let region = mcp_tool_from_spice("deploy", &HeaderAnnotatedTool);
+        let zone = mcp_tool_from_spice("deploy", &ZoneAnnotatedTool);
+        assert!(snapshot.insert("deploy".to_string(), region.clone()));
+        snapshot.bump_if(true);
+        let epoch = snapshot.epoch();
+
+        let unchanged = snapshot.replace_listed(std::slice::from_ref(&region));
+        assert!(
+            !unchanged,
+            "an identical listed schema must not count as a change"
+        );
+        snapshot.bump_if(unchanged);
+        assert_eq!(snapshot.epoch(), epoch);
+
+        let changed = snapshot.replace_listed(std::slice::from_ref(&zone));
+        assert!(
+            changed,
+            "same-name x-mcp-header rewrite must count as a change"
+        );
+        snapshot.bump_if(changed);
+        assert!(
+            snapshot.epoch() > epoch,
+            "same-name schema identity change must bump the snapshot epoch so Streamable HTTP reloads"
+        );
+        let tool = snapshot
+            .get("deploy")
+            .expect("deploy should still be present after the schema rewrite");
+        assert_eq!(x_mcp_header_region(&tool), Some("Zone"));
+    }
+
+    #[test]
+    fn insert_and_merge_treat_same_name_schema_identity_change_as_a_change() {
+        let snapshot = McpSchemaSnapshot::default();
+        assert!(snapshot.insert(
+            "deploy".to_string(),
+            mcp_tool_from_spice("deploy", &HeaderAnnotatedTool)
+        ));
+        snapshot.bump_if(true);
+        let after_insert = snapshot.epoch();
+
+        assert!(
+            snapshot.insert(
+                "deploy".to_string(),
+                mcp_tool_from_spice("deploy", &ZoneAnnotatedTool)
+            ),
+            "insert of a same-name rewritten schema must report a change"
+        );
+        snapshot.bump_if(true);
+        assert!(
+            snapshot.epoch() > after_insert,
+            "insert of a rewritten schema must bump the snapshot epoch"
+        );
+
+        let mut tools = HashMap::new();
+        tools.insert(
+            "deploy".to_string(),
+            Tooling::Tool(Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>),
+        );
+        assert!(
+            snapshot.merge_from_map(&tools),
+            "merge of a same-name rewritten schema must report a change"
+        );
     }
 
     #[test]
@@ -898,13 +1015,29 @@ mod tests {
     where
         S: ServerHandler,
     {
+        post_tools_call_param(service, tool_name, "region", region_header, region_body).await
+    }
+
+    async fn post_tools_call_param<S>(
+        service: &rmcp::transport::streamable_http_server::StreamableHttpService<
+            S,
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+        >,
+        tool_name: &str,
+        param: &str,
+        param_header: Option<&str>,
+        param_body: &str,
+    ) -> (http::StatusCode, Value)
+    where
+        S: ServerHandler,
+    {
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
             "params": {
                 "name": tool_name,
-                "arguments": { "region": region_body },
+                "arguments": { "region": param_body },
                 "_meta": {
                     "io.modelcontextprotocol/protocolVersion": "2026-07-28",
                     "io.modelcontextprotocol/clientInfo": {
@@ -924,8 +1057,8 @@ mod tests {
             .header("mcp-protocol-version", "2026-07-28")
             .header("mcp-method", "tools/call")
             .header("mcp-name", tool_name);
-        if let Some(region) = region_header {
-            builder = builder.header("mcp-param-region", region);
+        if let Some(value) = param_header {
+            builder = builder.header(format!("mcp-param-{param}"), value);
         }
         let request = builder
             .body(http_body_util::Full::new(bytes::Bytes::from(
@@ -1159,6 +1292,105 @@ mod tests {
             json.pointer("/error/code").and_then(Value::as_i64),
             Some(-32020),
             "expected HeaderMismatch (-32020) after rebuild, got {json}"
+        );
+    }
+
+    /// rmcp caches `get_tool` per name. After `deploy` rewrites
+    /// `x-mcp-header` from `Region` to `Zone`, the existing
+    /// `StreamableHttpService` still validates `mcp-param-region`; a
+    /// rebuilt service validates `mcp-param-zone`.
+    #[tokio::test]
+    async fn rebuilt_service_validates_after_same_name_schema_identity_change() {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "deploy".to_string(),
+            Tooling::Tool(Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>),
+        );
+        let tools = Arc::new(RwLock::new(tools));
+        let schemas = McpSchemaSnapshot::new();
+        schemas.replace_from_map(&*tools.read().await);
+        let first_epoch = schemas.epoch();
+
+        let factory_tools = Arc::clone(&tools);
+        let factory_schemas = Arc::clone(&schemas);
+        let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(true)
+            .disable_allowed_hosts()
+            .with_json_response(true);
+        let sessions = Arc::new(
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+        );
+        let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            {
+                let factory_tools = Arc::clone(&factory_tools);
+                let factory_schemas = Arc::clone(&factory_schemas);
+                move || {
+                    Ok(RuntimeServer::with_schema_snapshot(
+                        Arc::clone(&factory_tools),
+                        Arc::clone(&factory_schemas),
+                    ))
+                }
+            },
+            Arc::clone(&sessions),
+            config.clone(),
+        );
+
+        let (status, json) =
+            post_tools_call(&service, "deploy", Some("us-west1"), "us-west1").await;
+        assert!(
+            status.is_success(),
+            "matching Mcp-Param-Region must be accepted before the rewrite: {status} {json}"
+        );
+
+        {
+            let mut map = tools.write().await;
+            map.insert(
+                "deploy".to_string(),
+                Tooling::Tool(Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>),
+            );
+            let listed = vec![mcp_tool_from_spice("deploy", &ZoneAnnotatedTool)];
+            let changed = schemas.replace_listed(&listed);
+            schemas.bump_if(changed);
+            assert!(
+                changed,
+                "Region → Zone on deploy must count as a listed-schema change"
+            );
+        }
+        assert!(
+            schemas.epoch() > first_epoch,
+            "same-name schema identity change must bump the snapshot epoch"
+        );
+
+        let (status, json) =
+            post_tools_call_param(&service, "deploy", "zone", Some("us-west1"), "us-west1").await;
+        assert_eq!(
+            json.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32020),
+            "existing StreamableHttpService must still validate mcp-param-region: {status} {json}"
+        );
+
+        let rebuilt = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            move || {
+                Ok(RuntimeServer::with_schema_snapshot(
+                    Arc::clone(&factory_tools),
+                    Arc::clone(&factory_schemas),
+                ))
+            },
+            sessions,
+            config,
+        );
+        let (status, json) =
+            post_tools_call_param(&rebuilt, "deploy", "zone", Some("us-west1"), "us-west1").await;
+        assert!(
+            status.is_success(),
+            "rebuilt service must validate mcp-param-zone after the schema rewrite: {status} {json}"
+        );
+        assert!(
+            json.get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_i64)
+                != Some(-32020),
+            "matching Zone header must not raise HeaderMismatch: {json}"
         );
     }
 }
