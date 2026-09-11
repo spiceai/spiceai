@@ -333,13 +333,18 @@ impl McpToolCatalog {
         let heartbeat_task = tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS));
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // After the first `ttlMs == 0` refresh, wait for the heartbeat
+            // interval so Spice-to-Spice catalogs (which advertise `ttlMs: 0`)
+            // do not tight-loop `heartbeat` + `tools/list`.
+            let mut immediate_already_refreshed = false;
 
             loop {
                 let expires_at = tool_cache_clone
                     .read()
                     .ok()
                     .map_or(ListCacheExpiry::Unscheduled, |cache| cache.expires_at);
-                wait_for_heartbeat_or_ttl(&mut interval, expires_at).await;
+                wait_for_heartbeat_or_ttl(&mut interval, expires_at, immediate_already_refreshed)
+                    .await;
 
                 // The read lock is held during the heartbeat call. The underlying
                 // McpClient wraps a RunningService which is not Clone, so we cannot
@@ -394,6 +399,9 @@ impl McpToolCatalog {
                     )
                     .await;
                 }
+                immediate_already_refreshed = tool_cache_clone.read().ok().is_some_and(|cache| {
+                    matches!(cache.expires_at, ListCacheExpiry::ImmediatelyStale)
+                });
             }
         });
 
@@ -674,9 +682,14 @@ fn list_cache_is_fresh(expires_at: ListCacheExpiry, now: Instant) -> bool {
     matches!(expires_at, ListCacheExpiry::Until(deadline) if now < deadline)
 }
 
-fn ttl_wait(expires_at: ListCacheExpiry, now: Instant) -> TtlWait {
+fn ttl_wait(
+    expires_at: ListCacheExpiry,
+    now: Instant,
+    immediate_already_refreshed: bool,
+) -> TtlWait {
     match expires_at {
         ListCacheExpiry::Unscheduled => TtlWait::Heartbeat,
+        ListCacheExpiry::ImmediatelyStale if immediate_already_refreshed => TtlWait::Heartbeat,
         ListCacheExpiry::ImmediatelyStale => TtlWait::Immediate,
         ListCacheExpiry::Until(deadline) => deadline
             .checked_duration_since(now)
@@ -709,14 +722,17 @@ fn try_get_cached_spec<'a>(
 /// whichever is sooner, so an expired cache is republished before
 /// Streamable HTTP validates `Mcp-Param-*`.
 ///
-/// Immediately stale (`ttlMs` omitted or 0) and an already-elapsed
-/// deadline wake now. Only [`ListCacheExpiry::Unscheduled`] waits for
-/// the heartbeat interval — that is “no deadline,” not “stale now.”
+/// Immediately stale (`ttlMs` omitted or 0) wakes now on the first
+/// refresh. After that publish the waiter uses the heartbeat interval
+/// so a zero-TTL peer cannot tight-loop `tools/list`. An already-elapsed
+/// deadline still wakes now. [`ListCacheExpiry::Unscheduled`] always
+/// waits for the heartbeat — that is "no deadline," not "stale now."
 async fn wait_for_heartbeat_or_ttl(
     interval: &mut tokio::time::Interval,
     expires_at: ListCacheExpiry,
+    immediate_already_refreshed: bool,
 ) {
-    match ttl_wait(expires_at, Instant::now()) {
+    match ttl_wait(expires_at, Instant::now(), immediate_already_refreshed) {
         TtlWait::Heartbeat => {
             interval.tick().await;
         }
@@ -1263,6 +1279,7 @@ mod tests {
         wait_for_heartbeat_or_ttl(
             &mut interval,
             ListCacheExpiry::Until(Instant::now() + Duration::from_millis(20)),
+            false,
         )
         .await;
         assert!(
@@ -1280,12 +1297,12 @@ mod tests {
             "ttlMs 0 must not encode as Unscheduled (that waits for the heartbeat)"
         );
         assert_eq!(
-            ttl_wait(expires_at_from_ttl_ms(0, now), now),
+            ttl_wait(expires_at_from_ttl_ms(0, now), now, false),
             TtlWait::Immediate,
             "ttl_ms=0 expires_at=None used to take branch=heartbeat"
         );
         assert_eq!(
-            ttl_wait(ListCacheExpiry::Unscheduled, now),
+            ttl_wait(ListCacheExpiry::Unscheduled, now, false),
             TtlWait::Heartbeat,
             "no published page still waits for the heartbeat interval"
         );
@@ -1304,9 +1321,42 @@ mod tests {
         ));
         let elapsed_deadline = now + Duration::from_secs(6);
         assert_eq!(
-            ttl_wait(expires_at_from_ttl_ms(5_000, now), elapsed_deadline),
+            ttl_wait(expires_at_from_ttl_ms(5_000, now), elapsed_deadline, false),
             TtlWait::Immediate,
             "an already-elapsed deadline must not wait for the heartbeat"
+        );
+    }
+
+    #[test]
+    fn zero_ttl_refresh_is_bounded_after_the_first_immediate() {
+        let now = Instant::now();
+        let mut already_refreshed = false;
+        let mut immediate_waits = 0;
+        let mut heartbeat_waits = 0;
+        for _ in 0..10 {
+            match ttl_wait(ListCacheExpiry::ImmediatelyStale, now, already_refreshed) {
+                TtlWait::Immediate => immediate_waits += 1,
+                TtlWait::Heartbeat => heartbeat_waits += 1,
+                TtlWait::Until(_) => {}
+            }
+            already_refreshed = true;
+        }
+        eprintln!(
+            "window_iters=10 immediate_waits={immediate_waits} heartbeat_waits={heartbeat_waits} bounded_by_heartbeat_interval={}",
+            immediate_waits == 1 && heartbeat_waits == 9
+        );
+        assert_eq!(
+            immediate_waits, 1,
+            "only the first zero-ttl wait may skip the heartbeat"
+        );
+        assert_eq!(
+            heartbeat_waits, 9,
+            "later zero-ttl waits must use the heartbeat interval, not a tight loop"
+        );
+        assert_eq!(
+            ttl_wait(ListCacheExpiry::ImmediatelyStale, now, true),
+            TtlWait::Heartbeat,
+            "after the first immediate refresh, ttlMs 0 is bounded by the heartbeat"
         );
     }
 
@@ -1316,7 +1366,7 @@ mod tests {
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         interval.tick().await;
         let started = Instant::now();
-        wait_for_heartbeat_or_ttl(&mut interval, ListCacheExpiry::ImmediatelyStale).await;
+        wait_for_heartbeat_or_ttl(&mut interval, ListCacheExpiry::ImmediatelyStale, false).await;
         let elapsed = started.elapsed();
         eprintln!(
             "ttl_ms=0 expires_at=ImmediatelyStale branch=immediate elapsed_ms={}",
