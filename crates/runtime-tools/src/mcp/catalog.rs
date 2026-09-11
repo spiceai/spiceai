@@ -164,7 +164,7 @@ impl ListRefresh {
     /// publish lock and then `try_all` (a cache read). Holding the
     /// cache write across the snapshot publish would deadlock with
     /// that path.
-    fn publish_listed(&self, my_gen: u64, listed: ListedPublish<'_>) {
+    fn publish_listed(&self, my_gen: u64, listed: &ListedPublish<'_>) {
         let Some(_refresh) = self.lock_if_current(my_gen) else {
             return;
         };
@@ -264,7 +264,7 @@ impl McpToolCatalog {
                         if let Ok((listed, complete, ttl_ms)) = listed {
                             refresh_clone.publish_listed(
                                 my_gen,
-                                ListedPublish {
+                                &ListedPublish {
                                     tool_cache: &tool_cache_clone,
                                     schemas: &schemas_clone,
                                     catalog_name: &name_clone,
@@ -307,7 +307,7 @@ impl McpToolCatalog {
     fn remember_tools(&self, tools: &[rmcp::model::Tool], replace: bool, ttl_ms: u64, my_gen: u64) {
         self.refresh.publish_listed(
             my_gen,
-            ListedPublish {
+            &ListedPublish {
                 tool_cache: &self.tool_cache,
                 schemas: &self.schemas,
                 catalog_name: &self.name,
@@ -1032,7 +1032,7 @@ mod tests {
         let gen2 = refresh.next_gen();
         refresh.publish_listed(
             gen2,
-            ListedPublish {
+            &ListedPublish {
                 tool_cache: &tool_cache,
                 schemas: &schemas,
                 catalog_name: "srv",
@@ -1043,7 +1043,7 @@ mod tests {
         );
         refresh.publish_listed(
             gen1,
-            ListedPublish {
+            &ListedPublish {
                 tool_cache: &tool_cache,
                 schemas: &schemas,
                 catalog_name: "srv",
