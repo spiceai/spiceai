@@ -300,6 +300,102 @@ mod tests {
 
     use super::{home_dir, local_model_path, looks_like_local_model_path};
 
+    /// A static-embedding model directory holding only the two files
+    /// `model2vec-rs` actually reads: the tokenizer and the embedding tensor.
+    ///
+    /// Written by hand rather than downloaded so the guard is offline and needs no
+    /// fixture. `safetensors` is a length-prefixed JSON header followed by the raw
+    /// tensor bytes, and the loader takes the first of `embeddings`,
+    /// `embedding.weight` or `0` that it finds.
+    fn sentence_transformers_style_model_dir() -> tempfile::TempDir {
+        use std::io::Write;
+        use tokenizers::Tokenizer;
+        use tokenizers::models::wordpiece::WordPiece;
+
+        let dir = tempfile::tempdir().expect("creates a directory for the fixture model");
+
+        // The loader resolves the tokenizer's `unk_token` and requires it to be in
+        // the vocabulary, so the fixture needs a real one.
+        let vocab_path = dir.path().join("vocab.txt");
+        std::fs::write(&vocab_path, "[UNK]\nan\napple\nday\n")
+            .expect("writes the fixture vocabulary");
+        let model = WordPiece::from_file(
+            vocab_path
+                .to_str()
+                .expect("the fixture vocabulary path is UTF-8"),
+        )
+        .unk_token("[UNK]".to_string())
+        .build()
+        .expect("builds the fixture WordPiece model");
+        Tokenizer::new(model)
+            .save(dir.path().join("tokenizer.json"), false)
+            .expect("writes the fixture tokenizer");
+
+        // A 4x2 f32 `embeddings` tensor, one row per vocabulary entry.
+        let rows: usize = 4;
+        let cols: usize = 2;
+        let mut data = Vec::with_capacity(rows * cols * 4);
+        for i in 0..rows * cols {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "the fixture's values are small and arbitrary"
+            )]
+            data.extend_from_slice(&(i as f32).to_le_bytes());
+        }
+        let header = format!(
+            r#"{{"embeddings":{{"dtype":"F32","shape":[{rows},{cols}],"data_offsets":[0,{}]}}}}"#,
+            data.len()
+        );
+        let mut safetensors = std::fs::File::create(dir.path().join("model.safetensors"))
+            .expect("creates the tensor file");
+        safetensors
+            .write_all(&(header.len() as u64).to_le_bytes())
+            .expect("writes the safetensors header length");
+        safetensors
+            .write_all(header.as_bytes())
+            .expect("writes the safetensors header");
+        safetensors
+            .write_all(&data)
+            .expect("writes the safetensors tensor data");
+
+        dir
+    }
+
+    /// A local static-embedding model has to load without a `config.json`.
+    ///
+    /// `config.json` carries one thing `model2vec-rs` reads — the default for
+    /// `normalize` — and a sentence-transformers model does not ship it. Upstream
+    /// requires it anyway and refuses the directory outright ("missing tokenizer /
+    /// model / config"); a Spice patch to the `spiceai/model2vec-rs` fork makes it
+    /// optional and defaults `normalize` to true. Losing the patch is not a wrong
+    /// answer, it is a model that will not load at all, and the error names a file
+    /// the model was never supposed to have.
+    #[test]
+    fn a_local_model_loads_without_a_config_json() {
+        let dir = sentence_transformers_style_model_dir();
+        assert!(
+            !dir.path().join("config.json").exists(),
+            "this guard needs a model directory with no config.json"
+        );
+        // An absolute path, so the name is resolved as a local model rather than a
+        // Hub repo id.
+        let name = dir
+            .path()
+            .to_str()
+            .expect("the fixture model path is UTF-8");
+        assert!(
+            looks_like_local_model_path(name),
+            "this guard has to reach the local-directory branch, not the Hub"
+        );
+
+        Model2Vec::from_params(name, None, None, None, None, None, None).unwrap_or_else(|e| {
+            panic!(
+                "a static-embedding model directory without a config.json must load, since \
+                 sentence-transformers models do not ship one: {e}"
+            )
+        });
+    }
+
     #[test]
     fn detects_local_model_paths() {
         assert!(looks_like_local_model_path("/tmp/model"));

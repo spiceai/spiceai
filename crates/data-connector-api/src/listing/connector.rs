@@ -3385,6 +3385,56 @@ mod tests {
         }
     }
 
+    /// A truncated range body has to come back as an error the reader can act on,
+    /// not take the thread down.
+    ///
+    /// The pinned readers above ask for byte ranges, and an object store is
+    /// entitled to answer a range request with fewer bytes than were asked for —
+    /// notably when the object shrinks in place between the `HEAD` that sized it
+    /// and the `GET` that reads it, which is the same replace-mid-scan the pinning
+    /// exists for. Upstream `PushBuffers::push_range` asserts that the buffer
+    /// matches the range, so that answer aborts the thread doing the decode
+    /// (`Range length must match buffer length`) instead of surfacing a decode
+    /// error the scan could retry or report. A Spice patch to the
+    /// `spiceai/arrow-rs` fork returns `ParquetError` instead
+    /// ([apache/arrow-rs#10564](https://github.com/apache/arrow-rs/pull/10564)).
+    ///
+    /// Driven through `ParquetMetaDataPushDecoder`, which is the public surface
+    /// `push_range` sits behind; the panic and the error are the same two outcomes
+    /// there as on the prefetch path, and a panicking guard fails as loudly as an
+    /// assertion does.
+    #[test]
+    fn a_short_range_body_is_a_parquet_error_and_not_a_panic() {
+        use datafusion::parquet::file::metadata::ParquetMetaDataPushDecoder;
+
+        const FILE_LEN: u64 = 4096;
+
+        let mut decoder =
+            ParquetMetaDataPushDecoder::try_new(FILE_LEN).expect("builds a metadata decoder");
+
+        // Eight bytes asked for, three delivered — a short read, not a malformed
+        // one, so nothing but the length check can tell it apart from a good body.
+        let error = decoder
+            .push_range(0..8, bytes::Bytes::from_static(b"abc"))
+            .expect_err(
+                "a range answered with fewer bytes than were asked for must be reported, not \
+                 asserted on: a footer prefetch racing an in-place shrink takes the decoding \
+                 thread down instead of failing the scan",
+            );
+        let message = error.to_string();
+        assert!(
+            message.contains('3') && message.contains('8'),
+            "the error has to say what was asked for and what arrived, or a short read is \
+             indistinguishable from a corrupt file: {message}"
+        );
+
+        // The decoder is still usable afterwards, which is what makes the error
+        // retriable rather than merely non-fatal.
+        decoder
+            .push_range(0..3, bytes::Bytes::from_static(b"abc"))
+            .expect("a well-formed range is still accepted after a rejected one");
+    }
+
     /// A second reader built for the *same* file has to stay on the generation the
     /// first one pinned.
     ///

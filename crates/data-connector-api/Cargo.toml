@@ -56,6 +56,7 @@ vortex-datafusion.workspace = true
 # with `duplicate #[distributed_slice]`. Tests build a `DatasetSpec` rather than a
 # `runtime::component::dataset::Dataset` for exactly this reason.
 [dev-dependencies]
+bytes.workspace = true
 chrono.workspace = true
 paste.workspace = true
 tempfile.workspace = true
