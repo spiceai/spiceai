@@ -591,15 +591,33 @@ impl McpToolCatalog {
         &self,
         name: &str,
     ) -> std::result::Result<Option<rmcp::model::Tool>, ServiceError> {
-        // A listed spec is what `try_get` validated. Refreshing on TTL
-        // expiry here lets dispatch execute Zone while Streamable HTTP
-        // still authorized Region (`validated=Region executed=Zone`).
-        if let Some(tool) = self.cached_tool(name) {
-            return Ok(Some(tool));
+        // `Runtime::get_tool` and other catalog `get` callers must see
+        // the live page. An expired / `ttlMs: 0` entry is not a lookup
+        // hit — reuse would keep a removed tool or old schema until the
+        // heartbeat. Gateway `tools/call` pins the last listed spec via
+        // `try_get` / `try_all` instead of this path.
+        if self.cache_is_fresh() {
+            return Ok(self.cached_tool(name));
         }
         match self.list_tools().await {
             Ok(_) => Ok(self.cached_tool(name)),
             Err(e) => self.cached_tool(name).map_or(Err(e), |tool| Ok(Some(tool))),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(name: &str, cache: ToolListCache, client: McpClient) -> Self {
+        Self {
+            client: Arc::new(RwLock::new(client)),
+            name: name.to_string(),
+            heartbeat_task: tokio::spawn(async {}),
+            tool_cache: Arc::new(StdRwLock::new(cache)),
+            schemas: Arc::new(StdRwLock::new(None)),
+            refresh: Arc::new(ListRefresh {
+                generation: AtomicU64::new(0),
+                published: AtomicU64::new(0),
+                publish: StdMutex::new(()),
+            }),
         }
     }
 }
@@ -819,6 +837,18 @@ fn client_lifecycle() -> ClientLifecycleMode {
 pub enum McpClient {
     Stdio(RunningService<RoleClient, ()>),
     Http(RunningService<RoleClient, InitializeRequestParams>),
+    /// In-process `tools/list` page for catalog lookup tests.
+    #[cfg(test)]
+    Scripted(ScriptedMcpClient),
+}
+
+/// Counts `tools/list` and returns a fixed page. Used to prove catalog
+/// `get` refreshes an expired cache instead of reusing the last spec.
+#[cfg(test)]
+pub struct ScriptedMcpClient {
+    list_calls: Arc<AtomicU64>,
+    tools: Vec<rmcp::model::Tool>,
+    ttl_ms: u64,
 }
 
 impl McpClient {
@@ -829,6 +859,15 @@ impl McpClient {
         match self {
             McpClient::Stdio(s) => s.list_tools(params).await,
             McpClient::Http(s) => s.list_tools(params).await,
+            #[cfg(test)]
+            McpClient::Scripted(scripted) => {
+                scripted.list_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ListToolsResult {
+                    tools: scripted.tools.clone(),
+                    ..ListToolsResult::default()
+                }
+                .with_ttl_ms(scripted.ttl_ms))
+            }
         }
     }
     pub async fn call_tool(
@@ -838,6 +877,8 @@ impl McpClient {
         match self {
             McpClient::Stdio(s) => s.call_tool(params).await,
             McpClient::Http(s) => s.call_tool(params).await,
+            #[cfg(test)]
+            McpClient::Scripted(_) => Err(ServiceError::UnexpectedResponse),
         }
     }
 
@@ -853,6 +894,8 @@ impl McpClient {
         match self {
             McpClient::Stdio(s) => s.call_tool_once(params).await,
             McpClient::Http(s) => s.call_tool_once(params).await,
+            #[cfg(test)]
+            McpClient::Scripted(_) => Err(ServiceError::UnexpectedResponse),
         }
     }
 
@@ -868,6 +911,8 @@ impl McpClient {
                     .send_request(ClientRequest::PingRequest(PingRequest::default()))
                     .await?
             }
+            #[cfg(test)]
+            McpClient::Scripted(_) => return Err(ServiceError::UnexpectedResponse),
         };
         match result {
             ServerResult::EmptyResult(_) => Ok(()),
@@ -908,6 +953,15 @@ impl McpClient {
                 s.peer()
                     .send_request(ClientRequest::ListToolsRequest(ListToolsRequest::default()))
                     .await?
+            }
+            #[cfg(test)]
+            McpClient::Scripted(scripted) => {
+                scripted.list_calls.fetch_add(1, Ordering::SeqCst);
+                return Ok(ListToolsResult {
+                    tools: scripted.tools.clone(),
+                    ..ListToolsResult::default()
+                }
+                .with_ttl_ms(scripted.ttl_ms));
             }
         };
         match result {
@@ -984,9 +1038,9 @@ impl SpiceToolCatalog for McpToolCatalog {
     fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
         // Expired pages are not a validation contract. Serving them
         // lets rmcp accept `Mcp-Param-Region` while `get` refreshes
-        // and executes Zone. The heartbeat / TTL waiter republishes
-        // first; `cached_tool` still holds the last spec for dispatch
-        // until that publish lands.
+        // and executes Zone. The last spec stays in `try_all` so
+        // gateway dispatch can pin that generation without calling
+        // `get`.
         let spec = {
             let cache = self.tool_cache.read().ok()?;
             try_get_cached_spec(&cache, name, Instant::now())?.clone()
@@ -1019,7 +1073,7 @@ impl SpiceToolCatalog for McpToolCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn test_dangerous_patterns_reject_parent_traversal() {
@@ -1237,8 +1291,105 @@ mod tests {
         assert_eq!(
             cache.tools.get("deploy").and_then(x_mcp_header),
             Some("Region"),
-            "get_tool keeps the last listed spec so dispatch cannot run Zone first"
+            "the last listed spec stays in cache.tools for gateway pin via try_all"
         );
+    }
+
+    /// `Runtime::get_tool` uses catalog `get`. An expired / `ttlMs: 0`
+    /// page must refresh (`list_calls > 0`) instead of returning the
+    /// stale Region spec (`expired=True returned=Region-schema
+    /// list_calls=0`).
+    #[tokio::test]
+    async fn expired_catalog_get_refreshes_instead_of_reusing_listed_spec() {
+        let list_calls = Arc::new(AtomicU64::new(0));
+        let mut cache = ToolListCache::default();
+        apply_tool_cache(&mut cache, &[listed_deploy_with_header("Region")], true, 0);
+        assert!(
+            !list_cache_is_fresh(cache.expires_at, Instant::now()),
+            "ttlMs 0 is immediately stale"
+        );
+        assert!(
+            try_get_cached_spec(&cache, "deploy", Instant::now()).is_none(),
+            "try_get must not serve the expired Region page"
+        );
+
+        let catalog = McpToolCatalog::for_test(
+            "srv",
+            cache,
+            McpClient::Scripted(ScriptedMcpClient {
+                list_calls: Arc::clone(&list_calls),
+                tools: vec![listed_deploy_with_header("Zone")],
+                ttl_ms: 5_000,
+            }),
+        );
+
+        let tool = catalog
+            .get("deploy")
+            .await
+            .expect("expired get must refresh and return the live spec");
+        let parameters = tool.parameters();
+        let returned = parameters
+            .as_ref()
+            .and_then(|parameters| parameters.get("properties"))
+            .and_then(|properties| properties.get("region"))
+            .and_then(|region| region.get("x-mcp-header"))
+            .and_then(Value::as_str)
+            .unwrap_or("missing")
+            .to_string();
+        let calls = list_calls.load(Ordering::SeqCst);
+        eprintln!("expired=True returned={returned}-schema list_calls={calls}");
+        assert_eq!(
+            returned, "Zone",
+            "catalog get must not keep the expired Region spec"
+        );
+        assert!(
+            calls >= 1,
+            "expired get must call tools/list, list_calls={calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_catalog_get_reuses_the_page_without_list() {
+        let list_calls = Arc::new(AtomicU64::new(0));
+        let mut cache = ToolListCache::default();
+        apply_tool_cache(
+            &mut cache,
+            &[listed_deploy_with_header("Region")],
+            true,
+            5_000,
+        );
+        assert!(
+            try_get_cached_spec(&cache, "deploy", Instant::now()).is_some(),
+            "fresh page must still validate"
+        );
+
+        let catalog = McpToolCatalog::for_test(
+            "srv",
+            cache,
+            McpClient::Scripted(ScriptedMcpClient {
+                list_calls: Arc::clone(&list_calls),
+                tools: vec![listed_deploy_with_header("Zone")],
+                ttl_ms: 5_000,
+            }),
+        );
+
+        let tool = catalog
+            .get("deploy")
+            .await
+            .expect("fresh get must return the cached spec");
+        let parameters = tool.parameters();
+        let returned = parameters
+            .as_ref()
+            .and_then(|parameters| parameters.get("properties"))
+            .and_then(|properties| properties.get("region"))
+            .and_then(|region| region.get("x-mcp-header"))
+            .and_then(Value::as_str)
+            .unwrap_or("missing")
+            .to_string();
+        let calls = list_calls.load(Ordering::SeqCst);
+        eprintln!("expired=False returned={returned}-schema list_calls={calls}");
+        assert_eq!(returned, "Region", "fresh get must not refresh to Zone");
+        assert_eq!(calls, 0, "fresh get must not call tools/list");
     }
 
     /// After `ttlMs` elapses, `try_get` must not keep Region while a

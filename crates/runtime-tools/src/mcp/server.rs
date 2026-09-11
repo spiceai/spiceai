@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::catalog::SpiceToolCatalog;
 use crate::mcp::task_name_for_exposed_tool;
 use crate::tooling::Tooling;
 
@@ -379,10 +380,11 @@ impl RuntimeServer {
             let validated = self.snapshot_tool(&exposed_name).is_some()
                 || self.snapshot_tool(tool_name).is_some();
 
-            // Prefer `try_get` — the listed spec `ServerHandler::get_tool`
-            // used for `Mcp-Param-*`. `get` may refresh an expired TTL
-            // (`validated=Region executed=Zone`).
-            if let Some(tool) = catalog.try_get(&name) {
+            // Generation-pinned lookup. `catalog.get` refreshes an
+            // expired page (`Runtime::get_tool`); using it here when a
+            // listed spec exists would execute Zone after Streamable
+            // HTTP authorized Region.
+            if let Some(tool) = listed_gateway_spec(catalog.as_ref(), &name) {
                 return self.resolved_if_validated(
                     validated,
                     tool,
@@ -391,9 +393,9 @@ impl RuntimeServer {
                 );
             }
 
-            // Expired `try_get`: `get` returns the listed spec the
-            // snapshot already described. A name that was never in the
-            // snapshot is a first-seen discovery — publish and retry.
+            // No listed spec: first-seen discovery, or a retry after
+            // `remember_tool` published the snapshot. Refresh, then
+            // execute only if this generation already named the tool.
             if let Some(tool) = catalog.get(&name).await {
                 return self.resolved_if_validated(
                     validated,
@@ -782,6 +784,25 @@ fn mcp_tool_from_spice(name: impl Into<Cow<'static, str>>, tool: &dyn SpiceModel
         tool.description().map(|s| Cow::Owned(s.into_owned()));
     let schema = to_map(tool.parameters().unwrap_or_else(empty_input_schema));
     Tool::new_with_raw(name.into(), description, schema)
+}
+
+/// Last listed spec for gateway `tools/call`, even when the page is expired.
+///
+/// `try_get` is the fresh listed spec Streamable HTTP validated.
+/// `try_all` keeps the last page after `ttlMs` elapses so dispatch can
+/// pin that generation. Catalog `get` refreshes expired pages and must
+/// not be used here (`validated=Region executed=Zone`).
+fn listed_gateway_spec(
+    catalog: &dyn SpiceToolCatalog,
+    name: &str,
+) -> Option<Arc<dyn SpiceModelTool>> {
+    if let Some(tool) = catalog.try_get(name) {
+        return Some(tool);
+    }
+    catalog
+        .try_all()
+        .into_iter()
+        .find(|tool| tool.name() == name)
 }
 
 /// `2026-07-28` requires `ttlMs` and `cacheScope` on `tools/list`.
@@ -2814,7 +2835,9 @@ mod tests {
 
     #[tokio::test]
     async fn expired_try_get_schema_must_not_dispatch_refreshed_tool() {
-        struct ExpiredThenRefreshCatalog;
+        struct ExpiredThenRefreshCatalog {
+            get_calls: std::sync::atomic::AtomicU64,
+        }
 
         #[async_trait::async_trait]
         impl SpiceToolCatalog for ExpiredThenRefreshCatalog {
@@ -2828,10 +2851,13 @@ mod tests {
                 vec![Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>]
             }
             async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                self.get_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 (name == "deploy").then(|| Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>)
             }
-            fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
-                (name == "deploy").then(|| Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>)
+            fn try_get(&self, _name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                // Production `try_get` misses after `ttlMs` expires.
+                None
             }
             fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
                 vec![Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>]
@@ -2839,11 +2865,14 @@ mod tests {
         }
 
         let exposed = encode_tool_name("srv", "deploy");
+        let catalog = Arc::new(ExpiredThenRefreshCatalog {
+            get_calls: std::sync::atomic::AtomicU64::new(0),
+        });
         let mut tools = HashMap::new();
         tools.insert(
             "srv".to_string(),
             Tooling::Catalog {
-                tools: Arc::new(ExpiredThenRefreshCatalog) as Arc<dyn SpiceToolCatalog>,
+                tools: Arc::clone(&catalog) as Arc<dyn SpiceToolCatalog>,
                 default_catalog_names: vec![],
             },
         );
@@ -2900,6 +2929,13 @@ mod tests {
             executed.as_deref(),
             Some("Region"),
             "validated=Region executed=Zone accepted=True is the reported miss: {json}"
+        );
+        assert_eq!(
+            catalog
+                .get_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "gateway dispatch must pin try_all, not refreshing catalog get"
         );
     }
 
