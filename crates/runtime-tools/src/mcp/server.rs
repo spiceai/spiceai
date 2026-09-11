@@ -757,6 +757,7 @@ mod tests {
     use crate::catalog::SpiceToolCatalog;
     use rmcp::model::InputRequiredResult;
     use rmcp::service::ServiceError;
+    use spicepod::component::runtime::CorsConfig;
     use tools::McpProxy;
 
     struct StubTool(&'static str);
@@ -2828,6 +2829,50 @@ mod tests {
             status,
             http::StatusCode::FORBIDDEN,
             "non-browser clients that omit Origin must still pass, got {status}"
+        );
+    }
+
+    /// Default `runtime.cors.allowed_origins: ["*"]` must still install a
+    /// non-empty rmcp allow-list so `https://evil.example` is 403.
+    #[tokio::test]
+    async fn spice_default_cors_rejects_disallowed_origin_post() {
+        let rmcp_default =
+            rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default();
+        let origins = CorsConfig::default().mcp_allowed_origins();
+        eprintln!(
+            "rmcp_default_allowed_origins_empty={}",
+            rmcp_default.allowed_origins.is_empty()
+        );
+        eprintln!(
+            "spice_mcp_config_sets_allowed_origins={}",
+            !origins.is_empty()
+        );
+        assert!(
+            rmcp_default.allowed_origins.is_empty(),
+            "rmcp default allowed_origins must be empty: {:?}",
+            rmcp_default.allowed_origins
+        );
+        assert!(
+            !origins.is_empty(),
+            "spice_mcp_config_sets_allowed_origins=False: default CORS * must expand to localhost origins"
+        );
+
+        let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(true)
+            .disable_allowed_hosts()
+            .with_json_response(true)
+            .with_allowed_origins(origins);
+        let status =
+            post_tools_call_with_origin(&origin_service(config), Some("https://evil.example"))
+                .await;
+        eprintln!(
+            "origin_https_evil_example_accepted={}",
+            status != http::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status,
+            http::StatusCode::FORBIDDEN,
+            "Origin https://evil.example must be 403 on the default Spice CORS expansion, got {status}"
         );
     }
 }

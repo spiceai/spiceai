@@ -242,7 +242,7 @@ selected via the `Accept` header.",
                         .description(
                             "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list, \
 or the `Origin` header is not in `runtime.cors.allowed_origins`. \
-Configure `runtime.mcp.allowed_hosts` / `runtime.cors.allowed_origins`, or set either to `[\"*\"]` to disable that check.",
+Configure `runtime.mcp.allowed_hosts` or `runtime.cors.allowed_origins`. Host `[\"*\"]` disables the Host check. Origin `[\"*\"]` expands to localhost defaults — it does not accept every Origin.",
                         )
                         .build(),
                 )
@@ -720,13 +720,12 @@ async fn track_metrics(
 /// Host (`Host` header):
 /// - If `runtime.mcp` is not set or `runtime.mcp.allowed_hosts` is `None`, rmcp defaults
 ///   apply (`localhost`, `127.0.0.1`, `::1`).
-/// - If `runtime.mcp.allowed_hosts` contains `"*"`, host checking is disabled entirely
-///   (matches how `runtime.cors.allowed_origins: ["*"]` works).
+/// - If `runtime.mcp.allowed_hosts` contains `"*"`, host checking is disabled entirely.
 /// - Otherwise the provided list replaces the defaults entirely.
 ///
-/// Origin (`Origin` header), derived from `runtime.cors.allowed_origins`:
-/// - `"*"` (the CORS default) disables Origin validation so non-browser
-///   clients and CORS-wildcard deployments keep working.
+/// Origin (`Origin` header), derived from [`CorsConfig::mcp_allowed_origins`]:
+/// - `"*"` or an empty CORS list expands to localhost defaults so the
+///   rmcp allow-list is never empty (empty accepts every `Origin`).
 /// - A concrete list is the 2026-07-28 Streamable HTTP origin policy:
 ///   a mismatched `Origin` is 403; a missing `Origin` still passes.
 ///
@@ -745,15 +744,7 @@ fn mcp_server_config(
         None => config,
     };
 
-    if cors_config
-        .allowed_origins
-        .iter()
-        .any(|origin| origin == "*")
-    {
-        config.disable_allowed_origins()
-    } else {
-        config.with_allowed_origins(cors_config.allowed_origins.iter().map(String::as_str))
-    }
+    config.with_allowed_origins(cors_config.mcp_allowed_origins())
 }
 
 /// Rebuilds [`StreamableHttpService`] when [`McpSchemaSnapshot::epoch`]
@@ -1503,26 +1494,44 @@ mod mcp_origin_tests {
     }
 
     #[test]
-    fn mcp_server_config_wildcard_cors_disables_origin_check() {
+    fn mcp_server_config_default_sets_allowed_origins() {
+        let rmcp_default = StreamableHttpServerConfig::default();
+        let config = mcp_server_config(None, &CorsConfig::default());
+        eprintln!(
+            "rmcp_default_allowed_origins_empty={}",
+            rmcp_default.allowed_origins.is_empty()
+        );
+        eprintln!(
+            "spice_mcp_config_sets_allowed_origins={}",
+            !config.allowed_origins.is_empty()
+        );
+        assert!(
+            rmcp_default.allowed_origins.is_empty(),
+            "rmcp default allowed_origins must stay empty: {:?}",
+            rmcp_default.allowed_origins
+        );
+        assert!(
+            !config.allowed_origins.is_empty(),
+            "spice_mcp_config_sets_allowed_origins=False: default CORS * must still install localhost origins, got {:?}",
+            config.allowed_origins
+        );
+        assert_eq!(
+            config.allowed_origins,
+            CorsConfig::default().mcp_allowed_origins()
+        );
+    }
+
+    #[test]
+    fn mcp_server_config_wildcard_cors_sets_localhost_origins() {
         let cors = CorsConfig {
             enabled: true,
             allowed_origins: vec!["*".to_string()],
         };
         let config = mcp_server_config(None, &cors);
-        assert!(
-            config.allowed_origins.is_empty(),
-            "wildcard CORS must disable Origin validation, got {:?}",
-            config.allowed_origins
-        );
-    }
-
-    #[test]
-    fn mcp_server_config_default_cors_disables_origin_check() {
-        let config = mcp_server_config(None, &CorsConfig::default());
-        assert!(
-            config.allowed_origins.is_empty(),
-            "default CORS allowed_origins is * and must not enable Origin validation, got {:?}",
-            config.allowed_origins
+        assert_eq!(
+            config.allowed_origins,
+            cors.mcp_allowed_origins(),
+            "wildcard CORS must expand to localhost origins, not disable the check"
         );
     }
 
@@ -1562,13 +1571,28 @@ mod mcp_origin_tests {
     }
 
     #[tokio::test]
-    async fn default_cors_wildcard_still_accepts_any_origin() {
+    async fn default_cors_rejects_disallowed_origin_post() {
         let config = mcp_server_config(None, &CorsConfig::default());
         let status = post_mcp_with_origin(config, Some("https://evil.example")).await;
+        eprintln!(
+            "origin_https_evil_example_accepted={}",
+            status != StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "default CORS * must still 403 Origin https://evil.example, got {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_cors_accepts_localhost_origin_post() {
+        let config = mcp_server_config(None, &CorsConfig::default());
+        let status = post_mcp_with_origin(config, Some("http://localhost:8090")).await;
         assert_ne!(
             status,
             StatusCode::FORBIDDEN,
-            "default CORS * must keep Origin validation off, got {status}"
+            "localhost Origin must pass the default MCP allow-list, got {status}"
         );
     }
 
