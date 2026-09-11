@@ -2695,4 +2695,139 @@ mod tests {
             "validated=Region executed=Zone accepted=True is the reported miss: {json}"
         );
     }
+
+    async fn post_tools_call_with_origin<S>(
+        service: &rmcp::transport::streamable_http_server::StreamableHttpService<
+            S,
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+        >,
+        origin: Option<&str>,
+    ) -> http::StatusCode
+    where
+        S: ServerHandler,
+    {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "deploy",
+                "arguments": { "region": "us-west1" },
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientInfo": {
+                        "name": "runtime-tools-test",
+                        "version": "0.0.0"
+                    },
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+        let mut builder = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "deploy");
+        if let Some(origin) = origin {
+            builder = builder.header(http::header::ORIGIN, origin);
+        }
+        let request = builder
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                body.to_string(),
+            )))
+            .expect("valid tools/call request");
+        service.handle(request).await.status()
+    }
+
+    fn origin_service(
+        config: rmcp::transport::streamable_http_server::StreamableHttpServerConfig,
+    ) -> rmcp::transport::streamable_http_server::StreamableHttpService<
+        SchemaLessServer,
+        rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+    > {
+        rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            || Ok(SchemaLessServer),
+            Arc::new(
+                rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+            ),
+            config,
+        )
+    }
+
+    /// Pre-fix Spice left `allowed_origins` empty. rmcp then accepts every
+    /// `Origin`, including `https://evil.example`.
+    #[tokio::test]
+    async fn unconfigured_origin_policy_accepts_disallowed_origin() {
+        let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(true)
+            .disable_allowed_hosts()
+            .with_json_response(true);
+        assert!(
+            config.allowed_origins.is_empty(),
+            "rmcp default allowed_origins must be empty: {:?}",
+            config.allowed_origins
+        );
+        let status =
+            post_tools_call_with_origin(&origin_service(config), Some("https://evil.example"))
+                .await;
+        assert_ne!(
+            status,
+            http::StatusCode::FORBIDDEN,
+            "empty allowed_origins is the pre-fix reproduction: Origin https://evil.example was accepted, got {status}"
+        );
+        eprintln!("unconfigured_origin_policy_accepts_disallowed_origin status={status}");
+    }
+
+    #[tokio::test]
+    async fn allowed_origins_rejects_disallowed_origin_post() {
+        let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(true)
+            .disable_allowed_hosts()
+            .with_json_response(true)
+            .with_allowed_origins(["https://app.example.com"]);
+        let status =
+            post_tools_call_with_origin(&origin_service(config), Some("https://evil.example"))
+                .await;
+        assert_eq!(
+            status,
+            http::StatusCode::FORBIDDEN,
+            "Origin https://evil.example must be 403 when allowed_origins is https://app.example.com, got {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_origins_accepts_matching_origin_post() {
+        let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(true)
+            .disable_allowed_hosts()
+            .with_json_response(true)
+            .with_allowed_origins(["https://app.example.com"]);
+        let status =
+            post_tools_call_with_origin(&origin_service(config), Some("https://app.example.com"))
+                .await;
+        assert_ne!(
+            status,
+            http::StatusCode::FORBIDDEN,
+            "matching Origin https://app.example.com must not be 403, got {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_origins_accepts_missing_origin_post() {
+        let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(true)
+            .disable_allowed_hosts()
+            .with_json_response(true)
+            .with_allowed_origins(["https://app.example.com"]);
+        let status = post_tools_call_with_origin(&origin_service(config), None).await;
+        assert_ne!(
+            status,
+            http::StatusCode::FORBIDDEN,
+            "non-browser clients that omit Origin must still pass, got {status}"
+        );
+    }
 }

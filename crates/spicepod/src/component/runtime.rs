@@ -559,6 +559,10 @@ pub fn validate_metric_prefix(prefix: &str) -> Result<(), String> {
 /// answers legacy `initialize` so existing Cursor/Claude clients keep working.
 /// Unsupported versions return JSON-RPC `-32022` listing the versions this
 /// runtime supports.
+///
+/// Browser `Origin` validation is not a field here: it uses
+/// `runtime.cors.allowed_origins`. `"*"` (the CORS default) disables the
+/// check; a concrete list rejects a mismatched `Origin` with `HTTP` 403.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -911,6 +915,10 @@ impl std::fmt::Debug for ApiKey {
 pub struct CorsConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Browser origins allowed when [`Self::enabled`] is true. Also the MCP
+    /// Streamable HTTP `Origin` allow-list on `/v1/mcp`: `"*"` disables
+    /// `Origin` checking (the default); a concrete list rejects a mismatched
+    /// `Origin` with `HTTP` 403. Requests with no `Origin` still pass.
     #[serde(default = "default_allowed_origins")]
     pub allowed_origins: Vec<String>,
 }
