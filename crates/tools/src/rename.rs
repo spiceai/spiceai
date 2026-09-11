@@ -92,9 +92,9 @@ mod tests {
     impl crate::McpProxy for StubProxy {
         async fn call_tool(
             &self,
-            _arguments: Option<rmcp::model::JsonObject>,
-        ) -> Result<rmcp::model::CallToolResult, rmcp::service::ServiceError> {
-            Ok(rmcp::model::CallToolResult::success(vec![]))
+            _request: rmcp::model::CallToolRequestParams,
+        ) -> Result<rmcp::model::CallToolResponse, rmcp::service::ServiceError> {
+            Ok(rmcp::model::CallToolResult::success(vec![]).into())
         }
     }
 

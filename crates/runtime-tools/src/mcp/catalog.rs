@@ -22,9 +22,9 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt, RoleClient,
     model::{
-        CallToolRequestParams, CallToolResult, ClientCapabilities, ClientRequest, Implementation,
-        InitializeRequestParams, ListToolsResult, PaginatedRequestParams, PingRequest,
-        ProtocolVersion, ServerResult,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities, ClientRequest,
+        Implementation, InitializeRequestParams, ListToolsResult, PaginatedRequestParams,
+        PingRequest, ProtocolVersion, ServerResult,
     },
     service::{RunningService, ServiceError},
     transport::{
@@ -343,7 +343,7 @@ impl McpToolCatalog {
 /// finished (no cursor) before the pagination or total-tool caps.
 async fn list_tools_from_client(
     client: &McpClient,
-    ) -> std::result::Result<(Vec<rmcp::model::Tool>, bool, u64), ServiceError> {
+) -> std::result::Result<(Vec<rmcp::model::Tool>, bool, u64), ServiceError> {
     // Security: Limit pagination to prevent infinite loops and memory exhaustion
     const MAX_PAGINATION_ITERATIONS: usize = 100;
     const MAX_TOTAL_TOOLS: usize = 10000;
@@ -455,6 +455,21 @@ impl McpClient {
         match self {
             McpClient::Stdio(s) => s.call_tool(params).await,
             McpClient::Http(s) => s.call_tool(params).await,
+        }
+    }
+
+    /// One `tools/call` without driving MRTR follow-up rounds.
+    ///
+    /// The high-level [`Self::call_tool`] fulfils `input_required` locally and
+    /// returns only [`CallToolResult`]. The `/v1/mcp` gateway must use this so
+    /// a downstream client can continue the round trip.
+    pub async fn call_tool_once(
+        &self,
+        params: CallToolRequestParams,
+    ) -> Result<CallToolResponse, ServiceError> {
+        match self {
+            McpClient::Stdio(s) => s.call_tool_once(params).await,
+            McpClient::Http(s) => s.call_tool_once(params).await,
         }
     }
 
@@ -720,7 +735,10 @@ mod tests {
             "omitted or zero ttlMs is immediately stale"
         );
         let later = now + Duration::from_millis(1);
-        assert!(list_cache_is_fresh(expires_at_from_ttl_ms(5_000, now), later));
+        assert!(list_cache_is_fresh(
+            expires_at_from_ttl_ms(5_000, now),
+            later
+        ));
         assert!(!list_cache_is_fresh(
             expires_at_from_ttl_ms(5_000, now),
             now + Duration::from_secs(6)

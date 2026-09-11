@@ -413,16 +413,14 @@ impl ServerHandler for RuntimeServer {
                     tracing::info!(target: "task_history", parent: &span, mcp_server = %mcp_server, "labels");
                 }
 
-                return match mcp_proxy
-                    .call_tool(arguments)
-                    .instrument(span.clone())
-                    .await
-                {
-                    Ok(result) => {
-                        if let Ok(captured_output) = serde_json::to_string(&result.content) {
+                return match mcp_proxy.call_tool(request).instrument(span.clone()).await {
+                    Ok(response) => {
+                        if let CallToolResponse::Complete(result) = &response
+                            && let Ok(captured_output) = serde_json::to_string(&result.content)
+                        {
                             tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
                         }
-                        Ok(result.into())
+                        Ok(response)
                     }
                     Err(e) => {
                         tracing::error!(target: "task_history", parent: &span, "{e}");
@@ -543,6 +541,9 @@ fn mcp_tool_from_spice(name: impl Into<Cow<'static, str>>, tool: &dyn SpiceModel
 mod tests {
     use super::*;
     use crate::catalog::SpiceToolCatalog;
+    use rmcp::model::InputRequiredResult;
+    use rmcp::service::ServiceError;
+    use tools::McpProxy;
 
     struct StubTool(&'static str);
 
@@ -1391,6 +1392,91 @@ mod tests {
                 .and_then(Value::as_i64)
                 != Some(-32020),
             "matching Zone header must not raise HeaderMismatch: {json}"
+        );
+    }
+
+    struct InputRequiredProxyTool;
+
+    #[async_trait::async_trait]
+    impl SpiceModelTool for InputRequiredProxyTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed("ask")
+        }
+        fn description(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed("asks for more input"))
+        }
+        fn parameters(&self) -> Option<Value> {
+            Some(json!({ "type": "object", "properties": {} }))
+        }
+        async fn as_mcp_proxy(&self) -> Option<&dyn McpProxy> {
+            Some(self)
+        }
+        async fn call(
+            &self,
+            _arg: &str,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(json!({ "ok": true }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl McpProxy for InputRequiredProxyTool {
+        async fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+        ) -> Result<CallToolResponse, ServiceError> {
+            Ok(CallToolResponse::InputRequired(
+                InputRequiredResult::from_request_state("opaque-server-state"),
+            ))
+        }
+    }
+
+    /// `CallToolResult.into()` is always `Complete`. A proxied `input_required`
+    /// must reach the Streamable HTTP client so MRTR can continue.
+    #[tokio::test]
+    async fn proxied_input_required_is_relayed_not_forced_complete() {
+        let forced_complete: CallToolResponse =
+            CallToolResult::success(vec![ContentBlock::text("ok")]).into();
+        assert!(
+            matches!(forced_complete, CallToolResponse::Complete(_)),
+            "CallToolResult conversion is what used to drop input_required"
+        );
+
+        let mut tools = HashMap::new();
+        tools.insert(
+            "ask".to_string(),
+            Tooling::Tool(Arc::new(InputRequiredProxyTool) as Arc<dyn SpiceModelTool>),
+        );
+        let server = RuntimeServer::new(Arc::new(RwLock::new(tools)));
+        let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            move || Ok(server.clone()),
+            Arc::new(
+                rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+            ),
+            rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(true)
+                .disable_allowed_hosts()
+                .with_json_response(true),
+        );
+
+        let (status, json) = post_tools_call(&service, "ask", None, "unused").await;
+        assert!(
+            status.is_success(),
+            "input_required is a successful tools/call result, got {status}: {json}"
+        );
+        assert_eq!(
+            json.pointer("/result/resultType").and_then(Value::as_str),
+            Some("input_required"),
+            "proxied input_required must be relayed, not forced to Complete: {status} {json}"
+        );
+        assert_eq!(
+            json.pointer("/result/requestState").and_then(Value::as_str),
+            Some("opaque-server-state"),
+            "MRTR requestState must survive the gateway: {json}"
+        );
+        assert!(
+            json.pointer("/result/content").is_none(),
+            "Complete would carry content; input_required must not: {json}"
         );
     }
 }
