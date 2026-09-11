@@ -160,7 +160,7 @@ use super::memory_account::CayenneMemoryAccount;
 use super::staging_wal::PreparedStagedAppend;
 use super::utils::{bytes_key, i64_key};
 use super::vortex_format::PositionDeletionAccessPlanProvider;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
@@ -1387,12 +1387,43 @@ struct CompletedScanView {
     /// When the underlying state was captured. [`ScanViewReuse::WithinLag`] serves
     /// this view while `now - captured_at <= lag`.
     captured_at: Instant,
-    /// When this slot was last served. Drives idle eviction: the sweep drops the
-    /// view only after it has gone unserved for the idle window, so a still-reused
-    /// view — including a [`ScanViewReuse::UntilInvalidated`] hit that stays valid
-    /// at any age — is retained.
-    last_access: Instant,
+    /// When this slot was last served, as nanoseconds since
+    /// [`scan_view_clock_epoch`]. Atomic so a wait-free hit can refresh it
+    /// without taking the in-flight mutex. Drives idle eviction: the sweep drops
+    /// the view only after it has gone unserved for the idle window.
+    last_access_ns: AtomicU64,
     view: Arc<ScanView>,
+}
+
+impl CompletedScanView {
+    fn touch(&self, now: Instant) {
+        self.last_access_ns
+            .store(scan_view_instant_as_ns(now), Ordering::Relaxed);
+    }
+
+    fn last_access(&self) -> Instant {
+        scan_view_instant_from_ns(self.last_access_ns.load(Ordering::Relaxed))
+    }
+}
+
+/// Process-local origin for [`CompletedScanView::last_access_ns`]. `Instant`
+/// is not itself atomic; encoding as ns-since-epoch lets a hit refresh
+/// last-access with a single store.
+fn scan_view_clock_epoch() -> Instant {
+    static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    *EPOCH
+}
+
+fn scan_view_instant_as_ns(now: Instant) -> u64 {
+    u64::try_from(
+        now.saturating_duration_since(scan_view_clock_epoch())
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn scan_view_instant_from_ns(ns: u64) -> Instant {
+    scan_view_clock_epoch() + Duration::from_nanos(ns)
 }
 
 /// A `Shared` build future: N concurrent scans that key to the same identity await
@@ -1414,23 +1445,19 @@ struct InFlightScanView {
     build: ScanViewBuild,
 }
 
-/// The decision a scan reaches under the cache lock, executed (awaited) after the
-/// lock is released. Keeps `.await` outside the `parking_lot` guard.
+/// The decision a scan reaches under the in-flight lock, executed (awaited)
+/// after the lock is released. Keeps `.await` outside the `parking_lot` guard.
 enum ScanViewAction {
     /// A completed view to return immediately.
     Serve(Arc<ScanView>),
-    /// A build (own or deduplicated) to await.
-    Await(ScanViewBuild),
-}
-
-/// Result of probing the cache for a specific [`ScanViewKey`].
-enum ScanViewProbe {
-    /// A completed view with this exact identity — serve it, no rebuild.
-    Hit(Arc<ScanView>),
-    /// A build for this identity is in flight — await it (dedup).
-    Pending(ScanViewBuild),
-    /// Nothing for this identity — the caller must start a build.
-    Miss,
+    /// A build (own or deduplicated) to await. Identity is carried so the
+    /// awaiter can publish `latest_complete` without a second in-flight lock.
+    Await {
+        build: ScanViewBuild,
+        key: ScanViewKey,
+        order: u64,
+        captured_at: Instant,
+    },
 }
 
 /// How a cached [`ScanView`] is reused across scans.
@@ -1455,112 +1482,144 @@ pub enum ScanViewReuse {
 /// version a scan actually queries (build-only-what's-queried), which relieves the
 /// per-version rebuild CPU that competed with the CDC apply under churn.
 ///
-/// Two slots, not a map: a single self-replacing `latest_complete` (a newer completed
-/// build overwrites it, oldest-out — implicit eviction) plus a short `in_flight` list
-/// for dedup. Guarded by a `parking_lot::Mutex`; the rule is **decide under the lock,
-/// await OUTSIDE it** — the mutex is never held across `.await`.
-#[derive(Default)]
+/// Two slots, not a map:
+/// - `latest_complete` is an [`ArcSwapOption`] so a hit is wait-free (no mutex,
+///   no drain). Concurrent scans pipeline: they load the published view while a
+///   miss is still capturing.
+/// - `in_flight` is a short list behind a `parking_lot::Mutex` used only on a
+///   miss, for build dedup. The rule remains **decide under that lock, await
+///   OUTSIDE it**.
 struct ScanViewCache {
     /// The newest completed bundle. `None` until the first build resolves.
-    latest_complete: Option<CompletedScanView>,
+    latest_complete: ArcSwapOption<CompletedScanView>,
     /// Builds still resolving. Self-trims on [`Self::drain_completed`].
-    in_flight: Vec<InFlightScanView>,
+    in_flight: ParkingMutex<Vec<InFlightScanView>>,
+}
+
+impl Default for ScanViewCache {
+    fn default() -> Self {
+        Self {
+            latest_complete: ArcSwapOption::empty(),
+            in_flight: ParkingMutex::new(Vec::new()),
+        }
+    }
 }
 
 impl ScanViewCache {
+    /// Publish `view` as `latest_complete` if it is at least as new as the
+    /// currently published slot (`order` is the scan-input version at capture).
+    fn publish_completed(
+        &self,
+        key: ScanViewKey,
+        order: u64,
+        captured_at: Instant,
+        view: Arc<ScanView>,
+    ) {
+        let completed = Arc::new(CompletedScanView {
+            key,
+            order,
+            captured_at,
+            // Seed last-access at PROMOTION time (not `captured_at`): a build
+            // slower than the idle window would otherwise be published already
+            // "stale" and evicted on the next tick before any scan could reuse
+            // it. Serves refresh it from here.
+            last_access_ns: AtomicU64::new(scan_view_instant_as_ns(Instant::now())),
+            view,
+        });
+        self.latest_complete.rcu(|current| match current {
+            Some(existing) if existing.order > order => Some(Arc::clone(existing)),
+            _ => Some(Arc::clone(&completed)),
+        });
+    }
+
+    /// Wait-free serve of `latest_complete` when `reuse` says it is still valid.
+    /// Double-loads `scan_input_version` around the `ArcSwap` load so a write
+    /// that races the lookup falls through to a recapture rather than serving
+    /// a pre-write view tagged with the post-write version.
+    fn try_serve_latest(
+        &self,
+        reuse: ScanViewReuse,
+        version_before: u64,
+        version_after: u64,
+        structural: u64,
+        now: Instant,
+    ) -> Option<Arc<ScanView>> {
+        // A live schema-evolution leaves the generation odd; never serve across it.
+        if structural & 1 == 1 {
+            return None;
+        }
+        match reuse {
+            ScanViewReuse::UntilInvalidated => {
+                if version_before != version_after {
+                    return None;
+                }
+                self.serve_if(|current| {
+                    current.order == version_after && current.view.structural_version == structural
+                })
+            }
+            ScanViewReuse::WithinLag(lag) if !lag.is_zero() => self.serve_if(|current| {
+                now.saturating_duration_since(current.captured_at) <= lag
+                    && current.view.structural_version == structural
+            }),
+            ScanViewReuse::WithinLag(_) => None,
+        }
+    }
+
+    /// Wait-free serve when `latest_complete` has this exact identity.
+    fn serve_if_key(&self, key: &ScanViewKey) -> Option<Arc<ScanView>> {
+        self.serve_if(|current| current.key == *key)
+    }
+
+    fn serve_if(
+        &self,
+        is_servable: impl FnOnce(&CompletedScanView) -> bool,
+    ) -> Option<Arc<ScanView>> {
+        let current = self.latest_complete.load();
+        let current = current.as_ref()?;
+        if !is_servable(current) {
+            return None;
+        }
+        current.touch(Instant::now());
+        Some(Arc::clone(&current.view))
+    }
+
     /// Peek every in-flight build (a `Shared` peek — NO poll), promote the
     /// highest-`order` SUCCESS to `latest_complete`, and drop completed entries
-    /// (errored or superseded), leaving only still-pending builds. A build is
-    /// observed complete only once some awaiter or the independent driver task has
-    /// driven it to completion; a build no one has driven simply stays pending here.
-    fn drain_completed(&mut self) {
+    /// (errored or superseded), leaving only still-pending builds. Called only
+    /// on the miss / evictor path — a hit never walks `in_flight`.
+    fn drain_completed(&self, in_flight: &mut Vec<InFlightScanView>) {
         let mut idx = 0;
-        while idx < self.in_flight.len() {
-            if self.in_flight[idx].build.peek().is_none() {
+        while idx < in_flight.len() {
+            if in_flight[idx].build.peek().is_none() {
                 idx += 1;
                 continue;
             }
             // Ready: remove it (swap_remove moves the last entry into `idx`, so do
             // NOT advance — re-examine `idx` next iteration) and promote-or-drop.
-            let done = self.in_flight.swap_remove(idx);
+            let done = in_flight.swap_remove(idx);
             let Some(Ok(view)) = done.build.peek() else {
                 continue; // errored build — drop it (not poisoned)
             };
-            let newer = self
-                .latest_complete
-                .as_ref()
-                .is_none_or(|current| done.order >= current.order);
-            if newer {
-                self.latest_complete = Some(CompletedScanView {
-                    key: done.key,
-                    order: done.order,
-                    captured_at: done.captured_at,
-                    // Seed last-access at PROMOTION time (not `captured_at`): a build
-                    // slower than the idle window would otherwise be promoted already
-                    // "stale" and evicted on the next tick before any scan could reuse
-                    // it. Serves refresh it from here.
-                    last_access: Instant::now(),
-                    view: Arc::clone(view),
-                });
-            }
+            self.publish_completed(done.key, done.order, done.captured_at, Arc::clone(view));
         }
     }
 
-    /// Serve `latest_complete` when `is_servable` holds, recording `last_access`.
-    fn serve_latest_if(
-        &mut self,
-        now: Instant,
-        is_servable: impl FnOnce(&CompletedScanView) -> bool,
-    ) -> Option<Arc<ScanView>> {
-        let current = self.latest_complete.as_mut()?;
-        if !is_servable(current) {
-            return None;
+    /// Drop `latest_complete` iff it has gone unserved past `idle_window`.
+    /// Compare-and-swap so a concurrent publish is not clobbered.
+    fn evict_if_idle(&self, now: Instant, idle_window: Duration) {
+        let current = self.latest_complete.load();
+        let Some(current_view) = current.as_ref() else {
+            return;
+        };
+        if now.saturating_duration_since(current_view.last_access()) <= idle_window {
+            return;
         }
-        current.last_access = now;
-        Some(Arc::clone(&current.view))
+        let _ = self.latest_complete.compare_and_swap(&current, None);
     }
 
-    /// The `latest_complete` view iff `order == version` AND the structural
-    /// generation matches. [`ScanViewReuse::UntilInvalidated`]: no recapture
-    /// while nothing has been written.
-    fn servable_until_invalidated(
-        &mut self,
-        version: u64,
-        structural: u64,
-    ) -> Option<Arc<ScanView>> {
-        self.serve_latest_if(Instant::now(), |current| {
-            current.order == version && current.view.structural_version == structural
-        })
-    }
-
-    /// The `latest_complete` view iff captured within `lag` of `now` AND at the
-    /// current structural generation. Records `last_access` only on a true serve
-    /// — a within-lag-but-obsolete view is not refreshed, so the evictor can
-    /// still drop it.
-    fn servable_within_lag(
-        &mut self,
-        now: Instant,
-        lag: Duration,
-        structural: u64,
-    ) -> Option<Arc<ScanView>> {
-        self.serve_latest_if(now, |current| {
-            now.duration_since(current.captured_at) <= lag
-                && current.view.structural_version == structural
-        })
-    }
-
-    /// Probe for an exact identity: serve a completed view, await an in-flight build,
-    /// or report a miss. Used by the recapture/miss path of both reuse modes.
-    /// Records the access (`last_access`) on a hit so a view still being reused
-    /// is not idle-evicted.
-    fn find_by_key(&mut self, key: &ScanViewKey) -> ScanViewProbe {
-        if let Some(view) = self.serve_latest_if(Instant::now(), |current| current.key == *key) {
-            return ScanViewProbe::Hit(view);
-        }
-        if let Some(entry) = self.in_flight.iter().find(|entry| entry.key == *key) {
-            return ScanViewProbe::Pending(entry.build.clone());
-        }
-        ScanViewProbe::Miss
+    #[cfg(test)]
+    fn has_latest_complete(&self) -> bool {
+        self.latest_complete.load().is_some()
     }
 }
 
@@ -1914,9 +1973,9 @@ pub struct CayenneTableProvider {
     /// computation is offloaded to `spawn_blocking` (D3) and deduplicated across
     /// concurrent scans on the same state. Retires the two per-scan `ArcSwapOption`
     /// memos (`merged_scan_deletions`, `mem_tier_visible_memo`). Shared across
-    /// `clone_for_write` clones. `parking_lot::Mutex` — decide under
-    /// the lock, await OUTSIDE it (never held across `.await`).
-    scan_view_cache: Arc<ParkingMutex<ScanViewCache>>,
+    /// `clone_for_write` clones. Hit path is wait-free (`ArcSwapOption`); the
+    /// in-flight mutex is taken only on a miss, and never held across `.await`.
+    scan_view_cache: Arc<ScanViewCache>,
     /// A weak self-reference the cache uses to obtain an owned `Arc<Self>` for its
     /// `spawn_blocking` builds (a build closure must be `'static`, so it cannot borrow
     /// `&self`). Set once via [`Self::init_weak_self`] right after the provider is
@@ -8165,7 +8224,7 @@ impl CayenneTableProvider {
             mem_tier_pending_superseded: Arc::new(AtomicI64::new(0)),
             inlined_generation: Arc::new(AtomicU64::new(0)),
             inlined_structural_epoch: Arc::new(AtomicU64::new(0)),
-            scan_view_cache: Arc::new(ParkingMutex::new(ScanViewCache::default())),
+            scan_view_cache: Arc::new(ScanViewCache::default()),
             weak_self: Arc::new(std::sync::OnceLock::new()),
             scan_input_version: Arc::new(AtomicU64::new(0)),
             structural_version: Arc::new(
@@ -27188,15 +27247,11 @@ impl CayenneTableProvider {
             ScanViewReuse::UntilInvalidated => Self::SCAN_VIEW_EVICTION_INTERVAL,
             ScanViewReuse::WithinLag(lag) => lag.max(Self::SCAN_VIEW_EVICTION_INTERVAL),
         };
-        let mut cache = self.scan_view_cache.lock();
-        cache.drain_completed();
-        if cache
-            .latest_complete
-            .as_ref()
-            .is_some_and(|current| now.duration_since(current.last_access) > idle_window)
         {
-            cache.latest_complete = None;
+            let mut in_flight = self.scan_view_cache.in_flight.lock();
+            self.scan_view_cache.drain_completed(&mut in_flight);
         }
+        self.scan_view_cache.evict_if_idle(now, idle_window);
     }
 
     /// Start a `ScanView` build for `raw` (validated at seqlock generation
@@ -27210,11 +27265,19 @@ impl CayenneTableProvider {
     /// Fallback (no `weak_self` — a provider never `Arc`-wrapped, i.e. the unit-test
     /// path): build inline and wrap the ready result. Correct; just not offloaded or
     /// independently driven.
-    fn spawn_scan_view_build(&self, raw: RawScanInput, structural_version: u64) -> ScanViewBuild {
+    fn spawn_scan_view_build(
+        &self,
+        raw: RawScanInput,
+        structural_version: u64,
+        key: ScanViewKey,
+        order: u64,
+        captured_at: Instant,
+    ) -> ScanViewBuild {
         use futures::FutureExt;
         let Some(provider) = self.weak_self.get().and_then(std::sync::Weak::upgrade) else {
             // Fallback (no `weak_self` — a provider never `Arc`-wrapped, i.e. the
-            // unit-test path): build inline and wrap the ready result.
+            // unit-test path): build inline and wrap the ready result. The
+            // awaiter publishes `latest_complete`.
             let result = self
                 .build_scan_view(raw, structural_version)
                 .map(Arc::new)
@@ -27234,14 +27297,23 @@ impl CayenneTableProvider {
         }
         .boxed()
         .shared();
-        // Independent driver: drives the shared build to completion regardless of
-        // whether the originating scan stays parked on it.
-        task::spawn(build.clone());
+        // Independent driver: drives the shared build to completion and publishes
+        // `latest_complete` even if the originating scan is cancelled, so the next
+        // hit is wait-free (no drain of `in_flight` required).
+        let driver_build = build.clone();
+        let cache = Arc::clone(&self.scan_view_cache);
+        task::spawn(async move {
+            if let Ok(view) = driver_build.await {
+                cache.publish_completed(key, order, captured_at, view);
+            }
+        });
         build
     }
 
     /// Obtain the [`ScanView`] for this scan from the demand cache.
-    /// Decide under the cache mutex; await outside it.
+    /// A hit is wait-free (`ArcSwap` load + two atomic version reads). A miss
+    /// captures, then takes the in-flight mutex only long enough to dedup or
+    /// spawn; the build is awaited outside it.
     ///
     /// [`ScanViewReuse::UntilInvalidated`]: serve `latest_complete` when
     /// `order == scan_input_version` and the structural generation matches.
@@ -27253,28 +27325,22 @@ impl CayenneTableProvider {
         &self,
         reuse: ScanViewReuse,
     ) -> datafusion_common::Result<Arc<ScanView>> {
-        {
-            let mut cache = self.scan_view_cache.lock();
-            cache.drain_completed();
-            // Read the seqlock generation UNDER the cache mutex, immediately before the
-            // servability check, so no live schema-evolution can slip in between the
-            // read and the compare. An in-flight evolution reads ODD and can never equal
-            // a completed view's always-EVEN `structural_version`, so a straddling
-            // evolution falls through to a recapture.
-            let structural = self.structural_version.current();
-            let hit = match reuse {
-                ScanViewReuse::UntilInvalidated => {
-                    let version = self.scan_input_version.load(Ordering::Acquire);
-                    cache.servable_until_invalidated(version, structural)
-                }
-                ScanViewReuse::WithinLag(lag) if !lag.is_zero() => {
-                    cache.servable_within_lag(Instant::now(), lag, structural)
-                }
-                ScanViewReuse::WithinLag(_) => None,
-            };
-            if let Some(view) = hit {
-                return Ok(view);
-            }
+        // Wait-free hit: double-load `scan_input_version` around the `ArcSwap`
+        // load so a write that races the lookup recaptures rather than serving
+        // a pre-write view. An odd structural generation is a live schema-
+        // evolution and also falls through. No drain, no mutex.
+        let version_before = self.scan_input_version.load(Ordering::Acquire);
+        let now = Instant::now();
+        let structural = self.structural_version.current();
+        let version_after = self.scan_input_version.load(Ordering::Acquire);
+        if let Some(view) = self.scan_view_cache.try_serve_latest(
+            reuse,
+            version_before,
+            version_after,
+            structural,
+            now,
+        ) {
+            return Ok(view);
         }
 
         // Capture the CURRENT state under the structural seqlock, retrying across a
@@ -27329,40 +27395,79 @@ impl CayenneTableProvider {
             let order = order_after;
             let captured_at = Instant::now();
 
-            // Decide under the lock; the build future is awaited AFTER releasing it.
+            // Another scan may have published while we captured — serve it
+            // without taking the in-flight mutex.
+            if let Some(view) = self.scan_view_cache.serve_if_key(&key) {
+                return Ok(view);
+            }
+
+            // Dedup or spawn under the in-flight lock; await AFTER releasing it.
             let action = {
-                let mut cache = self.scan_view_cache.lock();
-                cache.drain_completed();
-                match cache.find_by_key(&key) {
-                    ScanViewProbe::Hit(view) => ScanViewAction::Serve(view),
-                    ScanViewProbe::Pending(build) => ScanViewAction::Await(build),
-                    ScanViewProbe::Miss => {
-                        let build = self.spawn_scan_view_build(raw, structural_version);
-                        // Cache the in-flight build for dedup, unless we are over the
-                        // churn cap (then build standalone — bounded memory, no dedup).
-                        if cache.in_flight.len() < Self::MAX_IN_FLIGHT_SCAN_VIEWS {
-                            cache.in_flight.push(InFlightScanView {
-                                key,
-                                order,
-                                captured_at,
-                                build: build.clone(),
-                            });
-                        }
-                        ScanViewAction::Await(build)
+                let mut in_flight = self.scan_view_cache.in_flight.lock();
+                self.scan_view_cache.drain_completed(&mut in_flight);
+                if let Some(view) = self.scan_view_cache.serve_if_key(&key) {
+                    ScanViewAction::Serve(view)
+                } else if let Some(pending) = in_flight.iter().find(|entry| entry.key == key) {
+                    ScanViewAction::Await {
+                        build: pending.build.clone(),
+                        key: pending.key.clone(),
+                        order: pending.order,
+                        captured_at: pending.captured_at,
+                    }
+                } else {
+                    let build = self.spawn_scan_view_build(
+                        raw,
+                        structural_version,
+                        key.clone(),
+                        order,
+                        captured_at,
+                    );
+                    // Cache the in-flight build for dedup, unless we are over the
+                    // churn cap (then build standalone — bounded memory, no dedup).
+                    if in_flight.len() < Self::MAX_IN_FLIGHT_SCAN_VIEWS {
+                        in_flight.push(InFlightScanView {
+                            key: key.clone(),
+                            order,
+                            captured_at,
+                            build: build.clone(),
+                        });
+                    }
+                    ScanViewAction::Await {
+                        build,
+                        key,
+                        order,
+                        captured_at,
                     }
                 }
             };
 
             return match action {
                 ScanViewAction::Serve(view) => Ok(view),
-                ScanViewAction::Await(build) => build.await.map_err(|error| {
-                    // The shared build errored; it was dropped (not promoted) on drain,
-                    // so a subsequent scan re-enters and starts a fresh build.
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to build scan view for table {}: {error}",
-                        self.table_metadata.table_name
-                    ))
-                }),
+                ScanViewAction::Await {
+                    build,
+                    key,
+                    order,
+                    captured_at,
+                } => {
+                    let view = build.await.map_err(|error| {
+                        // The shared build errored; it was dropped (not promoted) on drain,
+                        // so a subsequent scan re-enters and starts a fresh build.
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to build scan view for table {}: {error}",
+                            self.table_metadata.table_name
+                        ))
+                    })?;
+                    // Publish before returning so the next sequential scan is a
+                    // wait-free hit (the driver also publishes; last-writer with
+                    // a lower `order` is ignored).
+                    self.scan_view_cache.publish_completed(
+                        key,
+                        order,
+                        captured_at,
+                        Arc::clone(&view),
+                    );
+                    Ok(view)
+                }
             };
         }
     }
@@ -55279,7 +55384,7 @@ mod tests {
             .await
             .expect("promote to latest_complete");
         assert!(
-            provider.scan_view_cache.lock().latest_complete.is_some(),
+            provider.scan_view_cache.has_latest_complete(),
             "a completed view must be cached before eviction"
         );
 
@@ -55287,7 +55392,7 @@ mod tests {
         // it is within the idle window — a still-reused view is retained, not dropped.
         provider.evict_stale_scan_view(Instant::now());
         assert!(
-            provider.scan_view_cache.lock().latest_complete.is_some(),
+            provider.scan_view_cache.has_latest_complete(),
             "a just-served view is within the idle window and must be retained"
         );
 
@@ -55295,7 +55400,7 @@ mod tests {
         // evicts it, releasing its pinned snapshot dirs.
         provider.evict_stale_scan_view(Instant::now() + Duration::from_hours(1));
         assert!(
-            provider.scan_view_cache.lock().latest_complete.is_none(),
+            !provider.scan_view_cache.has_latest_complete(),
             "an idle (long-unserved) cached view must be evicted, releasing its pinned snapshot dirs"
         );
 
@@ -55309,6 +55414,176 @@ mod tests {
             vec![(1, 10), (2, 20)],
             "a scan after eviction rebuilds and still returns the correct rows"
         );
+    }
+
+    fn catalog_query_count(catalog: &Arc<dyn MetadataCatalog>) -> u64 {
+        catalog
+            .as_any()
+            .downcast_ref::<CayenneCatalog>()
+            .expect("CayenneCatalog")
+            .metastore_query_count()
+    }
+
+    /// A cache hit of `scan_view_at_current_input` must not round-trip the
+    /// metastore. Covers both production reuse modes (`UntilInvalidated` for
+    /// `full`/`append`, `WithinLag` for read-only `changes`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_reuse_does_not_query_metastore() {
+        let cases: [(&str, ScanViewReuse); 3] = [
+            ("full", ScanViewReuse::UntilInvalidated),
+            ("append", ScanViewReuse::UntilInvalidated),
+            ("changes", ScanViewReuse::WithinLag(Duration::from_secs(1))),
+        ];
+        for (mode, reuse) in cases {
+            let ctx = SessionContext::new();
+            let runtime_env = ctx.runtime_env();
+            let (provider, catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+                &format!("scan_view_no_meta_{mode}"),
+                Arc::clone(&runtime_env),
+                VortexConfig {
+                    cdc_durability: crate::metadata::CdcDurability::Memory,
+                    deletion_mode: crate::metadata::DeletionMode::Key,
+                    inline_max_rows: 1024,
+                    ..VortexConfig::default()
+                },
+            )
+            .await;
+            let schema = Arc::clone(&provider.table_metadata.schema);
+            provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+            let _ = provider
+                .write_cdc_append_stream(
+                    single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                    &ctx.task_ctx(),
+                )
+                .await
+                .expect("seed");
+            let first = provider
+                .scan_view_at_current_input(reuse)
+                .await
+                .expect("warmup capture");
+            let before = catalog_query_count(&catalog);
+            for _ in 0..32 {
+                let reused = provider
+                    .scan_view_at_current_input(reuse)
+                    .await
+                    .expect("reuse");
+                assert!(
+                    Arc::ptr_eq(&first, &reused),
+                    "{mode}: reuse must serve the same cached ScanView"
+                );
+            }
+            let after = catalog_query_count(&catalog);
+            assert_eq!(
+                before, after,
+                "{mode}: scan-view reuse queried the metastore ({before} -> {after})"
+            );
+        }
+    }
+
+    async fn file_backed_reuse_table(
+        table_name: &str,
+        reuse: ScanViewReuse,
+    ) -> (
+        tempfile::TempDir,
+        Arc<CayenneCatalog>,
+        Arc<CayenneTableProvider>,
+        Arc<SessionContext>,
+    ) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let data_path = temp_dir.path().join("data");
+        tokio::fs::create_dir_all(&data_path)
+            .await
+            .expect("data dir");
+        let db_path = temp_dir.path().join("catalog.db");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{}", db_path.display())).expect("catalog"),
+        );
+        catalog.init().await.expect("catalog init");
+        let ctx = Arc::new(SessionContext::new());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let table = Arc::new(
+            CayenneTableProviderBuilder::new(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                Arc::clone(&ctx.runtime_env()),
+            )
+            .with_scan_view_reuse(reuse)
+            .create(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: None,
+                base_path: data_path.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            })
+            .await
+            .expect("create table"),
+        );
+        table.init_scan_view_cache();
+        let ids: Vec<i64> = (0..64).collect();
+        let names: Vec<String> = ids.iter().map(|id| format!("n{id}")).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int64Array::from(ids)),
+                Arc::new(arrow::array::StringArray::from(names)),
+            ],
+        )
+        .expect("batch");
+        let input = MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None)
+            .expect("memory exec");
+        let insert_plan = table
+            .insert_into(&ctx.state(), input, InsertOp::Append)
+            .await
+            .expect("insert plan");
+        let _ = collect(insert_plan, ctx.task_ctx())
+            .await
+            .expect("insert collect");
+        for _ in 0..8 {
+            let plan = table
+                .scan(&ctx.state(), Some(&vec![0]), &[], None)
+                .await
+                .expect("warmup scan");
+            let _ = collect(plan, ctx.task_ctx()).await.expect("warmup collect");
+        }
+        (temp_dir, catalog, table, ctx)
+    }
+
+    /// `TableProvider::scan` under each production reuse mode must not query
+    /// the metastore after the cache is warm. `full` and `append` are
+    /// `UntilInvalidated`; read-only `changes` is `WithinLag`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_production_scan_reuse_does_not_query_metastore() {
+        let cases: [(&str, ScanViewReuse); 3] = [
+            ("full", ScanViewReuse::UntilInvalidated),
+            ("append", ScanViewReuse::UntilInvalidated),
+            ("changes", ScanViewReuse::WithinLag(Duration::from_secs(1))),
+        ];
+        for (mode, reuse) in cases {
+            let (_tmp, catalog, table, ctx) =
+                file_backed_reuse_table(&format!("scan_no_meta_{mode}"), reuse).await;
+            let before = catalog.metastore_query_count();
+            for _ in 0..32 {
+                let plan = table
+                    .scan(&ctx.state(), Some(&vec![0]), &[], None)
+                    .await
+                    .expect("reuse scan");
+                let rows = collect(plan, ctx.task_ctx()).await.expect("reuse collect");
+                let n: usize = rows.iter().map(RecordBatch::num_rows).sum();
+                assert_eq!(
+                    n, 64,
+                    "{mode}: reuse scan must still return the inserted rows"
+                );
+            }
+            let after = catalog.metastore_query_count();
+            assert_eq!(
+                before, after,
+                "{mode}: production scan reuse queried the metastore ({before} -> {after})"
+            );
+        }
     }
 
     /// A `ScanView` a scan is holding must stay valid across a concurrent mem-tier
