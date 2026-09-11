@@ -1365,39 +1365,32 @@ struct ScanView {
     /// corpus is hidden by EVERY shard's tombstones. Computed once here and reused
     /// for the inline pruning. At N==1 this is shard 0's tombstone clone (O(1)).
     union_tombstones: crate::provider::mem_tier::InMemTombstones,
-    /// The forced-structural generation ([`super::structural_version::StructuralVersion`])
-    /// this bundle was validated at (EVEN — a non-torn capture; see
-    /// [`CayenneTableProvider::scan_view_at_current_input`]). It is folded into the
-    /// [`ScanViewKey`] so a **live schema-evolution** — the sole event wired to
-    /// `StructuralVersion::begin_mutation()`, whose off-fence all-shards mem-tier flush
-    /// could otherwise tear a straddling capture — mints a fresh key, and it gates the
-    /// read-current (lag > 0) fast path so a stale-tolerant scan is never served a
-    /// pre-evolution bundle. The other forced snapshot events (truncate / full-delete /
-    /// `INSERT OVERWRITE` / reopen) are fence-serialized and advance only the additive
-    /// `scan_input_version`, so a read-your-writes (lag == 0) capture sees them via the
-    /// snapshot id and they need no structural bump.
+    /// Seqlock generation this bundle was validated at (even — a non-torn capture).
+    /// Folded into the [`ScanViewKey`] so a live schema-evolution mints a fresh key,
+    /// and compared on both reuse fast paths so a serve is never a pre-evolution
+    /// bundle. Fence-serialized snapshot events (truncate / full-delete /
+    /// `INSERT OVERWRITE` / reopen) bump only `scan_input_version`.
     structural_version: u64,
 }
 
 /// A completed, cached scan view plus its identity and ordering metadata. Held by
 /// [`ScanViewCache::latest_complete`].
 struct CompletedScanView {
-    /// The identity this view was built for. A read-your-writes (lag == 0) scan whose
-    /// capture keys to this serves it directly (no rebuild).
+    /// The identity this view was built for. A [`ScanViewReuse::UntilInvalidated`]
+    /// scan whose capture keys to this serves it directly (no rebuild).
     key: ScanViewKey,
     /// Ordering axis — the `scan_input_version` observed at capture. Higher = newer.
     /// A SAFE heuristic: any completed view at a given identity is valid, so a wrong
     /// "which is newest" pick is still correct; it only decides which completed build
     /// wins the single `latest_complete` slot.
     order: u64,
-    /// When the underlying state was captured — the staleness reference for the
-    /// read-current (lag > 0) path (`now - captured_at <= lag` ⇒ servable).
+    /// When the underlying state was captured. [`ScanViewReuse::WithinLag`] serves
+    /// this view while `now - captured_at <= lag`.
     captured_at: Instant,
-    /// When this slot was last SERVED (a read-current within-lag serve or a
-    /// read-your-writes exact-key hit); seeded at promotion time. Drives idle eviction: the background sweep
-    /// drops the view only after it has gone unserved for the idle window, so a view
-    /// still being reused — including a read-your-writes exact-key hit that stays
-    /// valid regardless of age — is retained, not dropped mid-reuse.
+    /// When this slot was last served. Drives idle eviction: the sweep drops the
+    /// view only after it has gone unserved for the idle window, so a still-reused
+    /// view — including a [`ScanViewReuse::UntilInvalidated`] hit that stays valid
+    /// at any age — is retained.
     last_access: Instant,
     view: Arc<ScanView>,
 }
@@ -1438,6 +1431,23 @@ enum ScanViewProbe {
     Pending(ScanViewBuild),
     /// Nothing for this identity — the caller must start a build.
     Miss,
+}
+
+/// How a cached [`ScanView`] is reused across scans.
+///
+/// Derived from the dataset's `refresh_mode`:
+///
+/// - [`Self::UntilInvalidated`] — `full` / `append` / `snapshot` / `caching`.
+///   Serve the cached view until a write bumps `scan_input_version`.
+/// - [`Self::WithinLag`] — `changes`. Serve a view captured within `lag` so
+///   concurrent scans can share one build across a burst of applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanViewReuse {
+    /// Serve `latest_complete` until a write advances `scan_input_version`.
+    #[default]
+    UntilInvalidated,
+    /// Serve a view captured within `lag`. A zero lag recaptures every scan.
+    WithinLag(Duration),
 }
 
 /// Demand-driven cache of [`ScanView`] bundles, keyed by scan-visible identity.
@@ -1496,37 +1506,56 @@ impl ScanViewCache {
         }
     }
 
-    /// The `latest_complete` view iff it is servable for a read-current scan: captured
-    /// within `lag` of `now` AND at the current structural generation (so a
-    /// stale-tolerant scan is never served a pre-schema-evolution view). Records the
-    /// access (`last_access`) ONLY on a true serve — a within-lag-but-obsolete view is
-    /// NOT refreshed, so the evictor can still drop it and release its pinned dirs.
+    /// Serve `latest_complete` when `is_servable` holds, recording `last_access`.
+    fn serve_latest_if(
+        &mut self,
+        now: Instant,
+        is_servable: impl FnOnce(&CompletedScanView) -> bool,
+    ) -> Option<Arc<ScanView>> {
+        let current = self.latest_complete.as_mut()?;
+        if !is_servable(current) {
+            return None;
+        }
+        current.last_access = now;
+        Some(Arc::clone(&current.view))
+    }
+
+    /// The `latest_complete` view iff `order == version` AND the structural
+    /// generation matches. [`ScanViewReuse::UntilInvalidated`]: no recapture
+    /// while nothing has been written.
+    fn servable_until_invalidated(
+        &mut self,
+        version: u64,
+        structural: u64,
+    ) -> Option<Arc<ScanView>> {
+        self.serve_latest_if(Instant::now(), |current| {
+            current.order == version && current.view.structural_version == structural
+        })
+    }
+
+    /// The `latest_complete` view iff captured within `lag` of `now` AND at the
+    /// current structural generation. Records `last_access` only on a true serve
+    /// — a within-lag-but-obsolete view is not refreshed, so the evictor can
+    /// still drop it.
     fn servable_within_lag(
         &mut self,
         now: Instant,
         lag: Duration,
         structural: u64,
     ) -> Option<Arc<ScanView>> {
-        let current = self.latest_complete.as_mut()?;
-        let servable = now.duration_since(current.captured_at) <= lag
-            && current.view.structural_version == structural;
-        servable.then(|| {
-            current.last_access = now;
-            Arc::clone(&current.view)
+        self.serve_latest_if(now, |current| {
+            now.duration_since(current.captured_at) <= lag
+                && current.view.structural_version == structural
         })
     }
 
     /// Probe for an exact identity: serve a completed view, await an in-flight build,
-    /// or report a miss. Used by the read-your-writes (lag == 0) path and the
-    /// read-current MISS path. Records the access (`last_access`) on a hit so a view
-    /// still being reused (an exact-key hit is valid regardless of age) is not
-    /// idle-evicted.
+    /// or report a miss. Used by the recapture/miss path of both reuse modes.
+    /// Records the access (`last_access`) on a hit so a view still being reused
+    /// is not idle-evicted.
     fn find_by_key(&mut self, key: &ScanViewKey) -> ScanViewProbe {
-        if let Some(current) = self.latest_complete.as_mut()
-            && current.key == *key
-        {
-            current.last_access = Instant::now();
-            return ScanViewProbe::Hit(Arc::clone(&current.view));
+        if let Some(view) = self.serve_latest_if(Instant::now(), |current| current.key == *key) {
+            return ScanViewProbe::Hit(view);
         }
         if let Some(entry) = self.in_flight.iter().find(|entry| entry.key == *key) {
             return ScanViewProbe::Pending(entry.build.clone());
@@ -1675,28 +1704,9 @@ pub struct CayenneTableProvider {
     /// derived from the acceleration settings and set via the builder, and shared
     /// across writer clones (a plain in-memory `bool`, `Copy`).
     durable_write_back: bool,
-    /// Per-scan freshness tolerance (the read-current lag) applied by [`Self::scan`].
-    /// `0` = read-your-writes: every scan captures and serves the CURRENT state.
-    /// Non-zero lets concurrent analytical scans share a recently-built [`ScanView`]
-    /// within the lag (the demand cache's cross-query reuse lever). Derived at
-    /// construction from the dataset's `access` mode AND refresh mode: only a read-only
-    /// CDC replica (`access: read` + `refresh_mode: changes`) — eventually-consistent by
-    /// design — gets a bounded non-zero lag; every other table (a read-only
-    /// full-refresh/snapshot/append table, which must reflect its last refresh
-    /// immediately, or any writable dataset) gets `0` for read-your-writes. Set via the
-    /// builder. A plain in-memory `Duration` (`Copy`), shared across writer clones. See
-    /// [`Self::scan_view_at_current_input`].
-    ///
-    /// NOTE: `0` for read-write datasets rebuilds per scan under a mixed read/write
-    /// workload (any mutation re-keys the capture), even across RESULT-PRESERVING churn
-    /// (compaction / checkpoint) that leaves query results identical. If that proves too
-    /// eager, the intended refinement is to export a monotonic WRITE-WATERMARK bumped
-    /// only by result-changing writes and serve any view whose watermark ≥ the reader's
-    /// start — coarse read-your-writes that reuses across result-preserving churn, with
-    /// this `Duration` staying as the bounded-staleness fallback. Deferred: it moves a
-    /// value that is currently a heuristic onto the correctness path and needs a
-    /// write-vs-preserving bump audit + loom test, so it is out of scope for this change.
-    default_scan_freshness: Duration,
+    /// How a scan reuses a cached [`ScanView`]. Set from `refresh_mode` at
+    /// construction; see [`ScanViewReuse`] and [`Self::scan_view_at_current_input`].
+    scan_view_reuse: ScanViewReuse,
     /// Write lock to serialize insert operations and prevent concurrent write races.
     /// This ensures that:
     /// - Only one `insert()` runs at a time per table
@@ -1760,6 +1770,12 @@ pub struct CayenneTableProvider {
     /// sweep holds a now-stale floor. Consumed on first fire.
     #[cfg(test)]
     test_post_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired after a demand-cache `capture_raw_scan_input` returns
+    /// and before `scan_input_version` is sampled to stamp the capture. A write
+    /// in this window used to tag stale rows with the post-write version; the
+    /// capture now retries when the counter moved. Consumed on first fire.
+    #[cfg(test)]
+    test_post_scan_input_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -1910,8 +1926,10 @@ pub struct CayenneTableProvider {
     weak_self: Arc<std::sync::OnceLock<std::sync::Weak<CayenneTableProvider>>>,
     /// Monotonic scan-input version, bumped by [`Self::notify_scan_input_change`] on
     /// EVERY mutation (ordinary or forced). It is the cache's ORDERING axis (which
-    /// completed build wins the `latest_complete` slot) and a cheap freshness signal;
-    /// it is NOT a correctness gate. Shared across `clone_for_write` clones.
+    /// completed build wins the `latest_complete` slot) and the invalidation signal
+    /// for [`ScanViewReuse::UntilInvalidated`]: a scan serves `latest_complete` iff
+    /// this counter still equals the view's capture generation. Shared across
+    /// `clone_for_write` clones.
     scan_input_version: Arc<AtomicU64>,
     /// Seqlock bracketing a demand capture (`read_validated_async`) so a scan never
     /// builds a bundle whose capture straddled a mutation that changes the per-shard
@@ -1922,7 +1940,7 @@ pub struct CayenneTableProvider {
     /// snapshot publishing does NOT bump it — those run under `listing_fence.write()`,
     /// so a capture (holding `listing_fence.read()`) sees them all-or-nothing. Its
     /// even value is folded into the [`ScanViewKey`] (so a schema-evolve mints a fresh
-    /// key) and gates the read-current fast path. INERT at `cdc_mem_tier_shards == 1`
+    /// key) and gates both reuse fast paths. INERT at `cdc_mem_tier_shards == 1`
     /// (single-shard capture is atomic), which memory mode enforces. Shared across
     /// clones.
     structural_version: Arc<crate::provider::structural_version::StructuralVersion>,
@@ -2526,7 +2544,7 @@ pub struct CayenneTableProviderBuilder {
     context: Option<Arc<CayenneContext>>,
     maintained_aggregates: Vec<MaintainedAggregateSpec>,
     durable_write_back: bool,
-    default_scan_freshness: Duration,
+    scan_view_reuse: ScanViewReuse,
 }
 
 struct PendingMaintainedAggregateInsert {
@@ -2624,7 +2642,7 @@ struct CayenneTableProviderOpenOptions {
     context: Option<Arc<CayenneContext>>,
     maintained_aggregate_specs: Vec<MaintainedAggregateSpec>,
     durable_write_back: bool,
-    default_scan_freshness: Duration,
+    scan_view_reuse: ScanViewReuse,
 }
 
 impl CayenneTableProviderBuilder {
@@ -2641,8 +2659,7 @@ impl CayenneTableProviderBuilder {
             context: None,
             maintained_aggregates: Vec::new(),
             durable_write_back: false,
-            // Read-your-writes by default; the runtime raises it for read-only datasets.
-            default_scan_freshness: Duration::ZERO,
+            scan_view_reuse: ScanViewReuse::UntilInvalidated,
         }
     }
 
@@ -2714,15 +2731,13 @@ impl CayenneTableProviderBuilder {
         self
     }
 
-    /// Set the per-scan freshness tolerance (read-current lag). `0` =
-    /// read-your-writes (the default). The runtime derives this from the dataset's
-    /// `access` mode AND refresh mode: a bounded non-zero lag only for a read-only CDC
-    /// replica (`access: read` + `refresh_mode: changes`), and `0` for every other
-    /// table (read-write, or read-only non-CDC). See
-    /// [`CayenneTableProvider::default_scan_freshness`].
+    /// Set how a scan reuses a cached [`ScanView`]. Default is
+    /// [`ScanViewReuse::UntilInvalidated`] (`full` / `append` / `snapshot` /
+    /// `caching`, and writable `changes`). The runtime sets
+    /// [`ScanViewReuse::WithinLag`] only for read-only `refresh_mode: changes`.
     #[must_use]
-    pub fn with_default_scan_freshness(mut self, freshness: Duration) -> Self {
-        self.default_scan_freshness = freshness;
+    pub fn with_scan_view_reuse(mut self, reuse: ScanViewReuse) -> Self {
+        self.scan_view_reuse = reuse;
         self
     }
 
@@ -2741,7 +2756,7 @@ impl CayenneTableProviderBuilder {
             context: self.context,
             maintained_aggregate_specs: self.maintained_aggregates,
             durable_write_back: self.durable_write_back,
-            default_scan_freshness: self.default_scan_freshness,
+            scan_view_reuse: self.scan_view_reuse,
         };
 
         CayenneTableProvider::new_internal(table_name, self.catalog, self.runtime_env, options)
@@ -2765,7 +2780,7 @@ impl CayenneTableProviderBuilder {
             context: self.context,
             maintained_aggregate_specs: self.maintained_aggregates,
             durable_write_back: self.durable_write_back,
-            default_scan_freshness: self.default_scan_freshness,
+            scan_view_reuse: self.scan_view_reuse,
         };
 
         CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
@@ -7876,7 +7891,7 @@ impl CayenneTableProvider {
             context,
             maintained_aggregate_specs,
             durable_write_back,
-            default_scan_freshness,
+            scan_view_reuse,
         } = options;
 
         let table_metadata = catalog.get_table(table_name).await?;
@@ -8091,6 +8106,8 @@ impl CayenneTableProvider {
             test_pre_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_capture_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_post_scan_input_capture_hook: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -8116,7 +8133,7 @@ impl CayenneTableProvider {
             pk_row_converter,
             pk_column_indices,
             durable_write_back,
-            default_scan_freshness,
+            scan_view_reuse,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
             scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
@@ -10064,7 +10081,7 @@ impl CayenneTableProvider {
             pk_row_converter: self.pk_row_converter.as_ref().map(Arc::clone),
             pk_column_indices: self.pk_column_indices.clone(),
             durable_write_back: self.durable_write_back,
-            default_scan_freshness: self.default_scan_freshness,
+            scan_view_reuse: self.scan_view_reuse,
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
             scan_state_lock: Arc::clone(&self.scan_state_lock),
@@ -10078,6 +10095,8 @@ impl CayenneTableProvider {
             test_pre_publish_hook: Arc::clone(&self.test_pre_publish_hook),
             #[cfg(test)]
             test_post_capture_hook: Arc::clone(&self.test_post_capture_hook),
+            #[cfg(test)]
+            test_post_scan_input_capture_hook: Arc::clone(&self.test_post_scan_input_capture_hook),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
@@ -14801,7 +14820,7 @@ impl CayenneTableProvider {
             .fetch_add(1, Ordering::Release);
         self.inlined_generation.fetch_add(1, Ordering::Release);
         // A structural bump changes what a scan sees, so advance the scan-input version
-        // (the demand cache's ordering axis; the next read-your-writes capture re-keys
+        // (the demand cache's ordering axis; the next UntilInvalidated capture re-keys
         // over the new state). Single funnel for inline mutations, checkpoint clears,
         // overwrite, recovery, on-conflict, and deferred-snapshot publishes.
         self.notify_scan_input_change();
@@ -14810,12 +14829,11 @@ impl CayenneTableProvider {
     /// Advance the monotonic scan-input version: a cheap signal (NO lock, NO capture,
     /// NO clone) that scan-visible state may have changed. It is the demand cache's
     /// ORDERING axis (which completed build wins the `latest_complete` slot — see
-    /// [`ScanViewCache`]) and a cheap freshness signal, NOT a correctness gate: a
-    /// read-your-writes scan captures the CURRENT state directly, so it sees the
-    /// mutation regardless of this counter. Spurious calls are harmless (they only
-    /// nudge the ordering heuristic), so callers may bump LIBERALLY. Wired at every
-    /// mutation that changes a scan input (the sites that invalidated the retired
-    /// memos, direct or indirect).
+    /// [`ScanViewCache`]) and the invalidation signal for
+    /// [`ScanViewReuse::UntilInvalidated`]: a later scan will recapture rather than
+    /// serve the cached view. Spurious calls are harmless (they only force a rebuild),
+    /// so callers may bump LIBERALLY. Wired at every mutation that changes a scan
+    /// input (writes, deletes, refresh, compaction, snapshot flips).
     fn notify_scan_input_change(&self) {
         self.scan_input_version.fetch_add(1, Ordering::Release);
     }
@@ -15919,7 +15937,8 @@ impl CayenneTableProvider {
                 Arc::clone(self.context.runtime_env()),
                 None,
                 Arc::clone(&self.seq_allocator),
-            );
+            )
+            .with_scan_input_version(Arc::clone(&self.scan_input_version));
             sink.persist_position_based_deletions(position_specs)
                 .await
                 .map_err(|err| CatalogError::InvalidOperationNoSource {
@@ -24804,6 +24823,16 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Fire (and consume) the test-only post-scan-input-capture hook, if one
+    /// is installed. See [`Self::test_post_scan_input_capture_hook`].
+    #[cfg(test)]
+    async fn run_test_post_scan_input_capture_hook(&self) {
+        let hook = self.test_post_scan_input_capture_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
     /// Update the current snapshot ID after a compaction operation.
     ///
     /// This must be called after `commit_compaction` to keep the in-memory snapshot ID
@@ -27112,14 +27141,13 @@ impl CayenneTableProvider {
     /// (awaited locally) but is not cached for dedup — bounded memory, correct result.
     const MAX_IN_FLIGHT_SCAN_VIEWS: usize = 8;
 
-    /// Bound on the seqlock capture retry across a live schema-evolution (odd/torn
-    /// generation). Each retry yields; the window is one schema-evolve, so a handful of
-    /// yields settles it. Exceeding this fails the scan loud rather than spinning.
+    /// Bound on capture retries across a live schema-evolution (odd/torn generation)
+    /// or a write that advanced `scan_input_version` while the capture ran. Each
+    /// retry yields; exceeding this fails the scan loud rather than spinning.
     const MAX_STRUCTURAL_CAPTURE_RETRIES: u32 = 32;
 
-    /// Tick period of the background [`Self::run_scan_view_evictor`] sweep. Bounds how
-    /// long a no-longer-servable cached view lingers (and pins its snapshot dirs)
-    /// after a table goes idle, on top of its own freshness bound.
+    /// Tick period of the background [`Self::run_scan_view_evictor`] sweep.
+    /// Also the idle window for [`ScanViewReuse::UntilInvalidated`].
     const SCAN_VIEW_EVICTION_INTERVAL: Duration = Duration::from_secs(5);
 
     /// Initialize the demand scan-view cache once the provider is wrapped in an `Arc`:
@@ -27137,23 +27165,11 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Background sweep that DROPS a cached `latest_complete` view once it has gone
-    /// UNSERVED for the idle window — even when NO query is running. A completed view
-    /// holds its capture's [`SnapshotScanRef`], pinning the snapshot dirs it reads; on a
-    /// table that was queried once and then went idle, that reference would otherwise
-    /// keep those dirs alive forever, blocking compaction GC. The demand cache only
-    /// refreshes `latest_complete` on a scan miss, so with no scans nothing would ever
-    /// release it — hence a timer rather than piggybacking on the query path.
-    ///
-    /// It evicts on IDLE TIME (`now - last_access`), not age-since-capture, so a view
-    /// still being reused is retained rather than dropped mid-reuse — including a
-    /// read-your-writes (`freshness == 0`) exact-key hit, which stays valid regardless
-    /// of the view's age as long as the scan-visible state has not moved. Only a view
-    /// that has not been served for `max(default_scan_freshness, SCAN_VIEW_EVICTION_INTERVAL)`
-    /// is dropped. An in-flight build (and a query currently executing, which cloned its
-    /// own `Arc`) is untouched — dropping the cache's reference just lets the dirs free
-    /// once the last user finishes. Holds only a `Weak<Self>`, so it never pins the
-    /// provider and exits on the first tick after the table is torn down.
+    /// Background sweep that drops a cached `latest_complete` once it has gone
+    /// unserved for the idle window. Keyed on last-access, not age, so a
+    /// [`ScanViewReuse::UntilInvalidated`] view stays cached while scans keep
+    /// hitting it (valid at any age until a write). Holds only a `Weak<Self>`
+    /// and exits after the table is torn down.
     async fn run_scan_view_evictor(weak: std::sync::Weak<Self>) {
         loop {
             tokio::time::sleep(Self::SCAN_VIEW_EVICTION_INTERVAL).await;
@@ -27165,17 +27181,13 @@ impl CayenneTableProvider {
         }
     }
 
-    /// One eviction step (the body of [`Self::run_scan_view_evictor`], factored out so
-    /// it is testable without the timer): drain completed builds, then drop
-    /// `latest_complete` iff it has not been SERVED within the idle window
-    /// (`max(default_scan_freshness, SCAN_VIEW_EVICTION_INTERVAL)`). Keying on
-    /// last-access (not age) keeps a still-reused view — e.g. a read-your-writes
-    /// exact-key hit, valid at any age while the state is unchanged — instead of
-    /// dropping it mid-reuse; an idle view's pinned snapshot dirs are released for GC.
+    /// One eviction step: drain completed builds, then drop `latest_complete`
+    /// iff it has not been served within the idle window (last-access, not age).
     fn evict_stale_scan_view(&self, now: Instant) {
-        let idle_window = self
-            .default_scan_freshness
-            .max(Self::SCAN_VIEW_EVICTION_INTERVAL);
+        let idle_window = match self.scan_view_reuse {
+            ScanViewReuse::UntilInvalidated => Self::SCAN_VIEW_EVICTION_INTERVAL,
+            ScanViewReuse::WithinLag(lag) => lag.max(Self::SCAN_VIEW_EVICTION_INTERVAL),
+        };
         let mut cache = self.scan_view_cache.lock();
         cache.drain_completed();
         if cache
@@ -27192,7 +27204,7 @@ impl CayenneTableProvider {
     /// identity await ONE build (dedup). The CPU-bound merge + visible-segment build
     /// runs in `spawn_blocking` (D3) off the tokio worker. An INDEPENDENTLY-SPAWNED
     /// driver task polls a clone of the `Shared` to completion, so a completed build is
-    /// observable via `peek()` (and reusable by read-current scans) even if the
+    /// observable via `peek()` (and reusable by a `WithinLag` serve) even if the
     /// originating scan is cancelled before it resolves.
     ///
     /// Fallback (no `weak_self` — a provider never `Arc`-wrapped, i.e. the unit-test
@@ -27228,57 +27240,52 @@ impl CayenneTableProvider {
         build
     }
 
-    /// Obtain the [`ScanView`] bundle for a scan from the demand-driven cache, at the
-    /// requested `freshness` tolerance. Decide under the cache mutex, await OUTSIDE it
-    /// (the mutex is never held across `.await`).
+    /// Obtain the [`ScanView`] for this scan from the demand cache.
+    /// Decide under the cache mutex; await outside it.
     ///
-    /// **Read-current (`freshness > 0`, stale-tolerant analytical path).** Fast path:
-    /// under the cache mutex, drain completed builds and serve `latest_complete` iff it
-    /// was captured within `freshness` AND its structural generation still matches
-    /// `structural_version.current()` — the latter guard means a stale-tolerant scan is
-    /// NEVER served a pre-schema-evolution bundle (a schema-evolve advances the
-    /// generation). No capture, no fence on this path. On a miss it falls through to a
-    /// fresh build (below).
+    /// [`ScanViewReuse::UntilInvalidated`]: serve `latest_complete` when
+    /// `order == scan_input_version` and the structural generation matches.
+    /// [`ScanViewReuse::WithinLag`]: serve it when `now - captured_at <= lag`
+    /// and the structural generation matches. A zero lag recaptures every scan.
     ///
-    /// **Read-your-writes (`freshness == 0`, the default and correctness path).**
-    /// Capture the CURRENT state atomically under the structural seqlock
-    /// (`read_validated_async`, so the key's structural version is self-consistent with
-    /// the captured snapshot — a capture that straddled a live schema-evolution is
-    /// discarded and retried), key it, then under the cache mutex: serve an exact-key
-    /// completed view, await an in-flight build for the same key (dedup), or start a
-    /// build. Because the capture reflects the writer's own mutations (a direct DML bump
-    /// changes the snapshot id / tier version → a fresh key → a miss → a rebuild from
-    /// current state), the scan sees its own writes — fixing the overwrite regression.
+    /// On a miss, capture under the structural seqlock, then hit / await / build.
     async fn scan_view_at_current_input(
         &self,
-        freshness: Duration,
+        reuse: ScanViewReuse,
     ) -> datafusion_common::Result<Arc<ScanView>> {
-        // Read-current fast path: serve a recent, structurally-current completed view.
-        if !freshness.is_zero() {
-            let now = Instant::now();
+        {
             let mut cache = self.scan_view_cache.lock();
             cache.drain_completed();
             // Read the seqlock generation UNDER the cache mutex, immediately before the
             // servability check, so no live schema-evolution can slip in between the
-            // read and the compare (a pre-lock read left a TOCTOU window across the
-            // `.lock()` + `drain_completed()`). An in-flight evolution reads ODD and can
-            // never equal a completed view's always-EVEN `structural_version`, so a
-            // straddling evolution falls through to the read-your-writes rebuild below.
+            // read and the compare. An in-flight evolution reads ODD and can never equal
+            // a completed view's always-EVEN `structural_version`, so a straddling
+            // evolution falls through to a recapture.
             let structural = self.structural_version.current();
-            if let Some(view) = cache.servable_within_lag(now, freshness, structural) {
+            let hit = match reuse {
+                ScanViewReuse::UntilInvalidated => {
+                    let version = self.scan_input_version.load(Ordering::Acquire);
+                    cache.servable_until_invalidated(version, structural)
+                }
+                ScanViewReuse::WithinLag(lag) if !lag.is_zero() => {
+                    cache.servable_within_lag(Instant::now(), lag, structural)
+                }
+                ScanViewReuse::WithinLag(_) => None,
+            };
+            if let Some(view) = hit {
                 return Ok(view);
             }
-            // Miss (nothing fresh enough, or superseded by a schema-evolve): fall
-            // through to a fresh read-your-writes build. Drop the guard first — the
-            // capture below awaits and the mutex must never be held across `.await`.
-            drop(cache);
         }
 
         // Capture the CURRENT state under the structural seqlock, retrying across a
-        // (rare) live schema-evolution that leaves the generation odd/torn.
+        // (rare) live schema-evolution that leaves the generation odd/torn, and
+        // across a write that advanced `scan_input_version` while we captured.
+        // Stamping the capture with a post-write version would make
+        // `UntilInvalidated` serve the pre-write rows until the next write.
         let mut attempts: u32 = 0;
         loop {
             attempts += 1;
+            let order_before = self.scan_input_version.load(Ordering::Acquire);
             let (structural_version, raw) = match self
                 .structural_version
                 .read_validated_async(|| self.capture_raw_scan_input())
@@ -27293,7 +27300,7 @@ impl CayenneTableProvider {
                     if attempts >= Self::MAX_STRUCTURAL_CAPTURE_RETRIES {
                         return Err(datafusion_common::DataFusionError::Execution(format!(
                             "Scan of table {} could not capture a stable scan view across \
-                             {attempts} structural retries (persistent schema-evolution churn?)",
+                             {attempts} retries (persistent schema-evolution or write churn?)",
                             self.table_metadata.table_name
                         )));
                     }
@@ -27302,8 +27309,24 @@ impl CayenneTableProvider {
                 }
             };
 
+            #[cfg(test)]
+            self.run_test_post_scan_input_capture_hook().await;
+
+            let order_after = self.scan_input_version.load(Ordering::Acquire);
+            if order_before != order_after {
+                if attempts >= Self::MAX_STRUCTURAL_CAPTURE_RETRIES {
+                    return Err(datafusion_common::DataFusionError::Execution(format!(
+                        "Scan of table {} could not capture a stable scan view across \
+                         {attempts} retries (persistent schema-evolution or write churn?)",
+                        self.table_metadata.table_name
+                    )));
+                }
+                tokio::task::yield_now().await;
+                continue;
+            }
+
             let key = raw.key(structural_version);
-            let order = self.scan_input_version.load(Ordering::Acquire);
+            let order = order_after;
             let captured_at = Instant::now();
 
             // Decide under the lock; the build future is awaited AFTER releasing it.
@@ -28556,8 +28579,7 @@ impl CayenneTableProvider {
             // Advance the scan-input version: a mem-tier append changes the visible
             // set + tier version but deliberately does NOT bump the structural epoch
             // (see the invariant above), so it is NOT covered by the
-            // `bump_inlined_structural_epoch` funnel and must signal here. The tier
-            // version change re-keys the next read-your-writes capture.
+            // `bump_inlined_structural_epoch` funnel and must signal here.
             self.notify_scan_input_change();
             record_cayenne_write_phase(
                 &self.table_metadata.table_name,
@@ -33114,12 +33136,11 @@ impl TableProvider for CayenneTableProvider {
         // or once every file has been verified this process.
         self.verify_data_file_integrity().await?;
 
-        // Obtain the scan-view bundle from the demand cache at this dataset's freshness
-        // (`default_scan_freshness`: 0 = read-your-writes for read-write datasets; a
-        // bounded lag for read-only ones — see [`Self::scan_view_at_current_input`]). The
-        // KDI merge + visible mem-tier segments are computed OFF the query path (in
-        // `spawn_blocking`) and deduplicated across concurrent scans on the same state,
-        // so the scan no longer recomputes them per-scan (the retired memos' job).
+        // Obtain the scan-view bundle from the demand cache. See
+        // [`Self::scan_view_at_current_input`]. The KDI merge + visible mem-tier
+        // segments are computed OFF the query path (in `spawn_blocking`) and
+        // deduplicated across concurrent scans on the same state, so the scan no
+        // longer recomputes them per-scan (the retired memos' job).
         // Everything below descends from that ONE capture, so it is internally
         // consistent (the merged deletions hide the old copies of the exact rows this
         // scan sees), and the bundle's `scan_guard` pins the captured snapshot dirs
@@ -33128,7 +33149,7 @@ impl TableProvider for CayenneTableProvider {
         // The fields are cloned out (cheap `Arc` / short-`String` / `im`-HAMT clones)
         // so downstream plan-build owns them exactly as when it captured inline.
         let scan_view = self
-            .scan_view_at_current_input(self.default_scan_freshness)
+            .scan_view_at_current_input(self.scan_view_reuse)
             .await?;
         let mem_tier_any_rows = scan_view.raw.mem_tier_shards.iter().any(|s| !s.is_empty());
         let maintained_aggregate_epoch = scan_view.raw.maintained_aggregate_epoch;
@@ -34153,6 +34174,7 @@ impl CayenneTableProvider {
             write_lock,
             Arc::clone(&self.seq_allocator),
         )
+        .with_scan_input_version(Arc::clone(&self.scan_input_version))
         .with_exact_count(source.requires_exact_count());
 
         Ok(sink)
@@ -34258,7 +34280,8 @@ impl CayenneTableProvider {
             Arc::clone(self.context.runtime_env()),
             None, // write lock already held above
             Arc::clone(&self.seq_allocator),
-        );
+        )
+        .with_scan_input_version(Arc::clone(&self.scan_input_version));
 
         let deleted = sink
             .delete_by_key_hash_probe(&ctx, &all_tables, matched_keys, key_columns)
@@ -54625,8 +54648,9 @@ mod tests {
     /// directions:
     /// - two quiescent captures (no write between) produce EQUAL keys — every cheap
     ///   anchor (current snapshot id, structural epoch, per-shard version, file-index
-    ///   ptr, protected-map / inline-view `Arc`) is stable, so a read-your-writes scan
-    ///   HITS the cached bundle instead of rebuilding;
+    ///   ptr, protected-map / inline-view `Arc`) is stable, so a
+    ///   [`ScanViewReuse::UntilInvalidated`] scan hits the cached bundle instead of
+    ///   rebuilding;
     /// - a capture taken after a RAM append produces a DIFFERENT key (the tier version
     ///   moved), so the scan rebuilds — never serving a stale view across a mutation.
     ///
@@ -54677,7 +54701,7 @@ mod tests {
         assert_eq!(
             first.key(structural),
             second.key(structural),
-            "two quiescent captures must key identically (a read-your-writes scan hits the cache)"
+            "two quiescent captures must key identically (UntilInvalidated hits the cache)"
         );
         // The cheap anchors must be genuinely stable, not trivially always-equal.
         assert_eq!(first.current_snapshot_id, second.current_snapshot_id);
@@ -54739,15 +54763,13 @@ mod tests {
         pairs
     }
 
-    /// Read-your-writes (`freshness == 0`) — the correctness default. A scan through
-    /// the demand cache must see its own writes on the VERY NEXT scan: after an append,
-    /// `scan_view_at_current_input(0)` captures the current state, keys to it (a fresh
-    /// key ⇒ cache miss ⇒ rebuild), and serves a bundle reflecting the append — never a
-    /// stale prior bundle (the class of the overwrite regression this replaces).
-    /// A second scan of the SAME state HITS the cached bundle (same `Arc`) — the dedup /
-    /// reuse the cache preserves. (`weak_self` is unset here, so the cache builds inline;
-    /// the identity + freshness logic is identical to the production `spawn_blocking`
-    /// path.)
+    /// [`ScanViewReuse::UntilInvalidated`] — the full/append path. A scan through
+    /// the demand cache must see its own writes on the VERY NEXT scan: after an append
+    /// bumps `scan_input_version`, the cached view is invalid, so the scan recaptures
+    /// and rebuilds. A second scan of the SAME state HITS the cached bundle (same
+    /// `Arc`) without recapturing. (`weak_self` is unset here, so the cache builds
+    /// inline; the identity + reuse logic is identical to the production
+    /// `spawn_blocking` path.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scan_view_cache_serves_own_writes_and_reuses() {
         let ctx = SessionContext::new();
@@ -54774,26 +54796,26 @@ mod tests {
             .await
             .expect("first RAM append");
         let first = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
-            .expect("read-your-writes build 1");
+            .expect("UntilInvalidated build 1");
         assert_eq!(
             collect_segment_pairs(&first.visible_segments),
             vec![(1, 10), (2, 20)],
-            "first read-your-writes scan reflects the first append"
+            "first UntilInvalidated scan reflects the first append"
         );
 
         // Same state, no mutation between: the next scan HITS the cached bundle.
         let reused = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
-            .expect("read-your-writes build 2 (reuse)");
+            .expect("UntilInvalidated build 2 (reuse)");
         assert!(
             Arc::ptr_eq(&first, &reused),
             "an unchanged state must serve the SAME cached bundle (dedup / reuse)"
         );
 
-        // A second append: read-your-writes must see it on the very next scan.
+        // A second append: UntilInvalidated must see it on the very next scan.
         let _ = provider
             .write_cdc_append_stream(
                 single_batch_stream(id_value_batch(Arc::clone(&schema), &[3], &[30])),
@@ -54802,9 +54824,9 @@ mod tests {
             .await
             .expect("second RAM append");
         let after = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
-            .expect("read-your-writes build 3");
+            .expect("UntilInvalidated build 3");
         assert!(
             !Arc::ptr_eq(&first, &after),
             "a mutated state must rebuild (a fresh key), not serve the stale bundle"
@@ -54812,15 +54834,147 @@ mod tests {
         assert_eq!(
             collect_segment_pairs(&after.visible_segments),
             vec![(1, 10), (2, 20), (3, 30)],
-            "read-your-writes scan sees the second append immediately"
+            "UntilInvalidated scan sees the second append immediately"
         );
     }
 
-    /// Read-current (`freshness > 0`, stale-tolerant) — the analytical alignment path.
-    /// Once a bundle is cached, a read-current scan within the lag serves that
-    /// (now-stale) bundle rather than rebuilding, while a read-your-writes
-    /// (`freshness == 0`) scan of the same moment sees the newer state. This is the
-    /// bounded-staleness knob the SF1000 latency A/B exercises.
+    fn value_for_id(pairs: &[(i64, i64)], id: i64) -> Option<i64> {
+        pairs
+            .iter()
+            .filter(|(row_id, _)| *row_id == id)
+            .map(|(_, value)| *value)
+            .max()
+    }
+
+    /// Sequential read-modify-write under [`ScanViewReuse::UntilInvalidated`]:
+    /// each scan must see the previous committed upsert so two increments of
+    /// the same PK produce `x=2`, not a lost update. This is the write-back
+    /// UPDATE shape (read current, write current+1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_until_invalidated_sees_sequential_rmw() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_cache_rmw",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[0])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed x=0");
+
+        for expected in [1_i64, 2] {
+            let view = provider
+                .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+                .await
+                .expect("RMW read");
+            let current = value_for_id(&collect_segment_pairs(&view.visible_segments), 1)
+                .expect("id 1 is visible");
+            let next = current + 1;
+            let _ = provider
+                .write_cdc_append_stream(
+                    single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[next])),
+                    &ctx.task_ctx(),
+                )
+                .await
+                .expect("RMW write");
+            let after = provider
+                .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+                .await
+                .expect("RMW verify");
+            assert_eq!(
+                value_for_id(&collect_segment_pairs(&after.visible_segments), 1),
+                Some(expected),
+                "UntilInvalidated sequential increment must produce x={expected}"
+            );
+        }
+    }
+
+    /// A write that lands after `capture_raw_scan_input` returns and before the
+    /// capture is stamped with `scan_input_version` must not tag the pre-write
+    /// rows with the post-write version. The capture retries and the scan sees
+    /// the write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_retries_when_a_write_races_capture() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_cache_capture_race",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed");
+
+        {
+            let writer = provider.clone_for_write();
+            let schema = Arc::clone(&schema);
+            let task_ctx = ctx.task_ctx();
+            *provider.test_post_scan_input_capture_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let _ = writer
+                        .write_cdc_append_stream(
+                            single_batch_stream(id_value_batch(schema, &[3], &[30])),
+                            &task_ctx,
+                        )
+                        .await
+                        .expect("write that races the capture stamp");
+                })
+            }));
+        }
+
+        let raced = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("scan that raced a write");
+        assert_eq!(
+            collect_segment_pairs(&raced.visible_segments),
+            vec![(1, 10), (2, 20), (3, 30)],
+            "a write between capture and version stamp must not be cached as current"
+        );
+
+        let after = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("scan after raced write");
+        assert_eq!(
+            collect_segment_pairs(&after.visible_segments),
+            vec![(1, 10), (2, 20), (3, 30)],
+            "UntilInvalidated must keep serving the post-write view"
+        );
+    }
+
+    /// [`ScanViewReuse::WithinLag`] — the `refresh_mode: changes` path. Once a
+    /// bundle is cached, a timed-reuse scan within the lag serves that (now-stale)
+    /// bundle rather than rebuilding, while [`ScanViewReuse::UntilInvalidated`] at
+    /// the same moment sees the newer state (the write bumped `scan_input_version`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scan_view_cache_read_current_serves_within_lag() {
         let ctx = SessionContext::new();
@@ -54846,14 +55000,14 @@ mod tests {
             )
             .await
             .expect("first RAM append");
-        // Build the bundle, then a second read-your-writes scan promotes it to
+        // Build the bundle, then a second UntilInvalidated scan promotes it to
         // `latest_complete` (drain observes the first build complete).
         let _ = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
             .expect("build");
         let _ = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
             .expect("promote to latest_complete");
 
@@ -54866,35 +55020,230 @@ mod tests {
             .await
             .expect("second RAM append");
 
-        // Read-current with a generous lag serves the STALE cached bundle (no rebuild).
+        // WithinLag with a generous lag serves the STALE cached bundle (no rebuild).
         let stale = provider
-            .scan_view_at_current_input(Duration::from_hours(1))
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(Duration::from_hours(1)))
             .await
-            .expect("read-current within lag");
+            .expect("WithinLag within lag");
         assert_eq!(
             collect_segment_pairs(&stale.visible_segments),
             vec![(1, 10), (2, 20)],
-            "read-current within the lag serves the cached (stale) bundle"
+            "WithinLag within the lag serves the cached (stale) bundle"
         );
 
-        // Read-your-writes at the same moment sees the newer state.
+        // UntilInvalidated at the same moment sees the newer state.
         let fresh = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
-            .expect("read-your-writes after mutation");
+            .expect("UntilInvalidated after mutation");
         assert_eq!(
             collect_segment_pairs(&fresh.visible_segments),
             vec![(1, 10), (2, 20), (3, 30)],
-            "read-your-writes bypasses the lag and sees the mutation"
+            "UntilInvalidated bypasses the lag and sees the mutation"
         );
     }
 
-    /// The background evictor drops a cached `latest_complete` once it has aged past the
-    /// dataset's freshness bound, releasing the snapshot dirs its capture pinned — so an
-    /// idle table (queried once, then quiet) does not pin an old snapshot forever and
-    /// block compaction GC. Eviction only removes an already-non-servable view, and a
-    /// subsequent scan rebuilds correctly. (This provider's `default_scan_freshness` is
-    /// the builder default `0`, so any cached view is immediately stale-for-reuse.)
+    /// [`ScanViewReuse::WithinLag(ZERO)`] recaptures every scan, so a write is
+    /// visible on the next scan — the old full/append freshness-0 path, and
+    /// `CAYENNE_SCAN_VIEW_FRESHNESS_MS=0`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_zero_lag_sees_write() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_cache_zero_lag",
+            Arc::clone(&ctx.runtime_env()),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed");
+        let _ = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("build");
+        let _ = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("promote");
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[3], &[30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("write");
+
+        let zero = provider
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(Duration::ZERO))
+            .await
+            .expect("zero lag");
+        assert_eq!(
+            collect_segment_pairs(&zero.visible_segments),
+            vec![(1, 10), (2, 20), (3, 30)],
+            "WithinLag(0) recaptures every scan and must see the write"
+        );
+    }
+
+    /// After the lag elapses, [`ScanViewReuse::WithinLag`] recaptures and sees
+    /// the write it batched. Time itself is under test — keep the sleep short.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_within_lag_expires_and_recaptures() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_cache_lag_expire",
+            Arc::clone(&ctx.runtime_env()),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed");
+        let _ = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("build");
+        let _ = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("promote");
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[3], &[30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("write");
+
+        let lag = Duration::from_millis(30);
+        let still_stale = provider
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(lag))
+            .await
+            .expect("within lag");
+        assert_eq!(
+            collect_segment_pairs(&still_stale.visible_segments),
+            vec![(1, 10), (2, 20)],
+            "WithinLag still batches the write before the lag elapses"
+        );
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let expired = provider
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(lag))
+            .await
+            .expect("lag elapsed");
+        assert_eq!(
+            collect_segment_pairs(&expired.visible_segments),
+            vec![(1, 10), (2, 20), (3, 30)],
+            "once the lag elapses, WithinLag recaptures and sees the write"
+        );
+    }
+
+    /// A CDC in-memory delete must bump `scan_input_version` so
+    /// [`ScanViewReuse::UntilInvalidated`] (and the production `TableProvider::scan`
+    /// path) hide the deleted key on the next scan. [`ScanViewReuse::WithinLag`]
+    /// may still serve the pre-delete view inside the lag — that is the batching
+    /// trade for read-only `changes`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_delete_invalidates_until_invalidated_not_within_lag() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_cache_delete",
+            Arc::clone(&ctx.runtime_env()),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed");
+        let _ = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("build");
+        let _ = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("promote");
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2],
+            "production scan sees both seed rows before the delete"
+        );
+
+        provider
+            .write_cdc_delete_keys_in_memory(&int64_id_batch(&[1]))
+            .await
+            .expect("delete")
+            .expect("in-memory CDC delete absorbed");
+
+        let stale = provider
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(Duration::from_hours(1)))
+            .await
+            .expect("within lag after delete");
+        assert_eq!(
+            collect_segment_pairs(&stale.visible_segments),
+            vec![(1, 10), (2, 20)],
+            "WithinLag batches the delete and still serves id 1"
+        );
+
+        let fresh = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("until-invalidated after delete");
+        assert_eq!(
+            collect_segment_pairs(&fresh.visible_segments),
+            vec![(2, 20)],
+            "UntilInvalidated recaptures after the delete and hides id 1"
+        );
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![2],
+            "production TableProvider::scan uses UntilInvalidated by default and hides id 1"
+        );
+    }
+
+    /// The background evictor drops a cached `latest_complete` once it has gone
+    /// unserved past the idle window, releasing the snapshot dirs its capture pinned
+    /// — so an idle table (queried once, then quiet) does not pin an old snapshot
+    /// forever and block compaction GC. A subsequent scan rebuilds correctly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scan_view_cache_evictor_releases_idle_cached_view() {
         let ctx = SessionContext::new();
@@ -54922,11 +55271,11 @@ mod tests {
             .expect("RAM append");
         // Two scans populate + promote a completed view into `latest_complete`.
         let _ = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
             .expect("build");
         let _ = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
             .expect("promote to latest_complete");
         assert!(
@@ -54952,7 +55301,7 @@ mod tests {
 
         // Eviction must not break correctness: the next scan rebuilds the current state.
         let rebuilt = provider
-            .scan_view_at_current_input(Duration::ZERO)
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
             .await
             .expect("rebuild after eviction");
         assert_eq!(

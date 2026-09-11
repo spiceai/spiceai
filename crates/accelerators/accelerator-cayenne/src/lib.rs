@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
-use cayenne::CayennePartitionCreator;
+use cayenne::{CayennePartitionCreator, ScanViewReuse};
 // The by-name half of the metastore-collision check is shared with the Cayenne catalog
 // connector, so both configuration surfaces refuse the same overlap. The delete-path
 // half — a metastore on disk that no parameter names — stays in this file, beside the
@@ -752,43 +752,46 @@ fn auto_tuned_config_is_newly_resolved(table_name: &str, fingerprint: u64) -> bo
     true
 }
 
-/// Default read-current freshness (bounded staleness), in ms, for a READ-ONLY Cayenne
-/// CDC replica (`access: read` + `refresh_mode: changes`). Such a replica's data
-/// streams in only via CDC and is eventually-consistent by design, so a scan need not
-/// be read-your-writes; serving a recently-built `ScanView` within this lag lets
-/// concurrent analytical scans share one build (the demand cache's reuse lever) while
-/// staying far inside the freshness SLO. Every other table uses 0 (read-your-writes):
-/// read-write datasets, and read-only NON-CDC tables (full-refresh/snapshot/append),
-/// which must reflect their last refresh immediately and can still take a direct
-/// `delete_from` via the accelerator. 1 s is a conservative bounded-staleness default,
-/// far inside the freshness SLO; tune as the A/B data lands.
-const DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS: u64 = 1000;
+/// Default `WithinLag` for `refresh_mode: changes`, in milliseconds.
+const DEFAULT_CHANGES_SCAN_VIEW_LAG_MS: u64 = 1000;
 
-/// The read-current lag applied to a READ-ONLY Cayenne CDC replica:
-/// [`DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS`], overridable via the
-/// `CAYENNE_SCAN_VIEW_FRESHNESS_MS` environment variable (a process-wide operational
-/// knob, not per-table data config, so it stays out of `configuration_matches`).
-/// Setting it to `0` opts CDC replicas back into read-your-writes (the A/B no-reuse
-/// baseline). Never affects any other table, which always uses 0.
-///
-/// Parsed once into a process-global `LazyLock`: the env var is a process-wide knob, so
-/// caching avoids re-parsing on every provider/partition construction AND emits the
-/// invalid-value warning at most once (rather than per construction).
-fn read_only_scan_freshness() -> std::time::Duration {
-    static READ_ONLY_SCAN_FRESHNESS: LazyLock<std::time::Duration> = LazyLock::new(|| {
+/// Process-wide `WithinLag` for **read-only** `refresh_mode: changes`, from
+/// `CAYENNE_SCAN_VIEW_FRESHNESS_MS` (default [`DEFAULT_CHANGES_SCAN_VIEW_LAG_MS`];
+/// `0` recaptures every scan). Cached so the env var is parsed — and an invalid
+/// value warned — once per process. Writable `changes` datasets (write-back)
+/// do not use this lag — see [`scan_view_reuse_for`].
+fn changes_scan_view_lag() -> Duration {
+    static CHANGES_SCAN_VIEW_LAG: LazyLock<Duration> = LazyLock::new(|| {
         let ms = match std::env::var("CAYENNE_SCAN_VIEW_FRESHNESS_MS") {
-            Err(_) => DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS,
+            Err(_) => DEFAULT_CHANGES_SCAN_VIEW_LAG_MS,
             // A set-but-invalid value is a misconfiguration; warn (don't silently
             // swallow it) before falling back, mirroring `parse_env_u64`. `{raw:?}`
             // escapes control characters so untrusted input cannot inject log lines.
             Ok(raw) => raw.trim().parse::<u64>().unwrap_or_else(|_| {
-                tracing::warn!("Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS={raw:?}: expected a non-negative integer (milliseconds); using default {DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS} ms.");
-                DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS
+                tracing::warn!("Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS={raw:?}: expected a non-negative integer (milliseconds); using default {DEFAULT_CHANGES_SCAN_VIEW_LAG_MS} ms.");
+                DEFAULT_CHANGES_SCAN_VIEW_LAG_MS
             }),
         };
-        std::time::Duration::from_millis(ms)
+        Duration::from_millis(ms)
     });
-    *READ_ONLY_SCAN_FRESHNESS
+    *CHANGES_SCAN_VIEW_LAG
+}
+
+/// `WithinLag` only for **read-only** `refresh_mode: changes` (analytical CDC
+/// replicas that batch applies). Everything else — `full` / `append` /
+/// `snapshot` / `caching`, and **writable** `changes` (write-back UPDATE/DML)
+/// — is [`ScanViewReuse::UntilInvalidated`], so a mutation cannot read a
+/// lag-cached view of its own table.
+fn scan_view_reuse_for(source: &dyn AccelerationSource) -> ScanViewReuse {
+    let is_readonly_changes = !source.allows_write()
+        && source
+            .acceleration()
+            .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Changes));
+    if is_readonly_changes {
+        ScanViewReuse::WithinLag(changes_scan_view_lag())
+    } else {
+        ScanViewReuse::UntilInvalidated
+    }
 }
 
 /// How a dataset's refresh mode writes to its Cayenne table. The three shapes want
@@ -2689,26 +2692,7 @@ impl CayenneAccelerator {
             .acceleration()
             .is_some_and(Acceleration::resolves_to_durable_write_back);
 
-        // Default per-scan freshness. Bounded staleness is only in-contract for a
-        // read-only CDC *replica* (`refresh_mode: changes`): its data streams in
-        // continuously and is eventually-consistent by design, so a read tolerates a
-        // bounded lag — and there the demand cache's cross-query reuse lever pays off
-        // (concurrent analytical scans share one build). Read-only alone is NOT enough:
-        // a full-refresh / snapshot / append table is expected to reflect its last
-        // refresh immediately (refresh-then-query reads its own writes), and a read-only
-        // table can still take direct `delete_from`/DML via the accelerator — so serving
-        // a pre-mutation view there is a stale (wrong) result. Any table we cannot prove
-        // is a read-only CDC replica therefore uses 0 = read-your-writes, so a scan
-        // always sees the latest state. (A read-write dataset requires BOTH a ReadWrite
-        // API key and `access: read_write`.)
-        let is_cdc_replica = source
-            .acceleration()
-            .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Changes));
-        let default_scan_freshness = if is_cdc_replica && !source.allows_write() {
-            read_only_scan_freshness()
-        } else {
-            std::time::Duration::ZERO
-        };
+        let scan_view_reuse = scan_view_reuse_for(source);
 
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
@@ -2716,7 +2700,7 @@ impl CayenneAccelerator {
             .with_retention_filters(retention_filters)
             .with_maintained_aggregates(maintained_aggregate_specs)
             .with_durable_write_back(durable_write_back)
-            .with_default_scan_freshness(default_scan_freshness);
+            .with_scan_view_reuse(scan_view_reuse);
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }
@@ -4072,7 +4056,8 @@ impl DataAccelerator for CayenneAccelerator {
                 // one budget, and an accelerated partitioned table is a target for
                 // the dual-write path.
                 .with_background_compaction(Arc::clone(&self.compaction_semaphore))
-                .with_direct_partition_writes(),
+                .with_direct_partition_writes()
+                .with_scan_view_reuse(scan_view_reuse_for(source)),
             );
 
             // Wrap the base table provider with partitioning logic, installing
@@ -7949,6 +7934,55 @@ mod tests {
         assert!(
             validate_snapshot_consistency(&agreeing).is_ok(),
             "datasets that agree may share a metadata directory"
+        );
+    }
+
+    /// [`scan_view_reuse_for`]: `WithinLag` only for read-only `refresh_mode: changes`.
+    /// Every other refresh mode, plus writable `changes` (write-back), invalidates
+    /// on write. Unset `refresh_mode` and no acceleration configured are the same
+    /// as UntilInvalidated.
+    #[test]
+    fn scan_view_reuse_for_all_refresh_modes_and_writability() {
+        let modes = [
+            None,
+            Some(RefreshMode::Disabled),
+            Some(RefreshMode::Full),
+            Some(RefreshMode::Append),
+            Some(RefreshMode::Changes),
+            Some(RefreshMode::Caching),
+            Some(RefreshMode::Snapshot),
+        ];
+        for mode in modes {
+            for allows_write in [false, true] {
+                let expect_lag = mode == Some(RefreshMode::Changes) && !allows_write;
+                let mut source = TestAccelerationSource::new("t").with_allows_write(allows_write);
+                if let Some(refresh_mode) = mode {
+                    source = source.with_acceleration(Acceleration {
+                        refresh_mode: Some(refresh_mode),
+                        ..Acceleration::default()
+                    });
+                }
+                let reuse = scan_view_reuse_for(&source);
+                if expect_lag {
+                    assert!(
+                        matches!(reuse, ScanViewReuse::WithinLag(_)),
+                        "read-only changes must WithinLag (mode={mode:?}, write={allows_write})"
+                    );
+                } else {
+                    assert_eq!(
+                        reuse,
+                        ScanViewReuse::UntilInvalidated,
+                        "must invalidate on write (mode={mode:?}, write={allows_write})"
+                    );
+                }
+            }
+        }
+
+        let no_accel = TestAccelerationSource::new("bare").with_allows_write(false);
+        assert_eq!(
+            scan_view_reuse_for(&no_accel),
+            ScanViewReuse::UntilInvalidated,
+            "no acceleration configured is not read-only changes"
         );
     }
 }
