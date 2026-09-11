@@ -69,6 +69,7 @@ pub mod logical_optimizer;
 pub mod maintained_aggregate;
 pub mod metadata;
 pub mod metastore;
+pub mod metastore_layout;
 
 /// Z-order clustering kernel, re-exported for benchmarks only. Not a stable API.
 #[doc(hidden)]
@@ -109,12 +110,12 @@ pub use provider::{
     begin_compaction_shutdown, cap_global_encode_concurrency, clear_global_mem_tier_pool_account,
     compaction_budget, compaction_budget_permits, deregister_query_observations,
     drain_compaction_tasks, encode_budget_snapshot, global_mem_tier_pool_account_bytes,
-    global_mem_tier_total, global_mem_tier_used, global_qph, in_flight_compaction_tasks,
-    record_global_query, record_query_latency, register_query_observations,
-    release_global_mem_tier_bytes, reset_compaction_shutdown, set_compaction_runtime_env,
-    set_compaction_runtime_handle, set_cpu_burstable, set_global_encode_concurrency,
-    set_global_mem_tier_bytes, set_global_mem_tier_pool_account, set_global_memory_budget,
-    set_global_pk_keyset_bytes, set_query_admission_governor, try_reserve_global_mem_tier_bytes,
-    update_global_mem_tier_total,
+    global_mem_tier_total, global_mem_tier_used, global_pk_keyset_total, global_pk_keyset_used,
+    global_qph, in_flight_compaction_tasks, record_global_query, record_query_latency,
+    register_query_observations, release_global_mem_tier_bytes, reset_compaction_shutdown,
+    set_compaction_runtime_env, set_compaction_runtime_handle, set_cpu_burstable,
+    set_global_encode_concurrency, set_global_mem_tier_bytes, set_global_mem_tier_pool_account,
+    set_global_memory_budget, set_global_pk_keyset_bytes, set_query_admission_governor,
+    try_reserve_global_mem_tier_bytes, update_global_mem_tier_total,
 };
 pub use schema::{CAYENNE_TYPE_REWRITE_RULES, transform_schema_for_vortex};

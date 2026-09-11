@@ -60,6 +60,27 @@ fn tpch_primary_key(table_name: &str) -> Option<&'static str> {
         .map(|(_, pk)| *pk)
 }
 
+/// A non-key numeric column per TPC-H table, each one read by at least one TPC-H
+/// query. Negating it in a conflicting row makes that row's survival visible to
+/// the query results, so an `on_conflict` that keeps the superseded row fails
+/// the benchmark's own answers rather than passing unnoticed.
+const TPCH_CONFLICT_MARKER_COLUMNS: &[(&str, &str)] = &[
+    ("customer", "c_acctbal"),
+    ("lineitem", "l_extendedprice"),
+    ("orders", "o_totalprice"),
+    ("part", "p_size"),
+    ("partsupp", "ps_supplycost"),
+    ("supplier", "s_acctbal"),
+];
+
+/// Returns the column to negate in a conflicting copy of a TPC-H table's rows.
+fn tpch_conflict_marker_column(table_name: &str) -> Option<&'static str> {
+    TPCH_CONFLICT_MARKER_COLUMNS
+        .iter()
+        .find(|(t, _)| *t == table_name)
+        .map(|(_, column)| *column)
+}
+
 /// Generates SQL for TPC-H initial setup (step 0).
 /// Unlike `generate_tpch_sql`, this creates fresh tables rather than appending to existing ones.
 fn generate_tpch_setup_sql(
@@ -175,9 +196,21 @@ fn generate_tpch_sql(
 
         // Conflict data: same primary keys, will be handled by ON CONFLICT
         if generate_conflict_data {
-            write!(&mut sql, "ALTER TABLE {name}_conflict ADD COLUMN {column} TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;
-                             INSERT INTO {name} SELECT * FROM {name}_conflict;
-                             DROP TABLE {name}_conflict;\n").ok();
+            writeln!(&mut sql, "ALTER TABLE {name}_conflict ADD COLUMN {column} TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;").ok();
+
+            // The next step appends these same keys with their real values, so
+            // this copy is the one an upsert must discard. Negate a queried
+            // column to make keeping it change the query results.
+            if let Some(marker) = tpch_conflict_marker_column(name) {
+                writeln!(&mut sql, "UPDATE {name}_conflict SET {marker} = -{marker};").ok();
+            }
+
+            write!(
+                &mut sql,
+                "INSERT INTO {name} SELECT * FROM {name}_conflict;
+                             DROP TABLE {name}_conflict;\n"
+            )
+            .ok();
         }
 
         writeln!(
@@ -378,5 +411,55 @@ impl AppendableSource for FileAppendableSource {
 
     async fn teardown(&self, _worker: &AppendConfig) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TableWithTimeColumn, generate_tpch_sql};
+    use std::path::Path;
+
+    fn tpch_sql(generate_conflict_data: bool, table: &'static str, column: &'static str) -> String {
+        generate_tpch_sql(
+            10,
+            1,
+            generate_conflict_data,
+            &[TableWithTimeColumn {
+                name: table,
+                column,
+            }],
+            Path::new("/tmp"),
+        )
+    }
+
+    #[test]
+    fn a_conflicting_copy_negates_a_queried_column_before_it_is_appended() {
+        let sql = tpch_sql(true, "lineitem", "l_created_at");
+        let update = sql
+            .find("UPDATE lineitem_conflict SET l_extendedprice = -l_extendedprice;")
+            .expect("the conflicting copy should have its marker column negated");
+        let insert = sql
+            .find("INSERT INTO lineitem SELECT * FROM lineitem_conflict")
+            .expect("the conflicting copy should be appended");
+
+        assert!(
+            update < insert,
+            "the marker column must be negated before the copy is appended"
+        );
+    }
+
+    #[test]
+    fn a_table_without_a_marker_column_is_appended_unchanged() {
+        let sql = tpch_sql(true, "nation", "n_created_at");
+        assert!(
+            !sql.contains("UPDATE nation_conflict"),
+            "nation has no marker column, so its conflicting copy is left alone"
+        );
+    }
+
+    #[test]
+    fn no_conflicting_copy_is_generated_without_conflict_data() {
+        let sql = tpch_sql(false, "lineitem", "l_created_at");
+        assert!(!sql.contains("_conflict"));
     }
 }

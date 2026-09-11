@@ -21,10 +21,10 @@ use arrow_flight::{
     FlightData, PutResult,
     flight_service_server::FlightService,
     sql::{Any, Command},
-    utils::flight_data_to_arrow_batch,
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::SchemaRef;
+use arrow_tools::map_entries::{self, MapEntriesNormalizer};
 use arrow_tools::schema::verify_schema;
 use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
@@ -275,12 +275,16 @@ pub(crate) async fn handle(
         .map_err(|e| Status::internal(format!("Failed to get schema from data header: {e}")))?;
     let schema = Arc::new(schema);
 
+    // One stream carries one schema, so what its batches need is resolved once — and the dataset is
+    // checked against the shape that will actually be written. See [`MapEntriesGuard`].
+    let guard = MapEntriesGuard::for_declared(schema);
+
     let target_schema = datafusion
         .get_arrow_schema(path.clone())
         .await
         .map_err(|e| Status::internal(format!("Failed to get target dataset schema: {e}")))?;
 
-    if let Err(e) = verify_schema(target_schema.fields(), schema.fields()) {
+    if let Err(e) = verify_schema(target_schema.fields(), guard.write_schema().fields()) {
         return Err(Status::invalid_argument(format!(
             "Schema validation error: the provided data schema does not match the expected schema for dataset `{path}`: {e}",
         )));
@@ -290,7 +294,7 @@ pub(crate) async fn handle(
     let response_stream = create_response_stream(
         path,
         path_label,
-        schema,
+        guard,
         Arc::clone(&datafusion),
         streaming_flight,
         &first_message,
@@ -307,27 +311,66 @@ fn allow_scheduler_trusted_executor_write(datafusion: &DataFusion) -> bool {
         && datafusion.cluster_config.tls_config().is_some()
 }
 
+/// What draining the inbound stream after an early write completion found.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DiscardedMessages {
+    /// Messages that carried IPC data — i.e. client rows that were streamed but never
+    /// written. This is the number reported to the client.
+    total: usize,
+    /// How many of `total` had a header that could not be read. Reported alongside the
+    /// total rather than logged per message: the stream is client-controlled and
+    /// unbounded, so a per-message log lets one broken client write an arbitrarily long
+    /// burst into the runtime's log for a single failed request.
+    unreadable_headers: usize,
+}
+
 /// Drains the messages remaining on the inbound flight stream after the write
-/// sink has already completed, returning the number of discarded messages that
-/// carried record-batch data — i.e. client rows that were streamed but never
-/// written. Keepalive heartbeats and empty trailer messages do not carry data
-/// and are not counted, so a sink that completes exactly as the stream ends
-/// reports zero discarded batches and the write is still acked as a success.
-async fn drain_discarded_data_batches<S>(stream: &mut S) -> usize
+/// sink has already completed, counting the ones that carried IPC data.
+/// Keepalive heartbeats and schema-only or trailer messages carry no data and
+/// are not counted, so a sink that completes exactly as the stream ends reports
+/// zero discarded batches and the write is still acked as a success.
+///
+/// Takes no logging of its own so the caller can report one line per failed write, with
+/// the dataset it belongs to; see [`DiscardedMessages::unreadable_headers`].
+async fn drain_discarded_data_batches<S>(stream: &mut S) -> DiscardedMessages
 where
     S: futures::Stream<Item = Result<FlightData, Status>> + Unpin,
 {
-    let mut discarded = 0usize;
+    let mut discarded = DiscardedMessages::default();
     while let Some(msg) = stream.next().await {
         match msg {
             Ok(data) => {
-                // A message carries record-batch (or dictionary) data when its
-                // body is non-empty; keepalive heartbeats are tagged and never
-                // count as lost client data.
-                if data.app_metadata.as_ref() != crate::flight::KEEPALIVE_APP_METADATA
-                    && !data.data_body.is_empty()
-                {
-                    discarded += 1;
+                // Keepalive heartbeats are tagged and never count as lost client
+                // data, whatever they carry.
+                if data.app_metadata.as_ref() == crate::flight::KEEPALIVE_APP_METADATA {
+                    continue;
+                }
+
+                // A body is counted whichever way the header reads, so the header can only ever
+                // add to what the body already establishes. That floor is what stops reading the
+                // header from *narrowing* the count: a body the client streamed went nowhere, and
+                // a header that parses into something other than a batch does not make those
+                // bytes absent. `Tensor`, `SparseTensor` and any IPC header a later Arrow adds all
+                // land here, so an unsupported message loses rows rather than being acked.
+                if !data.data_body.is_empty() {
+                    discarded.total += 1;
+                    continue;
+                }
+
+                match declares_ipc_data(&data.data_header) {
+                    // Reached only with an empty body, which a batch legitimately has: a
+                    // zero-row batch is data, and counting by body length alone missed it.
+                    Ok(true) => discarded.total += 1,
+                    // A schema-only message, a trailer, or anything else carrying no rows.
+                    Ok(false) => {}
+                    Err(_) => {
+                        // A header with bytes that will not parse is a malformed
+                        // message, not the absence of a batch. This count sizes a
+                        // data-loss report, so it is counted: saying less was lost
+                        // than was is the error that matters here.
+                        discarded.total += 1;
+                        discarded.unreadable_headers += 1;
+                    }
                 }
             }
             Err(e) => {
@@ -340,10 +383,122 @@ where
     discarded
 }
 
+/// What a `DoPut` stream's `MAP` columns need, resolved once from the client's schema message.
+///
+/// A client is free to declare a `MAP`'s `entries` field nullable, which the Arrow map layout
+/// forbids. Every batch is therefore decoded under the client's own declarations and relabelled
+/// afterwards, so that an entries array carrying nulls — the one shape relabelling cannot fix — is
+/// refused rather than written under a declaration that says it holds none.
+///
+/// The two decisions the write makes about that live together here because they have to agree: the
+/// schema the write stream advertises, and the shape of the batches pushed into it.
+struct MapEntriesGuard {
+    /// The client's own declaration. Batches are decoded under it — the IPC buffers are laid out
+    /// the way it describes.
+    declared: SchemaRef,
+    normalizer: MapEntriesNormalizer,
+}
+
+impl MapEntriesGuard {
+    fn for_declared(declared: SchemaRef) -> Self {
+        let normalizer = MapEntriesNormalizer::for_schema(&declared);
+        Self {
+            declared,
+            normalizer,
+        }
+    }
+
+    /// The schema the write stream advertises: the one its batches carry once corrected.
+    fn write_schema(&self) -> &SchemaRef {
+        self.normalizer.schema()
+    }
+
+    /// Decodes one `FlightData` message and brings its `MAP` columns in line with the map layout.
+    ///
+    /// `Ok(None)` is a message that carries no batch, read from the IPC header: a schema-only
+    /// message, or one with no header at all. A message whose header declares a record batch but
+    /// will not decode is a malformed stream, and is reported with the decoder's own error rather
+    /// than skipped — as is a header that will not parse at all, since neither tells the client
+    /// anything if it is reported as an absent batch.
+    fn decode(
+        &self,
+        message: &FlightData,
+        dictionaries_by_id: &HashMap<i64, arrow::array::ArrayRef>,
+        path: &TableReference,
+    ) -> Result<Option<RecordBatch>, Status> {
+        let declares_batch = declares_record_batch(&message.data_header).map_err(|e| {
+            let message = decode_failure_message(path, &e);
+            tracing::error!(dataset = %path, "{message}");
+            Status::invalid_argument(message)
+        })?;
+
+        if !declares_batch {
+            return Ok(None);
+        }
+
+        let batch = arrow_flight::utils::flight_data_to_arrow_batch(
+            message,
+            Arc::clone(&self.declared),
+            dictionaries_by_id,
+        )
+        .map_err(|e| {
+            let message = decode_failure_message(path, &e);
+            tracing::error!(dataset = %path, "{message}");
+            Status::invalid_argument(message)
+        })?;
+
+        self.normalizer.normalize(batch).map(Some).map_err(|e| {
+            let message = map_entries_message(path, &e);
+            tracing::error!(dataset = %path, "{message}");
+            Status::invalid_argument(message)
+        })
+    }
+}
+
+/// What an IPC message's header declares, or `None` when the message carries no header bytes.
+///
+/// The header is the discriminator, not the body length: a batch of zero rows — and a batch
+/// whose columns need no buffers — is sent with an empty body, so treating an empty body as
+/// "no data" both drops rows the writer sent and under-counts the ones a failed write discarded.
+///
+/// A message with no header bytes at all declares nothing — Flight allows a metadata-only
+/// message, and there is nothing there to misread. A header that has bytes but will not parse is
+/// neither a declaration nor the absence of one: it is a malformed stream, and the `Err` is what
+/// lets a caller report that parse failure instead of the "carries no batch" diagnosis a `false`
+/// would produce, which names the wrong problem and hides the reason the IPC was rejected.
+fn declared_message_header(data_header: &[u8]) -> Result<Option<arrow_ipc::MessageHeader>, String> {
+    if data_header.is_empty() {
+        return Ok(None);
+    }
+
+    arrow_ipc::root_as_message(data_header)
+        .map(|message| Some(message.header_type()))
+        .map_err(|e| e.to_string())
+}
+
+/// Whether an IPC message's header declares a record batch — the messages the write decodes.
+fn declares_record_batch(data_header: &[u8]) -> Result<bool, String> {
+    Ok(declared_message_header(data_header)? == Some(arrow_ipc::MessageHeader::RecordBatch))
+}
+
+/// Whether an IPC message's header declares data the write needed: a record batch, or a
+/// dictionary the batches referencing it cannot be decoded without.
+///
+/// Wider than [`declares_record_batch`] because it answers a different question. That one asks
+/// what to decode; this one asks what was lost. A dictionary message carries the values its
+/// batch refers to, so a batch that references one carries nothing without it — a discarded
+/// dictionary is discarded client data even though it is not itself a batch.
+fn declares_ipc_data(data_header: &[u8]) -> Result<bool, String> {
+    Ok(matches!(
+        declared_message_header(data_header)?,
+        Some(arrow_ipc::MessageHeader::RecordBatch | arrow_ipc::MessageHeader::DictionaryBatch)
+    ))
+}
+
 fn create_response_stream(
     path: TableReference,
     path_label: Arc<str>,
-    schema: SchemaRef,
+    guard: MapEntriesGuard,
     df: Arc<DataFusion>,
     mut streaming_flight: Peekable<Streaming<FlightData>>,
     first_message: &FlightData,
@@ -352,24 +507,25 @@ fn create_response_stream(
     tracing::debug!("Starting writing data into dataset: {path}");
 
     // Sometimes the first message only contains the schema and no data
-    let first_batch = arrow_flight::utils::flight_data_to_arrow_batch(
-        first_message,
-        Arc::clone(&schema),
-        &dictionaries_by_id,
-    )
-    .ok();
+    let first_batch = guard.decode(first_message, &dictionaries_by_id, &path);
+    let write_schema = Arc::clone(guard.write_schema());
 
     stream! {
         // channel to propagate new record batches to the data writing stream
         let (batch_tx, batch_rx)= mpsc::channel::<Result<RecordBatch, DataFusionError>>(100);
 
-        let write_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), Box::new(ReceiverStream::new(batch_rx))));
+        let write_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(write_schema, Box::new(ReceiverStream::new(batch_rx))));
         let streaming_update = StreamingDataUpdate::new(write_stream, UpdateType::Append);
         let path = path.clone();
         let mut write_future = Box::pin(df.write_streaming_data(&path, streaming_update));
 
-        if let Some(first_batch) = first_batch {
-            yield handle_record_batch(first_batch, &batch_tx, &path_label).await;
+        match first_batch {
+            Ok(Some(first_batch)) => yield handle_record_batch(first_batch, &batch_tx, &path_label).await,
+            Ok(None) => {}
+            Err(status) => {
+                yield Err(status);
+                return;
+            }
         }
 
         // Use a single pinned Sleep future that is reset on each received message,
@@ -403,16 +559,21 @@ fn create_response_stream(
                             // record-batch data those client rows were never
                             // written — fail loudly instead of acking a silent
                             // partial ingest.
-                            let discarded = drain_discarded_data_batches(&mut streaming_flight).await;
+                            let drained = drain_discarded_data_batches(&mut streaming_flight).await;
+                            let discarded = drained.total;
                             if discarded > 0 {
+                                let message = discarded_data_message(
+                                    &path,
+                                    SinkFinishedEarly::WhileClientStreaming,
+                                    discarded,
+                                );
                                 tracing::error!(
                                     dataset = %path,
-                                    discarded_batches = discarded,
-                                    "Write sink completed before the client finished streaming; {discarded} data batch(es) were not written",
+                                    discarded_messages = discarded,
+                                    unreadable_headers = drained.unreadable_headers,
+                                    "{message}",
                                 );
-                                yield Err(Status::data_loss(format!(
-                                    "Write sink for dataset `{path}` finished before the client stream ended; {discarded} data batch(es) streamed by the client were not written",
-                                )));
+                                yield Err(Status::data_loss(message));
                                 break;
                             }
                             tracing::warn!("Write operation completed before stream ended for dataset: {path}");
@@ -438,15 +599,26 @@ fn create_response_stream(
                                 continue;
                             }
 
-                            let new_batch = match flight_data_to_arrow_batch(
-                                &message,
-                                Arc::clone(&schema),
-                                &dictionaries_by_id,
-                            ) {
-                                Ok(batches) => batches,
-                                Err(e) => {
-                                    tracing::error!("Failed to convert flight data to batches: {e}");
-                                    yield Err(Status::internal(format!("Failed to convert flight data to batches: {e}")));
+                            let new_batch = match guard.decode(&message, &dictionaries_by_id, &path) {
+                                Ok(Some(new_batch)) => new_batch,
+                                Ok(None) => {
+                                    // Only a non-batch header reaches here: a message whose
+                                    // header declares a record batch is decoded, empty body and
+                                    // all, and one that will not decode is refused by `decode`
+                                    // with the decoder's own error. Mid-stream, a schema message
+                                    // is not the schema-only first message, so the stream has
+                                    // gone out of step with what it declared.
+                                    let message = format!(
+                                        "Received an Arrow message that carries no record batch partway through the write to dataset '{path}', so the rest of the stream was not applied and any batch already accepted may have been. \
+                                        Send every message after the schema as a record batch. \
+                                        See: https://spiceai.org/docs/api/arrow-flight-sql"
+                                    );
+                                    tracing::error!(dataset = %path, "{message}");
+                                    yield Err(Status::invalid_argument(message));
+                                    break;
+                                }
+                                Err(status) => {
+                                    yield Err(status);
                                     break;
                                 }
                             };
@@ -489,15 +661,20 @@ fn create_response_stream(
                                             // pending batch was not accepted by the sink, so it
                                             // counts as discarded along with anything left on the
                                             // wire; fail loudly rather than ack a partial ingest.
-                                            let discarded = 1 + drain_discarded_data_batches(&mut streaming_flight).await;
+                                            let drained = drain_discarded_data_batches(&mut streaming_flight).await;
+                                            let discarded = 1 + drained.total;
+                                            let message = discarded_data_message(
+                                                &path,
+                                                SinkFinishedEarly::WithBatchPending,
+                                                discarded,
+                                            );
                                             tracing::error!(
                                                 dataset = %path,
-                                                discarded_batches = discarded,
-                                                "Write sink completed while a client batch was still pending; {discarded} data batch(es) were not written",
+                                                discarded_messages = discarded,
+                                                unreadable_headers = drained.unreadable_headers,
+                                                "{message}",
                                             );
-                                            yield Err(Status::data_loss(format!(
-                                                "Write sink for dataset `{path}` finished before the client stream ended; {discarded} data batch(es) streamed by the client were not written",
-                                            )));
+                                            yield Err(Status::data_loss(message));
                                             break;
                                         }
                                         Err(e) => {
@@ -559,6 +736,80 @@ fn create_response_stream(
     }
 }
 
+/// Reports Arrow data a client sent that will not decode.
+///
+/// [`MapEntriesGuard::decode`] serves the first message of a write and every later one alike, so
+/// this may assert only what holds for both: a first message that fails has applied nothing, while
+/// a later one may follow batches the sink has already accepted. It therefore says the write did
+/// not complete and leaves the rollback question to the callers that can answer it — claiming the
+/// write "was not applied" would be false for every message after the first.
+fn decode_failure_message(path: &TableReference, source: &impl std::fmt::Display) -> String {
+    format!(
+        "Failed to read the Arrow data sent for dataset '{path}' ({source}), so the write did not complete. \
+         Send each message as an Arrow IPC record batch matching the schema the stream declared. \
+         See: https://spiceai.org/docs/api/arrow-flight-sql"
+    )
+}
+
+/// Which of the two ways the write sink can finish ahead of the client's stream a discarded-data
+/// failure is reporting. Both lose client rows the same way and differ only in whether a batch had
+/// already been handed to the sink, which changes the count but not the remedy.
+#[derive(Clone, Copy, Debug)]
+enum SinkFinishedEarly {
+    /// The sink completed while the client was still streaming, with no batch handed to it.
+    WhileClientStreaming,
+    /// The sink completed with a batch already handed to it, which it therefore never accepted.
+    WithBatchPending,
+}
+
+impl std::fmt::Display for SinkFinishedEarly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WhileClientStreaming => {
+                f.write_str("the write sink completed before the client finished streaming")
+            }
+            Self::WithBatchPending => {
+                f.write_str("the write sink completed while a client batch was still pending")
+            }
+        }
+    }
+}
+
+/// The failure a client sees, and the operator reads in the log, when the write sink finished ahead
+/// of the client's stream and data messages the client streamed were therefore never written.
+///
+/// This is the `data_loss` path, which makes two parts of the wording load-bearing. The dataset goes
+/// in the message text rather than only in a `tracing` field, because this line is the operator's
+/// only record of *which* dataset dropped rows and a consumer reading the rendered message would
+/// otherwise lose it. And the remedy cannot be a bare "send it again": the sink accepted an unknown
+/// number of batches before it finished, so on an append table an unreconciled re-send duplicates
+/// exactly the rows that did land.
+fn discarded_data_message(
+    path: &TableReference,
+    cause: SinkFinishedEarly,
+    discarded: usize,
+) -> String {
+    format!(
+        "Failed to write every message the client streamed to dataset '{path}' ({cause}), so {discarded} data message(s) were dropped and the rows they carried are absent from the dataset. \
+         Re-send those rows, reconciling against the batches the sink did accept before it finished — on an append table an unreconciled re-send duplicates them. \
+         See: https://spiceai.org/docs/api/arrow-flight-sql"
+    )
+}
+
+/// The failure a client sees when the Arrow data it streamed holds a `MAP` column that cannot be
+/// brought in line with the Arrow map layout.
+///
+/// This is an append that has been consuming the client's stream, so it cannot say that nothing was
+/// written: a batch accepted before the refusing one may already have reached the sink. It says what
+/// holds for every batch the refusal can land on — the rest of the stream is not applied.
+fn map_entries_message(path: &TableReference, source: &map_entries::Error) -> String {
+    format!(
+        "Failed to write to dataset '{path}' ({source}), so the rest of the stream was not applied and any batch already accepted may have been. \
+         Send the MAP column with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
+         See: https://spiceai.org/docs/api/arrow-flight-sql"
+    )
+}
+
 async fn handle_record_batch(
     batch: RecordBatch,
     batch_tx: &Sender<Result<RecordBatch, DataFusionError>>,
@@ -583,11 +834,29 @@ async fn handle_record_batch(
 mod tests {
     use super::*;
 
-    fn data_message(body: &'static [u8]) -> FlightData {
-        FlightData {
-            data_body: body.into(),
-            ..Default::default()
-        }
+    /// Encodes `batch` the way a Flight client does and returns the messages after the leading
+    /// schema message: the batch itself, with a real IPC header. Building the messages by hand
+    /// would let the test agree with the code about a header layout neither shares with a client.
+    fn encoded_messages(batch: &RecordBatch) -> Vec<FlightData> {
+        let mut messages =
+            arrow_flight::utils::batches_to_flight_data(&batch.schema(), vec![batch.clone()])
+                .expect("encoding a batch as flight data");
+        // The leading message declares the schema and carries no rows.
+        messages.remove(0);
+        messages
+    }
+
+    /// A batch of one `Int32` row — the ordinary case, whose body is non-empty.
+    fn one_row_batch() -> RecordBatch {
+        use arrow::array::{ArrayRef, Int32Array};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+        )
+        .expect("building a one-row batch")
     }
 
     fn keepalive_message() -> FlightData {
@@ -604,34 +873,579 @@ mod tests {
     /// trailers, and transient read errors are ignored.
     #[tokio::test]
     async fn drain_counts_only_data_bearing_messages() {
-        let messages = vec![
-            Ok(data_message(b"batch-1")),
-            Ok(keepalive_message()),
-            Ok(data_message(b"batch-2")),
-            Ok(FlightData::default()), // empty trailer message
-            Err(Status::internal("transient read error")),
-            Ok(data_message(b"batch-3")),
-        ];
+        let batch = one_row_batch();
+        let mut messages: Vec<Result<FlightData, Status>> = vec![];
+        messages.extend(encoded_messages(&batch).into_iter().map(Ok));
+        messages.push(Ok(keepalive_message()));
+        messages.extend(encoded_messages(&batch).into_iter().map(Ok));
+        messages.push(Ok(FlightData::default())); // empty trailer message
+        messages.push(Err(Status::internal("transient read error")));
+        messages.extend(encoded_messages(&batch).into_iter().map(Ok));
+
         let mut stream = futures::stream::iter(messages);
-        assert_eq!(drain_discarded_data_batches(&mut stream).await, 3);
+        assert_eq!(
+            drain_discarded_data_batches(&mut stream).await,
+            DiscardedMessages {
+                total: 3,
+                unreadable_headers: 0
+            }
+        );
     }
 
-    /// A sink that completes exactly as the stream ends discards nothing, so
-    /// the write is still acked as a success.
+    /// The count sizes a data-loss report, so a batch of zero rows has to appear in it: the
+    /// client streamed it and it was not written. Arrow encodes such a batch as a `RecordBatch`
+    /// header with an empty body, so counting by body length reported it as nothing at all.
     #[tokio::test]
-    async fn drain_empty_stream_reports_zero() {
-        let mut stream = futures::stream::iter(Vec::<Result<FlightData, Status>>::new());
-        assert_eq!(drain_discarded_data_batches(&mut stream).await, 0);
+    async fn drain_counts_a_zero_row_batch() {
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let messages = encoded_messages(&RecordBatch::new_empty(schema));
+
+        assert_eq!(messages.len(), 1, "expected a single batch message");
+        assert!(
+            messages[0].data_body.is_empty(),
+            "a zero-row batch is expected to encode with an empty body; without that this case does not exercise the miscount"
+        );
+        // What the discriminator this replaces would have counted. Asserted so the case cannot
+        // quietly stop distinguishing the two: it is the whole reason the case exists.
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|data| !data.data_body.is_empty())
+                .count(),
+            0
+        );
+
+        let mut stream = futures::stream::iter(messages.into_iter().map(Ok::<_, Status>));
+        assert_eq!(
+            drain_discarded_data_batches(&mut stream).await,
+            DiscardedMessages {
+                total: 1,
+                unreadable_headers: 0
+            }
+        );
     }
 
+    /// A dictionary message carries the values its batch refers to, so discarding one discards
+    /// client data even though the message is not itself a batch. `Resend` because the default
+    /// hydrates dictionaries into plain arrays and no dictionary message is sent at all.
     #[tokio::test]
-    async fn drain_keepalive_and_trailers_only_reports_zero() {
-        let messages = vec![
+    async fn drain_counts_a_dictionary_message() {
+        use arrow::array::{ArrayRef, DictionaryArray};
+        use arrow::datatypes::Int32Type;
+        use arrow_flight::encode::{DictionaryHandling, FlightDataEncoderBuilder};
+        use arrow_schema::{DataType, Field, Schema};
+        use futures::TryStreamExt;
+
+        let values: DictionaryArray<Int32Type> = vec!["a", "b", "a"].into_iter().collect();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "label",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(values) as ArrayRef])
+            .expect("building a dictionary-encoded batch");
+
+        let mut messages: Vec<FlightData> = FlightDataEncoderBuilder::new()
+            .with_dictionary_handling(DictionaryHandling::Resend)
+            .build(futures::stream::iter(vec![Ok(batch)]))
+            .try_collect()
+            .await
+            .expect("encoding a dictionary batch as flight data");
+        // The leading message declares the schema and carries no rows.
+        messages.remove(0);
+
+        let dictionaries = messages
+            .iter()
+            .filter(|message| {
+                arrow_ipc::root_as_message(&message.data_header)
+                    .expect("parsing an encoded header")
+                    .header_type()
+                    == arrow_ipc::MessageHeader::DictionaryBatch
+            })
+            .count();
+        assert_eq!(
+            dictionaries, 1,
+            "expected the encoder to emit one dictionary message"
+        );
+
+        let expected = messages.len();
+        let mut stream = futures::stream::iter(messages.into_iter().map(Ok::<_, Status>));
+        assert_eq!(
+            drain_discarded_data_batches(&mut stream).await,
+            DiscardedMessages {
+                total: expected,
+                unreadable_headers: 0
+            }
+        );
+    }
+
+    /// A schema message declares no rows, so re-sending one after the sink completed loses
+    /// nothing and must not be reported as a discarded batch.
+    #[tokio::test]
+    async fn drain_does_not_count_a_schema_message() {
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let schema_message = arrow_flight::utils::batches_to_flight_data(&schema, vec![])
+            .expect("encoding a schema as flight data")
+            .remove(0);
+
+        assert!(
+            !schema_message.data_header.is_empty(),
+            "a schema message is expected to carry a header"
+        );
+
+        let mut stream = futures::stream::iter(vec![Ok::<_, Status>(schema_message)]);
+        assert_eq!(
+            drain_discarded_data_batches(&mut stream).await,
+            DiscardedMessages::default()
+        );
+    }
+
+    /// A header with bytes that will not parse is a malformed message, not an absent batch.
+    /// Under-reporting is the failure that matters for a data-loss count, so it counts — and it
+    /// is counted separately, because the caller reports one line per failed write rather than
+    /// one per message. The stream is client-controlled and unbounded, so a per-message log would
+    /// let one broken client write an arbitrarily long burst for a single failed request.
+    #[tokio::test]
+    async fn drain_counts_a_message_whose_header_will_not_parse() {
+        let malformed = || FlightData {
+            data_header: (&b"not an ipc message"[..]).into(),
+            ..Default::default()
+        };
+
+        let mut stream = futures::stream::iter(vec![
+            Ok::<_, Status>(malformed()),
             Ok(keepalive_message()),
+            Ok(malformed()),
+        ]);
+        assert_eq!(
+            drain_discarded_data_batches(&mut stream).await,
+            DiscardedMessages {
+                total: 2,
+                unreadable_headers: 2
+            }
+        );
+    }
+
+    /// A message carrying a body with no header to describe it is malformed client input, not
+    /// the metadata-only message Flight allows: its bytes are undecodable rather than absent,
+    /// and the write never applied them. Reading the header alone reports it as nothing at all,
+    /// so a stream ending on one was acked as a complete write.
+    ///
+    /// It counts toward `total` but *not* `unreadable_headers`, which is the one distinction this
+    /// case exists to pin: that counter is documented as headers that could not be read, and this
+    /// message has no header to fail on. Counting it there would conflate "the client sent a header
+    /// we could not parse" — worth investigating as a client or version problem — with "the client
+    /// sent no header at all", and the operator reading the pair could no longer tell which
+    /// happened. The rows are lost either way, so `total` covers the part that sizes the report.
+    #[tokio::test]
+    async fn drain_counts_a_body_with_no_header() {
+        let body_only = || FlightData {
+            data_body: (&b"rows the client sent"[..]).into(),
+            ..Default::default()
+        };
+
+        assert!(
+            body_only().data_header.is_empty(),
+            "the case is a body with no header; with a header it exercises nothing"
+        );
+
+        let mut stream = futures::stream::iter(vec![
+            Ok::<_, Status>(body_only()),
+            Ok(keepalive_message()),
+            // A message carrying neither loses nothing and must still not be counted.
             Ok(FlightData::default()),
-            Ok(keepalive_message()),
-        ];
-        let mut stream = futures::stream::iter(messages);
-        assert_eq!(drain_discarded_data_batches(&mut stream).await, 0);
+        ]);
+        assert_eq!(
+            drain_discarded_data_batches(&mut stream).await,
+            DiscardedMessages {
+                total: 1,
+                unreadable_headers: 0
+            }
+        );
+    }
+
+    /// Regression test for #13820: a body paired with a header that parses into something other
+    /// than a batch is still lost client data, and must not be acked as a complete write.
+    ///
+    /// Reading the header is what this change is for, but reading it *instead of* the body narrows
+    /// the count: `declares_ipc_data` answers `Ok(false)` for a schema message, a trailer, a
+    /// `Tensor`, or any IPC header a later Arrow version adds, and on that answer alone a
+    /// body-bearing message of those kinds would leave `total` at zero and the early-completion
+    /// path would return `PutResult::default()`. Counting by body length — which this branch
+    /// replaced — got this case right, so it is a floor to keep rather than a case to defer.
+    ///
+    /// A schema message is used because it is the shape a real client is likeliest to send with a
+    /// stray body; the arm it exercises is shared by every non-batch header.
+    #[tokio::test]
+    async fn drain_counts_a_body_under_a_non_data_header() {
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let mut schema_message = arrow_flight::utils::batches_to_flight_data(&schema, vec![])
+            .expect("encoding a schema as flight data")
+            .remove(0);
+        schema_message.data_body = (&b"rows the client sent"[..]).into();
+
+        assert!(
+            !schema_message.data_header.is_empty() && !schema_message.data_body.is_empty(),
+            "the case is a parseable non-data header carrying a body"
+        );
+
+        let mut stream = futures::stream::iter(vec![Ok::<_, Status>(schema_message)]);
+        assert_eq!(
+            drain_discarded_data_batches(&mut stream).await,
+            DiscardedMessages {
+                total: 1,
+                // The header read fine — it simply declared something else — so nothing about
+                // this message is an unreadable header.
+                unreadable_headers: 0
+            },
+            "a body under a non-data header is lost client data, not an absent batch"
+        );
+    }
+
+    /// The `data_loss` failure a client sees — and the line an operator reads in the log — when the
+    /// sink finished ahead of the client's stream. It is the operator's only record of which dataset
+    /// dropped rows, so it has to name the dataset *in the text*, say how many messages were lost,
+    /// state that those rows are absent, give a remedy that survives an append, and point at the
+    /// docs. A reword must not quietly drop any of them.
+    ///
+    /// Asserted for both causes, because the two call sites differ only in the cause they pass and a
+    /// message built for one of them must hold for the other.
+    #[test]
+    fn the_discarded_data_failure_names_the_dataset_the_loss_and_a_safe_remedy() {
+        for (cause, expected_cause) in [
+            (
+                super::SinkFinishedEarly::WhileClientStreaming,
+                "before the client finished streaming",
+            ),
+            (
+                super::SinkFinishedEarly::WithBatchPending,
+                "while a client batch was still pending",
+            ),
+        ] {
+            let message = super::discarded_data_message(
+                &TableReference::partial("sales", "orders"),
+                cause,
+                3,
+            );
+
+            assert!(
+                message.contains("'sales.orders'"),
+                "the dataset belongs in the text, not only a tracing field: {message}"
+            );
+            assert!(message.contains(expected_cause), "{message}");
+            assert!(
+                message.contains("3 data message(s) were dropped"),
+                "{message}"
+            );
+            assert!(
+                message.contains("absent from the dataset"),
+                "a data_loss message must state that the rows are gone: {message}"
+            );
+            assert!(
+                message.contains("reconciling against the batches the sink did accept"),
+                "a bare re-send duplicates the batches that did land: {message}"
+            );
+            assert!(
+                message.contains("https://spiceai.org/docs/api/arrow-flight-sql"),
+                "{message}"
+            );
+        }
+    }
+
+    /// The failure a client sees when its `MAP` column cannot be brought in line with the Arrow
+    /// map layout has to name the dataset, state what the write did and did not apply, give a
+    /// remediation that covers the case it actually refuses, and point at the docs — a reword must
+    /// not quietly drop any of the four.
+    #[test]
+    fn the_map_entries_refusal_names_the_dataset_the_impact_and_the_docs() {
+        let source = arrow_tools::map_entries::Error::MapEntriesContainNulls {
+            column: "attributes".to_string(),
+        };
+        let message =
+            super::map_entries_message(&TableReference::partial("sales", "orders"), &source);
+
+        assert!(message.contains("'sales.orders'"), "{message}");
+        assert!(
+            message.contains("the rest of the stream was not applied"),
+            "{message}"
+        );
+        assert!(
+            message.contains("may have been"),
+            "an append cannot claim nothing was written: {message}"
+        );
+        assert!(message.contains("attributes"), "{message}");
+        assert!(
+            message.contains("holds no null entries"),
+            "flipping the declaration does not fix the case this refuses: {message}"
+        );
+        assert!(
+            message.contains("https://spiceai.org/docs/api/arrow-flight-sql"),
+            "{message}"
+        );
+    }
+
+    /// Builds a `MapArray` the way the Flight decoder does — straight from `ArrayData`, so
+    /// neither of `MapArray::try_new`'s `entries` checks runs and a client's non-conforming
+    /// declaration survives the decode.
+    fn map_batch(entry_nulls: Option<arrow::buffer::NullBuffer>) -> RecordBatch {
+        use arrow::array::{Array, ArrayData, ArrayRef, MapArray, StringArray, StructArray};
+        use arrow::buffer::Buffer;
+        use arrow_schema::{DataType, Field, Fields, Schema};
+
+        let rows = entry_nulls
+            .as_ref()
+            .map_or(1, arrow::buffer::NullBuffer::len);
+        let entry_fields: Fields = vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into();
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields.clone()),
+                true,
+            )),
+            false,
+        );
+
+        let keys: Vec<String> = (0..rows).map(|i| format!("k{i}")).collect();
+        let values: Vec<String> = (0..rows).map(|i| format!("v{i}")).collect();
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(keys)) as ArrayRef,
+                Arc::new(StringArray::from(values)) as ArrayRef,
+            ],
+            entry_nulls,
+        )
+        .expect("entries struct");
+
+        let offsets: Vec<i32> = (0..=i32::try_from(rows).expect("row count")).collect();
+        let data = ArrayData::builder(data_type.clone())
+            .len(rows)
+            .add_buffer(Buffer::from_slice_ref(&offsets))
+            .add_child_data(entries.to_data())
+            .build()
+            .expect("map array data");
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
+            vec![Arc::new(MapArray::from(data)) as ArrayRef],
+        )
+        .expect("map batch")
+    }
+
+    /// The schema message and the data message a client would put on the wire for `batch`.
+    fn flight_messages(batch: &RecordBatch) -> Vec<FlightData> {
+        arrow_flight::utils::batches_to_flight_data(batch.schema().as_ref(), vec![batch.clone()])
+            .expect("encoding the batch")
+    }
+
+    fn conforming(schema: &arrow_schema::SchemaRef) -> bool {
+        match schema.field(0).data_type() {
+            arrow_schema::DataType::Map(entries, _) => !entries.is_nullable(),
+            other => panic!("expected a Map column, got {other:?}"),
+        }
+    }
+
+    /// Regression test for #13495: a batch of zero rows is still a batch. Arrow encodes one as a
+    /// `RecordBatch` message with an empty body, so a decoder that discriminates on body length
+    /// reports it as carrying no batch — and mid-stream this path refuses the whole write once
+    /// that happens, after earlier batches have already been appended, which a retry duplicates.
+    #[test]
+    fn a_zero_row_batch_is_decoded_rather_than_read_as_a_schema_message() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let guard = MapEntriesGuard::for_declared(Arc::clone(&schema));
+        let path = TableReference::bare("orders");
+        let dictionaries = HashMap::new();
+
+        let messages = flight_messages(&batch);
+        assert!(
+            messages
+                .last()
+                .expect("the encoding carries a batch message")
+                .data_body
+                .is_empty(),
+            "premise of this test: Arrow sends a zero-row batch with an empty body"
+        );
+
+        let decoded: Vec<RecordBatch> = messages
+            .iter()
+            .filter_map(|message| {
+                guard
+                    .decode(message, &dictionaries, &path)
+                    .expect("a zero-row batch decodes")
+            })
+            .collect();
+
+        let [decoded] = decoded.as_slice() else {
+            panic!("exactly one message carries a batch, got {}", decoded.len());
+        };
+        assert_eq!(decoded.num_rows(), 0);
+        assert_eq!(&decoded.schema(), guard.write_schema());
+    }
+
+    /// Regression test for #13495: a client declaring a `MAP`'s `entries` nullable — which the
+    /// Arrow map layout forbids — has the declaration corrected as each message is decoded, and
+    /// the write stream advertises the corrected schema rather than the client's. The two have to
+    /// agree: a stream that describes its batches with a type they no longer carry is a defect of
+    /// its own.
+    #[test]
+    fn a_clients_nullable_map_entries_declaration_is_corrected_before_the_sink() {
+        let batch = map_batch(None);
+        let guard = MapEntriesGuard::for_declared(batch.schema());
+        let path = TableReference::bare("orders");
+        let dictionaries = HashMap::new();
+
+        assert!(
+            conforming(guard.write_schema()),
+            "the write stream still advertises the client's non-conforming declaration"
+        );
+
+        let decoded: Vec<RecordBatch> = flight_messages(&batch)
+            .iter()
+            .filter_map(|message| {
+                guard
+                    .decode(message, &dictionaries, &path)
+                    .expect("a nullable entries declaration is relabelled, not refused")
+            })
+            .collect();
+
+        let [decoded] = decoded.as_slice() else {
+            panic!("exactly one message carries a batch, got {}", decoded.len());
+        };
+        assert!(conforming(&decoded.schema()));
+        assert_eq!(&decoded.schema(), guard.write_schema());
+        assert_eq!(decoded.num_rows(), 1);
+    }
+
+    /// The one shape relabelling cannot fix is refused at the decode, so it never reaches the
+    /// sink, and the refusal reaches the client as an argument error naming the column.
+    #[test]
+    fn a_map_whose_entries_carry_nulls_is_refused_before_the_sink() {
+        let batch = map_batch(Some(arrow::buffer::NullBuffer::from(vec![true, false])));
+        let guard = MapEntriesGuard::for_declared(batch.schema());
+        let path = TableReference::bare("orders");
+        let dictionaries = HashMap::new();
+
+        let statuses: Vec<Status> = flight_messages(&batch)
+            .iter()
+            .filter_map(|message| guard.decode(message, &dictionaries, &path).err())
+            .collect();
+
+        let [status] = statuses.as_slice() else {
+            panic!(
+                "the data message must be refused, got {} refusals",
+                statuses.len()
+            );
+        };
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("'orders'") && status.message().contains("'m'"),
+            "the refusal must name the dataset and the column: {}",
+            status.message()
+        );
+    }
+
+    /// The decode failure is reported by a function shared with the first message of the write,
+    /// so it must not claim a rollback it cannot guarantee — while still naming the dataset,
+    /// giving a remediation, and pointing at the docs.
+    #[test]
+    fn the_decode_failure_names_the_dataset_without_promising_a_rollback() {
+        let message = super::decode_failure_message(
+            &TableReference::partial("sales", "orders"),
+            &"unexpected end of stream",
+        );
+
+        assert!(message.contains("'sales.orders'"), "{message}");
+        assert!(message.contains("unexpected end of stream"), "{message}");
+        assert!(
+            !message.contains("the write was not applied"),
+            "a message shared with the mid-stream path cannot promise nothing was written: {message}"
+        );
+        assert!(
+            message.contains("Send each message as an Arrow IPC record batch"),
+            "{message}"
+        );
+        assert!(message.contains("https://spiceai.org/docs"), "{message}");
+    }
+
+    /// A schema message carries no batch. It is skipped rather than refused, which is what the
+    /// write has always done with a first message that holds only the schema.
+    #[test]
+    fn a_message_carrying_no_batch_is_skipped() {
+        let batch = map_batch(None);
+        let guard = MapEntriesGuard::for_declared(batch.schema());
+        let messages = flight_messages(&batch);
+        let schema_message = messages.first().expect("a schema message");
+
+        assert!(
+            guard
+                .decode(
+                    schema_message,
+                    &HashMap::new(),
+                    &TableReference::bare("orders")
+                )
+                .expect("a schema message is not a failure")
+                .is_none()
+        );
+    }
+
+    /// A message with no IPC header is metadata-only, not malformed: there are no bytes there to
+    /// misread, so it is skipped exactly as a schema message is.
+    #[test]
+    fn a_message_with_no_header_carries_no_batch() {
+        let guard = MapEntriesGuard::for_declared(map_batch(None).schema());
+
+        assert!(
+            guard
+                .decode(
+                    &FlightData::default(),
+                    &HashMap::new(),
+                    &TableReference::bare("orders")
+                )
+                .expect("a message with no header is not a failure")
+                .is_none()
+        );
+    }
+
+    /// A header that has bytes but will not parse is a malformed stream. Reporting it as a message
+    /// that merely carries no batch names the wrong problem and drops the reason the IPC was
+    /// rejected, so it is refused with the parse failure the client can act on.
+    #[test]
+    fn a_malformed_header_is_refused_with_the_parse_failure() {
+        let guard = MapEntriesGuard::for_declared(map_batch(None).schema());
+        let malformed = FlightData {
+            data_header: (&b"this is not a flatbuffer"[..]).into(),
+            ..Default::default()
+        };
+
+        let status = guard
+            .decode(&malformed, &HashMap::new(), &TableReference::bare("orders"))
+            .expect_err("a header that will not parse is a malformed stream");
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("Failed to read the Arrow data"),
+            "the parse failure has to reach the client, not an absent-batch diagnosis: {}",
+            status.message()
+        );
+        assert!(
+            !status.message().contains("carries no record batch"),
+            "a malformed header is not an absent batch: {}",
+            status.message()
+        );
     }
 }

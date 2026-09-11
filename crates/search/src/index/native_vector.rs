@@ -41,7 +41,7 @@ use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::{error::DataFusionError, logical_expr::LogicalPlan, sql::TableReference};
-use spice_table::Index;
+use spice_table::{GroupPruning, Index};
 
 /// A vector index that scores rows in-table via Spice's SIMD similarity UDFs.
 ///
@@ -113,6 +113,12 @@ impl Index for NativeVectorIndex {
         // No augmentation needed — the embedding column is already in the underlying
         // table, written through the normal accelerator sink.
         Ok(batches)
+    }
+
+    /// Co-located: a row's entry is the row itself, so an upsert that rewrites the row leaves no
+    /// group remainder to prune, and the no-op `delete_group_remainder` is complete.
+    fn group_pruning(&self) -> GroupPruning {
+        GroupPruning::Complete
     }
 
     // Co-located: the embedding lives in the accelerated table row itself, so it disappears

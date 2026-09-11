@@ -1124,6 +1124,28 @@ mod tests {
         )
     }
 
+    /// The lock budget a test uses when its contenders wait out real work rather
+    /// than prove a timeout.
+    ///
+    /// `LOCK_WAIT_BUDGET` is 250ms under `cfg(test)` so the tests that deliberately
+    /// wait out a held lock finish quickly. That budget is a suite convenience, not
+    /// a property of the code, and it is thin for a critical section that generates
+    /// a keypair and fsyncs twice before the next contender can take the lock. A
+    /// test about convergence takes the production budget so the timeout is not
+    /// what it measures.
+    const UNTIMED_LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+    fn load_or_create_within(
+        config_dir: &Path,
+        wait_budget: std::time::Duration,
+    ) -> Result<EnrollmentDraft> {
+        EnrollmentTransactionLock::acquire_with_budget(config_dir, wait_budget)?.load_or_create(
+            &test_instance("v2.2.0-test"),
+            Some("us-west-2"),
+            &test_binding(),
+        )
+    }
+
     #[test]
     fn creates_and_persists_a_fresh_draft() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1301,6 +1323,14 @@ mod tests {
         );
     }
 
+    /// Eight creators racing for one directory converge on a single operation.
+    ///
+    /// They serialize on the publication lock, and the winner holds it through key
+    /// generation and two fsyncs, so the last contender waits out all of that plus
+    /// six quick re-reads. That wait is not what this test is about, so it uses
+    /// [`UNTIMED_LOCK_WAIT_BUDGET`] rather than the 250ms suite budget: eight
+    /// contenders reach ~90ms of that budget on an idle machine, and a loaded CI
+    /// runner has taken one past it and failed here with `CreationInProgress`.
     #[test]
     fn concurrent_creation_publishes_one_operation() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1310,7 +1340,8 @@ mod tests {
                 .map(|_| {
                     scope.spawn(|| {
                         barrier.wait();
-                        load_or_create(dir.path()).expect("create or load")
+                        load_or_create_within(dir.path(), UNTIMED_LOCK_WAIT_BUDGET)
+                            .expect("create or load")
                     })
                 })
                 .collect();

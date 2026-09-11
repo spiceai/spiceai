@@ -107,6 +107,16 @@ impl DataConnector for DeferredConnector {
         self.inner.supports_durable_write_back_delivery()
     }
 
+    async fn write_back_deliverer(
+        &self,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
+    ) -> Option<
+        data_connector_api::DataConnectorResult<Arc<dyn data_connector_api::WriteBackDeliverer>>,
+    > {
+        self.inner.write_back_deliverer(context, dataset).await
+    }
+
     async fn changes_stream(
         &self,
         _context: &dyn ConnectorContext,

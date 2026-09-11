@@ -6,7 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.56",
+      "_score": "0.78",
       "dataset": "spice.public.qs",
       "matches": {
         "question": [
@@ -18,7 +18,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "0.51",
+      "_score": "0.75",
       "dataset": "spice.public.qs",
       "matches": {
         "question": [
@@ -30,7 +30,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "0.49",
+      "_score": "0.74",
       "dataset": "spice.public.qs",
       "matches": {
         "question": [
@@ -42,15 +42,15 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "0.45",
+      "_score": "0.73",
       "dataset": "spice.public.qs",
       "matches": {
         "question": [
-          "Which base number, when raised to the fifth power, equals thirty-two?"
+          "Find the number of groups of 7 in 21."
         ]
       },
       "primary_key": {
-        "id": 1277
+        "id": 359
       }
     }
   ]

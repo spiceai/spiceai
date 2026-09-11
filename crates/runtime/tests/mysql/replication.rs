@@ -506,6 +506,64 @@ async fn purged_position_behavior() -> Result<(), anyhow::Error> {
         .expect("rebuild persists a fresh position")
         .position;
     assert_ne!(repersisted.file, "binlog.999999");
+    drop(stream);
+
+    // `restart` with the initial snapshot DISABLED: the same rebuild, reached
+    // end to end through `resolve_start_position`. Regression test for #13024.
+    //
+    // `initial_snapshot: disabled` governs the first load. It cannot mean that
+    // an acceleration whose history the source dropped may keep serving rows
+    // the source no longer has, and this is the arm where that used to happen:
+    // the member streamed on from a freshly captured head, so a row deleted at
+    // the source inside the purged window kept being served by every later
+    // query — and persisting that head up front made it permanent, because the
+    // next start resumed cleanly and never revisited the gap.
+    let store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
+    store.save(&stale).await.expect("save stale position");
+    let mut input = stream_input(port, 200_203, Arc::clone(&store) as Arc<dyn PositionStore>);
+    input.params.invalid_position_behavior = InvalidCheckpointBehavior::Restart;
+    input.params.snapshot_mode = InitialSnapshotMode::Disabled;
+    let mut stream = start_replication_stream(input);
+
+    let envelope = next_envelope(
+        &mut stream,
+        "the rebuild signal under `initial_snapshot: disabled` (without it the member streams \
+         on from the source head and keeps every row deleted inside the purged window)",
+    )
+    .await?;
+    assert!(
+        envelope.history_unavailable(),
+        "a purged position under `restart` must ask the consumer to rebuild whatever \
+         `initial_snapshot` says"
+    );
+    // The rebuild does not use the snapshot machinery the mode disabled: it is
+    // one zero-row signal the consumer answers with an atomic replacement.
+    assert_eq!(num_rows(&envelope), 0);
+    assert!(ops_of(&envelope).is_empty());
+
+    // The stale position survives until the rebuild commits. Recording the new
+    // head before the replacement lands is what made the divergence permanent,
+    // and it would also let a crash mid-rebuild resume past rows that never
+    // arrived.
+    let held = store
+        .load()
+        .await
+        .expect("store readable")
+        .expect("the stale checkpoint is still there")
+        .position;
+    assert_eq!(
+        held.file, "binlog.999999",
+        "the fresh head must not be persisted before the rebuild is applied"
+    );
+
+    envelope.commit().await?;
+    let repersisted = store
+        .load()
+        .await
+        .expect("store readable")
+        .expect("rebuild persists a fresh position")
+        .position;
+    assert_ne!(repersisted.file, "binlog.999999");
 
     pool.disconnect().await?;
     Ok(())

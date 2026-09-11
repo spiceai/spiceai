@@ -344,6 +344,189 @@ pub fn create_embedding_array(
     Ok(Arc::new(builder.finish()))
 }
 
+/// Why a write cannot index a vector.
+///
+/// The variants are the two shapes [`keys_to_evict`] names, kept apart because each has
+/// its own diagnostic on the paths that count them separately, not because they call for
+/// different handling: both are [`RowOutcome::Rejected`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VectorRejection {
+    /// No component carries a direction — every one is zero or `NaN`, so the vector points
+    /// nowhere and a cosine distance to it is undefined.
+    NoDirection,
+    /// At least one component is `NaN` or `±Inf`, so every metric the index offers answers
+    /// `NaN`/`Inf` for this vector whatever it is compared against.
+    NonFinite,
+}
+
+impl VectorRejection {
+    /// The cause clause for the user-facing line the caller logs, worded to sit after the
+    /// name of the record being skipped.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NoDirection => "its embedding has no direction — every component is zero or NaN",
+            Self::NonFinite => {
+                "its embedding has a NaN or infinite component, so every distance to it is undefined"
+            }
+        }
+    }
+}
+
+/// Whether a vector can be indexed, by the one criterion [`keys_to_evict`] states: it must
+/// have a defined direction under the metrics the index offers.
+///
+/// The three write paths that participate in [`keys_to_evict`] — Elasticsearch, the
+/// in-memory index, and S3 Vectors — classify through this rather than spelling the test
+/// themselves. They did spell it separately, and two of the three carried only the
+/// [`VectorRejection::NoDirection`] limb — so a *partially* non-finite vector (`[1.0, NaN]`,
+/// `[0.0, Inf]`) was stored as if it were indexable and, being no rejection, evicted
+/// nothing (#13872). `Inf` is neither `== 0.0` nor `is_nan()`, so it does not merely escape
+/// the narrow limb, it actively prevents it from matching.
+///
+/// **Not every vector write reaches this.** The DuckDB vector index applies no criterion at
+/// all, and `PutVectors`' DataFusion sink spells its own — see #13901. Do not read a call to
+/// this as a guarantee that some other path enforced it.
+///
+/// `NoDirection` is tested first so that a vector which is both — `[NaN, NaN]` — is
+/// reported under the more specific of the two, which is what the paths counting the
+/// two separately have always reported it as.
+#[must_use]
+pub fn classify_vector(vector: &[f32]) -> Option<VectorRejection> {
+    if vector.iter().all(|&x| x == 0.0 || x.is_nan()) {
+        return Some(VectorRejection::NoDirection);
+    }
+    if vector.iter().any(|x| !x.is_finite()) {
+        return Some(VectorRejection::NonFinite);
+    }
+    None
+}
+
+/// The vector shapes no index may store, as `dims`-component vectors paired with the
+/// rejection each must classify as.
+///
+/// Shared by the classifier's own test and by the guard of each backend that classifies
+/// through it, so one of them cannot come to cover a narrower set than the criterion does —
+/// which is the shape of #13872, where two of the three carried only the
+/// [`VectorRejection::NoDirection`] limb.
+/// `dims` must be at least 2, since the partially non-finite shapes need a finite
+/// component to sit beside the non-finite one.
+#[cfg(test)]
+pub(crate) fn unindexable_shapes(dims: usize) -> Vec<(&'static str, Vec<f32>, VectorRejection)> {
+    assert!(
+        dims >= 2,
+        "a partially non-finite shape needs two components"
+    );
+    let last = dims - 1;
+    let with_last = |fill: f32, last_value: f32| {
+        let mut vector = vec![fill; dims];
+        vector[last] = last_value;
+        vector
+    };
+    vec![
+        ("all zero", vec![0.0; dims], VectorRejection::NoDirection),
+        (
+            "all NaN",
+            vec![f32::NAN; dims],
+            VectorRejection::NoDirection,
+        ),
+        (
+            "finite, one NaN",
+            with_last(1.0, f32::NAN),
+            VectorRejection::NonFinite,
+        ),
+        (
+            "finite, one +Inf",
+            with_last(1.0, f32::INFINITY),
+            VectorRejection::NonFinite,
+        ),
+        (
+            "finite, one -Inf",
+            with_last(1.0, f32::NEG_INFINITY),
+            VectorRejection::NonFinite,
+        ),
+        (
+            "all +Inf",
+            vec![f32::INFINITY; dims],
+            VectorRejection::NonFinite,
+        ),
+        (
+            "zero, one +Inf",
+            with_last(0.0, f32::INFINITY),
+            VectorRejection::NonFinite,
+        ),
+    ]
+}
+
+/// A vector every backend must store, as the control the shapes above are measured
+/// against. Deliberately the `1.0`-filled base of the partially non-finite shapes, so the
+/// only difference between this and a rejection is the one component under test.
+#[cfg(test)]
+pub(crate) fn indexable_shape(dims: usize) -> Vec<f32> {
+    vec![1.0; dims]
+}
+
+/// What a write did with one row, for the row's primary key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowOutcome {
+    /// The write is about to store this row under its key.
+    Indexed,
+    /// The write could not index this row — no embedding at all (a NULL or empty search
+    /// value), or one with no defined direction under any metric the index offers
+    /// (all-zero, all-NaN, non-finite).
+    Rejected,
+}
+
+/// The primary keys a write must remove from its index because it could not index
+/// the rows they name.
+///
+/// A vector write drops a row it cannot embed — a NULL or empty search text, or a
+/// vector with no defined direction under any metric the index offers. Dropping it
+/// from the write is not the same as removing it from the index: whatever the index
+/// already holds under that key stays there, so a row rewritten from an indexable
+/// value to a rejected one goes on being returned at its previous vector while the
+/// write's own log line says the row was not indexed.
+///
+/// A stale vector is a wrong search result — the index asserts the row matches text
+/// it no longer contains. An absent one is a correct-by-omission result that agrees
+/// with what the write reported, and it costs nothing that is not recoverable: a
+/// vector index is derived from its source table, so the row itself is untouched and
+/// the next indexable write restores it. Removing the entry is therefore the one
+/// behaviour every backend can implement with the delete primitive it already has,
+/// and it is what these paths do.
+///
+/// `rows` is every row of the batch that names a key, **in batch order**, tagged with
+/// what the write did with it. A key the batch carries more than once is decided by its
+/// **last** row, because that is the row the table itself resolves the key to under
+/// last-write-wins — so a key whose deciding row is [`RowOutcome::Rejected`] is evicted
+/// even when an earlier row of the same batch was indexable, and a key rejected earlier
+/// and indexed later is not evicted at all. Order is what carries that distinction, which
+/// is why this takes a sequence rather than two sets.
+///
+/// Callers must do two things with the result, and neither alone is enough:
+///
+/// - **Delete these keys before writing**, so the two orders agree.
+/// - **Drop from the write every row whose key this returns.** An earlier indexable row
+///   for an evicted key would otherwise be stored straight back over the delete, which
+///   re-establishes exactly the stale entry the eviction exists to remove.
+pub fn keys_to_evict<'a>(rows: impl IntoIterator<Item = (&'a str, RowOutcome)>) -> Vec<String> {
+    let mut deciding: std::collections::HashMap<&str, RowOutcome> =
+        std::collections::HashMap::new();
+    // Eviction order follows first appearance, so a batch always produces the same delete
+    // request for the same rows.
+    let mut first_seen: Vec<&str> = Vec::new();
+    for (key, outcome) in rows {
+        if deciding.insert(key, outcome).is_none() {
+            first_seen.push(key);
+        }
+    }
+    first_seen
+        .into_iter()
+        .filter(|key| deciding.get(key) == Some(&RowOutcome::Rejected))
+        .map(ToString::to_string)
+        .collect()
+}
+
 /// Reorder a [`RecordBatch`]'s columns alphabetically by field name.
 ///
 /// Because of limitations of `DFSchema::logically_equivalent_names_and_types` and its use in
@@ -637,6 +820,70 @@ mod tests {
         assert_eq!(names, vec!["alpha".to_string(), "zeta".to_string()]);
     }
 
+    fn owned(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(|k| (*k).to_string()).collect()
+    }
+
+    use RowOutcome::{Indexed, Rejected};
+
+    #[test]
+    fn keys_to_evict_names_every_rejected_key_the_write_does_not_also_store() {
+        let evicted = keys_to_evict([("a", Rejected), ("b", Rejected), ("c", Indexed)]);
+        assert_eq!(
+            evicted,
+            owned(&["a", "b"]),
+            "a rejected key is what leaves a stale vector behind, so it must be evicted"
+        );
+    }
+
+    /// The batch carries one key twice, rejected first and indexed after. The row that
+    /// decides the key is the one this write stores, so the entry it is about to write is
+    /// the current one and a delete for it would only cost a round trip.
+    #[test]
+    fn keys_to_evict_skips_a_key_the_same_write_stores_after_rejecting_it() {
+        let evicted = keys_to_evict([("a", Rejected), ("b", Rejected), ("b", Indexed)]);
+        assert_eq!(evicted, owned(&["a"]));
+    }
+
+    /// Regression test for #13848. The same pair the other way round: the row that decides
+    /// the key is the rejected one, so the entry the earlier row would leave behind is
+    /// exactly what has to go.
+    #[test]
+    fn keys_to_evict_names_a_key_whose_deciding_row_is_rejected() {
+        let evicted = keys_to_evict([("a", Indexed), ("b", Indexed), ("a", Rejected)]);
+        assert_eq!(
+            evicted,
+            owned(&["a"]),
+            "the table resolves a repeated key to its last row, so an earlier indexable row \
+             does not keep the key indexed"
+        );
+    }
+
+    #[test]
+    fn keys_to_evict_deduplicates_a_key_rejected_more_than_once() {
+        let evicted = keys_to_evict([
+            ("a", Rejected),
+            ("a", Rejected),
+            ("b", Rejected),
+            ("a", Rejected),
+        ]);
+        assert_eq!(
+            evicted,
+            owned(&["a", "b"]),
+            "one delete per key is enough; repeating it only costs request size"
+        );
+    }
+
+    #[test]
+    fn keys_to_evict_is_empty_when_the_write_rejected_nothing() {
+        assert!(keys_to_evict([("a", Indexed), ("b", Indexed)]).is_empty());
+    }
+
+    #[test]
+    fn keys_to_evict_is_empty_for_a_batch_that_names_no_key() {
+        assert!(keys_to_evict(std::iter::empty()).is_empty());
+    }
+
     #[test]
     fn test_extract_and_format_primary_key_composite_all_null_returns_none() {
         let batch = create_composite_primary_key_batch(
@@ -654,5 +901,33 @@ mod tests {
         assert_eq!(keys[0].as_deref(), Some("{\"id\":1,\"tenant\":\"a\"}"));
         assert_eq!(keys[1].as_deref(), Some("{\"tenant\":\"b\"}"));
         assert_eq!(keys[2], None);
+    }
+
+    /// Regression test for #13872. The criterion [`keys_to_evict`] states covers every
+    /// vector with no usable direction, and the classifier is the one place it is spelled.
+    #[test]
+    fn classify_vector_rejects_every_unindexable_shape() {
+        for (name, vector, expected) in unindexable_shapes(3) {
+            assert_eq!(
+                classify_vector(&vector),
+                Some(expected),
+                "{name} has no defined direction under any metric an index offers"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_vector_accepts_an_ordinary_vector() {
+        assert_eq!(classify_vector(&indexable_shape(3)), None);
+    }
+
+    /// A vector that is both all-NaN and non-finite is reported as the more specific of
+    /// the two, which is what the paths counting them separately have always logged it as.
+    #[test]
+    fn an_all_nan_vector_is_reported_as_having_no_direction() {
+        assert_eq!(
+            classify_vector(&[f32::NAN, f32::NAN]),
+            Some(VectorRejection::NoDirection)
+        );
     }
 }

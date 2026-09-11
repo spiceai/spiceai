@@ -22,7 +22,8 @@ datasets:
       github_token: ${secrets:GITHUB_PUBLIC_REPO_STARGAZERS_PAT}
     acceleration: &github_acceleration
       enabled: true
-      engine: duckdb
+      engine: cayenne
+      mode: file
       refresh_mode: append
       refresh_append_overlap: 5m
       refresh_check_interval: 1h

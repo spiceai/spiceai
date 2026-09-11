@@ -471,98 +471,6 @@ pub(crate) async fn verify_anthropic_model_available(model_id: &str) -> Result<(
     }
 }
 
-/// Response structure for Google Gemini models API
-#[derive(Debug, Deserialize)]
-struct GeminiModelResponse {
-    name: String,
-}
-
-/// Verify that a specific model is available from Google Gemini.
-/// This calls the Google Generative AI models API to check if the model exists.
-pub(crate) async fn verify_google_model_available(model_id: &str) -> Result<(), String> {
-    let api_key = std::env::var("SPICE_GOOGLE_API_KEY")
-        .map_err(|_| "SPICE_GOOGLE_API_KEY environment variable not set".to_string())?;
-
-    let client = reqwest::Client::new();
-    // Google Gemini models API uses the format: models/{model_id}
-    let url =
-        format!("https://generativelanguage.googleapis.com/v1beta/models/{model_id}?key={api_key}");
-
-    let response = client
-        .get(&url)
-        .header(CONTENT_TYPE, "application/json")
-        .send()
-        .await
-        .map_err(|e| format!("Failed to connect to Google Gemini API: {e}"))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read Google Gemini API response: {e}"))?;
-
-    if status.is_success() {
-        // Verify the response contains model info
-        if serde_json::from_str::<GeminiModelResponse>(&body).is_ok() {
-            Ok(())
-        } else {
-            Err(format!(
-                "Google Gemini model '{model_id}' response was unexpected: {body}"
-            ))
-        }
-    } else {
-        Err(format!(
-            "Google Gemini model '{model_id}' not available (HTTP {status}): {body}"
-        ))
-    }
-}
-
-/// List available Google Gemini models
-pub(crate) async fn list_google_models() -> Result<Vec<String>, String> {
-    let api_key = std::env::var("SPICE_GOOGLE_API_KEY")
-        .map_err(|_| "SPICE_GOOGLE_API_KEY environment variable not set".to_string())?;
-
-    let client = reqwest::Client::new();
-    let url = format!("https://generativelanguage.googleapis.com/v1beta/models?key={api_key}");
-
-    let response = client
-        .get(&url)
-        .header(CONTENT_TYPE, "application/json")
-        .send()
-        .await
-        .map_err(|e| format!("Failed to connect to Google Gemini API: {e}"))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read Google Gemini API response: {e}"))?;
-
-    if status.is_success() {
-        #[derive(Deserialize)]
-        struct ModelsResponse {
-            models: Vec<GeminiModelResponse>,
-        }
-        let models: ModelsResponse = serde_json::from_str(&body)
-            .map_err(|e| format!("Failed to parse Google Gemini models response: {e}"))?;
-        // Extract model names, stripping the "models/" prefix
-        Ok(models
-            .models
-            .into_iter()
-            .map(|m| {
-                m.name
-                    .strip_prefix("models/")
-                    .unwrap_or(&m.name)
-                    .to_string()
-            })
-            .collect())
-    } else {
-        Err(format!(
-            "Failed to list Google Gemini models (HTTP {status}): {body}"
-        ))
-    }
-}
-
 /// Verify that a Bedrock model is accessible.
 /// Since Bedrock uses AWS SDK authentication, we verify by checking if the model ID
 /// matches known Bedrock model patterns.
@@ -611,7 +519,6 @@ pub(crate) async fn verify_models_available(
                 "openai" => verify_openai_model_available(model_id).await,
                 "anthropic" => verify_anthropic_model_available(model_id).await,
                 "xai" => verify_xai_model_available(model_id).await,
-                "google" | "gemini" => verify_google_model_available(model_id).await,
                 "bedrock" => verify_bedrock_model_available(model_id),
                 _ => Err(format!("Unknown provider: {provider}")),
             };
@@ -663,13 +570,6 @@ impl ModelVerificationBuilder {
     #[must_use]
     pub fn xai(mut self, model_id: &str) -> Self {
         self.models.push(("xai".to_string(), model_id.to_string()));
-        self
-    }
-
-    #[must_use]
-    pub fn google(mut self, model_id: &str) -> Self {
-        self.models
-            .push(("google".to_string(), model_id.to_string()));
         self
     }
 

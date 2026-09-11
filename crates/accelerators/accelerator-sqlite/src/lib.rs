@@ -42,9 +42,9 @@ use datafusion_table_providers::{
 use runtime_acceleration::Engine;
 use runtime_acceleration::acceleration::Mode;
 use runtime_acceleration::snapshot::AccelerationEngine;
+use runtime_datafusion::function_support::deny_spice_functions_for_sqlite_table_providers;
 use runtime_parameters::ParameterSpec;
 use runtime_table_partition::expression::PartitionedBy;
-use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
@@ -144,7 +144,7 @@ impl SqliteAccelerator {
             sqlite_factory: SqliteTableProviderFactory::new()
                 .with_batch_insert_use_prepared_statements(true)
                 .with_decimal_between(true)
-                .with_function_support(deny_spice_functions_for_table_providers()),
+                .with_function_support(deny_spice_functions_for_sqlite_table_providers()),
         }
     }
 

@@ -180,11 +180,13 @@ pub async fn execute(ctx: &RuntimeContext, args: &TraceArgs) -> Result<()> {
 
 fn is_valid_trace_task(task: &str) -> bool {
     // Built-in task types are matched exactly. Custom and MCP-proxied tools are recorded
-    // dynamically in task_history as `tool_use::<tool>` or `tool_use::<server>/<tool>`
-    // (via the `task_override` label emitted in runtime-tools), so the static allowlist
-    // can never enumerate them. Accept any `tool_use::`-prefixed task with a non-empty
-    // suffix; the SQL filter already quotes the value via `quote_sql_string`, so this does
-    // not introduce injection. See https://github.com/spiceai/spiceai/issues/10995.
+    // dynamically in task_history as `tool_use::<tool>` or, for a catalog-qualified tool,
+    // `tool_use::<server>__<tool>` (via the `task_override` label emitted in runtime-tools),
+    // so the static allowlist can never enumerate them. Accept any `tool_use::`-prefixed
+    // task with a non-empty suffix — which also keeps rows written under the pre-#11629
+    // `<server>/<tool>` spelling traceable. The SQL filter already quotes the value via
+    // `quote_sql_string`, so this does not introduce injection.
+    // See https://github.com/spiceai/spiceai/issues/10995.
     SUPPORTED_TRACE_TASKS.contains(&task)
         || task
             .strip_prefix("tool_use::")
@@ -497,11 +499,14 @@ mod tests {
     #[test]
     fn dynamic_mcp_tool_use_tasks_are_valid() {
         // Regression for https://github.com/spiceai/spiceai/issues/10995: MCP and other
-        // custom tools are recorded with dynamic `tool_use::<server>/<tool>` task names.
-        assert!(is_valid_trace_task("tool_use::github/search_code"));
-        assert!(is_valid_trace_task("tool_use::my_catalog/my_tool"));
+        // custom tools are recorded with dynamic `tool_use::<server>__<tool>` task names.
+        assert!(is_valid_trace_task("tool_use::github__search_code"));
+        assert!(is_valid_trace_task("tool_use::my_catalog__my_tool"));
         // A custom tool without a server segment is also valid.
         assert!(is_valid_trace_task("tool_use::custom_tool"));
+        // Rows written before #13338 carry the `<server>/<tool>` spelling and must stay
+        // traceable — the fix changed what the runtime writes, not what history holds.
+        assert!(is_valid_trace_task("tool_use::github/search_code"));
     }
 
     #[test]
@@ -516,9 +521,9 @@ mod tests {
     fn dynamic_tool_task_produces_quoted_sql_filter() {
         // The dynamic name must flow through unchanged and be single-quoted so it is a
         // literal (not injected) in the generated SQL.
-        let filter = get_trace_filter("tool_use::github/search_code", None, None);
+        let filter = get_trace_filter("tool_use::github__search_code", None, None);
         assert!(
-            filter.contains("task='tool_use::github/search_code'"),
+            filter.contains("task='tool_use::github__search_code'"),
             "got: {filter}"
         );
     }

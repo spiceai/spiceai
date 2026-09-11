@@ -17,6 +17,7 @@ limitations under the License.
 //! Login command and subcommands for authenticating with various data sources.
 
 mod auth_config;
+pub(crate) mod keychain;
 mod providers;
 pub mod session;
 
@@ -28,6 +29,9 @@ use spice_cloud_client::redirect::same_origin_redirect_policy;
 pub use auth_config::{
     env_file_path, env_file_vars, merge_auth_config, read_env_var, store_keychain,
 };
+
+#[cfg(test)]
+pub(crate) use auth_config::test_env_file;
 
 /// Credential storage backend for `spice login`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]

@@ -23,7 +23,7 @@ limitations under the License.
 //! 3. Bulk-indexes the documents into Elasticsearch, using the primary key as
 //!    the document `_id`.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow::array::{
     Array, FixedSizeListBuilder, Float32Builder, LargeStringArray, RecordBatch, StringArray,
@@ -36,8 +36,9 @@ use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 use util::{convert_string_arrow_to_iterator, distribute_nulls};
 
-use crate::index::elasticsearch::ElasticsearchIndex;
+use crate::index::elasticsearch::{ElasticsearchIndex, delete};
 use crate::index::embedding_col;
+use crate::index::write_util;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -109,6 +110,14 @@ pub enum Error {
         "Failed to write to Elasticsearch index '{index}': source column '{column}' collides with the configured vector_field name. Rename one of the columns so the embedding vector does not silently overwrite a source value."
     ))]
     VectorFieldCollidesWithSourceColumn { index: String, column: String },
+
+    #[snafu(display(
+        "Failed to update the search index '{index}' (elasticsearch): the documents stored for the records this write could not embed could not be removed, so a search would return them at their previous value. Cause: {source}"
+    ))]
+    CannotEvictRejectedRecords {
+        index: String,
+        source: datafusion::error::DataFusionError,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -160,8 +169,25 @@ pub async fn write(index: &ElasticsearchIndex, record: RecordBatch) -> Result<Re
 
     // Build all documents in a sync block so the arrow-json encoders (which are
     // `!Send`) are dropped before any subsequent `.await`.
-    let docs: Vec<(Option<String>, Value)> =
+    let (docs, evicted): (Vec<(Option<String>, Value)>, Vec<String>) =
         build_documents(index, &record, &embedding_vectors, &primary_keys)?;
+
+    // Before the bulk index, for two reasons. A key this batch both rejects and indexes is
+    // excluded from `evicted`, so deleting first is what lets the two orders agree. And the
+    // delete and the `_bulk` are separate requests that cannot be made atomic, so one of them
+    // has to be able to land without the other: deleting first fails toward the stale document
+    // being gone, whereas indexing first fails toward it still being searchable — which is the
+    // bug. A retry of the whole batch converges either way, because the delete is idempotent
+    // and the rows it addresses are exactly the ones no `index` action will restore.
+    // No rejected row means no extra request at all.
+    if !evicted.is_empty() {
+        delete::delete_by_ids(index.client.as_ref(), es_index, &evicted)
+            .await
+            .map_err(|source| Error::CannotEvictRejectedRecords {
+                index: es_index.to_string(),
+                source,
+            })?;
+    }
 
     if docs.is_empty() {
         tracing::debug!(
@@ -200,14 +226,18 @@ pub async fn write(index: &ElasticsearchIndex, record: RecordBatch) -> Result<Re
 
 /// Build ES `_bulk` documents from a record batch + pre-computed embeddings.
 ///
+/// Returns the documents to index and, beside them, the `_id`s of the rows this batch
+/// could not index and must therefore delete (see [`write_util::keys_to_evict`]).
+///
 /// Kept sync so the arrow-json encoders it uses (which are `!Send`) stay off
 /// the async state machine.
+#[expect(clippy::type_complexity)]
 fn build_documents(
     index: &ElasticsearchIndex,
     record: &RecordBatch,
     embedding_vectors: &[Option<Vec<f32>>],
     primary_keys: &[Option<String>],
-) -> Result<Vec<(Option<String>, Value)>> {
+) -> Result<(Vec<(Option<String>, Value)>, Vec<String>)> {
     // Aggregate per-row skip reasons into batch-level counts (plus a small
     // sample of row indices) to avoid high-volume per-row logs on large
     // batches with many NULLs or invalid embeddings.
@@ -261,16 +291,26 @@ fn build_documents(
 
     let expected_dims = usize::try_from(index.dims.max(0)).unwrap_or(0);
 
+    // What this batch did with each row that names an `_id`, in row order. A document
+    // already stored under a rejected `_id` holds a vector from an earlier value of the
+    // row's text, which a search would go on returning — see
+    // [`write_util::keys_to_evict`], which also decides a repeated `_id` by its last row.
+    let mut outcomes: Vec<(&str, write_util::RowOutcome)> = Vec::with_capacity(record.num_rows());
+
     for row in 0..record.num_rows() {
         let Some(embedding) = embedding_vectors[row].as_ref() else {
             missing_embedding_skips += 1;
+            if let Some(id) = primary_keys[row].as_ref() {
+                outcomes.push((id.as_str(), write_util::RowOutcome::Rejected));
+            }
             continue;
         };
 
         // Skip rows with NULL primary keys when a primary key is configured.
         // Without an `_id`, Elasticsearch would auto-generate one, making
         // re-indexing the same row non-idempotent (producing duplicates on
-        // refresh/CDC writes).
+        // refresh/CDC writes). No `_id` also means no document this write can
+        // address, so there is nothing for it to evict.
         if !index.primary_key.is_empty() && primary_keys[row].is_none() {
             null_pk_skips += 1;
             if null_pk_samples.len() < SAMPLE_LIMIT {
@@ -288,18 +328,21 @@ fn build_documents(
             });
         }
 
-        if embedding.iter().all(|&x| x == 0.0 || x.is_nan()) {
-            zero_or_nan_skips += 1;
-            if zero_or_nan_samples.len() < SAMPLE_LIMIT {
-                zero_or_nan_samples.push(row);
+        if let Some(rejection) = write_util::classify_vector(embedding) {
+            let (skips, samples) = match rejection {
+                write_util::VectorRejection::NoDirection => {
+                    (&mut zero_or_nan_skips, &mut zero_or_nan_samples)
+                }
+                write_util::VectorRejection::NonFinite => {
+                    (&mut non_finite_skips, &mut non_finite_samples)
+                }
+            };
+            *skips += 1;
+            if samples.len() < SAMPLE_LIMIT {
+                samples.push(row);
             }
-            continue;
-        }
-
-        if embedding.iter().any(|x| !x.is_finite()) {
-            non_finite_skips += 1;
-            if non_finite_samples.len() < SAMPLE_LIMIT {
-                non_finite_samples.push(row);
+            if let Some(id) = primary_keys[row].as_ref() {
+                outcomes.push((id.as_str(), write_util::RowOutcome::Rejected));
             }
             continue;
         }
@@ -332,6 +375,9 @@ fn build_documents(
         );
         doc.insert(index.vector_field.clone(), vec_json);
 
+        if let Some(id) = primary_keys[row].as_ref() {
+            outcomes.push((id.as_str(), write_util::RowOutcome::Indexed));
+        }
         docs.push((primary_keys[row].clone(), Value::Object(doc)));
     }
 
@@ -342,12 +388,12 @@ fn build_documents(
     }
     if zero_or_nan_skips > 0 {
         tracing::warn!(
-            "Skipped {zero_or_nan_skips} record(s) for Elasticsearch index '{es_index}': embedding vector is all zeros or NaN. Sample row indices: {zero_or_nan_samples:?}"
+            "Skipped {zero_or_nan_skips} record(s) for Elasticsearch index '{es_index}': embedding vector is all zeros or NaN. Any document already stored for those records is removed, so a search does not return them at their previous value. Sample row indices: {zero_or_nan_samples:?}"
         );
     }
     if non_finite_skips > 0 {
         tracing::warn!(
-            "Skipped {non_finite_skips} record(s) for Elasticsearch index '{es_index}': embedding vector contains non-finite values (NaN or infinity). Sample row indices: {non_finite_samples:?}"
+            "Skipped {non_finite_skips} record(s) for Elasticsearch index '{es_index}': embedding vector contains non-finite values (NaN or infinity). Any document already stored for those records is removed, so a search does not return them at their previous value. Sample row indices: {non_finite_samples:?}"
         );
     }
     if missing_embedding_skips > 0 {
@@ -356,7 +402,16 @@ fn build_documents(
         );
     }
 
-    Ok(docs)
+    let evicted = write_util::keys_to_evict(outcomes);
+
+    // A document whose `_id` is evicted must not be indexed by this same request: the
+    // delete runs first, so leaving it in `docs` would restore under that `_id` a row a
+    // later row of the same batch replaced with one this write could not index.
+    if !evicted.is_empty() {
+        let evicted_ids: HashSet<&str> = evicted.iter().map(String::as_str).collect();
+        docs.retain(|(id, _)| !id.as_deref().is_some_and(|id| evicted_ids.contains(id)));
+    }
+    Ok((docs, evicted))
 }
 
 async fn embed_column(
@@ -719,7 +774,7 @@ const MAX_CATEGORY_LEN: usize = 64;
 /// Rather than copy a network-provided string into an error, a token that does not match the
 /// expected shape is replaced wholesale (never truncated, so no fragment of it survives).
 /// This also keeps the message on one line, as the logging rules require.
-fn categorical_token(value: &str) -> &str {
+pub(super) fn categorical_token(value: &str) -> &str {
     let looks_categorical = !value.is_empty()
         && value.len() <= MAX_CATEGORY_LEN
         && value
@@ -776,17 +831,57 @@ fn describe_bulk_failure(position: usize, op: &Value) -> String {
     )
 }
 
+/// Top-level keys an Elasticsearch write or delete response is allowed to name.
+///
+/// Covers the `_bulk` response (`took`, `errors`, `items`), the `_delete_by_query` response,
+/// the `{"task": …}` handle it returns instead when asked not to wait for completion, and
+/// the `{"error": …, "status": …}` envelope they share on failure.
+const KNOWN_RESPONSE_KEYS: &[&str] = &[
+    "batches",
+    "deleted",
+    "error",
+    "errors",
+    "failures",
+    "items",
+    "noops",
+    "requests_per_second",
+    "retries",
+    "status",
+    "task",
+    "throttled_millis",
+    "throttled_until_millis",
+    "timed_out",
+    "took",
+    "total",
+    "version_conflicts",
+];
+
+/// Accept `key` only if it is one Elasticsearch itself puts at the top level of a response.
+///
+/// [`categorical_token`] is the wrong filter for a response key: it admits *any*
+/// `lower_snake_case` string, and a document identifier (`customer_123`) has exactly that
+/// shape, so it would be copied verbatim into the error and `runtime.task_history`. The set
+/// of top-level keys is fixed and small, so match it exactly instead of by shape.
+fn response_key_token(key: &str) -> &str {
+    if KNOWN_RESPONSE_KEYS.contains(&key) {
+        key
+    } else {
+        UNRECOGNIZED_CATEGORY
+    }
+}
+
 /// Describe an unexpected `_bulk` response body by its shape alone.
 ///
 /// A successful bulk response contains one item per document, each naming its `_id`, so the
 /// body itself can never be reported. Its top-level key names are what actually distinguish
 /// the interesting cases (an `{"error": …}` envelope from a proxy versus a truncated
-/// response), and each goes through [`categorical_token`] because an unexpected response is
-/// exactly the case where the keys are not Elasticsearch's own.
-fn describe_unexpected_response(resp: &Value) -> String {
+/// response), and each goes through [`response_key_token`] — an unexpected response is
+/// exactly the case where the keys are *not* Elasticsearch's own, so a key is reported only
+/// when it is one Elasticsearch itself defines.
+pub(super) fn describe_unexpected_response(resp: &Value) -> String {
     match resp {
         Value::Object(map) => {
-            let mut keys: Vec<&str> = map.keys().map(|k| categorical_token(k)).collect();
+            let mut keys: Vec<&str> = map.keys().map(|k| response_key_token(k)).collect();
             keys.sort_unstable();
             // Several rejected keys collapse onto the same placeholder; report it once.
             keys.dedup();
@@ -900,6 +995,235 @@ mod tests {
             panic!("expected a BulkIndexItemErrors rejection");
         };
         failures
+    }
+
+    mod eviction {
+        use std::sync::Arc;
+
+        use arrow::array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use super::super::build_documents;
+        use crate::index::elasticsearch::{
+            ElasticsearchIndex, ElasticsearchIndexWriteMaintenance, unused_client,
+        };
+        use crate::index::write_util;
+        use crate::metadata::MetadataColumns;
+
+        const DIMS: i32 = 2;
+
+        /// `build_documents` neither embeds nor talks to Elasticsearch — it is handed the
+        /// embeddings and the `_id`s — so the index's client and embedder only have to exist.
+        #[derive(Debug)]
+        struct Unused;
+
+        #[async_trait::async_trait]
+        impl llms::embeddings::Embed for Unused {
+            async fn embed(
+                &self,
+                _input: llms::embeddings::EmbeddingInput,
+            ) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+                panic!("build_documents must not embed");
+            }
+
+            fn size(&self) -> i32 {
+                DIMS
+            }
+        }
+
+        fn index() -> ElasticsearchIndex {
+            let source_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("content", DataType::Utf8, true),
+            ]));
+            ElasticsearchIndex {
+                client: Arc::new(unused_client::UnusedClient),
+                es_index: "idx".to_string(),
+                embedded_column: "content".to_string(),
+                vector_field: "content_vector".to_string(),
+                text_fields: vec![],
+                primary_key: vec![Field::new("id", DataType::Int64, false)],
+                compute_query: Arc::new(Unused),
+                dims: DIMS,
+                similarity: "cosine".to_string(),
+                source_schema,
+                metadata_columns: MetadataColumns::none(),
+                batch_write_rows: 100,
+                write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::default()),
+            }
+        }
+
+        fn record(ids: &[i64]) -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("content", DataType::Utf8, true),
+            ]));
+            let contents: Vec<String> = ids.iter().map(|id| format!("row {id}")).collect();
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(ids.to_vec())),
+                    Arc::new(StringArray::from(contents)),
+                ],
+            )
+            .expect("valid test batch")
+        }
+
+        fn keys(ids: &[i64]) -> Vec<Option<String>> {
+            ids.iter().map(|id| Some(id.to_string())).collect()
+        }
+
+        fn evicted(ids: &[i64], embeddings: &[Option<Vec<f32>>]) -> Vec<String> {
+            let index = index();
+            let (_docs, evicted) = build_documents(&index, &record(ids), embeddings, &keys(ids))
+                .expect("documents build");
+            let mut evicted = evicted;
+            evicted.sort();
+            evicted
+        }
+
+        /// Regression test for #13503. A row rewritten from an indexable embedding to a
+        /// rejected one is left out of the `_bulk` body, which only ever carries `index`
+        /// actions — so the document stored under its `_id` survives untouched and search
+        /// keeps returning it at the vector its previous text produced.
+        #[test]
+        fn an_all_zero_or_nan_embedding_evicts_its_document() {
+            assert_eq!(
+                evicted(
+                    &[1, 2, 3],
+                    &[
+                        Some(vec![1.0, 2.0]),
+                        Some(vec![0.0, 0.0]),
+                        Some(vec![f32::NAN, f32::NAN]),
+                    ],
+                ),
+                vec!["2".to_string(), "3".to_string()],
+            );
+        }
+
+        /// Elasticsearch is the one backend that already rejected a *partially* non-finite
+        /// vector, so this class is live on it today.
+        #[test]
+        fn a_partially_non_finite_embedding_evicts_its_document() {
+            assert_eq!(
+                evicted(
+                    &[1, 2, 3],
+                    &[
+                        Some(vec![1.0, 2.0]),
+                        Some(vec![1.0, f32::NAN]),
+                        Some(vec![1.0, f32::INFINITY]),
+                    ],
+                ),
+                vec!["2".to_string(), "3".to_string()],
+            );
+        }
+
+        /// No embedding at all — a NULL or empty search text — leaves the same stale
+        /// document behind as a rejected one.
+        #[test]
+        fn a_row_with_no_embedding_evicts_its_document() {
+            assert_eq!(
+                evicted(&[1, 2], &[Some(vec![1.0, 2.0]), None]),
+                vec!["2".to_string()],
+            );
+        }
+
+        /// Regression test for #13872. Elasticsearch already rejected every shape, so this
+        /// is the guard that keeps it aligned with the other two backends rather than a
+        /// behaviour change — and it runs the same shared list they do, so a shape added
+        /// for one backend cannot quietly go uncovered here.
+        #[test]
+        fn every_unindexable_shape_evicts_its_document_and_indexes_nothing() {
+            let ids = [1, 2, 1];
+            for (name, deciding, _) in write_util::unindexable_shapes(2) {
+                let embeddings = [Some(vec![1.0, 2.0]), Some(vec![3.0, 4.0]), Some(deciding)];
+                assert_eq!(
+                    evicted(&ids, &embeddings),
+                    vec!["1".to_string()],
+                    "the deciding row for _id 1 carries a {name} vector, so the document \
+                     the earlier row stored answers a search from text it no longer has"
+                );
+                assert_eq!(
+                    indexed_ids(&ids, &embeddings),
+                    vec!["2".to_string()],
+                    "re-indexing the earlier row would restore the document just deleted"
+                );
+            }
+        }
+
+        /// The control: an ordinary vector in the same position is stored and evicts nothing.
+        #[test]
+        fn an_ordinary_deciding_vector_evicts_nothing() {
+            let ids = [1, 2, 1];
+            let embeddings = [
+                Some(vec![1.0, 2.0]),
+                Some(vec![3.0, 4.0]),
+                Some(write_util::indexable_shape(2)),
+            ];
+            assert!(evicted(&ids, &embeddings).is_empty());
+            assert_eq!(
+                indexed_ids(&ids, &embeddings),
+                vec!["1".to_string(), "2".to_string(), "1".to_string()],
+            );
+        }
+
+        /// The `_id`s the `_bulk` body would carry, in the order it carries them.
+        fn indexed_ids(ids: &[i64], embeddings: &[Option<Vec<f32>>]) -> Vec<String> {
+            let index = index();
+            let (docs, _evicted) = build_documents(&index, &record(ids), embeddings, &keys(ids))
+                .expect("documents build");
+            docs.into_iter()
+                .map(|(id, _)| id.expect("every test row names an _id"))
+                .collect()
+        }
+
+        /// Regression test for #13848. One batch carries `_id` 1 twice, and the row that
+        /// *decides* it — the last — is one Elasticsearch cannot be given a vector for. The
+        /// document the earlier row would index is exactly the stale one, so it must neither
+        /// survive the delete nor be re-indexed by the `_bulk` that follows it.
+        #[test]
+        fn a_repeated_id_whose_deciding_row_is_rejected_is_evicted_and_not_indexed() {
+            let ids = [1, 2, 1];
+            let embeddings = [
+                Some(vec![1.0, 2.0]),
+                Some(vec![3.0, 4.0]),
+                Some(vec![0.0, 0.0]),
+            ];
+
+            assert_eq!(evicted(&ids, &embeddings), vec!["1".to_string()]);
+            assert_eq!(
+                indexed_ids(&ids, &embeddings),
+                vec!["2".to_string()],
+                "the delete runs first, so indexing the earlier row would restore the \
+                 document it just removed"
+            );
+        }
+
+        /// The other direction: the deciding row is the indexable one, so the `_bulk`
+        /// re-establishes the document and a delete would only cost a request.
+        #[test]
+        fn a_repeated_id_indexed_after_being_rejected_is_not_evicted() {
+            let ids = [1, 2, 1];
+            let embeddings = [
+                Some(vec![0.0, 0.0]),
+                Some(vec![3.0, 4.0]),
+                Some(vec![5.0, 6.0]),
+            ];
+
+            assert!(evicted(&ids, &embeddings).is_empty());
+            assert_eq!(
+                indexed_ids(&ids, &embeddings),
+                vec!["2".to_string(), "1".to_string()],
+            );
+        }
+
+        #[test]
+        fn a_batch_that_indexes_every_row_evicts_nothing() {
+            assert!(
+                evicted(&[1, 2], &[Some(vec![1.0, 2.0]), Some(vec![3.0, 4.0])]).is_empty(),
+                "the happy path must issue no delete request at all"
+            );
+        }
     }
 
     #[test]
@@ -1188,6 +1512,22 @@ mod tests {
             message.matches(UNRECOGNIZED_CATEGORY).count(),
             1,
             "the three rejected keys must collapse to one placeholder: {message}"
+        );
+        assert!(
+            message.contains("took"),
+            "a legitimate key must still be reported: {message}"
+        );
+    }
+
+    /// A document identifier is `lower_snake_case` too, so shape alone cannot reject it.
+    #[test]
+    fn an_identifier_shaped_response_key_is_replaced() {
+        let resp = json!({ "took": 3, "customer_123": 1, "order_2026_08_08": 2 });
+
+        let message = describe(&resp);
+        assert!(
+            !message.contains("customer_123") && !message.contains("order_2026_08_08"),
+            "an identifier-shaped response key reached the error: {message}"
         );
         assert!(
             message.contains("took"),

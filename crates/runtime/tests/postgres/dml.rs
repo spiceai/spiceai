@@ -138,7 +138,7 @@ async fn refresh_dataset(rt: &runtime::Runtime, name: &str) -> Result<(), anyhow
         .await?;
     notifier
         .ok_or_else(|| anyhow::anyhow!("no completion notifier for {name}"))?
-        .notified()
+        .wait()
         .await;
     Ok(())
 }

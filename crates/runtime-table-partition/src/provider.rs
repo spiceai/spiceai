@@ -459,7 +459,10 @@ impl TableProvider for PartitionTableProvider {
         };
 
         if let Some(limit) = limit {
-            return Ok(Arc::new(GlobalLimitExec::new(plan, limit, None)));
+            // `GlobalLimitExec::new(input, skip, fetch)` — each partition already returned at most
+            // `limit` rows, so the union has to be cut to the first `limit` of them: skip nothing,
+            // fetch `limit`.
+            return Ok(Arc::new(GlobalLimitExec::new(plan, 0, Some(limit))));
         }
 
         Ok(plan)
@@ -1166,10 +1169,98 @@ mod tests {
             .expect("scan failed");
 
         // With a limit, should wrap in GlobalLimitExec
-        assert!(
-            plan.is::<GlobalLimitExec>(),
-            "Expected GlobalLimitExec when limit is provided"
+        let limit_exec = plan
+            .downcast_ref::<GlobalLimitExec>()
+            .expect("Expected GlobalLimitExec when limit is provided");
+
+        // The limit is a `fetch`, not a `skip`: asserting only the plan's *type* let a swapped
+        // `GlobalLimitExec::new(plan, limit, None)` pass while the scan returned rows
+        // `limit + 1..` — or, as here with a limit above the row count, nothing at all.
+        assert_eq!(limit_exec.skip(), 0, "the scan limit must not skip rows");
+        assert_eq!(
+            limit_exec.fetch(),
+            Some(10),
+            "the scan limit must be applied as a fetch"
         );
+
+        let rows = collect_rows(&plan, &session_state).await;
+        assert_eq!(
+            rows,
+            vec![1, 2, 3],
+            "a limit above the row count must return every row"
+        );
+    }
+
+    /// A limit below the total row count returns the *first* `limit` rows, not the rows after them.
+    #[tokio::test]
+    async fn test_scan_limit_returns_the_first_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+
+        let partitions_data = vec![(
+            ScalarValue::Utf8(Some("us-east-1".to_string())),
+            Arc::new(
+                MemTable::try_new(
+                    Arc::clone(&schema),
+                    vec![vec![create_test_batch("us-east-1", vec![1, 2, 3, 4, 5])]],
+                )
+                .expect("failed to create MemTable"),
+            ) as Arc<dyn TableProvider>,
+        )];
+
+        let creator = Arc::new(MockCreator {
+            partitions_data: Arc::new(RwLock::new(partitions_data)),
+        });
+
+        let partition_by = PartitionedBy {
+            name: "region".to_string(),
+            expression: col("region"),
+        };
+
+        let provider =
+            PartitionTableProvider::new(creator, vec![partition_by], Arc::clone(&schema))
+                .await
+                .expect("failed to create provider");
+
+        let session_state = datafusion::execution::context::SessionContext::new().state();
+        let plan = provider
+            .scan(&session_state, None, &[], Some(2))
+            .await
+            .expect("scan failed");
+
+        let rows = collect_rows(&plan, &session_state).await;
+        assert_eq!(
+            rows,
+            vec![1, 2],
+            "a limit of 2 over 5 rows must return the first 2"
+        );
+    }
+
+    /// Executes `plan` and returns the `id` column of every row, in the order produced.
+    async fn collect_rows(
+        plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        session_state: &datafusion::execution::context::SessionState,
+    ) -> Vec<i32> {
+        let batches =
+            datafusion::physical_plan::collect(Arc::clone(plan), session_state.task_ctx())
+                .await
+                .expect("failed to execute the scan plan");
+
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .expect("the scan output carries an id column")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is an Int32 column")
+                    .values()
+                    .to_vec()
+            })
+            .collect()
     }
 
     #[tokio::test]

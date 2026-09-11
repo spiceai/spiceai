@@ -71,7 +71,7 @@ pub struct MissingKeyDeletionVector {
 }
 
 /// Directory under the table snapshot where deletion vectors are stored.
-const DELETION_DIR_NAME: &str = "deletions";
+pub(crate) const DELETION_DIR_NAME: &str = "deletions";
 /// File extension used for deletion-vector files.
 const DELETION_FILE_EXTENSION: &str = "arrow";
 /// File format recorded in the catalog for deletion vectors.

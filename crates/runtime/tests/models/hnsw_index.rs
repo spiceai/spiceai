@@ -140,7 +140,7 @@ async fn refresh_table(rt: &Arc<Runtime>, table_name: &str) -> Result<(), anyhow
         .await?;
     notifier
         .ok_or_else(|| anyhow::anyhow!("No refresh notifier returned for {table_name}"))?
-        .notified()
+        .wait()
         .await;
     Ok(())
 }

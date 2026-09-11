@@ -332,7 +332,7 @@ pub(crate) async fn refresh_table(rt: Arc<Runtime>, table_name: &str) -> Result<
         .await?;
     notifier
         .ok_or_else(|| anyhow::anyhow!("Failed to refresh table"))?
-        .notified()
+        .wait()
         .await;
     Ok(())
 }

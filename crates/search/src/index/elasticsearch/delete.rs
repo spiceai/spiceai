@@ -18,12 +18,68 @@ use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use elasticsearch::Elasticsearch;
+use elasticsearch::{Elasticsearch, FieldMapping};
 use serde_json::{Value, json};
-use snafu::ResultExt;
+use snafu::Snafu;
 
 use super::write;
 use crate::index::chunking::ChunkedSearchIndex;
+
+#[derive(Snafu, Debug)]
+pub enum Error {
+    #[snafu(display(
+        "Failed to delete rows from the search index '{index}' (elasticsearch): Elasticsearch applied the delete only partially — {failures} document failure(s), {version_conflicts} version conflict(s), {undeleted} of {total} matched document(s) left in place, timed out: {timed_out}. First failure: {first}. The index still holds documents for rows the dataset no longer has, so a search can return them. Reconcile the index against the source before re-running this delete: a version conflict means the row was written concurrently, so re-issuing the delete can remove the document that write just produced. Any other failure needs its reported error class resolved on the Elasticsearch index first. See: https://spiceai.org/docs/features/search"
+    ))]
+    DeleteByQueryPartiallyApplied {
+        index: String,
+        failures: usize,
+        version_conflicts: u64,
+        undeleted: u64,
+        total: u64,
+        timed_out: bool,
+        first: String,
+    },
+
+    #[snafu(display(
+        "Failed to delete rows from the search index '{index}' (elasticsearch): the _delete_by_query response carries no usable `{field}`, so it cannot be confirmed that every matching document was deleted; got {shape}. Check whether a proxy sits in front of Elasticsearch and is rewriting the response. See: https://spiceai.org/docs/features/search"
+    ))]
+    UnexpectedDeleteResponse {
+        index: String,
+        field: &'static str,
+        shape: String,
+    },
+
+    #[snafu(display(
+        "Failed to delete rows from the search index '{index}' (elasticsearch): its field mapping could not be read, so it is not known which field an exact-match filter on the key columns {columns} has to name; the delete was not issued. Cause: {source}"
+    ))]
+    KeyColumnMappingUnreadable {
+        index: String,
+        columns: String,
+        source: elasticsearch::Error,
+    },
+
+    #[snafu(display(
+        "Failed to delete rows from the search index '{index}' (elasticsearch): key column '{column}' is mapped `{mapped_as}`, which no exact-match filter can address — a `text` mapping indexes analyzed tokens rather than the value, and an unsearchable mapping indexes nothing — and it has no exact-match sub-field either, so the delete was not issued. Map '{column}' as a searchable `keyword` and re-create the index; Elasticsearch cannot change an existing field's type. See: https://spiceai.org/docs/features/search"
+    ))]
+    KeyColumnNotExactlyMatchable {
+        index: String,
+        column: String,
+        mapped_as: String,
+    },
+
+    #[snafu(display(
+        "Failed to delete rows from the search index '{index}' (elasticsearch): a key in column '{column}' is {length} characters, past the `ignore_above: {ignore_above}` of the '{path}' field it is matched on, so Elasticsearch never indexed it and no filter can address its documents; the delete was not issued. Re-create the index so the runtime maps its key columns as `keyword` with no `ignore_above`. See: https://spiceai.org/docs/features/search"
+    ))]
+    KeyValueNotIndexed {
+        index: String,
+        column: String,
+        path: String,
+        length: usize,
+        ignore_above: i64,
+    },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// The columns to address documents by in [`delete_by_keys`], given an index's `primary_key`.
 ///
@@ -47,13 +103,11 @@ const DELETE_CHUNK_ROWS: usize = 512;
 /// `key_columns` covers every `primary_key` column, a prefix delete when it's a strict subset
 /// (the chunked-index case).
 ///
-/// The two cases address documents differently, because filtering on a key *column* is not
-/// reliable. Nothing maps the primary-key columns: the index mapping the runtime creates covers
-/// the vector field, the configured text fields, and declared metadata columns only, so a string
-/// key is dynamically mapped `text` and its inverted index holds *analyzed* tokens. A `term`
-/// query is not analyzed, so `{"term": {"id": "ORDER-1024"}}` looks for one token in an index
-/// holding `[order, 1024]` and matches nothing — a delete that reports success having removed
-/// no documents (#12267).
+/// The two cases address documents differently, because filtering on a key *column* depends on
+/// how that column is mapped. A string column with no mapping of its own is dynamically mapped
+/// `text`, whose inverted index holds *analyzed* tokens; a `term` query is not analyzed, so
+/// `{"term": {"id": "ORDER-1024"}}` looks for one token in an index holding `[order, 1024]` and
+/// matches nothing — a delete that reports success having removed no documents (#12267, #13714).
 ///
 /// So when `key_columns` covers the whole primary key, this addresses documents by `_id` via an
 /// `ids` query. `_id` is the value the write path already stores for the row, derived by the
@@ -61,8 +115,13 @@ const DELETE_CHUNK_ROWS: usize = 512;
 /// the write produced — no field mapping, no analysis, and no dependence on the key's type.
 ///
 /// A strict subset of the key (the chunked-index case) cannot use `_id`, because the chunk id is
-/// part of it and is unknown at delete time; that case still filters on the key columns and so
-/// remains subject to the mapping gap above.
+/// part of it and is unknown at delete time. That case filters on the key columns, so it first
+/// reads the index mapping and resolves each key column to the field path a `term` matches the
+/// stored value on — the column itself when it is mapped to an exact-match type, its `keyword`
+/// multi-field when the column is `text` (which is what dynamic mapping gives an unmapped string,
+/// and what the runtime maps a key column that is also a search field to). A column that resolves
+/// to neither is refused by name rather than filtered on: the filter would match nothing, and
+/// reporting that as a successful delete is the failure this addressing exists to avoid (#13714).
 ///
 /// Only reads `key_columns` from `keys`, ignoring any other column present — `keys` may be
 /// shaped by [`spice_table::Index::required_columns`] (a superset of the primary
@@ -71,7 +130,10 @@ const DELETE_CHUNK_ROWS: usize = 512;
 ///
 /// Issues one `_delete_by_query` request per [`DELETE_CHUNK_ROWS`]-row slice of `keys` rather
 /// than a single request for the whole batch, so a large delete can't build an unbounded
-/// clause or id list.
+/// clause or id list. Every chunk is issued even when an earlier one comes back only partially
+/// applied, or fails outright against an index that was reached; the first such failure is
+/// reported once the batch is through. Only a refused connection ends the batch early, since it
+/// is the one failure that says the later chunks have nothing to reach either.
 ///
 /// Shared by [`super::ElasticsearchIndex`] and [`super::ElasticsearchTextIndex`], which both
 /// address documents the same way (client + index name + primary key columns).
@@ -90,6 +152,36 @@ pub async fn delete_by_keys(
             .iter()
             .all(|f| key_columns.iter().any(|c| c == f.name()));
 
+    // An empty batch addresses nothing, so it must not reach out to the index at all — including
+    // for the mapping read below, whose failure would report a delete of no rows as failed.
+    if keys.num_rows() == 0 {
+        return Ok(());
+    }
+
+    // Resolve once for the whole batch, before the first request: every chunk filters on the same
+    // columns, and a key column with no exact-match field path fails the delete outright rather
+    // than per chunk.
+    let key_paths = if addresses_whole_key {
+        Vec::new()
+    } else {
+        match resolve_term_exact_paths(client, es_index, key_columns).await {
+            Ok(Some(paths)) => paths,
+            // No document carries these columns, so there is nothing this delete can address.
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(DataFusionError::External(Box::new(e))),
+        }
+    };
+
+    // Before the first request, not per chunk: a key the resolved field never indexed fails the
+    // whole delete, and finding that out three chunks in would leave the batch half applied.
+    ensure_keys_are_indexable(es_index, &key_paths, keys)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    // Hold the first failure and keep going. Each chunk is an independent `_delete_by_query` over
+    // its own slice of `keys`, so returning at the first one would leave every later chunk
+    // unissued, turning a report of a partial delete into a cause of a larger one.
+    let mut failure: Option<DataFusionError> = None;
+
     let mut offset = 0;
     while offset < keys.num_rows() {
         let len = DELETE_CHUNK_ROWS.min(keys.num_rows() - offset);
@@ -99,20 +191,270 @@ pub async fn delete_by_keys(
         let query = if addresses_whole_key {
             build_ids_query(primary_key, es_index, &chunk)?
         } else {
-            build_or_of_row_term_queries(key_columns, &chunk)?
+            build_or_of_row_term_queries(&key_paths, &chunk)?
         };
         let Some(query) = query else {
             continue;
         };
 
-        client
-            .delete_by_query(es_index, &query)
-            .await
-            .boxed()
-            .map_err(DataFusionError::External)?;
+        let outcome = issue_delete_chunk(client, es_index, &query).await;
+        if let Some(e) = outcome.failure {
+            failure.get_or_insert(e);
+        }
+        if outcome.never_reached {
+            break;
+        }
+    }
+
+    if let Some(e) = failure {
+        return Err(e);
     }
 
     Ok(())
+}
+
+/// What issuing one `_delete_by_query` chunk produced: the failure to report, if any, and
+/// whether the rest of the batch has anything to reach.
+struct ChunkOutcome {
+    failure: Option<DataFusionError>,
+    never_reached: bool,
+}
+
+/// Issue one `_delete_by_query` and classify what came back.
+///
+/// Only a refused connection proves this chunk never reached the index, and so that no later
+/// chunk will either — stopping there costs nothing and spares a dead node one request per
+/// remaining chunk. Every other error leaves the delete's fate unknown: `JsonParse` is raised
+/// *after* a 2xx, so Elasticsearch ran that delete and only the body was unreadable, and a
+/// status error or a timeout can each land on a request the index already applied in part.
+/// Treating those as "never reached" is what would leave the later chunks unissued — a larger
+/// divergence than the one being reported.
+async fn issue_delete_chunk(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+    query: &Value,
+) -> ChunkOutcome {
+    match client.delete_by_query(es_index, query).await {
+        Ok(resp) => ChunkOutcome {
+            // Report the first, which is the one whose surrounding state a reconcile starts
+            // from; later chunks fail the same way once the index has diverged.
+            failure: inspect_delete_response(&resp, es_index)
+                .err()
+                .map(|e| DataFusionError::External(Box::new(e))),
+            never_reached: false,
+        },
+        Err(e) => {
+            let never_reached = matches!(
+                &e,
+                elasticsearch::Error::HttpRequest { source } if source.is_connect()
+            );
+            ChunkOutcome {
+                failure: Some(DataFusionError::External(Box::new(e))),
+                never_reached,
+            }
+        }
+    }
+}
+
+/// Delete the documents stored under `ids`, addressing them by `_id`.
+///
+/// The write path derives each document's `_id` from its row's primary key and holds it while
+/// building the batch, so a write that could not index a row already has the identity of the
+/// document it has to remove — no re-derivation, and no dependence on the key's field mapping
+/// (see [`delete_by_keys`] for why filtering on a key column is not reliable).
+///
+/// Chunked and error-reported exactly as [`delete_by_keys`] is, via [`issue_delete_chunk`].
+pub async fn delete_by_ids(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+    ids: &[String],
+) -> DataFusionResult<()> {
+    let mut failure: Option<DataFusionError> = None;
+
+    for chunk in ids.chunks(DELETE_CHUNK_ROWS) {
+        let values: Vec<Value> = chunk.iter().cloned().map(Value::String).collect();
+        if values.is_empty() {
+            continue;
+        }
+        let query = json!({ "ids": { "values": values } });
+
+        let outcome = issue_delete_chunk(client, es_index, &query).await;
+        if let Some(e) = outcome.failure {
+            failure.get_or_insert(e);
+        }
+        if outcome.never_reached {
+            break;
+        }
+    }
+
+    if let Some(e) = failure {
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+/// Check a `_delete_by_query` response body and return an error unless every matching document
+/// was deleted.
+///
+/// A `2xx` only means the request ran. `_delete_by_query` snapshots the index when it starts and
+/// then deletes document by document, reporting per-document outcomes in the body: `failures`
+/// carries the ones that errored, and `version_conflicts` counts the ones skipped because their
+/// version moved after the snapshot — which a concurrent write cycle over the same rows produces.
+/// Ignoring the body reports a partial delete as a success, leaving documents behind for rows the
+/// dataset no longer has (#12364), the same observable symptom as #12267 and #12272.
+///
+/// Reports rather than retries. Re-issuing the query here is not a safe repair: the delete
+/// addresses documents by the `_id` derived from the row's primary key, so an upsert that rewrote
+/// that row under the same `_id` is exactly what raises the conflict, and an automatic retry would
+/// delete the document that write just produced. Every caller drives this from a delete it has
+/// already applied to the accelerator and logs the error rather than propagating it, so surfacing
+/// it makes the divergence visible where the retry decision can be made with the source in hand.
+///
+/// Success is positively confirmed, never assumed from the absence of a complaint. `failures` and
+/// `version_conflicts` name only the outcomes Elasticsearch chose to itemise; a request can also
+/// leave documents behind by running out of time (`timed_out`), which it reports as a flag rather
+/// than as a failure entry. So the counts have to agree as well: `deleted` must reach `total`, the
+/// number of documents the initial search matched. A body reporting `timed_out: true, total: 2,
+/// deleted: 1` with no conflicts and an empty `failures` array is a partial delete that every
+/// itemised signal calls clean.
+fn inspect_delete_response(resp: &Value, es_index: &str) -> Result<()> {
+    // Elasticsearch and OpenSearch both always include these in a synchronous `_delete_by_query`
+    // response. A missing one means the body is not one — a `wait_for_completion` task handle, or
+    // a proxy's envelope — and neither confirms the delete applied. `total` and `deleted` are
+    // required for the same reason `failures` is: without them the delete cannot be confirmed,
+    // and coercing an absent count to a convenient default would manufacture that confirmation.
+    //
+    // Each arm reports `shape` rather than the body itself: the body can carry document ids (its
+    // `failures` entries do), and the shape is what distinguishes an async task handle from a
+    // proxy's error envelope.
+    let Some(failures) = resp.get("failures").and_then(Value::as_array) else {
+        return UnexpectedDeleteResponseSnafu {
+            index: es_index.to_string(),
+            field: "failures",
+            shape: write::describe_unexpected_response(resp),
+        }
+        .fail();
+    };
+    let Some(total) = resp.get("total").and_then(Value::as_u64) else {
+        return UnexpectedDeleteResponseSnafu {
+            index: es_index.to_string(),
+            field: "total",
+            shape: write::describe_unexpected_response(resp),
+        }
+        .fail();
+    };
+    let Some(deleted) = resp.get("deleted").and_then(Value::as_u64) else {
+        return UnexpectedDeleteResponseSnafu {
+            index: es_index.to_string(),
+            field: "deleted",
+            shape: write::describe_unexpected_response(resp),
+        }
+        .fail();
+    };
+    // Present but not a number is a rewritten body, not a zero — reading it as one would report a
+    // conflicted delete as clean.
+    let version_conflicts = match resp.get("version_conflicts").map(Value::as_u64) {
+        None => 0,
+        Some(Some(count)) => count,
+        Some(None) => {
+            return UnexpectedDeleteResponseSnafu {
+                index: es_index.to_string(),
+                field: "version_conflicts",
+                shape: write::describe_unexpected_response(resp),
+            }
+            .fail();
+        }
+    };
+    // Absent means the request did not report a timeout, which is the claim being tested — unlike
+    // the counts above, reading it as `false` asserts nothing that the body denies. Present but not
+    // a boolean is a rewritten body rather than that silence, and reading it as `false` would
+    // assert the one thing this field exists to deny, so it is rejected like `version_conflicts`.
+    let timed_out = match resp.get("timed_out").map(Value::as_bool) {
+        None => false,
+        Some(Some(flag)) => flag,
+        Some(None) => {
+            return UnexpectedDeleteResponseSnafu {
+                index: es_index.to_string(),
+                field: "timed_out",
+                shape: write::describe_unexpected_response(resp),
+            }
+            .fail();
+        }
+    };
+
+    // `deleted` counts documents drawn from the `total` the initial search matched, so it cannot
+    // exceed it. A body where it does is not a response this function can read a verdict from;
+    // saturating the difference to zero would turn that contradiction into a clean delete.
+    let Some(undeleted) = total.checked_sub(deleted) else {
+        return UnexpectedDeleteResponseSnafu {
+            index: es_index.to_string(),
+            field: "deleted",
+            shape: write::describe_unexpected_response(resp),
+        }
+        .fail();
+    };
+
+    if failures.is_empty() && version_conflicts == 0 && undeleted == 0 && !timed_out {
+        return Ok(());
+    }
+
+    let first = match failures.first() {
+        Some(failure) => describe_delete_failure(failure),
+        // Conflicts alone: `conflicts=abort` (the default) stops the request and reports the
+        // count, and older versions report it without a matching `failures` entry. A timeout or a
+        // short `deleted` count has no failure entry to describe either.
+        None => "no failure entry; the delete stopped before every matching document was deleted"
+            .to_string(),
+    };
+
+    DeleteByQueryPartiallyAppliedSnafu {
+        index: es_index.to_string(),
+        failures: failures.len(),
+        version_conflicts,
+        undeleted,
+        total,
+        timed_out,
+        first,
+    }
+    .fail()
+}
+
+/// Describe a `_delete_by_query` failure entry from a whitelist of non-identifying fields.
+///
+/// A failure entry names the document it belongs to (`id` is the row's primary key, see
+/// [`write::extract_primary_key_from_fields`]) and Elasticsearch's free-form `cause.reason` quotes
+/// it too — a version conflict reads `[<_id>]: version conflict, current version [2] is different
+/// than the one provided [1]`. This error is logged by every caller and recorded in
+/// `runtime.task_history`, so only fixed vocabulary is reported: the HTTP `status` and the
+/// exception class names, each through [`write::categorical_token`] — never `reason`, never `id`,
+/// never the entry itself.
+fn describe_delete_failure(failure: &Value) -> String {
+    let mut parts = Vec::with_capacity(3);
+
+    if let Some(status) = failure.get("status").and_then(Value::as_u64) {
+        parts.push(format!("status {status}"));
+    }
+
+    let cause = failure.get("cause");
+    if let Some(kind) = cause.and_then(|c| c.get("type")).and_then(Value::as_str) {
+        parts.push(write::categorical_token(kind).to_string());
+    }
+    if let Some(caused_by) = cause
+        .and_then(|c| c.get("caused_by"))
+        .and_then(|c| c.get("type"))
+        .and_then(Value::as_str)
+    {
+        parts.push(format!("caused by {}", write::categorical_token(caused_by)));
+    }
+
+    if parts.is_empty() {
+        // Neither a status nor a typed cause: say so rather than falling back to stringifying the
+        // entry, which would name the document directly.
+        parts.push("no status or cause type reported".to_string());
+    }
+
+    parts.join(", ")
 }
 
 /// Builds `{"ids": {"values": ["<_id>", ...]}}` — the documents written for `keys`, addressed by
@@ -138,29 +480,34 @@ fn build_ids_query(
 }
 
 /// Builds `{"bool": {"should": [{"bool": {"filter": [{"term": {...}}, ...]}}, ...], "minimum_should_match": 1}}`
-/// — one `should` clause (`key_columns` ANDed) per row of `keys`, rows ORed together.
+/// — one `should` clause (the key columns ANDed) per row of `keys`, rows ORed together.
+///
+/// Each term names the field path [`resolve_term_exact_paths`] resolved for that column, which is
+/// not always the column's own name: a `text`-mapped column is matched on its `keyword`
+/// multi-field, since the column itself holds analyzed tokens.
 fn build_or_of_row_term_queries(
-    key_columns: &[String],
+    key_paths: &[KeyFieldPath],
     keys: &RecordBatch,
 ) -> DataFusionResult<Option<Value>> {
-    if keys.num_rows() == 0 || key_columns.is_empty() {
+    if keys.num_rows() == 0 || key_paths.is_empty() {
         return Ok(None);
     }
 
-    let arrays: Vec<_> = key_columns
+    let arrays: Vec<_> = key_paths
         .iter()
-        .map(|name| keys.column_by_name(name).cloned())
+        .map(|p| keys.column_by_name(&p.column).cloned())
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| {
+            let columns: Vec<&str> = key_paths.iter().map(|p| p.column.as_str()).collect();
             DataFusionError::Plan(format!(
-                "delete key batch is missing one of the requested key columns: {key_columns:?}"
+                "delete key batch is missing one of the requested key columns: {columns:?}"
             ))
         })?;
 
     let mut row_clauses = Vec::with_capacity(keys.num_rows());
     for row in 0..keys.num_rows() {
-        let mut terms = Vec::with_capacity(key_columns.len());
-        for (name, array) in key_columns.iter().zip(&arrays) {
+        let mut terms = Vec::with_capacity(key_paths.len());
+        for (key_path, array) in key_paths.iter().zip(&arrays) {
             let value = ScalarValue::try_from_array(array.as_ref(), row)?;
             let Some(json_value) = scalar_to_term_value(&value) else {
                 // A NULL/unsupported key column can never equal anything via `term` — skip this
@@ -168,7 +515,7 @@ fn build_or_of_row_term_queries(
                 terms.clear();
                 break;
             };
-            terms.push(json!({ "term": { name.as_str(): json_value } }));
+            terms.push(json!({ "term": { key_path.path.as_str(): json_value } }));
         }
         if !terms.is_empty() {
             row_clauses.push(json!({ "bool": { "filter": terms } }));
@@ -185,6 +532,215 @@ fn build_or_of_row_term_queries(
             "minimum_should_match": 1
         }
     })))
+}
+
+/// The Elasticsearch field a key column's values are matched on, and the length past which that
+/// field stops indexing them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyFieldPath {
+    /// The key column, as it is named in the delete-key batch.
+    column: String,
+    /// The field path a `term` query has to name to match that column's stored value — `column`
+    /// itself, or one of its multi-fields (`column.keyword`).
+    path: String,
+    /// `path`'s `ignore_above`, when it declares one: a longer string is stored but not indexed,
+    /// so no filter reaches it.
+    ignore_above: Option<i64>,
+}
+
+/// Elasticsearch field types whose indexed form is the value itself, so an unanalyzed `term`
+/// query matches what the write path stored.
+///
+/// `text` (and its variants) is deliberately absent: it holds the value's *analyzed* tokens, so a
+/// `term` for `ORDER-1024` searches an index holding `[order, 1024]` and matches nothing. Being
+/// one of these types is necessary but not sufficient — see [`is_term_exact`].
+const TERM_EXACT_FIELD_TYPES: &[&str] = &[
+    "boolean",
+    "byte",
+    "constant_keyword",
+    "date",
+    "date_nanos",
+    "double",
+    "float",
+    "half_float",
+    "integer",
+    "ip",
+    "keyword",
+    "long",
+    "scaled_float",
+    "short",
+    "unsigned_long",
+    "version",
+    "wildcard",
+];
+
+/// Whether a `term` on this field matches the value the write path stored: an exact type, and
+/// searchable at all. A field mapped `index: false` — which is what a column the user declared
+/// non-filterable gets — is stored in `_source` and indexed nowhere, so a filter naming it
+/// matches nothing however exact its type is.
+fn is_term_exact(mapping: &FieldMapping) -> bool {
+    mapping.is_indexed()
+        && mapping
+            .field_type
+            .as_deref()
+            .is_some_and(|t| TERM_EXACT_FIELD_TYPES.contains(&t))
+}
+
+/// Resolves each of `key_columns` to the field path an exact-match `term` query has to name, by
+/// reading `es_index`'s live mapping.
+///
+/// The runtime maps a key column as `keyword` when it creates the index, but the index may
+/// predate that, may have been created by the user, or may map the column as a search field — so
+/// what a `term` has to name is a property of the index in front of us, not of our own intent.
+/// Three outcomes, and the third is the point:
+///
+/// - the column is mapped to an exact type — name the column;
+/// - the column is `text` with an exact multi-field (`keyword`, which dynamic mapping derives for
+///   every unmapped string) — name that sub-field;
+/// - neither — return [`Error::KeyColumnNotExactlyMatchable`]. No filter can address the
+///   documents, and issuing one anyway is what let a delete remove nothing and report success.
+///
+/// Returns `Ok(None)` when a key column is absent from the mapping entirely: Elasticsearch maps a
+/// field the first time a document carries it, so no document holds that column and the delete
+/// has nothing to address. That is a delete of rows the index does not have, not a failure. The
+/// exception is an index the user pre-created with `dynamic: false` and then populated elsewhere,
+/// where a document can carry an unmapped field — but the runtime maps its own key columns when
+/// it prepares the index, so a column it writes is mapped by the time any delete runs.
+async fn resolve_term_exact_paths(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+    key_columns: &[String],
+) -> Result<Option<Vec<KeyFieldPath>>> {
+    if key_columns.is_empty() {
+        return Ok(None);
+    }
+
+    let response =
+        client
+            .get_mapping(es_index)
+            .await
+            .map_err(|source| Error::KeyColumnMappingUnreadable {
+                index: es_index.to_string(),
+                columns: key_columns
+                    .iter()
+                    .map(|c| format!("'{c}'"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                source,
+            })?;
+
+    let Some(properties) = elasticsearch::index_properties(&response, es_index) else {
+        // An index with no mapping of its own holds no documents to delete.
+        return Ok(None);
+    };
+
+    let mut paths = Vec::with_capacity(key_columns.len());
+    for column in key_columns {
+        let Some(mapping) = properties.get(column) else {
+            return Ok(None);
+        };
+
+        if is_term_exact(mapping) {
+            paths.push(KeyFieldPath {
+                column: column.clone(),
+                path: column.clone(),
+                ignore_above: mapping.ignore_above,
+            });
+            continue;
+        }
+
+        // Multi-fields index the same value a second way. `keyword` is the one dynamic mapping
+        // derives and the one to prefer; any other exact sub-field is still exact, and taking the
+        // lowest name keeps the choice stable across runs rather than following hash order.
+        let sub_fields = mapping.fields.as_ref();
+        let exact_sub = sub_fields
+            .and_then(|fields| {
+                fields
+                    .get("keyword")
+                    .filter(|m| is_term_exact(m))
+                    .map(|m| ("keyword", m))
+            })
+            .or_else(|| {
+                sub_fields
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, m)| is_term_exact(m))
+                    .min_by(|(a, _), (b, _)| a.cmp(b))
+                    .map(|(n, m)| (n.as_str(), m))
+            });
+
+        let Some((sub_name, sub_mapping)) = exact_sub else {
+            return KeyColumnNotExactlyMatchableSnafu {
+                index: es_index.to_string(),
+                column: column.clone(),
+                mapped_as: mapping
+                    .field_type
+                    .as_deref()
+                    .unwrap_or("object")
+                    .to_string(),
+            }
+            .fail();
+        };
+
+        paths.push(KeyFieldPath {
+            column: column.clone(),
+            path: format!("{column}.{sub_name}"),
+            ignore_above: sub_mapping.ignore_above,
+        });
+    }
+
+    Ok(Some(paths))
+}
+
+/// Refuses the delete if any key in `keys` is longer than the `ignore_above` of the field it
+/// would be matched on.
+///
+/// Elasticsearch stores such a value but does not index it, so no filter reaches it — the same
+/// silent no-op an analyzed key column produces, one layer down. It cannot be caught while
+/// resolving the field, which sees no values, so it is caught here: before the first request,
+/// rather than by the chunk that happens to carry the long key, which would leave the chunks
+/// before it applied and the ones after it unissued.
+///
+/// Only the columns whose resolved field declares a limit are scanned, and the runtime's own
+/// mapping declares none — so on an index it created this walks nothing.
+fn ensure_keys_are_indexable(
+    es_index: &str,
+    key_paths: &[KeyFieldPath],
+    keys: &RecordBatch,
+) -> Result<()> {
+    for key_path in key_paths {
+        let Some(ignore_above) = key_path.ignore_above else {
+            continue;
+        };
+        let Some(array) = keys.column_by_name(&key_path.column) else {
+            // A missing column is the query builder's error to report, with the whole key in hand.
+            continue;
+        };
+        for row in 0..array.len() {
+            let Ok(value) = ScalarValue::try_from_array(array.as_ref(), row) else {
+                continue;
+            };
+            let Some(json_value) = scalar_to_term_value(&value) else {
+                continue;
+            };
+            let Some(text) = json_value.as_str() else {
+                continue;
+            };
+            let length = text.chars().count();
+            if i64::try_from(length).is_ok_and(|length| length > ignore_above) {
+                return KeyValueNotIndexedSnafu {
+                    index: es_index.to_string(),
+                    column: key_path.column.clone(),
+                    path: key_path.path.clone(),
+                    length,
+                    ignore_above,
+                }
+                .fail();
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn scalar_to_term_value(value: &ScalarValue) -> Option<Value> {
@@ -214,7 +770,8 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Schema};
     use elasticsearch::{
-        Error as EsError, MappingResponse, Result as EsResult, SearchRequest, SearchResponse,
+        Error as EsError, IndexMapping, MappingResponse, Mappings, Result as EsResult,
+        SearchRequest, SearchResponse,
     };
     use std::sync::Arc;
 
@@ -222,8 +779,25 @@ mod tests {
     use crate::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex};
     use arrow::array::{ArrayRef, UInt64Array};
 
-    /// Records the `_delete_by_query` bodies it is asked to issue; every other trait method is
-    /// an error, so a test that reaches one fails loudly rather than silently passing.
+    /// A fully-applied `_delete_by_query` response, in the shape Elasticsearch returns it.
+    fn clean_delete_response(deleted: u64) -> Value {
+        json!({
+            "took": 1,
+            "timed_out": false,
+            "total": deleted,
+            "deleted": deleted,
+            "batches": 1,
+            "version_conflicts": 0,
+            "noops": 0,
+            "retries": {"bulk": 0, "search": 0},
+            "throttled_millis": 0,
+            "failures": [],
+        })
+    }
+
+    /// Records the `_delete_by_query` bodies it is asked to issue and answers each with a
+    /// configured response; every other trait method is an error, so a test that reaches one
+    /// fails loudly rather than silently passing.
     ///
     /// It also models a document store keyed by `_id`: seed it with [`RecordingClient::with_ids`]
     /// and an `ids` query (the whole-key delete path) removes exactly those documents, so a test
@@ -233,6 +807,20 @@ mod tests {
     struct RecordingClient {
         queries: Mutex<Vec<Value>>,
         ids: Mutex<Vec<String>>,
+        /// One response per request, in order; the last one answers every request beyond it, so a
+        /// single-element list answers a whole multi-request delete the same way. Empty — the
+        /// default — means the stub reports exactly what the modeled store removed as fully
+        /// applied, which is what leaves the store-based and query-shape tests indifferent to the
+        /// response body.
+        responses: Vec<Value>,
+        /// Request ordinals (1-based) answered with a client error instead of a body. The error
+        /// carries a status, so it stands for the kind Elasticsearch itself raised — the request
+        /// reached the index, and the delete's fate there is unknown.
+        erroring: Vec<usize>,
+        /// The body `get_mapping` answers with. `None` — the default — errors instead, so a test
+        /// of the whole-key path fails loudly if that path ever reads the mapping it does not
+        /// need.
+        mapping: Option<MappingResponse>,
     }
 
     impl RecordingClient {
@@ -241,6 +829,35 @@ mod tests {
                 ids: Mutex::new(ids.iter().map(|s| (*s).to_string()).collect()),
                 ..Self::default()
             }
+        }
+
+        /// Answers every request with `response` instead of a fully-applied one.
+        fn answering(response: Value) -> Self {
+            Self::answering_in_turn(vec![response])
+        }
+
+        /// Answers the nth request with the nth response, so a test can make one request in a
+        /// multi-request delete differ from the rest.
+        fn answering_in_turn(responses: Vec<Value>) -> Self {
+            Self {
+                responses,
+                ..Self::default()
+            }
+        }
+
+        /// Answers `get_mapping` for index `idx` with `fields`, so a partial-key delete can
+        /// resolve the field path to filter on.
+        fn mapped(fields: Vec<(&str, FieldMapping)>) -> Self {
+            Self {
+                mapping: Some(mapping_of("idx", fields)),
+                ..Self::default()
+            }
+        }
+
+        /// Answers the `nth` request (1-based) with a client error rather than a body.
+        fn erroring_on(mut self, nth: usize) -> Self {
+            self.erroring.push(nth);
+            self
         }
 
         fn queries(&self) -> Vec<Value> {
@@ -271,10 +888,20 @@ mod tests {
     #[async_trait::async_trait]
     impl Elasticsearch for RecordingClient {
         async fn delete_by_query(&self, _index: &str, query: &Value) -> EsResult<Value> {
-            self.queries
-                .lock()
-                .expect("queries mutex should not be poisoned")
-                .push(query.clone());
+            let issued = {
+                let mut queries = self
+                    .queries
+                    .lock()
+                    .expect("queries mutex should not be poisoned");
+                queries.push(query.clone());
+                queries.len()
+            };
+            if self.erroring.contains(&issued) {
+                return Err(EsError::ElasticsearchError {
+                    status: 502,
+                    message: format!("request {issued} failed at the index"),
+                });
+            }
 
             // Apply an `ids` query to the modeled store so a test can assert the surviving set.
             let mut deleted = 0;
@@ -286,11 +913,28 @@ mod tests {
                 ids.retain(|id| !doomed.contains(id.as_str()));
                 deleted = before - ids.len();
             }
-            Ok(json!({ "deleted": deleted }))
+
+            // A configured response wins, so a test can make the body disagree with what the
+            // store removed — which is the whole point of the response-inspection tests. With
+            // none configured, report that removal as fully applied so `inspect_delete_response`
+            // reads it as clean.
+            Ok(
+                match self
+                    .responses
+                    .get(issued - 1)
+                    .or_else(|| self.responses.last())
+                {
+                    Some(response) => response.clone(),
+                    None => clean_delete_response(deleted as u64),
+                },
+            )
         }
 
         async fn get_mapping(&self, _index: &str) -> EsResult<MappingResponse> {
-            Err(unexpected("get_mapping"))
+            match &self.mapping {
+                Some(mapping) => Ok(mapping.clone()),
+                None => Err(unexpected("get_mapping")),
+            }
         }
         async fn search(&self, _index: &str, _body: &SearchRequest) -> EsResult<SearchResponse> {
             Err(unexpected("search"))
@@ -337,6 +981,47 @@ mod tests {
             _docs: &[(Option<String>, Value)],
         ) -> EsResult<Value> {
             Err(unexpected("bulk_index"))
+        }
+    }
+
+    /// A `GET /<index>/_mapping` body naming `fields` under `index`.
+    fn mapping_of(index: &str, fields: Vec<(&str, FieldMapping)>) -> MappingResponse {
+        MappingResponse::from([(
+            index.to_string(),
+            IndexMapping {
+                mappings: Mappings {
+                    properties: fields
+                        .into_iter()
+                        .map(|(name, mapping)| (name.to_string(), mapping))
+                        .collect(),
+                },
+            },
+        )])
+    }
+
+    fn field_mapping(field_type: &str) -> FieldMapping {
+        FieldMapping {
+            field_type: Some(field_type.to_string()),
+            properties: None,
+            fields: None,
+            ignore_above: None,
+            index: None,
+            dims: None,
+            similarity: None,
+        }
+    }
+
+    /// What dynamic mapping gives an unmapped string column: `text` holding analyzed tokens, plus
+    /// a `keyword` multi-field that indexes the value itself up to `ignore_above`.
+    fn dynamic_string_mapping() -> FieldMapping {
+        let mut keyword = field_mapping("keyword");
+        keyword.ignore_above = Some(256);
+        FieldMapping {
+            fields: Some(std::collections::HashMap::from([(
+                "keyword".to_string(),
+                keyword,
+            )])),
+            ..field_mapping("text")
         }
     }
 
@@ -430,7 +1115,7 @@ mod tests {
     /// chunk id is part of it and unknown at delete time — that path still filters on columns.
     #[tokio::test]
     async fn partial_key_falls_back_to_term_filters() {
-        let client = RecordingClient::default();
+        let client = RecordingClient::mapped(vec![("id", field_mapping("keyword"))]);
 
         delete_by_keys(
             &client,
@@ -450,6 +1135,301 @@ mod tests {
             vec![json!({
                 "bool": {
                     "should": [{"bool": {"filter": [{"term": {"id": "ORDER-1024"}}]}}],
+                    "minimum_should_match": 1
+                }
+            })],
+        );
+    }
+
+    /// The reported bug (#13714) on the half `_id` addressing cannot reach: a chunked index's
+    /// delete filters on the key column, and a string column the runtime did not map exactly is
+    /// `text` — analyzed tokens an unanalyzed `term` never matches. Filtering on the column name
+    /// removed nothing and reported success; the delete must name the `keyword` multi-field that
+    /// holds the value itself.
+    #[tokio::test]
+    async fn a_text_mapped_key_column_is_filtered_on_its_keyword_sub_field() {
+        let client = RecordingClient::mapped(vec![("id", dynamic_string_mapping())]);
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(
+            client.queries(),
+            vec![json!({
+                "bool": {
+                    "should": [{"bool": {"filter": [{"term": {"id.keyword": "ORDER-1024"}}]}}],
+                    "minimum_should_match": 1
+                }
+            })],
+            "a `text`-mapped key column holds analyzed tokens, so the filter has to name the \
+             exact-match sub-field instead"
+        );
+    }
+
+    /// A `text` column with no exact sub-field cannot be filtered on at all. Issuing the filter
+    /// anyway is what made a delete of nothing look like a delete of everything asked for, so the
+    /// delete has to refuse — and refuse before issuing a request, not after.
+    #[tokio::test]
+    async fn a_key_column_with_no_exact_match_field_refuses_instead_of_deleting_nothing() {
+        let client = RecordingClient::mapped(vec![("id", field_mapping("text"))]);
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("a key column with no exact-match field must fail the delete");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("'id'") && message.contains("text"),
+            "the error must name the key column and how it is mapped, got: {message}"
+        );
+        assert!(
+            client.queries().is_empty(),
+            "no _delete_by_query may be issued for a key the filter cannot address"
+        );
+    }
+
+    /// A key column the user declared non-filterable is mapped `index: false` — an exact type
+    /// that is searchable nowhere. Its documents are unreachable by any filter, so the delete has
+    /// to refuse rather than issue a `term` that cannot match.
+    #[tokio::test]
+    async fn an_unsearchable_key_column_refuses_despite_an_exact_type() {
+        let mut unsearchable = field_mapping("keyword");
+        unsearchable.index = Some(serde_json::Value::Bool(false));
+        let client = RecordingClient::mapped(vec![("id", unsearchable)]);
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("an unsearchable key column must fail the delete");
+
+        assert!(err.to_string().contains("'id'"), "got: {err}");
+        assert!(client.queries().is_empty());
+    }
+
+    /// Elasticsearch maps a field the first time a document carries it, so a key column absent
+    /// from the mapping means no document holds it — a delete of rows the index does not have.
+    /// That is success with no request, not a refusal.
+    #[tokio::test]
+    async fn a_key_column_absent_from_the_mapping_issues_no_request() {
+        let client = RecordingClient::mapped(vec![("other", field_mapping("keyword"))]);
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect("an index holding no such column has nothing to delete");
+
+        assert!(client.queries().is_empty());
+    }
+
+    /// The `keyword` multi-field dynamic mapping derives stops indexing past `ignore_above`, so a
+    /// longer key is stored but unreachable — the same silent no-op one layer down. The delete
+    /// has to say so rather than issue a filter that cannot match.
+    #[tokio::test]
+    async fn a_key_longer_than_ignore_above_refuses_rather_than_filtering_on_it() {
+        let client = RecordingClient::mapped(vec![("id", dynamic_string_mapping())]);
+        let long_key = "x".repeat(257);
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some(long_key.as_str())]),
+        )
+        .await
+        .expect_err("a key Elasticsearch never indexed must fail the delete");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("ignore_above") && message.contains("id.keyword"),
+            "the error must name the limit and the field it applies to, got: {message}"
+        );
+        assert!(
+            client.queries().is_empty(),
+            "no _delete_by_query may be issued for a key the filter cannot address"
+        );
+    }
+
+    /// A key at the limit is indexed, so it must still be deleted — the refusal above is a
+    /// boundary, not a rounding-down of what the index holds.
+    #[tokio::test]
+    async fn a_key_exactly_at_ignore_above_is_still_deleted() {
+        let client = RecordingClient::mapped(vec![("id", dynamic_string_mapping())]);
+        let key = "x".repeat(256);
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some(key.as_str())]),
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(
+            client.queries(),
+            vec![json!({
+                "bool": {
+                    "should": [{"bool": {"filter": [{"term": {"id.keyword": key}}]}}],
+                    "minimum_should_match": 1
+                }
+            })],
+        );
+    }
+
+    /// `ignore_above` counts characters, not bytes, so a key of multi-byte characters that is
+    /// within the limit is indexed and must be deleted rather than refused.
+    #[tokio::test]
+    async fn a_multi_byte_key_within_ignore_above_is_measured_in_characters() {
+        let client = RecordingClient::mapped(vec![("id", dynamic_string_mapping())]);
+        let key = "é".repeat(200);
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some(key.as_str())]),
+        )
+        .await
+        .expect("a 200-character key is inside a 256-character limit");
+
+        assert_eq!(client.queries().len(), 1);
+    }
+
+    /// An unreadable mapping leaves it unknown which field an exact-match filter has to name, and
+    /// filtering on the column name regardless is the silent no-op this addressing exists to
+    /// avoid. Report it instead — the callers log this rather than assuming the delete applied.
+    #[tokio::test]
+    async fn an_unreadable_mapping_fails_the_delete_rather_than_guessing() {
+        // No mapping configured, so the stub's `get_mapping` errors.
+        let client = RecordingClient::default();
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("an unreadable mapping must fail the delete");
+
+        assert!(err.to_string().contains("could not be read"), "got: {err}");
+        assert!(client.queries().is_empty());
+    }
+
+    /// A numeric key column was never broken by the mapping gap — `long` is exact — so it must
+    /// keep being filtered on the column itself, with no sub-field detour.
+    #[tokio::test]
+    async fn a_numeric_key_column_is_filtered_on_the_column_itself() {
+        let client = RecordingClient::mapped(vec![("id", field_mapping("long"))]);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let keys = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7_i64]))])
+            .expect("int key batch should build");
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Int64),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &keys,
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(
+            client.queries(),
+            vec![json!({
+                "bool": {
+                    "should": [{"bool": {"filter": [{"term": {"id": 7}}]}}],
+                    "minimum_should_match": 1
+                }
+            })],
+        );
+    }
+
+    /// `GET /<alias>/_mapping` keys its body by the concrete index the alias resolves to, not by
+    /// the name asked for, so the single entry is the one to read.
+    #[tokio::test]
+    async fn a_mapping_returned_under_another_index_name_is_still_read() {
+        let client = RecordingClient {
+            mapping: Some(mapping_of(
+                "idx-000001",
+                vec![("id", dynamic_string_mapping())],
+            )),
+            ..RecordingClient::default()
+        };
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(
+            client.queries(),
+            vec![json!({
+                "bool": {
+                    "should": [{"bool": {"filter": [{"term": {"id.keyword": "ORDER-1024"}}]}}],
                     "minimum_should_match": 1
                 }
             })],
@@ -596,6 +1576,96 @@ mod tests {
         assert_eq!(client.present_ids(), vec!["ORDER-1024", "ORDER-1026"]);
     }
 
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    /// End-to-end over the modeled store: the write path's eviction removes exactly the
+    /// documents whose rows it could not index, and leaves every other document alone.
+    #[tokio::test]
+    async fn delete_by_ids_removes_only_the_addressed_documents() {
+        let client = RecordingClient::with_ids(&["ORDER-1024", "ORDER-1025", "ORDER-1026"]);
+
+        delete_by_ids(&client, "idx", &ids(&["ORDER-1025"]))
+            .await
+            .expect("delete should succeed");
+
+        assert_eq!(client.present_ids(), vec!["ORDER-1024", "ORDER-1026"]);
+    }
+
+    #[tokio::test]
+    async fn delete_by_ids_addresses_documents_by_id() {
+        let client = RecordingClient::default();
+
+        delete_by_ids(&client, "idx", &ids(&["7", "8"]))
+            .await
+            .expect("delete should succeed");
+
+        assert_eq!(
+            client.queries(),
+            vec![json!({"ids": {"values": ["7", "8"]}})]
+        );
+    }
+
+    /// A write that rejected nothing must not reach Elasticsearch at all — an `ids` query
+    /// with an empty list is not a no-op to send, it is a request that costs a round trip.
+    #[tokio::test]
+    async fn delete_by_ids_issues_no_request_for_an_empty_list() {
+        let client = RecordingClient::default();
+
+        delete_by_ids(&client, "idx", &[])
+            .await
+            .expect("delete should succeed");
+
+        assert!(client.queries().is_empty());
+    }
+
+    /// Chunked exactly as [`delete_by_keys`] is, so a large eviction cannot build an
+    /// unbounded id list in one request.
+    #[tokio::test]
+    async fn delete_by_ids_chunks_a_large_eviction() {
+        let client = RecordingClient::default();
+        let all: Vec<String> = (0..=DELETE_CHUNK_ROWS).map(|i| i.to_string()).collect();
+
+        delete_by_ids(&client, "idx", &all)
+            .await
+            .expect("delete should succeed");
+
+        let queries = client.queries();
+        assert_eq!(queries.len(), 2, "one request per {DELETE_CHUNK_ROWS} ids");
+        let first = queries[0]["ids"]["values"]
+            .as_array()
+            .expect("an ids query carries an array");
+        assert_eq!(first.len(), DELETE_CHUNK_ROWS);
+    }
+
+    /// The eviction reports a partially-applied delete the same way [`delete_by_keys`] does:
+    /// a document left in place is a stale vector still being served.
+    #[tokio::test]
+    async fn delete_by_ids_reports_a_partially_applied_delete() {
+        let client = RecordingClient::answering(json!({
+            "took": 1,
+            "timed_out": false,
+            "total": 2,
+            "deleted": 1,
+            "batches": 1,
+            "version_conflicts": 1,
+            "noops": 0,
+            "retries": {"bulk": 0, "search": 0},
+            "throttled_millis": 0,
+            "failures": [],
+        }));
+
+        let err = delete_by_ids(&client, "idx", &ids(&["7", "8"]))
+            .await
+            .expect_err("a delete that left a document behind must be reported");
+
+        assert!(
+            err.to_string().contains("only partially"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// An index with no primary key writes documents under generated `_id`s, so there is no id
     /// to address and no key column to filter on; the delete must not emit a match-everything
     /// query.
@@ -616,6 +1686,572 @@ mod tests {
         assert!(client.queries().is_empty());
     }
 
+    /// The reported bug (#12364): `_delete_by_query` answers `200` with a populated `failures`
+    /// array when individual documents could not be deleted, so discarding the body reports a
+    /// delete that left documents behind as a success — search keeps returning rows the dataset
+    /// no longer has.
+    #[tokio::test]
+    async fn a_document_failure_is_not_reported_as_a_successful_delete() {
+        let client = RecordingClient::answering(json!({
+            "total": 2,
+            "deleted": 1,
+            "version_conflicts": 0,
+            "failures": [{
+                "index": "idx",
+                "id": "ORDER-1024",
+                "cause": {
+                    "type": "mapper_parsing_exception",
+                    "reason": "[ORDER-1024] failed to parse",
+                    "caused_by": {"type": "illegal_argument_exception"},
+                },
+                "status": 400,
+            }],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024"), Some("ORDER-1025")]),
+        )
+        .await
+        .expect_err("a partially applied delete must not report success");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("1 document failure(s)"),
+            "the error should count the failures: {message}"
+        );
+        assert!(
+            message.contains("status 400")
+                && message.contains("mapper_parsing_exception")
+                && message.contains("caused by illegal_argument_exception"),
+            "the error should name the failure's fixed vocabulary: {message}"
+        );
+    }
+
+    /// A version conflict is the common partial-delete shape: `_delete_by_query` snapshots the
+    /// index at the start of the request and skips a document whose version moved since, which a
+    /// concurrent write cycle over the same rows produces. Elasticsearch reports it as a count,
+    /// so a body with no `failures` entry at all is still a partial delete.
+    #[tokio::test]
+    async fn a_version_conflict_alone_is_not_reported_as_a_successful_delete() {
+        let client = RecordingClient::answering(json!({
+            "total": 3,
+            "deleted": 1,
+            "version_conflicts": 2,
+            "failures": [],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("a delete stopped by a version conflict must not report success");
+
+        assert!(
+            err.to_string().contains("2 version conflict(s)"),
+            "the error should count the conflicts: {err}"
+        );
+    }
+
+    /// The document `_id` is the row's primary key and Elasticsearch's free-form `cause.reason`
+    /// quotes it. Every caller of `delete_by_keys` logs its error and it reaches
+    /// `runtime.task_history`, so neither may appear in the message.
+    #[tokio::test]
+    async fn a_failure_never_reports_the_document_id_or_the_free_form_reason() {
+        let client = RecordingClient::answering(json!({
+            "total": 1,
+            "deleted": 0,
+            "version_conflicts": 1,
+            "failures": [{
+                "index": "idx",
+                "id": "SENTINEL-ROW-VALUE-9F3A",
+                "cause": {
+                    "type": "version_conflict_engine_exception",
+                    "reason": "[SENTINEL-ROW-VALUE-9F3A]: version conflict, current version [2] is different than the one provided [1]",
+                },
+                "status": 409,
+            }],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("SENTINEL-ROW-VALUE-9F3A")]),
+        )
+        .await
+        .expect_err("a partially applied delete must not report success");
+
+        let message = err.to_string();
+        assert!(
+            !message.contains("SENTINEL-ROW-VALUE-9F3A"),
+            "the document id must not reach the error: {message}"
+        );
+        assert!(
+            !message.contains("version conflict, current version"),
+            "the free-form reason must not reach the error: {message}"
+        );
+        assert!(
+            message.contains("version_conflict_engine_exception"),
+            "the exception class is the part that may be reported: {message}"
+        );
+        assert!(
+            !message.contains('\n'),
+            "the message must stay on one line: {message}"
+        );
+    }
+
+    /// A failure entry carrying neither a status nor a typed cause must still be described from
+    /// the whitelist — falling back to stringifying the entry would name the document.
+    #[tokio::test]
+    async fn a_failure_with_no_typed_cause_is_still_described_without_the_entry() {
+        let client = RecordingClient::answering(json!({
+            "total": 1,
+            "deleted": 0,
+            "version_conflicts": 0,
+            "failures": [{"id": "SENTINEL-ROW-VALUE-9F3A"}],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("SENTINEL-ROW-VALUE-9F3A")]),
+        )
+        .await
+        .expect_err("a partially applied delete must not report success");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("no status or cause type reported"),
+            "the error should say the entry carried nothing reportable: {message}"
+        );
+        assert!(
+            !message.contains("SENTINEL-ROW-VALUE-9F3A"),
+            "the document id must not reach the error: {message}"
+        );
+    }
+
+    /// A cause type that does not have the shape of an Elasticsearch exception class is
+    /// network-provided text, so it is replaced wholesale rather than copied into the error.
+    #[tokio::test]
+    async fn a_non_categorical_cause_type_is_replaced_not_copied() {
+        let client = RecordingClient::answering(json!({
+            "total": 1,
+            "deleted": 0,
+            "version_conflicts": 0,
+            "failures": [{
+                "status": 400,
+                "cause": {"type": "rejected: SENTINEL-ROW-VALUE-9F3A"},
+            }],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("a partially applied delete must not report success");
+
+        let message = err.to_string();
+        assert!(
+            !message.contains("SENTINEL-ROW-VALUE-9F3A"),
+            "a non-categorical cause type must not be copied into the error: {message}"
+        );
+        assert!(
+            message.contains("<unrecognized>"),
+            "the rejected token should be replaced: {message}"
+        );
+    }
+
+    /// A body with no `failures` array is not a synchronous `_delete_by_query` response — an
+    /// async task handle, or a proxy's envelope. Neither confirms the delete applied, so it
+    /// cannot be reported as a success.
+    #[tokio::test]
+    async fn a_response_without_a_failures_array_is_not_reported_as_a_successful_delete() {
+        let client = RecordingClient::answering(json!({"task": "node-1:12345"}));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("an unconfirmable delete must not report success");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("no usable `failures`")
+                && message.contains("a JSON object with keys: task"),
+            "the error should describe the response by its shape alone: {message}"
+        );
+    }
+
+    /// `timed_out` is the one partial-delete signal Elasticsearch reports as a flag rather than
+    /// as a failure entry: the request stopped early, so documents the query matched are still
+    /// indexed even though every itemised count reads clean.
+    #[tokio::test]
+    async fn a_timed_out_delete_is_not_reported_as_a_successful_delete() {
+        let client = RecordingClient::answering(json!({
+            "timed_out": true,
+            "total": 2,
+            "deleted": 1,
+            "version_conflicts": 0,
+            "failures": [],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024"), Some("ORDER-1025")]),
+        )
+        .await
+        .expect_err("a delete that timed out must not report success");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("timed out: true"),
+            "the error should report the timeout: {message}"
+        );
+        assert!(
+            message.contains("1 of 2 matched document(s) left in place"),
+            "the error should count the documents left behind: {message}"
+        );
+    }
+
+    /// `deleted` falling short of `total` means documents the query matched were not removed,
+    /// whatever the itemised signals say. Nothing else in the body reports this shape.
+    #[tokio::test]
+    async fn a_short_deleted_count_is_not_reported_as_a_successful_delete() {
+        let client = RecordingClient::answering(json!({
+            "timed_out": false,
+            "total": 5,
+            "deleted": 3,
+            "version_conflicts": 0,
+            "failures": [],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("a delete that left documents behind must not report success");
+
+        assert!(
+            err.to_string()
+                .contains("2 of 5 matched document(s) left in place"),
+            "the error should count the documents left behind: {err}"
+        );
+    }
+
+    /// The counts are required, not defaulted: a body without them cannot confirm the delete, and
+    /// reading an absent `deleted` as zero — or as "as many as matched" — would invent a verdict
+    /// the response never gave.
+    #[tokio::test]
+    async fn a_response_without_the_document_counts_is_not_reported_as_a_successful_delete() {
+        for missing in ["total", "deleted"] {
+            // The same fully-applied body, minus the one count under test.
+            let body = match missing {
+                "total" => json!({"deleted": 1, "version_conflicts": 0, "failures": []}),
+                _ => json!({"total": 1, "version_conflicts": 0, "failures": []}),
+            };
+            let client = RecordingClient::answering(body);
+
+            let err = delete_by_keys(
+                &client,
+                "idx",
+                &[pk("id", DataType::Utf8)],
+                &["id".to_string()],
+                &string_key_batch(vec![Some("ORDER-1024")]),
+            )
+            .await
+            .expect_err("an unconfirmable delete must not report success");
+
+            assert!(
+                err.to_string().contains(&format!("no usable `{missing}`")),
+                "the error should name the missing field: {err}"
+            );
+        }
+    }
+
+    /// A `version_conflicts` that is present but not a number is a rewritten body. Coercing it to
+    /// zero would report a conflicted delete as clean — the exact failure this check exists to
+    /// catch.
+    #[tokio::test]
+    async fn a_non_numeric_version_conflicts_is_not_read_as_zero() {
+        let client = RecordingClient::answering(json!({
+            "total": 1,
+            "deleted": 1,
+            "version_conflicts": "0",
+            "failures": [],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("an unconfirmable delete must not report success");
+
+        assert!(
+            err.to_string().contains("no usable `version_conflicts`"),
+            "the error should name the unusable field: {err}"
+        );
+    }
+
+    /// An absent `timed_out` asserts nothing the body denies, so it reads as `false`. A present one
+    /// that is not a boolean is a rewritten body instead of that silence, and reading it as `false`
+    /// would assert the timeout did not happen — the one claim the field exists to make.
+    #[tokio::test]
+    async fn a_non_boolean_timed_out_is_not_read_as_absent() {
+        let client = RecordingClient::answering(json!({
+            "timed_out": "true",
+            "total": 1,
+            "deleted": 1,
+            "version_conflicts": 0,
+            "failures": [],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("an unconfirmable delete must not report success");
+
+        assert!(
+            err.to_string().contains("no usable `timed_out`"),
+            "the error should name the unusable field: {err}"
+        );
+    }
+
+    /// `deleted` counts documents drawn from the `total` the initial search matched, so a body
+    /// reporting more deleted than matched is one no verdict can be read from. Saturating the
+    /// difference to zero would read that contradiction as a fully-applied delete.
+    #[tokio::test]
+    async fn a_deleted_count_above_the_total_is_not_reported_as_a_successful_delete() {
+        let client = RecordingClient::answering(json!({
+            "timed_out": false,
+            "total": 1,
+            "deleted": 2,
+            "version_conflicts": 0,
+            "failures": [],
+        }));
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("a contradictory delete response must not report success");
+
+        assert!(
+            err.to_string().contains("no usable `deleted`"),
+            "the error should name the contradictory field: {err}"
+        );
+    }
+
+    /// The happy path stays a success: a fully-applied delete reports `failures: []` and no
+    /// conflicts, and every chunk of a multi-request delete is checked.
+    #[tokio::test]
+    async fn a_fully_applied_delete_succeeds_across_every_chunk() {
+        let client = RecordingClient::answering(clean_delete_response(DELETE_CHUNK_ROWS as u64));
+        let ids: Vec<String> = (0..=DELETE_CHUNK_ROWS).map(|i| i.to_string()).collect();
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(ids.iter().map(|s| Some(s.as_str())).collect()),
+        )
+        .await
+        .expect("a fully applied delete should succeed");
+
+        assert_eq!(
+            client.queries().len(),
+            2,
+            "the batch should span two requests, both checked"
+        );
+    }
+
+    /// A later chunk's partial delete is caught too — the check runs per request, not only on
+    /// the first.
+    #[tokio::test]
+    async fn a_partial_delete_in_a_later_chunk_is_still_caught() {
+        let client = RecordingClient::answering_in_turn(vec![
+            clean_delete_response(DELETE_CHUNK_ROWS as u64),
+            json!({"total": 1, "deleted": 0, "version_conflicts": 1, "failures": []}),
+        ]);
+        let ids: Vec<String> = (0..=DELETE_CHUNK_ROWS).map(|i| i.to_string()).collect();
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(ids.iter().map(|s| Some(s.as_str())).collect()),
+        )
+        .await
+        .expect_err("the second chunk's partial delete must surface");
+
+        assert_eq!(
+            client.queries().len(),
+            2,
+            "the first chunk should have been issued and accepted"
+        );
+        assert!(
+            err.to_string().contains("1 version conflict(s)"),
+            "the second chunk's conflict should be the reported one: {err}"
+        );
+    }
+
+    /// An early chunk's partial delete does not cancel the rest of the batch. The chunks address
+    /// disjoint slices of `keys`, so stopping at the first partial response would leave documents
+    /// behind for rows no request ever named — the very divergence this check exists to report.
+    #[tokio::test]
+    async fn an_early_partial_delete_still_issues_the_remaining_chunks() {
+        let client = RecordingClient::answering_in_turn(vec![
+            json!({"total": 1, "deleted": 0, "version_conflicts": 1, "failures": []}),
+            clean_delete_response(DELETE_CHUNK_ROWS as u64),
+        ]);
+        let ids: Vec<String> = (0..=DELETE_CHUNK_ROWS).map(|i| i.to_string()).collect();
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(ids.iter().map(|s| Some(s.as_str())).collect()),
+        )
+        .await
+        .expect_err("the first chunk's partial delete must still surface");
+
+        assert_eq!(
+            client.queries().len(),
+            2,
+            "the second chunk should have been issued despite the first coming back partial"
+        );
+        assert!(
+            err.to_string().contains("1 version conflict(s)"),
+            "the first chunk's conflict should be the reported one: {err}"
+        );
+    }
+
+    /// The same reasoning as the partial-body case above, on the arm that reports through an
+    /// `Err` instead of a 200 body. An error from the client does not mean the request never
+    /// reached the index — `JsonParse` is raised only after a 2xx, and a status error can land on
+    /// a delete Elasticsearch already applied in part — so returning at the first one would leave
+    /// the later chunks unissued and turn one chunk's unknown outcome into a batch-wide one.
+    #[tokio::test]
+    async fn an_early_chunk_error_still_issues_the_remaining_chunks() {
+        let client = RecordingClient::answering(clean_delete_response(DELETE_CHUNK_ROWS as u64))
+            .erroring_on(1);
+        let ids: Vec<String> = (0..=DELETE_CHUNK_ROWS).map(|i| i.to_string()).collect();
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(ids.iter().map(|s| Some(s.as_str())).collect()),
+        )
+        .await
+        .expect_err("the first chunk's failure must still surface");
+
+        assert_eq!(
+            client.queries().len(),
+            2,
+            "the second chunk should have been issued despite the first erroring"
+        );
+        assert!(
+            err.to_string().contains("request 1 failed at the index"),
+            "the first chunk's error should be the reported one: {err}"
+        );
+    }
+
+    /// A later chunk's error is reported when every earlier one applied cleanly — without this,
+    /// the loop could swallow the last chunk's failure and report the whole delete as applied.
+    #[tokio::test]
+    async fn a_later_chunk_error_is_still_reported() {
+        let client = RecordingClient::answering(clean_delete_response(DELETE_CHUNK_ROWS as u64))
+            .erroring_on(2);
+        let ids: Vec<String> = (0..=DELETE_CHUNK_ROWS).map(|i| i.to_string()).collect();
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(ids.iter().map(|s| Some(s.as_str())).collect()),
+        )
+        .await
+        .expect_err("a failure in the last chunk must not be reported as a clean delete");
+
+        assert_eq!(client.queries().len(), 2);
+        assert!(
+            err.to_string().contains("request 2 failed at the index"),
+            "the erroring chunk should be the reported one: {err}"
+        );
+    }
+
+    /// The first failure is the reported one whether it arrived as an `Err` or as a partial body:
+    /// it is the one whose surrounding state a reconcile starts from.
+    #[tokio::test]
+    async fn the_first_of_two_failing_chunks_is_the_reported_one() {
+        let client = RecordingClient::answering_in_turn(vec![
+            clean_delete_response(0),
+            json!({"total": 1, "deleted": 0, "version_conflicts": 1, "failures": []}),
+        ])
+        .erroring_on(1);
+        let ids: Vec<String> = (0..=DELETE_CHUNK_ROWS).map(|i| i.to_string()).collect();
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(ids.iter().map(|s| Some(s.as_str())).collect()),
+        )
+        .await
+        .expect_err("both chunks failed, so the delete must not report success");
+
+        assert_eq!(client.queries().len(), 2);
+        assert!(
+            err.to_string().contains("request 1 failed at the index"),
+            "the earlier failure should win over the later partial body: {err}"
+        );
+    }
+
     fn id_field() -> Field {
         Field::new("id", DataType::Int64, false)
     }
@@ -627,6 +2263,20 @@ mod tests {
             vec![Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef],
         )
         .expect("valid batch")
+    }
+
+    /// The field paths a delete resolves for `columns` against an index that maps each of them
+    /// exactly — which is what the runtime's own mapping produces. These tests are about *which*
+    /// columns a query filters on, not about resolving the path to filter them on.
+    fn exact_paths(columns: &[String]) -> Vec<KeyFieldPath> {
+        columns
+            .iter()
+            .map(|column| KeyFieldPath {
+                column: column.clone(),
+                path: column.clone(),
+                ignore_above: None,
+            })
+            .collect()
     }
 
     #[test]
@@ -646,9 +2296,12 @@ mod tests {
     #[test]
     fn a_chunked_index_deletes_every_chunk_of_a_base_key() {
         let chunked = ChunkedSearchIndex::augment_primary_key(vec![id_field()]);
-        let query = build_or_of_row_term_queries(&document_key_columns(&chunked), &base_keys(&[7]))
-            .expect("query builds")
-            .expect("non-empty batch produces a query");
+        let query = build_or_of_row_term_queries(
+            &exact_paths(&document_key_columns(&chunked)),
+            &base_keys(&[7]),
+        )
+        .expect("query builds")
+        .expect("non-empty batch produces a query");
 
         let clauses = query["bool"]["should"]
             .as_array()
@@ -670,7 +2323,7 @@ mod tests {
             .map(|f| f.name().clone())
             .collect();
 
-        let err = build_or_of_row_term_queries(&full, &base_keys(&[7]))
+        let err = build_or_of_row_term_queries(&exact_paths(&full), &base_keys(&[7]))
             .expect_err("the chunk id is not in the batch");
         assert!(
             err.to_string().contains(CHUNKED_INDEX_CHUNK_KEY),
@@ -691,9 +2344,10 @@ mod tests {
         )
         .expect("valid batch");
 
-        let query = build_or_of_row_term_queries(&document_key_columns(&chunked), &keys)
-            .expect("query builds")
-            .expect("non-empty batch produces a query");
+        let query =
+            build_or_of_row_term_queries(&exact_paths(&document_key_columns(&chunked)), &keys)
+                .expect("query builds")
+                .expect("non-empty batch produces a query");
 
         assert_eq!(
             query["bool"]["should"][0]["bool"]["filter"],

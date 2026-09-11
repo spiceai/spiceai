@@ -152,14 +152,16 @@ pub fn collect_data_connectors() -> Vec<ConnectorSchema> {
 pub fn collect_data_accelerators() -> Vec<ConnectorSchema> {
     let mut accelerators: Vec<ConnectorSchema> = DATA_ACCELERATOR_REGISTRATIONS
         .iter()
-        .map(|reg| {
-            let accelerator = (reg.constructor)();
-            ConnectorSchema {
+        .filter_map(|reg| {
+            // An engine that cannot be prepared has already logged why; leaving it out of
+            // the schema is better than emitting an entry with no parameters.
+            let accelerator = reg.build_with_defaults()?;
+            Some(ConnectorSchema {
                 // Use Display trait to get the string representation
                 name: reg.engine.to_string(),
                 prefix: accelerator.prefix(),
                 parameters: accelerator.parameters(),
-            }
+            })
         })
         .collect();
     accelerators.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.prefix.cmp(b.prefix)));
@@ -212,52 +214,52 @@ pub fn collect_model_sources() -> Vec<ModelSourceSchema> {
     vec![
         ModelSourceSchema {
             name: "openai",
-            prefix: "openai",
+            prefix: ModelSource::OpenAi.short_name(),
             parameters: get_params_spec(&ModelSource::OpenAi),
         },
         ModelSourceSchema {
             name: "azure",
-            prefix: "azure",
+            prefix: ModelSource::Azure.short_name(),
             parameters: get_params_spec(&ModelSource::Azure),
         },
         ModelSourceSchema {
             name: "file",
-            prefix: "file",
+            prefix: ModelSource::File.short_name(),
             parameters: get_params_spec(&ModelSource::File),
         },
         ModelSourceSchema {
             name: "databricks",
-            prefix: "databricks",
+            prefix: ModelSource::Databricks.short_name(),
             parameters: get_params_spec(&ModelSource::Databricks),
         },
         ModelSourceSchema {
             name: "huggingface",
-            prefix: "huggingface",
+            prefix: ModelSource::HuggingFace.short_name(),
             parameters: get_params_spec(&ModelSource::HuggingFace),
         },
         ModelSourceSchema {
             name: "anthropic",
-            prefix: "anthropic",
+            prefix: ModelSource::Anthropic.short_name(),
             parameters: get_params_spec(&ModelSource::Anthropic),
         },
         ModelSourceSchema {
             name: "xai",
-            prefix: "xai",
+            prefix: ModelSource::Xai.short_name(),
             parameters: get_params_spec(&ModelSource::Xai),
         },
         ModelSourceSchema {
             name: "bedrock",
-            prefix: "bedrock",
+            prefix: ModelSource::Bedrock.short_name(),
             parameters: get_params_spec(&ModelSource::Bedrock),
         },
         ModelSourceSchema {
             name: "google",
-            prefix: "google",
+            prefix: ModelSource::Google.short_name(),
             parameters: get_params_spec(&ModelSource::Google),
         },
         ModelSourceSchema {
             name: "spiceai",
-            prefix: "spiceai",
+            prefix: ModelSource::SpiceAI.short_name(),
             parameters: get_params_spec(&ModelSource::SpiceAI),
         },
     ]

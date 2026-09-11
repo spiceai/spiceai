@@ -59,7 +59,7 @@ use tonic::transport::Channel;
 /// Gated serializable transaction (`BEGIN … COMMIT`) regression tests + bench.
 /// Gated off Windows to match the other Cayenne provider-level tests.
 #[cfg(not(target_os = "windows"))]
-mod transaction;
+pub(crate) mod transaction;
 
 /// Append a single row to a Cayenne-accelerated table through the Runtime write path.
 ///

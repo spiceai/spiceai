@@ -105,7 +105,10 @@ impl CayenneCatalogConnector {
         })
     }
 
-    async fn parse_provider_config(&self) -> CayenneCatalogProviderConfig {
+    async fn parse_provider_config(
+        &self,
+        catalog_name: Option<&str>,
+    ) -> CayenneCatalogProviderConfig {
         // Parse a numeric catalog parameter, warning (and ignoring) on a value
         // that does not parse, so a typo surfaces instead of being silently
         // dropped — matching the acceleration-param path's behavior.
@@ -256,7 +259,9 @@ impl CayenneCatalogConnector {
         let tuning = data_accelerator_api::DATA_ACCELERATOR_REGISTRATIONS
             .iter()
             .find(|registration| registration.engine == runtime_acceleration::Engine::Cayenne)
-            .map(|registration| (registration.constructor)());
+            // Built only to ask for tuning seeds, which are derived from the host rather
+            // than from any runtime-level setting.
+            .and_then(data_accelerator_api::AcceleratorRegistration::build_with_defaults);
         let outcome = if let Some(engine) = tuning {
             engine
                 .adaptive_tuning_seeds(raw_tuning, &data_path, &metastore_path)
@@ -324,6 +329,7 @@ impl CayenneCatalogConnector {
             data_dir,
             metadata_dir,
             spice_data_base_path: crate::spice_data_base_path(),
+            catalog_name: catalog_name.map(ToOwned::to_owned),
             footer_cache_mb: None,
             segment_cache_mb,
             target_file_size_mb,
@@ -372,7 +378,9 @@ impl CatalogConnector for CayenneCatalogConnector {
         }
 
         let runtime_env = runtime.datafusion().ctx.runtime_env();
-        let provider_config = self.parse_provider_config().await;
+        let provider_config = self
+            .parse_provider_config(Some(catalog.name.as_str()))
+            .await;
         let refreshable_provider = Arc::new(
             CayenneCatalogProvider::try_new(provider_config, runtime_env, table_selector(catalog))
                 .await
@@ -461,8 +469,11 @@ mod tests {
         .expect("single-prefixed Cayenne catalog params should validate");
         let connector = CayenneCatalogConnector { params };
 
-        let config = connector.parse_provider_config().await;
+        let config = connector.parse_provider_config(Some("warehouse")).await;
 
+        // Carried for diagnostics only — the storage paths stay keyed on the constant, so
+        // a rename must not relocate anybody's data.
+        assert_eq!(config.catalog_name.as_deref(), Some("warehouse"));
         assert_eq!(config.data_dir.as_deref(), Some("/tmp/cayenne-data"));
         assert_eq!(config.upload_concurrency, Some(1));
         assert_eq!(config.write_concurrency, Some(8));

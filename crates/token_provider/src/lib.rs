@@ -15,15 +15,33 @@ limitations under the License.
 */
 
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use tokio::sync::watch;
 
+pub mod gcp_service_account_token;
 pub mod github_app_token;
 pub mod registry;
+
+// Ensure the aws-lc-rs crypto provider is installed for jsonwebtoken before the first JWT
+// operation. This is required because Cargo feature unification can activate both `aws_lc_rs`
+// and `rust_crypto` features simultaneously (e.g. via a transitive dep like octocrab), causing
+// jsonwebtoken's auto-detection to panic at runtime. Calling install_default() here makes it a
+// compile error if the `aws_lc_rs` feature is ever missing, and a safe no-op if already set.
+static JWT_CRYPTO_INIT: OnceLock<()> = OnceLock::new();
+
+pub(crate) fn ensure_jwt_crypto_provider() {
+    JWT_CRYPTO_INIT.get_or_init(|| {
+        // install_default() returns Err only if a provider is already installed by another caller
+        // (e.g. a test harness). That is not an error — any installed provider is acceptable here.
+        // The only real failure mode (aws_lc_rs feature missing) is a compile error: the symbol
+        // jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER would not exist.
+        let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
+    });
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {

@@ -20,6 +20,7 @@ use globset::GlobSet;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 
+use crate::identity::{push_identity_columns, push_identity_fields};
 use arrow::{
     array::{ArrayRef, Int64Builder, RecordBatch, StringBuilder, TimestampMillisecondBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
@@ -159,6 +160,8 @@ impl GithubFilesTableProvider {
         if fetch_content {
             fields.push(Field::new("content", DataType::Utf8, true));
         }
+
+        push_identity_fields(&mut fields, true);
 
         let schema = Arc::new(Schema::new(fields));
 
@@ -870,6 +873,8 @@ impl GithubRestClient {
             }
             columns.push(Arc::new(content_builder.finish()));
         }
+
+        push_identity_columns(&mut columns, owner, Some(repo), tree.len());
 
         let record_batch = RecordBatch::try_new(Arc::clone(&schema), columns)
             .context(UnableToConstructRecordBatchSnafu)?;
@@ -1661,6 +1666,9 @@ impl GithubRestClient {
             columns.push(Arc::new(map_builder.finish()));
         }
 
+        push_identity_fields(&mut fields, true);
+        push_identity_columns(&mut columns, &owner, Some(&*repo), all_runs.len());
+
         let schema = Arc::new(Schema::new(fields));
 
         let record_batch = RecordBatch::try_new(Arc::clone(&schema), columns)
@@ -1901,7 +1909,7 @@ impl GithubRestClient {
             badge_url_builder.append_value(&workflow.badge_url);
         }
 
-        let fields = vec![
+        let mut fields = vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
             Field::new("path", DataType::Utf8, false),
@@ -1919,7 +1927,7 @@ impl GithubRestClient {
             Field::new("badge_url", DataType::Utf8, false),
         ];
 
-        let columns: Vec<ArrayRef> = vec![
+        let mut columns: Vec<ArrayRef> = vec![
             Arc::new(id_builder.finish()),
             Arc::new(name_builder.finish()),
             Arc::new(path_builder.finish()),
@@ -1928,6 +1936,9 @@ impl GithubRestClient {
             Arc::new(updated_at_builder.finish()),
             Arc::new(badge_url_builder.finish()),
         ];
+
+        push_identity_fields(&mut fields, true);
+        push_identity_columns(&mut columns, &owner, Some(&*repo), all_workflows.len());
 
         let schema = Arc::new(Schema::new(fields));
 

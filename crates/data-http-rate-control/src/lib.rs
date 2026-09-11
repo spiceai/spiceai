@@ -330,7 +330,12 @@ impl HttpRateControlMetrics {
     }
 }
 
-const HTTP_RATE_CONTROL_METRIC_SPECS: &[MetricSpec] = &[
+/// Every rate-control metric this crate can report.
+///
+/// Public so a connector that reports other metric families alongside these can
+/// present one combined list: `available_metrics` is what answers whether a
+/// metric a user asked for exists.
+pub const HTTP_RATE_CONTROL_METRIC_SPECS: &[MetricSpec] = &[
     MetricSpec::new("inflight_operations", MetricType::ObservableGaugeU64)
         .description("Current number of HTTP requests holding a rate-control permit")
         .auto_register(),

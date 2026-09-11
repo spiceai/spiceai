@@ -15,7 +15,7 @@ description: "SELECT id, answer, trunc(_score, 3) as _score FROM text_search(qs,
 |               |         CoalescePartitionsExec                                                                                                                                       |
 |               |           BytesProcessedExec                                                                                                                                         |
 |               |             RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                     |
-|               |               FullTextSearchTableExec q=secondary                                                                                                                    |
+|               |               FullTextSearchTableExec q=secondary, limit=1000                                                                                                        |
 |               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                         |
 |               |           FilterExec: subject@2 != math, projection=[answer@0, id@1]                                                                                                 |
 |               |             SchemaCastScanExec                                                                                                                                       |

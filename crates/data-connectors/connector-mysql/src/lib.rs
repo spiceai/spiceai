@@ -34,9 +34,9 @@ use mysql_async::{Metrics, prelude::Queryable};
 use opentelemetry::KeyValue;
 use runtime_api_types::v1::ComponentType;
 use runtime_component::dataset::DatasetSpec;
+use runtime_datafusion::function_support::deny_spice_functions_for_mysql_table_providers;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ParameterSpec, Parameters};
-use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use secrecy::{ExposeSecret, SecretBox};
 use snafu::prelude::*;
 use std::any::Any;
@@ -161,7 +161,11 @@ const PARAMETERS: &[ParameterSpec] = &[
             "When `refresh_mode: changes` loads the table's existing rows: 'auto' (default) \
              snapshots when no resumable binlog position exists and resumes without a snapshot \
              when one does; 'disabled' streams changes only; 'always' re-snapshots on every \
-             start, discarding any persisted position. Default: auto.",
+             start, discarding any persisted position. 'disabled' governs the first load only: \
+             an acceleration that already holds rows is still re-read when its recorded position \
+             can no longer be resumed from and `mysql_replication_invalid_checkpoint_behavior` \
+             is 'restart', which would otherwise leave it serving rows the source deleted. \
+             Default: auto.",
         )
         .default("auto")
         .one_of_ignore_ascii_case(InitialSnapshotMode::VALUES)
@@ -184,8 +188,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("replication_invalid_checkpoint_behavior")
         .description(
             "What to do when the persisted binlog position was purged from the source: 'error' \
-             (default) surfaces an actionable error; 'restart' drops the saved position and \
-             re-snapshots the table. Default: error.",
+             (default) surfaces an actionable error; 'restart' re-reads the table, whatever \
+             `mysql_replication_initial_snapshot` is set to. Default: error.",
         )
         .default("error")
         .one_of_ignore_ascii_case(InvalidCheckpointBehavior::VALUES)
@@ -360,7 +364,7 @@ impl DataConnectorFactory for MySQLFactory {
             // those functions don't exist and the query would fail with an
             // "unknown function" error. See issue #10703.
             let mysql_factory = MySQLTableFactory::new(Arc::clone(&pool))
-                .with_function_support(deny_spice_functions_for_table_providers());
+                .with_function_support(deny_spice_functions_for_mysql_table_providers());
 
             Ok(Arc::new(MySQL {
                 mysql_factory,

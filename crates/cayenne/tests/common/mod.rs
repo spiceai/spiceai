@@ -27,6 +27,8 @@ use arrow::record_batch::RecordBatch;
 use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::SessionContext;
 use datafusion_common::Result as DFResult;
 use datafusion_expr::dml::InsertOp;
@@ -106,6 +108,15 @@ impl TestFixture {
             BackendType::Turso => format!("libsql://{}", db_path.to_string_lossy()),
         }
     }
+}
+
+/// Wrap one record batch in a [`SendableRecordBatchStream`].
+pub fn single_batch_stream(batch: RecordBatch) -> SendableRecordBatchStream {
+    let schema = batch.schema();
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures::stream::iter([Ok(batch)]),
+    ))
 }
 
 /// Stack size for the thread a backend-parameterized test body runs on.
@@ -252,6 +263,33 @@ pub async fn poll_inlined_data_count_zero(
     loop {
         let count = catalog.get_inlined_data_count(table_id).await?;
         if count == 0 || started.elapsed() >= TIMEOUT {
+            return Ok(count);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Poll `catalog.get_inlined_data_stats(table_id).tombstone_entry_count` until it
+/// is at or below `limit`, or the timeout elapses; returns the last count seen.
+///
+/// The tombstone sibling of [`poll_inlined_data_count_zero`], and it races the
+/// same background task: the reclamation that drains `cayenne_inlined_delete`
+/// runs in a `tokio::spawn` scheduled from the write path.
+pub async fn poll_inlined_delete_count_at_most(
+    catalog: &Arc<CayenneCatalog>,
+    table_id: &str,
+    limit: i64,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    use cayenne::MetadataCatalog;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    let started = std::time::Instant::now();
+    loop {
+        let count = catalog
+            .get_inlined_data_stats(table_id)
+            .await?
+            .tombstone_entry_count;
+        if count <= limit || started.elapsed() >= TIMEOUT {
             return Ok(count);
         }
         tokio::time::sleep(POLL_INTERVAL).await;

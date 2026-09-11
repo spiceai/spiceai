@@ -1,0 +1,35 @@
+---
+source: crates/runtime/tests/github/mod.rs
+expression: batches_to_string(&result_batches)
+---
++--------------------------+---------------+-------------+
+| column_name              | data_type     | is_nullable |
++--------------------------+---------------+-------------+
+| id                       | Utf8          | YES         |
+| owner                    | Utf8          | NO          |
+| repo                     | Utf8          | NO          |
+| name_with_owner          | Utf8          | YES         |
+| description              | Utf8          | YES         |
+| url                      | Utf8          | YES         |
+| homepage_url             | Utf8          | YES         |
+| default_branch           | Utf8          | YES         |
+| license                  | Utf8          | YES         |
+| primary_language         | Utf8          | YES         |
+| is_archived              | Boolean       | YES         |
+| is_private               | Boolean       | YES         |
+| is_fork                  | Boolean       | YES         |
+| is_template              | Boolean       | YES         |
+| is_disabled              | Boolean       | YES         |
+| is_locked                | Boolean       | YES         |
+| created_at               | Timestamp(ms) | YES         |
+| updated_at               | Timestamp(ms) | YES         |
+| pushed_at                | Timestamp(ms) | YES         |
+| disk_usage               | Int64         | YES         |
+| stargazers_count         | Int64         | YES         |
+| forks_count              | Int64         | YES         |
+| watchers_count           | Int64         | YES         |
+| open_issues_count        | Int64         | YES         |
+| open_pull_requests_count | Int64         | YES         |
+| topics_count             | Int64         | YES         |
+| topics                   | List(Utf8)    | YES         |
++--------------------------+---------------+-------------+
