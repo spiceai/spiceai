@@ -114,8 +114,14 @@ pub(crate) struct McpToolCatalog {
 
 /// Serializes listed-cache publishes and discards superseded fetches.
 ///
-/// Increment [`Self::next_gen`] at the start of each list/reconnect
-/// fetch. Apply a result only when it is not older than the highest
+/// `list_tools` increments [`Self::next_gen`] at the start of each
+/// fetch. Reconnect lists the replacement first, then reserves via
+/// [`Self::swap_and_reserve`] while publishing the client swap, after
+/// existing `client.read()` holders have drained. Reserving before
+/// that list lets a concurrent `list_tools` take a newer generation
+/// while still holding the old client and discard the new schema.
+///
+/// Apply a result only when it is not older than the highest
 /// generation already published. Tracking started generations as
 /// "current" would drop a successful fetch as soon as a later one
 /// starts, even if that later fetch fails and never publishes.
@@ -139,6 +145,18 @@ struct ListedPublish<'a> {
 impl ListRefresh {
     fn next_gen(&self) -> u64 {
         self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Swap in `new_client` and reserve this reconnect's list generation.
+    ///
+    /// The caller must list `new_client` *before* this so the write
+    /// lock is not held across the upstream RTT. Reservation happens
+    /// here, after existing readers have drained, so an old-client
+    /// `list_tools` cannot take a newer generation than this swap.
+    async fn swap_and_reserve<T>(&self, client: &RwLock<T>, new_client: T) -> u64 {
+        let mut guard = client.write().await;
+        *guard = new_client;
+        self.next_gen()
     }
 
     /// Hold this guard across cache write and snapshot publish so two
@@ -258,10 +276,12 @@ impl McpToolCatalog {
                         // List from the new client *before* taking the write
                         // lock. Holding `client.write()` across that await
                         // stalls every concurrent `client.read()` (tool call)
-                        // for the full upstream RTT.
-                        let my_gen = refresh_clone.next_gen();
+                        // for the full upstream RTT. Reserve the generation
+                        // only while swapping, after those readers drain.
                         let listed = list_tools_from_client(&new_client).await;
-                        *client_clone.write().await = new_client;
+                        let my_gen = refresh_clone
+                            .swap_and_reserve(&client_clone, new_client)
+                            .await;
                         // Keep the last successful cache on list failure.
                         // Clearing it would make `try_get` miss and let rmcp
                         // cache `get_tool == None` for that name forever.
@@ -490,6 +510,11 @@ impl McpToolCatalog {
     }
 }
 
+/// Upper bound on tools retained from one `tools/list` and on the
+/// merged persistent catalog cache. A truncated page stays incomplete
+/// (`replace = false`); the merge must not grow past this.
+const MAX_TOTAL_TOOLS: usize = 10000;
+
 /// Page through `tools/list`. `complete` is true only when the peer
 /// finished (no cursor) before the pagination or total-tool caps.
 async fn list_tools_from_client(
@@ -497,7 +522,6 @@ async fn list_tools_from_client(
 ) -> std::result::Result<(Vec<rmcp::model::Tool>, bool, u64), ServiceError> {
     // Security: Limit pagination to prevent infinite loops and memory exhaustion
     const MAX_PAGINATION_ITERATIONS: usize = 100;
-    const MAX_TOTAL_TOOLS: usize = 10000;
 
     let mut cursor: Option<String> = None;
     let mut tools: Vec<rmcp::model::Tool> = vec![];
@@ -566,11 +590,32 @@ fn apply_tool_cache(
     replace: bool,
     ttl_ms: u64,
 ) {
+    apply_tool_cache_with_cap(cache, tools, replace, ttl_ms, MAX_TOTAL_TOOLS);
+}
+
+/// Merge `tools` into `cache`, never growing past `max_tools`.
+///
+/// `replace = false` keeps tools from an earlier complete list (a
+/// truncated page must not wipe them). New names are refused once
+/// the cap is reached so two disjoint capped responses cannot grow
+/// the cache without bound. Same-name entries are still overwritten
+/// so a schema refresh at cap is not skipped.
+fn apply_tool_cache_with_cap(
+    cache: &mut ToolListCache,
+    tools: &[rmcp::model::Tool],
+    replace: bool,
+    ttl_ms: u64,
+    max_tools: usize,
+) {
     if replace {
         cache.tools.clear();
     }
     for tool in tools {
-        cache.tools.insert(tool.name.to_string(), tool.clone());
+        let name = tool.name.to_string();
+        if !cache.tools.contains_key(&name) && cache.tools.len() >= max_tools {
+            continue;
+        }
+        cache.tools.insert(name, tool.clone());
     }
     cache.expires_at = expires_at_from_ttl_ms(ttl_ms, Instant::now());
 }
@@ -914,6 +959,70 @@ mod tests {
         assert!(cache.tools.contains_key("page"));
     }
 
+    /// Two disjoint capped `complete=false` pages used to merge without
+    /// a bound: `returned=10000 complete=False cached=10000`, then
+    /// `returned=10000 complete=False cached=20000` (`cap_exceeded=True`).
+    /// The merge must keep incomplete-list semantics and refuse new
+    /// names once `max_tools` is reached.
+    #[test]
+    fn merged_incomplete_lists_do_not_exceed_tool_cache_cap() {
+        const CAP: usize = 2;
+        let mut cache = ToolListCache::default();
+        apply_tool_cache_with_cap(
+            &mut cache,
+            &[listed_deploy_with_header("Region"), sample_listed_tool("a1")],
+            false,
+            5_000,
+            CAP,
+        );
+        assert_eq!(
+            cache.tools.len(),
+            CAP,
+            "returned={CAP} complete=false cached={}",
+            cache.tools.len()
+        );
+
+        apply_tool_cache_with_cap(
+            &mut cache,
+            &[sample_listed_tool("b0"), sample_listed_tool("b1")],
+            false,
+            5_000,
+            CAP,
+        );
+        assert_eq!(
+            cache.tools.len(),
+            CAP,
+            "two disjoint capped responses must not grow the cache (cached={} cap_exceeded)",
+            cache.tools.len()
+        );
+        assert!(
+            cache.tools.contains_key("deploy") && cache.tools.contains_key("a1"),
+            "incomplete-list semantics must keep the first capped page"
+        );
+        assert!(
+            !cache.tools.contains_key("b0") && !cache.tools.contains_key("b1"),
+            "new names from a second disjoint capped page must be refused at the cap"
+        );
+
+        apply_tool_cache_with_cap(
+            &mut cache,
+            &[listed_deploy_with_header("Zone"), sample_listed_tool("b0")],
+            false,
+            5_000,
+            CAP,
+        );
+        assert_eq!(cache.tools.len(), CAP);
+        assert_eq!(
+            cache.tools.get("deploy").and_then(x_mcp_header),
+            Some("Zone"),
+            "a same-name schema refresh must apply even when the cache is at cap"
+        );
+        assert!(
+            !cache.tools.contains_key("b0"),
+            "the accompanying new name must still be refused at the cap"
+        );
+    }
+
     #[test]
     fn omitted_or_zero_ttl_is_immediately_stale() {
         let now = Instant::now();
@@ -1124,6 +1233,69 @@ mod tests {
         );
     }
 
+    /// Reported ordering when reconnect reserved *before* listing the
+    /// replacement: `reconnect_gen=1`, concurrent `list_tools` reserved
+    /// `old_list_gen=2` while still on the old client, old published
+    /// first → `reconnect_publish=discarded`, `old_publish=applied`,
+    /// `final_client=new final_schema=Region expected_schema=Zone`.
+    ///
+    /// Production reserves reconnect at the client swap, after that
+    /// old-client refresh has already taken its generation.
+    #[test]
+    fn reconnect_generation_reserved_after_old_client_refresh_keeps_new_schema() {
+        use tools::naming::encode_tool_name;
+
+        let snapshot = McpSchemaSnapshot::new();
+        let tool_cache = StdRwLock::new(ToolListCache::default());
+        let schemas = StdRwLock::new(Some(Arc::clone(&snapshot)));
+        let refresh = ListRefresh {
+            generation: AtomicU64::new(0),
+            published: AtomicU64::new(0),
+            publish: StdMutex::new(()),
+        };
+
+        let old_list_gen = refresh.next_gen();
+        let reconnect_gen = refresh.next_gen();
+        refresh.publish_listed(
+            old_list_gen,
+            &ListedPublish {
+                tool_cache: &tool_cache,
+                schemas: &schemas,
+                catalog_name: "srv",
+                tools: &[listed_deploy_with_header("Region")],
+                replace: true,
+                ttl_ms: 0,
+            },
+        );
+        refresh.publish_listed(
+            reconnect_gen,
+            &ListedPublish {
+                tool_cache: &tool_cache,
+                schemas: &schemas,
+                catalog_name: "srv",
+                tools: &[listed_deploy_with_header("Zone")],
+                replace: true,
+                ttl_ms: 0,
+            },
+        );
+
+        let cache = tool_cache
+            .read()
+            .expect("reconnect generation test must read the catalog cache");
+        assert_eq!(
+            cache.tools.get("deploy").and_then(x_mcp_header),
+            Some("Zone"),
+            "final_schema=Region after a later reconnect reserve is the reported overwrite"
+        );
+        drop(cache);
+        let exposed = encode_tool_name("srv", "deploy");
+        assert_eq!(
+            snapshot.get(&exposed).as_ref().and_then(x_mcp_header),
+            Some("Zone"),
+            "expected_schema=Zone after reconnect reserves at the client swap"
+        );
+    }
+
     #[test]
     fn heartbeat_propagates_the_uncached_list_error_not_the_ping_error() {
         assert_eq!(
@@ -1247,5 +1419,128 @@ mod tests {
             "listed"
         );
         assert_eq!(*slot.read().await, 1);
+    }
+
+    /// Concurrent `list_tools` holds the old client and has already
+    /// reserved a generation. Reconnect listed the replacement without
+    /// reserving, then [`ListRefresh::swap_and_reserve`] waits for that
+    /// reader to drain. The old-client Region publish cannot supersede
+    /// the new client's Zone (`final_client=new expected_schema=Zone`).
+    ///
+    /// The reported reserve-before-list order produced
+    /// `reconnect_publish=discarded`, `old_publish=applied`,
+    /// `final_schema=Region`.
+    #[tokio::test]
+    async fn reconnect_generation_reserved_at_swap_beats_old_client_refresh() {
+        use tools::naming::encode_tool_name;
+
+        let client = Arc::new(RwLock::new("old"));
+        let snapshot = McpSchemaSnapshot::new();
+        let tool_cache = Arc::new(StdRwLock::new(ToolListCache::default()));
+        let schemas = Arc::new(StdRwLock::new(Some(Arc::clone(&snapshot))));
+        let refresh = Arc::new(ListRefresh {
+            generation: AtomicU64::new(0),
+            published: AtomicU64::new(0),
+            publish: StdMutex::new(()),
+        });
+
+        let (holding_old_tx, holding_old_rx) = tokio::sync::oneshot::channel();
+        let (release_old_tx, release_old_rx) = tokio::sync::oneshot::channel();
+
+        let old_client = Arc::clone(&client);
+        let old_refresh = Arc::clone(&refresh);
+        let old_cache = Arc::clone(&tool_cache);
+        let old_schemas = Arc::clone(&schemas);
+        let old_list = tokio::spawn(async move {
+            let old_gen = old_refresh.next_gen();
+            let guard = old_client.read().await;
+            assert_eq!(
+                *guard, "old",
+                "list_tools must still hold the old client when it reserves"
+            );
+            holding_old_tx
+                .send(())
+                .expect("reconnect is waiting for the old-client reader");
+            release_old_rx
+                .await
+                .expect("reconnect listed and is blocked on the write lock");
+            drop(guard);
+            old_refresh.publish_listed(
+                old_gen,
+                &ListedPublish {
+                    tool_cache: &old_cache,
+                    schemas: &old_schemas,
+                    catalog_name: "srv",
+                    tools: &[listed_deploy_with_header("Region")],
+                    replace: true,
+                    ttl_ms: 0,
+                },
+            );
+        });
+
+        holding_old_rx
+            .await
+            .expect("old list_tools must hold the old client before reconnect swaps");
+
+        let rec_client = Arc::clone(&client);
+        let rec_refresh = Arc::clone(&refresh);
+        let rec_cache = Arc::clone(&tool_cache);
+        let rec_schemas = Arc::clone(&schemas);
+        let reconnect = tokio::spawn(async move {
+            let my_gen = rec_refresh.swap_and_reserve(&rec_client, "new").await;
+            rec_refresh.publish_listed(
+                my_gen,
+                &ListedPublish {
+                    tool_cache: &rec_cache,
+                    schemas: &rec_schemas,
+                    catalog_name: "srv",
+                    tools: &[listed_deploy_with_header("Zone")],
+                    replace: true,
+                    ttl_ms: 0,
+                },
+            );
+        });
+
+        let still_blocked = tokio::time::timeout(Duration::from_millis(50), client.write()).await;
+        assert!(
+            still_blocked.is_err(),
+            "old-client reader must block the reconnect swap until it drains"
+        );
+        assert_eq!(
+            *client.read().await,
+            "old",
+            "final_client must still be old while the reader holds it"
+        );
+
+        release_old_tx
+            .send(())
+            .expect("reconnect is waiting to swap after the old reader drains");
+        old_list
+            .await
+            .expect("old-client list_tools should finish after release");
+        reconnect
+            .await
+            .expect("reconnect swap_and_reserve should finish after the reader drains");
+
+        assert_eq!(
+            *client.read().await,
+            "new",
+            "final_client=new after the reconnect swap"
+        );
+        let cache = tool_cache
+            .read()
+            .expect("reconnect swap test must read the catalog cache");
+        assert_eq!(
+            cache.tools.get("deploy").and_then(x_mcp_header),
+            Some("Zone"),
+            "final_schema=Region expected_schema=Zone is the reported reserve-before-list loss"
+        );
+        drop(cache);
+        let exposed = encode_tool_name("srv", "deploy");
+        assert_eq!(
+            snapshot.get(&exposed).as_ref().and_then(x_mcp_header),
+            Some("Zone"),
+            "expected_schema=Zone after reconnect reserves at the client swap"
+        );
     }
 }
