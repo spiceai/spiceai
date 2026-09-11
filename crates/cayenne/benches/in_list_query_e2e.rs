@@ -67,7 +67,9 @@ use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::dml::InsertOp;
-use datafusion_table_providers::util::{column_reference::ColumnReference, on_conflict::OnConflict};
+use datafusion_table_providers::util::{
+    column_reference::ColumnReference, on_conflict::OnConflict,
+};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
@@ -159,7 +161,7 @@ async fn setup() -> Fixture {
                 schema: Arc::clone(&schema),
                 primary_key: vec!["id".to_string()],
                 on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                    "id".to_string()
+                    "id".to_string(),
                 ]))),
                 base_path: data_path.to_string_lossy().to_string(),
                 partition_column: None,
@@ -307,9 +309,8 @@ fn bench_in_list_queries(c: &mut Criterion) {
     for &list_len in LIST_LENS {
         let ids = list_ids(list_len);
         let matched_sum: i64 = ids.iter().map(|&id| id * 2).sum();
-        let rendered = |f: &dyn Fn(i64) -> String| {
-            ids.iter().map(|&id| f(id)).collect::<Vec<_>>().join(", ")
-        };
+        let rendered =
+            |f: &dyn Fn(i64) -> String| ids.iter().map(|&id| f(id)).collect::<Vec<_>>().join(", ");
 
         // All three are probed, keyed the way `Operator::Eq` compares them:
         // integers by value, strings by their bytes, and floats by their bits —
@@ -318,7 +319,11 @@ fn bench_in_list_queries(c: &mut Criterion) {
         // specific to one key shape.
         let mut arms = vec![
             ("i64", "id".to_string(), rendered(&|id| id.to_string())),
-            ("utf8", "label".to_string(), rendered(&|id| format!("'k{id:09}'"))),
+            (
+                "utf8",
+                "label".to_string(),
+                rendered(&|id| format!("'k{id:09}'")),
+            ),
             (
                 "f64",
                 "ratio".to_string(),
@@ -365,12 +370,16 @@ fn bench_in_list_queries(c: &mut Criterion) {
             "SELECT count(*), sum(v1) FROM t WHERE id IN ({})",
             arms[0].2
         );
-        group.bench_with_input(BenchmarkId::new("plan_only", list_len), &list_len, |b, _| {
-            b.iter(|| {
-                let plan = rt.block_on(async { ctx.sql(&in_sql).await.expect("sql") });
-                black_box(plan);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("plan_only", list_len),
+            &list_len,
+            |b, _| {
+                b.iter(|| {
+                    let plan = rt.block_on(async { ctx.sql(&in_sql).await.expect("sql") });
+                    black_box(plan);
+                });
+            },
+        );
     }
     group.finish();
 }

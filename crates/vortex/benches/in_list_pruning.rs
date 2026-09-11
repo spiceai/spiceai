@@ -33,8 +33,8 @@ use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::{InListExpr, Literal, col};
 use vortex::VortexSessionDefault;
 use vortex::dtype::{DType, Nullability, PType, StructFields};
-use vortex::session::VortexSession;
 use vortex::expr::not;
+use vortex::session::VortexSession;
 use vortex_datafusion::{DefaultExpressionConvertor, ExpressionConvertor};
 
 /// Build-side list lengths. A few thousand brackets the size an analytical
@@ -43,7 +43,11 @@ use vortex_datafusion::{DefaultExpressionConvertor, ExpressionConvertor};
 const LIST_LENS: [usize; 7] = [64, 150, 256, 512, 1024, 2048, 8192];
 
 fn arrow_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![Field::new("skey", DataType::Int64, false)]))
+    Arc::new(Schema::new(vec![Field::new(
+        "skey",
+        DataType::Int64,
+        false,
+    )]))
 }
 
 /// The dtype of a row of the file the filter is pushed into — the scope

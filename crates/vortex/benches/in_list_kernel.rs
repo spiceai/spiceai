@@ -34,7 +34,7 @@ use vortex::array::validity::Validity;
 use vortex::array::{IntoArray, VortexSessionExecute};
 use vortex::buffer::Buffer;
 use vortex::dtype::{DType, Nullability, PType};
-use vortex::expr::{lit, list_contains, not, root};
+use vortex::expr::{list_contains, lit, not, root};
 use vortex::scalar::Scalar;
 use vortex::session::VortexSession;
 
@@ -58,7 +58,9 @@ fn needles() -> Vec<i64> {
 /// Selectivity therefore rises with the list length for both engines alike.
 fn list_values(list_len: usize) -> Vec<i64> {
     let step = (BATCH_ROWS / list_len).max(1) as i64;
-    (0..list_len as i64).map(|i| (i * step) % BATCH_ROWS as i64).collect()
+    (0..list_len as i64)
+        .map(|i| (i * step) % BATCH_ROWS as i64)
+        .collect()
 }
 
 fn vortex_batch(needles: &[i64]) -> vortex::array::ArrayRef {
@@ -97,8 +99,9 @@ fn bench_in_list_kernel(c: &mut Criterion) {
                 values
                     .iter()
                     .map(|v| {
-                        Arc::new(Literal::new(datafusion_common::ScalarValue::Int64(Some(*v))))
-                            as Arc<dyn PhysicalExpr>
+                        Arc::new(Literal::new(datafusion_common::ScalarValue::Int64(Some(
+                            *v,
+                        )))) as Arc<dyn PhysicalExpr>
                     })
                     .collect(),
                 false,
@@ -126,14 +129,10 @@ fn bench_in_list_kernel(c: &mut Criterion) {
             .expect("execute list_contains")
             .bit_buffer_view()
             .true_count();
-        let arrow_hits = match arrow_expr
-            .evaluate(&arrow_input)
-            .expect("evaluate in list")
-        {
-            ColumnarValue::Array(array) => datafusion::arrow::array::BooleanArray::from(
-                array.to_data(),
-            )
-            .true_count(),
+        let arrow_hits = match arrow_expr.evaluate(&arrow_input).expect("evaluate in list") {
+            ColumnarValue::Array(array) => {
+                datafusion::arrow::array::BooleanArray::from(array.to_data()).true_count()
+            }
             ColumnarValue::Scalar(_) => panic!("in list should evaluate to an array"),
         };
         assert_eq!(
@@ -200,7 +199,6 @@ fn bench_in_list_kernel(c: &mut Criterion) {
                 b.iter(|| arrow_expr.evaluate(&arrow_input).expect("evaluate"));
             },
         );
-
     }
     group.finish();
 }

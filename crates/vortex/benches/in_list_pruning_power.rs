@@ -115,14 +115,12 @@ fn shapes() -> Vec<(&'static str, Vec<usize>)> {
         ("clustered", (0..2048).map(|i| ROW_COUNT / 2 + i).collect()),
         // 1024 keys at the bottom of the range and 1024 at the top, leaving
         // the whole middle of the table outside the list but inside its bounds.
-        (
-            "two_bands",
-            (0..1024)
-                .chain((last - 1023)..=last)
-                .collect(),
-        ),
+        ("two_bands", (0..1024).chain((last - 1023)..=last).collect()),
         // 2048 keys spread evenly over the whole range.
-        ("scattered", (0..2048).map(|i| i * (ROW_COUNT / 2048)).collect()),
+        (
+            "scattered",
+            (0..2048).map(|i| i * (ROW_COUNT / 2048)).collect(),
+        ),
     ]
 }
 
