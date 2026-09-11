@@ -94,7 +94,6 @@ use crate::datafusion::{
     sql_session_extension::{SessionError, SqlSessionExtension},
     sql_validator::{validate_sql_query_operations, validate_sql_query_read_only},
 };
-use crate::sessions::SqlSession;
 use crate::task_history::correlation;
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
@@ -522,16 +521,36 @@ impl Query {
     ///
     /// Synchronous APIs (`/v1/sql`, Flight SQL) always execute locally, so the
     /// session context is the execution context.
-    fn resolve_session(
+    /// The session context this request already has, or `None` to run against
+    /// the runtime's shared context.
+    ///
+    /// Deliberately does not build one: most requests never run a statement
+    /// that needs session state, and a context is a clone of the runtime's
+    /// whole session state. [`Self::activate_session`] builds it for the
+    /// statements that do.
+    fn existing_session(
         request_context: &Arc<RequestContext>,
-        base_ctx: &SessionContext,
-    ) -> Result<Option<Arc<SqlSession>>, DataFusionError> {
+    ) -> Result<Option<Arc<SessionContext>>, DataFusionError> {
         let Some(extension) = request_context.extension::<SqlSessionExtension>() else {
             return Ok(None);
         };
-        let principal = request_context.auth_principal();
         extension
-            .resolve(principal, base_ctx)
+            .existing(request_context.auth_principal())
+            .map_err(SessionError::into_datafusion)
+    }
+
+    /// The session context, building it if this is the first statement in the
+    /// session to need one.
+    fn activate_session(
+        request_context: &Arc<RequestContext>,
+        base_ctx: &SessionContext,
+    ) -> Result<Option<Arc<SessionContext>>, DataFusionError> {
+        let Some(extension) = request_context.extension::<SqlSessionExtension>() else {
+            return Ok(None);
+        };
+        extension
+            .activate(request_context.auth_principal(), base_ctx)
+            .map(Some)
             .map_err(SessionError::into_datafusion)
     }
 
@@ -1087,11 +1106,11 @@ impl Query {
                 let results_cache_mode = ctx.results_cache_mode;
                 let tracker = ctx.tracker;
 
-                // Bind the request to its session once. Both the planning state
-                // below and the Statement branch further down run in whichever
-                // context this picks, so `PREPARE` and the `EXECUTE` that
-                // follows it cannot land in different ones.
-                let session_scope = match Self::resolve_session(&request_context, &ctx.df.ctx) {
+                // Plan against the session's context when it has one, so an
+                // `EXECUTE` resolves the statement its session prepared. A
+                // session that has never needed a context plans against the
+                // shared one and builds nothing.
+                let session_scope = match Self::existing_session(&request_context) {
                     Ok(scope) => scope,
                     Err(e) => handle_error!(
                         tracker,
@@ -1103,7 +1122,7 @@ impl Query {
                 };
                 let mut session = session_scope
                     .as_ref()
-                    .map_or_else(|| ctx.df.ctx.state(), |scope| scope.context().state());
+                    .map_or_else(|| ctx.df.ctx.state(), |scope| scope.state());
 
                 // A read-only request keeps `EXECUTE` unresolved so
                 // `validate_sql_query_read_only` still refuses it, as it refuses
@@ -1415,16 +1434,29 @@ impl Query {
                     // plan it names during planning, so it arrives here only when
                     // the request is read-only, where the validation above has
                     // already refused it.
-                    let session_ctx = if let Some(scope) = &session_scope {
+                    // This is where the session's context is built, if it does
+                    // not have one yet. Everything above runs against the shared
+                    // context, so a caller that only ever queries never costs one.
+                    let activated = match Self::activate_session(&request_context, &ctx.df.ctx) {
+                        Ok(activated) => activated,
+                        Err(e) => handle_error!(
+                            tracker,
+                            &request_context,
+                            ErrorCode::QueryPlanningError,
+                            e,
+                            UnableToExecuteQuery
+                        ),
+                    };
+                    let session_ctx = if let Some(session_ctx) = activated {
                         tracing::debug!(
                             "Statement plan using SQL session: {}",
-                            scope.context().session_id()
+                            session_ctx.session_id()
                         );
-                        Arc::clone(scope.context())
+                        session_ctx
                     } else {
-                        // No session: the statement mutates a context that is
-                        // discarded when the request ends, so a `PREPARE` here is
-                        // not visible to any later request.
+                        // No session extension — an internal caller. The statement
+                        // mutates a context discarded with the request, so a
+                        // `PREPARE` here outlives nothing.
                         tracing::debug!("Statement plan using ad-hoc session (no SQL session)");
                         Arc::new(SessionContext::new_with_state(ctx.df.ctx.state()))
                     };
@@ -1722,8 +1754,8 @@ impl Query {
 
         // Resolve against the same session the query will execute in, so the
         // schema advertised for a statement matches what running it produces.
-        let session = match Self::resolve_session(&request_context, &self.df.ctx) {
-            Ok(Some(scope)) => scope.context().state(),
+        let session = match Self::existing_session(&request_context) {
+            Ok(Some(scope)) => scope.state(),
             Ok(None) => self.df.ctx.state(),
             Err(e) => {
                 self.handle_schema_error(&request_context, &e);

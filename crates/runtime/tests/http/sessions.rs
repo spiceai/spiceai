@@ -287,33 +287,38 @@ async fn two_principals_do_not_share_prepared_statements() -> Result<(), anyhow:
         .await
 }
 
-/// A stale or unrelated `x-session-id` must not fail the request. The header
-/// name is one other systems use, and on HTTP the runtime never issues an id,
-/// so a value it does not recognise says nothing about what the caller wants —
-/// the request runs in the caller's own session.
+/// Naming an id the runtime has never seen does not fail the request: it opens
+/// a session under that id, which is how a client pins sessions of its own.
 #[tokio::test]
-async fn an_unknown_session_id_does_not_fail_the_request() -> Result<(), anyhow::Error> {
+async fn an_unknown_session_id_opens_a_session_of_its_own() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
         .scope(async {
             let rt = start(&["k:rw"]).await?;
-            let stale = "00000000-0000-4000-8000-000000000000";
+            let pinned = "my-own-id";
 
-            let body = rt.sql_ok("k", Some(stale), "SELECT 1 AS n").await?;
+            let body = rt.sql_ok("k", Some(pinned), "SELECT 1 AS n").await?;
             assert_eq!(
                 serde_json::from_str::<Value>(&body)?,
                 serde_json::json!([{ "n": 1 }]),
-                "an ordinary query is unaffected by a session id the runtime does not hold"
+                "an id the runtime does not hold is not a failure"
             );
 
-            // And it is the caller's own session, so statements still carry over.
-            rt.sql_ok("k", Some(stale), "PREPARE p AS SELECT 2 AS n")
+            rt.sql_ok("k", Some(pinned), "PREPARE p AS SELECT 2 AS n")
                 .await?;
-            let body = rt.sql_ok("k", None, "EXECUTE p").await?;
+            let body = rt.sql_ok("k", Some(pinned), "EXECUTE p").await?;
             assert_eq!(
                 serde_json::from_str::<Value>(&body)?,
-                serde_json::json!([{ "n": 2 }])
+                serde_json::json!([{ "n": 2 }]),
+                "statements carry over within the session that id names"
+            );
+
+            let (status, body) = rt.sql("k", None, "EXECUTE p").await?;
+            assert!(
+                !status.is_success() && body.contains("'p' does not exist"),
+                "and that session is not the one the same caller gets without the header: \
+                {status} {body}"
             );
 
             Ok(())
@@ -365,9 +370,9 @@ async fn a_session_cannot_be_used_by_another_principal() -> Result<(), anyhow::E
         .await
 }
 
-/// Regression: two principals naming the same id must not share a context.
-/// They are authenticated, so each gets the session its own principal owns and
-/// the id they chose is ignored.
+/// Regression: the session id is client-chosen, so a second principal naming
+/// the same one must not land in the first's session and its prepared
+/// statements. The creator is recorded when the session is opened.
 #[tokio::test]
 async fn two_principals_naming_the_same_id_do_not_share_a_session() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -385,9 +390,17 @@ async fn two_principals_naming_the_same_id_do_not_share_a_session() -> Result<()
             .await?;
 
             let (status, body) = rt.sql("b", Some(GUESSABLE), "EXECUTE squat").await?;
-            assert!(
-                !status.is_success() && body.contains("'squat' does not exist"),
-                "the second principal must not reach the first's statement: {status} {body}"
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "the second principal must be refused, not handed the session: {body}"
+            );
+
+            let body = rt.sql_ok("a", Some(GUESSABLE), "EXECUTE squat").await?;
+            assert_eq!(
+                serde_json::from_str::<Value>(&body)?,
+                serde_json::json!([{ "v": "a private" }]),
+                "and the owner still has it"
             );
 
             Ok(())

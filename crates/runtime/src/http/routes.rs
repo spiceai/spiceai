@@ -21,7 +21,7 @@ use crate::datafusion::request_context_extension::DataFusionContextExtension;
 use crate::datafusion::sql_session_extension::SqlSessionExtension;
 use crate::model::ModelContextLayer;
 use crate::request::DatabricksAuthExtension;
-use crate::sessions::{RequestedSession, SESSION_ID_HEADER, SessionStore};
+use crate::sessions::{SESSION_ID_HEADER, SessionStore};
 use crate::status::RuntimeStatus;
 
 use crate::Runtime;
@@ -552,11 +552,13 @@ async fn track_metrics(
     {
         request_context_builder = ext.add_from_headers(request_context_builder, &headers);
     }
-    // Record which session the request names. This layer runs before auth, so
-    // the session is resolved later, where the principal is known and its
-    // ownership can be checked.
-    let session_extension =
-        SqlSessionExtension::new(sessions, RequestedSession::from_headers(&headers));
+    // Settle which session this request belongs to, minting an id when it
+    // names none. Only the id: the context behind it is built later, and only
+    // if a statement needs one. This layer runs before auth, so ownership is
+    // checked where the principal is known.
+    let session = crate::sessions::resolve_or_mint(&sessions, &headers);
+    let session_id = session.id().to_string();
+    let session_extension = SqlSessionExtension::new(session);
 
     let request_context = Arc::new(
         request_context_builder
@@ -595,6 +597,17 @@ async fn track_metrics(
             let response = next.run(req).await;
             let (mut parts, body) = response.into_parts();
             runtime_request_context::attach_trace_id(&mut parts.headers, &request_context);
+            // Hand the id back both ways: a header for a client that reads
+            // headers, a cookie for one that does not. Either brings the next
+            // request back to this session.
+            if let Ok(value) = HeaderValue::from_str(&session_id) {
+                parts.headers.insert(SESSION_ID_HEADER, value);
+            }
+            if let Ok(value) =
+                HeaderValue::from_str(&crate::sessions::session_cookie_value(&session_id))
+            {
+                parts.headers.append(http::header::SET_COOKIE, value);
+            }
             let body = axum::body::Body::new(util::cancel_guard_body::CancelGuardBody::new(
                 body,
                 cancel_guard,

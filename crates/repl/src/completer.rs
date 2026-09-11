@@ -1,6 +1,7 @@
 use crate::EditorHelper;
 use arrow::array::{Array, StringArray};
 use arrow_flight::flight_service_client::FlightServiceClient;
+use flight_client::FlightChannel;
 use rustyline::Context;
 use rustyline::completion::{Completer, Pair};
 use rustyline::history::SearchDirection;
@@ -8,7 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, oneshot};
 use tokio::time::interval;
-use tonic::transport::Channel;
 
 #[derive(Debug, Clone)]
 struct StringValue {
@@ -313,7 +313,7 @@ impl Completer for EditorHelper {
 
 #[expect(clippy::similar_names)]
 async fn refresh_schema(
-    client: FlightServiceClient<Channel>,
+    client: FlightServiceClient<FlightChannel>,
     schema_cache: &Arc<RwLock<SchemaCache>>,
     api_key: Option<&String>,
     user_agent: &str,
@@ -372,7 +372,7 @@ async fn refresh_schema(
 const AUTOCOMPLETE_PREFIX: &str = "--autocomplete\n";
 
 async fn get_tables(
-    client: &mut FlightServiceClient<Channel>,
+    client: &mut FlightServiceClient<FlightChannel>,
     api_key: Option<&String>,
     user_agent: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
@@ -414,7 +414,7 @@ async fn get_tables(
 }
 
 async fn get_schemas(
-    client: &mut FlightServiceClient<Channel>,
+    client: &mut FlightServiceClient<FlightChannel>,
     api_key: Option<&String>,
     user_agent: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
@@ -445,7 +445,7 @@ async fn get_schemas(
 }
 
 async fn get_columns(
-    client: &mut FlightServiceClient<Channel>,
+    client: &mut FlightServiceClient<FlightChannel>,
     api_key: Option<&String>,
     user_agent: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
@@ -473,7 +473,7 @@ async fn get_columns(
 }
 
 async fn get_udfs(
-    client: &mut FlightServiceClient<Channel>,
+    client: &mut FlightServiceClient<FlightChannel>,
     api_key: Option<&String>,
     user_agent: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
@@ -501,7 +501,7 @@ async fn get_udfs(
 }
 
 async fn get_udtfs(
-    client: &mut FlightServiceClient<Channel>,
+    client: &mut FlightServiceClient<FlightChannel>,
     api_key: Option<&String>,
     user_agent: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
@@ -529,7 +529,7 @@ async fn get_udtfs(
 }
 
 async fn get_builtin_functions(
-    client: &mut FlightServiceClient<Channel>,
+    client: &mut FlightServiceClient<FlightChannel>,
     api_key: Option<&String>,
     user_agent: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {

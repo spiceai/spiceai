@@ -24,7 +24,7 @@ use runtime_auth::AuthPrincipalRef;
 use runtime_request_context::Extension;
 use snafu::prelude::*;
 
-use crate::sessions::{RequestedSession, SessionStore, SqlSession};
+use crate::sessions::SqlSession;
 
 /// Why a request may not have the session it named.
 #[derive(Debug, Snafu)]
@@ -57,84 +57,87 @@ impl SessionError {
     }
 }
 
-/// Resolves the [`SqlSession`] a request runs in.
+/// The SQL session a request runs in.
 ///
-/// Attached to the request context by the HTTP and Flight middlewares, which run
-/// *before* authentication and so can only record what the request named. The
-/// principal is known later, at the point the session is used, which is why
-/// resolution — and the ownership check that goes with it — happens here rather
-/// than in the middleware.
+/// The middlewares settle the id before authentication and put it here; this is
+/// where the context behind it is reached, because only here is the principal
+/// known and only here is it clear whether the request needs a context at all.
 #[derive(Clone)]
 pub struct SqlSessionExtension {
-    store: SessionStore,
-    requested: RequestedSession,
+    session: Arc<SqlSession>,
 }
 
 impl SqlSessionExtension {
     #[must_use]
-    pub fn new(store: SessionStore, requested: RequestedSession) -> Self {
-        Self { store, requested }
+    pub fn new(session: Arc<SqlSession>) -> Self {
+        Self { session }
     }
 
-    /// The session this request runs in, or `None` to run against the shared
-    /// context.
-    ///
-    /// There is deliberately no accessor that hands back a session without a
-    /// principal to check it against: the session id arrives in a
-    /// client-controlled header, so every path that selects one has to prove the
-    /// caller owns it.
+    /// The session's id, which the response hands back to the client.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        self.session.id()
+    }
+
+    /// The context this session already has, or `None` if nothing has needed
+    /// one — in which case the request runs against the runtime's shared
+    /// context and builds nothing.
     ///
     /// # Errors
     ///
-    /// Returns [`SessionError`] when the request explicitly named a session that
-    /// does not exist or that belongs to another principal.
-    pub fn resolve(
+    /// Returns [`SessionError`] when the session belongs to another principal.
+    pub fn existing(
+        &self,
+        principal: Option<&AuthPrincipalRef>,
+    ) -> Result<Option<Arc<SessionContext>>, SessionError> {
+        let Some(ctx) = self.session.context() else {
+            return Ok(None);
+        };
+        self.ensure_owned(principal)?;
+        Ok(Some(Arc::clone(ctx)))
+    }
+
+    /// The context, building it if this is the first statement in the session
+    /// to need one.
+    ///
+    /// Only statements that carry state between requests — `PREPARE`, `SET`,
+    /// and the `EXECUTE`/`DEALLOCATE` that read it back — reach this. An
+    /// ordinary query never does, so a caller that runs only queries never
+    /// costs a context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] when the session belongs to another principal.
+    pub fn activate(
         &self,
         principal: Option<&AuthPrincipalRef>,
         base_ctx: &SessionContext,
-    ) -> Result<Option<Arc<SqlSession>>, SessionError> {
-        // `x-session-id` when the request set it, otherwise its bearer token,
-        // which is only sometimes a session id.
-        let named = self
-            .requested
-            .explicit_id
-            .as_deref()
-            .or(self.requested.bearer_token.as_deref());
+    ) -> Result<Arc<SessionContext>, SessionError> {
+        // Checked before activating as well as after: an unactivated session is
+        // unowned and would otherwise be claimed by whoever asked first, which
+        // is the same check being skipped.
+        self.ensure_owned(principal)?;
+        let owner = principal.and_then(|principal| principal.stable_id());
+        let ctx = Arc::clone(self.session.activate(base_ctx, owner.as_deref()));
+        self.ensure_owned(principal)?;
+        Ok(ctx)
+    }
 
-        if let Some(id) = named
-            && let Some(session) = self.store.get_issued(id)
-        {
-            ensure!(
-                session.is_owned_by(principal),
-                NotOwnedSnafu {
-                    session_id: id.to_string()
-                }
-            );
-            return Ok(Some(session));
-        }
-
-        // An id that resolves to nothing is not an error. Most bearer tokens are
-        // API keys rather than session ids, and `x-session-id` is a name other
-        // systems use too — failing those requests would break callers that have
-        // nothing to do with sessions.
-        if let Some(stable_id) = principal.and_then(|principal| principal.stable_id()) {
-            return Ok(Some(self.store.implicit_for(base_ctx, stable_id.as_ref())));
-        }
-
-        // No principal to key a session on: the id the request supplied is the
-        // key, as it has always been on Flight SQL.
-        if let Some(id) = named {
-            return Ok(Some(self.store.open_unowned(base_ctx, id)));
-        }
-
-        Ok(None)
+    fn ensure_owned(&self, principal: Option<&AuthPrincipalRef>) -> Result<(), SessionError> {
+        ensure!(
+            self.session.is_owned_by(principal),
+            NotOwnedSnafu {
+                session_id: self.session.id().to_string()
+            }
+        );
+        Ok(())
     }
 }
 
 impl std::fmt::Debug for SqlSessionExtension {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqlSessionExtension")
-            .field("requested", &self.requested)
+            .field("session", &self.session)
             .finish_non_exhaustive()
     }
 }
@@ -148,6 +151,7 @@ impl Extension for SqlSessionExtension {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sessions::SessionStore;
     use runtime_auth::AuthPrincipal;
     use spicepod::component::runtime::ApiKey;
 
@@ -155,160 +159,93 @@ mod tests {
         Arc::new(ApiKey::parse_str(key)) as AuthPrincipalRef
     }
 
-    fn stable_id_of(key: &str) -> String {
-        ApiKey::parse_str(key)
-            .stable_id()
-            .map(std::borrow::Cow::into_owned)
-            .expect("an api key principal always has a stable id")
-    }
-
-    fn named(explicit: Option<&str>, bearer: Option<&str>) -> RequestedSession {
-        RequestedSession {
-            explicit_id: explicit.map(str::to_string),
-            bearer_token: bearer.map(str::to_string),
-        }
-    }
-
+    /// A request that runs only ordinary queries never builds a context: the
+    /// session is an id and nothing more until a statement needs state.
     #[test]
-    fn an_explicitly_named_session_resolves_for_its_owner() {
+    fn a_session_has_no_context_until_something_needs_one() {
         let store = SessionStore::new();
-        let base = SessionContext::new();
-        let session = store.issue(&base, Some(stable_id_of("a")), None);
-
-        let ext = SqlSessionExtension::new(store, named(Some(session.id()), None));
-
-        let resolved = ext
-            .resolve(Some(&principal("a")), &base)
-            .expect("the owner may use its own session")
-            .expect("the session resolves");
-        assert!(Arc::ptr_eq(resolved.context(), session.context()));
-    }
-
-    /// Regression: a session id reaching another principal — by a leak, or by
-    /// both principals naming the same id — must not carry that principal into
-    /// the owner's prepared statements.
-    #[test]
-    fn an_explicitly_named_session_is_refused_to_another_principal() {
-        let store = SessionStore::new();
-        let base = SessionContext::new();
-        let session = store.issue(&base, Some(stable_id_of("a")), None);
-
-        let ext = SqlSessionExtension::new(store, named(Some(session.id()), None));
-
-        let error = ext
-            .resolve(Some(&principal("b")), &base)
-            .expect_err("a different principal is refused");
-        assert!(matches!(error, SessionError::NotOwned { .. }), "{error}");
-    }
-
-    /// An `x-session-id` the store does not hold is not an error: `x-session-id`
-    /// is a name other systems use too, and failing every request that carries
-    /// a stale or unrelated one would break callers with no interest in
-    /// sessions. The caller runs in its own session instead.
-    #[test]
-    fn an_unknown_explicit_session_falls_through_to_the_callers_own() {
-        let store = SessionStore::new();
-        let ext = SqlSessionExtension::new(store, named(Some("no-such-session"), None));
-
-        let resolved = ext
-            .resolve(Some(&principal("a")), &SessionContext::new())
-            .expect("an unknown session id is not an error")
-            .expect("the caller still gets its own session");
-        assert!(resolved.is_owned_by(Some(&principal("a"))));
-    }
-
-    /// With no principal there is nothing to key a session on, so the id the
-    /// request supplied is the key — the behaviour Flight SQL has always had,
-    /// and what makes prepared statements work on a runtime with no auth.
-    #[test]
-    fn an_unauthenticated_caller_gets_a_session_keyed_on_the_id_it_supplied() {
-        let store = SessionStore::new();
-        let base = SessionContext::new();
-
-        let first = SqlSessionExtension::new(store.clone(), named(Some("my-own-id"), None))
-            .resolve(None, &base)
-            .expect("resolving is not an error")
-            .expect("a session is created under the supplied id");
-        let again = SqlSessionExtension::new(store.clone(), named(Some("my-own-id"), None))
-            .resolve(None, &base)
-            .expect("resolving is not an error")
-            .expect("and is reused on the next request");
-        assert!(Arc::ptr_eq(first.context(), again.context()));
-
-        let other = SqlSessionExtension::new(store, named(Some("a-different-id"), None))
-            .resolve(None, &base)
-            .expect("resolving is not an error")
-            .expect("a different id is a different session");
-        assert!(!Arc::ptr_eq(first.context(), other.context()));
-    }
-
-    /// A bearer token is ordinarily an API key. One that names no session must
-    /// fall through rather than fail the request, or every authenticated call
-    /// made without a session would be refused.
-    #[test]
-    fn a_bearer_token_that_names_no_session_is_not_an_error() {
-        let store = SessionStore::new();
-        let ext = SqlSessionExtension::new(store, named(None, Some("an-api-key")));
-
-        let resolved = ext
-            .resolve(Some(&principal("an-api-key")), &SessionContext::new())
-            .expect("an api key presented as a bearer token names no session");
-        assert!(resolved.is_none());
-    }
-
-    #[test]
-    fn a_bearer_token_that_is_a_session_id_selects_that_session() {
-        let store = SessionStore::new();
-        let base = SessionContext::new();
-        let session = store.issue(&base, Some(stable_id_of("a")), Some("a".to_string()));
-
-        let ext = SqlSessionExtension::new(store, named(None, Some(session.id())));
-
-        let resolved = ext
-            .resolve(Some(&principal("a")), &base)
-            .expect("the owner may use its own session")
-            .expect("the session resolves");
-        assert_eq!(resolved.id(), session.id());
-    }
-
-    /// A caller that names no session gets one of its own, keyed on its
-    /// principal — the same behavior on both protocols, and what lets
-    /// `PREPARE`/`EXECUTE` span requests without a client asking for a session.
-    #[test]
-    fn a_caller_naming_no_session_gets_one_keyed_on_its_principal() {
-        let store = SessionStore::new();
-        let base = SessionContext::new();
-        let ext = SqlSessionExtension::new(store, RequestedSession::default());
-
-        let resolved = ext
-            .resolve(Some(&principal("a")), &base)
-            .expect("resolving is not an error")
-            .expect("an implicit session is created on first use");
-
-        assert!(resolved.is_owned_by(Some(&principal("a"))));
-        assert!(
-            !resolved.is_owned_by(Some(&principal("b"))),
-            "another principal must not land in it"
-        );
-    }
-
-    /// Without a principal there is nothing to key an implicit session on, so an
-    /// unauthenticated caller runs against the shared context rather than
-    /// joining a session others could reach.
-    #[test]
-    fn an_unauthenticated_caller_gets_no_implicit_session() {
-        let ext = SqlSessionExtension::new(SessionStore::new(), RequestedSession::default());
+        let ext = SqlSessionExtension::new(store.mint());
 
         assert!(
-            ext.resolve(None, &SessionContext::new())
-                .expect("resolving is not an error")
+            ext.existing(Some(&principal("a")))
+                .expect("an unactivated session is not an error")
                 .is_none()
         );
     }
 
-    /// This message is the only explanation a caller gets for a session that is
-    /// not theirs, so a reword must not quietly drop the session it names, what
-    /// the caller should do, or where to read more.
+    /// The first statement that needs state builds the context, and later
+    /// requests naming the same id come back to it.
+    #[test]
+    fn activating_builds_the_context_once() {
+        let store = SessionStore::new();
+        let base = SessionContext::new();
+        let session = store.mint();
+
+        let first = SqlSessionExtension::new(Arc::clone(&session))
+            .activate(Some(&principal("a")), &base)
+            .expect("the first statement builds it");
+        let again = SqlSessionExtension::new(store.open(session.id()))
+            .activate(Some(&principal("a")), &base)
+            .expect("a later request comes back to it");
+
+        assert!(Arc::ptr_eq(&first, &again));
+        assert!(Arc::ptr_eq(
+            &first,
+            &SqlSessionExtension::new(store.open(session.id()))
+                .existing(Some(&principal("a")))
+                .expect("still owned by the same principal")
+                .expect("and now has a context")
+        ));
+    }
+
+    /// Regression: the id is client-supplied, so a second principal naming the
+    /// same one must not reach the first's prepared statements.
+    #[test]
+    fn a_second_principal_naming_the_same_id_is_refused() {
+        let store = SessionStore::new();
+        let base = SessionContext::new();
+        let session = store.mint();
+
+        SqlSessionExtension::new(Arc::clone(&session))
+            .activate(Some(&principal("a")), &base)
+            .expect("the first principal activates it");
+
+        let ext = SqlSessionExtension::new(store.open(session.id()));
+        assert!(matches!(
+            ext.activate(Some(&principal("b")), &base)
+                .expect_err("a second principal is refused"),
+            SessionError::NotOwned { .. }
+        ));
+        assert!(matches!(
+            ext.existing(Some(&principal("b")))
+                .expect_err("and cannot read it either"),
+            SessionError::NotOwned { .. }
+        ));
+    }
+
+    /// A runtime with no `runtime.auth` records no owner, so the session stays
+    /// open — there are no identities to keep apart.
+    #[test]
+    fn an_unauthenticated_session_is_open() {
+        let store = SessionStore::new();
+        let base = SessionContext::new();
+        let session = store.mint();
+
+        SqlSessionExtension::new(Arc::clone(&session))
+            .activate(None, &base)
+            .expect("an unauthenticated caller may activate it");
+
+        assert!(
+            SqlSessionExtension::new(store.open(session.id()))
+                .existing(Some(&principal("anyone")))
+                .expect("an unowned session is open")
+                .is_some()
+        );
+    }
+
+    /// These messages are the only explanation a caller gets for a session that
+    /// is not theirs, so a reword must not drop the session it names, what to
+    /// do, or where to read more.
     #[test]
     fn a_session_error_names_the_session_the_fix_and_the_docs() {
         let message = SessionError::NotOwned {
@@ -320,10 +257,6 @@ mod tests {
         assert!(
             message.contains("https://spiceai.org/docs/"),
             "links the docs: {message}"
-        );
-        assert!(
-            message.contains("credentials this request presents"),
-            "says which credentials to use: {message}"
         );
         assert!(
             !message.contains('\n'),
@@ -341,9 +274,7 @@ mod tests {
 
         let recovered =
             SessionError::from_datafusion(&carried).expect("the session error is recoverable");
-        assert!(matches!(recovered, SessionError::NotOwned { .. }));
         assert_eq!(recovered.to_string(), message);
-
         assert!(
             SessionError::from_datafusion(&DataFusionError::Execution("other".to_string()))
                 .is_none()

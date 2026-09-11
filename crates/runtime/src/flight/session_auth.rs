@@ -77,7 +77,6 @@ pub fn with_session_awareness(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::prelude::SessionContext;
     use runtime_auth::api_key::ApiKeyAuth;
     use spicepod::component::runtime::ApiKey;
 
@@ -90,7 +89,7 @@ mod tests {
     #[test]
     fn a_session_id_authenticates_as_the_key_it_was_issued_against() {
         let store = SessionStore::new();
-        let session = store.issue(&SessionContext::new(), None, Some("test-key".to_string()));
+        let session = store.issue(Some("test-key".to_string()));
 
         let session_auth = SessionAwareAuth::new(auth_with(&["test-key:rw"]), store);
 
@@ -126,7 +125,7 @@ mod tests {
     #[test]
     fn a_session_issued_without_a_credential_is_not_a_credential() {
         let store = SessionStore::new();
-        let session = store.issue(&SessionContext::new(), None, None);
+        let session = store.issue(None);
 
         let session_auth = SessionAwareAuth::new(auth_with(&["valid-key:rw"]), store);
 
@@ -142,11 +141,7 @@ mod tests {
     #[test]
     fn revoking_the_key_revokes_the_sessions_issued_against_it() {
         let store = SessionStore::new();
-        let session = store.issue(
-            &SessionContext::new(),
-            None,
-            Some("retired-key".to_string()),
-        );
+        let session = store.issue(Some("retired-key".to_string()));
 
         let session_auth = SessionAwareAuth::new(auth_with(&["current-key:rw"]), store);
 

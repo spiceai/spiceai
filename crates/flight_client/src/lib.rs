@@ -33,6 +33,7 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use bytes::Bytes;
+use cookie::{CookieService, CookieStore};
 use futures::Stream;
 use futures::StreamExt;
 use futures::{TryStreamExt, ready, stream};
@@ -274,9 +275,15 @@ impl Credentials {
 ///
 /// This client is cheap to clone. Most fields are wrapped in `Arc`, and the `FlightServiceClient` is
 /// also designed to be cheap to clone.
+/// The channel every request rides, wrapped so the client keeps the cookies the
+/// server sets. The runtime hands a SQL session back in a `session-id` cookie,
+/// so without this each request would be given a session of its own and
+/// `PREPARE` would not reach the `EXECUTE` that follows it.
+pub type FlightChannel = CookieService<Channel>;
+
 #[derive(Debug, Clone)]
 pub struct FlightClient {
-    client: FlightServiceClient<Channel>,
+    client: FlightServiceClient<FlightChannel>,
     credentials: Credentials,
     url: Arc<str>,
     metadata: Option<tonic::metadata::MetadataMap>,
@@ -323,6 +330,8 @@ impl FlightClient {
         let flight_channel = tls::new_tls_flight_channel_with_options(&url, tls_options)
             .await
             .context(UnableToConnectToServerSnafu)?;
+
+        let flight_channel = CookieService::new(flight_channel, Arc::new(CookieStore::new()));
 
         Ok(FlightClient {
             client: FlightServiceClient::new(flight_channel)
@@ -650,7 +659,7 @@ impl FlightClient {
         Some(username)
     }
 
-    pub fn client(&self) -> &FlightServiceClient<Channel> {
+    pub fn client(&self) -> &FlightServiceClient<FlightChannel> {
         &self.client
     }
 }

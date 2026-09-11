@@ -17,30 +17,35 @@ limitations under the License.
 //! SQL sessions shared by the HTTP and Flight SQL endpoints.
 //!
 //! A session is a [`SessionContext`] the runtime keeps alive across requests so
-//! that `PREPARE` / `EXECUTE` / `DEALLOCATE` work: `DataFusion` stores prepared
-//! plans in `SessionState`, reachable only through the context that owns them,
-//! so the same context object has to serve every request in the session.
+//! that `PREPARE` / `SET` / `EXECUTE` work: `DataFusion` stores prepared plans
+//! and session settings in `SessionState`, reachable only through the context
+//! that owns them, so the same context object has to serve every request in the
+//! session.
 //!
-//! # Session ids are issued, never accepted
+//! # Every request has a session id; few requests have a context
 //!
-//! Only [`SessionStore::issue`] mints an id, and it always records the
-//! principal that asked for it. A request *names* a session — with
-//! `x-session-id`, or with an `Authorization` bearer token that happens to be a
-//! session id — and naming an id the store does not hold creates nothing. This
-//! is what keeps two principals that pick the same id from sharing a context,
-//! and what keeps a leaked id from being usable by anyone but its owner (see
-//! [`SqlSession::is_owned_by`]).
+//! Each request names its session with `x-session-id`, a `session-id` cookie,
+//! or a bearer token that is one. A request naming none is given a freshly
+//! minted id, returned to it in both the header and the cookie, so the next
+//! request can come back to the same session.
 //!
-//! # Interchangeable across protocols
+//! Minting an id registers the id and nothing else. The [`SessionContext`] —
+//! the expensive part, a clone of the runtime's session state — is built on
+//! first use by [`SqlSession::activate`], which only the statements that need
+//! session state reach. A caller that only ever runs ordinary queries therefore
+//! pays for an id and never for a context.
 //!
-//! One store serves both endpoints. A caller that names no session gets an
-//! implicit one keyed on its principal, so `PREPARE`/`EXECUTE` span requests on
-//! either protocol without a client asking for a session. An id issued by a
-//! Flight SQL handshake is also usable on `/v1/sql` — as `x-session-id`, or as
-//! the bearer token, which both endpoints resolve back to the credential the
-//! session was issued against (see [`SessionStore::bearer_credential`]).
+//! # Ownership
+//!
+//! The id arrives in a client-controlled header, so it cannot by itself say who
+//! the caller is. The principal is recorded when the context is built, and
+//! every later use is checked against it ([`SqlSession::is_owned_by`]); that is
+//! what stops a second principal naming the same id from reaching the first's
+//! prepared statements. A session activated without authentication records no
+//! owner and stays open, which is correct on a runtime with no `runtime.auth`
+//! to distinguish callers.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use datafusion::prelude::SessionContext;
@@ -63,43 +68,30 @@ const MAX_SESSIONS: u64 = 10_000;
 /// one definition, checked at compile time.
 pub const SESSION_ID_HEADER: HeaderName = HeaderName::from_static("x-session-id");
 
-/// Key prefix for implicit sessions, which are addressed by the principal that
-/// owns them rather than by an issued id. It is not a valid issued id (those are
-/// UUIDs), so a request cannot name one.
-const IMPLICIT_KEY_PREFIX: &str = "implicit:";
+/// Cookie a request names its session with, and which the runtime sets on the
+/// response so a browser or any cookie-keeping client comes back to the same
+/// session without having to read a header.
+pub const SESSION_ID_COOKIE: &str = "session-id";
 
-/// How a session came to exist.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SessionKind {
-    /// The client asked for a session and was given an id — today that is the
-    /// Flight SQL handshake. The id is what the client presents on later
-    /// requests, so it is a CSPRNG-random `UUIDv4`: it must be
-    /// unpredictable, and (unlike the time-ordered `UUIDv7`) must not leak when
-    /// the session was created.
-    Issued,
-
-    /// Derived from the authenticated principal for a client that never asked
-    /// for a session. This is what lets a Flight SQL client that skips the
-    /// handshake — `spice sql --api-key …` among them — still run
-    /// `PREPARE`/`EXECUTE` across requests. Its key is not an id any request can
-    /// name, so it is reachable only by the principal it belongs to.
-    Implicit,
+/// What a session holds once something has needed it: the `DataFusion` context,
+/// and the principal that caused it to be built.
+struct Active {
+    ctx: Arc<SessionContext>,
+    /// `stable_id()` of the principal that activated the session, or `None`
+    /// when it was activated without authentication.
+    owner_stable_id: Option<String>,
 }
 
-/// A live `DataFusion` session and the principal it belongs to.
+/// A session id, and the `DataFusion` context behind it once one is needed.
 pub struct SqlSession {
     id: String,
-    kind: SessionKind,
-    ctx: Arc<SessionContext>,
-    /// `stable_id()` of the principal that created the session, or `None` when
-    /// it was created without authentication. An unowned session is usable by
-    /// anyone, which is the right behavior on a runtime with no `runtime.auth`
-    /// configured — there is no identity to bind it to.
-    owner_stable_id: Option<String>,
+    /// Built on first use rather than when the id is minted: most requests
+    /// never run a statement that needs session state, and a context is a clone
+    /// of the runtime's whole session state.
+    active: OnceLock<Active>,
     /// The API key the session stands in for when its id is presented as a
-    /// bearer token. `None` when the creator authenticated by some other means
-    /// (a client certificate) or not at all — such a session is still usable
-    /// via `x-session-id`, it just is not a credential.
+    /// bearer token. `None` unless the session was issued against a credential
+    /// — a Flight SQL handshake — so a minted id is never itself a credential.
     bearer_api_key: Option<String>,
 }
 
@@ -109,21 +101,49 @@ impl SqlSession {
         &self.id
     }
 
+    /// The context, if something has already needed one.
     #[must_use]
-    pub fn context(&self) -> &Arc<SessionContext> {
-        &self.ctx
+    pub fn context(&self) -> Option<&Arc<SessionContext>> {
+        self.active.get().map(|active| &active.ctx)
+    }
+
+    /// The context, building it against `base_ctx` if this is the first
+    /// statement to need one and recording `owner_stable_id` as its owner.
+    ///
+    /// The context is built from `base_ctx`'s state with this session's id as
+    /// the `session_id`, which is what isolates its prepared plans from every
+    /// other session. The catalog list is shared with `base_ctx` rather than
+    /// copied, so datasets registered later remain visible inside it;
+    /// configuration options and the function registries are snapshots.
+    #[must_use]
+    pub fn activate(
+        &self,
+        base_ctx: &SessionContext,
+        owner_stable_id: Option<&str>,
+    ) -> &Arc<SessionContext> {
+        &self
+            .active
+            .get_or_init(|| Active {
+                ctx: context_from(base_ctx, &self.id),
+                owner_stable_id: owner_stable_id.map(str::to_string),
+            })
+            .ctx
     }
 
     /// Whether `principal` may use this session.
     ///
-    /// An unowned session is open to everyone. An owned one is usable only by
-    /// the principal that created it — this is the check that stops a leaked
-    /// session id from carrying another principal's prepared statements, and it
-    /// has to be applied at every point a session is selected, because the id is
-    /// read from a client-controlled header before authentication runs.
+    /// A session nothing has activated yet belongs to nobody, so the first
+    /// caller to reach it may have it. Once activated it is usable only by the
+    /// principal recorded then — the check that stops a leaked or guessed id
+    /// from carrying another principal's prepared statements. An unowned
+    /// session (activated without authentication) stays open to everyone.
     #[must_use]
     pub fn is_owned_by(&self, principal: Option<&AuthPrincipalRef>) -> bool {
-        let Some(owner) = self.owner_stable_id.as_deref() else {
+        let Some(owner) = self
+            .active
+            .get()
+            .and_then(|active| active.owner_stable_id.as_deref())
+        else {
             return true;
         };
         principal
@@ -136,10 +156,19 @@ impl std::fmt::Debug for SqlSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqlSession")
             .field("id", &self.id)
-            .field("kind", &self.kind)
-            .field("owner_stable_id", &self.owner_stable_id)
+            .field("activated", &self.active.get().is_some())
             .finish_non_exhaustive()
     }
+}
+
+/// A context sharing `base_ctx`'s catalogs, functions and custom rules but
+/// carrying its own `session_id`, which is what scopes prepared plans to this
+/// session.
+fn context_from(base_ctx: &SessionContext, session_id: &str) -> Arc<SessionContext> {
+    let state = builder_from_existing(&base_ctx.state())
+        .with_session_id(session_id.to_string())
+        .build();
+    Arc::new(SessionContext::new_with_state(state))
 }
 
 /// Maps session ids to the [`SqlSession`] they name, expiring them after a
@@ -174,118 +203,51 @@ impl SessionStore {
         }
     }
 
-    /// Creates a session and returns it. The id is the caller's to hand back to
-    /// the client.
+    /// Registers a freshly minted id and returns the session it names.
     ///
-    /// `owner_stable_id` binds the session to a principal; pass `None` only when
-    /// the request that asked for it was unauthenticated.
-    ///
-    /// The context is built from `base_ctx`'s state with a fresh `session_id`,
-    /// which is what isolates its prepared plans from every other session. The
-    /// catalog list is shared with `base_ctx` rather than copied, so datasets
-    /// registered after the session is created remain visible inside it;
-    /// configuration options and the function registries are snapshots.
+    /// Only the id is created here. The [`SessionContext`] is built later, by
+    /// [`SqlSession::activate`], if a statement in this session ever needs one.
     #[must_use]
-    pub fn issue(
-        &self,
-        base_ctx: &SessionContext,
-        owner_stable_id: Option<String>,
-        bearer_api_key: Option<String>,
-    ) -> Arc<SqlSession> {
-        let id = Uuid::new_v4().hyphenated().to_string();
-        let session = Arc::new(SqlSession {
-            ctx: Self::context_from(base_ctx, &id),
-            kind: SessionKind::Issued,
-            id: id.clone(),
-            owner_stable_id,
-            bearer_api_key,
-        });
-        self.insert(id, &session);
-        session
+    pub fn mint(&self) -> Arc<SqlSession> {
+        self.register(Uuid::new_v4().hyphenated().to_string(), None)
     }
 
-    /// The session named by an id a request supplied, if the store holds one.
-    ///
-    /// Implicit sessions are deliberately unreachable here: their key is derived
-    /// from a principal, not issued to a client, so treating a request-supplied
-    /// string as one would let a caller address a session by guessing a
-    /// principal id rather than by holding a credential.
+    /// Registers an id issued against a credential, so presenting the id as a
+    /// bearer token authenticates as that credential. The Flight SQL handshake
+    /// hands its id back in exactly that form.
     #[must_use]
-    pub fn get_issued(&self, id: &str) -> Option<Arc<SqlSession>> {
-        self.sessions
-            .get(id)
-            .filter(|session| session.kind == SessionKind::Issued)
+    pub fn issue(&self, bearer_api_key: Option<String>) -> Arc<SqlSession> {
+        self.register(Uuid::new_v4().hyphenated().to_string(), bearer_api_key)
     }
 
-    /// The session a principal gets when it never asked for one, created on
-    /// first use.
+    /// The session an id names, registering the id if the store does not hold
+    /// it.
     ///
-    /// Keyed by the principal's stable id, so two principals can never land in
-    /// the same session and a client cannot choose which one it reaches.
+    /// Registering an id a client chose is what lets a client pin its own
+    /// sessions, and costs an id rather than a context — nothing is built until
+    /// a statement needs one.
     #[must_use]
-    pub fn implicit_for(
-        &self,
-        base_ctx: &SessionContext,
-        owner_stable_id: &str,
-    ) -> Arc<SqlSession> {
-        let key = format!("{IMPLICIT_KEY_PREFIX}{owner_stable_id}");
-        if let Some(session) = self.sessions.get(&key) {
+    pub fn open(&self, id: &str) -> Arc<SqlSession> {
+        if let Some(session) = self.sessions.get(id) {
             return session;
         }
-
-        // `get_with` collapses a concurrent race onto one initializer, so two
-        // requests from the same principal arriving together share a context
-        // rather than each building one and one of them losing its prepared
-        // statements to the other's insert.
-        let session = self.sessions.get_with(key.clone(), || {
-            Arc::new(SqlSession {
-                ctx: Self::context_from(base_ctx, &key),
-                kind: SessionKind::Implicit,
-                id: key.clone(),
-                owner_stable_id: Some(owner_stable_id.to_string()),
-                bearer_api_key: None,
-            })
-        });
-        self.sessions.run_pending_tasks();
-        session
+        self.register(id.to_string(), None)
     }
 
-    /// The session a request's own id names on a runtime with no
-    /// authentication, created on first use.
-    ///
-    /// With no `runtime.auth` there is no principal to key a session on, so the
-    /// id the request supplied — `x-session-id`, or its bearer token — is the
-    /// key, which is how Flight SQL has always behaved. The session is unowned
-    /// and so reachable by anyone who names the same id; that is only offered
-    /// where the runtime has no identities to keep apart in the first place.
+    /// The session an id names, if the store holds it. Registers nothing.
     #[must_use]
-    pub fn open_unowned(&self, base_ctx: &SessionContext, id: &str) -> Arc<SqlSession> {
-        if let Some(session) = self.get_issued(id) {
-            return session;
-        }
-
-        let session = self.sessions.get_with(id.to_string(), || {
-            Arc::new(SqlSession {
-                ctx: Self::context_from(base_ctx, id),
-                kind: SessionKind::Issued,
-                id: id.to_string(),
-                owner_stable_id: None,
-                // Never a credential: it was not issued against one.
-                bearer_api_key: None,
-            })
-        });
-        self.sessions.run_pending_tasks();
-        session
+    pub fn get(&self, id: &str) -> Option<Arc<SqlSession>> {
+        self.sessions.get(id)
     }
 
-    /// The API key an issued session id stands in for, so a bearer token that is
-    /// a session id authenticates as the principal the session was issued to.
+    /// The API key an id stands in for, so a bearer token that is a session id
+    /// authenticates as the principal the session was issued to.
     ///
-    /// Returns `None` for anything that is not an issued session carrying a key,
-    /// leaving the caller to fall through to its ordinary credential check.
+    /// `None` for anything that is not a session carrying a key, leaving the
+    /// caller to fall through to its ordinary credential check.
     #[must_use]
     pub fn bearer_credential(&self, token: &str) -> Option<String> {
-        self.get_issued(token)
+        self.get(token)
             .and_then(|session| session.bearer_api_key.clone())
     }
 
@@ -297,70 +259,106 @@ impl SessionStore {
         removed
     }
 
-    /// The number of live sessions, implicit ones included.
+    /// The number of live sessions, counting ids that have no context yet.
     #[must_use]
     pub fn count(&self) -> usize {
         usize::try_from(self.sessions.entry_count()).unwrap_or(usize::MAX)
     }
 
-    fn insert(&self, id: String, session: &Arc<SqlSession>) {
-        self.sessions.insert(id, Arc::clone(session));
+    fn register(&self, id: String, bearer_api_key: Option<String>) -> Arc<SqlSession> {
+        // `get_with` collapses a concurrent race onto one initializer, so two
+        // requests naming the same id share a session rather than each building
+        // one and one of them losing its statements to the other's insert.
+        let session = self.sessions.get_with(id.clone(), || {
+            Arc::new(SqlSession {
+                id,
+                active: OnceLock::new(),
+                bearer_api_key,
+            })
+        });
         self.sessions.run_pending_tasks();
-    }
-
-    /// A context sharing `base_ctx`'s catalogs, functions and custom rules but
-    /// carrying its own `session_id`, which is what scopes prepared plans to
-    /// this session.
-    fn context_from(base_ctx: &SessionContext, session_id: &str) -> Arc<SessionContext> {
-        let state = builder_from_existing(&base_ctx.state())
-            .with_session_id(session_id.to_string())
-            .build();
-        Arc::new(SessionContext::new_with_state(state))
+        session
     }
 }
 
-/// The session id a request names, if any: `x-session-id` when the client set
-/// it, otherwise the `Authorization` bearer token.
+/// Resolves the session a request runs in, minting an id when it names none.
 ///
-/// The two are not equivalent to the caller. `x-session-id` is a request to use
-/// a specific session and is an error when the store does not hold it; a bearer
-/// token is a credential that only *might* be a session id, so failing to
-/// resolve one is ordinary. [`RequestedSession`] keeps them apart for that
-/// reason.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RequestedSession {
-    /// Value of the `x-session-id` header.
-    pub explicit_id: Option<String>,
-    /// The `Authorization` bearer token, which may or may not name a session.
-    pub bearer_token: Option<String>,
+/// Called by the HTTP and Flight middlewares, before authentication — gRPC
+/// metadata is HTTP/2 headers, so both read the same map and agree on how a
+/// session is named. Only the id is settled here; the context is built later,
+/// and only if a statement needs one.
+///
+/// The order matters. `x-session-id` is the client saying which session it
+/// wants. The `session-id` cookie is the same thing for a client that keeps
+/// cookies rather than reading headers. A bearer token is checked last and only
+/// against ids the store already holds, because it is usually an API key —
+/// treating an unknown one as a session id would give every distinct key its
+/// own session keyed on the credential itself.
+#[must_use]
+pub fn resolve_or_mint(store: &SessionStore, headers: &HeaderMap) -> Arc<SqlSession> {
+    if let Some(id) = named_session(headers) {
+        return store.open(&id);
+    }
+
+    // A bearer token that is a live session id — how a Flight SQL handshake
+    // hands its session back to the client.
+    if let Some(session) = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bearer_token)
+        .and_then(|token| store.get(token))
+    {
+        return session;
+    }
+
+    store.mint()
 }
 
-impl RequestedSession {
-    /// Reads the session a request names out of its headers.
-    ///
-    /// gRPC metadata is HTTP/2 headers, so the Flight middleware reads the same
-    /// map this does and both endpoints agree on how a session is named.
-    #[must_use]
-    pub fn from_headers(headers: &HeaderMap) -> Self {
-        // An empty header names nothing. A proxy that injects a blank
-        // `x-session-id` should leave the request stateless, not fail it.
-        let named = |value: &str| {
-            let value = value.trim();
-            (!value.is_empty()).then(|| value.to_string())
-        };
+/// The id a request names in `x-session-id` or the `session-id` cookie.
+///
+/// A blank value names nothing: a proxy that injects an empty `x-session-id`
+/// should leave the request to be given an id of its own, not be handed a
+/// session called `''`.
+#[must_use]
+fn named_session(headers: &HeaderMap) -> Option<String> {
+    let nonempty = |value: &str| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    };
 
-        Self {
-            explicit_id: headers
-                .get(SESSION_ID_HEADER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(named),
-            bearer_token: headers
-                .get(http::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .and_then(bearer_token)
-                .and_then(named),
-        }
-    }
+    headers
+        .get(SESSION_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(nonempty)
+        .or_else(|| {
+            headers
+                .get_all(http::header::COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .find_map(session_cookie)
+                .and_then(nonempty)
+        })
+}
+
+/// The `session-id` value out of a `Cookie` header, which carries every cookie
+/// for the request as `name=value` pairs separated by `; `.
+#[must_use]
+fn session_cookie(header_value: &str) -> Option<&str> {
+    header_value.split(';').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name.trim() == SESSION_ID_COOKIE).then(|| value.trim())
+    })
+}
+
+/// The `Set-Cookie` value handing `id` back to the client.
+///
+/// `HttpOnly` keeps it away from page scripts, `SameSite=Lax` keeps another
+/// origin from driving a browser's session, and `Path=/` covers every endpoint.
+/// Deliberately not `Secure`: the runtime is routinely served over plain HTTP
+/// on a private network, and a `Secure` cookie would be silently dropped there.
+#[must_use]
+pub fn session_cookie_value(id: &str) -> String {
+    format!("{SESSION_ID_COOKIE}={id}; Path=/; HttpOnly; SameSite=Lax")
 }
 
 /// The token out of an `Authorization: Bearer <token>` header value, matching
@@ -395,98 +393,121 @@ mod tests {
             .expect("an api key principal always has a stable id")
     }
 
+    fn headers(pairs: &[(HeaderName, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(name.clone(), value.parse().expect("a valid header value"));
+        }
+        headers
+    }
+
+    /// Minting registers an id and nothing more: the context is what costs, and
+    /// most requests never need one.
     #[test]
-    fn an_issued_session_is_returned_by_its_id() {
+    fn minting_an_id_builds_no_context() {
         let store = SessionStore::new();
-        let base = SessionContext::new();
+        let session = store.mint();
 
-        let session = store.issue(&base, Some(stable_id_of("k")), Some("k".to_string()));
-        let found = store
-            .get_issued(session.id())
-            .expect("the issued session is in the store");
-
-        assert!(Arc::ptr_eq(session.context(), found.context()));
-        assert_eq!(store.count(), 1);
+        assert!(session.context().is_none());
+        assert_eq!(store.count(), 1, "the id is registered so it can be named");
+        assert!(
+            Arc::ptr_eq(&session, &store.open(session.id())),
+            "and naming it comes back to the same session"
+        );
     }
 
     /// Session ids are handed to clients and accepted as bearer tokens, so they
-    /// must be CSPRNG-random (`UUIDv4`) — never the time-ordered `UUIDv7`, whose
+    /// must be CSPRNG-random (UUIDv4) — never the time-ordered UUIDv7, whose
     /// value leaks its creation time and is partly predictable.
     #[test]
-    fn an_issued_id_is_a_random_uuid() {
+    fn a_minted_id_is_a_random_uuid() {
         let store = SessionStore::new();
-        let session = store.issue(&SessionContext::new(), None, None);
+        let session = store.mint();
 
         let uuid = Uuid::parse_str(session.id()).expect("the id is a UUID");
         assert_eq!(
             uuid.get_version(),
             Some(uuid::Version::Random),
-            "session id must be a UUIDv4, got {}",
+            "{}",
             session.id()
         );
     }
 
     #[test]
+    fn activating_builds_the_context_once() {
+        let store = SessionStore::new();
+        let base = SessionContext::new();
+        let session = store.mint();
+
+        let first = Arc::clone(session.activate(&base, Some(&stable_id_of("a"))));
+        let again = Arc::clone(session.activate(&base, Some(&stable_id_of("b"))));
+
+        assert!(Arc::ptr_eq(&first, &again), "the context is built once");
+        assert!(
+            session.is_owned_by(Some(&principal("a"))),
+            "and keeps the owner recorded by the first activation"
+        );
+        assert!(!session.is_owned_by(Some(&principal("b"))));
+    }
+
+    #[test]
+    fn an_unactivated_session_belongs_to_nobody() {
+        let store = SessionStore::new();
+        let session = store.mint();
+
+        assert!(session.is_owned_by(None));
+        assert!(session.is_owned_by(Some(&principal("anyone"))));
+    }
+
+    /// A runtime with no `runtime.auth` has no identity to record, so the
+    /// session stays open — the behaviour an unauthenticated deployment has.
+    #[test]
+    fn an_unowned_session_is_open_to_everyone() {
+        let store = SessionStore::new();
+        let session = store.mint();
+        session.activate(&SessionContext::new(), None);
+
+        assert!(session.is_owned_by(None));
+        assert!(session.is_owned_by(Some(&principal("anyone"))));
+    }
+
+    #[test]
     fn a_removed_session_is_gone() {
         let store = SessionStore::new();
-        let session = store.issue(&SessionContext::new(), None, None);
+        let session = store.mint();
 
         assert!(store.remove(session.id()));
-        assert!(store.get_issued(session.id()).is_none());
+        assert!(store.get(session.id()).is_none());
         assert!(
             !store.remove(session.id()),
             "removing a session twice reports it was already gone"
         );
     }
 
-    /// Naming an id the store never issued resolves to nothing. It must not
-    /// create a session: a store that mints one for any string a client sends
-    /// lets two principals that pick the same id share a context.
+    /// Only an id issued against a credential stands in for one; a minted id
+    /// must never authenticate.
     #[test]
-    fn naming_an_unknown_id_creates_nothing() {
+    fn only_an_issued_session_is_a_bearer_credential() {
         let store = SessionStore::new();
 
-        assert!(store.get_issued("shared-guessable-id").is_none());
-        assert_eq!(store.count(), 0);
-    }
+        let issued = store.issue(Some("k".to_string()));
+        assert_eq!(store.bearer_credential(issued.id()), Some("k".to_string()));
 
-    #[test]
-    fn a_session_is_usable_only_by_its_owner() {
-        let store = SessionStore::new();
-        let owned = store.issue(&SessionContext::new(), Some(stable_id_of("a")), None);
-
-        assert!(owned.is_owned_by(Some(&principal("a"))));
-        assert!(
-            !owned.is_owned_by(Some(&principal("b"))),
-            "another principal must not reach a session it does not own"
-        );
-        assert!(
-            !owned.is_owned_by(None),
-            "an unauthenticated caller must not reach an owned session"
-        );
-    }
-
-    /// A runtime with no `runtime.auth` has no identity to bind a session to,
-    /// so its sessions stay open — the behavior an unauthenticated deployment
-    /// already has.
-    #[test]
-    fn an_unowned_session_is_open_to_everyone() {
-        let store = SessionStore::new();
-        let unowned = store.issue(&SessionContext::new(), None, None);
-
-        assert!(unowned.is_owned_by(None));
-        assert!(unowned.is_owned_by(Some(&principal("anyone"))));
+        assert_eq!(store.bearer_credential(store.mint().id()), None);
+        assert_eq!(store.bearer_credential(store.issue(None).id()), None);
+        assert_eq!(store.bearer_credential("not-a-session"), None);
     }
 
     /// A session shares the base context's catalog list rather than
-    /// snapshotting it, so a dataset registered after the session was created is
-    /// visible inside it. Were it a snapshot, a long-lived session would answer
-    /// from a catalog that no longer matches the runtime's.
+    /// snapshotting it, so a dataset registered after the session was activated
+    /// is visible inside it. Were it a snapshot, a long-lived session would
+    /// answer from a catalog that no longer matches the runtime's.
     #[tokio::test]
-    async fn a_session_sees_a_table_registered_after_it_was_created() {
+    async fn a_session_sees_a_table_registered_after_it_was_activated() {
         let base = SessionContext::new();
         let store = SessionStore::new();
-        let session = store.issue(&base, None, None);
+        let session = store.mint();
+        let ctx = Arc::clone(session.activate(&base, None));
 
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)])),
@@ -496,11 +517,10 @@ mod tests {
         base.register_batch("registered_late", batch)
             .expect("the base context accepts the table");
 
-        let rows = session
-            .context()
+        let rows = ctx
             .sql("SELECT n FROM registered_late")
             .await
-            .expect("the session resolves a table registered after it was created")
+            .expect("the session resolves a table registered after it was activated")
             .collect()
             .await
             .expect("the query runs");
@@ -510,104 +530,96 @@ mod tests {
     }
 
     #[test]
-    fn an_implicit_session_is_stable_per_principal() {
+    fn a_request_naming_no_session_is_given_one() {
         let store = SessionStore::new();
-        let base = SessionContext::new();
 
-        let first = store.implicit_for(&base, &stable_id_of("a"));
-        let again = store.implicit_for(&base, &stable_id_of("a"));
-        let other = store.implicit_for(&base, &stable_id_of("b"));
+        let first = resolve_or_mint(&store, &HeaderMap::new());
+        let second = resolve_or_mint(&store, &HeaderMap::new());
 
-        assert!(
-            Arc::ptr_eq(first.context(), again.context()),
-            "the same principal comes back to the same session"
-        );
-        assert!(
-            !Arc::ptr_eq(first.context(), other.context()),
-            "two principals never share an implicit session"
+        assert_ne!(
+            first.id(),
+            second.id(),
+            "a request that names nothing cannot be put in someone else's session"
         );
     }
 
-    /// An implicit session's key is derived from a principal, so a request that
-    /// guesses the key must not reach it — only the owning principal does, and
-    /// it gets there without naming anything.
     #[test]
-    fn an_implicit_session_cannot_be_named_by_a_request() {
+    fn a_request_is_put_in_the_session_its_header_names() {
         let store = SessionStore::new();
-        let owner = stable_id_of("a");
-        let implicit = store.implicit_for(&SessionContext::new(), &owner);
+        let named = headers(&[(SESSION_ID_HEADER, "pinned")]);
 
-        assert!(store.get_issued(implicit.id()).is_none());
+        assert_eq!(resolve_or_mint(&store, &named).id(), "pinned");
         assert!(
-            store
-                .get_issued(&format!("{IMPLICIT_KEY_PREFIX}{owner}"))
-                .is_none()
+            Arc::ptr_eq(
+                &resolve_or_mint(&store, &named),
+                &resolve_or_mint(&store, &named)
+            ),
+            "and comes back to it on the next request"
         );
     }
 
-    /// The id of an issued session authenticates as the key it was issued
-    /// against. An implicit session's key must not, and neither must a session
-    /// created without one.
     #[test]
-    fn only_an_issued_session_is_a_bearer_credential() {
+    fn a_request_is_put_in_the_session_its_cookie_names() {
         let store = SessionStore::new();
-        let base = SessionContext::new();
+        let cookie = headers(&[(http::header::COOKIE, "foo=bar; session-id=pinned; baz=qux")]);
 
-        let issued = store.issue(&base, Some(stable_id_of("k")), Some("k".to_string()));
-        assert_eq!(store.bearer_credential(issued.id()), Some("k".to_string()));
-
-        let no_key = store.issue(&base, Some(stable_id_of("m")), None);
-        assert_eq!(store.bearer_credential(no_key.id()), None);
-
-        let implicit = store.implicit_for(&base, &stable_id_of("k"));
-        assert_eq!(store.bearer_credential(implicit.id()), None);
-
-        assert_eq!(store.bearer_credential("not-a-session"), None);
+        assert_eq!(resolve_or_mint(&store, &cookie).id(), "pinned");
     }
 
+    /// The header is the client asking directly, so it wins over a cookie a
+    /// browser is replaying from an earlier session.
     #[test]
-    fn a_request_names_the_explicit_header_and_the_bearer_token() {
-        let mut headers = HeaderMap::new();
-        assert_eq!(
-            RequestedSession::from_headers(&headers),
-            RequestedSession::default()
-        );
+    fn the_header_wins_over_the_cookie() {
+        let store = SessionStore::new();
+        let both = headers(&[
+            (SESSION_ID_HEADER, "from-header"),
+            (http::header::COOKIE, "session-id=from-cookie"),
+        ]);
 
-        headers.insert(
+        assert_eq!(resolve_or_mint(&store, &both).id(), "from-header");
+    }
+
+    /// A bearer token is usually an API key, so it names a session only when
+    /// the store already holds one under it — how a Flight SQL handshake hands
+    /// its session back. An API key must not become a session key.
+    #[test]
+    fn a_bearer_token_names_a_session_only_if_it_is_one() {
+        let store = SessionStore::new();
+        let issued = store.issue(Some("k".to_string()));
+
+        let known = headers(&[(
             http::header::AUTHORIZATION,
-            "Bearer tok".parse().expect("a valid header value"),
-        );
-        let named = RequestedSession::from_headers(&headers);
-        assert_eq!(named.explicit_id, None);
-        assert_eq!(named.bearer_token.as_deref(), Some("tok"));
+            &format!("Bearer {}", issued.id()),
+        )]);
+        assert_eq!(resolve_or_mint(&store, &known).id(), issued.id());
 
-        headers.insert(
-            SESSION_ID_HEADER,
-            "sess".parse().expect("a valid header value"),
+        let api_key = headers(&[(http::header::AUTHORIZATION, "Bearer an-api-key")]);
+        assert_ne!(
+            resolve_or_mint(&store, &api_key).id(),
+            "an-api-key",
+            "an api key is a credential, not a session id"
         );
-        let named = RequestedSession::from_headers(&headers);
-        assert_eq!(named.explicit_id.as_deref(), Some("sess"));
-        assert_eq!(named.bearer_token.as_deref(), Some("tok"));
     }
 
-    /// A blank header names nothing, so the request stays stateless instead of
-    /// failing on a session id of `''`.
+    /// A blank header names nothing, so the request is given an id of its own
+    /// rather than a session called `''`.
     #[test]
     fn a_blank_header_names_no_session() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            SESSION_ID_HEADER,
-            "   ".parse().expect("a valid header value"),
-        );
-        headers.insert(
-            http::header::AUTHORIZATION,
-            "Bearer ".parse().expect("a valid header value"),
-        );
+        let store = SessionStore::new();
+        let blank = headers(&[(SESSION_ID_HEADER, "   ")]);
 
-        assert_eq!(
-            RequestedSession::from_headers(&headers),
-            RequestedSession::default()
-        );
+        let session = resolve_or_mint(&store, &blank);
+        assert!(!session.id().trim().is_empty());
+    }
+
+    #[test]
+    fn the_cookie_handed_back_carries_the_id_and_its_attributes() {
+        let value = session_cookie_value("abc");
+
+        assert!(value.starts_with("session-id=abc;"), "{value}");
+        for attribute in ["Path=/", "HttpOnly", "SameSite=Lax"] {
+            assert!(value.contains(attribute), "missing {attribute}: {value}");
+        }
     }
 
     #[test]

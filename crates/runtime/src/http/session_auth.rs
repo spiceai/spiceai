@@ -98,7 +98,6 @@ pub fn with_session_awareness(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::prelude::SessionContext;
     use runtime_auth::api_key::ApiKeyAuth;
     use spicepod::component::runtime::ApiKey;
 
@@ -123,7 +122,7 @@ mod tests {
     #[test]
     fn a_session_id_authenticates_as_the_key_it_was_issued_against() {
         let sessions = SessionStore::new();
-        let session = sessions.issue(&SessionContext::new(), None, Some("k".to_string()));
+        let session = sessions.issue(Some("k".to_string()));
         let auth = SessionAwareHttpAuth::new(auth_with(&["k:rw"]), sessions);
 
         let verdict = auth
@@ -165,7 +164,7 @@ mod tests {
     #[test]
     fn revoking_the_key_revokes_the_sessions_issued_against_it() {
         let sessions = SessionStore::new();
-        let session = sessions.issue(&SessionContext::new(), None, Some("retired".to_string()));
+        let session = sessions.issue(Some("retired".to_string()));
         let auth = SessionAwareHttpAuth::new(auth_with(&["current:rw"]), sessions);
 
         let verdict = auth

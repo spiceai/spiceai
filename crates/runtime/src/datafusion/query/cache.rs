@@ -1054,7 +1054,7 @@ mod tests {
             query::{QueryBuilder, ResultsCacheMode},
             sql_session_extension::SqlSessionExtension,
         },
-        sessions::{RequestedSession, SessionStore},
+        sessions::SessionStore,
         status,
     };
     use runtime_request_context::{
@@ -2732,13 +2732,7 @@ mod tests {
         Arc::new(
             RequestContext::builder(Protocol::Internal)
                 .with_cache_control(cache_control)
-                .with_extension(SqlSessionExtension::new(
-                    sessions.clone(),
-                    RequestedSession {
-                        explicit_id: Some(session_id.to_string()),
-                        bearer_token: None,
-                    },
-                ))
+                .with_extension(SqlSessionExtension::new(sessions.open(session_id)))
                 .build(),
         )
     }
@@ -2794,7 +2788,7 @@ mod tests {
     async fn test_prepared_execute_is_cached_per_argument_list() {
         let df = prepare_runtime(None).await;
         let sessions = SessionStore::new();
-        let session = sessions.issue(&df.ctx, None, None);
+        let session = sessions.mint();
         let context = create_test_session_request_context(
             CacheControl::Cache(CacheKeyType::Default),
             &sessions,
@@ -2851,7 +2845,7 @@ mod tests {
         }))
         .await;
         let sessions = SessionStore::new();
-        let session = sessions.issue(&df.ctx, None, None);
+        let session = sessions.mint();
         let context = create_test_session_request_context(
             CacheControl::Cache(CacheKeyType::Raw),
             &sessions,
@@ -2905,8 +2899,8 @@ mod tests {
 
             // Both sessions are unowned, so they share one cache namespace —
             // exactly the case where a text-only key would collide.
-            let first = sessions.issue(&df.ctx, None, None);
-            let second = sessions.issue(&df.ctx, None, None);
+            let first = sessions.mint();
+            let second = sessions.mint();
             let first_context =
                 create_test_session_request_context(cache_control, &sessions, first.id());
             let second_context =
@@ -2950,7 +2944,7 @@ mod tests {
         .await;
         register_i64_table(&df, "revalidated_rows", &[1, 2]);
         let sessions = SessionStore::new();
-        let session = sessions.issue(&df.ctx, None, None);
+        let session = sessions.mint();
         let context = create_test_session_request_context(
             CacheControl::Cache(CacheKeyType::Default),
             &sessions,
@@ -3029,7 +3023,7 @@ mod tests {
         let df = prepare_runtime(None).await;
         register_i64_table(&df, "prepared_rows", &[1, 2]);
         let sessions = SessionStore::new();
-        let session = sessions.issue(&df.ctx, None, None);
+        let session = sessions.mint();
         let context = create_test_session_request_context(
             CacheControl::Cache(CacheKeyType::Default),
             &sessions,

@@ -43,8 +43,9 @@ use arrow::array::RecordBatch;
 use clap::Parser;
 use config::get_user_agent;
 use flight_client::{
-    MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, TonicStatusError,
+    FlightChannel, MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, TonicStatusError,
     configure_endpoint_for_high_throughput,
+    cookie::{CookieService, CookieStore},
 };
 use futures::{StreamExt, TryStreamExt};
 use prost::Message;
@@ -287,7 +288,7 @@ impl ConditionalEventHandler for KeyEventHandler {
 #[derive(Helper, Hinter, Validator)]
 struct EditorHelper {
     schema_cache: Arc<RwLock<SchemaCache>>,
-    flight_client: Option<FlightServiceClient<Channel>>,
+    flight_client: Option<FlightServiceClient<FlightChannel>>,
     api_key: Option<String>,
     user_agent: String,
     refresh_task_handle: Option<JoinHandle<()>>,
@@ -296,7 +297,7 @@ struct EditorHelper {
 
 impl EditorHelper {
     pub fn new(
-        flight_client: Option<FlightServiceClient<Channel>>,
+        flight_client: Option<FlightServiceClient<FlightChannel>>,
         api_key: Option<String>,
         user_agent: String,
     ) -> Self {
@@ -343,7 +344,8 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     // For now, this flag is accepted but not used.
     warn_if_custom_headers_are_unsupported(&repl_config);
     let user_agent = build_user_agent(repl_config.user_agent.as_deref());
-    let client = connect_flight_client(&repl_config, &user_agent).await?;
+    let (client, cookies) = connect_flight_client(&repl_config, &user_agent).await?;
+    let mut session_id: Option<String> = None;
 
     let config = Config::builder()
         .completion_type(CompletionType::List)
@@ -648,6 +650,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 .await
                 {
                     Ok((records, total_rows, from_cache)) => {
+                        report_session(&cookies, &mut session_id);
                         display_records(&records, start_time, total_rows, from_cache, expanded)?;
                     }
                     Err(FlightError::Tonic(status)) => {
@@ -711,6 +714,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         .await
         {
             Ok((records, total_rows, from_cache)) => {
+                report_session(&cookies, &mut session_id);
                 display_records(&records, start_time, total_rows, from_cache, expanded)?;
             }
             Err(FlightError::Tonic(status)) => {
@@ -754,7 +758,7 @@ pub async fn run_query(
 ) -> Result<(), Box<dyn std::error::Error>> {
     warn_if_custom_headers_are_unsupported(&repl_config);
     let user_agent = build_user_agent(repl_config.user_agent.as_deref());
-    let client = connect_flight_client(&repl_config, &user_agent).await?;
+    let (client, _cookies) = connect_flight_client(&repl_config, &user_agent).await?;
     let start_time = Instant::now();
 
     match get_records(
@@ -796,7 +800,7 @@ pub async fn run_query_json(
 ) -> Result<(), Box<dyn std::error::Error>> {
     warn_if_custom_headers_are_unsupported(&repl_config);
     let user_agent = build_user_agent(repl_config.user_agent.as_deref());
-    let client = connect_flight_client(&repl_config, &user_agent).await?;
+    let (client, _cookies) = connect_flight_client(&repl_config, &user_agent).await?;
 
     match get_records(
         client,
@@ -887,10 +891,33 @@ fn flight_connection_failed(flight_endpoint: &str, cause: &str) -> Box<dyn Error
     ))
 }
 
+/// Reports the SQL session the runtime has put this connection in, and says so
+/// again whenever it changes.
+///
+/// A session carries `PREPARE`, `SET` and the statements that read them back,
+/// so a session that changes between statements is the one thing that makes
+/// them silently stop working — worth a line rather than a puzzle.
+fn report_session(cookies: &CookieStore, last: &mut Option<String>) {
+    let Some(session_id) = cookies.get("session-id") else {
+        return;
+    };
+    if last.as_deref() == Some(session_id.as_str()) {
+        return;
+    }
+    if last.is_some() {
+        tracing::warn!(
+            "SQL session changed to '{session_id}', so anything PREPAREd or SET before this is no longer in scope"
+        );
+    } else {
+        tracing::debug!("SQL session '{session_id}'");
+    }
+    *last = Some(session_id);
+}
+
 async fn connect_flight_client(
     repl_config: &ReplConfig,
     user_agent: &str,
-) -> Result<FlightServiceClient<Channel>, Box<dyn std::error::Error>> {
+) -> Result<(FlightServiceClient<FlightChannel>, Arc<CookieStore>), Box<dyn std::error::Error>> {
     let mut repl_flight_endpoint = repl_config.repl_flight_endpoint.clone();
     let client_identity = if let (Some(cert_path), Some(key_path)) = (
         &repl_config.client_tls_certificate_file,
@@ -937,9 +964,19 @@ async fn connect_flight_client(
         .await
         .map_err(|e| flight_connection_failed(&repl_flight_endpoint, &e.to_string()))?;
 
-    Ok(FlightServiceClient::new(channel)
-        .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
-        .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE))
+    // Keep the cookies the runtime sets. It hands a SQL session back in a
+    // `session-id` cookie, so without this every statement would be given a
+    // session of its own and `PREPARE` would never reach the `EXECUTE` that
+    // follows it.
+    let cookies = Arc::new(CookieStore::new());
+    let channel = CookieService::new(channel, Arc::clone(&cookies));
+
+    Ok((
+        FlightServiceClient::new(channel)
+            .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
+            .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
+        cookies,
+    ))
 }
 
 async fn connect_channel(
@@ -962,7 +999,7 @@ async fn connect_channel(
 ///
 /// Returns an error if the Flight service returns an error.
 pub async fn get_records(
-    mut client: FlightServiceClient<Channel>,
+    mut client: FlightServiceClient<FlightChannel>,
     line: &str,
     api_key: Option<&String>,
     user_agent: &str,

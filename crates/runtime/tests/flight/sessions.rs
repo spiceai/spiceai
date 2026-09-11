@@ -154,9 +154,9 @@ async fn a_session_cannot_be_used_by_another_principal() -> Result<(), anyhow::E
         .await
 }
 
-/// Regression: two principals naming the same id must not share a context.
-/// They are authenticated, so each lands in the session its own principal owns
-/// and the id they chose is ignored.
+/// Regression: the session id is client-chosen, so a second principal naming
+/// the same one must not land in the first's session and its prepared
+/// statements.
 #[tokio::test]
 async fn two_principals_naming_the_same_id_do_not_share_a_session() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -172,12 +172,17 @@ async fn two_principals_naming_the_same_id_do_not_share_a_session() -> Result<()
             let mut second = client_for(&channel, "b", Some(GUESSABLE));
             let status = run(&mut second, "EXECUTE squat")
                 .await
-                .expect_err("the second principal must not reach the first's statement");
-            assert!(
-                status.message().contains("'squat' does not exist"),
-                "expected a missing statement, got: {}",
+                .expect_err("the second principal must be refused");
+            assert_eq!(
+                status.code(),
+                Code::PermissionDenied,
+                "{}",
                 status.message()
             );
+
+            let rows = run(&mut first, "EXECUTE squat").await?;
+            let total: usize = rows.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(total, 1, "and the owner still has it");
 
             Ok(())
         })
