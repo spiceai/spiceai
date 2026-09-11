@@ -1453,6 +1453,13 @@ fn update_preauth_hash(hash: &mut [u8; 64], message: &[u8]) {
 }
 
 fn smb_status_to_io_error(status: u32, path: &str) -> io::Error {
+    // The share root is addressed by the empty path; name it rather than
+    // leaving the message to trail off after "for ".
+    let path = if path.is_empty() {
+        "<share root>"
+    } else {
+        path
+    };
     tracing::warn!(target: "smb", "error 0x{status:08X}: {path}");
     match status {
         0xC000_000F // STATUS_NO_SUCH_FILE
@@ -1627,6 +1634,16 @@ mod tests {
 
     const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
     const SMB2_FLAGS_RESPONSE: u32 = 0x0000_0001;
+
+    #[test]
+    fn status_error_names_the_share_root_for_an_empty_path() {
+        let err = smb_status_to_io_error(0xC000_000D, "");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "SMB error 0xC000000D for <share root>");
+
+        let err = smb_status_to_io_error(0xC000_000D, "sub");
+        assert_eq!(err.to_string(), "SMB error 0xC000000D for sub");
+    }
     const TEST_USERNAME: &str = "spicetester";
     const TEST_PASSWORD: &str = "s3cret-pw!";
     const TEST_DOMAIN: &str = "WORKGROUP";

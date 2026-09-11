@@ -409,6 +409,21 @@ pub enum CreateOptions {
 /// Bit that adds `DELETE_ON_CLOSE` to a `CreateOptions` value.
 pub const CREATE_OPTION_DELETE_ON_CLOSE: u32 = 0x0000_1000;
 
+/// Append the variable-length `Buffer` of a request whose `StructureSize`
+/// is odd (57 for CREATE, 33 for QUERY_DIRECTORY, 49 for WRITE). The odd
+/// size declares that at least one byte of dynamic data follows the fixed
+/// part, so an empty buffer still has to carry one zero byte: Samba's
+/// `smbd_smb2_request_verify_sizes` answers a frame with no dynamic bytes
+/// with `STATUS_INVALID_PARAMETER` (0xC000000D), while Windows accepts it.
+/// The share root is the common case: its path is the empty string.
+fn put_variable_buffer(buf: &mut BytesMut, bytes: &[u8]) {
+    if bytes.is_empty() {
+        buf.put_u8(0);
+    } else {
+        buf.put_slice(bytes);
+    }
+}
+
 pub fn encode_create_request(
     buf: &mut BytesMut,
     path: &str,
@@ -435,7 +450,7 @@ pub fn encode_create_request(
     buf.put_u16_le(name_len); // NameLength
     buf.put_u32_le(0); // CreateContextsOffset
     buf.put_u32_le(0); // CreateContextsLength
-    buf.put_slice(&name_bytes);
+    put_variable_buffer(buf, &name_bytes);
 }
 
 #[derive(Debug, Clone)]
@@ -578,14 +593,7 @@ pub fn encode_write_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64,
     buf.put_u16_le(0); // WriteChannelInfoOffset
     buf.put_u16_le(0); // WriteChannelInfoLength
     buf.put_u32_le(0); // Flags
-    // Spec mandates StructureSize=49 (one byte beyond the 48-byte fixed part).
-    // When `data` is empty we still need to emit one zero byte so stricter
-    // servers (and the SMB2 validator) accept the request.
-    if data.is_empty() {
-        buf.put_u8(0);
-    } else {
-        buf.put_slice(data);
-    }
+    put_variable_buffer(buf, data);
 }
 
 #[must_use]
@@ -661,7 +669,7 @@ pub fn encode_query_directory_request(
     buf.put_u16_le(name_offset);
     buf.put_u16_le(pattern_len);
     buf.put_u32_le(65536); // OutputBufferLength
-    buf.put_slice(&pattern_bytes);
+    put_variable_buffer(buf, &pattern_bytes);
 }
 
 #[derive(Debug, Clone)]
@@ -977,6 +985,68 @@ mod tests {
         let mut buf = BytesMut::new();
         encode_read_request(&mut buf, &[0u8; 16], 0, 65536);
         assert_eq!(buf.len(), 49);
+    }
+
+    /// The share root is opened with an empty name. Samba rejects a CREATE
+    /// whose dynamic part is empty with `STATUS_INVALID_PARAMETER`, so the
+    /// frame must still be 57 bytes long: 56 fixed bytes plus one padding
+    /// byte, with `NameLength` reporting the real (zero) length.
+    #[test]
+    fn encode_create_request_empty_name_pads_buffer() {
+        let mut buf = BytesMut::new();
+        encode_create_request(&mut buf, "", 0, 0, 0, 0);
+        assert_eq!(buf.len(), 57);
+        assert_eq!(
+            u16::from_le_bytes(buf[44..46].try_into().expect("test fixture")),
+            CREATE_NAME_OFFSET
+        );
+        assert_eq!(
+            u16::from_le_bytes(buf[46..48].try_into().expect("test fixture")),
+            0
+        );
+        assert_eq!(buf[56], 0);
+    }
+
+    #[test]
+    fn encode_create_request_with_name_has_no_padding() {
+        let mut buf = BytesMut::new();
+        encode_create_request(&mut buf, "sub", 0, 0, 0, 0);
+        let name_len = "sub".encode_utf16().count() * 2;
+        assert_eq!(buf.len(), 56 + name_len);
+        assert_eq!(
+            usize::from(u16::from_le_bytes(
+                buf[46..48].try_into().expect("test fixture")
+            )),
+            name_len
+        );
+    }
+
+    #[test]
+    fn encode_query_directory_request_empty_pattern_pads_buffer() {
+        let mut buf = BytesMut::new();
+        encode_query_directory_request(
+            &mut buf,
+            &[0u8; 16],
+            "",
+            FILE_ID_BOTH_DIRECTORY_INFORMATION,
+            true,
+        );
+        assert_eq!(buf.len(), 33);
+        assert_eq!(
+            u16::from_le_bytes(buf[26..28].try_into().expect("test fixture")),
+            0
+        );
+    }
+
+    #[test]
+    fn encode_write_request_empty_data_pads_buffer() {
+        let mut buf = BytesMut::new();
+        encode_write_request(&mut buf, &[0u8; 16], 0, &[]);
+        assert_eq!(buf.len(), 49);
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().expect("test fixture")),
+            0
+        );
     }
 
     #[test]
