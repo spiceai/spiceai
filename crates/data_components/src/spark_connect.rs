@@ -834,9 +834,25 @@ mod tests {
 
         let accepted = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.ok()?;
-            let mut first = [0_u8; H2_PREFACE.len()];
-            let read = stream.read(&mut first).await.ok()?;
-            Some(first[..read].to_vec())
+            // TCP is a byte stream, so the preface arrives in as many segments as the
+            // client happens to write it in: a single `read` can return one byte of it
+            // and the comparison below would fail on a client that behaved correctly.
+            // Read until the preface is complete, or until the peer stops sending.
+            //
+            // Accumulated rather than `read_exact`ed because what arrived is itself a
+            // diagnostic: a peer that opens the connection and sends nothing, or sends
+            // a `ClientHello` and stops, has to reach the assertions below with the
+            // bytes it did send rather than be lost in a read that never returns.
+            let mut first = Vec::with_capacity(H2_PREFACE.len());
+            while first.len() < H2_PREFACE.len() {
+                let mut chunk = [0_u8; H2_PREFACE.len()];
+                match stream.read(&mut chunk).await {
+                    // The peer closed, or the read failed: report what did arrive.
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => first.extend_from_slice(&chunk[..read]),
+                }
+            }
+            Some(first)
         });
 
         // The dial is what is under assertion, not the session: nothing on the
@@ -854,8 +870,10 @@ mod tests {
         let first = tokio::time::timeout(std::time::Duration::from_secs(10), accepted)
             .await
             .expect(
-                "nothing was dialled within 10s: an endpoint that asks for no TLS was resolved \
-                 to https, which tonic refuses without a TLS configuration",
+                "no complete HTTP/2 preface within 10s: either nothing was dialled, because an \
+                 endpoint that asks for no TLS was resolved to https and tonic refuses that \
+                 without a TLS configuration, or the peer opened the connection and stopped \
+                 part-way through sending",
             )
             .expect("the accept task panicked")
             .expect("the accept task saw no connection");
