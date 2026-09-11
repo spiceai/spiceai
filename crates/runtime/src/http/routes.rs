@@ -995,7 +995,7 @@ fn cors_allow_headers_value(requested: Option<&str>) -> HeaderValue {
             }
         }
     }
-    HeaderValue::from_str(&names.join(", ")).unwrap_or_else(|_| CORS_ALLOWED_HEADERS_VALUE)
+    HeaderValue::from_str(&names.join(", ")).unwrap_or(CORS_ALLOWED_HEADERS_VALUE)
 }
 
 async fn allow_mcp_param_cors_headers(req: Request<Body>, next: Next) -> axum::response::Response {
