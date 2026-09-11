@@ -45,6 +45,9 @@ use crate::utils::{run_query, runtime_ready_check, test_request_context, wait_un
 
 /// The accelerated table under test.
 const TABLE: &str = "cayenne_retention_sql_it";
+/// The `mode: memory` twin of [`TABLE`]. Distinct so the two tests never share an
+/// acceleration or a metastore slice.
+const MEM_TABLE: &str = "cayenne_retention_sql_memory_it";
 
 /// Rows scoring below this are deleted by the retention predicate.
 const SCORE_FLOOR: i64 = 90;
@@ -248,10 +251,9 @@ async fn cayenne_memory_mode_does_not_apply_retention_sql() -> Result<(), anyhow
         .scope(async {
             crate::configure_test_datafusion();
 
-            const MEM_TABLE: &str = "cayenne_retention_sql_memory_it";
             let temp_dir = tempfile::tempdir()?;
             let source = temp_dir.path().join("scores.csv");
-            write_source(&source, &INITIAL_ROWS.to_vec())?;
+            write_source(&source, INITIAL_ROWS.as_ref())?;
 
             let app = AppBuilder::new("test_cayenne_retention_sql_memory")
                 .with_dataset(make_memory_dataset(&source, MEM_TABLE))
