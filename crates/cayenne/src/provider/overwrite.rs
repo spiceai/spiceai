@@ -566,6 +566,12 @@ impl CayenneTableProvider {
         // `warm_inlined_cache_for_overwrite`.
         self.warm_inlined_cache_for_overwrite().await;
 
+        // Order the replacement before it is written, when the table asks for
+        // one. This is the only write a full-refresh table makes, and it is the
+        // only chance to establish that order — see `sort_overwrite_input`.
+        let (data, target_partitions, write_policy) =
+            self.sort_overwrite_input(data, target_partitions)?;
+
         let target_size_bytes = self.target_file_size_bytes();
         // Overwrite replaces the entire table, and anything that reached here did
         // not fit the inline caps, so it is large by definition; shard across the
@@ -579,7 +585,7 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 None,
-                crate::provider::delta_encoding::WritePolicy::MAINTENANCE,
+                write_policy,
             )
             .await?;
 
@@ -744,6 +750,73 @@ mod tests {
 
     /// Every id the table currently serves, sorted. Reads through a fresh
     /// `SessionContext` so nothing about the plan is cached between calls.
+    /// A table whose `sort_columns` an operator configured explicitly.
+    async fn setup_sorted(sort_columns: Vec<String>) -> (TempDir, CayenneTableProvider) {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let connection_string = format!(
+            "sqlite://{}",
+            temp_dir.path().join("cayenne.db").to_string_lossy()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"));
+        catalog.init().await.expect("catalog init");
+        let ctx = SessionContext::new();
+        let provider = CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+        )
+        .create(CreateTableOptions {
+            table_name: "sorted_overwrite".to_string(),
+            schema: test_schema(),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                sort_columns,
+                ..VortexConfig::default()
+            },
+        })
+        .await
+        .expect("create table");
+        (temp_dir, provider)
+    }
+
+    /// A sorted whole-table replace must emit ONE sequence of files.
+    ///
+    /// Ordering the stream is not enough by itself: the encode fan-out is
+    /// decided by the write policy, not by the shard count the caller passes.
+    /// Under a `Sized` policy the sorted stream is re-sharded round-robin and
+    /// every output file ends up spanning the whole key range — the layout the
+    /// sort exists to avoid, and one a scan cannot prune.
+    #[tokio::test]
+    async fn sorted_overwrite_writes_one_sequence_of_files() {
+        let (_dir, provider) = setup_sorted(vec!["id".to_string()]).await;
+        let (_stream, shards, policy) = provider
+            .sort_overwrite_input(id_stream(&[3, 1, 2]), 8)
+            .expect("sorted overwrite input");
+        assert_eq!(shards, 1, "a sorted replace must not fan its encode out");
+        assert_eq!(
+            policy.fan_out,
+            crate::provider::table::EncodeFanOut::Serial,
+            "the policy is what the writer honours, not the shard count"
+        );
+    }
+
+    /// An unsorted replace keeps the fan-out it was given: nothing about its
+    /// output order is load-bearing, so serializing it would only cost encode
+    /// throughput.
+    #[tokio::test]
+    async fn unsorted_overwrite_keeps_its_fan_out() {
+        let (_dir, provider) = setup_sorted(vec![]).await;
+        let (_stream, shards, policy) = provider
+            .sort_overwrite_input(id_stream(&[3, 1, 2]), 8)
+            .expect("unsorted overwrite input");
+        assert_eq!(shards, 8);
+        assert_eq!(policy.fan_out, crate::provider::table::EncodeFanOut::Sized);
+    }
+
     async fn scan_ids(provider: &CayenneTableProvider) -> Vec<i64> {
         let ctx = SessionContext::new();
         let batches = ctx
