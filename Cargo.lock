@@ -20117,6 +20117,8 @@ dependencies = [
  "event_stream",
  "fs4",
  "futures",
+ "iceberg",
+ "iceberg-storage-opendal",
  "libc",
  "mimalloc",
  "opentelemetry",
