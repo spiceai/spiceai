@@ -170,9 +170,13 @@ params:
     }
 
     fn parse_jsonrpc_body(body: &str) -> anyhow::Result<Value> {
+        // rmcp may prefix the stream with an empty priming `data:` event
+        // (`id` / `retry`). Skip empty payloads so initialize / tools/list
+        // parse the JSON-RPC frame.
         let json_str = body
             .lines()
-            .find_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| line.strip_prefix("data: "))
+            .find(|payload| !payload.is_empty())
             .unwrap_or(body);
         serde_json::from_str(json_str)
             .map_err(|e| anyhow::anyhow!("Failed to parse JSON-RPC body '{body}': {e}"))
@@ -252,14 +256,7 @@ params:
             .map(ToOwned::to_owned)
             .expect("initialize response missing Mcp-Session-Id header");
 
-        // Response may be SSE-framed or plain JSON depending on server policy.
-        let body = resp.text().await?;
-        let json_str = body
-            .lines()
-            .find_map(|line| line.strip_prefix("data: "))
-            .unwrap_or(body.as_str());
-        let v: Value = serde_json::from_str(json_str)
-            .map_err(|e| anyhow::anyhow!("Failed to parse initialize response '{body}': {e}"))?;
+        let v = parse_jsonrpc_body(&resp.text().await?)?;
         assert_eq!(v.get("jsonrpc"), Some(&Value::String("2.0".to_string())));
         assert_eq!(v.get("id"), Some(&Value::Number(1.into())));
         let result = v
