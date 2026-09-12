@@ -3,10 +3,10 @@ name: testoperator dispatch htap
 on:
   schedule:
     # htap-sf1000-adaptive, every 8 hours (0000, 0800, 1600) — the high-value SF1000 adaptive
-    # config for frequent adaptive trend data (spiceai-dev-xlarge-runners). 8h is the tightest
-    # cadence that still fits the serialized SF1000 xlarge queue in a day at a 30-minute HTAP
-    # window (16 runs/day across adaptive + daily + cold batches, ~20h occupancy with slack
-    # for slow/cold/mysql arms).
+    # config for frequent adaptive trend data (spiceai-dev-xlarge-runners). Cadence stays at 8h
+    # for a 30-minute HTAP window (22 runs/day across adaptive + daily + cold batches). Occupancy
+    # is tight; the extra CTE-materialization adaptive arms queue FIFO on
+    # chbench-htap-sf100-sf1000 rather than overlapping.
     - cron: '0 */8 * * *'
     # htap-sf1000 (other configs), once daily (0400) — the remaining SF1000 configs
     # (adaptive-turso, duckdb baseline) on the xlarge pool. 0400 sits after the 0000 adaptive
