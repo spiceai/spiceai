@@ -4576,7 +4576,7 @@ impl CayenneTableProvider {
             }
             // Per-file statistics were inferred against the old logical schema
             // width; drop them so the next scan re-infers at the evolved width.
-            self.scan_file_statistics.clear();
+            self.clear_scan_file_statistics_cache();
             self.refresh_listing_table_under_held_fence().await?;
         }
 
@@ -5185,7 +5185,7 @@ impl CayenneTableProvider {
         // stale. Invalidate the in-memory optimizer view synchronously with the
         // snapshot pointer; background maintenance can rebuild it later.
         self.clear_cached_table_statistics_unlocked();
-        self.scan_file_statistics.clear();
+        self.clear_scan_file_statistics_cache();
         self.mark_maintained_aggregates_stale();
     }
 
@@ -25147,8 +25147,12 @@ impl CayenneTableProvider {
         );
 
         // Invalidate the list-files cache for the snapshot directory so the next
-        // scan discovers newly written files
+        // scan discovers newly written files. Drop the in-process snapshot listing
+        // cache too: this path can add files without bumping
+        // `current_dir_generation` (position-based checkpoint, schema evolution),
+        // so a generation-keyed hit would serve the pre-refresh file set.
         Self::invalidate_list_files_cache(self.context.runtime_env(), &snapshot_dir_url);
+        self.cached_snapshot_listing.store(None);
 
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
@@ -45565,6 +45569,106 @@ mod tests {
             pruned_files, 1,
             "point-lookup id={target_id} must prune the 2 disjoint files at listing \
              via footer min/max, got {pruned_files}"
+        );
+    }
+
+    /// `refresh_listing_table` can add files to the current snapshot without
+    /// bumping `current_dir_generation` (position-based checkpoint, schema
+    /// evolution). The snapshot listing cache must drop so the next PK lookup
+    /// sees the new row, not a stale file list.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pk_point_lookup_sees_row_added_via_listing_refresh_without_generation_bump() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let vortex_config = VortexConfig {
+            inline_max_rows: 0,
+            compaction_background_interval_ms: 0,
+            compaction_trigger_files: usize::MAX,
+            compaction_trigger_protected_snapshots: usize::MAX,
+            compaction_trigger_snapshot_age_ms: u64::MAX,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "pk_lookup_listing_refresh_no_gen_bump",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let provider = Arc::new(provider);
+        let seed = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..100)),
+                Arc::new(Int64Array::from_iter_values((0..100).map(|id| id * 10))),
+            ],
+        )
+        .expect("seed batch");
+        insert_batch_with_context(&ctx, &provider, seed).await;
+
+        assert_eq!(
+            query_pk_i64(
+                Arc::clone(&provider) as Arc<dyn TableProvider>,
+                &ctx,
+                50,
+                "value",
+            )
+            .await,
+            vec![500],
+            "warmup PK lookup must see the seeded row"
+        );
+        assert!(
+            provider.cached_snapshot_listing.load_full().is_some(),
+            "warmup scan must populate the snapshot listing cache"
+        );
+        let generation_before = provider.current_dir_generation.load(Ordering::Relaxed);
+
+        let extra = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![200_i64])),
+                Arc::new(Int64Array::from(vec![2000_i64])),
+            ],
+        )
+        .expect("extra batch");
+        provider
+            .write_to_snapshot(
+                single_batch_stream(extra),
+                provider.target_file_size_bytes(),
+                &provider.get_current_snapshot_id(),
+                1,
+                None,
+                crate::provider::delta_encoding::WritePolicy::DELTA,
+            )
+            .await
+            .expect("write extra file into the current snapshot");
+        provider
+            .refresh_listing_table()
+            .await
+            .expect("refresh listing after extra file");
+        assert_eq!(
+            provider.current_dir_generation.load(Ordering::Relaxed),
+            generation_before,
+            "refresh_listing_table must not bump current_dir_generation"
+        );
+        assert!(
+            provider.cached_snapshot_listing.load_full().is_none(),
+            "listing refresh must drop the snapshot listing cache"
+        );
+        assert_eq!(
+            query_pk_i64(
+                Arc::clone(&provider) as Arc<dyn TableProvider>,
+                &ctx,
+                200,
+                "value",
+            )
+            .await,
+            vec![2000],
+            "PK lookup after listing refresh must see the new row, not a stale cached file list"
         );
     }
 
