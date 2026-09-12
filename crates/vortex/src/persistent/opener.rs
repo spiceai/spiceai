@@ -454,6 +454,9 @@ impl FileOpener for VortexOpener {
             } else {
                 layout_reader
             };
+            #[cfg(test)]
+            tests::record_scan_built();
+
             let mut scan_builder = ScanBuilder::new(session.clone(), layout_reader);
 
             if let Some(vortex_plan) = file.extensions.get::<VortexAccessPlan>() {
@@ -712,8 +715,14 @@ mod tests {
     use object_store::ObjectStore;
     use object_store::memory::InMemory;
     use rstest::rstest;
+    use std::cell::Cell;
     use vortex::VortexSessionDefault;
     use vortex::array::ArrayRef;
+    use vortex::array::IntoArray;
+    use vortex::array::arrays::ChunkedArray;
+    use vortex::array::arrays::StructArray as VortexStructArray;
+    use vortex::array::arrays::VarBinArray;
+    use vortex::array::validity::Validity;
     use vortex::arrow::FromArrowArray;
     use vortex::buffer::Buffer;
     use vortex::file::WriteOptionsSessionExt;
@@ -801,6 +810,79 @@ mod tests {
         write.shutdown().await?;
 
         Ok(summary.size())
+    }
+
+    /// Writes an ascending `i32` filter column plus a payload column, chunked.
+    ///
+    /// Chunk boundaries are what `SplitBy::Layout` reports as natural splits,
+    /// and a byte range owns whole natural splits. The payload is what keeps
+    /// those chunks apart: an ascending `i32` column alone compresses to a
+    /// couple of KiB, and the layout writer then emits the whole file as a
+    /// single split that no byte range can tile.
+    async fn write_chunked_ascending(
+        object_store: Arc<dyn ObjectStore>,
+        path: &str,
+        chunks: u32,
+        rows_per_chunk: u32,
+    ) -> anyhow::Result<u64> {
+        let ascending = (0..chunks)
+            .map(|chunk| {
+                (0..rows_per_chunk)
+                    .map(|row| i32::try_from(chunk * rows_per_chunk + row).expect("row fits i32"))
+                    .collect::<Buffer<_>>()
+                    .into_array()
+            })
+            .collect::<ChunkedArray>()
+            .into_array();
+        let payload = (0..chunks)
+            .map(|chunk| {
+                VarBinArray::from(
+                    (0..rows_per_chunk)
+                        .map(|row| format!("{chunk}-{row}-{}", "x".repeat(48)))
+                        .collect::<Vec<_>>(),
+                )
+                .into_array()
+            })
+            .collect::<ChunkedArray>()
+            .into_array();
+        let table = VortexStructArray::try_new(
+            ["a", "p"].into(),
+            vec![ascending, payload],
+            (chunks * rows_per_chunk) as usize,
+            Validity::NonNullable,
+        )?;
+
+        let path = Path::parse(path)?;
+        let mut write = ObjectStoreWrite::new(object_store, &path).await?;
+        let summary = SESSION
+            .write_options()
+            .write(&mut write, table.into_array().to_array_stream())
+            .await?;
+        write.shutdown().await?;
+        Ok(summary.size())
+    }
+
+    thread_local! {
+        /// Splits that reached scan construction on this thread.
+        ///
+        /// A split the zone map rejects returns before `ScanBuilder::new`, so
+        /// this is what separates "the split was skipped" from "the scan ran
+        /// and matched nothing". Row counts cannot: the scan prunes the same
+        /// zones itself and returns the same rows either way, so a test with
+        /// only that oracle stays green if the skip is deleted. Thread-local
+        /// rather than global because tests run in parallel, and each
+        /// `#[tokio::test]` polls its opener on its own thread.
+        static SCANS_BUILT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Called from `VortexOpener::open` immediately before a scan is built.
+    pub(super) fn record_scan_built() {
+        SCANS_BUILT.with(|built| built.set(built.get() + 1));
+    }
+
+    /// Scans built since the last call, resetting the count.
+    fn take_scans_built() -> usize {
+        SCANS_BUILT.with(|built| built.replace(0))
     }
 
     fn make_opener(
@@ -902,21 +984,27 @@ mod tests {
     /// would read as success.
     #[tokio::test]
     async fn zone_pruning_keeps_every_matching_row_across_byte_splits() -> anyhow::Result<()> {
-        const ROWS: i32 = 20_000;
-        const SPLITS: u64 = 3;
+        const CHUNKS: u32 = 16;
+        const ROWS_PER_CHUNK: u32 = 4_096;
+        const ROWS: i32 = (CHUNKS * ROWS_PER_CHUNK) as i32;
+        const SPLITS: usize = 4;
 
         let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let file_path = "zones.vortex";
-        let batch = record_batch!(("a", Int32, (0..ROWS).map(Some).collect::<Vec<_>>()))
-            .expect("ascending test record batch should build");
-        let file_schema = batch.schema();
-        let data_size = write_arrow_to_vortex(object_store.clone(), file_path, batch).await?;
+        let data_size =
+            write_chunked_ascending(object_store.clone(), file_path, CHUNKS, ROWS_PER_CHUNK)
+                .await?;
 
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("p", DataType::Utf8, false),
+        ]));
         let table_schema = TableSchema::from_file_schema(file_schema);
-        let byte_splits: Vec<PartitionedFile> = (0..SPLITS)
+        let splits = u64::try_from(SPLITS).expect("split count fits u64");
+        let byte_splits: Vec<PartitionedFile> = (0..splits)
             .map(|i| {
-                let start = data_size * i / SPLITS;
-                let end = data_size * (i + 1) / SPLITS;
+                let start = data_size * i / splits;
+                let end = data_size * (i + 1) / splits;
                 PartitionedFile::new_with_range(
                     file_path.to_string(),
                     data_size,
@@ -932,7 +1020,8 @@ mod tests {
             table_schema: &TableSchema,
             byte_splits: &[PartitionedFile],
             predicate: PhysicalExprRef,
-        ) -> anyhow::Result<Vec<usize>> {
+        ) -> anyhow::Result<(Vec<usize>, usize)> {
+            take_scans_built();
             // One opener over every split, as a scan partition does: the layout
             // reader and its zone map are shared between them.
             let opener = make_opener(
@@ -954,13 +1043,13 @@ mod tests {
                     .sum();
                 per_split.push(rows);
             }
-            Ok(per_split)
+            Ok((per_split, take_scans_built()))
         }
 
         // First row, both sides of a zone boundary, an interior value, last row.
-        for needle in [0, 8_191, 8_192, 12_345, ROWS - 1] {
+        for needle in [0, 4_095, 4_096, 16_384, 32_768, ROWS - 1] {
             let filter = logical2physical(&col("a").eq(lit(needle)), table_schema.table_schema());
-            let per_split =
+            let (per_split, scans_built) =
                 rows_per_split(&object_store, &table_schema, &byte_splits, filter).await?;
 
             assert_eq!(
@@ -973,24 +1062,41 @@ mod tests {
                 1,
                 "exactly one split owns {needle}; per split: {per_split:?}"
             );
+            assert_eq!(
+                scans_built,
+                1,
+                "only the split owning {needle} may reach scan construction; the other \
+                 {} built a scan the zone map could have skipped",
+                SPLITS - 1
+            );
         }
 
         // Outside every zone's range: every split is skipped, nothing is returned.
         let filter = logical2physical(&col("a").eq(lit(ROWS + 1)), table_schema.table_schema());
-        let per_split = rows_per_split(&object_store, &table_schema, &byte_splits, filter).await?;
+        let (per_split, scans_built) =
+            rows_per_split(&object_store, &table_schema, &byte_splits, filter).await?;
         assert!(
             per_split.iter().all(|rows| *rows == 0),
             "a value the file cannot hold must return no rows; per split: {per_split:?}"
+        );
+        assert_eq!(
+            scans_built, 0,
+            "no split may reach scan construction for a value the file cannot hold"
         );
 
         // Nothing prunable: the splits must still tile the file exactly, which is
         // what says the pruned range and the scanned range are the same range.
         let filter = logical2physical(&col("a").gt_eq(lit(0)), table_schema.table_schema());
-        let per_split = rows_per_split(&object_store, &table_schema, &byte_splits, filter).await?;
+        let (per_split, scans_built) =
+            rows_per_split(&object_store, &table_schema, &byte_splits, filter).await?;
         assert_eq!(
             per_split.iter().sum::<usize>(),
             ROWS as usize,
             "byte splits must cover every row exactly once; per split: {per_split:?}"
+        );
+        assert_eq!(
+            scans_built, SPLITS,
+            "a filter that prunes nothing must leave every split to the scan"
         );
 
         Ok(())
