@@ -124,6 +124,7 @@ pub mod dynamodb;
 mod endpoint_auth;
 mod file;
 mod flight;
+mod fts_snapshot;
 mod gcs;
 mod git;
 mod github;

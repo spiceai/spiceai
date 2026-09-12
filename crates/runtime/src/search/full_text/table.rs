@@ -72,6 +72,24 @@ pub(crate) fn build_full_text_database_index(
     store_fields_override: Option<&[String]>,
     stream_attached: bool,
 ) -> Result<FullTextDatabaseIndex, Box<dyn std::error::Error + Send + Sync>> {
+    build_full_text_database_index_with_directory(
+        inner_table_provider,
+        columns,
+        tbl,
+        store_fields_override,
+        stream_attached,
+        None,
+    )
+}
+
+fn build_full_text_database_index_with_directory(
+    inner_table_provider: Arc<dyn TableProvider>,
+    columns: &[Column],
+    tbl: &TableReference,
+    store_fields_override: Option<&[String]>,
+    stream_attached: bool,
+    directory_override: Option<PathBuf>,
+) -> Result<FullTextDatabaseIndex, Box<dyn std::error::Error + Send + Sync>> {
     let schema = inner_table_provider.schema();
     for c in columns {
         if schema.column_with_name(&c.name).is_none() {
@@ -95,16 +113,20 @@ pub(crate) fn build_full_text_database_index(
     };
 
     let directory = if index_store == IndexStore::File {
-        if let Some(path) = index_path {
-            Some(PathBuf::from_str(path.as_str()).boxed()?)
+        if let Some(directory) = directory_override {
+            Some(directory)
         } else {
-            // Default case. Example `.spice/data/fts/catalog/schema/table/`.
-            Some(
-                make_spice_data_sub_directory(
-                    [vec!["fts".to_string()], tbl.to_vec()].concat().as_slice(),
+            if let Some(path) = index_path {
+                Some(PathBuf::from_str(path.as_str()).boxed()?)
+            } else {
+                // Default case. Example `.spice/data/fts/catalog/schema/table/`.
+                Some(
+                    make_spice_data_sub_directory(
+                        [vec!["fts".to_string()], tbl.to_vec()].concat().as_slice(),
+                    )
+                    .boxed()?,
                 )
-                .boxed()?,
-            )
+            }
         }
     } else {
         None
