@@ -1099,11 +1099,13 @@ fn install_segment_cache(configured_mb: Option<usize>, cayenne_configured: bool)
         vortex_datafusion::install_process_segment_cache(0);
         return;
     }
-    if vortex_datafusion::install_process_segment_cache(bytes) && cayenne_configured {
-        tracing::info!(
-            "Vortex segment cache installed: {} MB shared across all Cayenne tables",
-            bytes / (1024 * 1024)
-        );
+    if vortex_datafusion::install_process_segment_cache(bytes) {
+        if cayenne_configured {
+            tracing::info!(
+                "Vortex segment cache installed: {} MB shared across all Cayenne tables",
+                bytes / (1024 * 1024)
+            );
+        }
     } else {
         // A second runtime in one process (tests, embedded hosts) keeps the cache
         // the first one installed; the budget is process-wide by construction.
