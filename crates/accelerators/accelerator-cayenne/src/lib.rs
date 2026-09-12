@@ -701,8 +701,12 @@ fn warn_if_low_disk_blocking(label: &str, path: &str) {
 /// deliberately excluded — they are calibration readings the line does not print;
 /// they still reach the fingerprint where they matter, through the knobs they
 /// resolved.
+///
+/// `metastore_dir` is keyed as well as printed: a table whose metastore path moves is
+/// reading a different catalog, and re-emitting the line is what makes that visible.
 fn auto_tuned_config_fingerprint(
     table_name: &str,
+    metastore_dir: &str,
     hw: &autotune::HardwareProfile,
     workload: &autotune::WorkloadProfile,
     config: &cayenne::metadata::VortexConfig,
@@ -711,7 +715,7 @@ fn auto_tuned_config_fingerprint(
 
     let mut hasher = DefaultHasher::new();
     format!(
-        "{table_name}|{cores}|{total_mem_bytes}|{data_storage:?}|{metastore_storage:?}|\
+        "{table_name}|{metastore_dir}|{cores}|{total_mem_bytes}|{data_storage:?}|{metastore_storage:?}|\
          {row_count:?}|{table_bytes:?}|{schema_present}|{has_primary_key}|{is_upsert}|{config:?}",
         cores = hw.cores,
         total_mem_bytes = hw.total_mem_bytes,
@@ -2325,7 +2329,14 @@ impl CayenneAccelerator {
             // dataset that keeps failing to load is rebuilt on every retry. Every
             // emit below is a pure function of `config` and `hw.cores`, so the one
             // fingerprint covers them all.
-            let fingerprint = auto_tuned_config_fingerprint(table_name, &hw, workload, &config);
+
+            // The catalog this table's metadata actually lives in. Printed because it is
+            // the one input to Cayenne's identity that nothing else reports: a pod that
+            // resolves a different path finds an empty metastore and creates a new table,
+            // leaving the previous table's files on disk under its old id.
+            let metastore_dir = Self::resolve_metadata_dir(source.acceleration());
+            let fingerprint =
+                auto_tuned_config_fingerprint(table_name, &metastore_dir, &hw, workload, &config);
             if auto_tuned_config_is_newly_resolved(table_name, fingerprint) {
                 // A `cayenne_goal_*` SLO with the closed loop off does nothing, and
                 // it is easy to set one globally and assume it took effect.
@@ -2357,6 +2368,7 @@ impl CayenneAccelerator {
                     total_mem_mib = hw.total_mem_bytes / (1024 * 1024),
                     data_storage = %hw.data_storage,
                     metastore_storage = %hw.metastore_storage,
+                    metastore_dir = %metastore_dir,
                     runtime_footer_cache_mb = ?config.footer_cache_mb,
                     tuning = if config.dynamic_tuning { "adaptive" } else { "auto" },
                     // Inferred workload signals (from schema inference). When these are
@@ -6822,6 +6834,55 @@ mod tests {
         }
     }
 
+    /// A table whose metastore path moves is reading a different catalog — an empty one
+    /// creates a second table and leaves the first one's files behind under its old id.
+    /// Keying the report on the path is what makes the move visible in the log instead of
+    /// being deduplicated away as an unchanged resolution.
+    #[test]
+    fn a_moved_metastore_path_re_reports_the_auto_tuned_config() {
+        use data_accelerator_api::storage::ResolvedAccelerationStorage;
+
+        let hw = autotune::HardwareProfile::new(
+            8,
+            16 * 1024 * 1024 * 1024,
+            ResolvedAccelerationStorage::Ebs,
+            ResolvedAccelerationStorage::Ebs,
+        );
+        let workload = autotune::WorkloadProfile::default();
+        let config = cayenne::metadata::VortexConfig::default();
+
+        let on_the_volume = auto_tuned_config_fingerprint(
+            "metrics",
+            "/data/metadata/metrics",
+            &hw,
+            &workload,
+            &config,
+        );
+        let same_again = auto_tuned_config_fingerprint(
+            "metrics",
+            "/data/metadata/metrics",
+            &hw,
+            &workload,
+            &config,
+        );
+        let somewhere_ephemeral = auto_tuned_config_fingerprint(
+            "metrics",
+            "/app/.spice/data/metadata",
+            &hw,
+            &workload,
+            &config,
+        );
+
+        assert_eq!(
+            on_the_volume, same_again,
+            "an unchanged resolution must stay deduplicated"
+        );
+        assert_ne!(
+            on_the_volume, somewhere_ephemeral,
+            "the same table reading a different metastore must report again"
+        );
+    }
+
     #[test]
     fn auto_tuned_config_is_reported_once_per_resolution() {
         // Table names are process-global keys; keep them unique to this test.
@@ -6850,6 +6911,9 @@ mod tests {
     fn auto_tuned_config_fingerprint_covers_the_logged_values_only() {
         use data_accelerator_api::storage::ResolvedAccelerationStorage;
 
+        // Held fixed here; a moved metastore path has its own test below.
+        const DIR: &str = "/data/metadata/t";
+
         let hw = autotune::HardwareProfile::new(
             8,
             32 * 1024 * 1024 * 1024,
@@ -6858,13 +6922,13 @@ mod tests {
         );
         let workload = autotune::WorkloadProfile::default();
         let config = cayenne::metadata::VortexConfig::default();
-        let baseline = auto_tuned_config_fingerprint("t", &hw, &workload, &config);
+        let baseline = auto_tuned_config_fingerprint("t", DIR, &hw, &workload, &config);
 
         // Deterministic: the same resolution fingerprints the same way, which is
         // what collapses the retry storm.
         assert_eq!(
             baseline,
-            auto_tuned_config_fingerprint("t", &hw, &workload, &config)
+            auto_tuned_config_fingerprint("t", DIR, &hw, &workload, &config)
         );
 
         // Every printed input participates.
@@ -6872,14 +6936,14 @@ mod tests {
         retuned.target_vortex_file_size_mb += 1;
         assert_ne!(
             baseline,
-            auto_tuned_config_fingerprint("t", &hw, &workload, &retuned),
+            auto_tuned_config_fingerprint("t", DIR, &hw, &workload, &retuned),
             "a knob that appears in the line must change the fingerprint"
         );
         let mut bigger_host = hw;
         bigger_host.cores += 1;
         assert_ne!(
             baseline,
-            auto_tuned_config_fingerprint("t", &bigger_host, &workload, &config),
+            auto_tuned_config_fingerprint("t", DIR, &bigger_host, &workload, &config),
             "the host basis appears in the line and must change the fingerprint"
         );
         let inferred = autotune::WorkloadProfile {
@@ -6888,12 +6952,12 @@ mod tests {
         };
         assert_ne!(
             baseline,
-            auto_tuned_config_fingerprint("t", &hw, &inferred, &config),
+            auto_tuned_config_fingerprint("t", DIR, &hw, &inferred, &config),
             "the inferred workload signals appear in the line"
         );
         assert_ne!(
             baseline,
-            auto_tuned_config_fingerprint("other", &hw, &workload, &config),
+            auto_tuned_config_fingerprint("other", DIR, &hw, &workload, &config),
             "the fingerprint is per table"
         );
 
@@ -6904,7 +6968,7 @@ mod tests {
         unprinted.stream_publish_interval_ms += 1;
         assert_ne!(
             baseline,
-            auto_tuned_config_fingerprint("t", &hw, &workload, &unprinted)
+            auto_tuned_config_fingerprint("t", DIR, &hw, &workload, &unprinted)
         );
 
         // The calibration measurements are deliberately excluded: they are not
@@ -6914,7 +6978,7 @@ mod tests {
         probed.metastore_perf.write_mbps = Some(4_000.0);
         assert_eq!(
             baseline,
-            auto_tuned_config_fingerprint("t", &probed, &workload, &config),
+            auto_tuned_config_fingerprint("t", DIR, &probed, &workload, &config),
             "a measured storage rate is not part of the line and must not re-report it"
         );
     }

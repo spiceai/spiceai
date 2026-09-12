@@ -2191,18 +2191,35 @@ impl MetadataCatalog for CayenneCatalog {
 
         validate_create_table_options(&options)?;
 
-        // Check if table already exists first (read-only check)
+        // Check if table already exists first (read-only check).
+        //
+        // A row set, not a single-row query: `query_row_helper` reports "no rows" as an
+        // error indistinguishable from a failed read, so treating any error as "absent"
+        // lets a transient metastore failure — a busy lock, an I/O error, a full disk —
+        // read as "this table has never existed". The create below would then mint a
+        // second table over the first one's data, orphaning every file the stored table
+        // still references, and report nothing. An empty `Vec` means absent; an error
+        // stays an error.
+        //
+        // `init` creates `cayenne_table` before this catalog is handed out, so a missing
+        // table is not a case this has to tolerate.
         let existing_table_id: Option<String> = self
             .metastore
-            .query_row_helper(
-                QueryRowParams {
+            .query_helper(
+                QueryParams {
                     sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?1",
                     params: vec![MetastoreValue::Text(table_name.clone())],
                 },
                 |row| row.get_string(0),
             )
             .await
-            .ok();
+            .map_err(|source| CatalogError::Database {
+                message: format!(
+                    "Failed to look up table '{table_name}' in the Cayenne metastore, so its existing acceleration cannot be opened and creating a new table would orphan the data it already holds. Cause: {source}"
+                ),
+            })?
+            .into_iter()
+            .next();
 
         if let Some(ref existing_id) = existing_table_id {
             return match self
