@@ -415,13 +415,17 @@ impl RuntimeServer {
                     Some(catalog_name),
                 );
             }
-            return ResolveOutcome::Missing;
+            // Catalog exists but does not contain this tool. A top-level
+            // tool may still own the encoded name (`srv__deploy` next to
+            // catalog `srv`); `Runtime::get_tool` falls through the same way.
         }
         // Fall back to a direct (non-catalog) lookup. This covers top-level
-        // tools whose names legitimately contain the `__` catalog separator.
-        // Such a tool is exposed under its own name, so that name is already
-        // canonical and must not be re-encoded — and it belongs to no catalog,
-        // however much its name may look like one qualified by the separator.
+        // tools whose names legitimately contain the `__` catalog separator,
+        // including when a catalog of the decoded prefix exists but does not
+        // contain the tool. Such a tool is exposed under its own name, so
+        // that name is already canonical and must not be re-encoded — and it
+        // belongs to no catalog, however much its name may look like one
+        // qualified by the separator.
         match tools.get(tool_name) {
             Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) => {
                 ResolveOutcome::Ready(ResolvedTool {
@@ -1090,6 +1094,83 @@ mod tests {
         // one — so the call carries no `mcp_server` label at all, rather than a
         // phantom `top` or a server named after the tool itself.
         assert_eq!(mcp_server, None);
+    }
+
+    /// Catalog `srv` without `deploy` must not hide a live top-level
+    /// `srv__deploy`. Returning `Missing` here is `method-not-found` on
+    /// `tools/call` whenever the catalog exists (`catalog_present=True
+    /// catalog_get=None direct_present=True`).
+    #[tokio::test]
+    async fn catalog_miss_falls_through_to_colliding_top_level_tool() {
+        struct EmptySrv;
+
+        #[async_trait::async_trait]
+        impl SpiceToolCatalog for EmptySrv {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn name(&self) -> &'static str {
+                "srv"
+            }
+            async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                Vec::new()
+            }
+            async fn get(&self, _name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                None
+            }
+            fn try_get(&self, _name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                None
+            }
+            fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                Vec::new()
+            }
+        }
+
+        let exposed = encode_tool_name("srv", "deploy");
+        let mut tools = HashMap::new();
+        tools.insert(
+            exposed.clone(),
+            Tooling::Tool(Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>),
+        );
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(EmptySrv) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+        let catalog_present = matches!(tools.get("srv"), Some(Tooling::Catalog { .. }));
+        let catalog_get = match tools.get("srv") {
+            Some(Tooling::Catalog { tools: catalog, .. }) => catalog.try_get("deploy").is_some(),
+            _ => false,
+        };
+        let direct_present = matches!(
+            tools.get(&exposed),
+            Some(Tooling::Tool(_) | Tooling::FunctionTool(_))
+        );
+        assert!(
+            catalog_present && !catalog_get && direct_present,
+            "catalog_present={catalog_present} catalog_get={catalog_get} direct_present={direct_present}"
+        );
+
+        let server = RuntimeServer::new(Arc::new(RwLock::new(tools)));
+        let outcome = server.get_tool(&exposed).await;
+        let ResolveOutcome::Ready(resolved) = outcome else {
+            let current = match outcome {
+                ResolveOutcome::Ready(_) => "Ready",
+                ResolveOutcome::Retry => "Retry",
+                ResolveOutcome::Missing => "Missing",
+            };
+            panic!("current={current} expected=Ready(top:Region) fallback_skipped=True");
+        };
+        assert_eq!(resolved.exposed_name, exposed);
+        assert_eq!(resolved.catalog, None);
+        let executed = resolved
+            .tool
+            .call("")
+            .await
+            .expect("top-level Region tool must execute");
+        assert_eq!(executed, json!({ "executed": "Region" }));
     }
 
     #[test]
