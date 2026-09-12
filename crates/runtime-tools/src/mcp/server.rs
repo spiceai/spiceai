@@ -1851,12 +1851,10 @@ mod tests {
                 vec![Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>]
             }
             async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
-                (name == "deploy")
-                    .then(|| Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>)
+                (name == "deploy").then(|| Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>)
             }
             fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
-                (name == "deploy")
-                    .then(|| Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>)
+                (name == "deploy").then(|| Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>)
             }
             fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
                 vec![Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>]
@@ -3178,8 +3176,7 @@ mod tests {
         }
         let mut responses = std::collections::BTreeMap::new();
         responses.insert("round".to_string(), nested);
-        let request =
-            CallToolRequestParams::new("ask").with_input_responses(responses);
+        let request = CallToolRequestParams::new("ask").with_input_responses(responses);
         let err = forwarded_call_within_limits(&request)
             .expect_err("deep input_responses must be rejected");
         assert!(
@@ -3283,7 +3280,9 @@ mod tests {
             .header("mcp-protocol-version", "2026-07-28")
             .header("mcp-method", "tools/call")
             .header("mcp-name", "ask")
-            .body(http_body_util::Full::new(bytes::Bytes::from(body.to_string())))
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                body.to_string(),
+            )))
             .expect("valid oversized tools/call request");
         let response = service.handle(request).await;
         let status = response.status();
@@ -3660,9 +3659,7 @@ mod tests {
             "validated=Region executed=Zone accepted=True is the reported miss: {json}"
         );
         assert_eq!(
-            catalog
-                .get_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
+            catalog.get_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "gateway dispatch must pin try_all, not refreshing catalog get"
         );
