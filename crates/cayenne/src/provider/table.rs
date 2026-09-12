@@ -1514,6 +1514,7 @@ impl Default for ScanViewCache {
 struct CachedSnapshotListing {
     snapshot_id: String,
     dir_generation: u64,
+    listing_epoch: u64,
     files: Arc<Vec<PartitionedFile>>,
 }
 
@@ -1726,11 +1727,17 @@ pub struct CayenneTableProvider {
     /// scan behavior when `collect_statistics` asks us to read Vortex footers.
     scan_file_statistics: Arc<dyn FileStatisticsCache>,
     /// Unpruned snapshot directory listing (paths + footer stats) for the
-    /// current file set. Keyed by snapshot id and [`Self::current_dir_generation`]
-    /// so a publish that adds files cannot serve a short list. A hit skips
-    /// object-store LIST and per-file footer/catalog fetches; the query still
-    /// prunes with its own predicate.
+    /// current file set. Keyed by snapshot id, [`Self::current_dir_generation`],
+    /// and [`Self::listing_cache_epoch`] so a publish that adds files cannot
+    /// serve a short list. A hit skips object-store LIST and per-file
+    /// footer/catalog fetches; the query still prunes with its own predicate.
     cached_snapshot_listing: Arc<ArcSwapOption<CachedSnapshotListing>>,
+    /// Bumped whenever [`Self::cached_snapshot_listing`] is dropped. Distinct
+    /// from [`Self::current_dir_generation`]: bumping that generation aborts
+    /// compaction. An in-flight LIST samples this at start and skips storing
+    /// if it moved, so a listing that overlapped
+    /// [`Self::refresh_listing_table`] cannot restore the pre-refresh file set.
+    listing_cache_epoch: Arc<AtomicU64>,
     /// Table-level Vortex statistics cache loaded from the metastore and maintained
     /// after writes. The optimizer-facing `Statistics` and raw `TableStatistics`
     /// blob live under the same lock so clears and updates publish both views
@@ -1853,6 +1860,12 @@ pub struct CayenneTableProvider {
     /// capture now retries when the counter moved. Consumed on first fire.
     #[cfg(test)]
     test_post_scan_input_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired after a snapshot-directory LIST is collected and
+    /// before it is stored in [`Self::cached_snapshot_listing`], so a test can
+    /// add files and refresh listing in the window an in-flight LIST would
+    /// otherwise re-store a stale file set. Consumed on first fire.
+    #[cfg(test)]
+    test_post_snapshot_list_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -8185,6 +8198,8 @@ impl CayenneTableProvider {
             test_post_capture_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_scan_input_capture_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_post_snapshot_list_hook: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -8194,6 +8209,7 @@ impl CayenneTableProvider {
             listing_fence: Arc::new(tokio::sync::RwLock::new(())),
             scan_file_statistics: Arc::new(DefaultFileStatisticsCache::default()),
             cached_snapshot_listing: Arc::new(ArcSwapOption::empty()),
+            listing_cache_epoch: Arc::new(AtomicU64::new(0)),
             table_statistics: Arc::new(RwLock::new(CachedTableStatistics {
                 optimizer_inexact: table_statistics
                     .as_ref()
@@ -10150,6 +10166,7 @@ impl CayenneTableProvider {
             listing_fence: Arc::clone(&self.listing_fence),
             scan_file_statistics: Arc::clone(&self.scan_file_statistics),
             cached_snapshot_listing: Arc::clone(&self.cached_snapshot_listing),
+            listing_cache_epoch: Arc::clone(&self.listing_cache_epoch),
             table_statistics: Arc::clone(&self.table_statistics),
             table_statistics_persistence_lock: Arc::clone(&self.table_statistics_persistence_lock),
             row_count_taint_pending: Arc::clone(&self.row_count_taint_pending),
@@ -10176,6 +10193,8 @@ impl CayenneTableProvider {
             test_post_capture_hook: Arc::clone(&self.test_post_capture_hook),
             #[cfg(test)]
             test_post_scan_input_capture_hook: Arc::clone(&self.test_post_scan_input_capture_hook),
+            #[cfg(test)]
+            test_post_snapshot_list_hook: Arc::clone(&self.test_post_snapshot_list_hook),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
@@ -10623,9 +10642,18 @@ impl CayenneTableProvider {
         cache.count_exact = false;
     }
 
+    /// Drop the unpruned snapshot listing cache and bump
+    /// [`Self::listing_cache_epoch`] so an in-flight LIST cannot re-store the
+    /// file set this drop is invalidating. Does **not** bump
+    /// [`Self::current_dir_generation`] (that aborts compaction).
+    fn drop_cached_snapshot_listing(&self) {
+        self.listing_cache_epoch.fetch_add(1, Ordering::AcqRel);
+        self.cached_snapshot_listing.store(None);
+    }
+
     pub(crate) fn clear_scan_file_statistics_cache(&self) {
         self.scan_file_statistics.clear();
-        self.cached_snapshot_listing.store(None);
+        self.drop_cached_snapshot_listing();
     }
 
     /// Check the table-wide PK index out for validation. The cell is left empty for
@@ -24921,6 +24949,16 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Fire (and consume) the test-only post-snapshot-LIST hook, if one is
+    /// installed. See [`Self::test_post_snapshot_list_hook`].
+    #[cfg(test)]
+    async fn run_test_post_snapshot_list_hook(&self) {
+        let hook = self.test_post_snapshot_list_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
     /// Update the current snapshot ID after a compaction operation.
     ///
     /// This must be called after `commit_compaction` to keep the in-memory snapshot ID
@@ -25115,8 +25153,7 @@ impl CayenneTableProvider {
     /// `COUNT(*)`) reinvokes `infer_stats`, which in turn reapplies the
     /// `VortexAccessPlanProvider` and observes the fresh deletion bitmap.
     pub(crate) fn invalidate_scan_file_statistics(&self) {
-        self.scan_file_statistics.clear();
-        self.cached_snapshot_listing.store(None);
+        self.clear_scan_file_statistics_cache();
     }
 
     /// Refresh the listing table, ASSUMING the caller already holds
@@ -25152,7 +25189,7 @@ impl CayenneTableProvider {
         // `current_dir_generation` (position-based checkpoint, schema evolution),
         // so a generation-keyed hit would serve the pre-refresh file set.
         Self::invalidate_list_files_cache(self.context.runtime_env(), &snapshot_dir_url);
-        self.cached_snapshot_listing.store(None);
+        self.drop_cached_snapshot_listing();
 
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
@@ -32305,19 +32342,22 @@ impl CayenneTableProvider {
     }
 
     /// Return the snapshot's files with statistics, using
-    /// [`Self::cached_snapshot_listing`] when the snapshot id and directory
-    /// generation still match. A complete listing (not truncated by LIMIT) is
-    /// stored so later point lookups prune in memory instead of re-LISTing.
+    /// [`Self::cached_snapshot_listing`] when the snapshot id, directory
+    /// generation, and listing-cache epoch still match. A complete listing
+    /// (not truncated by LIMIT) is stored so later point lookups prune in
+    /// memory instead of re-LISTing.
     async fn snapshot_files_with_stats(
         &self,
         request: &SnapshotScanListingRequest<'_>,
         collect_stats: bool,
         dir_generation: u64,
     ) -> datafusion_common::Result<Arc<Vec<PartitionedFile>>> {
+        let listing_epoch = self.listing_cache_epoch.load(Ordering::Acquire);
         if collect_stats
             && let Some(cached) = self.cached_snapshot_listing.load_full()
             && cached.snapshot_id == request.snapshot_id
             && cached.dir_generation == dir_generation
+            && cached.listing_epoch == listing_epoch
         {
             return Ok(Arc::clone(&cached.files));
         }
@@ -32375,13 +32415,17 @@ impl CayenneTableProvider {
         let (file_group, truncated) =
             Self::collect_scan_files_with_limit(files, None, collect_stats).await?;
         let files = Arc::new(file_group.into_inner());
+        #[cfg(test)]
+        self.run_test_post_snapshot_list_hook().await;
         if collect_stats && !truncated {
             let gen_after = self.current_dir_generation.load(Ordering::Acquire);
-            if gen_after == dir_generation {
+            let epoch_after = self.listing_cache_epoch.load(Ordering::Acquire);
+            if gen_after == dir_generation && epoch_after == listing_epoch {
                 self.cached_snapshot_listing
                     .store(Some(Arc::new(CachedSnapshotListing {
                         snapshot_id: request.snapshot_id.to_string(),
                         dir_generation,
+                        listing_epoch,
                         files: Arc::clone(&files),
                     })));
             }
@@ -45669,6 +45713,135 @@ mod tests {
             .await,
             vec![2000],
             "PK lookup after listing refresh must see the new row, not a stale cached file list"
+        );
+    }
+
+    /// A LIST that started before `refresh_listing_table` must not re-store the
+    /// pre-refresh file set: the next PK lookup of a row added in that window
+    /// has to see it. The overlapping scan itself still reads the files it
+    /// collected (the seeded row).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pk_point_lookup_overlapping_listing_refresh_sees_new_row_on_next_scan() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let vortex_config = VortexConfig {
+            inline_max_rows: 0,
+            compaction_background_interval_ms: 0,
+            compaction_trigger_files: usize::MAX,
+            compaction_trigger_protected_snapshots: usize::MAX,
+            compaction_trigger_snapshot_age_ms: u64::MAX,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "pk_lookup_overlapping_listing_refresh",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let provider = Arc::new(provider);
+        let seed = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..100)),
+                Arc::new(Int64Array::from_iter_values((0..100).map(|id| id * 10))),
+            ],
+        )
+        .expect("seed batch");
+        insert_batch_with_context(&ctx, &provider, seed).await;
+
+        assert_eq!(
+            query_pk_i64(
+                Arc::clone(&provider) as Arc<dyn TableProvider>,
+                &ctx,
+                50,
+                "value",
+            )
+            .await,
+            vec![500],
+            "warmup PK lookup must see the seeded row"
+        );
+        assert!(
+            provider.cached_snapshot_listing.load_full().is_some(),
+            "warmup scan must populate the snapshot listing cache"
+        );
+        let generation_before = provider.current_dir_generation.load(Ordering::Relaxed);
+        // Force a LIST without bumping `listing_cache_epoch`, matching an
+        // in-flight listing that sampled the epoch before refresh.
+        provider.cached_snapshot_listing.store(None);
+
+        let extra = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![200_i64])),
+                Arc::new(Int64Array::from(vec![2000_i64])),
+            ],
+        )
+        .expect("extra batch");
+        let hook_fired = Arc::new(AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let fired = Arc::clone(&hook_fired);
+            *provider.test_post_snapshot_list_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    provider_in_hook
+                        .write_to_snapshot(
+                            single_batch_stream(extra),
+                            provider_in_hook.target_file_size_bytes(),
+                            &provider_in_hook.get_current_snapshot_id(),
+                            1,
+                            None,
+                            crate::provider::delta_encoding::WritePolicy::DELTA,
+                        )
+                        .await
+                        .expect("write extra file during overlapping listing");
+                    provider_in_hook
+                        .refresh_listing_table()
+                        .await
+                        .expect("refresh listing during overlapping listing");
+                    fired.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+
+        assert_eq!(
+            query_pk_i64(
+                Arc::clone(&provider) as Arc<dyn TableProvider>,
+                &ctx,
+                50,
+                "value",
+            )
+            .await,
+            vec![500],
+            "overlapping PK lookup must still see the seeded row from the files it listed"
+        );
+        assert!(
+            hook_fired.load(Ordering::SeqCst),
+            "the overlapping scan must reach the post-LIST hook"
+        );
+        assert_eq!(
+            provider.current_dir_generation.load(Ordering::Relaxed),
+            generation_before,
+            "refresh_listing_table must not bump current_dir_generation"
+        );
+        assert!(
+            provider.cached_snapshot_listing.load_full().is_none(),
+            "an overlapping LIST must not re-store the pre-refresh file set"
+        );
+        assert_eq!(
+            query_pk_i64(
+                Arc::clone(&provider) as Arc<dyn TableProvider>,
+                &ctx,
+                200,
+                "value",
+            )
+            .await,
+            vec![2000],
+            "next PK lookup after an overlapping listing refresh must see the new row"
         );
     }
 
