@@ -62,10 +62,10 @@ use crate::{
     utils::{runtime_ready_check, test_request_context},
 };
 
-const MINIO_HOST_PORT: u16 = 19_137;
+const S3_HOST_PORT: u16 = 19_137;
 const PROXY_PORT: u16 = 19_138;
-const ACCESS_KEY: &str = "minioadmin";
-const SECRET_KEY: &str = "minioadmin";
+const ACCESS_KEY: &str = "rustfsadmin";
+const SECRET_KEY: &str = "rustfsadmin";
 const BUCKET: &str = "overwrite-race";
 const OBJECT_KEY: &str = "listing/data.parquet";
 const ROWS: i64 = 20_000;
@@ -325,17 +325,23 @@ async fn overwrite_object(
     Ok(())
 }
 
-async fn start_minio() -> Result<RunningContainer<'static>, anyhow::Error> {
-    let container = ContainerRunnerBuilder::new("spice_test_minio_parquet_overwrite")
-        .image("minio/minio:latest".to_string())
-        .add_port_binding(9000, MINIO_HOST_PORT)
-        .add_env_var("MINIO_ROOT_USER", ACCESS_KEY)
-        .add_env_var("MINIO_ROOT_PASSWORD", SECRET_KEY)
-        .command(["server", "/data", "--console-address", ":9001"])
+/// An S3-compatible object store for the fixtures these tests overwrite.
+///
+/// The store has to serve the two things the generation pin relies on: buckets
+/// with versioning enabled, so a replaced object keeps a fetchable `versionId`,
+/// and `If-Match` on GET, so a read pinned to a stale `ETag` fails with 412
+/// rather than returning the replacement's bytes.
+async fn start_object_store() -> Result<RunningContainer<'static>, anyhow::Error> {
+    let container = ContainerRunnerBuilder::new("spice_test_rustfs_parquet_overwrite")
+        .image("rustfs/rustfs:latest".to_string())
+        .add_port_binding(9000, S3_HOST_PORT)
+        .add_env_var("RUSTFS_ACCESS_KEY", ACCESS_KEY)
+        .add_env_var("RUSTFS_SECRET_KEY", SECRET_KEY)
+        .command(["/data"])
         .healthcheck(HealthConfig {
             test: Some(vec![
                 "CMD-SHELL".to_string(),
-                "curl -f http://127.0.0.1:9000/minio/health/live || exit 1".to_string(),
+                "netstat -tulpn | grep 9000 || exit 1".to_string(),
             ]),
             interval: Some(500_000_000),
             timeout: Some(1_000_000_000),
@@ -346,7 +352,7 @@ async fn start_minio() -> Result<RunningContainer<'static>, anyhow::Error> {
         .build()?
         .run(Some(Duration::from_mins(2)))
         .await?;
-    wait_for_tcp_port("127.0.0.1", MINIO_HOST_PORT, Duration::from_mins(1)).await?;
+    wait_for_tcp_port("127.0.0.1", S3_HOST_PORT, Duration::from_mins(1)).await?;
     Ok(container)
 }
 
@@ -504,7 +510,7 @@ async fn proxy_connection(
         if delay_later_gets {
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
-        let mut upstream = TcpStream::connect(("127.0.0.1", MINIO_HOST_PORT)).await?;
+        let mut upstream = TcpStream::connect(("127.0.0.1", S3_HOST_PORT)).await?;
         upstream.write_all(&headers).await?;
         upstream.write_all(&body).await?;
         let Some((resp_headers, resp_body)) = read_http_message(&mut upstream, !is_head).await?
@@ -690,12 +696,18 @@ struct GenerationPair {
 async fn race_listing_scan(
     mix: &MixProxy,
     proxy: &str,
-    minio: &str,
+    store_endpoint: &str,
     bucket: &str,
     generations: &GenerationPair,
     versioned: bool,
 ) -> Result<(), anyhow::Error> {
-    ensure_bucket_and_object(minio, bucket, generations.bytes_a.clone(), versioned).await?;
+    ensure_bucket_and_object(
+        store_endpoint,
+        bucket,
+        generations.bytes_a.clone(),
+        versioned,
+    )
+    .await?;
     mix.reset();
     let rt = run_runtime(proxy, bucket).await?;
     mix.reset();
@@ -718,7 +730,7 @@ async fn race_listing_scan(
         async move { scan_payload_char_len(rt.as_ref()).await }
     });
     mix.wait_for_first_pinned_object_get().await?;
-    overwrite_object(minio, bucket, generations.bytes_b.clone()).await?;
+    overwrite_object(store_endpoint, bucket, generations.bytes_b.clone()).await?;
     let raced = query
         .await
         .map_err(|e| anyhow::anyhow!("scan task join: {e}"))?;
@@ -791,7 +803,7 @@ fn accelerated_append_fixture_sets_append_and_a_time_column() {
 
 async fn corrupt_parquet_is_not_classified_as_generation_change(
     endpoint: &str,
-    minio: &str,
+    store_endpoint: &str,
     bucket: &str,
     mut bytes: Vec<u8>,
 ) -> Result<(), anyhow::Error> {
@@ -800,7 +812,7 @@ async fn corrupt_parquet_is_not_classified_as_generation_change(
     for byte in bytes.iter_mut().skip(start).take(64) {
         *byte ^= 0xff;
     }
-    ensure_bucket_and_object(minio, bucket, bytes, false).await?;
+    ensure_bucket_and_object(store_endpoint, bucket, bytes, false).await?;
     configure_test_datafusion();
     let rt = Arc::new(
         Runtime::builder()
@@ -846,11 +858,11 @@ async fn corrupt_parquet_is_not_classified_as_generation_change(
 async fn accelerated_refresh_retries_a_replaced_object(
     mix: &MixProxy,
     proxy: &str,
-    minio: &str,
+    store_endpoint: &str,
     bucket: &str,
     generations: &GenerationPair,
 ) -> Result<(), anyhow::Error> {
-    ensure_bucket_and_object(minio, bucket, generations.bytes_a.clone(), false).await?;
+    ensure_bucket_and_object(store_endpoint, bucket, generations.bytes_a.clone(), false).await?;
     mix.reset();
     let load = tokio::spawn({
         let proxy = proxy.to_string();
@@ -865,7 +877,7 @@ async fn accelerated_refresh_retries_a_replaced_object(
         "schema inference must GET '{OBJECT_KEY}' without If-Match/versionId before the refresh scan pins it; \
          otherwise waiting for any object GET would overwrite during inference"
     );
-    overwrite_object(minio, bucket, generations.bytes_b.clone()).await?;
+    overwrite_object(store_endpoint, bucket, generations.bytes_b.clone()).await?;
     let rt = load
         .await
         .map_err(|e| anyhow::anyhow!("accelerated load join: {e}"))?
@@ -893,11 +905,11 @@ async fn accelerated_refresh_retries_a_replaced_object(
 async fn accelerated_append_refresh_retries_without_partial_or_duplicate_rows(
     mix: &MixProxy,
     proxy: &str,
-    minio: &str,
+    store_endpoint: &str,
     bucket: &str,
     generations: &GenerationPair,
 ) -> Result<(), anyhow::Error> {
-    ensure_bucket_and_object(minio, bucket, generations.bytes_a.clone(), false).await?;
+    ensure_bucket_and_object(store_endpoint, bucket, generations.bytes_a.clone(), false).await?;
     mix.reset();
     let load = tokio::spawn({
         let proxy = proxy.to_string();
@@ -912,7 +924,7 @@ async fn accelerated_append_refresh_retries_without_partial_or_duplicate_rows(
         "schema inference must GET '{OBJECT_KEY}' without If-Match/versionId before the append refresh scan pins it; \
          otherwise waiting for any object GET would overwrite during inference"
     );
-    overwrite_object(minio, bucket, generations.bytes_b.clone()).await?;
+    overwrite_object(store_endpoint, bucket, generations.bytes_b.clone()).await?;
     let rt = load
         .await
         .map_err(|e| anyhow::anyhow!("append load join: {e}"))?
@@ -958,8 +970,8 @@ async fn listing_table_scan_does_not_decode_a_replaced_object() -> Result<(), an
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_request_context()
         .scope(async {
-            let container = start_minio().await?;
-            let minio = format!("http://127.0.0.1:{MINIO_HOST_PORT}");
+            let container = start_object_store().await?;
+            let store_endpoint = format!("http://127.0.0.1:{S3_HOST_PORT}");
             let proxy = format!("http://127.0.0.1:{PROXY_PORT}");
             let mix = MixProxy::start();
             wait_for_tcp_port("127.0.0.1", PROXY_PORT, Duration::from_secs(5)).await?;
@@ -988,11 +1000,12 @@ async fn listing_table_scan_does_not_decode_a_replaced_object() -> Result<(), an
             );
 
             let result = async {
-                race_listing_scan(&mix, &proxy, &minio, BUCKET, &generations, false).await?;
+                race_listing_scan(&mix, &proxy, &store_endpoint, BUCKET, &generations, false)
+                    .await?;
                 race_listing_scan(
                     &mix,
                     &proxy,
-                    &minio,
+                    &store_endpoint,
                     "overwrite-race-versioned",
                     &generations,
                     true,
@@ -1000,7 +1013,7 @@ async fn listing_table_scan_does_not_decode_a_replaced_object() -> Result<(), an
                 .await?;
                 corrupt_parquet_is_not_classified_as_generation_change(
                     &proxy,
-                    &minio,
+                    &store_endpoint,
                     "overwrite-race-corrupt",
                     generations.bytes_a.clone(),
                 )
@@ -1008,7 +1021,7 @@ async fn listing_table_scan_does_not_decode_a_replaced_object() -> Result<(), an
                 accelerated_refresh_retries_a_replaced_object(
                     &mix,
                     &proxy,
-                    &minio,
+                    &store_endpoint,
                     "overwrite-race-accel",
                     &generations,
                 )
@@ -1016,7 +1029,7 @@ async fn listing_table_scan_does_not_decode_a_replaced_object() -> Result<(), an
                 accelerated_append_refresh_retries_without_partial_or_duplicate_rows(
                     &mix,
                     &proxy,
-                    &minio,
+                    &store_endpoint,
                     "overwrite-race-accel-append",
                     &append_generations,
                 )

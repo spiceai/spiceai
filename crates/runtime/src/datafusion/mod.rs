@@ -140,6 +140,7 @@ pub mod builder;
 pub(crate) mod caching_retention;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
+pub(crate) mod query_memory_pool;
 pub use runtime_datafusion::composed_catalog;
 // `error` and `refresh_sql` below are named throughout the runtime through these
 // aliases, but they belong to `runtime-datafusion`. Crate-visible so a crate outside
@@ -4234,11 +4235,12 @@ impl DataFusion {
         // - Engines backed by a `PolyTableProvider` (duckdb/sqlite/postgres/cayenne) expose a
         //   federated source, so `AcceleratedTable::table_provider()` wraps the table in a
         //   `FederatedTableProviderAdaptor`.
-        // - The in-memory Arrow accelerator has no federated source, so
-        //   `create_federated_table_source()` returns `None` and `table_provider()` hands back the
-        //   bare `AcceleratedTable`.
+        // - The in-memory Arrow accelerator has no federated source, and neither does any
+        //   dataset that declines to federate (`on_zero_results: use_source`, or federation
+        //   disabled), so `create_federated_table_source()` returns `None` and
+        //   `table_provider()` hands back the bare `AcceleratedTable`.
         // Unwrap the adaptor when present so we can find the parent `AcceleratedTable` in either
-        // case; otherwise a child of an Arrow-accelerated parent would never synchronize. The
+        // case; otherwise a child of such a parent would never synchronize. The
         // downcast borrows `parent_table`, so clone out the inner provider first to release the
         // borrow before falling back to `parent_table` itself.
         let adaptor_inner = parent_table

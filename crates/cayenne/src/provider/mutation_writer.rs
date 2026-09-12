@@ -278,7 +278,7 @@ struct PreparedStagedAppendTarget {
     estimated_bytes: Option<u64>,
 }
 
-fn take_post_validation(
+pub(super) fn take_post_validation(
     post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
 ) -> PostValidationState {
     post_validation.lock().take().unwrap_or_default()

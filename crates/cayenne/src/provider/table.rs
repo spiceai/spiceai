@@ -24361,6 +24361,12 @@ impl CayenneTableProvider {
         // `DoNothing` table's keyset, and the next insert of that key would be dropped as
         // a duplicate of a row that no longer exists. The exact-count scan costs nothing
         // for the usual time/value retention predicate, which never had a fast path.
+        // Deliberately NOT wrapped in `InlineAwareDeletionSink`, so retention does
+        // not get its mem-tier arm: this is the one `build_deletion_vector_sink`
+        // caller that passes the `write_lock` INTO the sink rather than holding it,
+        // and the wrapper takes that same non-reentrant lock itself. The consequence
+        // is that `retention_sql` does not reach a `mode: memory` tier, which the
+        // accelerator warns about at registration.
         let sink = self
             .build_deletion_vector_sink(
                 &filters,
@@ -27837,19 +27843,23 @@ impl CayenneTableProvider {
         batches: Vec<RecordBatch>,
         incoming_bytes: u64,
         overwrite: bool,
+        deletions: &crate::provider::on_conflict::OnConflictDeletions,
     ) -> Result<u64> {
         self.enforce_memory_limit(incoming_bytes)?;
         if overwrite {
-            self.overwrite_mem_tier(batches, incoming_bytes).await
-        } else {
-            self.append_to_mem_tier(
-                batches,
-                &crate::provider::on_conflict::OnConflictDeletions::default(),
-                incoming_bytes,
-                0,
-            )
-            .await
+            return self.overwrite_mem_tier(batches, incoming_bytes).await;
         }
+
+        let incoming_rows: u64 = batches
+            .iter()
+            .map(|b| b.num_rows() as u64)
+            .fold(0, u64::saturating_add);
+        let superseded = u64::try_from(deletions.total_superseded()).unwrap_or(u64::MAX);
+        // `append_to_mem_tier` answers with the mem-tier epoch, which is not a row
+        // count — returning it would report the epoch as `rows affected`.
+        self.append_to_mem_tier(batches, deletions, incoming_bytes, superseded)
+            .await?;
+        Ok(incoming_rows)
     }
 
     /// Atomically REPLACE the entire RAM mem-tier with `batches` (memory-mode full
@@ -27899,6 +27909,20 @@ impl CayenneTableProvider {
             // bump, so advance the scan-input version (the next capture re-keys over the new tier).
             self.notify_scan_input_change();
         }
+
+        // The replaced tier's keys are gone and the replacement's are not recorded,
+        // so any cached primary-key index now describes rows that no longer exist and
+        // omits every row that does. Drop it; the next append rebuilds it from the
+        // live tier.
+        //
+        // A stale entry is not symmetric. A key the overwrite REMOVED that the cache
+        // still lists only costs a redundant tombstone on re-insert, which masks
+        // nothing — the documented `PkBloom` false-positive invariant. A key the
+        // overwrite INTRODUCED that the cache does not list is the damaging
+        // direction: an upsert reads it as new, supersedes nothing, and leaves two
+        // live rows under one primary key. This path could not produce that before
+        // the memory append started recording keys at all.
+        self.clear_cached_pk_keyset();
         Ok(incoming_rows)
     }
 
@@ -30052,6 +30076,194 @@ impl CayenneTableProvider {
         Ok(removed_rows)
     }
 
+    /// Remove every mem-tier row matching `filters` on a `mode: memory` table, and
+    /// return how many rows that removed (#12008).
+    ///
+    /// The caller must hold `write_lock`, and must be executing the delete rather
+    /// than planning it: the capture, the predicate pass and the swap all happen
+    /// inside this one hold, so no write can land between deciding what to delete
+    /// and deleting it. That is what keeps this path clear of the plan/execute
+    /// window #13828 describes for the durable arm.
+    ///
+    /// RESTRICTED TO MEMORY-RESIDENT MODE, for two reasons. A
+    /// `cdc_durability: memory` table already has this covered: its scanning
+    /// DELETE checkpoints the tier into Vortex first, so the rows are durable and
+    /// the deletion sink sees them. And its tier bytes are RESERVED against the
+    /// process-global mem-tier budget, released only by the checkpoint that flushes
+    /// them — shrinking the tier here would leak that reservation. Memory mode
+    /// skips the global reservation entirely (`write_cdc_in_memory` does not
+    /// reserve, so it must not release), which is what makes rebuilding the tier
+    /// safe.
+    ///
+    /// A predicate that matches nothing rebuilds nothing: every segment keeps its
+    /// `Arc`s, so a no-match delete costs one predicate pass over the tier and no
+    /// batch copy. A predicate that does match pays a visibility probe over the
+    /// matched rows only.
+    pub(crate) async fn delete_mem_tier_rows_matching(
+        &self,
+        filters: &[Expr],
+    ) -> datafusion_common::Result<u64> {
+        if !self.is_memory_resident_mode() || self.mem_tier.is_empty() {
+            return Ok(0);
+        }
+
+        let coerced = self.coerce_filters_for_inlined_delete(filters)?;
+        let physical_filters = self.build_physical_filters_for_inlined_delete(&coerced)?;
+        if physical_filters.is_empty() {
+            // No predicate means every row (the `TableProvider::delete_from`
+            // contract), which is delete-all — handled by `purge_mem_tier_all`,
+            // not here.
+            return Ok(0);
+        }
+
+        let mut visible_deleted: u64 = 0;
+        let mut raw_removed: u64 = 0;
+        // Each shard is rebuilt under ITS OWN publish lock, in index order — the
+        // deadlock-free order every other multi-shard site uses. Memory mode is
+        // single-shard (enforced by the accelerator's memory-mode overrides), so
+        // this is one iteration, and it relies on that: shards are swapped one at a
+        // time, so at N>1 a lock-free scan could capture one shard before the delete
+        // and the next after it. Making this atomic across shards needs more than
+        // per-shard locking, and nothing here provides it.
+        for (shard_id, shard) in self.mem_tier.shards().iter().enumerate() {
+            let _publish = self.mem_tier_publish_locks[shard_id].lock().await;
+            let current = shard.load_full();
+            if current.segments.is_empty() {
+                continue;
+            }
+
+            // The predicate is evaluated EXACTLY ONCE per batch, and both answers
+            // this loop needs come from that one mask. Evaluating it again to count
+            // would not merely cost a second pass: a volatile predicate
+            // (`WHERE random() < 0.5`) answers differently each time, so the count a
+            // client is told would describe a different row set than the one removed.
+            let deletion_maps = Self::mem_tier_deletion_maps(&current);
+            let tier_has_tombstones = Self::mem_tier_has_tombstones(&current);
+            let mut shard_visible: u64 = 0;
+            let (next, removed) = current.retain_rows(|batch, data_sequence| {
+                let Some(matched) = self.delete_match_mask(batch, &physical_filters)? else {
+                    return Ok(batch.clone());
+                };
+                let match_count = matched.true_count();
+                // Nothing to remove: hand the batch back untouched rather than
+                // building an all-true mask and filtering by it, which would
+                // allocate one `ArrayData` per column to reproduce the input.
+                if match_count == 0 {
+                    return Ok(batch.clone());
+                }
+
+                // A tier holding an upsert history carries superseded versions that
+                // no scan serves. Removing one is harmless — it is invisible either
+                // way, and its segment's tombstone stays to hide anything older —
+                // but COUNTING one is not: a user `DELETE` reports an exact
+                // `rows affected`, and a client that upserted a key twice would be
+                // told two rows went. Visibility is therefore resolved over the
+                // MATCHED rows alone — a probe of what is being deleted, not a walk
+                // of the tier. With no tombstone anywhere every row is visible and
+                // even that probe is skipped.
+                shard_visible = shard_visible.saturating_add(if tier_has_tombstones {
+                    let matched_rows = arrow::compute::filter_record_batch(batch, &matched)?;
+                    self.filter_inlined_batch_for_deletions(
+                        matched_rows,
+                        data_sequence,
+                        &deletion_maps,
+                    )
+                    .map_err(|error| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to resolve mem-tier row visibility while deleting from dataset '{}': {error}",
+                            self.table_metadata.table_name
+                        ))
+                    })?
+                    .map_or(0, |visible| visible.num_rows() as u64)
+                } else {
+                    match_count as u64
+                });
+
+                let keep = arrow::compute::not(&matched)?;
+                Ok(arrow::compute::filter_record_batch(batch, &keep)?)
+            })?;
+            if removed == 0 {
+                continue;
+            }
+            visible_deleted = visible_deleted.saturating_add(shard_visible);
+            shard.store(Arc::new(next));
+            raw_removed = raw_removed.saturating_add(removed);
+        }
+
+        // Keyed on the PHYSICAL fact, not on the number reported to the client: a
+        // rebuild that dropped only superseded rows still swapped the tier, and
+        // every scan-view cache keyed on its version has to re-key.
+        if raw_removed > 0 {
+            // Re-sync the resident-row counter from the tier rather than
+            // subtracting from it, exactly as `purge_mem_tier_all` does. Subtracting
+            // is not safe here: the position-based arm of `delete_from` runs
+            // `checkpoint_inlined_data_if_present_for_delete` first, which re-syncs
+            // this counter from the DURABLE inline corpus alone and so zeroes the
+            // mem-tier's contribution — a subtraction on top of that drives it
+            // NEGATIVE, and it gates the `> 0` branch that decides whether a scan
+            // consults the inline corpus at all.
+            //
+            // In memory-resident mode the tier IS the table (the inline corpus is
+            // disabled), so its row count is the whole truth. It counts superseded
+            // versions a scan does not serve, which over-reports rather than under-
+            // reports — the safe direction for a value served as an INEXACT estimate
+            // and as a "might have rows" gate.
+            self.inlined_row_count.store(
+                i64::try_from(self.mem_tier.total_rows()).unwrap_or(i64::MAX),
+                Ordering::Relaxed,
+            );
+            self.notify_scan_input_change();
+            self.clear_scan_file_statistics_cache();
+        }
+        Ok(visible_deleted)
+    }
+
+    /// The rows of `batch` a `DELETE ... WHERE` matches: the conjunction of
+    /// `physical_filters`, with NULL folded to "did not match". `None` when there
+    /// is nothing to decide — an empty batch, or no predicate at all (which means
+    /// every row, and is the delete-all purge's job, not this one's).
+    ///
+    /// SQL deletes a row only where the predicate evaluates TRUE, so NULL and
+    /// FALSE both mean keep. Folding the null mask into the values here is what
+    /// makes the caller's inversion total: `not(NULL)` is NULL, and
+    /// `filter_record_batch` drops a NULL-masked row, so inverting the raw mask
+    /// would silently delete the rows the predicate could not evaluate.
+    fn delete_match_mask(
+        &self,
+        batch: &RecordBatch,
+        physical_filters: &[Arc<dyn PhysicalExpr>],
+    ) -> datafusion_common::Result<Option<arrow::array::BooleanArray>> {
+        if batch.num_rows() == 0 || physical_filters.is_empty() {
+            return Ok(None);
+        }
+
+        let mut matched: Option<arrow::array::BooleanArray> = None;
+        for filter in physical_filters {
+            let value = filter.evaluate(batch)?;
+            let array = value.into_array(batch.num_rows())?;
+            let mask = array
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .ok_or_else(|| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Delete filter for table {} did not evaluate to BooleanArray, got {:?}",
+                        self.table_metadata.table_name,
+                        array.data_type()
+                    ))
+                })?;
+            let mask = if mask.null_count() == 0 {
+                mask.clone()
+            } else {
+                arrow::compute::prep_null_mask_filter(mask)
+            };
+            matched = Some(match matched {
+                None => mask,
+                Some(prev) => arrow::compute::and(&prev, &mask)?,
+            });
+        }
+        Ok(matched)
+    }
+
     /// Fire the installed [`SlotAdvancer`] for `durable_epoch`, if one is wired
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
@@ -31020,31 +31232,13 @@ impl CayenneTableProvider {
 
     fn apply_inlined_delete_filters(
         &self,
-        mut batch: RecordBatch,
+        batch: RecordBatch,
         physical_filters: &[Arc<dyn PhysicalExpr>],
     ) -> datafusion_common::Result<RecordBatch> {
-        for filter in physical_filters {
-            if batch.num_rows() == 0 {
-                break;
-            }
-
-            let filter_value = filter.evaluate(&batch)?;
-            let filter_array = filter_value.into_array(batch.num_rows())?;
-            let filter_array = filter_array
-                .as_any()
-                .downcast_ref::<arrow::array::BooleanArray>()
-                .ok_or_else(|| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Delete filter for table {} did not evaluate to BooleanArray, got {:?}",
-                        self.table_metadata.table_name,
-                        filter_array.data_type()
-                    ))
-                })?;
-
-            batch = arrow::compute::filter_record_batch(&batch, filter_array)?;
+        match self.delete_match_mask(&batch, physical_filters)? {
+            Some(matched) => Ok(arrow::compute::filter_record_batch(&batch, &matched)?),
+            None => Ok(batch),
         }
-
-        Ok(batch)
     }
 
     fn extract_primary_keys_from_batch(
@@ -34068,6 +34262,9 @@ impl TableProvider for CayenneTableProvider {
         // sink inside the execution-time critical section, not here.
         let file_sink = {
             let _guard = self.write_lock.lock().await;
+            // A no-op in `mode: memory`, which has no Vortex tier to checkpoint
+            // into — there the sink reconciles the tier itself at execution time
+            // (`delete_mem_tier_rows_matching`).
             self.checkpoint_mem_tier_for_delete().await?;
             self.build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
                 .await?
@@ -39891,13 +40088,23 @@ mod tests {
         let b1 = int64_id_batch(&[1, 2, 3]);
         let bytes1 = b1.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b1], bytes1, false)
+            .write_batches_memory_mode(
+                vec![b1],
+                bytes1,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("memory-mode append 1");
         let b2 = int64_id_batch(&[4, 5]);
         let bytes2 = b2.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b2], bytes2, false)
+            .write_batches_memory_mode(
+                vec![b2],
+                bytes2,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("memory-mode append 2");
         assert_eq!(
@@ -39935,10 +40142,79 @@ mod tests {
         );
     }
 
-    /// The purge is gated on the delete being a tautology: a filtered delete
-    /// through the same position-based sink must NOT discard the whole tier.
-    /// (Filtered deletes not reaching mem-tier rows is #12008; what matters here
-    /// is that the delete-all fix cannot over-delete.)
+    /// A filtered delete must take the rows it removed off the live-row counter.
+    ///
+    /// `inlined_row_count` gates whether a scan consults the inline corpus at all
+    /// and, with no persisted statistics, is served as the table's inexact row
+    /// estimate. Left unreconciled it only ever grows: a memory-mode table that
+    /// deletes as much as it inserts would report a count that climbs forever.
+    #[tokio::test]
+    async fn filtered_delete_takes_its_rows_off_the_live_row_count() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            memory_mode: true,
+            cdc_mem_tier_shards: 1,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "filtered_delete_live_row_count",
+            Arc::clone(&schema),
+            vortex_config,
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let batch = int64_id_batch(&[1, 2, 3, 4, 5]);
+        let bytes = batch.get_array_memory_size() as u64;
+        provider
+            .write_batches_memory_mode(
+                vec![batch],
+                bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
+            .await
+            .expect("memory-mode append");
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            5,
+            "precondition: the append counted its five rows as live"
+        );
+
+        let delete_plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("id").gt(datafusion_expr::lit(3_i64))],
+            )
+            .await
+            .expect("filtered delete plan");
+        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("filtered delete executed");
+
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3],
+            "precondition: the delete removed the two matching rows"
+        );
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            3,
+            "the live-row count must drop by what the delete removed"
+        );
+    }
+
+    /// A filtered delete through the position-based sink must remove exactly the
+    /// matching mem-tier rows — not nothing (#12008), and not the whole tier (the
+    /// delete-all purge must not fire on a predicate).
+    ///
+    /// A table with no primary key has no key to tombstone, so this is the arm
+    /// that can only be served by rebuilding the tier
+    /// (`delete_mem_tier_rows_matching`).
     #[tokio::test]
     async fn filtered_delete_does_not_purge_the_mem_tier_without_a_primary_key() {
         use arrow::datatypes::{DataType, Field, Schema};
@@ -39962,7 +40238,12 @@ mod tests {
         let batch = int64_id_batch(&[1, 2, 3]);
         let bytes = batch.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![batch], bytes, false)
+            .write_batches_memory_mode(
+                vec![batch],
+                bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("memory-mode append");
 
@@ -39973,13 +40254,24 @@ mod tests {
             )
             .await
             .expect("filtered delete plan");
-        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+        let results = datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
             .await
             .expect("filtered delete executed");
+        let deleted = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .expect("uint64 count column")
+            .value(0);
+        assert_eq!(deleted, 1, "exactly one mem-tier row matches `id = 2`");
 
         assert_eq!(
             scan_sorted_ids(&provider).await,
-            vec![1, 2, 3],
+            vec![1, 3],
+            "a filtered delete must remove the matching mem-tier row, and only it"
+        );
+        assert!(
+            !provider.mem_tier.is_empty(),
             "a filtered delete must not purge the whole mem-tier"
         );
     }
@@ -40488,13 +40780,23 @@ mod tests {
         let b1 = int64_id_batch(&[1, 2, 3]);
         let bytes1 = b1.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b1], bytes1, false)
+            .write_batches_memory_mode(
+                vec![b1],
+                bytes1,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("append 1");
         let b2 = int64_id_batch(&[4, 5]);
         let bytes2 = b2.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b2], bytes2, false)
+            .write_batches_memory_mode(
+                vec![b2],
+                bytes2,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("append 2");
         assert_eq!(
@@ -40507,7 +40809,12 @@ mod tests {
         let b3 = int64_id_batch(&[10, 20, 30, 40]);
         let bytes3 = b3.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b3], bytes3, true)
+            .write_batches_memory_mode(
+                vec![b3],
+                bytes3,
+                true,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("overwrite");
         assert_eq!(
@@ -40574,7 +40881,12 @@ mod tests {
             "batch ({bytes} bytes) must exceed the cap for the test to be meaningful"
         );
         let err = provider
-            .write_batches_memory_mode(vec![big], bytes, false)
+            .write_batches_memory_mode(
+                vec![big],
+                bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect_err("a write exceeding the memory limit must error");
         assert!(
@@ -40632,7 +40944,12 @@ mod tests {
             "seed ({seed_bytes} bytes) must fit under the cap ({cap})"
         );
         provider
-            .write_batches_memory_mode(vec![seed], seed_bytes, false)
+            .write_batches_memory_mode(
+                vec![seed],
+                seed_bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("seed write under cap");
 
@@ -40645,7 +40962,12 @@ mod tests {
         // Overwrite that would fit *after* replace must still fail while the old
         // tier is resident (peak = resident + incoming).
         let err = provider
-            .write_batches_memory_mode(vec![replacement], replacement_bytes, true)
+            .write_batches_memory_mode(
+                vec![replacement],
+                replacement_bytes,
+                true,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect_err("overwrite must count resident bytes toward the hard cap");
         assert!(

@@ -40,8 +40,10 @@ use runtime::{datafusion::DataFusion, task_history};
 use runtime_query_engine::query_engine::QueryEngine;
 use std::time::Duration;
 use tracing::Subscriber;
-use tracing_log::LogTracer;
 use tracing_subscriber::{EnvFilter, filter, fmt, layer::Layer, prelude::*, registry::LookupSpan};
+
+#[path = "tracing/dependency_log.rs"]
+mod dependency_log;
 
 #[derive(PartialEq, Debug)]
 pub enum LogVerbosity {
@@ -372,7 +374,7 @@ pub(crate) async fn init_tracing(
     // included, emits instead of `tracing` — into the subscriber above. Nothing
     // else installs a global `log` logger, so without this every one of them is
     // discarded.
-    LogTracer::init()?;
+    dependency_log::init()?;
 
     Ok(())
 }
