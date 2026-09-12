@@ -613,9 +613,7 @@ impl ServerHandler for RuntimeServer {
         let tool_name = request.name.clone();
         let arguments = request.arguments.clone();
         Box::pin(async move {
-            // Security constants
             const MAX_TOOL_NAME_LENGTH: usize = 256;
-            const MAX_ARGS_SIZE: usize = 1024 * 1024; // 1 MB
 
             // Security: Validate tool name to prevent injection attacks
             if tool_name.len() > MAX_TOOL_NAME_LENGTH {
@@ -660,38 +658,18 @@ impl ServerHandler for RuntimeServer {
             if let Some(mcp_proxy) = resolved.tool.as_mcp_proxy().await {
                 tracing::debug!("{tool_name} uses MCP. Will call directly");
 
-                // Security: Validate arguments JSON depth before proxying
-                if let Some(ref args) = arguments {
-                    let depth = get_json_depth(&Value::Object(args.clone()));
-                    if depth > MAX_SAFE_JSON_DEPTH {
-                        return Err(McpError::invalid_params(
-                            format!(
-                                "Arguments JSON too deeply nested (depth: {depth}). Maximum: {MAX_SAFE_JSON_DEPTH}"
-                            ),
-                            None,
-                        ));
-                    }
-                }
+                // `call_tool_once` forwards the whole MRTR request
+                // (`arguments`, `input_responses`, `request_state`).
+                // Checking only `arguments` lets a 2 MiB `requestState`
+                // pass the 1 MiB guard (`checked_arguments_bytes=2
+                // full_request_exceeds_max=True`).
+                forwarded_call_within_limits(&request)?;
 
                 // Record the proxied call in task history so tool calls made
                 // through the `/v1/mcp` gateway are audited identically to
                 // model-driven tool calls (see `McpToolWrapper::call`). Without
                 // this, gateway tool calls bypass the task_history span entirely.
                 let input = serde_json::to_string(&arguments).unwrap_or_default();
-
-                // Security: Validate serialized argument size to prevent DoS,
-                // matching the non-proxy path below. `/v1/mcp` is externally
-                // accessible, so reject oversized payloads before logging them
-                // to task history or forwarding them upstream.
-                if input.len() > MAX_ARGS_SIZE {
-                    return Err(McpError::invalid_params(
-                        format!(
-                            "Arguments too large ({} bytes). Maximum: {MAX_ARGS_SIZE} bytes",
-                            input.len()
-                        ),
-                        None,
-                    ));
-                }
 
                 // Labelled from the canonical identity `get_tool` resolved, never
                 // the requested spelling — see `get_tool`.
@@ -727,10 +705,10 @@ impl ServerHandler for RuntimeServer {
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
             // Security: Validate serialized argument size to prevent DoS
-            if args.len() > MAX_ARGS_SIZE {
+            if args.len() > MAX_TOOL_CALL_PAYLOAD_BYTES {
                 return Err(McpError::invalid_params(
                     format!(
-                        "Arguments too large ({} bytes). Maximum: {MAX_ARGS_SIZE} bytes",
+                        "Arguments too large ({} bytes). Maximum: {MAX_TOOL_CALL_PAYLOAD_BYTES} bytes",
                         args.len()
                     ),
                     None,
@@ -872,6 +850,37 @@ fn mcp_tool_from_spice(name: impl Into<Cow<'static, str>>, tool: &dyn SpiceModel
         tool.description().map(|s| Cow::Owned(s.into_owned()));
     let schema = to_map(tool.parameters().unwrap_or_else(empty_input_schema));
     Tool::new_with_raw(name.into(), description, schema)
+}
+
+/// 1 MiB cap for a `tools/call` payload we will execute or forward.
+const MAX_TOOL_CALL_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Reject a proxied `tools/call` whose serialized MRTR request exceeds
+/// the size or depth guards. `arguments` alone is not the forwarded body.
+fn forwarded_call_within_limits(request: &CallToolRequestParams) -> Result<(), McpError> {
+    let forwarded = serde_json::to_string(request)
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+    if forwarded.len() > MAX_TOOL_CALL_PAYLOAD_BYTES {
+        return Err(McpError::invalid_params(
+            format!(
+                "Request too large ({} bytes). Maximum: {MAX_TOOL_CALL_PAYLOAD_BYTES} bytes",
+                forwarded.len()
+            ),
+            None,
+        ));
+    }
+    let value: Value = serde_json::from_str(&forwarded)
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+    let depth = get_json_depth(&value);
+    if depth > MAX_SAFE_JSON_DEPTH {
+        return Err(McpError::invalid_params(
+            format!(
+                "Request JSON too deeply nested (depth: {depth}). Maximum: {MAX_SAFE_JSON_DEPTH}"
+            ),
+            None,
+        ));
+    }
+    Ok(())
 }
 
 /// Last listed spec for gateway `tools/call`, even when the page is expired.
@@ -3121,6 +3130,191 @@ mod tests {
         assert!(
             json.pointer("/result/content").is_none(),
             "Complete would carry content; input_required must not: {json}"
+        );
+    }
+
+    /// Proxy `tools/call` used to size-check only `arguments`, so a
+    /// 2 MiB `requestState` passed (`checked_arguments_bytes=2
+    /// full_request_exceeds_max=True`) and was forwarded upstream.
+    #[test]
+    fn forwarded_call_rejects_oversized_request_state() {
+        let arguments = rmcp::model::object(json!({}));
+        let request = CallToolRequestParams::new("ask")
+            .with_arguments(arguments.clone())
+            .with_request_state("x".repeat(2 * 1024 * 1024));
+        let checked_arguments_bytes = serde_json::to_string(&arguments)
+            .expect("arguments serialize")
+            .len();
+        let full_forwarded_request_bytes = serde_json::to_string(&request)
+            .expect("request serialize")
+            .len();
+        eprintln!(
+            "checked_arguments_bytes={checked_arguments_bytes} full_forwarded_request_bytes={full_forwarded_request_bytes} current_max_args_check_passes={} full_request_exceeds_max={}",
+            checked_arguments_bytes <= MAX_TOOL_CALL_PAYLOAD_BYTES,
+            full_forwarded_request_bytes > MAX_TOOL_CALL_PAYLOAD_BYTES
+        );
+        assert!(
+            checked_arguments_bytes <= MAX_TOOL_CALL_PAYLOAD_BYTES,
+            "arguments-only check must still pass: {checked_arguments_bytes}"
+        );
+        assert!(
+            full_forwarded_request_bytes > MAX_TOOL_CALL_PAYLOAD_BYTES,
+            "full MRTR request must exceed the 1 MiB guard: {full_forwarded_request_bytes}"
+        );
+        let err = forwarded_call_within_limits(&request)
+            .expect_err("oversized requestState must be rejected");
+        assert!(
+            err.message.contains("Request too large"),
+            "guard must name the full request, got {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn forwarded_call_rejects_deeply_nested_input_responses() {
+        let mut nested = json!("leaf");
+        for _ in 0..=MAX_SAFE_JSON_DEPTH {
+            nested = json!({ "n": nested });
+        }
+        let mut responses = std::collections::BTreeMap::new();
+        responses.insert("round".to_string(), nested);
+        let request =
+            CallToolRequestParams::new("ask").with_input_responses(responses);
+        let err = forwarded_call_within_limits(&request)
+            .expect_err("deep input_responses must be rejected");
+        assert!(
+            err.message.contains("too deeply nested"),
+            "guard must name depth, got {}",
+            err.message
+        );
+    }
+
+    struct RecordingProxyTool {
+        forwarded: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl SpiceModelTool for RecordingProxyTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed("ask")
+        }
+        fn description(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed("records whether the proxy was reached"))
+        }
+        fn parameters(&self) -> Option<Value> {
+            Some(json!({ "type": "object", "properties": {} }))
+        }
+        async fn as_mcp_proxy(&self) -> Option<&dyn McpProxy> {
+            Some(self)
+        }
+        async fn call(
+            &self,
+            _arg: &str,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(json!({ "ok": true }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl McpProxy for RecordingProxyTool {
+        async fn call_tool(
+            &self,
+            _arguments: Option<rmcp::model::JsonObject>,
+        ) -> Result<CallToolResult, ServiceError> {
+            Ok(CallToolResult::success(vec![ContentBlock::text("ok")]))
+        }
+
+        async fn call_tool_once(
+            &self,
+            _request: CallToolRequestParams,
+        ) -> Result<CallToolResponse, ServiceError> {
+            self.forwarded
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(CallToolResult::success(vec![ContentBlock::text("ok")]).into())
+        }
+    }
+
+    #[tokio::test]
+    async fn proxied_call_rejects_oversized_request_state_before_forward() {
+        let tool = Arc::new(RecordingProxyTool {
+            forwarded: std::sync::atomic::AtomicU64::new(0),
+        });
+        let mut tools = HashMap::new();
+        tools.insert(
+            "ask".to_string(),
+            Tooling::Tool(Arc::clone(&tool) as Arc<dyn SpiceModelTool>),
+        );
+        let server = RuntimeServer::new(Arc::new(RwLock::new(tools)));
+        let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            move || Ok(server.clone()),
+            Arc::new(
+                rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+            ),
+            rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(true)
+                .disable_allowed_hosts()
+                .with_json_response(true),
+        );
+
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "ask",
+                "arguments": {},
+                "requestState": "x".repeat(2 * 1024 * 1024),
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientInfo": {
+                        "name": "runtime-tools-test",
+                        "version": "0.0.0"
+                    },
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "ask")
+            .body(http_body_util::Full::new(bytes::Bytes::from(body.to_string())))
+            .expect("valid oversized tools/call request");
+        let response = service.handle(request).await;
+        let status = response.status();
+        let collected = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("response body");
+        let bytes = collected.to_bytes();
+        let json_str = std::str::from_utf8(&bytes).unwrap_or("<non-utf8>");
+        let json_payload = json_str
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap_or(json_str);
+        let json: Value = serde_json::from_str(json_payload)
+            .unwrap_or_else(|e| panic!("JSON-RPC body ({status}): {e}: {json_str:?}"));
+        assert_eq!(
+            json.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32602),
+            "oversized requestState must be invalid_params, got {status} {json}"
+        );
+        let message = json
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            message.contains("Request too large"),
+            "error must name the full request: {message}"
+        );
+        assert_eq!(
+            tool.forwarded.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "oversized requestState must not reach call_tool_once"
         );
     }
 
