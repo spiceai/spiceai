@@ -26,6 +26,10 @@ name: mysql-cayenne[file]-adaptive
 #
 # sql_results / task_history stay off to match the baseline and the -cdc-tuned configs, so a
 # comparison isolates the effect of adaptive tuning, not caching/history overhead.
+#
+# order_line carries predicate-aware maintained aggregates for CH-benCH q1 and q6.
+# Past the retained-entry cap the registry detaches and those queries fall back to a
+# base-table scan (expected at SF1000).
 
 # All `refresh_mode: changes` datasets coalesce onto ONE shared binlog dump
 # (server_id derived from the connection identity - the engine default). The
@@ -124,7 +128,31 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
-    acceleration: *cayenne_accel
+    acceleration:
+      <<: *cayenne_accel
+      # Predicate-aware maintained aggregates for CH-benCH q1 and q6 over
+      # order_line. Same views as the postgres adaptive pod: q1 grouped by
+      # ol_number over delivered lines; q6 a global SUM over a delivery-date
+      # window. Past the retained-entry cap the registry detaches and queries
+      # fall back to a base-table scan (expected at SF1000).
+      maintained_aggregates:
+        - group_by: [ol_number]
+          filter_sql: "ol_delivery_d > '2007-01-02 00:00:00.000000'"
+          aggregates:
+            - function: sum
+              column: ol_quantity
+            - function: sum
+              column: ol_amount
+            - function: avg
+              column: ol_quantity
+            - function: avg
+              column: ol_amount
+            - function: count
+        - group_by: []
+          filter_sql: "ol_delivery_d >= '1997-01-01 00:00:00' AND ol_delivery_d < '2030-01-01 00:00:00' AND ol_quantity BETWEEN 1 AND 100000"
+          aggregates:
+            - function: sum
+              column: ol_amount
 
   - from: mysql:stock
     name: stock
