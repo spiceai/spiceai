@@ -449,7 +449,7 @@ mod tests {
             .delete_expr
         });
 
-        let retention = Retention::builder()
+        let retention = Retention::builder("test")
             .time_column(time_column.map(String::from))
             .time_format(Some(runtime_component::dataset::TimeFormat::UnixSeconds))
             .time_period(retention_period)

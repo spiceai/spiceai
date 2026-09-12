@@ -62,12 +62,15 @@ pub(crate) enum CachingRetention {
         period: Duration,
         check_interval: Duration,
     },
-    /// The caching parameters cannot supply a policy, and the dataset's own is
-    /// already running. Leave that one alone.
+    /// The caching parameters cannot supply a derived expiry policy, and the
+    /// dataset's own policy is already running. Leave that one alone.
     LeaveDeclared,
     /// The caching parameters cannot supply a policy and no other one runs, so
     /// nothing bounds the accelerator. The caller warns.
     Unbounded,
+    /// A cache item or size budget is configured. Its entry-aware eviction
+    /// policy is installed by the accelerated-table builder.
+    BoundedByCacheLimit,
 }
 
 /// Clamp a retention period into a check interval that will actually run.
@@ -86,9 +89,9 @@ fn check_interval_for(period: Duration) -> Duration {
 /// Enabling `caching_stale_if_error` changes what an expired entry *is*: it is
 /// the copy served when the source fails, with no upper bound on its age.
 /// Evicting at the sum above would delete exactly the data the setting exists to
-/// serve, and no other duration in the caching parameters bounds one — so the
-/// caching parameters supply no policy at all, and the only thing that can bound
-/// the accelerator is a retention policy the dataset declares itself.
+/// serve, and no duration in the caching parameters can derive an expiry policy.
+/// A retention policy the dataset declares itself or a cache item/size budget
+/// can still bound the accelerator.
 ///
 /// `declared_retention_runs` is whether one does — whether the dataset's
 /// retention policy *built*, not whether it was configured. The two differ, and
@@ -97,11 +100,17 @@ fn check_interval_for(period: Duration) -> Duration {
 /// all, with no task started and no error raised, so reading intent off the
 /// config would suppress this warning for an accelerator that is just as
 /// unbounded as one configured with no policy at all.
+///
+/// `cache_limit_configured` is whether `caching_max_items` or
+/// `caching_max_size` is configured. Their entry-aware eviction is installed
+/// outside this retention-policy selection, so a budget bounds the accelerator
+/// even though nothing here derives a period for it.
 pub(crate) fn caching_retention(
     stale_if_error: bool,
     caching_ttl: Option<Duration>,
     caching_stale_while_revalidate_ttl: Option<Duration>,
     declared_retention_runs: bool,
+    cache_limit_configured: bool,
 ) -> CachingRetention {
     if !stale_if_error {
         let period = caching_ttl.unwrap_or(DEFAULT_CACHING_TTL)
@@ -115,6 +124,8 @@ pub(crate) fn caching_retention(
 
     if declared_retention_runs {
         CachingRetention::LeaveDeclared
+    } else if cache_limit_configured {
+        CachingRetention::BoundedByCacheLimit
     } else {
         CachingRetention::Unbounded
     }
@@ -163,7 +174,7 @@ mod tests {
 
     #[test]
     fn a_disabled_stale_if_error_evicts_at_ttl_plus_stale_while_revalidate() {
-        let retention = caching_retention(false, Some(Duration::from_secs(5)), None, false);
+        let retention = caching_retention(false, Some(Duration::from_secs(5)), None, false, false);
 
         assert_eq!(
             retention,
@@ -177,7 +188,7 @@ mod tests {
     #[test]
     fn an_unset_caching_ttl_falls_back_to_its_own_default() {
         let CachingRetention::Derive { period, .. } =
-            caching_retention(false, None, Some(Duration::from_secs(10)), false)
+            caching_retention(false, None, Some(Duration::from_secs(10)), false, false)
         else {
             panic!("a dataset with `caching_stale_if_error` disabled always derives a policy");
         };
@@ -190,8 +201,8 @@ mod tests {
     #[test]
     fn a_declared_retention_does_not_change_what_a_disabled_stale_if_error_derives() {
         assert_eq!(
-            caching_retention(false, Some(Duration::from_secs(5)), None, true),
-            caching_retention(false, Some(Duration::from_secs(5)), None, false),
+            caching_retention(false, Some(Duration::from_secs(5)), None, true, false),
+            caching_retention(false, Some(Duration::from_secs(5)), None, false, false),
         );
     }
 
@@ -199,7 +210,7 @@ mod tests {
     /// dataset with no retention policy at all, and said nothing about it.
     #[test]
     fn an_enabled_stale_if_error_with_no_declared_retention_is_unbounded() {
-        let retention = caching_retention(true, Some(Duration::from_secs(5)), None, false);
+        let retention = caching_retention(true, Some(Duration::from_secs(5)), None, false, false);
 
         assert_eq!(retention, CachingRetention::Unbounded);
     }
@@ -209,9 +220,17 @@ mod tests {
     /// with a policy keyed on a different column.
     #[test]
     fn an_enabled_stale_if_error_leaves_a_running_declared_retention_alone() {
-        let retention = caching_retention(true, Some(Duration::from_secs(5)), None, true);
+        let retention = caching_retention(true, Some(Duration::from_secs(5)), None, true, false);
 
         assert_eq!(retention, CachingRetention::LeaveDeclared);
+    }
+
+    #[test]
+    fn a_cache_limit_bounds_stale_on_error_without_a_declared_retention_policy() {
+        assert_eq!(
+            caching_retention(true, Some(Duration::from_secs(5)), None, false, true),
+            CachingRetention::BoundedByCacheLimit
+        );
     }
 
     /// A retention policy that was configured but did not build — no
@@ -220,7 +239,7 @@ mod tests {
     /// This is the caller's contract: it passes whether the policy *runs*.
     #[test]
     fn a_declared_retention_that_did_not_build_is_still_unbounded() {
-        let retention = caching_retention(true, Some(Duration::from_secs(5)), None, false);
+        let retention = caching_retention(true, Some(Duration::from_secs(5)), None, false, false);
 
         assert_eq!(retention, CachingRetention::Unbounded);
     }
@@ -237,7 +256,13 @@ mod tests {
         let CachingRetention::Derive {
             period,
             check_interval,
-        } = caching_retention(false, Some(Duration::from_secs(1)), Some(year), false)
+        } = caching_retention(
+            false,
+            Some(Duration::from_secs(1)),
+            Some(year),
+            false,
+            false,
+        )
         else {
             panic!("a dataset with `caching_stale_if_error` disabled always derives a policy");
         };

@@ -38,7 +38,7 @@ use cayenne::optimizer_rules::{
 };
 #[cfg(not(windows))]
 use cayenne::{
-    CayenneTableProvider,
+    CayenneCteMaterialization, CayenneCteMaterializationPlanner, CayenneTableProvider,
     logical_optimizer::{
         CayenneInListToRangeRewrite, CayennePropagateFilterAcrossEquiJoinKeys,
         CayennePushDownSemiJoin, CayenneReassociateCrossJoin,
@@ -103,7 +103,7 @@ use runtime_datafusion::{
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
-use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
+use spicepod::component::runtime::{CteMaterialization, SpillCompression as SpiceSpillCompression};
 use spicepod::metric::Metrics;
 use tokio::{
     runtime::Handle,
@@ -338,6 +338,7 @@ pub struct DataFusionBuilder {
     eager_aggregation: Option<bool>,
     eager_aggregation_min_reduction_factor: Option<usize>,
     eager_aggregation_max_pushed_groups: Option<usize>,
+    cte_materialization: CteMaterialization,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     query_admission_semaphore: Option<Arc<Semaphore>>,
@@ -427,6 +428,7 @@ impl DataFusionBuilder {
             eager_aggregation: None,
             eager_aggregation_min_reduction_factor: None,
             eager_aggregation_max_pushed_groups: None,
+            cte_materialization: CteMaterialization::Disabled,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             query_admission_semaphore: None,
@@ -505,6 +507,16 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn eager_aggregation_max_pushed_groups(mut self, cap: Option<usize>) -> Self {
         self.eager_aggregation_max_pushed_groups = cap;
+        self
+    }
+
+    /// Materialize multi-reference CTEs on the Cayenne query path.
+    ///
+    /// `CteMaterialization::Disabled` (the default) keeps `DataFusion`'s inlining
+    /// behavior. `Auto` registers the Cayenne CTE materialization optimizer.
+    #[must_use]
+    pub fn cte_materialization(mut self, cte_materialization: CteMaterialization) -> Self {
+        self.cte_materialization = cte_materialization;
         self
     }
 
@@ -994,7 +1006,15 @@ impl DataFusionBuilder {
             .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}));
 
-        state = with_spice_logical_optimizers(state, self.cayenne_optimizer_rules);
+        if self.cte_materialization.is_auto() {
+            tracing::info!("Applied runtime.query.cte_materialization=auto");
+        }
+
+        state = with_spice_logical_optimizers(
+            state,
+            self.cayenne_optimizer_rules,
+            self.cte_materialization,
+        );
 
         #[cfg(not(windows))]
         {
@@ -1077,9 +1097,9 @@ impl DataFusionBuilder {
             panic!("Unable to register JSON functions: {e}");
         }
 
-        // Register Spark-compatible functions, but skip Spark's `trunc` (scalar) and
-        // `avg` (aggregate): `register_all` would register them *over* the built-ins
-        // of the same name. Spark `trunc` is date-truncation and shadows numeric
+        // Register Spark-compatible functions, but skip Spark's `trunc` and
+        // `date_trunc` (scalar) and `avg` (aggregate): `register_all` would register
+        // them *over* the built-ins of the same name. Spark `trunc` is date-truncation and shadows numeric
         // `trunc(<float>, <int>)` (see spiceai/spiceai#11415). Spark `avg` uses a different
         // partial-aggregate state layout (`[sum, count:Int64]`) than the built-in
         // (`[count:UInt64, sum]`); harmless single-node, but it corrupts DISTRIBUTED
@@ -1089,7 +1109,12 @@ impl DataFusionBuilder {
         // array"). Keep the built-ins; register every other Spark function (mirrors
         // `datafusion_spark::register_all`).
         for udf in datafusion_spark::all_default_scalar_functions() {
-            if udf.name() == "trunc" {
+            // Spark `date_trunc` accepts only a string as the value to truncate,
+            // where the built-in also accepts a date. Registering it over the
+            // built-in makes `date_trunc(<unit>, <date>)` unplannable, and a
+            // federated filter comparing a timestamp against one loses the type
+            // its comparison needs and is pushed down as a pair BigQuery refuses.
+            if matches!(udf.name(), "trunc" | "date_trunc") {
                 continue;
             }
             let name = udf.name().to_string();
@@ -1263,7 +1288,7 @@ impl DataFusionBuilder {
             datafusion_ref,
             caching,
             schema_evolve_locks: TokioRwLock::new(HashMap::new()),
-            pending_sink_tables: TokioRwLock::new(Vec::new()),
+            pending_sink_tables: TokioRwLock::new(HashMap::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
             deferred_catalogs: TokioRwLock::new(HashMap::new()),
             pending_initializations: TokioRwLock::new(HashMap::new()),
@@ -1307,6 +1332,7 @@ impl DataFusionBuilder {
 fn with_spice_logical_optimizers(
     mut state: SessionStateBuilder,
     cayenne_optimizer_rules: CayenneOptimizerRules,
+    cte_materialization: CteMaterialization,
 ) -> SessionStateBuilder {
     let trailing_rules = state.optimizer_rules().take().unwrap_or_default();
     let mut optimizer_rules = state
@@ -1317,6 +1343,9 @@ fn with_spice_logical_optimizers(
     insert_regexp_match_null_check_rewrite(&mut optimizer_rules);
     #[cfg(not(windows))]
     {
+        if cte_materialization.is_auto() {
+            insert_cayenne_cte_materialization(&mut optimizer_rules);
+        }
         if cayenne_optimizer_rules.filter_propagation() {
             insert_cayenne_filter_propagation_rule(&mut optimizer_rules);
         }
@@ -1334,9 +1363,31 @@ fn with_spice_logical_optimizers(
         }
     }
     #[cfg(windows)]
-    let _ = cayenne_optimizer_rules;
+    {
+        let _ = cayenne_optimizer_rules;
+        let _ = cte_materialization;
+    }
     optimizer_rules.extend(trailing_rules);
     state.with_optimizer_rules(optimizer_rules)
+}
+
+#[cfg(not(windows))]
+fn insert_cayenne_cte_materialization(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
+    // Run first so the two inlined CTE copies are still identical, before
+    // projection/filter pushdown specializes each reference.
+    if !rules
+        .iter()
+        .any(|rule| rule.name() == "cayenne_cte_materialization")
+    {
+        rules.insert(
+            0,
+            Arc::new(
+                CayenneCteMaterialization::new_with_table_provider_predicate(
+                    is_cayenne_accelerated_table_provider,
+                ),
+            ),
+        );
+    }
 }
 
 fn insert_regexp_match_null_check_rewrite(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
@@ -1867,12 +1918,12 @@ fn runtime_env_with_effective_memory_limit_and_object_store_registry(
     #[expect(clippy::cast_possible_truncation)]
     let effective_memory_bytes = effective_memory_limit as usize;
 
-    let memory_pool = Arc::new(TrackConsumersPool::new(
-        // The runtime supports only 64-bit platforms, so casting u64 to usize
-        // will not truncate on supported targets.
-        GreedyMemoryPool::new(effective_memory_bytes),
-        topn,
-    ));
+    // Greedy first-come, but spillable operators (`ExternalSorter`) cannot
+    // take the last 1/16 of the pool. A coalesced TPC-DS Q97 sort-merge held
+    // 103.6 GiB of 107.50 GiB and the cayenne store_sales scan could not get
+    // 1 MiB (regression for #13918).
+    let memory_pool =
+        super::query_memory_pool::tracked_query_memory_pool(effective_memory_bytes, topn);
 
     let mut runtime_env_builder = RuntimeEnvBuilder::default()
         .with_object_store_registry(object_store_registry)
@@ -1967,6 +2018,8 @@ pub(crate) fn default_extension_planners(
         Arc::new(datafusion_dml::DmlExtensionPlanner),
         #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
+        #[cfg(not(windows))]
+        Arc::new(CayenneCteMaterializationPlanner),
     ];
     planners
 }
@@ -1987,6 +2040,8 @@ mod tests {
     use datafusion::common::stats::Precision;
     #[cfg(not(windows))]
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    #[cfg(not(windows))]
+    use datafusion::execution::SessionStateBuilder;
     use datafusion::execution::object_store::ObjectStoreRegistry;
     #[cfg(not(windows))]
     use datafusion::logical_expr::Operator;
@@ -1996,6 +2051,8 @@ mod tests {
     #[cfg(not(windows))]
     use datafusion_expr::{Expr, LogicalPlan};
 
+    #[cfg(not(windows))]
+    use super::CteMaterialization;
     use super::{
         CAYENNE_QUERY_MEMORY_FLOOR_PERCENT, CAYENNE_QUERY_MEMORY_PERCENT, CayenneOptimizerRules,
         DEFAULT_QUERY_MEMORY_PERCENT, DataFusionBuilder, MEM_TIER_CEILING_FRACTION,
@@ -2013,6 +2070,138 @@ mod tests {
     #[cfg(not(windows))]
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// The JSON extraction semantics the `BigQuery` federation guidance rests on.
+    ///
+    /// Which of these forms pushes down to `BigQuery` is decided by the federation
+    /// deny-list, and the advice we give a customer follows from what each one
+    /// *means*:
+    ///
+    /// | node at `$.a`   | `json_as_text` | `json_get_str` | federates |
+    /// |-----------------|----------------|----------------|-----------|
+    /// | `"s"`           | `s`            | `s`            | typed only |
+    /// | `7`             | `7`            | NULL           | typed only |
+    /// | `true`          | `true`         | NULL           | typed only |
+    /// | `{"b":1}`       | `{"b":1}`      | NULL           | neither    |
+    /// | `null`          | NULL           | NULL           | typed only |
+    ///
+    /// `json_get_str` answers only for a JSON **string** node; `json_as_text`
+    /// returns the matched node's own bytes whatever it is. They therefore agree
+    /// on a string and a JSON `null` and disagree everywhere else — which is
+    /// exactly the condition on the advice "replace `json_as_text` with
+    /// `json_get_str` to gain pushdown": it is exact only where that path always
+    /// holds a string. If either function's null handling changed, that advice
+    /// would silently start returning NULL where it used to return digits, so it
+    /// is pinned here rather than left to the crate.
+    ///
+    /// `json_as_text` cannot be federated to `BigQuery` at all: no `BigQuery`
+    /// function returns a container node's *original* bytes — `JSON_QUERY`
+    /// re-renders it — so there is no faithful rendering to push down.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn json_extraction_keeps_the_semantics_the_pushdown_guidance_assumes() {
+        let mut state = SessionStateBuilder::new().with_default_features().build();
+        datafusion_functions_json::register_all(&mut state).expect("register the JSON functions");
+        let ctx = SessionContext::new_with_state(state);
+
+        let one = |sql: String| {
+            let ctx = ctx.clone();
+            async move {
+                let batches = ctx
+                    .sql(&sql)
+                    .await
+                    .expect("plan the statement")
+                    .collect()
+                    .await
+                    .expect("run the statement");
+                let column = batches[0].column(0);
+                if column.is_null(0) {
+                    None
+                } else {
+                    Some(
+                        datafusion::common::ScalarValue::try_from_array(column, 0)
+                            .expect("read the value")
+                            .to_string(),
+                    )
+                }
+            }
+        };
+
+        for (doc, as_text, get_str) in [
+            (r#"{"a": "s"}"#, Some("s"), Some("s")),
+            (r#"{"a": 7}"#, Some("7"), None),
+            (r#"{"a": true}"#, Some("true"), None),
+            (r#"{"a": {"b": 1}}"#, Some(r#"{"b": 1}"#), None),
+            (r#"{"a": null}"#, None, None),
+        ] {
+            assert_eq!(
+                one(format!("SELECT json_as_text('{doc}', 'a')"))
+                    .await
+                    .as_deref(),
+                as_text,
+                "json_as_text returns the node's own bytes: {doc}"
+            );
+            assert_eq!(
+                one(format!("SELECT json_get_str('{doc}', 'a')"))
+                    .await
+                    .as_deref(),
+                get_str,
+                "json_get_str answers only for a JSON string node: {doc}"
+            );
+        }
+    }
+
+    /// `json_get(x, k)::string` federates, because `register_all` also installs
+    /// the rewrite that turns a cast of `json_get` into the typed accessor.
+    ///
+    /// That is why the guidance can offer the cast form as an alternative to
+    /// editing every call: `CAST(… AS VARCHAR)` becomes `json_get_str`,
+    /// `AS BIGINT` becomes `json_get_int`, `AS DOUBLE` becomes `json_get_float`
+    /// — and those are the names the `BigQuery` deny-list carves out, so the
+    /// statement pushes down. A bare `json_get` stays a JSON union with no SQL
+    /// type to unparse into, and stays local.
+    ///
+    /// Losing the rewrite would not fail a query; it would quietly stop the cast
+    /// form from federating, which is the whole point of recommending it.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_cast_of_json_get_becomes_the_typed_accessor_that_federates() {
+        let mut state = SessionStateBuilder::new().with_default_features().build();
+        datafusion_functions_json::register_all(&mut state).expect("register the JSON functions");
+        let ctx = SessionContext::new_with_state(state);
+
+        // Over a *column*, not a literal: constant folding would evaluate a
+        // literal document at plan time and erase the call before the plan could
+        // be inspected, which says nothing about what federates.
+        let docs = Arc::new(Schema::new(vec![Field::new("doc", DataType::Utf8, true)]));
+        let table =
+            MemTable::try_new(Arc::clone(&docs), vec![vec![]]).expect("build the document table");
+        ctx.register_table("docs", Arc::new(table) as Arc<dyn TableProvider>)
+            .expect("register the document table");
+
+        for (cast_to, expected) in [
+            ("VARCHAR", "json_get_str"),
+            ("BIGINT", "json_get_int"),
+            ("DOUBLE", "json_get_float"),
+            ("BOOLEAN", "json_get_bool"),
+        ] {
+            let plan = ctx
+                .sql(&format!(
+                    "SELECT CAST(json_get(doc, 'a') AS {cast_to}) FROM docs"
+                ))
+                .await
+                .expect("plan the cast")
+                .into_optimized_plan()
+                .expect("optimize the plan")
+                .display_indent()
+                .to_string();
+            assert!(
+                plan.contains(expected),
+                "a cast to {cast_to} has to become {expected}, which the BigQuery \
+                 deny-list carves out: {plan}"
+            );
+        }
+    }
 
     /// An explicit `runtime.query.memory_limit` is honored verbatim regardless of
     /// whether Cayenne is active — the coordinated default only applies when unset.
@@ -2375,6 +2564,106 @@ mod tests {
         );
     }
 
+    /// The built session keeps the **built-in** `date_trunc`, not Spark's.
+    ///
+    /// Spark's `date_trunc` accepts only a string as the value to truncate. If
+    /// `datafusion_spark::register_all` were allowed to register it over the
+    /// built-in, `date_trunc(<unit>, <date>)` would stop planning at all, and a
+    /// federated filter comparing a timestamp against one would lose the type
+    /// its comparison needs and reach `BigQuery` as a pair it refuses.
+    ///
+    /// This goes through `DataFusionBuilder::build` rather than a hand-built
+    /// `SessionState`, because the thing that can regress is the registration
+    /// loop's skip: a test that registers its own functions would still pass
+    /// with the skip deleted.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_keeps_the_built_in_date_trunc() {
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+
+        // A date argument is what Spark's overload cannot take, so this is the
+        // call that stops planning if the built-in is shadowed.
+        let over_a_date = df
+            .ctx
+            .sql("SELECT date_trunc('month', DATE '2024-03-17') AS m")
+            .await
+            .and_then(datafusion::dataframe::DataFrame::into_optimized_plan);
+        assert!(
+            over_a_date.is_ok(),
+            "date_trunc over a date must stay plannable, or a federated \
+             comparison against it is pushed down untyped: {:?}",
+            over_a_date.err()
+        );
+
+        // The truncation a BigQuery filter compares against is over a
+        // timestamp, and both overloads accept one — so this asserts the answer,
+        // which is what a silently swapped implementation would change.
+        let over_a_timestamp = df
+            .ctx
+            .sql("SELECT date_trunc('month', TIMESTAMP '2024-03-17T12:34:56') AS m")
+            .await
+            .expect("plan the timestamp truncation")
+            .collect()
+            .await
+            .expect("run the timestamp truncation");
+        let rendered = arrow::util::pretty::pretty_format_batches(&over_a_timestamp)
+            .expect("format the truncation")
+            .to_string();
+        assert!(
+            rendered.contains("2024-03-01T00:00:00"),
+            "date_trunc must truncate to the month, got {rendered}"
+        );
+
+        // Spark's *other* functions must still be there — the skip is meant to
+        // be two names, not a disabled registration.
+        assert!(
+            df.ctx
+                .state()
+                .scalar_functions()
+                .contains_key("array_append"),
+            "only `trunc` and `date_trunc` are skipped; the rest of the Spark \
+             functions must still register"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_concatenates_an_untyped_null() {
+        use arrow::array::{ArrayRef, RecordBatch, StringArray};
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+        let names: ArrayRef = Arc::new(StringArray::from(vec![Some("alpha"), None, Some("beta")]));
+        df.ctx
+            .register_batch(
+                "names",
+                RecordBatch::try_from_iter([("name", names)]).expect("name batch"),
+            )
+            .expect("register names");
+
+        let batches = df
+            .ctx
+            .sql("SELECT concat(name, NULL) AS combined FROM names")
+            .await
+            .expect("plan concat with an untyped NULL")
+            .collect()
+            .await
+            .expect("execute concat with an untyped NULL");
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+        for batch in batches {
+            assert_eq!(batch.column(0).null_count(), batch.num_rows());
+        }
+    }
+
     #[test]
     #[cfg(not(windows))]
     fn test_built_datafusion_registers_cayenne_optimizer_config() {
@@ -2636,6 +2925,47 @@ mod tests {
                 "CayenneAntiJoinSortMergeRewriter",
             ],
             "Default Cayenne physical optimizer selection should preserve prior safe defaults (now including the metadata-only stats aggregate fold) without re-enabling the exact join filter"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_registers_cte_materialization_when_auto() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df_disabled = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle.clone(),
+        )
+        .build();
+        assert!(
+            !df_disabled
+                .ctx
+                .state()
+                .optimizers()
+                .iter()
+                .any(|rule| rule.name() == "cayenne_cte_materialization"),
+            "default cte_materialization=disabled must not register the Cayenne CTE rewrite"
+        );
+
+        let df_auto = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .cte_materialization(CteMaterialization::Auto)
+        .build();
+        let state = df_auto.ctx.state();
+        let names: Vec<&str> = state.optimizers().iter().map(|rule| rule.name()).collect();
+        assert_eq!(
+            names.first().copied(),
+            Some("cayenne_cte_materialization"),
+            "cte_materialization=auto must insert the Cayenne CTE rewrite first so both inlined copies are still identical: {names:?}"
         );
     }
 

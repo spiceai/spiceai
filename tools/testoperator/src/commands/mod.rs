@@ -73,11 +73,12 @@ pub(crate) fn create_telemetry_with_resource(common: &CommonArgs, resource: Reso
 
 /// Build a test configuration with validation data if applicable
 ///
-/// This is a common helper for bench, throughput, and load tests that:
+/// This is a common helper for bench, throughput, load, and query tests that:
 /// 1. Loads the query set from args
 /// 2. Applies query overrides if specified
 /// 3. Adds validation data for scenario queries when validation is enabled
 /// 4. Adds reference schema for validation against known good tables
+/// 5. Fails closed when `--validate` is set but no result oracle can be resolved
 ///
 /// # Returns
 /// Tuple of (`QuerySet`, `NotStarted` builder)
@@ -101,20 +102,62 @@ pub(crate) async fn build_test_with_validation(
         .with_query_set_type(query_set.clone())
         .with_query_overrides(query_overrides);
 
+    let mut has_scenario_validation_data = false;
     // Add validation data if this is a scenario query set with validation enabled
     if args.validate
         && let Some(validation_data) =
             query_set.get_validation_data(args.scenario_query_file.as_deref())?
     {
+        has_scenario_validation_data = !validation_data.is_empty();
         test_builder = test_builder.with_validation_data(validation_data);
     }
 
     // Add reference schema for validation against known good tables
-    if let Some(ref_schema) = reference_schema {
+    if let Some(ref_schema) = reference_schema.clone() {
+        println!("Validating query results against {ref_schema}.* tables");
         test_builder = test_builder.with_reference_schema(Some(ref_schema));
     }
 
+    ensure_validation_oracle(
+        args,
+        &query_set,
+        reference_schema.as_deref(),
+        has_scenario_validation_data,
+    )?;
+
     Ok((query_set, test_builder))
+}
+
+fn has_static_answer_oracle(query_set: &QuerySet, scale_factor: f64) -> bool {
+    matches!(query_set, QuerySet::Tpch | QuerySet::ParameterizedTpch)
+        && (scale_factor - 1.0).abs() < f64::EPSILON
+}
+
+/// `--validate` without an oracle would otherwise fall through to TPC-H gold
+/// files and fail every TPC-DS (or TPC-H SF≠1) query with `NoExpectedAnswer`.
+/// Fail at start with the action that actually produces a comparison.
+fn ensure_validation_oracle(
+    args: &DatasetTestArgs,
+    query_set: &QuerySet,
+    reference_schema: Option<&str>,
+    has_scenario_validation_data: bool,
+) -> anyhow::Result<()> {
+    if !args.validate {
+        return Ok(());
+    }
+    if has_scenario_validation_data
+        || has_static_answer_oracle(query_set, args.scale_factor.unwrap_or(1.0))
+        || reference_schema.is_some()
+    {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "--validate is set for query set '{query_set}' but no result oracle is available, so query results cannot be checked. \
+TPC-H has static answers at scale factor 1 only; TPC-DS has none. \
+Compare against unaccelerated clones under a reference schema: start spiced via testoperator (`-s <spiced-binary>`) so it can inject `{AUTOMATIC_REFERENCE_SCHEMA}.*` datasets, \
+or add those clones to the spicepod (`scripts/add_test_reference_datasets.py`) and pass `--reference-schema {AUTOMATIC_REFERENCE_SCHEMA}`."
+    )
 }
 
 fn supports_automatic_reference_validation(query_set: &QuerySet) -> bool {
@@ -675,13 +718,17 @@ mod tests {
     use super::*;
 
     fn validation_args(query_set: &str) -> DatasetTestArgs {
+        validation_args_at_scale(query_set, "100")
+    }
+
+    fn validation_args_at_scale(query_set: &str, scale_factor: &str) -> DatasetTestArgs {
         DatasetTestArgs::parse_from([
             "testoperator",
             "--query-set",
             query_set,
             "--validate",
             "--scale-factor",
-            "100",
+            scale_factor,
         ])
     }
 
@@ -730,6 +777,80 @@ mod tests {
                 .iter()
                 .all(|dataset| dataset.name != "__test_reference.existing.lineitem")
         );
+    }
+
+    #[tokio::test]
+    async fn tpcds_validate_without_reference_is_an_error() {
+        let (args, query_set, _) = validation_context("tpcds").await;
+        let err = ensure_validation_oracle(&args, &query_set, None, false)
+            .expect_err("tpcds --validate with no reference must fail closed");
+        let message = err.to_string();
+        assert!(
+            message.contains("no result oracle"),
+            "error must name the missing oracle: {message}"
+        );
+        assert!(
+            message.contains("__test_reference"),
+            "error must name the reference schema to inject: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tpcds_validate_with_reference_schema_is_ok() {
+        let (args, query_set, _) = validation_context("tpcds").await;
+        ensure_validation_oracle(&args, &query_set, Some("__test_reference"), false)
+            .expect("a resolved reference schema is a TPC-DS oracle");
+    }
+
+    #[tokio::test]
+    async fn tpch_sf1_validate_without_reference_is_ok() {
+        let args = validation_args_at_scale("tpch", "1");
+        let query_set = args.load_query_set().expect("should load query set");
+        ensure_validation_oracle(&args, &query_set, None, false)
+            .expect("TPC-H SF-1 has static answers");
+    }
+
+    #[tokio::test]
+    async fn tpch_sf100_validate_without_reference_is_an_error() {
+        let (args, query_set, _) = validation_context("tpch").await;
+        let err = ensure_validation_oracle(&args, &query_set, None, false)
+            .expect_err("TPC-H SF-100 has no static answers");
+        assert!(
+            err.to_string().contains("no result oracle"),
+            "error must name the missing oracle: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_tpcds_reference_datasets_can_be_generated() {
+        let (args, query_set, queries) = validation_context("tpcds").await;
+        let table_names = reference_table_names(&queries);
+        assert!(table_names.contains("store_sales"));
+
+        let mut app = App::default();
+        add_unqualified_datasets(&mut app, &table_names);
+
+        assert_eq!(
+            validation_reference_schema(&args, &app, &query_set, &queries, false),
+            None
+        );
+
+        add_automatic_reference_datasets(&args, &mut app)
+            .await
+            .expect("should add TPC-DS reference datasets");
+
+        assert!(
+            app.datasets
+                .iter()
+                .any(|dataset| dataset.name == "__test_reference.store_sales")
+        );
+        assert_eq!(
+            validation_reference_schema(&args, &app, &query_set, &queries, false),
+            Some("__test_reference".to_string())
+        );
+
+        ensure_validation_oracle(&args, &query_set, Some("__test_reference"), false)
+            .expect("generated TPC-DS references are an oracle");
     }
 
     #[tokio::test]

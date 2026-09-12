@@ -30,6 +30,12 @@ mod provider;
 impl AcceleratedTable {
     #[must_use]
     fn create_federated_table_source(&self) -> Option<Arc<dyn FederatedTableSource>> {
+        // A fallback scan must retain local planning, including subquery
+        // decorrelation, even when its accelerator supports SQL federation.
+        if self.zero_results_action == ZeroResultsAction::UseSource || self.disable_federation {
+            return None;
+        }
+
         let accelerated_table_federation_provider = Arc::new(
             spice_table::find_layer::<PolyTableProvider>(
                 self.accelerator.as_ref(),
@@ -44,12 +50,8 @@ impl AcceleratedTable {
             .downcast_ref::<SQLTableSource>()
             .map(SQLTableSource::table_reference)?;
 
-        let enabled =
-            self.zero_results_action != ZeroResultsAction::UseSource && !self.disable_federation;
-
         let fed_provider = Arc::new(AcceleratedTableFederationProvider::new(
-            enabled,
-            Some(accelerated_table_federation_provider),
+            accelerated_table_federation_provider,
             self.refresher(),
         ));
 

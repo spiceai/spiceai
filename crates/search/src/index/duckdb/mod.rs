@@ -32,7 +32,7 @@ use datafusion_table_providers::{
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
 use snafu::ResultExt;
-use spice_table::Index;
+use spice_table::{GroupPruning, Index};
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,
@@ -251,6 +251,13 @@ impl Index for DuckDBVectorIndex {
             .into_iter()
             .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
         try_join_all(futs).await
+    }
+
+    /// Co-located: embeddings are written into the DuckDB-accelerated table row, so an upsert
+    /// that rewrites the row leaves no group remainder to prune, and the no-op
+    /// `delete_group_remainder` is complete.
+    fn group_pruning(&self) -> GroupPruning {
+        GroupPruning::Complete
     }
 
     /// Creates (or verifies existence of) the HNSW index on the current underlying table

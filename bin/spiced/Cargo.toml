@@ -111,6 +111,8 @@ vortex-utils.workspace = true
 
 # Non-default features should be added to `lint-rust` make target.
 [dev-dependencies]
+iceberg.workspace = true
+iceberg-storage-opendal.workspace = true
 # The cloud-connect cache-write seam probes the connect mutation lock directly
 # to prove the guard is still held while the blocking write runs.
 fs4 = { workspace = true }

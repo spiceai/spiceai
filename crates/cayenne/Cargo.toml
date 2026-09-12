@@ -113,6 +113,8 @@ result-correctness-duckdb = ["dep:duckdb"]
 result-correctness-chdb = ["dep:chdb-rust"]
 
 [dev-dependencies]
+datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
+tpchgen = { workspace = true }
 vortex-io = { workspace = true }
 # Kept only for the `row_converter` byte-identity equivalence test; Cayenne's runtime no
 # longer depends on arrow-row's (unstable) row format.
@@ -151,6 +153,10 @@ libc = "0.2"
 #     provider::structural_version --release
 [target.'cfg(cayenne_loom)'.dev-dependencies]
 loom = { workspace = true }
+
+[[bench]]
+harness = false
+name = "in_list_query_e2e"
 
 [[bench]]
 harness = false
@@ -504,6 +510,12 @@ name = "pk_keyset_present_path"
 [[test]]
 name = "result_correctness_inventory_test"
 path = "tests/result_correctness_inventory_test.rs"
+
+# Static comparison-cell census over the inventory. Links no engines; prints the
+# planned-coverage ceiling as markdown. Not a gate — it asserts nothing.
+[[test]]
+name = "result_correctness_census_test"
+path = "tests/result_correctness_census_test.rs"
 
 # Result correctness vs DuckDB on SF1 suites + SQLLancer. Not a Criterion bench.
 [[test]]

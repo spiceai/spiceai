@@ -253,6 +253,16 @@ impl RuntimeContext {
         }
     }
 
+    /// The context [`with_deadlines_for_test`](Self::with_deadlines_for_test) builds, carrying
+    /// an API key — for the tests that check where a credential is and is not sent.
+    #[cfg(test)]
+    pub(crate) fn with_api_key_for_test(self, api_key: &str) -> Self {
+        Self {
+            api_key: Some(api_key.to_string()),
+            ..self
+        }
+    }
+
     /// Create a context whose runtime binary is `<spice_bin_dir>/spiced`.
     ///
     /// This is how a test drives the parts of the CLI that *run* the runtime —
