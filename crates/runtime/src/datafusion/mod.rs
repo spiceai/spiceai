@@ -1794,6 +1794,11 @@ impl DataFusion {
     /// compaction setup would silently un-cap a fleet of simultaneously-refreshing
     /// tables, and leave a `mode: memory` pod's RAM tier unbounded.
     pub fn install_cayenne_global_budgets(&self) {
+        // These process-global limits must be ready for a Cayenne table added
+        // through DDL. Only announce them at startup when the initial Spicepod
+        // actually configures a Cayenne workload.
+        let cayenne_configured = self.cayenne_workload.is_configured();
+
         // Cap the aggregate number of concurrent Vortex encode shards across ALL
         // Cayenne tables. Per-table `cayenne_write_concurrency` is sized in
         // isolation — its unset default is conservative, but it can be raised per
@@ -1810,10 +1815,12 @@ impl DataFusion {
         // has its own dedicated runtime and memory carve-out.
         let encode_budget = cpu_budget::cpu_budget().cayenne_encode_permits();
         cayenne::set_global_encode_concurrency(encode_budget);
-        tracing::info!(
-            encode_budget,
-            "Cayenne global encode-concurrency budget active (caps aggregate write-encode shards across all tables)"
-        );
+        if cayenne_configured {
+            tracing::info!(
+                encode_budget,
+                "Cayenne global encode-concurrency budget active (caps aggregate write-encode shards across all tables)"
+            );
+        }
 
         // Install the process-global query-admission governor so the per-table
         // adaptive CDC controller can SHED concurrent analytical queries when a
@@ -1828,10 +1835,12 @@ impl DataFusion {
             // full capacity (`max_concurrent_queries`).
             let max = semaphore.available_permits();
             cayenne::set_query_admission_governor(Arc::clone(semaphore), max);
-            tracing::info!(
-                max_concurrent_queries = max,
-                "Cayenne adaptive query-admission throttle active (controller sheds concurrent queries when CDC is behind its freshness/lag SLO under CPU contention)"
-            );
+            if cayenne_configured {
+                tracing::info!(
+                    max_concurrent_queries = max,
+                    "Cayenne adaptive query-admission throttle active (controller sheds concurrent queries when CDC is behind its freshness/lag SLO under CPU contention)"
+                );
+            }
         }
 
         // Install the cgroup-aware memory budget the dynamic auto-tuner uses to
@@ -1842,10 +1851,12 @@ impl DataFusion {
         // `get_total_memory` rebuilds a sysinfo System on every call.
         let memory_budget = self.total_memory;
         cayenne::set_global_memory_budget(memory_budget);
-        tracing::info!(
-            memory_budget,
-            "Cayenne dynamic-tuning memory budget active (cgroup-aware)"
-        );
+        if cayenne_configured {
+            tracing::info!(
+                memory_budget,
+                "Cayenne dynamic-tuning memory budget active (cgroup-aware)"
+            );
+        }
 
         let rt = self.ctx.runtime_env();
 
@@ -1893,11 +1904,13 @@ impl DataFusion {
         // bloom, which is the fallback an over-budget table already takes.
         let pk_keyset_budget_bytes = self.total_memory / 16;
         cayenne::set_global_pk_keyset_bytes(pk_keyset_budget_bytes);
-        tracing::info!(
-            pk_keyset_budget_bytes,
-            total_memory = self.total_memory,
-            "Cayenne global PK keyset byte budget active (bounds the SUM of per-table keyset caches, which are sized independently)"
-        );
+        if cayenne_configured {
+            tracing::info!(
+                pk_keyset_budget_bytes,
+                total_memory = self.total_memory,
+                "Cayenne global PK keyset byte budget active (bounds the SUM of per-table keyset caches, which are sized independently)"
+            );
+        }
 
         if let Some(mem_tier_budget_bytes) = self.mem_tier_budget_bytes {
             cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
