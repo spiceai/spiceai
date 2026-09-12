@@ -12,8 +12,7 @@ on:
     # (adaptive-turso, duckdb baseline) on the xlarge pool. 0400 sits after the 0000 adaptive
     # batch (~4h) so it usually starts on an idle slot rather than queueing immediately.
     - cron: '0 4 * * *'
-    # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners),
-    # including adaptive-ivm (lower rate so IVM contribution indexes stay under the safety cap).
+    # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners).
     # SF1 uses a different runner pool and a unique concurrency group, so it does not serialize
     # with the SF1000 xlarge queue.
     - cron: '0 6,18 * * *'

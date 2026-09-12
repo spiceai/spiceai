@@ -41,6 +41,8 @@ postgres_connection_params: &postgres_params
   pg_sslmode: disable
 
 runtime:
+  query:
+    cte_materialization: auto
   flight:
     ipc_compression: lz4_frame
   caching:
