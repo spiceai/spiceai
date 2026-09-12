@@ -1505,6 +1505,18 @@ impl Default for ScanViewCache {
     }
 }
 
+/// Unpruned snapshot-directory listing with per-file footer statistics.
+///
+/// A PK point lookup still has to LIST the snapshot and fetch stats for every
+/// Vortex file before it can prune to the one file whose min/max contains K.
+/// On a frozen snapshot that work is identical across queries, so the first
+/// complete listing is stored here and later scans prune in memory.
+struct CachedSnapshotListing {
+    snapshot_id: String,
+    dir_generation: u64,
+    files: Arc<Vec<PartitionedFile>>,
+}
+
 impl ScanViewCache {
     /// Publish `view` as `latest_complete` if it is at least as new as the
     /// currently published slot (`order` is the scan-input version at capture).
@@ -1713,6 +1725,12 @@ pub struct CayenneTableProvider {
     /// replaces the per-scan `ListingTable` cache while preserving repeated
     /// scan behavior when `collect_statistics` asks us to read Vortex footers.
     scan_file_statistics: Arc<dyn FileStatisticsCache>,
+    /// Unpruned snapshot directory listing (paths + footer stats) for the
+    /// current file set. Keyed by snapshot id and [`Self::current_dir_generation`]
+    /// so a publish that adds files cannot serve a short list. A hit skips
+    /// object-store LIST and per-file footer/catalog fetches; the query still
+    /// prunes with its own predicate.
+    cached_snapshot_listing: Arc<ArcSwapOption<CachedSnapshotListing>>,
     /// Table-level Vortex statistics cache loaded from the metastore and maintained
     /// after writes. The optimizer-facing `Statistics` and raw `TableStatistics`
     /// blob live under the same lock so clears and updates publish both views
@@ -8175,6 +8193,7 @@ impl CayenneTableProvider {
             listing_table: Arc::new(ArcSwap::new(listing_table)),
             listing_fence: Arc::new(tokio::sync::RwLock::new(())),
             scan_file_statistics: Arc::new(DefaultFileStatisticsCache::default()),
+            cached_snapshot_listing: Arc::new(ArcSwapOption::empty()),
             table_statistics: Arc::new(RwLock::new(CachedTableStatistics {
                 optimizer_inexact: table_statistics
                     .as_ref()
@@ -10130,6 +10149,7 @@ impl CayenneTableProvider {
             listing_table: Arc::clone(&self.listing_table),
             listing_fence: Arc::clone(&self.listing_fence),
             scan_file_statistics: Arc::clone(&self.scan_file_statistics),
+            cached_snapshot_listing: Arc::clone(&self.cached_snapshot_listing),
             table_statistics: Arc::clone(&self.table_statistics),
             table_statistics_persistence_lock: Arc::clone(&self.table_statistics_persistence_lock),
             row_count_taint_pending: Arc::clone(&self.row_count_taint_pending),
@@ -10605,6 +10625,7 @@ impl CayenneTableProvider {
 
     pub(crate) fn clear_scan_file_statistics_cache(&self) {
         self.scan_file_statistics.clear();
+        self.cached_snapshot_listing.store(None);
     }
 
     /// Check the table-wide PK index out for validation. The cell is left empty for
@@ -25095,6 +25116,7 @@ impl CayenneTableProvider {
     /// `VortexAccessPlanProvider` and observes the fresh deletion bitmap.
     pub(crate) fn invalidate_scan_file_statistics(&self) {
         self.scan_file_statistics.clear();
+        self.cached_snapshot_listing.store(None);
     }
 
     /// Refresh the listing table, ASSUMING the caller already holds
@@ -32183,41 +32205,7 @@ impl CayenneTableProvider {
         let collect_stats = request.options.collect_stat;
         let has_pending_deletions = self.has_pending_deletions();
         let use_stats_for_limit = collect_stats && !has_pending_deletions;
-        let store = request
-            .state
-            .runtime_env()
-            .object_store(request.table_url)?;
-        let meta_fetch_concurrency = request
-            .state
-            .config_options()
-            .execution
-            .meta_fetch_concurrency;
-
-        // Manifest-driven file resolution (default OFF). When enabled and the
-        // manifest has rows for this snapshot, the scan's file set comes from
-        // `cayenne_snapshot_file`; otherwise it falls back to directory listing
-        // (dual-source). The two sources are equal by construction — see
-        // `manifest_partitioned_files` and `upsert_snapshot_manifest_from_listing`.
-        let manifest_files = if self.context.scan_from_manifest() {
-            self.manifest_partitioned_files(request).await
-        } else {
-            None
-        };
-        let file_list: futures::stream::BoxStream<'_, DataFusionResult<PartitionedFile>> =
-            match manifest_files {
-                Some(files) => stream::iter(files.into_iter().map(Ok)).boxed(),
-                None => {
-                    pruned_partition_list(
-                        request.state,
-                        store.as_ref(),
-                        request.table_url,
-                        request.partition_filters,
-                        &request.options.file_extension,
-                        &request.options.table_partition_cols,
-                    )
-                    .await?
-                }
-            };
+        let dir_generation = self.current_dir_generation.load(Ordering::Acquire);
 
         let listing_pruning_predicate = if collect_stats && !request.data_filters.is_empty() {
             super::file_pruning::build_listing_pruning_predicate(
@@ -32228,60 +32216,47 @@ impl CayenneTableProvider {
             None
         };
 
-        let table_name = self.table_metadata.table_name.clone();
-        let files = file_list
-            .map(|part_file| async {
-                let part_file = part_file?;
-                let statistics = if collect_stats {
-                    self.collect_scan_file_statistics(
-                        request.state,
-                        request.snapshot_id,
-                        &store,
-                        request.options.format.as_ref(),
-                        &part_file,
-                    )
-                    .await?
-                } else {
-                    Arc::new(Statistics::new_unknown(&self.table_schema()))
-                };
-                let part_file = part_file.with_statistics(statistics);
-                if let Some(ref predicate) = listing_pruning_predicate
-                    && super::file_pruning::should_prune_partitioned_file(
-                        &part_file,
-                        &request.scan_schema,
-                        predicate,
-                    )?
-                {
-                    tracing::debug!(
-                        table = %table_name,
-                        file = %part_file.object_meta.location,
-                        "Pruned Vortex file at listing time via footer statistics"
-                    );
-                    telemetry::cayenne::track_scan_files(
-                        1,
-                        1,
-                        &[telemetry::KeyValue::new("table", table_name.clone())],
-                    );
-                    return Ok(None);
-                }
+        let unpruned = self
+            .snapshot_files_with_stats(request, collect_stats, dir_generation)
+            .await?;
+        let table_name = self.table_metadata.table_name.as_str();
+        let pk_eq = i64_eq_literal_on_schema(&request.scan_schema, request.data_filters);
+        let mut kept = Vec::new();
+        for part_file in unpruned.iter() {
+            let prune = if let Some((col_idx, value)) = pk_eq {
+                super::file_pruning::should_prune_i64_eq(part_file, col_idx, value)
+            } else if let Some(ref predicate) = listing_pruning_predicate {
+                super::file_pruning::should_prune_partitioned_file(
+                    part_file,
+                    &request.scan_schema,
+                    predicate,
+                )?
+            } else {
+                false
+            };
+            if prune {
+                tracing::debug!(
+                    table = %table_name,
+                    file = %part_file.object_meta.location,
+                    "Pruned Vortex file at listing time via footer statistics"
+                );
                 telemetry::cayenne::track_scan_files(
                     1,
-                    0,
-                    &[telemetry::KeyValue::new("table", table_name.clone())],
+                    1,
+                    &[telemetry::KeyValue::new("table", table_name.to_string())],
                 );
-                Ok(Some(part_file))
-            })
-            .buffer_unordered(meta_fetch_concurrency)
-            .filter_map(|result| async move {
-                match result {
-                    Ok(Some(file)) => Some(Ok(file)),
-                    Ok(None) => None,
-                    Err(err) => Some(Err(err)),
-                }
-            });
+                continue;
+            }
+            telemetry::cayenne::track_scan_files(
+                1,
+                0,
+                &[telemetry::KeyValue::new("table", table_name.to_string())],
+            );
+            kept.push(part_file.clone());
+        }
 
         let (file_group, truncated_file_set) =
-            Self::collect_scan_files_with_limit(files, request.limit, use_stats_for_limit).await?;
+            Self::file_group_with_limit(kept, request.limit, use_stats_for_limit);
 
         let threshold = request
             .state
@@ -32323,6 +32298,123 @@ impl CayenneTableProvider {
             statistics,
             grouped_by_partition,
         })
+    }
+
+    /// Return the snapshot's files with statistics, using
+    /// [`Self::cached_snapshot_listing`] when the snapshot id and directory
+    /// generation still match. A complete listing (not truncated by LIMIT) is
+    /// stored so later point lookups prune in memory instead of re-LISTing.
+    async fn snapshot_files_with_stats(
+        &self,
+        request: &SnapshotScanListingRequest<'_>,
+        collect_stats: bool,
+        dir_generation: u64,
+    ) -> datafusion_common::Result<Arc<Vec<PartitionedFile>>> {
+        if collect_stats
+            && let Some(cached) = self.cached_snapshot_listing.load_full()
+            && cached.snapshot_id == request.snapshot_id
+            && cached.dir_generation == dir_generation
+        {
+            return Ok(Arc::clone(&cached.files));
+        }
+
+        let store = request
+            .state
+            .runtime_env()
+            .object_store(request.table_url)?;
+        let meta_fetch_concurrency = request
+            .state
+            .config_options()
+            .execution
+            .meta_fetch_concurrency;
+
+        let manifest_files = if self.context.scan_from_manifest() {
+            self.manifest_partitioned_files(request).await
+        } else {
+            None
+        };
+        let file_list: futures::stream::BoxStream<'_, DataFusionResult<PartitionedFile>> =
+            match manifest_files {
+                Some(files) => stream::iter(files.into_iter().map(Ok)).boxed(),
+                None => {
+                    pruned_partition_list(
+                        request.state,
+                        store.as_ref(),
+                        request.table_url,
+                        request.partition_filters,
+                        &request.options.file_extension,
+                        &request.options.table_partition_cols,
+                    )
+                    .await?
+                }
+            };
+
+        let files = file_list
+            .map(|part_file| async {
+                let part_file = part_file?;
+                let statistics = if collect_stats {
+                    self.collect_scan_file_statistics(
+                        request.state,
+                        request.snapshot_id,
+                        &store,
+                        request.options.format.as_ref(),
+                        &part_file,
+                    )
+                    .await?
+                } else {
+                    Arc::new(Statistics::new_unknown(&self.table_schema()))
+                };
+                Ok(part_file.with_statistics(statistics))
+            })
+            .buffer_unordered(meta_fetch_concurrency);
+
+        let (file_group, truncated) =
+            Self::collect_scan_files_with_limit(files, None, collect_stats).await?;
+        let files = Arc::new(file_group.into_inner());
+        if collect_stats && !truncated {
+            let gen_after = self.current_dir_generation.load(Ordering::Acquire);
+            if gen_after == dir_generation {
+                self.cached_snapshot_listing
+                    .store(Some(Arc::new(CachedSnapshotListing {
+                        snapshot_id: request.snapshot_id.to_string(),
+                        dir_generation,
+                        files: Arc::clone(&files),
+                    })));
+            }
+        }
+        Ok(files)
+    }
+
+    fn file_group_with_limit(
+        files: Vec<PartitionedFile>,
+        limit: Option<usize>,
+        use_stats_for_limit: bool,
+    ) -> (FileGroup, bool) {
+        let Some(limit) = limit.filter(|_| use_stats_for_limit) else {
+            return (FileGroup::new(files), false);
+        };
+        let mut file_group = FileGroup::default();
+        let mut num_rows = DFPrecision::Absent;
+        let mut truncated = false;
+        for file in files {
+            if truncated {
+                break;
+            }
+            if let Some(file_stats) = &file.statistics {
+                num_rows = if file_group.is_empty() {
+                    file_stats.num_rows
+                } else {
+                    num_rows.add(&file_stats.num_rows)
+                };
+            }
+            file_group.push(file);
+            if let DFPrecision::Exact(row_count) = num_rows
+                && row_count > limit
+            {
+                truncated = true;
+            }
+        }
+        (file_group, truncated)
     }
 
     async fn collect_scan_file_statistics(
@@ -33173,6 +33265,20 @@ fn extract_integer_literal(expr: &Expr) -> Option<i64> {
         ScalarValue::Int8(Some(v)) => Some(i64::from(*v)),
         _ => None,
     }
+}
+
+fn i64_eq_literal_on_schema(schema: &SchemaRef, filters: &[Expr]) -> Option<(usize, i64)> {
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if field.data_type() != &arrow_schema::DataType::Int64 {
+            continue;
+        }
+        for filter in filters {
+            if let Some(ScalarValue::Int64(Some(v))) = pk_scalar_for(filter, field.name()) {
+                return Some((idx, v));
+            }
+        }
+    }
+    None
 }
 
 #[async_trait]
@@ -45405,6 +45511,31 @@ mod tests {
             .into_iter()
             .map(|g| g.len())
             .sum();
+        assert!(
+            provider.cached_snapshot_listing.load_full().is_some(),
+            "a complete listing must populate the snapshot listing cache"
+        );
+        let pruned_cached = provider
+            .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
+                state: &ctx.state(),
+                table_url: &table_url,
+                options: &options,
+                partition_filters: &[],
+                data_filters: std::slice::from_ref(&sel_filter),
+                snapshot_id: &snapshot_id,
+                limit: None,
+                scan_schema: Arc::clone(&scan_schema),
+            })
+            .await
+            .expect("cached listing scan with point-lookup filter");
+        let pruned_cached_files: usize = file_group_paths(&pruned_cached.file_groups)
+            .into_iter()
+            .map(|g| g.len())
+            .sum();
+        assert_eq!(
+            pruned_cached_files, pruned_files,
+            "a cache hit must still prune disjoint files at listing time"
+        );
 
         // Control: a no-filter listing sees all three files.
         let all = provider
@@ -45434,6 +45565,175 @@ mod tests {
             pruned_files, 1,
             "point-lookup id={target_id} must prune the 2 disjoint files at listing \
              via footer min/max, got {pruned_files}"
+        );
+    }
+
+    /// A warm PK lookup over many on-disk files must not re-pay listing. After
+    /// the snapshot listing cache is populated, `scan` + collect of `id = K`
+    /// should stay in the single-digit-millisecond range even with dozens of
+    /// files (the SF-10 path: prune in memory, open one Vortex file).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pk_point_lookup_warm_scan_is_single_digit_ms_with_many_files() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let vortex_config = VortexConfig {
+            inline_max_rows: 0,
+            compaction_background_interval_ms: 0,
+            compaction_trigger_files: usize::MAX,
+            compaction_trigger_protected_snapshots: usize::MAX,
+            compaction_trigger_snapshot_age_ms: u64::MAX,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "pk_lookup_warm_many_files",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let provider = Arc::new(provider);
+        const FILES: i64 = 64;
+        const ROWS_PER_FILE: i64 = 256;
+        for f in 0..FILES {
+            let start = f * ROWS_PER_FILE;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(start..start + ROWS_PER_FILE)),
+                    Arc::new(Int64Array::from_iter_values(
+                        (start..start + ROWS_PER_FILE).map(|x| x * 10),
+                    )),
+                ],
+            )
+            .expect("batch");
+            insert_batch_with_context(&ctx, &provider, batch).await;
+        }
+        let target_id = (FILES * ROWS_PER_FILE) / 2;
+        let expected = target_id * 10;
+        for _ in 0..4 {
+            assert_eq!(
+                query_pk_i64(
+                    Arc::clone(&provider) as Arc<dyn TableProvider>,
+                    &ctx,
+                    target_id,
+                    "value",
+                )
+                .await,
+                vec![expected]
+            );
+        }
+        let mut elapsed = Vec::new();
+        for _ in 0..16 {
+            let t0 = Instant::now();
+            let values = query_pk_i64(
+                Arc::clone(&provider) as Arc<dyn TableProvider>,
+                &ctx,
+                target_id,
+                "value",
+            )
+            .await;
+            elapsed.push(t0.elapsed());
+            assert_eq!(values, vec![expected]);
+        }
+        elapsed.sort();
+        let p50 = elapsed[elapsed.len() / 2];
+        assert!(
+            p50 < Duration::from_millis(10),
+            "warm PK lookup p50 over {FILES} files was {p50:?}, want < 10ms; samples={elapsed:?}"
+        );
+    }
+
+    /// Same executed PK lookup as the SF-10 bench, against one ~64 MiB Vortex
+    /// file (the per-file size that bench produces). Isolates Vortex
+    /// plan+execute from listing hundreds of files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pk_point_lookup_warm_scan_is_single_digit_ms_on_large_file() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new("payload", DataType::Binary, false),
+        ]));
+        let ctx = SessionContext::new();
+        let vortex_config = VortexConfig {
+            inline_max_rows: 0,
+            compaction_background_interval_ms: 0,
+            compaction_trigger_files: usize::MAX,
+            compaction_trigger_protected_snapshots: usize::MAX,
+            compaction_trigger_snapshot_age_ms: u64::MAX,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "pk_lookup_warm_large_file",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let provider = Arc::new(provider);
+        const ROWS: i64 = 262_144;
+        const PAYLOAD_LEN: usize = 256;
+        let ids: Vec<i64> = (0..ROWS).collect();
+        let values: Vec<i64> = ids.iter().map(|id| id * 100).collect();
+        let mut payload_flat =
+            Vec::with_capacity(usize::try_from(ROWS).expect("rows") * PAYLOAD_LEN);
+        for id in 0..ROWS {
+            let mut buf = [0_u8; PAYLOAD_LEN];
+            let mut x = (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for b in &mut buf {
+                x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                *b = (x >> 33) as u8;
+            }
+            payload_flat.extend_from_slice(&buf);
+        }
+        let payload =
+            arrow::array::BinaryArray::from_iter_values(payload_flat.chunks_exact(PAYLOAD_LEN));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(values)),
+                Arc::new(payload),
+            ],
+        )
+        .expect("batch");
+        insert_batch_with_context(&ctx, &provider, batch).await;
+        let target_id = ROWS / 2;
+        let expected = target_id * 100;
+        for _ in 0..4 {
+            assert_eq!(
+                query_pk_i64(
+                    Arc::clone(&provider) as Arc<dyn TableProvider>,
+                    &ctx,
+                    target_id,
+                    "value",
+                )
+                .await,
+                vec![expected]
+            );
+        }
+        let mut elapsed = Vec::new();
+        for _ in 0..16 {
+            let t0 = Instant::now();
+            let values = query_pk_i64(
+                Arc::clone(&provider) as Arc<dyn TableProvider>,
+                &ctx,
+                target_id,
+                "value",
+            )
+            .await;
+            elapsed.push(t0.elapsed());
+            assert_eq!(values, vec![expected]);
+        }
+        elapsed.sort();
+        let p50 = elapsed[elapsed.len() / 2];
+        assert!(
+            p50 < Duration::from_millis(10),
+            "warm PK lookup p50 on a ~64MiB file was {p50:?}, want < 10ms; samples={elapsed:?}"
         );
     }
 
