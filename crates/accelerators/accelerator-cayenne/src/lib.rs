@@ -1090,9 +1090,13 @@ async fn metastore_file_under(data_dir: &Path) -> std::io::Result<Option<PathBuf
         // live — which is the same loss as a catalog directly inside the directory, and
         // is refused the same way.
         Ok(metadata) if metadata.is_symlink() => match tokio::fs::canonicalize(data_dir).await {
-            Ok(resolved) if resolved.is_dir() => resolved,
-            // Dangling, or naming a file: no catalog is reachable through it.
-            Ok(_) => return Ok(None),
+            Ok(resolved) => match tokio::fs::metadata(&resolved).await {
+                Ok(resolved_meta) if resolved_meta.is_dir() => resolved,
+                // Dangling, or naming a file: no catalog is reachable through it.
+                Ok(_) => return Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         },
@@ -1184,6 +1188,13 @@ async fn catalog_directly_inside(link: &Path) -> std::io::Result<Option<PathBuf>
         }
     }
     Ok(None)
+}
+
+/// Async equivalent of [`Path::exists`]: `true` only when the path is present.
+/// I/O errors (including permission denied) are `false`, matching `Path::exists`,
+/// so converting the accelerator's existence gates does not change who proceeds.
+async fn path_exists(path: impl AsRef<Path>) -> bool {
+    matches!(tokio::fs::try_exists(path).await, Ok(true))
 }
 
 /// Process-wide counter giving each [`CayenneAccelerator`] instance a unique id,
@@ -1453,7 +1464,7 @@ impl CayenneAccelerator {
     /// proof describe a different tree from the one that gets deleted: `is_local_path` is
     /// a substring test, so a local directory whose name merely contains `://` would be
     /// waved through while `remove_dir_all` still walked it; and `remove_dir_all` — like
-    /// the `exists()` test each delete is gated on — is handed the string itself. A path that
+    /// the existence test each delete is gated on — is handed the string itself. A path that
     /// is genuinely remote is simply absent from the filesystem, and the walk answers
     /// `None` for it at the cost of one `stat`.
     async fn ensure_no_catalog_under_data_dir(
@@ -2411,15 +2422,16 @@ impl CayenneAccelerator {
         Ok(Arc::new(transformed_schema))
     }
 
-    fn ensure_directory(dir_path: &str) -> Result<PathBuf> {
+    async fn ensure_directory(dir_path: &str) -> Result<PathBuf> {
         // Skip directory creation for S3 object store URLs
         if dir_path.starts_with("s3://") {
             return Ok(PathBuf::from(dir_path));
         }
 
         let path_buf = PathBuf::from(dir_path);
-        if !path_buf.exists() {
-            std::fs::create_dir_all(&path_buf)
+        if !path_exists(&path_buf).await {
+            tokio::fs::create_dir_all(&path_buf)
+                .await
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
         }
@@ -2605,7 +2617,8 @@ impl CayenneAccelerator {
             self.get_or_create_memory_catalog().await?
         } else {
             // Ensure metadata directory exists
-            std::fs::create_dir_all(&metadata_dir)
+            tokio::fs::create_dir_all(&metadata_dir)
+                .await
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
             // Get or create the shared catalog (lazy initialization)
@@ -3422,9 +3435,7 @@ impl DataAccelerator for CayenneAccelerator {
             let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
             let metadata_db_path = format!("{metadata_dir}/cayenne.db");
 
-            if open_option == OpenOption::OpenExisting
-                && !std::path::Path::new(&metadata_db_path).exists()
-            {
+            if open_option == OpenOption::OpenExisting && !path_exists(&metadata_db_path).await {
                 return Err(CheckpointError::Store {
                     source: format!(
                         "Cayenne metadata directory does not exist at {metadata_db_path}"
@@ -3645,7 +3656,7 @@ impl DataAccelerator for CayenneAccelerator {
             && acceleration.mode == Mode::FileCreate
         {
             let path_buf = PathBuf::from(&dir_path);
-            if path_buf.exists() {
+            if path_exists(&path_buf).await {
                 let metadata_dir_for_snapshot =
                     PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
                 let snapshot_layout = runtime_acceleration::snapshot::AccelerationLayout::cayenne(
@@ -3704,7 +3715,7 @@ impl DataAccelerator for CayenneAccelerator {
                 );
             }
 
-            if path_buf.exists() {
+            if path_exists(&path_buf).await {
                 // The proofs run here rather than earlier because
                 // `snapshot_before_recreate` creates both directories, so an overlap
                 // only a symlink reveals is resolvable now even though the open-time
@@ -3719,7 +3730,7 @@ impl DataAccelerator for CayenneAccelerator {
 
         // Create the vortex data directory if it doesn't exist
         let path_buf = PathBuf::from(&dir_path);
-        if !path_buf.exists() {
+        if !path_exists(&path_buf).await {
             tokio::fs::create_dir_all(&path_buf)
                 .await
                 .boxed()
@@ -3813,7 +3824,7 @@ impl DataAccelerator for CayenneAccelerator {
             Self::resolve_default_data_path(&source.name().to_string().replace(['.', '/'], "_"))
         } else {
             let dir_path = self.resolve_storage_config(source).boxed()?;
-            let _ = Self::ensure_directory(&dir_path).boxed()?;
+            Self::ensure_directory(&dir_path).await.boxed()?;
             dir_path
         };
         let arrow_schema = Self::transformed_arrow_schema(&cmd, source).boxed()?;
@@ -3949,7 +3960,8 @@ impl DataAccelerator for CayenneAccelerator {
             let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
 
             // Ensure metadata directory exists
-            std::fs::create_dir_all(&metadata_dir)
+            tokio::fs::create_dir_all(&metadata_dir)
+                .await
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
 
@@ -4249,7 +4261,7 @@ impl DataAccelerator for CayenneAccelerator {
             catalog.drop_table(table_name).await.boxed()?;
         }
 
-        if path_buf.exists() {
+        if path_exists(&path_buf).await {
             Self::remove_acceleration_data_dir(source, &dir_path).await?;
             tracing::info!(
                 "Removed Cayenne data directory '{dir_path}' for schema recreation (file_update mode)"
@@ -5738,6 +5750,46 @@ mod tests {
             "`://` inside a metadata path does not put it on object storage, and the \
              delete still reaches it"
         );
+    }
+
+    /// `ensure_directory` is the `create_external_table` mkdir. Creating a missing
+    /// local path, repeating that create, and leaving an `s3://` URL untouched are
+    /// the three cases that path handles — and must not block a Tokio worker.
+    #[tokio::test]
+    async fn ensure_directory_creates_a_missing_local_path_and_skips_object_stores() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let dir = base.path().join("vortex").join("nested");
+
+        assert!(
+            !path_exists(&dir).await,
+            "the test directory must start absent"
+        );
+
+        let created = CayenneAccelerator::ensure_directory(&dir.to_string_lossy())
+            .await
+            .expect("create a missing local directory");
+        assert_eq!(created, dir);
+        assert!(dir.is_dir(), "ensure_directory must create the local path");
+
+        CayenneAccelerator::ensure_directory(&dir.to_string_lossy())
+            .await
+            .expect("creating an existing directory is a no-op");
+
+        let s3 = CayenneAccelerator::ensure_directory("s3://bucket/prefix")
+            .await
+            .expect("object-store URLs are not created on disk");
+        assert_eq!(s3, PathBuf::from("s3://bucket/prefix"));
+    }
+
+    #[tokio::test]
+    async fn path_exists_matches_std_path_exists() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let present = base.path().join("present");
+        std::fs::create_dir_all(&present).expect("present dir");
+        let missing = base.path().join("missing");
+
+        assert_eq!(path_exists(&present).await, present.exists());
+        assert_eq!(path_exists(&missing).await, missing.exists());
     }
 
     /// `mode: file_create` must refuse the configuration at open time, before the
