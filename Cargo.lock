@@ -6506,7 +6506,6 @@ dependencies = [
  "futures",
  "object_store 0.13.2",
  "orc-rust",
- "snafu",
  "tempfile",
  "tokio",
 ]

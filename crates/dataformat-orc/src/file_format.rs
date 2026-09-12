@@ -175,7 +175,7 @@ impl FileFormat for OrcFormat {
 mod tests {
     use super::*;
     use crate::test_support::{put_orc, write_orc_bytes};
-    use arrow::array::{Int32Array, StringArray};
+    use arrow::array::{Array, Int32Array, StringArray};
     use arrow::datatypes::DataType;
     use arrow::record_batch::RecordBatch;
     use datafusion::execution::context::SessionContext;

@@ -116,7 +116,7 @@ impl FileSource for OrcSource {
 /// Reorder (and, for `COUNT(*)`, drop) ORC columns so the batch matches the
 /// projected file schema. `orc-rust`'s `ProjectionMask::named_roots` emits
 /// columns in file order, which is not necessarily `SELECT` order.
-fn align_orc_batch(batch: RecordBatch, schema: &Arc<Schema>) -> Result<RecordBatch> {
+fn align_orc_batch(batch: &RecordBatch, schema: &Arc<Schema>) -> Result<RecordBatch> {
     if schema.fields().is_empty() {
         return RecordBatch::try_new_with_options(
             Arc::clone(schema),
@@ -173,7 +173,7 @@ impl FileOpener for OrcOpener {
                 let names: Vec<String> = projected_schema
                     .fields()
                     .iter()
-                    .map(|field| field.name().to_string())
+                    .map(|field| field.name().clone())
                     .collect();
                 let projection = ProjectionMask::named_roots(
                     builder.file_metadata().root_data_type(),
@@ -198,7 +198,7 @@ impl FileOpener for OrcOpener {
                 .map(move |result| {
                     result
                         .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))
-                        .and_then(|batch| align_orc_batch(batch, &projected_schema))
+                        .and_then(|batch| align_orc_batch(&batch, &projected_schema))
                 })
                 .boxed())
         }))
