@@ -55,8 +55,10 @@ use cayenne::{
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::prelude::SessionContext;
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_execution::cache::DefaultListFilesCache;
+use datafusion_execution::cache::cache_manager::CacheManagerConfig;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{col, lit};
 use datafusion_physical_plan::collect;
@@ -207,7 +209,15 @@ async fn load_sf10_table() -> LoadedTable {
     let catalog =
         Arc::new(CayenneCatalog::new(format!("sqlite://{}", db_path.display())).expect("catalog"));
     catalog.init().await.expect("catalog init");
-    let runtime_env = Arc::new(RuntimeEnv::default());
+    let runtime_env = Arc::new(
+        RuntimeEnvBuilder::new()
+            .with_cache_manager(
+                CacheManagerConfig::default()
+                    .with_list_files_cache(Some(Arc::new(DefaultListFilesCache::default()))),
+            )
+            .build()
+            .expect("runtime env"),
+    );
 
     let table = Arc::new(
         CayenneTableProviderBuilder::new(
@@ -287,7 +297,10 @@ async fn open_reuse_lane(loaded: &LoadedTable, reuse: ScanViewReuse) -> ReuseFix
     // Production path: offload ScanView builds and run the idle evictor.
     table.init_scan_view_cache();
 
-    let ctx = Arc::new(SessionContext::new());
+    let ctx = Arc::new(SessionContext::new_with_config_rt(
+        SessionConfig::new(),
+        Arc::clone(&loaded.runtime_env),
+    ));
     let target_id = i64::try_from(loaded.rows / 2).expect("row count fits i64");
 
     // Populate the scan-view cache (and Vortex footer cache) before any timed load.
