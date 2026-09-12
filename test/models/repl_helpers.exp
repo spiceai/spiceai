@@ -85,6 +85,23 @@ proc repl_endpoint_args {} {
     return [list]
 }
 
+# Seconds to wait for a REPL response. `SPICE_CHAT_EXPECT_TIMEOUT` overrides
+# `default` when set to a positive integer so CI or a local run can raise the
+# budget without editing the script.
+proc repl_timeout_seconds {default} {
+    if {![info exists ::env(SPICE_CHAT_EXPECT_TIMEOUT)] || $::env(SPICE_CHAT_EXPECT_TIMEOUT) eq ""} {
+        return $default
+    }
+
+    set raw [string trim $::env(SPICE_CHAT_EXPECT_TIMEOUT)]
+    if {![string is integer -strict $raw] || $raw < 1} {
+        send_user "SPICE_CHAT_EXPECT_TIMEOUT must be a positive integer (seconds); got \"$raw\"\n"
+        exit 1
+    }
+
+    return $raw
+}
+
 # Fails the script if the spawned process has exited. Writing to the pty of an
 # exited process succeeds silently, so a REPL that crashes while sitting idle at
 # its prompt is invisible to `repl_send` alone; reading finds the eof. Output

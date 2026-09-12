@@ -649,6 +649,12 @@ jobs:
         run: |
           ./test/models/search_01.exp
 
+      # No step retry: the 30s timeout in merge-queue job 103597842965 fired
+      # while Qwen2.5-3B was still streaming a long answer on Metal, not on a
+      # Hub download (config probe HTTP 200; `search_01.exp` had already
+      # passed). chat_01_simple.exp now waits 120s per turn (override with
+      # SPICE_CHAT_EXPECT_TIMEOUT) and spicepod_hf.yml caps
+      # hf_max_completion_tokens at 64. A timeout after that is a hang.
       - name: Test chat
         run: |
           ./test/models/chat_01_simple.exp
