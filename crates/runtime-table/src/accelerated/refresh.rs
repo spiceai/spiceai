@@ -621,6 +621,9 @@ pub struct Refresher {
     accelerator: Arc<dyn TableProvider>,
     // `Weak` reference to `Caching` is used to prevent blocking cache cleanup during runtime termination.
     caching: Option<Weak<Caching>>,
+    /// The caching accelerator's claim set, forwarded to the refresh task so
+    /// its periodic stale-row refresh claims the keys it replaces.
+    in_flight_revalidations: Option<crate::accelerated::caching::InFlightRevalidations>,
     refresh_task_runner: Option<RefreshTaskRunner>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     refresh_on_startup: RefreshOnStartup,
@@ -691,6 +694,7 @@ impl Refresher {
             refresh,
             accelerator,
             caching: None,
+            in_flight_revalidations: None,
             refresh_task_runner: None,
             checkpointer: None,
             refresh_on_startup: RefreshOnStartup::default(),
@@ -714,6 +718,14 @@ impl Refresher {
             engine_type_rewrites: &[],
             cdc_param_overrides: None,
         }
+    }
+
+    pub fn in_flight_revalidations(
+        &mut self,
+        in_flight_revalidations: crate::accelerated::caching::InFlightRevalidations,
+    ) -> &mut Self {
+        self.in_flight_revalidations = Some(in_flight_revalidations);
+        self
     }
 
     pub fn caching(&mut self, caching: &Option<Arc<Caching>>) -> &mut Self {
@@ -749,6 +761,15 @@ impl Refresher {
     pub fn semaphore(&mut self, semaphore: Arc<Semaphore>) -> &mut Self {
         self.semaphore = Some(semaphore);
         self
+    }
+
+    /// Mark the accelerated table as changed now.
+    ///
+    /// For a write path that only learns whether its write is allowed once it
+    /// executes: it stamps the table itself when the write lands, so a refused one
+    /// leaves the freshness timestamp alone.
+    pub fn mark_updated_now(&self) {
+        crate::accelerated::AcceleratedTable::set_timestamp_to_now(&self.last_updated_at);
     }
 
     pub fn with_last_updated_at(&mut self, last_updated_at: Arc<AtomicI64>) -> &mut Self {
@@ -1019,6 +1040,11 @@ impl Refresher {
 
         refresh_task_runner = refresh_task_runner
             .with_initial_load_completed(Arc::clone(&self.initial_load_completed));
+
+        if let Some(in_flight_revalidations) = &self.in_flight_revalidations {
+            refresh_task_runner = refresh_task_runner
+                .with_in_flight_revalidations(Arc::clone(in_flight_revalidations));
+        }
 
         let mut refresh_task_runner = refresh_task_runner.build();
 
@@ -1455,8 +1481,6 @@ mod tests {
         catalog::Session, datasource::TableType, physical_plan::ExecutionPlan,
         physical_plan::collect, prelude::SessionContext,
     };
-    use opentelemetry::global;
-    use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
     use prometheus::proto::MetricType;
     use tokio::{
         sync::{mpsc, watch},
@@ -1578,6 +1602,14 @@ mod tests {
         ) -> Result<Option<SchemaRef>, Box<dyn std::error::Error + Send + Sync>> {
             // Not needed for this test
             Ok(None)
+        }
+
+        async fn set_schema(
+            &self,
+            _schema: &SchemaRef,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            // Not needed for this test
+            Ok(())
         }
 
         async fn last_checkpoint_time(
@@ -2066,24 +2098,7 @@ mod tests {
             false
         }
 
-        let registry = prometheus::Registry::new();
-
-        let resource = Resource::builder().build();
-
-        let prometheus_exporter = opentelemetry_prometheus::exporter()
-            .with_registry(registry.clone())
-            .without_scope_info()
-            .without_units()
-            .without_counter_suffixes()
-            .without_target_info()
-            .build()
-            .expect("to build prometheus exporter");
-
-        let provider = SdkMeterProvider::builder()
-            .with_resource(resource)
-            .with_reader(prometheus_exporter)
-            .build();
-        global::set_meter_provider(provider);
+        let registry = crate::accelerated::refresh_task::test_prometheus_registry().clone();
 
         let status = status::RuntimeStatus::new();
         status.update_dataset(

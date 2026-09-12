@@ -31,7 +31,7 @@ use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
 use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use runtime_datafusion::dialect::new_bigquery_dialect;
 use runtime_datafusion::function_support::deny_spice_functions_for_bigquery_table_providers;
-use runtime_datafusion::optimizer_rule::RegexpMatchNullCheckRewrite;
+use runtime_datafusion::optimizer_rule::{JsonGetNullCheckRewrite, RegexpMatchNullCheckRewrite};
 use runtime_udfs_api::deny_spice_functions_for_table_providers;
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync>;
@@ -67,7 +67,10 @@ fn pre_federation_optimizer_rules_for_driver(
     driver_name: &str,
 ) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     match driver_name {
-        BIGQUERY_DRIVER => vec![Arc::new(RegexpMatchNullCheckRewrite::new())],
+        BIGQUERY_DRIVER => vec![
+            Arc::new(RegexpMatchNullCheckRewrite::new()),
+            Arc::new(JsonGetNullCheckRewrite),
+        ],
         _ => vec![],
     }
 }
@@ -100,6 +103,8 @@ pub(crate) struct AdbcTableFactoryWithPolicy<D>
 where
     D: adbc_core::Database + Send + 'static,
     D::ConnectionType: adbc_core::Connection + Send + Sync,
+    <D::ConnectionType as adbc_core::Connection>::StatementType:
+        datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement,
 {
     factory: AdbcTableFactory<D>,
 }
@@ -108,6 +113,8 @@ impl<D> AdbcTableFactoryWithPolicy<D>
 where
     D: adbc_core::Database + Send + 'static,
     D::ConnectionType: adbc_core::Connection + Send + Sync,
+    <D::ConnectionType as adbc_core::Connection>::StatementType:
+        datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement,
 {
     /// Builds the factory with the driver's function-support policy installed
     /// and the `query_federation` setting applied.

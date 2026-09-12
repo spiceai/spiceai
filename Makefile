@@ -149,8 +149,47 @@ endif
 # command surface. `cloud_integration` needs live credentials and remains in
 # the nightly gate, so select the other two binaries by name rather than every
 # integration test in the `spice` package.
-NEXTEST_SELECTION := --all --exclude libnfs
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics)
+#
+# `spiced`'s `dependency_logging` uses a loopback S3 endpoint to exercise
+# Iceberg retries through the runtime's dependency logger without credentials.
+# Select it explicitly so the gate checks the diagnostic emitted by the pinned
+# storage dependency as well as the formatter's unit tests.
+#
+# `llms`'s `anthropic_stream_errors` and `list_models_errors` are selected by
+# name for the same reason: each stands a local one-shot HTTP server up on an
+# ephemeral port and drives a provider adapter against it, so they exercise the
+# real client's error mapping with no credentials and no external service.
+# `llms`'s remaining `kind(=test)` binary, `integration`, calls the live
+# provider APIs and needs a `.env`, so it stays in the nightly gate.
+#
+# `--features` here, not a per-crate default, because the result-correctness
+# lanes are the only reason the gate links an engine at all. Cargo skips a test
+# target whose `required-features` are unmet *without saying so*, so before this
+# the filterset below selected `result_correctness_vs_duckdb_test` and cargo
+# silently never built it — selection looked complete while three lanes never
+# ran. See `crates/cayenne/tests/correctness/README.md`.
+#
+# Scoped to `cayenne` deliberately. `runtime/duckdb,runtime/sqlite` would also
+# unlock runtime's accelerator-parity binary, but the feature flows through the
+# whole `--all --tests` build: every one of runtime's integration test binaries
+# relinks with them, and those link at hundreds of megabytes each. That is a
+# large, permanent cost on every sign-off and merge-queue run to gain two
+# micro-shape comparisons — the thinnest of the five lanes. It belongs in the
+# integration workflow, which already builds with `duckdb,sqlite`.
+#
+# The chDB lane is deliberately not here. `chdb-rust` needs libchdb, which its
+# build script fetches over the network, so folding it into the gate would make
+# every sign-off depend on that fetch and on a machine that can link it. CI runs
+# it instead (`.github/workflows/correctness_chdb.yml`). Because cargo drops a
+# target whose required-features are unmet *without saying so* — the very way
+# three lanes once went unbuilt — the `nextest` target says out loud that this
+# one did not run.
+NEXTEST_SELECTION := --all --exclude libnfs \
+	--features cayenne/result-correctness-duckdb
+# `spice-substrait-compliance` is a binary crate: its unit tests, including the
+# fork-ledger guards (docs/dev/fork_patches.md), live in its bin target, which
+# `kind(=lib)` does not select.
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=spiced) & binary(=dependency_logging)) + (package(=llms) & binary(=anthropic_stream_errors)) + (package(=llms) & binary(=list_models_errors)) + binary(=metrics) + (package(=spice-substrait-compliance) & kind(=bin))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
@@ -167,6 +206,8 @@ $(error NEXTEST_FLAG carries a nextest filterset — pass it as NEXTEST_FILTER_E
 endif
 .PHONY: nextest
 nextest:
+	@echo 'note: the chDB result-correctness lane is not in this run (it needs libchdb; CI runs it in correctness_chdb.yml).' >&2
+	@echo '      to run it here: cargo test -p cayenne --features result-correctness-chdb --test result_correctness_vs_chdb_test' >&2
 	@cargo nextest run $(NEXTEST_SELECTION) --tests $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
@@ -435,7 +476,19 @@ display-deps:
 TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 
 # Default install includes models. Use -data suffix variants to build without models.
-# Data-only features (default features minus models)
+#
+# The feature set the -data variants build with. It is NOT derived from bin/spiced's `default`,
+# and it is not `default` minus `models`: it is an independent list maintained by hand right here,
+# so a feature added to `default` does not reach `make install-data-only` until it is added below
+# too, and no check reports the omission. The two currently differ in both directions, which is why
+# reading this list as "default, less the model bits" is wrong: -data is also an ADBC-less build
+# without any of the three feature-gated secret stores `default` turns on (aws-secrets-manager,
+# azure-keyvault and keyring-secret-store) — the env and Kubernetes stores are not feature-gated
+# at all, so a -data build still reads secrets from both of those — and it carries the PostgreSQL
+# accelerator and acceleration snapshots, which `default` does not. Recompute the difference
+# before relying on it rather than trusting a comment, from this list and the
+# `default = [...]` array in bin/spiced/Cargo.toml.
+#
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
 SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb
 

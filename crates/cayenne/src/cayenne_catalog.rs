@@ -1061,25 +1061,44 @@ impl CayenneCatalog {
         Ok(())
     }
 
-    /// List up to `limit` undelivered write-back markers for `table_id`, oldest
-    /// commit sequence first. Returns `(pk_bytes, sequence_number)` pairs.
+    /// List up to `limit` undelivered write-back markers for `table_id` in
+    /// delivery order — oldest commit sequence first, then key — starting after
+    /// `after`, or at the oldest marker when that is `None`. Returns
+    /// `(pk_bytes, sequence_number)` pairs.
+    ///
+    /// Every key one commit dirties shares that commit's sequence, so the key
+    /// breaks the tie and makes the order total. `after` is then an exact cursor:
+    /// a caller can page past markers it could not deliver without re-claiming or
+    /// skipping one, whatever else commits meanwhile.
     pub(crate) async fn list_pending_write_back(
         &self,
         table_id: &str,
         limit: usize,
+        after: Option<&(i64, Vec<u8>)>,
     ) -> CatalogResult<Vec<(Vec<u8>, i64)>> {
+        let table_id_value = insert_record_table_id_value(table_id);
+        let limit_value = MetastoreValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX));
+        let params = match after {
+            None => QueryParams {
+                sql: "SELECT pk_bytes, sequence_number FROM cayenne_pending_write_back \
+                      WHERE table_id = ?1 ORDER BY sequence_number ASC, pk_bytes ASC LIMIT ?2",
+                params: vec![table_id_value, limit_value],
+            },
+            Some((sequence_number, pk_bytes)) => QueryParams {
+                sql: "SELECT pk_bytes, sequence_number FROM cayenne_pending_write_back \
+                      WHERE table_id = ?1 \
+                        AND (sequence_number > ?3 OR (sequence_number = ?3 AND pk_bytes > ?4)) \
+                      ORDER BY sequence_number ASC, pk_bytes ASC LIMIT ?2",
+                params: vec![
+                    table_id_value,
+                    limit_value,
+                    MetastoreValue::Integer(*sequence_number),
+                    MetastoreValue::Blob(pk_bytes.clone()),
+                ],
+            },
+        };
         self.metastore
-            .query_helper(
-                QueryParams {
-                    sql: "SELECT pk_bytes, sequence_number FROM cayenne_pending_write_back \
-                          WHERE table_id = ?1 ORDER BY sequence_number ASC LIMIT ?2",
-                    params: vec![
-                        insert_record_table_id_value(table_id),
-                        MetastoreValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
-                    ],
-                },
-                |row| Ok((row.get_blob(0)?, row.get_i64(1)?)),
-            )
+            .query_helper(params, |row| Ok((row.get_blob(0)?, row.get_i64(1)?)))
             .await
     }
 

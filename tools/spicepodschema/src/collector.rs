@@ -214,52 +214,52 @@ pub fn collect_model_sources() -> Vec<ModelSourceSchema> {
     vec![
         ModelSourceSchema {
             name: "openai",
-            prefix: "openai",
+            prefix: ModelSource::OpenAi.short_name(),
             parameters: get_params_spec(&ModelSource::OpenAi),
         },
         ModelSourceSchema {
             name: "azure",
-            prefix: "azure",
+            prefix: ModelSource::Azure.short_name(),
             parameters: get_params_spec(&ModelSource::Azure),
         },
         ModelSourceSchema {
             name: "file",
-            prefix: "file",
+            prefix: ModelSource::File.short_name(),
             parameters: get_params_spec(&ModelSource::File),
         },
         ModelSourceSchema {
             name: "databricks",
-            prefix: "databricks",
+            prefix: ModelSource::Databricks.short_name(),
             parameters: get_params_spec(&ModelSource::Databricks),
         },
         ModelSourceSchema {
             name: "huggingface",
-            prefix: "huggingface",
+            prefix: ModelSource::HuggingFace.short_name(),
             parameters: get_params_spec(&ModelSource::HuggingFace),
         },
         ModelSourceSchema {
             name: "anthropic",
-            prefix: "anthropic",
+            prefix: ModelSource::Anthropic.short_name(),
             parameters: get_params_spec(&ModelSource::Anthropic),
         },
         ModelSourceSchema {
             name: "xai",
-            prefix: "xai",
+            prefix: ModelSource::Xai.short_name(),
             parameters: get_params_spec(&ModelSource::Xai),
         },
         ModelSourceSchema {
             name: "bedrock",
-            prefix: "bedrock",
+            prefix: ModelSource::Bedrock.short_name(),
             parameters: get_params_spec(&ModelSource::Bedrock),
         },
         ModelSourceSchema {
             name: "google",
-            prefix: "google",
+            prefix: ModelSource::Google.short_name(),
             parameters: get_params_spec(&ModelSource::Google),
         },
         ModelSourceSchema {
             name: "spiceai",
-            prefix: "spiceai",
+            prefix: ModelSource::SpiceAI.short_name(),
             parameters: get_params_spec(&ModelSource::SpiceAI),
         },
     ]

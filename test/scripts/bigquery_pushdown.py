@@ -64,6 +64,35 @@ DATASET_ID_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 PROJECT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{4,61}[a-z0-9]$")
 
 QUERIES = {
+    # --- fork PR #212 renderings, one per case ---
+    # `date - date` is an Int64 day count in the plan and an INTERVAL in
+    # BigQuery, so a bare `-` hands the next operator a duration.
+    "date-difference": """SELECT id, d - e AS days
+FROM temporal_values
+ORDER BY id""",
+    # BigQuery has no cast from DATE to INT64.
+    "date-to-integer": """SELECT id, CAST(d AS BIGINT) AS epoch_day
+FROM temporal_values
+ORDER BY id""",
+    # A civil timestamp compared against a civil literal: typed TIMESTAMP it
+    # becomes an instant, which BigQuery gives no supertype against DATETIME.
+    "naive-timestamp-compare": """SELECT id
+FROM temporal_values
+WHERE naive >= CAST('2026-05-11 00:00:00' AS TIMESTAMP)
+ORDER BY id""",
+    # BigQuery refuses a literal grouping key outright.
+    "constant-group-by": """SELECT 'POOLED' AS bucket, COUNT(*) AS n
+FROM temporal_values
+GROUP BY 1""",
+    # `array_element` is 1-based; a bare BigQuery subscript is 0-based.
+    "array-element-literal": """SELECT id, array_element(arr, 1) AS first_el
+FROM temporal_values
+ORDER BY id""",
+    # Control: an index whose sign is unknown cannot be rendered, so it must
+    # evaluate locally rather than fail or read the neighbouring element.
+    "array-element-non-literal-control": """SELECT id, array_element(arr, idx) AS nth_el
+FROM temporal_values
+ORDER BY id""",
     "union-distinct": """SELECT value
 FROM union_values
 WHERE value <= 2
@@ -141,9 +170,109 @@ ORDER BY id""",
   regexp_like(word, '^\\d+$') IS TRUE AS all_digits
 FROM regexp_values
 ORDER BY id""",
+    # A GROUP BY expression reached through a wrapper in the SELECT list.
+    # BigQuery matches a whole select item and a column reference and nothing in
+    # between, so flattening the Projection onto the Aggregate makes it report
+    # `booked_at` as neither grouped nor aggregated and refuse the statement. The
+    # aggregate has to reach it in a scope of its own.
+    "group-by-expr-nested-in-select": """SELECT
+  CAST(CAST(date_trunc('week', booked_at) AS DATE) AS VARCHAR) AS week_start,
+  COUNT(*) AS n
+FROM bucket_values
+GROUP BY date_trunc('week', booked_at)
+ORDER BY week_start""",
+    # Control: a grouped *column* wrapped in the select list needs no scope — a
+    # column reference is matched wherever it appears. Without this the scope
+    # would be paid on most grouped statements a BigQuery connector emits.
+    "group-by-column-nested-in-select-control": """SELECT
+  UPPER(tok) AS k,
+  COUNT(*) AS n
+FROM bucket_values
+GROUP BY tok
+ORDER BY k""",
+    # A correlated subquery whose *outer* relation scans nothing. The federation
+    # provider map is keyed off relations that scan something, so the constant
+    # relation is absent from it; the whole statement still has to reach BigQuery
+    # as one query rather than one scan per table reference.
+    "correlated-subquery-over-constant-relation": """WITH keys AS (
+  SELECT 1 AS k UNION ALL SELECT 2 AS k UNION ALL SELECT 3 AS k
+)
+SELECT
+  keys.k,
+  (SELECT COUNT(*) FROM union_values WHERE union_values.value = keys.k) AS n
+FROM keys
+ORDER BY keys.k""",
+    # An aggregate window whose frame a plan normalizes to RANGE. BigQuery accepts
+    # no NULL placement but its own inside a RANGE clause, and an ORDER BY with no
+    # explicit frame implies RANGE for an aggregate, so `ASC NULLS LAST` is
+    # refused. `aggregate-window-control` above cannot reach this: it names an
+    # explicit ROWS frame, which accepts either placement.
+    "aggregate-window-range-frame": """SELECT
+  tok,
+  COUNT(*) OVER (ORDER BY booked_at) AS running
+FROM bucket_values
+ORDER BY tok""",
+    # Control: the same shape whose outer relation is a BigQuery table, which
+    # federated whole before this change too. It tells a regression in the
+    # scanless case apart from a regression in correlated pushdown generally.
+    "correlated-subquery-over-scanning-relation-control": """SELECT
+  u.value,
+  (SELECT COUNT(*) FROM union_values v WHERE v.value = u.value) AS n
+FROM union_values u
+WHERE u.value = 3
+ORDER BY u.value""",
+    # A recursive CTE that generates a series and joins it to a BigQuery table.
+    # BigQuery accepts `WITH RECURSIVE` only at the top level of a statement, so
+    # every layer between the plan and the driver has to leave it there: the
+    # unparser hoists it out of the derived table it plans into, and the ADBC
+    # schema fetch must not wrap the statement it is about to describe.
+    "recursive-cte-joined-to-a-table": """WITH RECURSIVE steps(n) AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM steps WHERE n < 3
+)
+SELECT steps.n, COUNT(union_values.value) AS matches
+FROM steps
+LEFT JOIN union_values ON union_values.value = steps.n
+GROUP BY steps.n
+ORDER BY steps.n""",
+    "filtered-recursive-self-join": """WITH RECURSIVE steps AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM steps WHERE n < 3
+)
+SELECT a.n, COUNT(union_values.value) AS matches
+FROM steps a
+JOIN steps b ON a.n = b.n
+JOIN union_values ON union_values.value = a.n
+WHERE a.n > 1 AND b.n < 3
+GROUP BY a.n
+ORDER BY a.n""",
 }
 
 EXPECTED_ROWS = {
+    "date-difference": [
+        {"id": 1, "days": 10},
+        {"id": 2, "days": 18},
+        {"id": 3, "days": -10},
+    ],
+    "date-to-integer": [
+        {"id": 1, "epoch_day": 20584},
+        {"id": 2, "epoch_day": 20592},
+        {"id": 3, "epoch_day": 20574},
+    ],
+    "naive-timestamp-compare": [{"id": 1}, {"id": 2}],
+    "constant-group-by": [{"bucket": "POOLED", "n": 3}],
+    "array-element-literal": [
+        {"id": 1, "first_el": 10},
+        {"id": 2, "first_el": 40},
+        {"id": 3, "first_el": 60},
+    ],
+    "array-element-non-literal-control": [
+        {"id": 1, "nth_el": 10},
+        {"id": 2, "nth_el": 50},
+        {"id": 3, "nth_el": 60},
+    ],
     "union-distinct": [{"value": 1}, {"value": 2}, {"value": 3}],
     "union-all-control": [
         {"value": 1},
@@ -225,6 +354,47 @@ EXPECTED_ROWS = {
         {"id": 5, "all_digits": False},
         {"id": 6, "all_digits": True},
     ],
+    # The NULL timestamp buckets on its own, and sorts last: the plan's ORDER BY
+    # normalizes to NULLS LAST, and the scope must carry that out to the caller
+    # rather than leaving it inside the derived table.
+    "group-by-expr-nested-in-select": [
+        {"week_start": "2026-05-11", "n": 2},
+        {"week_start": "2026-05-18", "n": 1},
+        {"week_start": None, "n": 1},
+    ],
+    "group-by-column-nested-in-select-control": [
+        {"k": "A", "n": 1},
+        {"k": "B", "n": 1},
+        {"k": "C", "n": 1},
+        {"k": "D", "n": 1},
+    ],
+    "correlated-subquery-over-constant-relation": [
+        {"k": 1, "n": 2},
+        {"k": 2, "n": 2},
+        {"k": 3, "n": 1},
+    ],
+    "correlated-subquery-over-scanning-relation-control": [
+        {"value": 3, "n": 1},
+    ],
+    # `booked_at` is NULL for tok 'd'. The plan asks for NULLS LAST, so 'd' is the
+    # last row of the ordering and its running count is 4; the other three follow
+    # their timestamps. Under the reversed placement BigQuery would default to,
+    # 'd' would be first and every one of these four numbers would differ — which
+    # is what makes this case test the ordering and not just the SQL shape.
+    "aggregate-window-range-frame": [
+        {"tok": "a", "running": 1},
+        {"tok": "b", "running": 2},
+        {"tok": "c", "running": 3},
+        {"tok": "d", "running": 4},
+    ],
+    # `union_values` holds [1, 1, 2, 2, 3], so the generated series meets two
+    # rows at 1, two at 2 and one at 3.
+    "recursive-cte-joined-to-a-table": [
+        {"n": 1, "matches": 2},
+        {"n": 2, "matches": 2},
+        {"n": 3, "matches": 1},
+    ],
+    "filtered-recursive-self-join": [{"n": 2, "matches": 2}],
 }
 
 
@@ -321,6 +491,25 @@ FROM UNNEST([
   STRUCT('b' AS grp, 1 AS ord, 7 AS amount)
 ]);
 
+CREATE OR REPLACE TABLE {prefix}.bucket_values` AS
+SELECT *
+FROM UNNEST([
+  STRUCT(TIMESTAMP '2026-05-11 03:00:00' AS booked_at, 'a' AS tok),
+  STRUCT(TIMESTAMP '2026-05-12 04:00:00', 'b'),
+  STRUCT(TIMESTAMP '2026-05-19 05:00:00', 'c'),
+  STRUCT(CAST(NULL AS TIMESTAMP), 'd')
+]);
+
+CREATE OR REPLACE TABLE {prefix}.temporal_values` AS
+SELECT * FROM UNNEST([
+  STRUCT(1 AS id, DATE '2026-05-11' AS d, DATE '2026-05-01' AS e,
+         DATETIME '2026-05-11 03:00:00' AS naive, [10, 20, 30] AS arr, 1 AS idx),
+  STRUCT(2, DATE '2026-05-19', DATE '2026-05-01',
+         DATETIME '2026-05-19 05:00:00', [40, 50], 2),
+  STRUCT(3, DATE '2026-05-01', DATE '2026-05-11',
+         DATETIME '2026-05-01 00:00:00', [60], 1)
+]);
+
 CREATE OR REPLACE TABLE {prefix}.regexp_values` AS
 SELECT *
 FROM UNNEST([
@@ -356,6 +545,12 @@ datasets:
     params: *bigquery_params
   - from: adbc:regexp_values
     name: regexp_values
+    params: *bigquery_params
+  - from: adbc:bucket_values
+    name: bucket_values
+    params: *bigquery_params
+  - from: adbc:temporal_values
+    name: temporal_values
     params: *bigquery_params
 """
 
@@ -422,7 +617,70 @@ def initial_physical_sql(explain_body: str) -> str:
     return plan.split("base_sql=", 1)[1].strip()
 
 
+def pushed_statement_count(explain_body: str) -> int:
+    """How many statements the plan sends BigQuery, one per federated node.
+
+    `initial_physical_sql` returns the first, which is all a dialect check needs.
+    A pushdown check needs the count: a plan the federation analyzer refuses
+    degrades to one scan per table reference, and every one of those is a
+    separate BigQuery job.
+    """
+    plans = json.loads(explain_body)
+    plan = next(
+        (
+            entry["plan"]
+            for entry in plans
+            if entry["plan_type"] == "initial_physical_plan"
+        ),
+        None,
+    )
+    if plan is None:
+        raise HarnessError("EXPLAIN VERBOSE did not contain an initial physical plan")
+    return sum(
+        1
+        for line in plan.splitlines()
+        if "base_sql=" in line and "VirtualExecutionPlan" in line
+    )
+
+
 def assert_generated_sql(name: str, sql: str) -> None:
+    if name == "date-difference":
+        if "DATE_DIFF(" not in sql or re.search(r"`d` - `e`|`e` - `d`", sql):
+            raise HarnessError(
+                f"DATE - DATE was not pushed as DATE_DIFF, so BigQuery types the day "
+                f"count as an INTERVAL: {sql}"
+            )
+    if name == "date-to-integer":
+        if "UNIX_DATE(" not in sql or re.search(r"CAST\(`[^`]*`\.?`?d`? AS INT64\)", sql):
+            raise HarnessError(
+                f"CAST(date AS INT64) was not pushed as UNIX_DATE, a cast BigQuery does "
+                f"not have: {sql}"
+            )
+    if name == "naive-timestamp-compare":
+        if "DATETIME" not in sql:
+            raise HarnessError(
+                f"the civil timestamp was not typed DATETIME, so BigQuery has no "
+                f"supertype for the comparison: {sql}"
+            )
+    if name == "constant-group-by":
+        group_by = sql.split("GROUP BY", 1)[1] if "GROUP BY" in sql else ""
+        if "CAST(" not in group_by:
+            raise HarnessError(
+                f"the constant grouping key was not cast, which BigQuery refuses as a "
+                f"literal and other engines read as an ordinal: {sql}"
+            )
+    if name == "array-element-literal":
+        if "SAFE_ORDINAL(1)" not in sql:
+            raise HarnessError(
+                f"array_element was not pushed 1-based, so a bare 0-based subscript "
+                f"reads the neighbouring element: {sql}"
+            )
+    if name == "array-element-non-literal-control":
+        if "SAFE_ORDINAL" in sql or "array_element" in sql:
+            raise HarnessError(
+                f"an index whose sign is unknown must not be pushed down; it has to "
+                f"evaluate locally: {sql}"
+            )
     if name == "union-distinct" and " UNION DISTINCT " not in sql:
         raise HarnessError(f"distinct union is not explicit in pushed SQL: {sql}")
     if name == "union-all-control" and " UNION ALL " not in sql:
@@ -467,6 +725,55 @@ def assert_generated_sql(name: str, sql: str) -> None:
         if "REGEXP_CONTAINS" in sql:
             raise HarnessError(
                 f"a Unicode-divergent pattern must not push down, RE2 reads it differently: {sql}"
+            )
+    if name == "group-by-expr-nested-in-select":
+        # The grouping expression must be rendered only inside the scope. Checked
+        # on the rendered call, not on the base column: the dialect sanitises the
+        # derived output's alias out of the schema name, which spells the base
+        # column inside it.
+        outer_select = sql.split(" FROM ", 1)[0]
+        if "TIMESTAMP_TRUNC" in outer_select:
+            raise HarnessError(
+                f"the outer select list still re-derives the grouping expression, which "
+                f"BigQuery cannot bind against its GROUP BY: {sql}"
+            )
+        if "GROUP BY" not in sql or "TIMESTAMP_TRUNC" not in sql:
+            raise HarnessError(
+                f"the scope has to carry the grouping expression and its GROUP BY: {sql}"
+            )
+    if name == "aggregate-window-range-frame":
+        # Only the window's own ORDER BY is at issue; the statement's top-level
+        # ORDER BY carries its NULLS clause perfectly well.
+        over_clause = sql.split("OVER (", 1)[1].split(")", 1)[0]
+        if "IS NULL ASC" not in over_clause:
+            raise HarnessError(
+                f"the NULL placement was not spelled as an ascending leading key, so "
+                f"BigQuery refuses this RANGE window or orders NULLs at the wrong end: "
+                f"{sql}"
+            )
+        if "NULLS" in over_clause:
+            raise HarnessError(
+                f"a NULLS clause survived inside the RANGE frame: {sql}"
+            )
+        if "RANGE" not in over_clause:
+            raise HarnessError(f"the RANGE frame itself was lost: {sql}")
+    if name == "group-by-column-nested-in-select-control":
+        # A grouped column binds flattened, so the scope must not be paid here:
+        # one statement, one SELECT, no derived table.
+        if "FROM (SELECT" in sql:
+            raise HarnessError(
+                f"{name} binds as one SELECT for BigQuery, so it must not be scoped: {sql}"
+            )
+    if name in {"recursive-cte-joined-to-a-table", "filtered-recursive-self-join"}:
+        if not sql.lstrip().upper().startswith("WITH RECURSIVE"):
+            raise HarnessError(
+                f"the recursive CTE is not at the top level of the pushed statement, "
+                f"which is the only place BigQuery accepts one: {sql}"
+            )
+        if sql.upper().count("WITH RECURSIVE") != 1:
+            raise HarnessError(
+                f"the recursive CTE was hoisted more than once, so BigQuery is asked "
+                f"to define the same name twice: {sql}"
             )
 
 
@@ -527,6 +834,7 @@ def main() -> int:
     dataset_ref = bigquery.Dataset(f"{project}.{dataset}")
     dataset_ref.location = location
     dataset_ref.labels = {"purpose": "spice-bigquery-pushdown"}
+    dataset_ref.default_table_expiration_ms = 86_400_000
     created_dataset = False
     succeeded = False
     process: subprocess.Popen[bytes] | None = None
@@ -585,7 +893,7 @@ def main() -> int:
                 "false",
                 str(pod_path),
             ],
-            cwd=ROOT,
+            cwd=output,
             env=environment,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
@@ -593,9 +901,15 @@ def main() -> int:
         wait_until_ready(process, http_port, timeout=180)
 
         generated_sql: dict[str, str] = {}
+        executions: dict[str, dict[str, str]] = {}
         for name, query in QUERIES.items():
             (output / f"{name}.sql").write_text(query + ";\n", encoding="utf-8")
+            query_started = datetime.now(timezone.utc)
             status, headers, body = http_sql(http_port, query)
+            executions[name] = {
+                "started": query_started.isoformat(),
+                "ended": datetime.now(timezone.utc).isoformat(),
+            }
             write_json(output / f"{name}.headers.json", headers)
             (output / f"{name}.body").write_text(body, encoding="utf-8")
             if status != 200:
@@ -615,26 +929,29 @@ def main() -> int:
                 raise HarnessError(
                     f"EXPLAIN VERBOSE for {name} returned HTTP {explain_status}: {explain_body}"
                 )
+            statements = pushed_statement_count(explain_body)
+            if statements != 1:
+                raise HarnessError(
+                    f"{name} reaches BigQuery as {statements} statements, not one:\n"
+                    f"{explain_body[:2000]}"
+                )
             pushed_sql = initial_physical_sql(explain_body)
             assert_generated_sql(name, pushed_sql)
             generated_sql[name] = pushed_sql
-            print(f"{name}: ok")
+            print(f"{name}: ok ({statements} statement)")
 
         write_json(output / "generated-sql.json", generated_sql)
+        write_json(output / "executions.json", executions)
         jobs = []
         for job in sorted(
-            client.list_jobs(min_creation_time=started, max_results=100),
+            client.list_jobs(min_creation_time=started),
             key=lambda item: item.created,
         ):
             query = getattr(job, "query", None)
-            if query and not any(
-                table in query
-                for table in (
-                    "union_values",
-                    "json_values",
-                    "window_values",
-                    "regexp_values",
-                )
+            default_dataset = getattr(job, "default_dataset", None)
+            if not query or (
+                dataset not in query
+                and (default_dataset is None or default_dataset.dataset_id != dataset)
             ):
                 continue
             jobs.append(
@@ -645,9 +962,21 @@ def main() -> int:
                     "state": job.state,
                     "error_result": job.error_result,
                     "query": query,
+                    "default_dataset": str(default_dataset) if default_dataset else None,
                 }
             )
         write_json(output / "bigquery-jobs.json", jobs)
+        counts = {
+            name: [
+                job["job_id"] for job in jobs
+                if execution["started"] <= job["created"] <= execution["ended"]
+            ]
+            for name, execution in executions.items()
+        }
+        write_json(output / "query-job-ids.json", counts)
+        for name, job_ids in counts.items():
+            if len(job_ids) != 1:
+                raise HarnessError(f"{name} created {len(job_ids)} BigQuery jobs: {job_ids}")
         succeeded = True
         print(f"PASS evidence={output}")
         return 0

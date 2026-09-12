@@ -60,7 +60,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
+        uses: spiceai/spiceio/.github/actions/setup@71b9a1f2d548b19503a023e9b0c033c0931f92da # v0.9.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -121,6 +121,22 @@ jobs:
 
       - name: Check runtime/openapi feature
         run: cargo check --no-default-features --features runtime/openapi --profile lint
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      # `mcp` is excluded from the powerset above, so nothing else compiles
+      # `runtime-tools` under its own `mcp` feature: it is otherwise only ever built as
+      # part of a graph including `runtime`, which supplies the feature's real
+      # requirements and hides them from the declaration.
+      #
+      # `-p` is what makes this a guard rather than another workspace build. Without it
+      # Cargo selects the workspace `default-members` (`bin/spiced`) and checks that whole
+      # graph, which both costs far more and re-admits the feature unification the check
+      # exists to escape.
+      - name: Check runtime-tools/mcp feature
+        run: cargo check -p runtime-tools --features mcp --profile lint
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}

@@ -30,7 +30,7 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::AsArray;
+use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use data_components::cdc::{AccelerationContents, ChangeEnvelope, ChangesStream};
 use data_components::postgres_replication::{
@@ -613,6 +613,173 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// JSON, JSONB and text retain `PostgreSQL`'s text representation through both
+/// snapshot reads and binary pgoutput changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn json_and_jsonb_snapshot_then_binary_wal_match_source_text() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+    let (port, _container) = common::replication_test_database().await?;
+    let port = u16::try_from(port)?;
+    let source = common::connect(port).await?;
+    source.simple_query("DROP TABLE IF EXISTS public.repl_json_wire; CREATE TABLE public.repl_json_wire (id int PRIMARY KEY, json_value json, jsonb_value jsonb, text_value text); ALTER TABLE public.repl_json_wire REPLICA IDENTITY FULL").await?;
+    let slot = "spice_itest_slot_json_wire";
+    drop_replication_slot_when_inactive(&source, slot).await?;
+    let values = [
+        Some(r#"{ "z": [1, null], "a": true, "unicode": "한글 🦀" }"#),
+        Some(r#"[1, {"nested": [true, null]}, "é"]"#),
+        Some(r#""scalar 한글""#),
+        Some("42.125"),
+        Some("null"),
+        None,
+    ];
+    for (index, value) in values.iter().enumerate() {
+        let id = i32::try_from(index)?;
+        source.execute("INSERT INTO public.repl_json_wire VALUES ($1, $2::text::json, $2::text::jsonb, $2::text)", &[&id, value]).await?;
+    }
+    let input = || ReplicationStreamInput {
+        dataset_name: "repl_json_wire".into(),
+        params: params_for(port, slot, "spice_itest_pub_json_wire"),
+        schema: Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("json_value", DataType::Utf8, true),
+            Field::new("jsonb_value", DataType::Utf8, true),
+            Field::new("text_value", DataType::Utf8, true),
+        ])),
+        primary_keys: vec!["id".into()],
+        schema_name: "public".into(),
+        table_name: "repl_json_wire".into(),
+        metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::Block,
+        applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
+    };
+    let mut stream = start_replication_stream(input());
+    let snapshot = next_change_envelope(&mut stream, "JSON snapshot").await?;
+    assert_eq!(num_rows(&snapshot), values.len());
+    assert_json_wire_rows(&source, &snapshot, None).await?;
+    snapshot.commit().await?;
+    wait_for_ready(&mut stream, "JSON snapshot readiness")
+        .await?
+        .commit()
+        .await?;
+
+    for (index, value) in values.iter().enumerate() {
+        let id = 100 + i32::try_from(index)?;
+        source.execute("INSERT INTO public.repl_json_wire VALUES ($1, $2::text::json, $2::text::jsonb, $2::text)", &[&id, value]).await?;
+        let envelope = next_change_envelope(&mut stream, "binary JSON INSERT").await?;
+        assert_eq!(num_rows(&envelope), 1);
+        assert_json_wire_rows(&source, &envelope, Some("c")).await?;
+        envelope.commit().await?;
+        let updated = values[(index + 1) % values.len()];
+        source.execute("UPDATE public.repl_json_wire SET json_value=$2::text::json, jsonb_value=$2::text::jsonb, text_value=$2::text WHERE id=$1", &[&id, &updated]).await?;
+        let envelope = next_change_envelope(&mut stream, "binary JSON UPDATE").await?;
+        assert_json_wire_rows(&source, &envelope, Some("u")).await?;
+        envelope.commit().await?;
+        let expected_delete = source.query_one(
+            "SELECT json_value::text, jsonb_value::text, text_value FROM public.repl_json_wire WHERE id=$1", &[&id]
+        ).await?;
+        source
+            .execute("DELETE FROM public.repl_json_wire WHERE id=$1", &[&id])
+            .await?;
+        let envelope = next_change_envelope(&mut stream, "binary JSON DELETE").await?;
+        let batch = envelope.change_batch()?;
+        assert_eq!(
+            batch
+                .record
+                .column_by_name("op")
+                .expect("op")
+                .as_string::<i32>()
+                .value(0),
+            "d"
+        );
+        assert_eq!(
+            batch
+                .record
+                .column_by_name("data")
+                .expect("data")
+                .as_struct()
+                .column_by_name("id")
+                .expect("id")
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .value(0),
+            id
+        );
+        let data = batch
+            .record
+            .column_by_name("data")
+            .expect("data")
+            .as_struct();
+        for (column, name) in ["json_value", "jsonb_value", "text_value"]
+            .iter()
+            .enumerate()
+        {
+            let values = data
+                .column_by_name(name)
+                .expect("column")
+                .as_string::<i32>();
+            let actual = (!values.is_null(0)).then(|| values.value(0));
+            let expected: Option<String> = expected_delete.get(column);
+            assert_eq!(actual, expected.as_deref(), "DELETE id={id} column={name}");
+        }
+        envelope.commit().await?;
+    }
+    // A text-only change after JSONB changes proves that delivery continues.
+    source
+        .simple_query("UPDATE public.repl_json_wire SET text_value='after JSONB' WHERE id=0")
+        .await?;
+    let envelope = next_change_envelope(&mut stream, "following text UPDATE").await?;
+    assert_json_wire_rows(&source, &envelope, Some("u")).await?;
+    envelope.commit().await?;
+    drop(stream);
+    drop_replication_slot_when_inactive(&source, slot).await?;
+    Ok(())
+}
+
+async fn assert_json_wire_rows(
+    source: &tokio_postgres::Client,
+    envelope: &ChangeEnvelope,
+    expected_op: Option<&str>,
+) -> Result<(), anyhow::Error> {
+    let batch = envelope.change_batch()?;
+    let data = batch
+        .record
+        .column_by_name("data")
+        .expect("data")
+        .as_struct();
+    for row in 0..batch.record.num_rows() {
+        if let Some(op) = expected_op {
+            assert_eq!(
+                batch
+                    .record
+                    .column_by_name("op")
+                    .expect("op")
+                    .as_string::<i32>()
+                    .value(row),
+                op
+            );
+        }
+        let id = data
+            .column_by_name("id")
+            .expect("id")
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .value(row);
+        let expected = source.query_one("SELECT json_value::text, jsonb_value::text, text_value FROM public.repl_json_wire WHERE id=$1", &[&id]).await?;
+        for (column, name) in ["json_value", "jsonb_value", "text_value"]
+            .iter()
+            .enumerate()
+        {
+            let actual = data
+                .column_by_name(name)
+                .expect("column")
+                .as_string::<i32>();
+            let expected: Option<String> = expected.get(column);
+            let actual = (!actual.is_null(row)).then(|| actual.value(row));
+            assert_eq!(actual, expected.as_deref(), "id={id} column={name}");
+        }
+    }
+    Ok(())
+}
+
 /// Arrow schema covering every column type that has a distinct binary decoder,
 /// used by [`wide_column_types_binary_matches_text`].
 fn wide_schema() -> SchemaRef {
@@ -645,8 +812,7 @@ fn wide_schema() -> SchemaRef {
 #[tokio::test(flavor = "multi_thread")]
 async fn wide_column_types_binary_matches_text() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let (port, _container) = common::replication_test_database().await?;
     let port = u16::try_from(port).expect("port fits in u16");
 
     // Same scenario, both wire formats. Distinct table/slot/publication per run
@@ -1013,7 +1179,7 @@ async fn resume_with_stale_backlog_is_not_ready_until_caught_up() -> Result<(), 
     Ok(())
 }
 
-async fn drop_replication_slot_when_inactive(
+pub(super) async fn drop_replication_slot_when_inactive(
     source: &tokio_postgres::Client,
     slot: &str,
 ) -> Result<(), anyhow::Error> {

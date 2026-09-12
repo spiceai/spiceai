@@ -620,10 +620,12 @@ impl UCTable {
         UCTableType::from(self.table_type.as_str())
     }
 
-    /// Returns `true` if the table type is supported for direct querying
-    /// through the SQL Warehouse or Spark Connect connectors.
+    /// Returns `true` if the table type can be queried through the Databricks
+    /// connectors. Views and streaming tables are plain `SELECT` targets on a
+    /// SQL warehouse or Spark cluster; in `delta_lake` mode they still fail
+    /// later because they expose no storage location to read from.
     ///
-    /// `VIEW` and `STREAMING_TABLE` types are not supported.
+    /// Unrecognised types are rejected.
     #[must_use]
     pub fn is_queryable(&self) -> bool {
         self.parsed_table_type().is_queryable()
@@ -657,7 +659,12 @@ impl UCTableType {
     pub const fn is_queryable(self) -> bool {
         matches!(
             self,
-            Self::Managed | Self::External | Self::Foreign | Self::MaterializedView
+            Self::Managed
+                | Self::External
+                | Self::Foreign
+                | Self::View
+                | Self::MaterializedView
+                | Self::StreamingTable
         )
     }
 
@@ -940,12 +947,13 @@ mod tests {
         assert!(make_table("EXTERNAL").is_queryable());
         assert!(make_table("FOREIGN").is_queryable());
         assert!(make_table("MATERIALIZED_VIEW").is_queryable());
+        assert!(make_table("VIEW").is_queryable());
+        assert!(make_table("STREAMING_TABLE").is_queryable());
     }
 
     #[test]
-    fn test_non_queryable_table_types() {
-        assert!(!make_table("VIEW").is_queryable());
-        assert!(!make_table("STREAMING_TABLE").is_queryable());
+    fn test_unrecognised_table_types_are_not_queryable() {
+        assert!(!make_table("METRIC_VIEW").is_queryable());
         assert!(!make_table("UNKNOWN_TYPE").is_queryable());
     }
 
@@ -980,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_queryable_types_still_require_permission_validation() {
+    fn test_views_and_streaming_tables_require_permission_validation() {
         assert!(make_table("VIEW").requires_read_permission_validation());
         assert!(make_table("STREAMING_TABLE").requires_read_permission_validation());
     }

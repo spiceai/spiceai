@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
@@ -289,21 +292,26 @@ pub fn extract_and_format_metadata(
     Ok(metadata)
 }
 
-/// Filter out invalid embedding vectors where all values are either zero or NaN.
+/// Filter out the rows this batch will not store a vector for.
 ///
-/// This filters vectors that consist entirely of invalid values (zeros and/or NaNs).
-/// A vector with any valid non-zero, non-NaN value is kept.
-/// For example:
-/// - `[0.0, 0.0]` -> filtered (all zeros)
-/// - `[NaN, NaN]` -> filtered (all NaN)
-/// - `[0.0, NaN]` -> filtered (all values are either zero or NaN)
-/// - `[1.0, 0.0]` -> kept (has a valid non-zero value)
-/// - `[1.0, NaN]` -> kept (has a valid non-NaN value)
+/// A vector is dropped when it has no defined direction under any metric the index offers,
+/// which [`write_util::classify_vector`] decides: every component zero or `NaN`, or any
+/// component non-finite. For example:
+/// - `[0.0, 0.0]` -> filtered (no direction: all zero)
+/// - `[NaN, NaN]` -> filtered (no direction: all NaN)
+/// - `[0.0, NaN]` -> filtered (no direction: every component is zero or NaN)
+/// - `[1.0, NaN]` -> filtered (non-finite: every distance to it is `NaN`)
+/// - `[0.0, Inf]` -> filtered (non-finite, and note the all-zero test does not catch it)
+/// - `[1.0, 0.0]` -> kept (a finite, non-zero direction)
 ///
 /// The fourth element is the keys this batch will not store a vector for and so must
 /// delete, per [`write_util::keys_to_evict`]. It covers the rows filtered here and the
 /// rows carrying no embedding at all — `write_data` drops a `None` embedding, which
 /// leaves an earlier vector in place just as a filtered row does.
+///
+/// A row whose key is evicted is dropped from the write as well, even when its own vector
+/// is fine: the delete runs before the put, so storing it would restore under that key a
+/// row a later row of the same batch replaced with one this write cannot embed.
 #[expect(clippy::type_complexity)]
 fn filter_zero_vectors(
     mut embeddings: Vec<Option<Vec<f32>>>,
@@ -316,23 +324,61 @@ fn filter_zero_vectors(
     HashMap<String, Vec<Option<Value>>>,
     Vec<String>,
 ) {
-    let mut rejected: Vec<String> = Vec::new();
-    // Filter in reverse order to avoid index shifting when removing elements
-    for i in (0..embeddings.len()).rev() {
-        if let Some(embedding) = &embeddings[i]
-            // Single pass: check if all values are zero or NaN (both are invalid embeddings)
-            && embedding.iter().all(|&x| x == 0.0 || x.is_nan())
-        {
-            let key = primary_keys.get(i).and_then(Option::as_ref);
-            let key_str = key.map_or("unknown", String::as_str);
-            tracing::warn!(
-                "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes or contains only invalid values. Any vector already stored for this record is removed, so it is not returned at its previous value"
-            );
+    // Per row: the key this row would be stored under, or `None` for a row that addresses
+    // no stored vector, and what this write would do with it. In row order, because that is
+    // what decides a key the batch carries more than once.
+    let rows: Vec<(Option<&str>, write_util::RowOutcome)> = embeddings
+        .iter()
+        .zip(primary_keys.iter())
+        .map(|(embedding, key)| {
+            let outcome = match embedding {
+                Some(embedding) => match write_util::classify_vector(embedding) {
+                    Some(rejection) => {
+                        let key_str = key.as_deref().unwrap_or("unknown");
+                        let reason = rejection.reason();
+                        tracing::warn!(
+                            "Skipping record '{key_str}' for S3 Vector index '{index_name}': {reason}. Any vector already stored for this record is removed, so it is not returned at its previous value"
+                        );
+                        write_util::RowOutcome::Rejected
+                    }
+                    None => write_util::RowOutcome::Indexed,
+                },
+                // `write_data` skips a row whose embedding is `None` (a NULL or empty search
+                // text), so those keys keep whatever vector an earlier text stored.
+                None => write_util::RowOutcome::Rejected,
+            };
             // A NULL key addresses no stored vector, so there is nothing to remove.
-            if let Some(key) = key {
-                rejected.push(key.clone());
-            }
+            (key.as_deref(), outcome)
+        })
+        .collect();
 
+    let evicted = write_util::keys_to_evict(
+        rows.iter()
+            .filter_map(|(key, outcome)| key.map(|key| (key, *outcome))),
+    );
+    let evicted_keys: HashSet<&str> = evicted.iter().map(String::as_str).collect();
+
+    // A row this write will not store: its own vector is invalid, or a later row of the
+    // batch decided its key against it and the delete below would otherwise be undone by
+    // the put. A row with no embedding at all is left in place either way — `write_data`
+    // skips it, so removing it would only change the arrays for no effect.
+    let drop_row: Vec<bool> = rows
+        .iter()
+        .zip(embeddings.iter())
+        .map(|((key, outcome), embedding)| {
+            embedding.is_some()
+                && match outcome {
+                    write_util::RowOutcome::Rejected => true,
+                    write_util::RowOutcome::Indexed => {
+                        key.is_some_and(|key| evicted_keys.contains(key))
+                    }
+                }
+        })
+        .collect();
+
+    // In reverse order to avoid index shifting when removing elements.
+    for i in (0..drop_row.len()).rev() {
+        if drop_row[i] {
             embeddings.remove(i);
             primary_keys.remove(i);
             for values in metadata.values_mut() {
@@ -341,19 +387,6 @@ fn filter_zero_vectors(
         }
     }
 
-    // `write_data` skips a row whose embedding is `None` (a NULL or empty search
-    // text), so those keys keep whatever vector an earlier text stored.
-    let mut indexed: Vec<&str> = Vec::with_capacity(embeddings.len());
-    for (embedding, key) in embeddings.iter().zip(primary_keys.iter()) {
-        match (embedding, key) {
-            (Some(_), Some(key)) => indexed.push(key.as_str()),
-            // A NULL key addresses no stored vector, so `None` here evicts nothing.
-            (None, Some(key)) => rejected.push(key.clone()),
-            _ => {}
-        }
-    }
-
-    let evicted = write_util::keys_to_evict(rejected, indexed);
     (embeddings, primary_keys, metadata, evicted)
 }
 
@@ -362,6 +395,64 @@ mod tests {
     use super::*;
     use arrow::array::{Int32Array, UnionArray};
     use arrow_schema::{DataType, Schema, UnionFields, UnionMode};
+
+    /// Regression test for #13872. The batch carries one key twice and the row that
+    /// *decides* it carries a vector the index cannot use. Before the shared classifier,
+    /// only the all-zero / all-NaN shapes were a rejection here, so a partially non-finite
+    /// deciding row evicted nothing and the stale vector stayed searchable — while the
+    /// unusable vector was itself put alongside it.
+    #[test]
+    fn every_unindexable_shape_evicts_its_key_and_is_not_put() {
+        for (name, deciding, _) in write_util::unindexable_shapes(2) {
+            let embeddings = vec![
+                Some(vec![1.0_f32, 2.0]),
+                Some(vec![3.0_f32, 4.0]),
+                Some(deciding),
+            ];
+            let keys = vec![
+                Some("same".to_string()),
+                Some("other".to_string()),
+                Some("same".to_string()),
+            ];
+            let (kept, kept_keys, _metadata, evicted) =
+                filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
+
+            assert_eq!(
+                evicted,
+                vec!["same".to_string()],
+                "the deciding row for 'same' is a {name} vector, so whatever S3 Vectors \
+                 already holds under that key must be removed"
+            );
+            assert_eq!(
+                kept_keys.into_iter().flatten().collect::<Vec<_>>(),
+                vec!["other".to_string()],
+                "the delete runs before the put, so putting the earlier row would restore \
+                 the entry the eviction exists to remove"
+            );
+            assert_eq!(kept.len(), 1);
+        }
+    }
+
+    /// The control: an ordinary deciding vector leaves both rows in the put and evicts
+    /// nothing, so the guard above is measuring the shapes and not the repeated key.
+    #[test]
+    fn an_ordinary_deciding_vector_evicts_nothing_and_puts_every_row() {
+        let embeddings = vec![
+            Some(vec![1.0_f32, 2.0]),
+            Some(vec![3.0_f32, 4.0]),
+            Some(write_util::indexable_shape(2)),
+        ];
+        let keys = vec![
+            Some("same".to_string()),
+            Some("other".to_string()),
+            Some("same".to_string()),
+        ];
+        let (kept, _kept_keys, _metadata, evicted) =
+            filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
+
+        assert!(evicted.is_empty());
+        assert_eq!(kept.len(), 3);
+    }
 
     #[test]
     fn test_filter_zero_vectors() {
@@ -505,17 +596,43 @@ mod tests {
         assert!(evicted.is_empty(), "a NULL key names no stored vector");
     }
 
-    /// The same key indexed and rejected within one batch: the put re-establishes it, so a
-    /// delete would only cost a round trip.
+    /// The same key rejected and then stored within one batch: the row that decides the key
+    /// is the one the put re-establishes, so a delete would only cost a round trip.
     #[test]
-    fn a_key_this_batch_also_stores_is_not_named_for_deletion() {
-        let embeddings = vec![Some(vec![1.0, 2.0]), Some(vec![0.0, 0.0])];
+    fn a_key_this_batch_stores_after_rejecting_is_not_named_for_deletion() {
+        let embeddings = vec![Some(vec![0.0, 0.0]), Some(vec![1.0, 2.0])];
         let keys = keys_of(&[Some("same"), Some("same")]);
 
-        let (_, _, _, evicted) =
+        let (filtered_embeddings, filtered_keys, _, evicted) =
             filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
 
         assert!(evicted.is_empty());
+        assert_eq!(
+            filtered_embeddings,
+            vec![Some(vec![1.0, 2.0])],
+            "the deciding row is still stored"
+        );
+        assert_eq!(filtered_keys, keys_of(&[Some("same")]));
+    }
+
+    /// Regression test for #13848. The same pair the other way round: the row that decides
+    /// the key cannot be embedded, so the vector the earlier row would have stored is
+    /// exactly what a search must stop returning — the key is deleted, and the earlier row
+    /// is dropped from the put that would otherwise restore it.
+    #[test]
+    fn a_key_whose_deciding_row_is_rejected_is_deleted_and_not_stored() {
+        let embeddings = vec![Some(vec![1.0, 2.0]), Some(vec![0.0, 0.0])];
+        let keys = keys_of(&[Some("same"), Some("same")]);
+
+        let (filtered_embeddings, filtered_keys, _, evicted) =
+            filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
+
+        assert_eq!(evicted, vec!["same".to_string()]);
+        assert!(
+            filtered_embeddings.is_empty(),
+            "storing the earlier row would write the stale vector back over its own delete"
+        );
+        assert!(filtered_keys.is_empty());
     }
 
     #[test]
