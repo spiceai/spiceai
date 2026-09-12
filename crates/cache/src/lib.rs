@@ -42,6 +42,7 @@ pub mod utils;
 pub mod encoding;
 pub mod intern;
 pub mod key;
+mod namespace_key;
 pub mod result;
 
 pub use backend::CacheBackend;

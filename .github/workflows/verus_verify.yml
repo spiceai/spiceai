@@ -1,25 +1,32 @@
 ---
 name: Verus Verification
 
-# `crates/hash-index/src/sbbf_layout.rs` carries proofs, not just tests: the
-# block index it returns subscripts the bloom filter's block vector, so an
-# out-of-range result is a panic on a lock-free read path. The bound is a Verus
-# postcondition discharged for every input, which is a property no test can
-# establish by sampling. Nothing else in the normal build checks it — a normal
-# `cargo build` erases the specifications — so this gate is what keeps the
-# proofs from silently rotting into comments.
+# These crates carry proofs, not just tests. Nothing else in the normal build
+# checks them — a normal `cargo build` erases the specifications — so this gate
+# is what keeps the proofs from silently rotting into comments.
+#
+# `crates/hash-index/src/sbbf_layout.rs`: the block index it returns subscripts
+# the bloom filter's block vector, so an out-of-range result is a panic on a
+# lock-free read path. The bound is a Verus postcondition discharged for every
+# input, which is a property no test can establish by sampling.
+#
+# `crates/cache/src/namespace_key.rs`: the results-cache namespace prefix is
+# what keeps a principal from being served another principal's rows as a fresh
+# hit. Prefix-unambiguity of `[tag][id.len() LE][id]` is a Verus postcondition
+# discharged for every `(tag, id, payload)` triple.
 #
 # That is also why this runs on `merge_group` and not only on the pull request.
 # A proof is a claim about the tree it was checked against; two individually
 # green changes can combine into one the verifier would reject, and no other
 # check in the queue would notice.
 #
-# The job carries NO `paths` filter, deliberately. It is registered in
-# `REQUIRED_CHECKS` (scripts/signoff), and a required context has to be emitted
-# by every pull request — a workflow that never triggers reports nothing at all,
-# which blocks the PR rather than passing it. So the job always runs and always
-# reports; the change filter below skips only the verification work when nothing
-# it covers was touched. See docs/dev/ci_signoff.md.
+# One job, one required context (`Verify Verus proofs` in REQUIRED_CHECKS).
+# A second job per crate would be a second required check; do not add one.
+# The job carries NO `paths` filter, deliberately: a required context has to
+# be emitted by every pull request — a workflow that never triggers reports
+# nothing at all, which blocks the PR rather than passing it. So the job
+# always runs and always reports; the change filter below skips only the
+# verification work when nothing it covers was touched. See docs/dev/ci_signoff.md.
 on:
   pull_request:
     branches:
@@ -54,9 +61,10 @@ permissions:
 env:
   # The verifier and its specification library ship together and are versioned
   # together, so these move as a set. VERUS_VSTD_VERSION must match the `vstd`
-  # pin in `crates/hash-index/Cargo.toml`, and VERUS_SHA256 pins the exact
-  # bytes of the archive: a release tag names an asset, it does not fix its
-  # contents, and this job executes what it downloads.
+  # pin in every crate that opted into verification (`crates/hash-index` and
+  # `crates/cache` today), and VERUS_SHA256 pins the exact bytes of the
+  # archive: a release tag names an asset, it does not fix its contents, and
+  # this job executes what it downloads.
   VERUS_RELEASE: release/0.2026.08.30.b432e82
   VERUS_ASSET: verus-0.2026.08.30.b432e82-x86-linux.zip
   VERUS_SHA256: 067f5f72a457fe66b77c0c10b180f2a919a9c7481a8baa024ffc716aa931a41b
@@ -64,15 +72,19 @@ env:
 
 jobs:
   verus-verify:
-    name: Verify hash-index proofs
-    # GitHub-hosted on purpose: a seconds-long verification must not queue
-    # behind the saturated self-hosted pool.
+    # Crate-agnostic on purpose: this is the single required-check context
+    # for every crate that opted into `[package.metadata.verus]`. Adding a
+    # crate updates the verify loop and the path filter, not the job name.
+    name: Verify Verus proofs
+    # GitHub-hosted on purpose: verification must not queue behind the
+    # saturated self-hosted pool.
     runs-on: ubuntu-24.04
     # Bounded because this is a required `merge_group` check: an unbounded job
     # leaves the queue candidate `AWAITING_CHECKS` for GitHub's six-hour default
-    # and stalls every entry behind it (#12717). Observed runtime is ~7 minutes
-    # including a cold archive download.
-    timeout-minutes: 20
+    # and stalls every entry behind it (#12717). hash-index alone is ~7 minutes
+    # including a cold archive download; cache also compiles its DataFusion
+    # graph through the driver, so the bound sits above that combined cost.
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -95,6 +107,7 @@ jobs:
           filters: |
             code_changes:
               - 'crates/hash-index/**'
+              - 'crates/cache/**'
               # The verifier is a rustc driver bound to one toolchain, so a
               # workspace toolchain bump can invalidate this gate without
               # touching the crate.
@@ -151,13 +164,15 @@ jobs:
         if: steps.gate.outputs.verify == 'true'
         run: |
           set -euo pipefail
-          pinned=$(grep -oP 'vstd = "=\K[^"]+' crates/hash-index/Cargo.toml)
-          if [ "$pinned" != "$VERUS_VSTD_VERSION" ]; then
-            echo "::error::vstd pin in crates/hash-index/Cargo.toml is '$pinned'," \
-                 "but this workflow runs Verus '$VERUS_VSTD_VERSION'." \
-                 "The verifier and vstd ship together — update both."
-            exit 1
-          fi
+          for manifest in crates/hash-index/Cargo.toml crates/cache/Cargo.toml; do
+            pinned=$(grep -oP 'vstd = "=\K[^"]+' "$manifest")
+            if [ "$pinned" != "$VERUS_VSTD_VERSION" ]; then
+              echo "::error::vstd pin in $manifest is '$pinned'," \
+                   "but this workflow runs Verus '$VERUS_VSTD_VERSION'." \
+                   "The verifier and vstd ship together — update both."
+              exit 1
+            fi
+          done
 
       # Only the archive is cached. It is re-hashed and re-extracted on every
       # run, so a cache that has been tampered with fails the digest check
@@ -235,11 +250,21 @@ jobs:
 
       - name: Verify
         if: steps.gate.outputs.verify == 'true'
-        working-directory: crates/hash-index
         run: |
           set -euo pipefail
           export PATH="$VERUS_DIR:$PATH"
-          cargo verus focus 2>&1 | tee /tmp/verus.log
-          # `cargo verus` exits 0 when a crate opts out of verification and
-          # nothing is checked, so assert the proofs actually ran.
-          grep -qE 'verification results:: [1-9][0-9]* verified, 0 errors' /tmp/verus.log
+          # Every crate that opted into `[package.metadata.verus]` must be
+          # checked here, in this one job. A crate missing from this loop is
+          # a proof CI never sees. A second job per crate would be a second
+          # required check — do not split the loop out.
+          for crate_dir in crates/hash-index crates/cache; do
+            crate_name=$(basename "$crate_dir")
+            (
+              cd "$crate_dir"
+              cargo verus focus 2>&1 | tee "/tmp/verus-${crate_name}.log"
+            )
+            # `cargo verus` exits 0 when a crate opts out of verification and
+            # nothing is checked, so assert the proofs actually ran.
+            grep -qE 'verification results:: [1-9][0-9]* verified, 0 errors' \
+              "/tmp/verus-${crate_name}.log"
+          done

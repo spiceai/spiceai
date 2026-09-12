@@ -3478,6 +3478,7 @@ dependencies = [
  "tokio",
  "tracing",
  "twox-hash",
+ "vstd",
 ]
 
 [[package]]
