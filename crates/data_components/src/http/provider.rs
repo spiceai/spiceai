@@ -67,9 +67,6 @@ pub enum Error {
     #[snafu(display("HTTP request failed: {source}"))]
     HttpRequest { source: reqwest::Error },
 
-    #[snafu(display("HTTP request failed with status code {status}"))]
-    HttpServerError { status: u16 },
-
     #[snafu(display("HTTP client error ({status}): {message}"))]
     HttpClientError { status: u16, message: String },
 
@@ -101,9 +98,108 @@ pub enum Error {
 
     #[snafu(display("Failed to decompose HTTP response row into declared columns: {source}"))]
     JsonNesting { source: super::json_nest::Error },
+
+    #[snafu(display(
+        "Failed to fetch {endpoint} for {dataset}: the origin answered {status}, which \
+        `on_error_response` is set to treat as a failed request rather than as data. \
+        Fix the origin, or set `on_error_response: store` on this dataset to keep recording \
+        the response body as a row. \
+        See: https://spiceai.org/docs/components/data-connectors/https"
+    ))]
+    ErrorResponse {
+        status: u16,
+        endpoint: String,
+        dataset: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The part of a *configured* endpoint that is safe to put in an error or a log line:
+/// scheme, host and port, and nothing else.
+///
+/// **Pass the dataset's `base_url`, never a built request URL.** Everything a query
+/// contributes to a request is out of bounds: `request_query_filters` puts a query's own
+/// values in the query string, and `build_request_url` appends a `request_path` the query
+/// chose — which `allowed_request_paths` admits by glob, so a wildcard allowlist lets a
+/// filter name any path under the endpoint.
+///
+/// **The path is dropped even though the operator wrote it**, because a path is a place
+/// credentials are routinely kept rather than a merely descriptive part of a URL: a
+/// webhook endpoint carries its whole secret there, and so do the "unguessable URL"
+/// designs several APIs use in place of a header. The reader of these messages is whoever
+/// ran the query, who need not be the operator who can see the spicepod, so the path is
+/// theirs to keep. Nothing is lost that the reader needs: every message built from this
+/// also names the dataset, which identifies the endpoint uniquely and is what an operator
+/// looks up to fix it.
+fn endpoint_label(url: &Url) -> String {
+    // `Origin::ascii_serialization` renders scheme, host and a non-default port and can
+    // carry nothing else — no path, query, fragment or userinfo — so the redaction is a
+    // property of the type rather than of remembering to clear each field.
+    url.origin().ascii_serialization()
+}
+
+/// What the connector does with a response the origin did not mark as successful.
+///
+/// A non-2xx body is otherwise recorded as an ordinary row, and on a dataset with
+/// `refresh_mode: full` that row *replaces* the previously good contents — a transient
+/// origin failure substitutes error pages for data without the query result marking it
+/// (spiceai/spiceai#13515).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ErrorResponseAction {
+    /// Fail the request, so a refresh fails and the accelerated table keeps what it had.
+    #[default]
+    Error,
+    /// Record the response as a row, and warn that it happened.
+    Warn,
+    /// Record the response as a row, silently.
+    Store,
+}
+
+impl ErrorResponseAction {
+    /// The value that selects this variant in a dataset's `params`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorResponseAction::Error => "error",
+            ErrorResponseAction::Warn => "warn",
+            ErrorResponseAction::Store => "store",
+        }
+    }
+
+    /// Every action, in the order they are listed to the user. Holds the variants
+    /// rather than their spellings so the list and [`Self::as_str`] cannot disagree.
+    pub const VARIANTS: [Self; 3] = [Self::Error, Self::Warn, Self::Store];
+
+    /// The accepted values, joined for a message that has to list them.
+    #[must_use]
+    pub fn accepted_values() -> String {
+        Self::VARIANTS
+            .iter()
+            .map(|action| action.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for ErrorResponseAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ErrorResponseAction {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "error" => Ok(ErrorResponseAction::Error),
+            "warn" => Ok(ErrorResponseAction::Warn),
+            "store" => Ok(ErrorResponseAction::Store),
+            _ => Err(()),
+        }
+    }
+}
 
 impl From<Error> for DataFusionError {
     fn from(err: Error) -> Self {
@@ -112,10 +208,21 @@ impl From<Error> for DataFusionError {
             Error::HttpClientError { status, message } => {
                 DataFusionError::Plan(format!("HTTP client error ({status}): {message}"))
             }
-            // Server errors (5xx) are external errors
-            Error::HttpServerError { status } => DataFusionError::External(Box::new(
-                std::io::Error::other(format!("HTTP request failed with status code {status}")),
-            )),
+            // The origin answered, and said the answer was not a success. Which
+            // DataFusionError this becomes decides whether a *refresh* retries it:
+            // `check_and_mark_retriable_error` wraps everything except `Plan`/`SQL`/
+            // `SchemaError` as retriable, so an `External` 404 would have one refresh
+            // invocation re-asking an origin that will keep saying no. The statuses worth
+            // re-asking are the ones the request ladder already retries, so both read the
+            // same predicate rather than two taxonomies that can drift apart.
+            Error::ErrorResponse { status, .. } => {
+                let message = err.to_string();
+                if HttpTableProvider::is_retryable_status(status) {
+                    DataFusionError::External(Box::new(std::io::Error::other(message)))
+                } else {
+                    DataFusionError::Plan(message)
+                }
+            }
             // Retry exhaustion is an external error
             Error::AllRetriesFailed { max_retries, url } => {
                 DataFusionError::External(Box::new(std::io::Error::other(format!(
@@ -647,6 +754,10 @@ pub struct HttpTableProvider {
     /// static columns plus a catch-all JSON column. Schema is replaced
     /// with the user-declared columns (all `Utf8`).
     json_nesting: Option<HttpJsonNesting>,
+    error_response_action: ErrorResponseAction,
+    /// The dataset this provider serves, for messages that have to name it. Absent when
+    /// the provider is built outside a dataset (tests, the optimizer's fixtures).
+    dataset_name: Option<String>,
 }
 
 impl std::fmt::Debug for HttpTableProvider {
@@ -656,6 +767,7 @@ impl std::fmt::Debug for HttpTableProvider {
             .field("file_format", &self.file_format)
             .field("acceleration_enabled", &self.acceleration_enabled)
             .field("pagination", &self.pagination)
+            .field("error_response_action", &self.error_response_action)
             .finish_non_exhaustive()
     }
 }
@@ -700,7 +812,35 @@ impl HttpTableProvider {
             rate_limiter: None,
             rate_controller: None,
             json_nesting: None,
+            error_response_action: ErrorResponseAction::default(),
+            dataset_name: None,
         }
+    }
+
+    /// Name the dataset this provider serves, so a failure can say which one it was.
+    /// Several datasets can share one endpoint with different request filters, so the
+    /// endpoint alone does not identify the failure for an operator.
+    #[must_use]
+    pub fn with_dataset_name(mut self, dataset_name: impl Into<String>) -> Self {
+        self.dataset_name = Some(dataset_name.into());
+        self
+    }
+
+    /// How a message refers to the dataset: by name when there is one, and by a phrase
+    /// that still reads as a sentence when there is not.
+    fn dataset_subject(&self) -> String {
+        self.dataset_name.as_ref().map_or_else(
+            || "this dataset".to_string(),
+            |name| format!("dataset '{name}'"),
+        )
+    }
+
+    /// Set what a response the origin did not mark successful becomes: a failed
+    /// request, or a row (with or without a warning). See [`ErrorResponseAction`].
+    #[must_use]
+    pub fn with_error_response_action(mut self, action: ErrorResponseAction) -> Self {
+        self.error_response_action = action;
+        self
     }
 
     #[must_use]
@@ -1520,18 +1660,33 @@ impl HttpTableProvider {
 
         // If retries exhausted due to transient errors (5xx/429), make one final attempt
         // and return whatever response we get - the response is still valid data.
-        // Don't retry on permanent errors (e.g., failed to read response body).
-        if let Ok(fetch_result) = result {
-            Ok(fetch_result)
-        } else {
-            tracing::debug!(
-                "Retries exhausted for {url}, making final attempt accepting any status"
-            );
-            self.perform_single_request(&url, body, request_headers, path_label, true)
-                .await
-                .map_err(|e| match e {
-                    RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
-                })
+        match result {
+            Ok(fetch_result) => Ok(fetch_result),
+            // That final attempt exists only to turn an exhausted retry into a row. Under
+            // `error` there is no row to make, so it would spend one more request on an
+            // origin that has already failed and arrive at this same error regardless.
+            //
+            // Only when the ladder ended on a *status*, though. A ladder exhausted by a
+            // network error, a rate-control acquisition failure or a body read that broke
+            // mid-stream is a different case: the extra attempt is a real recovery chance
+            // that has nothing to do with this action, and if it does answer non-2xx the
+            // check in `perform_single_request` refuses it there.
+            Err(err @ Error::ErrorResponse { .. })
+                if self.error_response_action == ErrorResponseAction::Error =>
+            {
+                Err(err)
+            }
+            Err(_) => {
+                tracing::debug!(
+                    "Retries exhausted for {}, making final attempt accepting any status",
+                    endpoint_label(&self.base_url)
+                );
+                self.perform_single_request(&url, body, request_headers, path_label, true)
+                    .await
+                    .map_err(|e| match e {
+                        RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
+                    })
+            }
         }
     }
 
@@ -1606,29 +1761,56 @@ impl HttpTableProvider {
         self.update_rate_limiter_from_headers(&response_headers)
             .await;
 
-        // 5xx/429: retry with backoff (transient server issue or rate limiting)
-        // After retries exhausted, we'll accept the response as valid data.
+        // 5xx/429: retry with backoff (transient server issue or rate limiting).
+        // Carries the same error the accepting pass below would raise, so exhausting the
+        // ladder and being handed the status directly read the same way to the operator.
         if !accept_retryable && Self::is_retryable_status(status_code) {
             tracing::debug!("HTTP retryable status ({status_code}), will retry");
-            if let Err(e) = response.error_for_status() {
-                return Err(RetryError::transient(Error::HttpRequest { source: e }));
-            }
-            // Defensive: should never reach here since 4xx and 5xx always produce error_for_status Err
-            return Err(RetryError::transient(Error::HttpServerError {
+            return Err(RetryError::transient(Error::ErrorResponse {
                 status: status_code,
+                endpoint: endpoint_label(&self.base_url),
+                dataset: self.dataset_subject(),
             }));
         }
 
-        // 2xx, 3xx, 4xx (and 5xx/429 when accept_retryable=true): valid response
-        // 4xx like 404 "not found" is a valid business response, not an error
-        Self::extract_response(
+        // Everything the origin did not mark successful reaches here: 4xx always (a 404
+        // "not found" can be a business fact for an API-shaped dataset), and 5xx/429 once
+        // retries are exhausted. `error_response_action` decides whether such a body is
+        // data. Anything but `Store` has to answer here rather than downstream of the row:
+        // the row is what a full refresh writes over good data with.
+        let is_error_response = !(200..300).contains(&status_code);
+
+        if is_error_response && self.error_response_action == ErrorResponseAction::Error {
+            // Permanent: the retry ladder above already spent its attempts on the statuses
+            // worth retrying, so retrying here would only repeat them.
+            return Err(RetryError::Permanent(Error::ErrorResponse {
+                status: status_code,
+                endpoint: endpoint_label(&self.base_url),
+                dataset: self.dataset_subject(),
+            }));
+        }
+
+        let fetched = Self::extract_response(
             response,
             status_code,
             path_label,
             attempt_started,
             self.auth.as_ref().map(|auth| auth.header_name()),
         )
-        .await
+        .await?;
+
+        // Warned only once the body is in hand. `extract_response` treats a broken read as
+        // transient and the request is retried, so warning before it would claim a row on
+        // every attempt, including the ones that never produce one.
+        if is_error_response && self.error_response_action == ErrorResponseAction::Warn {
+            tracing::warn!(
+                "The request to {} for {} answered {status_code}. If that response body parses, it is recorded as a row, and on a full refresh that row replaces the dataset's previous contents. Set `on_error_response: error` to fail the request instead, so a refresh keeps what it had. See: https://spiceai.org/docs/components/data-connectors/https",
+                endpoint_label(&self.base_url),
+                self.dataset_subject()
+            );
+        }
+
+        Ok(fetched)
     }
 
     /// Extract content and metadata from an HTTP response.
@@ -6826,6 +7008,9 @@ mod tests {
         // Use an invalid route that returns 404 with JSON error body
         let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
         let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            // What this asserts is that the connector can record an error response as a
+            // row, which is `store` rather than the default.
+            .with_error_response_action(ErrorResponseAction::Store)
             .with_allowed_paths(vec!["/search/invalid_404".to_string()])
             .expect("allowed paths");
 
@@ -6880,6 +7065,8 @@ mod tests {
         // httpbin.org provides endpoints that return specific HTTP status codes
         let url = Url::parse("https://httpbin.org").expect("valid URL");
         let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            // As above: recording the error response as a row is what `store` selects.
+            .with_error_response_action(ErrorResponseAction::Store)
             .with_allowed_paths(vec!["/status/500".to_string()])
             .expect("allowed paths");
 
@@ -7652,6 +7839,565 @@ mod tests {
             request_count.load(Ordering::SeqCst) > DEFAULT_PAGINATION_MAX_PAGES,
             "execution should request pages beyond the old safety limit"
         );
+    }
+
+    /// Serve `status` with `body` on every request, counting them, and return the URL to
+    /// point a provider at. Kept off `wiremock` so the request count is observed the same
+    /// way the sibling pagination server does it.
+    async fn start_status_server(status: u16, body: &'static str) -> (Url, Arc<AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_count = Arc::clone(&request_count_for_server);
+
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    request_count.fetch_add(1, Ordering::SeqCst);
+
+                    let response = format!(
+                        "HTTP/1.1 {status} STATUS\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        (
+            Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
+            request_count,
+        )
+    }
+
+    const TEST_DATASET: &str = "http_items";
+
+    fn status_provider(base_url: Url, action: ErrorResponseAction) -> HttpTableProvider {
+        HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
+            // The ladder is not what these assert, and every retry is a real sleep.
+            .with_max_retries(0)
+            .with_error_response_action(action)
+            .with_dataset_name(TEST_DATASET)
+    }
+
+    /// Run `SELECT content, response_status` against a provider serving one status.
+    async fn scan_status_dataset(
+        base_url: Url,
+        action: ErrorResponseAction,
+    ) -> std::result::Result<Vec<RecordBatch>, DataFusionError> {
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        ctx.register_table("items", Arc::new(status_provider(base_url, action)))
+            .expect("table should register");
+        ctx.sql("SELECT content, response_status FROM items")
+            .await?
+            .collect()
+            .await
+    }
+
+    #[test]
+    fn refusing_a_permanent_status_is_not_a_retriable_refresh_failure() {
+        use datafusion_table_providers::util::retriable_error::is_retriable_error;
+
+        // What this pins is not the DataFusionError variant but what the refresh layer
+        // does with it: `check_and_mark_retriable_error` treats everything except
+        // Plan/SQL/SchemaError as retriable, so an over-broad mapping has one refresh
+        // invocation re-asking an origin that will keep answering 404.
+        for status in [400, 401, 403, 404, 410, 451] {
+            let df: DataFusionError = Error::ErrorResponse {
+                status,
+                endpoint: "https://api.example.com/items".to_string(),
+                dataset: "dataset 'items'".to_string(),
+            }
+            .into();
+            assert!(
+                !is_retriable_error(&check_retriable(df)),
+                "{status} will not change on a retry, so a refresh must not re-ask for it"
+            );
+        }
+
+        // The statuses the request ladder itself retries are the ones a later refresh may
+        // usefully retry too; the two read the same predicate so they cannot drift.
+        for status in [429, 500, 502, 503, 504] {
+            let df: DataFusionError = Error::ErrorResponse {
+                status,
+                endpoint: "https://api.example.com/items".to_string(),
+                dataset: "dataset 'items'".to_string(),
+            }
+            .into();
+            assert!(
+                is_retriable_error(&check_retriable(df)),
+                "{status} is transient, so a later refresh should retry it"
+            );
+        }
+    }
+
+    /// Put a `DataFusionError` through the same wrapping the refresh path applies before
+    /// it asks whether the error is retriable.
+    fn check_retriable(err: DataFusionError) -> DataFusionError {
+        datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error(err)
+    }
+
+    #[test]
+    fn an_error_never_prints_the_part_of_a_url_that_carries_secrets() {
+        let url = Url::parse(
+            "https://tenant:hunter2@api.example.com:8443/v1/items?api_key=SECRET&cursor=TOKEN#frag",
+        )
+        .expect("valid URL");
+
+        let label = endpoint_label(&url);
+        for secret in ["hunter2", "tenant", "SECRET", "TOKEN", "api_key", "frag"] {
+            assert!(
+                !label.contains(secret),
+                "the label must not carry '{secret}': {label}"
+            );
+        }
+
+        // Still has to say which host was fetched, or the error is not worth reading.
+        assert!(
+            label.contains("api.example.com"),
+            "the label must still name the host: {label}"
+        );
+        assert!(
+            label.contains("8443"),
+            "a non-default port is part of the endpoint: {label}"
+        );
+        // The path goes too. An operator keeps credentials there — a webhook's secret is
+        // the path — and the reader of this message is whoever ran the query, not
+        // necessarily someone entitled to see the spicepod. The dataset named alongside it
+        // is what identifies the endpoint.
+        assert!(
+            !label.contains("/v1/items"),
+            "the configured path is not the reader's to see: {label}"
+        );
+
+        // And the message built from it inherits that, on both the error and the row-keeping
+        // path — the warning interpolates the same label.
+        let message = Error::ErrorResponse {
+            status: 503,
+            endpoint: label,
+            dataset: "dataset 'items'".to_string(),
+        }
+        .to_string();
+        assert!(
+            !message.contains("SECRET") && !message.contains("hunter2"),
+            "the rendered error must not carry the query or userinfo: {message}"
+        );
+    }
+
+    /// The secret-in-the-path shape specifically: a webhook endpoint keeps its whole
+    /// credential in the path the operator configured, so a label that renders the path
+    /// hands it to anyone who can provoke a non-2xx.
+    #[test]
+    fn an_error_never_prints_a_secret_the_configured_path_carries() {
+        let url = Url::parse("https://hooks.example.com/services/T0000/B0000/tOkEnSeCrEt")
+            .expect("valid URL");
+
+        let label = endpoint_label(&url);
+        for secret in ["tOkEnSeCrEt", "B0000", "T0000", "services"] {
+            assert!(
+                !label.contains(secret),
+                "the label must not carry '{secret}' from the path: {label}"
+            );
+        }
+        assert_eq!(label, "https://hooks.example.com");
+
+        let message = Error::ErrorResponse {
+            status: 401,
+            endpoint: label,
+            dataset: "dataset 'alerts'".to_string(),
+        }
+        .to_string();
+        assert!(
+            !message.contains("tOkEnSeCrEt"),
+            "the rendered error must not carry the path secret: {message}"
+        );
+        // The message is still actionable: it names the dataset to look up.
+        assert!(
+            message.contains("dataset 'alerts'"),
+            "the error must still name the dataset: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_never_prints_a_path_the_query_chose() {
+        // `allowed_request_paths` admits paths by glob, so a wildcard allowlist lets a
+        // SQL filter name any path under the endpoint — and `build_request_url` appends
+        // it. A path segment can therefore be a webhook secret or an embedded token, so
+        // the label has to come from the configured endpoint rather than the request.
+        let (base_url, _) = start_status_server(404, r#"{"error":"not found"}"#).await;
+
+        let provider = status_provider(base_url, ErrorResponseAction::Error)
+            .with_allowed_paths(vec!["/*".to_string()])
+            .expect("a wildcard allowlist is valid");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("items", Arc::new(provider))
+            .expect("table should register");
+
+        let error = ctx
+            .sql("SELECT content FROM items WHERE request_path = '/webhook/PATH-TOKEN'")
+            .await
+            .expect("query should plan")
+            .collect()
+            .await
+            .expect_err("a 404 must not be answered with rows");
+
+        let message = error.to_string();
+        assert!(
+            !message.contains("PATH-TOKEN"),
+            "a path the query chose must not reach the failure: {message}"
+        );
+        assert!(
+            message.contains("404"),
+            "the failure must still name the status: {message}"
+        );
+    }
+
+    #[test]
+    fn error_response_action_reads_every_documented_value() {
+        for action in ErrorResponseAction::VARIANTS {
+            let spelling = action.as_str();
+            let parsed: ErrorResponseAction = spelling
+                .parse()
+                .unwrap_or_else(|()| panic!("'{spelling}' is documented and must parse"));
+            assert_eq!(
+                parsed, action,
+                "'{spelling}' must round-trip through as_str"
+            );
+            assert!(
+                ErrorResponseAction::accepted_values().contains(spelling),
+                "'{spelling}' must be listed to the user"
+            );
+        }
+
+        // Case and surrounding whitespace are the operator's, not the parser's.
+        assert_eq!(
+            "  ERROR ".parse::<ErrorResponseAction>(),
+            Ok(ErrorResponseAction::Error)
+        );
+
+        // A value that is not one of them must not fall back to a policy: the connector
+        // reports it, and the operator learns their setting did not take.
+        for rejected in ["", "fail", "retain", "eror", "true"] {
+            assert!(
+                rejected.parse::<ErrorResponseAction>().is_err(),
+                "'{rejected}' is not a documented action and must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn error_response_action_defaults_to_refusing() {
+        // The default decides whether an origin failure can replace an accelerated
+        // table's contents with error bodies (#13515), so it is asserted rather than
+        // left to the derive.
+        assert_eq!(ErrorResponseAction::default(), ErrorResponseAction::Error);
+    }
+
+    #[tokio::test]
+    async fn a_server_error_response_does_not_become_a_row() {
+        use std::sync::atomic::Ordering;
+
+        let (base_url, request_count) =
+            start_status_server(503, r#"{"error":"unavailable"}"#).await;
+
+        let error = scan_status_dataset(base_url, ErrorResponseAction::Error)
+            .await
+            .expect_err("a 503 must not be answered with rows");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("503"),
+            "the failure must name the status the origin gave: {message}"
+        );
+        assert!(
+            message.contains("on_error_response"),
+            "the failure must name the parameter that decides this: {message}"
+        );
+        assert!(
+            message.contains("spiceai.org/docs/components/data-connectors/https"),
+            "the failure must link the connector's docs: {message}"
+        );
+        // Several datasets can share one endpoint with different request filters, so the
+        // endpoint alone does not say which one failed.
+        assert!(
+            message.contains(TEST_DATASET),
+            "the failure must name the dataset: {message}"
+        );
+
+        // The extra request that existed only to turn an exhausted retry into a row is
+        // not worth spending on an origin that has already failed.
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "refusing must not cost a second request"
+        );
+    }
+
+    /// Accept, count, and drop the connection without answering — a transient failure
+    /// that is not a status, which is what separates the two arms of the shortcut.
+    async fn start_hangup_server() -> (Url, Arc<AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_count = Arc::clone(&request_count_for_server);
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                });
+            }
+        });
+
+        (
+            Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
+            request_count,
+        )
+    }
+
+    /// Serve `status` with a `Content-Length` that overstates the body, then hang up — the
+    /// read fails after a valid status line, which `extract_response` treats as transient.
+    async fn start_truncated_body_server(status: u16) -> (Url, Arc<AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_count = Arc::clone(&request_count_for_server);
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    let head = format!(
+                        "HTTP/1.1 {status} STATUS\r\nContent-Type: application/json\r\nContent-Length: 400\r\n\r\n"
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(b"{\"partial\":").await;
+                    let _ = stream.flush().await;
+                    drop(stream);
+                });
+            }
+        });
+
+        (
+            Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
+            request_count,
+        )
+    }
+
+    /// Collect the `warn`-level lines emitted while `body` runs.
+    async fn warnings_emitted_during<F>(body: F) -> Vec<String>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use std::sync::Mutex;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buffer {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let sink = Buffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        // `set_default` rather than `with_default`: the latter takes a closure, which would
+        // force a `block_on` inside the test's own current-thread runtime and deadlock
+        // against the mock server's spawned tasks. The guard covers the provider's
+        // emissions because `#[tokio::test]` keeps this future on one thread.
+        let guard = tracing::subscriber::set_default(subscriber);
+        body.await;
+        drop(guard);
+
+        let captured = sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        String::from_utf8_lossy(&captured)
+            .lines()
+            .filter(|line| line.contains("WARN"))
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn warn_speaks_only_for_a_body_it_actually_has() {
+        use std::sync::atomic::Ordering;
+
+        // The warning claims a row is being recorded. `extract_response` treats a broken
+        // read as transient and the request is retried, so a warning emitted before it
+        // would make that claim on every attempt while producing no row at all.
+        let (base_url, request_count) = start_truncated_body_server(503).await;
+        let url = base_url.clone();
+
+        let warnings = warnings_emitted_during(async move {
+            let _ = scan_status_dataset(url, ErrorResponseAction::Warn).await;
+        })
+        .await;
+
+        assert!(
+            request_count.load(Ordering::SeqCst) >= 1,
+            "the server must have been asked at least once"
+        );
+        assert!(
+            warnings.is_empty(),
+            "no row was produced, so nothing should have claimed one: {warnings:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn warn_speaks_once_for_the_row_it_records() {
+        let (base_url, _) = start_status_server(404, r#"{"error":"not found"}"#).await;
+        let url = base_url.clone();
+
+        let warnings = warnings_emitted_during(async move {
+            let _ = scan_status_dataset(url, ErrorResponseAction::Warn).await;
+        })
+        .await;
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one recorded row is one warning: {warnings:#?}"
+        );
+        assert!(
+            warnings[0].contains("404") && warnings[0].contains("on_error_response"),
+            "the warning must name the status and the parameter: {warnings:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refusing_a_status_does_not_cost_a_network_failure_its_last_attempt() {
+        use std::sync::atomic::Ordering;
+
+        // The shortcut that skips the post-ladder attempt is about there being no row to
+        // make. A ladder exhausted by a network error is not that case, and it kept its
+        // extra attempt before `on_error_response` existed.
+        let (base_url, request_count) = start_hangup_server().await;
+
+        let _ = scan_status_dataset(base_url, ErrorResponseAction::Error).await;
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            2,
+            "a ladder exhausted by a network error keeps its post-ladder attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_error_response_does_not_become_a_row() {
+        // 404 is never retried, so it reaches the decision on the first response rather
+        // than through the exhausted ladder — a separate route to the same substitution.
+        let (base_url, _) = start_status_server(404, r#"{"error":"not found"}"#).await;
+
+        let error = scan_status_dataset(base_url, ErrorResponseAction::Error)
+            .await
+            .expect_err("a 404 must not be answered with rows");
+
+        assert!(
+            error.to_string().contains("404"),
+            "the failure must name the status the origin gave: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_keeps_recording_an_error_response_as_a_row() {
+        // The 404-as-a-business-fact dataset this connector already serves: `store` is
+        // the setting that keeps it working, so it is what makes the default a choice
+        // rather than a removal.
+        for action in [ErrorResponseAction::Store, ErrorResponseAction::Warn] {
+            let (base_url, _) = start_status_server(404, r#"{"error":"not found"}"#).await;
+
+            let batches = scan_status_dataset(base_url, action)
+                .await
+                .unwrap_or_else(|e| panic!("{action} must answer with the response body: {e}"));
+
+            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(total_rows, 1, "{action} must record the response as a row");
+
+            let statuses = batches[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .expect("response_status should be UInt16Array");
+            assert_eq!(
+                statuses.value(0),
+                404,
+                "{action} must record the status the origin gave"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refusing_an_error_response_leaves_a_successful_one_alone() {
+        // The control for the two refusal tests: the guard must decide on the status,
+        // not on every response reaching it.
+        let (base_url, _) = start_status_server(200, r#"{"id":1}"#).await;
+
+        let batches = scan_status_dataset(base_url, ErrorResponseAction::Error)
+            .await
+            .expect("a 200 must still be answered with rows");
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 1, "a successful response is still data");
     }
 
     #[test]
