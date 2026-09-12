@@ -65,10 +65,10 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let (app, mut start_request) = super::get_app_and_start_request(&test_args.common).await?;
 
     let query_set = test_args.load_query_set()?;
-    if !matches!(query_set, QuerySet::ChBench) {
+    if !matches!(query_set, QuerySet::ChBench | QuerySet::ChBenchFts) {
         anyhow::bail!(
-            "HTAP command requires the 'chbench' query set, but got '{query_set}'. \
-             Use '--query-set chbench' or run 'testoperator run bench' for other query sets."
+            "HTAP command requires the 'chbench' or 'chbench-fts' query set, but got '{query_set}'. \
+             Use '--query-set chbench' or '--query-set chbench-fts', or run 'testoperator run bench' for other query sets."
         );
     }
     super::ensure_shared_client_connections(test_args, "htap")?;
@@ -583,6 +583,25 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                     }
                     Err(e) => {
                         error_messages.push(format!("HTAP analytical-query error: {e}"));
+                    }
+                }
+
+                // The analytical gate above compares against the source engine,
+                // which has no `text_search` UDTF — the FTS queries are checked
+                // separately against a deterministic expectation instead. Gated
+                // the same way (row-count convergence + not skipped), since a
+                // diverged source/Spice row set makes this check meaningless too.
+                if matches!(query_set, QuerySet::ChBenchFts) {
+                    match correctness::verify_fts_results(&driver, &spice_clients).await {
+                        Ok(fts_report) => {
+                            fts_report.emit();
+                            if let Some(message) = fts_report.failure_message() {
+                                error_messages.push(message);
+                            }
+                        }
+                        Err(e) => {
+                            error_messages.push(format!("HTAP full-text-search gate error: {e}"));
+                        }
                     }
                 }
             }

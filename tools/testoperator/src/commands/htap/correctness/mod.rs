@@ -18,11 +18,15 @@ limitations under the License.
 //! workload stops: `row_count` waits for replication to drain and verifies
 //! per-table `MAX(_bench_ts)` + `COUNT(*)` parity, then `analytical`
 //! re-runs every CH-benCH analytical query against both source and Spice
-//! and compares the results.
+//! and compares the results. `fts` separately gates the `chbench-fts` query
+//! set's full-text queries, which `analytical` can't cover (the source has no
+//! `text_search` UDTF to compare against).
 
 pub mod analytical;
 pub mod compare;
+pub mod fts;
 pub mod row_count;
 
 pub use analytical::verify_analytical_results;
+pub use fts::verify_fts_results;
 pub use row_count::verify_after_drain;
