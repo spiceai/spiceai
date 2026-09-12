@@ -109,6 +109,8 @@ pub async fn unregister_all_factories(rt: &Runtime) {
 
     let mut tools = rt.tools.write().await;
     tools.clear();
+    #[cfg(feature = "mcp")]
+    rt.mcp_schemas.clear();
 }
 
 /// Get all catalogs available by default in the spice runtime.
