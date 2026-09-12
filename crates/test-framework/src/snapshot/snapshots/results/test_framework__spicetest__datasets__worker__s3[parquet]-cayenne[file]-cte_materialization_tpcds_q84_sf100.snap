@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q84"
+---
++------------------+--------------+
+| customer_id      | customername |
++------------------+--------------+
+| AAAAAAAAAAAKMBAA | Fry, Tiffany |
+| AAAAAAAAAAAKMBAA | Fry, Tiffany |
+| AAAAAAAAAAAKMBAA | Fry, Tiffany |
+| AAAAAAAAAAAKMBAA | Fry, Tiffany |
+| AAAAAAAAAAAKMBAA | Fry, Tiffany |
+| AAAAAAAAAAAKMBAA | Fry, Tiffany |
+| AAAAAAAAAAAKMBAA | Fry, Tiffany |
+| AAAAAAAAAAAKMBAA | Fry, Tiffany |
+| AAAAAAAAAAAKMBAA | Fry, Tiffany |
+| AAAAAAAAAAAKMBAA | Fry, Tiffany |
++------------------+--------------+

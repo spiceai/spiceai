@@ -78,7 +78,8 @@ use arrow::array::{Array, ArrayRef, RecordBatch, make_comparator};
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
 use datafusion::sql::sqlparser::ast::{
-    Expr, OrderBy, OrderByKind, Query as SqlQuery, SelectItem, SetExpr, Statement, Value,
+    Expr, LimitClause, OrderBy, OrderByKind, Query as SqlQuery, SelectItem, SetExpr, Statement,
+    Value,
 };
 use datafusion::sql::sqlparser::dialect::{Dialect, GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::parser::Parser;
@@ -771,6 +772,35 @@ fn statement_has_top_level_limit(statement: &Statement) -> bool {
     query.limit_clause.is_some() || query.fetch.is_some()
 }
 
+/// Top-level `LIMIT n` count, when it is a single integer literal.
+///
+/// `None` if there is no top-level limit, or if it is not a literal (`LIMIT
+/// $1`, `FETCH`, expressions). Callers that need to know whether a result
+/// filled the limit must treat `None` as unproven.
+#[must_use]
+pub fn top_level_limit_count(sql: &str) -> Option<usize> {
+    let statement = parse_one_statement(sql)?;
+    let Statement::Query(query) = statement else {
+        return None;
+    };
+    match query.limit_clause.as_ref() {
+        Some(LimitClause::LimitOffset {
+            limit: Some(expr), ..
+        }) => expr_as_usize(expr),
+        _ => None,
+    }
+}
+
+fn expr_as_usize(expr: &Expr) -> Option<usize> {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            Value::Number(n, _) => n.parse().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Resolve `sql`'s `ORDER BY` against `batches` and verify they honor it.
 ///
 /// # Errors
@@ -827,5 +857,24 @@ pub fn check_sort_order_parsed(
             verify_sorted_batch(batch, &key)?,
             unresolved_suffix,
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::top_level_limit_count;
+
+    #[test]
+    fn top_level_limit_count_reads_integer_literals() {
+        assert_eq!(
+            top_level_limit_count("SELECT v FROM t LIMIT 100"),
+            Some(100)
+        );
+        assert_eq!(top_level_limit_count("SELECT v FROM t LIMIT 2"), Some(2));
+        assert_eq!(top_level_limit_count("SELECT v FROM t"), None);
+        assert_eq!(
+            top_level_limit_count("SELECT v FROM t WHERE id IN (SELECT i FROM u LIMIT 5)"),
+            None
+        );
     }
 }

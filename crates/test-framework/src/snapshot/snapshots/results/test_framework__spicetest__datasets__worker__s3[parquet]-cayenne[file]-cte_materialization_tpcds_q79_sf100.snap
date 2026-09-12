@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q79"
+---
++-------------+--------------+--------------------------------------+------------------+---------+-----------+
+| c_last_name | c_first_name | substr(ms.s_city,Int64(1),Int64(30)) | ss_ticket_number | amt     | profit    |
++-------------+--------------+--------------------------------------+------------------+---------+-----------+
+| Aaron       | Bradley      | New Hope                             | 11784990         | 1279.06 | -19806.42 |
+| Aaron       | Brian        | Mount Pleasant                       | 23946370         | 558.81  | -9009.13  |
+| Aaron       | Charlene     | Riverside                            | 11154656         | 1031.85 | 1721.38   |
+| Aaron       | Charles      | New Hope                             | 18679418         | 663.11  | -7115.12  |
+| Aaron       | Charles      | Shady Grove                          | 11353238         | 247.82  | -10598.08 |
+| Aaron       | Charlie      | Riverside                            | 21750645         | 587.12  | -2707.72  |
+| Aaron       | Christopher  | Five Points                          | 22358858         | 1256.04 | -6135.78  |
+| Aaron       | Duncan       | Liberty                              | 21086067         | 194.82  | -10483.57 |
+| Aaron       | Evelyn       | Fairview                             | 22422534         | 8399.94 | -18530.60 |
+| Aaron       | Florence     | Bethel                               | 20126202         | 224.51  | 362.43    |
++-------------+--------------+--------------------------------------+------------------+---------+-----------+

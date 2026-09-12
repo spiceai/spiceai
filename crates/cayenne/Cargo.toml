@@ -113,6 +113,7 @@ result-correctness-duckdb = ["dep:duckdb"]
 result-correctness-chdb = ["dep:chdb-rust"]
 
 [dev-dependencies]
+datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 tpchgen = { workspace = true }
 vortex-io = { workspace = true }
 # Kept only for the `row_converter` byte-identity equivalence test; Cayenne's runtime no
