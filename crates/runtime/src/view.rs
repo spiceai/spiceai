@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::{
-    component::view::View, embeddings::index::table::wrap_table_as_index,
+    component::dataset::acceleration::RefreshMode, component::view::View,
+    datafusion::sql_validator::validate_view_append_refresh_plan,
+    embeddings::index::table::wrap_table_as_index,
     search::full_text::table::add_full_text_search_to_table,
 };
 use ::datafusion::sql::{TableReference, parser, sqlparser::ast};
@@ -107,6 +109,15 @@ pub(crate) async fn prepare_view(
     view: &Arc<View>,
 ) -> Result<Arc<dyn TableProvider>> {
     let plan = ctx.state().statement_to_plan(statement.clone()).await?;
+
+    if view
+        .acceleration
+        .as_ref()
+        .is_some_and(|acc| acc.refresh_mode == Some(RefreshMode::Append))
+    {
+        validate_view_append_refresh_plan(&plan)?;
+    }
+
     let view_table = ViewTable::new(plan, Some(view.sql.to_string()));
     let mut tbl_provider = Arc::new(view_table) as Arc<dyn TableProvider>;
 

@@ -18,7 +18,7 @@ use datafusion::sql::TableReference;
 use spicepod::vector::VectorStore;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use crate::dataset::{ReadyState, acceleration};
+use crate::dataset::{ReadyState, TimeFormat, acceleration};
 use spicepod::semantic::Column;
 
 /// Config-only core of a view — every declared field of a
@@ -30,6 +30,11 @@ pub struct ViewSpec {
     pub sql: Arc<str>,
     pub metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
+    /// Column carrying the row's time value, used by the acceleration /
+    /// warm-tier data-window logic (e.g. retention), mirroring datasets.
+    pub time_column: Option<String>,
+    /// Encoding of `time_column`'s values.
+    pub time_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
     pub ready_state: ReadyState,
     pub vectors: Option<VectorStore>,
@@ -42,6 +47,8 @@ impl PartialEq for ViewSpec {
             && self.sql == other.sql
             && self.metadata == other.metadata
             && self.columns == other.columns
+            && self.time_column == other.time_column
+            && self.time_format == other.time_format
             && self.acceleration == other.acceleration
             && self.vectors == other.vectors
             && self.params == other.params
@@ -56,6 +63,8 @@ impl std::fmt::Debug for ViewSpec {
             .field("sql", &self.sql)
             .field("metadata", &self.metadata)
             .field("columns", &self.columns)
+            .field("time_column", &self.time_column)
+            .field("time_format", &self.time_format)
             .field("acceleration", &self.acceleration)
             .field("ready_state", &self.ready_state)
             .field("vectors", &self.vectors)
