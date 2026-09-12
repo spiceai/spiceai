@@ -799,12 +799,20 @@ impl DataAccelerator for DuckDBAccelerator {
                 if file_path.exists() {
                     snapshot_before_recreate(
                         acceleration,
-                        &source.name().to_string(),
+                        source,
                         runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(
                             &path,
                         )),
                         AccelerationEngine::DuckDB,
                         Arc::new(arrow_schema::Schema::empty()),
+                        // The periodic path folds DuckDB's write-ahead log into the
+                        // database file first, because `DuckDbDatasetCheckpointer` runs a
+                        // `CHECKPOINT` ahead of the copy. This branch reaches
+                        // `create_snapshot` directly, so this backup of a `file_create`
+                        // wipe may omit whatever a previous unclean shutdown left in the
+                        // log. Opening the pool here to fold it in is not an option: the
+                        // pool is cached by path, and the delete below would strand it on
+                        // a removed file.
                         None,
                         resolved_refresh_mode(source, acceleration),
                     )

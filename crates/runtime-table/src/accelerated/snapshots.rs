@@ -234,6 +234,12 @@ pub fn spawn_snapshot_interval_task(
     last_updated_at: Arc<AtomicI64>,
     accelerator: Option<Arc<dyn TableProvider>>,
     refresh: Arc<RwLock<Refresh>>,
+    // The refresh whose provenance mark gates publishing, or `None` for a path whose rows
+    // cannot come from a request-scoped refresh override. Only `RefreshTaskRunner` maintains
+    // that mark and it exists only on the refresher path, so passing a `changes` stream's
+    // `refresh` here would gate every snapshot on a mark left at its `false` default —
+    // skipping snapshots forever for exactly the streaming datasets this trigger serves.
+    provenance: Option<Arc<RwLock<Refresh>>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let interval_duration = snapshots_create_interval?;
     let checkpointer = checkpointer?;
@@ -274,14 +280,16 @@ pub fn spawn_snapshot_interval_task(
             tokio::time::sleep(initial_delay).await;
         }
 
-        let refresh_sql = refresh
-            .read()
-            .await
-            .sql
-            .as_ref()
-            .map(super::refresh::RefreshSQL::to_sql);
+        let refresh_sql = {
+            let refresh = refresh.read().await;
+            refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql)
+        };
         create_checkpoint_and_snapshot(
             &checkpointer,
+            // Always passed; `create_checkpoint_and_snapshot` withholds it under the write
+            // mutex if the rows are not known to be the configured definition's result. The
+            // checkpoint still happens either way: the rows are real and worth recording
+            // locally even when no archive of them can carry that identity.
             Some(&snapshot_manager),
             &checkpoint_schema,
             &accelerator_write_mutex,
@@ -295,6 +303,7 @@ pub fn spawn_snapshot_interval_task(
             accelerator.as_ref(),
             Some(&federated_schema),
             refresh_sql.as_deref(),
+            provenance.as_ref(),
         )
         .await;
 
@@ -306,12 +315,10 @@ pub fn spawn_snapshot_interval_task(
             // Wait for the next snapshot interval (accounting for time spent during previous snapshot creation)
             ticker.tick().await;
 
-            let refresh_sql = refresh
-                .read()
-                .await
-                .sql
-                .as_ref()
-                .map(super::refresh::RefreshSQL::to_sql);
+            let refresh_sql = {
+                let refresh = refresh.read().await;
+                refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql)
+            };
             create_checkpoint_and_snapshot(
                 &checkpointer,
                 Some(&snapshot_manager),
@@ -323,6 +330,7 @@ pub fn spawn_snapshot_interval_task(
                 accelerator.as_ref(),
                 Some(&federated_schema),
                 refresh_sql.as_deref(),
+                provenance.as_ref(),
             )
             .await;
         }
@@ -347,6 +355,12 @@ pub fn create_periodic_snapshot_callback(
     last_updated_at: Arc<AtomicI64>,
     accelerator: Option<Arc<dyn TableProvider>>,
     refresh: Arc<RwLock<Refresh>>,
+    // The refresh whose provenance mark gates publishing, or `None` for a path whose rows
+    // cannot come from a request-scoped refresh override. Only `RefreshTaskRunner` maintains
+    // that mark and it exists only on the refresher path, so passing a `changes` stream's
+    // `refresh` here would gate every snapshot on a mark left at its `false` default —
+    // skipping snapshots forever for exactly the streaming datasets this trigger serves.
+    provenance: Option<Arc<RwLock<Refresh>>>,
 ) -> Option<SnapshotCallback> {
     match (checkpointer, snapshot_manager) {
         (Some(checkpointer), Some(snapshot_manager)) => {
@@ -374,17 +388,16 @@ pub fn create_periodic_snapshot_callback(
             let accelerator_write_mutex_clone = Arc::clone(&accelerator_write_mutex);
             let accelerator_clone = accelerator.clone();
             let refresh_clone = Arc::clone(&refresh);
+            let provenance_clone = provenance.clone();
             tokio::spawn(async move {
                 if runtime_status.wait_for_ready().await == WaitOutcome::ShuttingDown {
                     return;
                 }
                 if !bootstrap_status.is_bootstrapped() {
-                    let refresh_sql = refresh_clone
-                        .read()
-                        .await
-                        .sql
-                        .as_ref()
-                        .map(super::refresh::RefreshSQL::to_sql);
+                    let refresh_sql = {
+                        let refresh = refresh_clone.read().await;
+                        refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql)
+                    };
                     create_checkpoint_and_snapshot(
                         &checkpointer_clone,
                         Some(&snapshot_manager_clone),
@@ -396,6 +409,7 @@ pub fn create_periodic_snapshot_callback(
                         accelerator_clone.as_ref(),
                         Some(&federated_schema_clone),
                         refresh_sql.as_deref(),
+                        provenance_clone.as_ref(),
                     )
                     .await;
                 }
@@ -417,6 +431,7 @@ pub fn create_periodic_snapshot_callback(
                 let last_updated_at = Arc::clone(&last_updated_at);
                 let accelerator = accelerator.clone();
                 let refresh = Arc::clone(&refresh);
+                let provenance = provenance.clone();
 
                 Box::pin(async move {
                     let mut batches_processed_value = batches_processed.write().await;
@@ -430,12 +445,10 @@ pub fn create_periodic_snapshot_callback(
                     if *batches_processed_value >= batches {
                         *batches_processed_value = 0;
 
-                        let refresh_sql = refresh
-                            .read()
-                            .await
-                            .sql
-                            .as_ref()
-                            .map(super::refresh::RefreshSQL::to_sql);
+                        let refresh_sql = {
+                            let refresh = refresh.read().await;
+                            refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql)
+                        };
                         create_checkpoint_and_snapshot(
                             &checkpointer,
                             Some(&snapshot_manager),
@@ -447,6 +460,7 @@ pub fn create_periodic_snapshot_callback(
                             accelerator.as_ref(),
                             Some(&federated_schema),
                             refresh_sql.as_deref(),
+                            provenance.as_ref(),
                         )
                         .await;
                     }
@@ -472,8 +486,29 @@ pub async fn create_checkpoint_and_snapshot(
     accelerator: Option<&Arc<dyn TableProvider>>,
     federated_schema: Option<&Arc<Schema>>,
     refresh_sql: Option<&str>,
+    provenance: Option<&Arc<RwLock<Refresh>>>,
 ) {
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
+
+    // Asked HERE, under the write mutex, rather than by the caller before it: the mutex is
+    // what serialises this against the refresh that writes the rows, so inside it the rows
+    // and their provenance are one consistent pair. A caller that sampled the mark first
+    // could be overtaken by an overridden refresh and archive its rows under the configured
+    // definition's identity.
+    let publishable = match provenance {
+        Some(refresh) => refresh.read().await.materialization_is_configured(),
+        // No provenance to consult (a path with no refresher, e.g. a CDC-fed accelerator
+        // whose rows are never produced by a request-scoped refresh).
+        None => true,
+    };
+    let snapshot_manager = if publishable {
+        snapshot_manager
+    } else {
+        tracing::warn!(
+            "Skipped creating a snapshot of '{dataset_name}', so its snapshot series keeps the previously published contents: the rows now in the acceleration are not known to be this dataset's configured definition applied to its source"
+        );
+        None
+    };
     // Re-derive the checkpoint schema from the LIVE accelerator schema when both
     // the accelerator and the federated (source) schema are available, so an
     // in-place / live schema evolution (e.g. Cayenne CDC) that widened the
