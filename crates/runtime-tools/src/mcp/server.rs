@@ -789,7 +789,6 @@ pub fn mcp_schemas_from_map(tools: &HashMap<String, Tooling>) -> HashMap<String,
 ///
 /// Names already supplied by `try_all` are left alone: that page is
 /// read under the publish lock and may be newer than `warm`.
-#[expect(clippy::implicit_hasher)]
 fn mcp_schemas_from_map_with_warm(
     tools: &HashMap<String, Tooling>,
     warm: &[Arc<dyn SpiceModelTool>],
