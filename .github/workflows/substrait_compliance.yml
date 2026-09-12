@@ -45,11 +45,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
-# `dorny/paths-filter` (via check-code-changes) reads the changed-file
-# list for a pull request from the REST API, not from the checkout.
+# check-code-changes only runs on merge_group here, where dorny/paths-filter
+# diffs the checkout (`git diff <base>..<head>`). No pull-request REST API.
 permissions:
   contents: read
-  pull-requests: read
 
 env:
   CARGO_TERM_COLOR: always
