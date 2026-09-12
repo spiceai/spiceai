@@ -2,17 +2,17 @@
 source: crates/runtime/tests/spark/mod.rs
 description: Spark Integration Test Results
 ---
-+--------------------------------------------+-----------+
-| l_comment                                  | l_partkey |
-+--------------------------------------------+-----------+
-|  slyly bold notornis wake quickly blithely | 37435     |
-| blithely even pearls was slyly regular in  | 3037      |
-| ravely busy pinto beans. regular, r        | 139247    |
-| ithely about                               | 157238    |
-| requests. b                                | 141233    |
-| ecial theodolites. slyly ironic            | 167828    |
-| ly. blithely unusual deposits against      | 117961    |
-| en hockey players. speci                   | 42134     |
-| ly pending packages wake slyly             | 168569    |
-| sly ironic requests. final                 | 4660      |
-+--------------------------------------------+-----------+
++---------------------------------------------+-----------+
+| l_comment                                   | l_partkey |
++---------------------------------------------+-----------+
+| . sometimes bold pinto beans dazzle furious | 199997    |
+| oost quickly after the carefully            | 199996    |
+| le carefully slyly ironic de                | 199996    |
+| gular deposits ab                           | 199996    |
+| ely dogged asymptotes. slyly ev             | 199996    |
+| ly silent accounts nag. daring, final th    | 199995    |
+|  against t                                  | 199995    |
+| ts cajole with the slyly regular notornis   | 199994    |
+| egrate slyly. slyly even packages wake a    | 199991    |
+| into beans. unusual, special r              | 199990    |
++---------------------------------------------+-----------+

@@ -388,6 +388,7 @@ enum WarehouseType {
 pub struct DatabricksSqlWarehouse {
     pool: Arc<dyn DbConnectionPool<Arc<SqlWarehouseApi>, &'static dyn Sync> + Send + Sync>,
     metrics: Arc<DatabricksMetrics>,
+    api: Arc<SqlWarehouseApi>,
 }
 
 impl DatabricksSqlWarehouse {
@@ -508,17 +509,29 @@ impl DatabricksSqlWarehouse {
             rate_controller,
         )?);
         let pool = Arc::new(SqlWarehouseConnectionPool {
-            api,
+            api: Arc::clone(&api),
             metrics: Arc::clone(&metrics),
             permissions,
         });
-        Ok(Self { pool, metrics })
+        Ok(Self { pool, metrics, api })
     }
 
     /// Returns the shared metrics for this SQL Warehouse instance.
     #[must_use]
     pub fn metrics(&self) -> &Arc<DatabricksMetrics> {
         &self.metrics
+    }
+
+    /// Returns whether this connector uses a Classic SQL warehouse.
+    ///
+    /// Lakehouse Federation foreign tables require a Pro or Serverless
+    /// warehouse even when Classic can return their schema with `DESCRIBE`.
+    pub async fn is_classic_warehouse(&self) -> Result<bool, Error> {
+        let token = self.api.token_provider.get_token();
+        Ok(matches!(
+            self.api.get_warehouse_type(&token).await?,
+            WarehouseType::Classic
+        ))
     }
 }
 

@@ -33,10 +33,10 @@ fn make_spark_dataset(path: &str, name: &str) -> Dataset {
             "spark_remote".to_string(),
             format!(
                 "sc://{}:443/;use_ssl=true;user_id=spice.ai;session_id={};token={};x-databricks-cluster-id={}",
-                std::env::var("TEST_DATABRICKS_HOST").unwrap_or_default(),
+                std::env::var("NEW_DATABRICKS_HOST").unwrap_or_default(),
                 uuid::Uuid::new_v4(),
-                std::env::var("TEST_DATABRICKS_TOKEN").unwrap_or_default(),
-                std::env::var("TEST_DATABRICKS_CLUSTER_ID").unwrap_or_default(),
+                std::env::var("NEW_DATABRICKS_TOKEN").unwrap_or_default(),
+                std::env::var("NEW_DATABRICKS_CLUSTER_ID").unwrap_or_default(),
             ),
         )]
             .into_iter()
@@ -82,7 +82,7 @@ async fn spark_integration_test() -> Result<(), anyhow::Error> {
             }
 
             let queries: QueryTests = vec![(
-                "select l_comment, l_partkey from lineitem order by l_linenumber desc limit 10",
+                "select l_comment, l_partkey from lineitem order by l_linenumber desc, l_partkey desc, l_comment desc limit 10",
                 "select",
                 Some(Box::new(|result_batches| {
                     for batch in &result_batches {

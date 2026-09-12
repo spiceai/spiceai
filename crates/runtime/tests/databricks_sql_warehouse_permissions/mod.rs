@@ -177,49 +177,49 @@ async fn databricks_permissions_pro_warehouse() -> Result<(), anyhow::Error> {
             let app = AppBuilder::new("databricks_permissions_pro")
                 // Case 1: UC-native, full access
                 .with_dataset(make_sp_dataset(
-                    "test_scp_permissions.test_scp.table_case1",
+                    "spice_integration_permissions.test_scp.table_case1",
                     "uc_native_full_access",
                     true,
                 ))
                 // Case 2: UC-native, infoschema but no table access
                 .with_dataset(make_sp_dataset(
-                    "test_scp_permissions.test_scp.table_case2",
+                    "spice_integration_permissions.test_scp.table_case2",
                     "uc_native_infoschema_only",
                     true,
                 ))
                 // Case 3: UC-native, table but no infoschema access
                 .with_dataset(make_sp_dataset(
-                    "test_scp_permissions.test_scp.table_case1",
+                    "spice_integration_permissions.test_scp.table_case1",
                     "uc_native_table_only",
                     false,
                 ))
                 // Case 4: UC-native, no access
                 .with_dataset(make_sp_dataset(
-                    "test_scp_permissions.test_scp.table_case2",
+                    "spice_integration_permissions.test_scp.table_case2",
                     "uc_native_no_access",
                     false,
                 ))
                 // Case 5: Foreign, full access
                 .with_dataset(make_sp_dataset(
-                    "spiceai_sandbox_via_serverless.tpch.region",
+                    "spice_integration_tests_lakebase.tpch.region",
                     "foreign_full_access",
                     true,
                 ))
                 // Case 6: Foreign, infoschema but no table access
                 .with_dataset(make_sp_dataset(
-                    "spiceai_sandbox_via_serverless.tpch.nation",
+                    "spice_integration_tests_lakebase.tpch.nation",
                     "foreign_infoschema_only",
                     true,
                 ))
                 // Case 7: Foreign, table but no infoschema access
                 .with_dataset(make_sp_dataset(
-                    "spiceai_sandbox_via_serverless.tpch.region",
+                    "spice_integration_tests_lakebase.tpch.region",
                     "foreign_table_only",
                     false,
                 ))
                 // Case 8: Foreign, no access
                 .with_dataset(make_sp_dataset(
-                    "spiceai_sandbox_via_serverless.tpch.nation",
+                    "spice_integration_tests_lakebase.tpch.nation",
                     "foreign_no_access",
                     false,
                 ))
@@ -266,7 +266,7 @@ async fn databricks_permissions_classic_foreign_table() -> Result<(), anyhow::Er
         .scope(async {
             let app = AppBuilder::new("databricks_permissions_classic_foreign")
                 .with_dataset(make_classic_dataset(
-                    "spiceai_sandbox_via_serverless.tpch.region",
+                    "spice_integration_tests_lakebase.tpch.region",
                     "foreign_on_classic",
                 ))
                 .build();
