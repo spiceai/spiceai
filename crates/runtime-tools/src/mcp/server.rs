@@ -175,13 +175,14 @@ impl McpSchemaSnapshot {
     /// be older than a concurrent catalog TTL/reconnect publish. Reading
     /// `try_all` here means that refresh either waits and applies after
     /// this write, or this write already sees the refreshed cache.
+    #[cfg(test)]
     fn replace_listed_from_map(&self, tools: &HashMap<String, Tooling>) -> (Vec<Tool>, bool) {
         self.replace_listed_from_map_with_warm(tools, &[])
     }
 
-    /// Like [`Self::replace_listed_from_map`], and keep definitions
-    /// collected by async `all()` for catalogs whose `try_all` is the
-    /// empty compatibility default.
+    /// Replace the snapshot from the live tool map under [`Self::publish`],
+    /// and keep definitions collected by async `all()` for catalogs whose
+    /// `try_all` is the empty compatibility default.
     fn replace_listed_from_map_with_warm(
         &self,
         tools: &HashMap<String, Tooling>,
@@ -460,33 +461,11 @@ impl RuntimeServer {
         ResolveOutcome::Retry
     }
 
-    async fn all_tools(&self) -> Vec<Arc<dyn SpiceModelTool>> {
-        let tools = self.tools.read().await;
-        let mut result = Vec::new();
-        for tooling in tools.values() {
-            match tooling {
-                Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
-                    result.push(Arc::clone(tool));
-                }
-                Tooling::Catalog { tools: catalog, .. } => {
-                    let catalog_name = catalog.name();
-                    for tool in catalog.all().await {
-                        result.push(with_name(
-                            &tool,
-                            encode_tool_name(catalog_name, &tool.name()).as_str(),
-                        ));
-                    }
-                }
-            }
-        }
-        result
-    }
-
     /// Catalog `all()` pages, already exposed under `encode_tool_name`.
     ///
-    /// [`Self::all_tools`] also flattens top-level tools. A top-level
-    /// `srv__deploy` then decodes as catalog `srv`, and `HashMap`
-    /// iteration order can overwrite the catalog schema
+    /// Only catalogs are warmed. Flattening top-level tools as well
+    /// would let a top-level `srv__deploy` decode as catalog `srv`,
+    /// and `HashMap` iteration order can overwrite the catalog schema
     /// (`validated=top:Region executed=catalog:Zone`).
     async fn warm_catalog_tools(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         let tools = self.tools.read().await;
@@ -831,9 +810,9 @@ fn mcp_schemas_from_map_with_warm(
         }
         let name = exposed.into_owned();
         let fetched = mcp_tool_from_spice(name.clone(), tool.as_ref());
-        // `all_tools` flattens top-level tools under their own names.
-        // A colliding `srv__deploy` decodes as catalog `srv`; skip that
-        // row so HashMap warm order cannot overwrite the catalog schema.
+        // A colliding top-level `srv__deploy` decodes as catalog `srv`;
+        // skip that row so HashMap warm order cannot overwrite the
+        // catalog schema.
         if let Some(Tooling::Tool(direct) | Tooling::FunctionTool(direct)) = tools.get(&name) {
             let direct_schema = mcp_tool_from_spice(name.clone(), direct.as_ref());
             if fetched == direct_schema {
@@ -1753,7 +1732,7 @@ mod tests {
         let tools = async_only_catalog_tools();
         let server = RuntimeServer::new(Arc::new(RwLock::new(tools)));
         let exposed = encode_tool_name("downstream", "lookup");
-        let warm = server.all_tools().await;
+        let warm = server.warm_catalog_tools().await;
         assert!(
             warm.iter().any(|tool| tool.name() == exposed),
             "all() must collect the downstream catalog tool"
@@ -1883,9 +1862,9 @@ mod tests {
         );
     }
 
-    /// Flattened `all_tools` warm used to treat top-level `srv__deploy`
-    /// as catalog `srv`. `warm_order=['catalog:Zone', 'top:Region']`
-    /// then left the snapshot on Region while dispatch ran Zone.
+    /// Flattened warm used to treat top-level `srv__deploy` as catalog
+    /// `srv`. `warm_order=['catalog:Zone', 'top:Region']` then left the
+    /// snapshot on Region while dispatch ran Zone.
     #[test]
     fn async_only_warm_fold_keeps_catalog_over_colliding_top_level() {
         struct AsyncOnlyZone;
