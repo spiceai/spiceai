@@ -231,17 +231,17 @@ impl Runtime {
                     // Extract dependencies from the validated statement
                     let dependencies = view::get_dependent_table_names(&statement);
 
-                    // `enabled: false` turns the whole acceleration block off, so anything
-                    // else set in it is read, accepted and then never applied — the same for
-                    // a view as for a dataset (#13514). Reported from here — the load path,
-                    // behind `log_errors` — rather than from `ViewBuilder::try_from`, which
-                    // read-only callers run too.
+                    // What the acceleration block asks for and the runtime will not do as
+                    // written — settings `enabled: false` discards (#13514), the deprecated
+                    // `acceleration.ready_state` (#13749) — is the same for a view as for a
+                    // dataset. Reported from here — the load path, behind `log_errors` —
+                    // rather than from `ViewBuilder::try_from`, which read-only callers run too.
                     //
                     // Last, after every rejection above has had its chance: a view that
                     // collides with a dataset name or fails SQL validation never loads, so
                     // nothing of its acceleration block is silently discarded and warning
                     // about it would only add noise to the error that actually matters.
-                    crate::init::dataset::warn_about_discarded_acceleration_settings(
+                    crate::init::dataset::warn_about_acceleration_block(
                         crate::component::AcceleratedComponent::View,
                         &spicepod_view.name,
                         spicepod_view.acceleration.as_ref(),
