@@ -482,6 +482,29 @@ impl RuntimeServer {
         result
     }
 
+    /// Catalog `all()` pages, already exposed under `encode_tool_name`.
+    ///
+    /// [`Self::all_tools`] also flattens top-level tools. A top-level
+    /// `srv__deploy` then decodes as catalog `srv`, and `HashMap`
+    /// iteration order can overwrite the catalog schema
+    /// (`validated=top:Region executed=catalog:Zone`).
+    async fn warm_catalog_tools(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+        let tools = self.tools.read().await;
+        let mut result = Vec::new();
+        for tooling in tools.values() {
+            if let Tooling::Catalog { tools: catalog, .. } = tooling {
+                let catalog_name = catalog.name();
+                for tool in catalog.all().await {
+                    result.push(with_name(
+                        &tool,
+                        encode_tool_name(catalog_name, &tool.name()).as_str(),
+                    ));
+                }
+            }
+        }
+        result
+    }
+
     /// Warm catalog caches, then publish the `tools/list` generation.
     ///
     /// `all()` fills MCP catalog caches so `try_all` is current under
@@ -489,7 +512,7 @@ impl RuntimeServer {
     /// leave `try_all` empty; their already-collected definitions are
     /// folded into that same generation so they still appear in the page.
     async fn publish_listed_tools(&self) -> Vec<Tool> {
-        let warm = self.all_tools().await;
+        let warm = self.warm_catalog_tools().await;
         let map = self.tools.read().await;
         let (tools, changed) = self.schemas.replace_listed_from_map_with_warm(&map, &warm);
         self.schemas.bump_if(changed);
@@ -829,7 +852,17 @@ fn mcp_schemas_from_map_with_warm(
             continue;
         }
         let name = exposed.into_owned();
-        schemas.insert(name.clone(), mcp_tool_from_spice(name, tool.as_ref()));
+        let fetched = mcp_tool_from_spice(name.clone(), tool.as_ref());
+        // `all_tools` flattens top-level tools under their own names.
+        // A colliding `srv__deploy` decodes as catalog `srv`; skip that
+        // row so HashMap warm order cannot overwrite the catalog schema.
+        if let Some(Tooling::Tool(direct) | Tooling::FunctionTool(direct)) = tools.get(&name) {
+            let direct_schema = mcp_tool_from_spice(name.clone(), direct.as_ref());
+            if fetched == direct_schema {
+                continue;
+            }
+        }
+        schemas.insert(name, fetched);
     }
     schemas
 }
@@ -1840,6 +1873,57 @@ mod tests {
             x_mcp_header_region(listed_schema),
             Some("Zone"),
             "try_all under the publish lock must beat the stale Region warm sample"
+        );
+    }
+
+    /// Flattened `all_tools` warm used to treat top-level `srv__deploy`
+    /// as catalog `srv`. `warm_order=['catalog:Zone', 'top:Region']`
+    /// then left the snapshot on Region while dispatch ran Zone.
+    #[test]
+    fn async_only_warm_fold_keeps_catalog_over_colliding_top_level() {
+        struct AsyncOnlyZone;
+
+        #[async_trait::async_trait]
+        impl SpiceToolCatalog for AsyncOnlyZone {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn name(&self) -> &'static str {
+                "srv"
+            }
+            async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                vec![Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>]
+            }
+            async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                (name == "deploy").then(|| Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>)
+            }
+        }
+
+        let exposed = encode_tool_name("srv", "deploy");
+        let top = with_name(
+            &(Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>),
+            &exposed,
+        );
+        let catalog_tool = with_name(
+            &(Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>),
+            &exposed,
+        );
+        let mut tools = HashMap::new();
+        tools.insert(exposed.clone(), Tooling::Tool(Arc::clone(&top)));
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(AsyncOnlyZone) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+
+        let warm = [Arc::clone(&catalog_tool), Arc::clone(&top)];
+        let schemas = mcp_schemas_from_map_with_warm(&tools, &warm);
+        assert_eq!(
+            schemas.get(&exposed).and_then(x_mcp_header_region),
+            Some("Zone"),
+            "warm_order=['catalog:Zone', 'top:Region'] validated=top:Region executed=catalog:Zone mismatch=True"
         );
     }
 
