@@ -1,8 +1,0 @@
-tests:
-  htap:
-    spicepod_path: accelerated/postgres-cayenne[file]-adaptive-cte_materialization.yaml
-    runner_type: spiceai-dev-large-runners
-    scale_factor: 1
-    duration: 1800
-    ready_wait: 60
-    rate: 9250
