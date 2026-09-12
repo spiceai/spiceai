@@ -4136,7 +4136,7 @@ impl DataAccelerator for CayenneAccelerator {
         PARAMETERS
     }
 
-    fn supports_snapshot_reload(&self) -> bool {
+    fn supports_provider_rebuild(&self) -> bool {
         true
     }
 
@@ -4195,7 +4195,7 @@ impl DataAccelerator for CayenneAccelerator {
     /// Cayenne uses a per-dataset directory layout; dropping the previous
     /// provider releases the cached `Vortex` segment/footer caches, and the
     /// factory then reopens the directory tree from disk.
-    async fn reload_from_snapshot(
+    async fn rebuild_provider(
         &self,
         _source: &dyn AccelerationSource,
         previous_provider: Arc<dyn TableProvider>,

@@ -34,7 +34,7 @@ limitations under the License.
 //! require AWS credentials — set `AWS_SNAPSHOT_KEY`/`AWS_SNAPSHOT_SECRET`, or
 //! configure `AWS_PROFILE` with read/write access to the test bucket. See
 //! `snapshot_refresh/mod.rs` for the full setup. Each accelerator that
-//! advertises `supports_snapshot_reload()` (`DuckDB`, `SQLite`, `Cayenne`, `Turso`)
+//! advertises `supports_provider_rebuild()` (`DuckDB`, `SQLite`, `Cayenne`, `Turso`)
 //! gets its own end-to-end test.
 
 mod snapshot_refresh;

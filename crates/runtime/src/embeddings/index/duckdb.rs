@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use data_accelerator_api::swappable::SwappableTableProvider;
 use data_components::poly::PolyTableProvider;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use datafusion_table_providers::{
@@ -267,6 +268,11 @@ fn normalized_duckdb_vector_param_name(key: &str) -> Option<&'static str> {
 fn duckdb_writer_context(
     provider: &Arc<dyn TableProvider>,
 ) -> Option<(Arc<DuckDbConnectionPool>, Arc<TableDefinition>)> {
+    if let Some(swappable) = provider.downcast_ref::<SwappableTableProvider>() {
+        let current = swappable.current();
+        return duckdb_writer_context(&current);
+    }
+
     if let Some(layered) = provider.downcast_ref::<SpiceTable>() {
         return duckdb_writer_context(layered.below());
     }
