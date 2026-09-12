@@ -385,31 +385,34 @@ impl RuntimeServer {
             let exposed_name = encode_tool_name(&catalog_name, &name);
             // Capture *before* any `get` / `remember_tool`. The transport
             // validated `Mcp-Param-*` against this snapshot generation
-            // (or skipped the check when it was empty). Executing a tool
-            // discovered after that sample is `validated_schema=None
-            // executed=True`.
-            let validated = self.snapshot_tool(&exposed_name).is_some()
-                || self.snapshot_tool(tool_name).is_some();
+            // (or skipped the check when it was empty). `catalog.get`
+            // refreshes an expired page and must not execute a different
+            // schema than that sample (`validated=Region executed=Zone`).
+            let validated_schema = self
+                .snapshot_tool(&exposed_name)
+                .or_else(|| self.snapshot_tool(tool_name));
 
             // Generation-pinned lookup. `catalog.get` refreshes an
             // expired page (`Runtime::get_tool`); using it here when a
             // listed spec exists would execute Zone after Streamable
             // HTTP authorized Region.
             if let Some(tool) = listed_gateway_spec(catalog.as_ref(), &name) {
-                return self.resolved_if_validated(
-                    validated,
+                return self.resolved_against_snapshot(
+                    validated_schema.as_ref(),
                     tool,
                     exposed_name,
-                    Some(catalog_name),
+                    Some(catalog_name.clone()),
                 );
             }
 
-            // No listed spec: first-seen discovery, or a retry after
-            // `remember_tool` published the snapshot. Refresh, then
-            // execute only if this generation already named the tool.
+            // No listed spec: first-seen discovery, a retry after
+            // `remember_tool`, or an async-only catalog whose
+            // `try_get`/`try_all` defaults are empty. Refresh, then
+            // execute only when the fetched schema is the one already
+            // in this generation.
             if let Some(tool) = catalog.get(&name).await {
-                return self.resolved_if_validated(
-                    validated,
+                return self.resolved_against_snapshot(
+                    validated_schema.as_ref(),
                     tool,
                     exposed_name,
                     Some(catalog_name),
@@ -438,21 +441,22 @@ impl RuntimeServer {
         }
     }
 
-    fn resolved_if_validated(
+    fn resolved_against_snapshot(
         &self,
-        validated: bool,
+        validated_schema: Option<&Tool>,
         tool: Arc<dyn SpiceModelTool>,
         exposed_name: String,
         catalog: Option<String>,
     ) -> ResolveOutcome {
-        if validated {
+        let fetched = mcp_tool_from_spice(exposed_name.clone(), tool.as_ref());
+        if validated_schema.is_some_and(|schema| schema == &fetched) {
             return ResolveOutcome::Ready(ResolvedTool {
                 tool,
                 exposed_name,
                 catalog,
             });
         }
-        self.remember_tool(mcp_tool_from_spice(exposed_name, tool.as_ref()));
+        self.remember_tool(fetched);
         ResolveOutcome::Retry
     }
 
@@ -1171,6 +1175,102 @@ mod tests {
             .await
             .expect("top-level Region tool must execute");
         assert_eq!(executed, json!({ "executed": "Region" }));
+    }
+
+    /// Async-only catalogs inherit empty `try_get`/`try_all`, so
+    /// `listed_gateway_spec` is `None`. `tools/list` still warms the
+    /// snapshot from `all()` (Region). Dispatch then called `get()`,
+    /// which can return Zone, and treating "name is in the snapshot" as
+    /// validated executed that current schema (`validated_schema=Region
+    /// fetched_schema=Zone outcome=Ready`).
+    #[tokio::test]
+    async fn async_only_catalog_get_must_not_execute_unvalidated_schema() {
+        struct AsyncOnlyRegionListZoneGet;
+
+        #[async_trait::async_trait]
+        impl SpiceToolCatalog for AsyncOnlyRegionListZoneGet {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn name(&self) -> &'static str {
+                "srv"
+            }
+            async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                vec![Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>]
+            }
+            async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                (name == "deploy").then(|| Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>)
+            }
+        }
+
+        let exposed = encode_tool_name("srv", "deploy");
+        let catalog = Arc::new(AsyncOnlyRegionListZoneGet) as Arc<dyn SpiceToolCatalog>;
+        let mut tools = HashMap::new();
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::clone(&catalog),
+                default_catalog_names: vec![],
+            },
+        );
+        let server = RuntimeServer::new(Arc::new(RwLock::new(tools)));
+        let listed = server.publish_listed_tools().await;
+        let validated_schema = listed
+            .iter()
+            .find(|tool| tool.name.as_ref() == exposed.as_str())
+            .and_then(x_mcp_header_region);
+        assert_eq!(
+            validated_schema,
+            Some("Region"),
+            "tools/list warm must publish Region from async all()"
+        );
+        assert!(
+            listed_gateway_spec(catalog.as_ref(), "deploy").is_none(),
+            "listed_gateway_spec=None for empty try_get/try_all"
+        );
+
+        let fetched_schema = catalog
+            .get("deploy")
+            .await
+            .map(|tool| mcp_tool_from_spice(exposed.clone(), tool.as_ref()));
+        assert_eq!(
+            fetched_schema.as_ref().and_then(x_mcp_header_region),
+            Some("Zone"),
+            "fetched_schema=Zone"
+        );
+
+        let outcome = server.get_tool(&exposed).await;
+        match outcome {
+            ResolveOutcome::Ready(resolved) => {
+                let executed = resolved
+                    .tool
+                    .call("")
+                    .await
+                    .expect("resolved tool must execute");
+                panic!(
+                    "validated_schema=Region listed_gateway_spec=None fetched_schema=Zone outcome=Ready executed={} validation_execution_mismatch=True",
+                    executed
+                        .get("executed")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                );
+            }
+            ResolveOutcome::Missing => {
+                panic!(
+                    "validated_schema=Region listed_gateway_spec=None fetched_schema=Zone outcome=Missing"
+                );
+            }
+            ResolveOutcome::Retry => {}
+        }
+
+        assert_eq!(
+            server
+                .snapshot_tool(&exposed)
+                .as_ref()
+                .and_then(x_mcp_header_region),
+            Some("Zone"),
+            "mismatch must publish Zone so the retry can validate that generation"
+        );
     }
 
     #[test]
