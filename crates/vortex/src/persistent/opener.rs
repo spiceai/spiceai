@@ -886,65 +886,115 @@ mod tests {
         Ok(())
     }
 
-    /// Zone pruning must never drop a row the filter matches.
+    /// Zone pruning must never drop a row the filter matches, split by split.
     ///
-    /// A split is skipped before the scan is built when the file's zone map
-    /// proves no row in the split's range can satisfy the filter. That is sound
-    /// only while the range pruned against is the range the scan would have
-    /// read, so this writes enough rows to close several zones (the writer ends
-    /// one every 8192 rows) with ascending values — the layout that gives zones
-    /// disjoint ranges and so actually reaches the skip path. Every value
-    /// present must still come back, including the ones on a zone boundary.
+    /// Pruning is applied to the split's own row range, so it is sound only
+    /// while that range is the one the scan would have read. A whole-file open
+    /// cannot catch a mismatch between the two — both are then the whole file —
+    /// so this tiles the file with byte-range splits the way `FileScanConfig`
+    /// does, opens each, and aggregates.
+    ///
+    /// 20,000 ascending rows close several zones (the writer ends one every
+    /// 8192 rows), which is what gives zones disjoint ranges and so actually
+    /// reaches the skip path. Byte thirds land one zone midpoint each, so every
+    /// needle is owned by exactly one split and provably absent from the other
+    /// two: the run asserts both halves, or a split silently returning nothing
+    /// would read as success.
     #[tokio::test]
-    async fn zone_pruning_keeps_every_matching_row() -> anyhow::Result<()> {
+    async fn zone_pruning_keeps_every_matching_row_across_byte_splits() -> anyhow::Result<()> {
         const ROWS: i32 = 20_000;
+        const SPLITS: u64 = 3;
+
         let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let file_path = "zones.vortex";
         let batch = record_batch!(("a", Int32, (0..ROWS).map(Some).collect::<Vec<_>>()))
             .expect("ascending test record batch should build");
         let file_schema = batch.schema();
         let data_size = write_arrow_to_vortex(object_store.clone(), file_path, batch).await?;
+
         let table_schema = TableSchema::from_file_schema(file_schema);
-        let file = PartitionedFile::new(file_path.to_string(), data_size);
+        let byte_splits: Vec<PartitionedFile> = (0..SPLITS)
+            .map(|i| {
+                let start = data_size * i / SPLITS;
+                let end = data_size * (i + 1) / SPLITS;
+                PartitionedFile::new_with_range(
+                    file_path.to_string(),
+                    data_size,
+                    i64::try_from(start).expect("split start fits i64"),
+                    i64::try_from(end).expect("split end fits i64"),
+                )
+            })
+            .collect();
+
+        // Rows each split returns for `a = needle`, in split order.
+        async fn rows_per_split(
+            object_store: &Arc<dyn ObjectStore>,
+            table_schema: &TableSchema,
+            byte_splits: &[PartitionedFile],
+            predicate: PhysicalExprRef,
+        ) -> anyhow::Result<Vec<usize>> {
+            // One opener over every split, as a scan partition does: the layout
+            // reader and its zone map are shared between them.
+            let opener = make_opener(
+                Arc::clone(object_store),
+                table_schema.clone(),
+                Some(predicate),
+            );
+            let mut per_split = Vec::with_capacity(byte_splits.len());
+            for split in byte_splits {
+                let rows: usize = opener
+                    .open(split.clone())
+                    .expect("opener should open the split")
+                    .await
+                    .expect("opening should produce a stream")
+                    .try_collect::<Vec<_>>()
+                    .await?
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum();
+                per_split.push(rows);
+            }
+            Ok(per_split)
+        }
 
         // First row, both sides of a zone boundary, an interior value, last row.
         for needle in [0, 8_191, 8_192, 12_345, ROWS - 1] {
             let filter = logical2physical(&col("a").eq(lit(needle)), table_schema.table_schema());
-            let opener = make_opener(object_store.clone(), table_schema.clone(), Some(filter));
-            let rows: usize = opener
-                .open(file.clone())
-                .expect("opener should open the file")
-                .await
-                .expect("opening should produce a stream")
-                .try_collect::<Vec<_>>()
-                .await?
-                .iter()
-                .map(RecordBatch::num_rows)
-                .sum();
+            let per_split =
+                rows_per_split(&object_store, &table_schema, &byte_splits, filter).await?;
+
             assert_eq!(
-                rows, 1,
-                "value {needle} is present once and must survive pruning"
+                per_split.iter().sum::<usize>(),
+                1,
+                "value {needle} is present once and must survive pruning; per split: {per_split:?}"
+            );
+            assert_eq!(
+                per_split.iter().filter(|rows| **rows > 0).count(),
+                1,
+                "exactly one split owns {needle}; per split: {per_split:?}"
             );
         }
 
-        // Outside every zone's range: nothing to return, and the split is skipped.
+        // Outside every zone's range: every split is skipped, nothing is returned.
         let filter = logical2physical(&col("a").eq(lit(ROWS + 1)), table_schema.table_schema());
-        let opener = make_opener(object_store.clone(), table_schema.clone(), Some(filter));
-        let rows: usize = opener
-            .open(file)
-            .expect("opener should open the file")
-            .await
-            .expect("opening should produce a stream")
-            .try_collect::<Vec<_>>()
-            .await?
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum();
-        assert_eq!(rows, 0, "a value the file cannot hold must return no rows");
+        let per_split = rows_per_split(&object_store, &table_schema, &byte_splits, filter).await?;
+        assert!(
+            per_split.iter().all(|rows| *rows == 0),
+            "a value the file cannot hold must return no rows; per split: {per_split:?}"
+        );
+
+        // Nothing prunable: the splits must still tile the file exactly, which is
+        // what says the pruned range and the scanned range are the same range.
+        let filter = logical2physical(&col("a").gt_eq(lit(0)), table_schema.table_schema());
+        let per_split = rows_per_split(&object_store, &table_schema, &byte_splits, filter).await?;
+        assert_eq!(
+            per_split.iter().sum::<usize>(),
+            ROWS as usize,
+            "byte splits must cover every row exactly once; per split: {per_split:?}"
+        );
 
         Ok(())
     }
-
     #[tokio::test]
     async fn test_open_empty_file() -> anyhow::Result<()> {
         use futures::TryStreamExt;
