@@ -1,0 +1,17 @@
+__pycache__/
+.spice/
+.env
+~$*
+/body.docx
+/reference.docx
+/Spice.ai in Action - Layout.pdf
+/Spice.ai in Action - Final Layout.pdf
+/Spice.ai in Action - Typeset.pdf
+/Spice.ai in Action - Delivery.docx
+/Spice.ai in Action - Delivery.pdf
+/cover/
+/evidence/instance*/
+/evidence/**/instance*/
+/evidence/blog-extracts/
+/evidence/blog-reading.txt
+/evidence/layout/*.png

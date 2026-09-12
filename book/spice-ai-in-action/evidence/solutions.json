@@ -1,0 +1,69 @@
+[
+  {
+    "name": "appendix-c-1",
+    "sql": "SELECT c.customer_id, c.customer_name,\n       COUNT(o.order_id) AS order_count\nFROM customers c\nLEFT JOIN orders o\n  ON c.customer_id = o.customer_id\n AND c.tenant_id = o.tenant_id\nGROUP BY c.customer_id, c.customer_name\nORDER BY c.customer_id;\n",
+    "actual": [
+      {
+        "customer_id": 1,
+        "customer_name": "Ada Outfitters",
+        "order_count": 2
+      },
+      {
+        "customer_id": 2,
+        "customer_name": "Birch Books",
+        "order_count": 2
+      },
+      {
+        "customer_id": 3,
+        "customer_name": "Cedar Cycles",
+        "order_count": 2
+      },
+      {
+        "customer_id": 4,
+        "customer_name": "Dune Design",
+        "order_count": 1
+      },
+      {
+        "customer_id": 5,
+        "customer_name": "Elm Studio",
+        "order_count": 0
+      }
+    ]
+  },
+  {
+    "name": "appendix-c-2",
+    "sql": "WITH events AS (\n  SELECT tenant_id,\n         CAST(ordered_at AS DATE) AS event_date,\n         total_cents AS signed_cents\n  FROM paid_orders\n  UNION ALL\n  SELECT o.tenant_id,\n         CAST(r.returned_at AS DATE) AS event_date,\n         -r.refund_cents AS signed_cents\n  FROM returns r\n  JOIN orders o ON r.order_id = o.order_id\n  WHERE o.status = 'paid'\n)\nSELECT tenant_id, event_date,\n       SUM(signed_cents) AS net_event_cents\nFROM events\nGROUP BY tenant_id, event_date\nORDER BY tenant_id, event_date;\n",
+    "actual": [
+      {
+        "tenant_id": "north",
+        "event_date": "2026-08-01",
+        "net_event_cents": 19700
+      },
+      {
+        "tenant_id": "north",
+        "event_date": "2026-08-03",
+        "net_event_cents": 2500
+      },
+      {
+        "tenant_id": "north",
+        "event_date": "2026-08-05",
+        "net_event_cents": -11200
+      },
+      {
+        "tenant_id": "south",
+        "event_date": "2026-08-02",
+        "net_event_cents": 9900
+      },
+      {
+        "tenant_id": "south",
+        "event_date": "2026-08-04",
+        "net_event_cents": 15000
+      },
+      {
+        "tenant_id": "south",
+        "event_date": "2026-08-06",
+        "net_event_cents": -3300
+      }
+    ]
+  }
+]

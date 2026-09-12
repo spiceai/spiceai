@@ -1,0 +1,30 @@
+version: v1
+kind: Spicepod
+name: northstar-policy
+runtime:
+  auth:
+    oidc:
+      enabled: true
+      issuer_url: https://identity.example.invalid/
+      audience:
+      - northstar-spice
+      groups_claims:
+      - groups
+      claims:
+        user_id: sub
+        org_id: tenant_id
+        roles:
+        - roles
+  authorization:
+    enabled: true
+    default: deny
+    provider: local
+    policies:
+    - name: analyst-sql-endpoint
+      cedar: permit(principal in Spice::Role::"analyst", action == Spice::Action::"access",
+        resource == Spice::Endpoint::"sql");
+    - name: analyst-orders
+      cedar: '@row_filter("tenant_id = current_org_id()")
+
+        permit(principal in Spice::Role::"analyst", action == Spice::Action::"read",
+        resource == Spice::Dataset::"orders");'

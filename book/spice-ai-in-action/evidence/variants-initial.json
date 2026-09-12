@@ -1,0 +1,36 @@
+[
+  {
+    "variant": "arrow",
+    "exit_code": 0,
+    "evidence": "arrow-sql.json"
+  },
+  {
+    "variant": "duckdb",
+    "error": "Runtime did not become ready: HTTP Error 503: Service Unavailable"
+  },
+  {
+    "variant": "sqlite",
+    "error": "Runtime did not become ready: HTTP Error 503: Service Unavailable"
+  },
+  {
+    "variant": "cayenne",
+    "exit_code": 1,
+    "evidence": "cayenne-sql.json"
+  },
+  {
+    "variant": "search",
+    "error": "HTTP Error 400: Bad Request"
+  },
+  {
+    "variant": "auth",
+    "authorized": false,
+    "status": 401,
+    "body": "Unauthorized"
+  },
+  {
+    "variant": "auth",
+    "authorized": true,
+    "status": 200,
+    "body": "[{\"ok\":1}]"
+  }
+]

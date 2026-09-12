@@ -1,0 +1,48 @@
+{
+  "schema_draft": "https://json-schema.org/draft/2020-12/schema",
+  "results": [
+    {
+      "file": "spicepod.arrow.yaml",
+      "valid": true,
+      "errors": []
+    },
+    {
+      "file": "spicepod.auth.yaml",
+      "valid": false,
+      "errors": [
+        "{'api_key': {'enabled': True, 'keys': ['${ env:BOOK_API_KEY }']}} is not valid under any of the given schemas"
+      ]
+    },
+    {
+      "file": "spicepod.cayenne.yaml",
+      "valid": true,
+      "errors": []
+    },
+    {
+      "file": "spicepod.duckdb.yaml",
+      "valid": true,
+      "errors": []
+    },
+    {
+      "file": "spicepod.search.yaml",
+      "valid": true,
+      "errors": []
+    },
+    {
+      "file": "spicepod.sqlite.yaml",
+      "valid": true,
+      "errors": []
+    },
+    {
+      "file": "spicepod.vectors.yaml",
+      "valid": true,
+      "errors": []
+    },
+    {
+      "file": "spicepod.yaml",
+      "valid": true,
+      "errors": []
+    }
+  ],
+  "note": "The generated schema represents ApiKey as enum objects, while the inspected custom deserializer and the actual runtime accept strings. Authentication passed real unauthorized/authorized requests; schema rejection alone is not a runtime rejection."
+}
