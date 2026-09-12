@@ -748,8 +748,6 @@ mod tests {
         (temp_dir, catalog, tables)
     }
 
-    /// Every id the table currently serves, sorted. Reads through a fresh
-    /// `SessionContext` so nothing about the plan is cached between calls.
     /// A table whose `sort_columns` an operator configured explicitly.
     async fn setup_sorted(sort_columns: Vec<String>) -> (TempDir, CayenneTableProvider) {
         let temp_dir = TempDir::new().expect("tempdir");
@@ -817,6 +815,8 @@ mod tests {
         assert_eq!(policy.fan_out, crate::provider::table::EncodeFanOut::Sized);
     }
 
+    /// Every id the table currently serves, sorted. Reads through a fresh
+    /// `SessionContext` so nothing about the plan is cached between calls.
     async fn scan_ids(provider: &CayenneTableProvider) -> Vec<i64> {
         let ctx = SessionContext::new();
         let batches = ctx
