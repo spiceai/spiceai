@@ -120,13 +120,13 @@ Isthmus names; `spiced` bring-up in this harness; auth.
 ## CI
 
 `.github/workflows/substrait_compliance.yml` runs on `pull_request` and
-`merge_group` (gated to the harness, DataFusion pin, toolchain, and
-workflow paths so docs-only changes skip the job), plus nightly
-`schedule` and `workflow_dispatch`. Per-query FAIL/ERROR already exit
-0; a harness/build crash fails the job (no `continue-on-error`).
-Uploads the JSON report as an artifact. Do not gate merge on pass rate
-until a threshold is set from this baseline. The job is not in
-`REQUIRED_CHECKS`.
+`merge_group` (gated to harness source, scripts, DataFusion pin,
+toolchain, and workflow paths so repo docs and harness Markdown skip
+the job), plus nightly `schedule` and `workflow_dispatch`. Per-query
+FAIL/ERROR already exit 0; a harness/build crash fails the job (no
+`continue-on-error`). Uploads the JSON and CSV reports as an artifact.
+Do not gate merge on pass rate until a threshold is set from this
+baseline. The job is not in `REQUIRED_CHECKS`.
 
 ## License
 

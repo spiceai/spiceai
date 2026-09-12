@@ -17,10 +17,16 @@ on:
       - release-*
       - release/*
       - feature-*
-    # Docs-only and unrelated-crate PRs must not pay for a 90m compile.
-    # Keep this list in lockstep with the check_changes filter below.
+    # Docs-only PRs (repo docs and harness Markdown) must not pay for a
+    # 90m compile. Harness globs omit `*.md` so README/RESULTS edits do
+    # not start this workflow. Keep this list in lockstep with the
+    # check_changes filter below.
     paths:
-      - 'tools/substrait-compliance/**'
+      - 'tools/substrait-compliance/src/**'
+      - 'tools/substrait-compliance/scripts/**'
+      - 'tools/substrait-compliance/Cargo.toml'
+      - 'tools/substrait-compliance/.gitignore'
+      - 'tools/substrait-compliance/NOTICE'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -85,7 +91,11 @@ jobs:
           # reports the merge-queue job green without running Mode A.
           filters: |
             code_changes:
-              - 'tools/substrait-compliance/**'
+              - 'tools/substrait-compliance/src/**'
+              - 'tools/substrait-compliance/scripts/**'
+              - 'tools/substrait-compliance/Cargo.toml'
+              - 'tools/substrait-compliance/.gitignore'
+              - 'tools/substrait-compliance/NOTICE'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
@@ -141,7 +151,7 @@ jobs:
             --out-json tools/substrait-compliance/results/mode-a-tpch.json \
             --out-csv tools/substrait-compliance/results/mode-a-tpch.csv
 
-      - name: Upload JSON report
+      - name: Upload JSON and CSV reports
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
