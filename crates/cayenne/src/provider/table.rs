@@ -46014,6 +46014,187 @@ mod tests {
         );
     }
 
+    /// Concurrent PK lookup throughput on the production planner path
+    /// (`read_table` + `id = ?` + collect), covering both reuse modes.
+    ///
+    /// Sequential p50 tests do not catch a lock that serializes the warm hit.
+    /// This drives 8 workers against many on-disk files after the listing cache
+    /// and `ScanView` are warm, and requires: every row is the seeded
+    /// `value = id * 10`, zero metastore queries, and enough completed
+    /// lookups that the workers cannot have been fully serialized at the
+    /// 10 ms sequential budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn pk_point_lookup_warm_concurrent_throughput_reuses_listing_and_scan_view() {
+        const FILES: i64 = 32;
+        const ROWS_PER_FILE: i64 = 256;
+        const WORKERS: usize = 8;
+        const LOOKUPS_PER_WORKER: usize = 64;
+        let cases: [(&str, ScanViewReuse); 2] = [
+            ("full_append", ScanViewReuse::UntilInvalidated),
+            ("changes", ScanViewReuse::WithinLag(Duration::from_secs(1))),
+        ];
+        for (mode, reuse) in cases {
+            pk_lookup_concurrent_throughput_case(
+                mode,
+                reuse,
+                FILES,
+                ROWS_PER_FILE,
+                WORKERS,
+                LOOKUPS_PER_WORKER,
+            )
+            .await;
+        }
+    }
+
+    async fn pk_lookup_concurrent_throughput_case(
+        mode: &str,
+        reuse: ScanViewReuse,
+        files: i64,
+        rows_per_file: i64,
+        workers: usize,
+        lookups_per_worker: usize,
+    ) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!(
+            "{}/metadata",
+            temp_dir.path().to_str().expect("should be str")
+        );
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("should be str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db")).expect("catalog"),
+        );
+        catalog.init().await.expect("catalog init");
+        let catalog_dyn: Arc<dyn MetadataCatalog> = Arc::clone(&catalog) as _;
+        let vortex_config = VortexConfig {
+            inline_max_rows: 0,
+            compaction_background_interval_ms: 0,
+            compaction_trigger_files: usize::MAX,
+            compaction_trigger_protected_snapshots: usize::MAX,
+            compaction_trigger_snapshot_age_ms: u64::MAX,
+            ..VortexConfig::default()
+        };
+        let provider = Arc::new(
+            CayenneTableProviderBuilder::new(catalog_dyn, runtime_env)
+                .with_scan_view_reuse(reuse)
+                .create(CreateTableOptions {
+                    table_name: format!("pk_lookup_throughput_{mode}"),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: data_dir,
+                    partition_column: None,
+                    vortex_config,
+                })
+                .await
+                .expect("create table"),
+        );
+        provider.init_scan_view_cache();
+        for f in 0..files {
+            let start = f * rows_per_file;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(start..start + rows_per_file)),
+                    Arc::new(Int64Array::from_iter_values(
+                        (start..start + rows_per_file).map(|x| x * 10),
+                    )),
+                ],
+            )
+            .expect("batch");
+            insert_batch_with_context(&ctx, &provider, batch).await;
+        }
+        let ctx = Arc::new(ctx);
+        let total_rows = files * rows_per_file;
+        // One PK from each quartile so workers prune different files.
+        let target_ids: [i64; 4] = [
+            rows_per_file / 2,
+            total_rows / 4 + rows_per_file / 2,
+            total_rows / 2 + rows_per_file / 2,
+            total_rows - rows_per_file / 2,
+        ];
+        for id in target_ids {
+            assert_eq!(
+                query_pk_i64(
+                    Arc::clone(&provider) as Arc<dyn TableProvider>,
+                    &ctx,
+                    id,
+                    "value",
+                )
+                .await,
+                vec![id * 10],
+                "{mode}: warmup PK lookup id={id}"
+            );
+        }
+        assert!(
+            provider.cached_snapshot_listing.load_full().is_some(),
+            "{mode}: warmup must populate the snapshot listing cache"
+        );
+        let queries_before = catalog.metastore_query_count();
+
+        let errors = Arc::new(AtomicU64::new(0));
+        let t0 = Instant::now();
+        let mut joins = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let provider = Arc::clone(&provider);
+            let ctx = Arc::clone(&ctx);
+            let errors = Arc::clone(&errors);
+            joins.push(tokio::spawn(async move {
+                for n in 0..lookups_per_worker {
+                    let id = target_ids[(worker + n) % target_ids.len()];
+                    let values = query_pk_i64(
+                        Arc::clone(&provider) as Arc<dyn TableProvider>,
+                        &ctx,
+                        id,
+                        "value",
+                    )
+                    .await;
+                    if values != vec![id * 10] {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for join in joins {
+            join.await.expect("throughput worker");
+        }
+        let elapsed = t0.elapsed();
+        let completed = u64::try_from(workers.saturating_mul(lookups_per_worker))
+            .expect("lookup count fits u64");
+        let error_count = errors.load(Ordering::Relaxed);
+        let queries_after = catalog.metastore_query_count();
+        let elapsed_ms = u64::try_from(elapsed.as_millis())
+            .expect("elapsed ms fits u64")
+            .max(1);
+        let qps = completed.saturating_mul(1000) / elapsed_ms;
+        // Serial 10 ms × N lookups is the sequential latency budget; concurrent
+        // workers on a wait-free warm hit must beat that.
+        let serial_budget = Duration::from_millis(10)
+            .saturating_mul(u32::try_from(completed).expect("lookup count fits u32"));
+        assert_eq!(
+            error_count, 0,
+            "{mode}: {error_count} PK lookups returned the wrong row"
+        );
+        assert_eq!(
+            queries_before, queries_after,
+            "{mode}: warm concurrent PK lookups queried the metastore ({queries_before} -> {queries_after})"
+        );
+        assert!(
+            elapsed < serial_budget,
+            "{mode}: {completed} concurrent PK lookups took {elapsed:?}, which is no faster than serial 10ms ({serial_budget:?}); qps={qps}"
+        );
+        assert!(
+            qps >= 200,
+            "{mode}: warm concurrent PK lookup QPS was {qps}, want >= 200; elapsed={elapsed:?} completed={completed}"
+        );
+    }
+
     /// Phase 2 manifest snapshot model: with `scan_from_manifest` ON, the scan's
     /// file set is resolved from `cayenne_snapshot_file` (the manifest) instead
     /// of by listing the snapshot directory — and the two must be EQUAL.
