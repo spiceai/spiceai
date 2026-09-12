@@ -155,6 +155,10 @@ loom = { workspace = true }
 
 [[bench]]
 harness = false
+name = "in_list_query_e2e"
+
+[[bench]]
+harness = false
 name = "zorder_clustering"
 
 [[bench]]
