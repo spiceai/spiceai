@@ -639,7 +639,7 @@ reclaiming space is then the remedy that fixes both. Unlike disk there is no
 after-the-fact backstop: the endpoint may well be answering again by the time the
 run ends, so the only evidence is what the build said while it was failing.
 
-### "A compiler subprocess crashed on the runner"
+### "Compiler subprocess crashed — checks did not complete"
 
 The compiler driver can lose a subprocess to a signal — a crash in `ld` itself,
 the kernel killing it for memory, or the driver's own frontend going down the

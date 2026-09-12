@@ -1663,12 +1663,70 @@ assert_describe "tells the author to re-dispatch rather than to read the log" 10
 # status names the class, not the tool, because the driver's signature does not
 # distinguish its frontend from the linker.
 assert_describe "says a crashed compiler subprocess could not complete, not that checks failed" 101 \
-  "Sign-off could not complete after 21195s — a compiler subprocess crashed on the runner; re-dispatch (triggered by someone)" \
+  "Compiler subprocess crashed after 21195s — checks did not complete, re-dispatch (triggered by someone)" \
   "the checks did not complete" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 assert_describe_lacks "does not call a crashed compiler subprocess a check failure" 101 \
   "checks failed" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# What a verdict must still say once GitHub is done with the line.
+#
+# post_commit_status cuts the description at STATUS_DESC_MAX_CHARS and the
+# attribution suffix is last, so an over-long verdict does not lose the detail
+# — it loses the name of whoever triggered it, mid-word. Asserted as a
+# property rather than against a copy of the text, so rewording an arm cannot
+# pass this by accident, and driven through describe_check_failure so it
+# measures what the run will publish.
+#
+# The cap comes from the subject rather than a literal here: a second copy of
+# the number is a guard that can agree with itself while the real cut still
+# truncates. The length likewise comes from the subject, which is the shell
+# that performs the cut — with no locale set that counts bytes, two or three
+# more than the characters GitHub counts, so this errs strict and never lax.
+assert_describe_fits() {
+  local name="$1" check_status="$2"
+  shift 2
+  tests_run=$((tests_run + 1))
+
+  # The longest login GitHub issues. The bug only appears at this boundary:
+  # every login that signs off today is a third of it, which is why four arms
+  # carried it unnoticed (spiceai/spiceai#14076).
+  local login
+  login="$(printf "%0${LONGEST_LOGIN_LEN}d" 0 | tr 0 a)"
+
+  local result rc output length cap
+  result="$(call_subject \
+    "describe_check_failure ${check_status} 999999 ${login}
+     printf 'LEN[%s]\nCAP[%s]\nDESC[%s]\n' \"\${#SIGNOFF_FAILURE_STATUS_DESC}\" \"\$STATUS_DESC_MAX_CHARS\" \"\$SIGNOFF_FAILURE_STATUS_DESC\"" \
+    "$@")"
+  rc="${result%%|*}"
+  output="${result#*|}"
+
+  if [[ "$rc" -ne 0 ]]; then
+    fail_test "$name: expected exit 0, got ${rc} (output: ${output})"
+    return
+  fi
+  length="${output#*LEN[}"; length="${length%%]*}"
+  cap="${output#*CAP[}"; cap="${cap%%]*}"
+  if [[ ! "$length" =~ ^[0-9]+$ || ! "$cap" =~ ^[0-9]+$ ]]; then
+    fail_test "$name: the verdict's length or the cap did not parse: '${output}'"
+    return
+  fi
+  if (( length > cap )); then
+    fail_test "$name: the verdict is ${length} long against a cap of ${cap}; GitHub cuts it there and the attribution is what is lost: '${output}'"
+    return
+  fi
+  if [[ "$output" != *"(triggered by ${login})"* ]]; then
+    fail_test "$name: the verdict must carry the whole login: '${output}'"
+    return
+  fi
+  echo "  ok: $name"
+}
+readonly LONGEST_LOGIN_LEN=39
+
+assert_describe_fits "the crash verdict fits a commit status with the longest login GitHub issues" 101 \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+
 assert_describe "still publishes a genuine check failure" 101 \
   "Sign-off checks failed after 21195s (triggered by someone)" \
   "sign-off checks failed" STUB_FREE_KB="$(gib_to_kb 200)"
