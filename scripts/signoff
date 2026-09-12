@@ -123,9 +123,10 @@ readonly REQUIRED_CHECKS=(
   # verus_verify.yml. The only check that reads the Verus proofs (hash-index
   # and the results-cache namespace prefix today): a normal `cargo build`
   # erases the specifications, so nothing else here would notice a
-  # postcondition that no longer holds. The job name is the required-check
-  # context and is kept stable so the trunk ruleset still matches.
-  "Verify hash-index proofs"
+  # postcondition that no longer holds. One job, one context — never a
+  # per-crate required check. The name is crate-agnostic so a later crate
+  # does not need another ruleset rename.
+  "Verify Verus proofs"
 )
 # GitHub Actions app id — pins each required check to Actions so a hand-POSTed
 # commit status can't satisfy a required check (only `signoff` is a raw status).

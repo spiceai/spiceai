@@ -20,12 +20,13 @@ name: Verus Verification
 # green changes can combine into one the verifier would reject, and no other
 # check in the queue would notice.
 #
-# The job carries NO `paths` filter, deliberately. It is registered in
-# `REQUIRED_CHECKS` (scripts/signoff), and a required context has to be emitted
-# by every pull request — a workflow that never triggers reports nothing at all,
-# which blocks the PR rather than passing it. So the job always runs and always
-# reports; the change filter below skips only the verification work when nothing
-# it covers was touched. See docs/dev/ci_signoff.md.
+# One job, one required context (`Verify Verus proofs` in REQUIRED_CHECKS).
+# A second job per crate would be a second required check; do not add one.
+# The job carries NO `paths` filter, deliberately: a required context has to
+# be emitted by every pull request — a workflow that never triggers reports
+# nothing at all, which blocks the PR rather than passing it. So the job
+# always runs and always reports; the change filter below skips only the
+# verification work when nothing it covers was touched. See docs/dev/ci_signoff.md.
 on:
   pull_request:
     branches:
@@ -71,7 +72,10 @@ env:
 
 jobs:
   verus-verify:
-    name: Verify hash-index proofs
+    # Crate-agnostic on purpose: this is the single required-check context
+    # for every crate that opted into `[package.metadata.verus]`. Adding a
+    # crate updates the verify loop and the path filter, not the job name.
+    name: Verify Verus proofs
     # GitHub-hosted on purpose: verification must not queue behind the
     # saturated self-hosted pool.
     runs-on: ubuntu-24.04
@@ -250,8 +254,9 @@ jobs:
           set -euo pipefail
           export PATH="$VERUS_DIR:$PATH"
           # Every crate that opted into `[package.metadata.verus]` must be
-          # checked here. A crate missing from this loop is a proof CI never
-          # sees.
+          # checked here, in this one job. A crate missing from this loop is
+          # a proof CI never sees. A second job per crate would be a second
+          # required check — do not split the loop out.
           for crate_dir in crates/hash-index crates/cache; do
             crate_name=$(basename "$crate_dir")
             (
