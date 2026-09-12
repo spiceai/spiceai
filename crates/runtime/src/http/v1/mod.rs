@@ -76,8 +76,9 @@ use snafu::ResultExt;
 
 use futures::{StreamExt, TryStreamExt};
 
-use runtime_auth::AuthPrincipalRef;
-use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
+use runtime_request_context::{
+    AsyncMarker, CacheNamespace, RequestContext, current_principal_requires_read_only,
+};
 
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 #[cfg(feature = "openapi")]
@@ -99,19 +100,6 @@ pub enum Format {
 
     /// CSV format
     Csv,
-}
-
-pub(crate) fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
-    principal
-        .groups()
-        .iter()
-        .any(|group| *group == "write" || *group == "read_write")
-}
-
-pub(crate) async fn current_principal_requires_read_only() -> bool {
-    let context = RequestContext::current(AsyncMarker::new().await);
-    runtime_auth::AuthRequestContext::auth_principal(context.as_ref())
-        .is_some_and(|principal| !principal_has_write_access(principal))
 }
 
 pub(crate) async fn require_write_access() -> Option<Response> {
@@ -496,35 +484,6 @@ fn json_array_body_stream(
             account.release(size);
         }
     }
-}
-
-// Runs query and returns the results as a vector of `RecordBatch`.
-pub async fn run_sql(
-    df: Arc<DataFusion>,
-    sql: &str,
-    parameters: Option<ParamValues>,
-) -> Result<(Vec<RecordBatch>, CacheStatus), Box<dyn std::error::Error + Send + Sync>> {
-    run_sql_with_read_only(df, sql, parameters, false).await
-}
-
-// Runs query and returns the results as a vector of `RecordBatch`, enforcing read-only mode when requested.
-pub async fn run_sql_with_read_only(
-    df: Arc<DataFusion>,
-    sql: &str,
-    parameters: Option<ParamValues>,
-    read_only: bool,
-) -> Result<(Vec<RecordBatch>, CacheStatus), Box<dyn std::error::Error + Send + Sync>> {
-    let query_res = QueryBuilder::new(sql, df)
-        .parameters(parameters)
-        .read_only(read_only)
-        .build()
-        .run()
-        .await?;
-
-    Ok((
-        query_res.data.try_collect::<Vec<RecordBatch>>().await?,
-        query_res.cache_status,
-    ))
 }
 
 // Converts a buffered query result to an HTTP response.

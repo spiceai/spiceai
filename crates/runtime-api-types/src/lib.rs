@@ -16,8 +16,8 @@ limitations under the License.
 
 //! Shared API types for Spice runtime HTTP endpoints and CLI.
 //!
-//! This crate defines the canonical API response types used by:
-//! - The runtime's HTTP API handlers (for serialization)
+//! This crate defines the canonical API request and response types used by:
+//! - The runtime's HTTP API handlers (for deserializing requests, serializing responses)
 //! - The CLI (for deserialization)
 //!
 //! Within a major API version (e.g., `/v1`), these types should not have breaking changes.
