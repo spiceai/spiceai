@@ -52,7 +52,12 @@ use datafusion_expr::{
     LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, TableProviderFilterPushDown,
     binary_expr, ident,
 };
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
+#[cfg(any(
+    feature = "s3_vectors",
+    feature = "elasticsearch",
+    feature = "duckdb",
+    feature = "qdrant"
+))]
 use futures::FutureExt;
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
@@ -80,7 +85,12 @@ use runtime_search::{
     udtf::{EmbeddingColumnConfig, table_ref_from_column_expr},
 };
 
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
+#[cfg(any(
+    feature = "s3_vectors",
+    feature = "elasticsearch",
+    feature = "duckdb",
+    feature = "qdrant"
+))]
 use {
     crate::search::util::find_index_in_table_provider,
     search::index::SearchIndex,
@@ -93,11 +103,19 @@ use crate::accelerated::AcceleratedTable;
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
 
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
+#[cfg(any(
+    feature = "s3_vectors",
+    feature = "elasticsearch",
+    feature = "duckdb",
+    feature = "qdrant"
+))]
 use search::index::chunking::ChunkedSearchIndex;
 
 #[cfg(feature = "elasticsearch")]
 use search::index::elasticsearch::ElasticsearchIndex;
+
+#[cfg(feature = "qdrant")]
+use search::index::qdrant::QdrantIndex;
 
 use tokio::sync::RwLock;
 
@@ -356,7 +374,12 @@ impl VectorSearchTableFunc {
         })
     }
 
-    #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
+    #[cfg(any(
+        feature = "s3_vectors",
+        feature = "elasticsearch",
+        feature = "duckdb",
+        feature = "qdrant"
+    ))]
     fn index_based_vector_table(
         tbl: &Arc<dyn TableProvider>,
         args: &VectorSearchTableFuncArgs,
@@ -393,6 +416,17 @@ impl VectorSearchTableFunc {
             {
                 vector_indexes.extend(
                     duckdb_indexes
+                        .into_iter()
+                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
+                );
+            }
+        }
+
+        #[cfg(feature = "qdrant")]
+        {
+            if let Some((qdrant_indexes, _)) = find_index_in_table_provider::<QdrantIndex>(tbl) {
+                vector_indexes.extend(
+                    qdrant_indexes
                         .into_iter()
                         .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
                 );
@@ -540,7 +574,12 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         };
 
         // For table with a vector engine, use it.
-        #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
+        #[cfg(any(
+            feature = "s3_vectors",
+            feature = "elasticsearch",
+            feature = "duckdb",
+            feature = "qdrant"
+        ))]
         if let Some(table_provider) = Self::index_based_vector_table(&table_provider, &args)? {
             return Ok(table_provider);
         }
