@@ -69,6 +69,12 @@ impl CookieStore {
         HeaderValue::from_str(&header).ok()
     }
 
+    /// The value of one cookie, if the server has set it.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<String> {
+        self.cookies.read().get(name).cloned()
+    }
+
     pub fn update_from_headers(&self, headers: &HeaderMap) {
         let mut cookies = self.cookies.write();
         for value in headers.get_all(SET_COOKIE) {

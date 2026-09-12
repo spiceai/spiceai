@@ -20,6 +20,7 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::app_context_extension::AppContextExtension;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
+use crate::datafusion::sql_session_extension::SessionError;
 use crate::datafusion::sql_validator::validate_sql_query_read_only;
 use crate::dataupdate::DataUpdateBroadcaster;
 use crate::egress::EgressAccount;
@@ -81,12 +82,11 @@ mod handshake;
 pub(crate) mod metrics;
 pub mod middleware;
 mod mtls;
-mod session;
 pub(crate) mod session_auth;
 mod traced_ticket;
 mod util;
 
-pub use session::SessionStore;
+pub use crate::sessions::SessionStore;
 
 /// Sentinel value in [`FlightData::app_metadata`] that marks a message as a
 /// keepalive heartbeat. Write-through forwarding tasks send these periodically
@@ -102,22 +102,21 @@ pub struct Service {
 
 impl Service {
     /// Creates a new Flight service using the shared data update broadcaster.
+    ///
+    /// `session_store` is the runtime's, not this service's: a session id issued
+    /// by the handshake here is equally usable on `/v1/sql`, and both endpoints
+    /// derive the same implicit session for a caller that names none.
     #[must_use]
     pub fn new(
         basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
         data_update_broadcaster: DataUpdateBroadcaster,
+        session_store: SessionStore,
     ) -> Self {
         Self {
             data_update_broadcaster,
             basic_auth,
-            session_store: SessionStore::new(),
+            session_store,
         }
-    }
-
-    /// Returns a clone of the session store.
-    #[must_use]
-    pub fn session_store(&self) -> SessionStore {
-        self.session_store.clone()
     }
 }
 
@@ -699,6 +698,13 @@ pub(crate) fn handle_datafusion_error(e: DataFusionError) -> Status {
     if query::is_timeout_error(&e) {
         return Status::deadline_exceeded(e.to_string());
     }
+    // A session belonging to someone else is not a malformed query — report it
+    // as the distinct condition it is.
+    if let Some(session_error) = SessionError::from_datafusion(&e) {
+        return match session_error {
+            SessionError::NotOwned { .. } => Status::permission_denied(session_error.to_string()),
+        };
+    }
     match e {
         DataFusionError::Plan(err_msg) | DataFusionError::Execution(err_msg) => {
             Status::invalid_argument(err_msg)
@@ -862,11 +868,12 @@ pub async fn start(
         });
     }
 
+    let session_store = rt.sessions();
     let service = Service::new(
         endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
         rt.datafusion().data_update_broadcaster(),
+        session_store.clone(),
     );
-    let session_store = service.session_store.clone();
 
     let flight_message_size = app
         .as_ref()

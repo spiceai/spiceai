@@ -36,7 +36,7 @@ use crate::{
     extension::{Extension, ExtensionFactory},
     flight::RateLimits,
     secrets::{self, Secrets},
-    status,
+    sessions, status,
 };
 use app::App;
 use runtime_acceleration::acceleration::{RefreshMode, unset_refresh_mode_for_connector};
@@ -845,6 +845,7 @@ impl RuntimeBuilder {
                 dataset_parallelism.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
             )),
             telemetry_config: self.telemetry_config,
+            sessions: sessions::SessionStore::new(),
         };
 
         // Executors: register cluster status before any concurrent

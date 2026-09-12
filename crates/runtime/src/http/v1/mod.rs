@@ -80,6 +80,7 @@ use runtime_auth::AuthPrincipalRef;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
+use crate::datafusion::sql_session_extension::SessionError;
 #[cfg(feature = "openapi")]
 use utoipa::{
     openapi::{
@@ -278,7 +279,7 @@ pub async fn sql_to_http_response(
         Ok(res) => res,
         Err(e) => {
             let kind = SqlErrorKind::of_query_error(&e);
-            return sql_error_response(e.to_string(), kind);
+            return sql_error_response(SqlErrorKind::message_for_query_error(&e), kind);
         }
     };
 
@@ -352,9 +353,10 @@ fn transaction_error_to_response(error: TransactionError) -> Response {
         TransactionError::Plan(e) | TransactionError::Stream(e) => {
             sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e))
         }
-        TransactionError::Query(e) => {
-            sql_error_response(e.to_string(), SqlErrorKind::of_query_error(&e))
-        }
+        TransactionError::Query(e) => sql_error_response(
+            SqlErrorKind::message_for_query_error(&e),
+            SqlErrorKind::of_query_error(&e),
+        ),
         TransactionError::Conflict { table } => {
             // Optimistic-concurrency conflict: a participant was committed to
             // between this transaction's start and commit. Retryable — map to
@@ -388,18 +390,41 @@ enum SqlErrorKind {
     /// separately so it can be logged as the operator-actionable condition it
     /// is and answered with a retriable status.
     ResourcesExhausted,
+    /// The request named a session belonging to another principal.
+    SessionNotOwned,
 }
 
 impl SqlErrorKind {
+    /// The message to answer a query error with.
+    ///
+    /// A session error travels inside a `DataFusionError::External`, and the
+    /// generic formatting wraps that as `Failed to execute query: External
+    /// error: …`. "External error" names a `DataFusion` internal the caller has
+    /// no use for, so the session error states itself.
+    fn message_for_query_error(e: &QueryError) -> String {
+        if let QueryError::UnableToExecuteQuery { source } = e
+            && let Some(session_error) = SessionError::from_datafusion(source)
+        {
+            return session_error.to_string();
+        }
+        e.to_string()
+    }
+
     fn of_query_error(e: &QueryError) -> Self {
         match e {
             QueryError::QueryCancelled { .. } => Self::Cancellation,
             QueryError::QueryTimedOut { .. } => Self::Timeout,
+            QueryError::UnableToExecuteQuery { source } => Self::of_datafusion_error(source),
             _ => Self::General,
         }
     }
 
     fn of_datafusion_error(e: &datafusion::error::DataFusionError) -> Self {
+        if let Some(session_error) = SessionError::from_datafusion(e) {
+            return match session_error {
+                SessionError::NotOwned { .. } => Self::SessionNotOwned,
+            };
+        }
         if is_cancellation_error(e) {
             Self::Cancellation
         } else if is_timeout_error(e) {
@@ -435,6 +460,7 @@ fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
         // replica. Flight already reports the same failure as the retriable
         // `RESOURCE_EXHAUSTED`.
         SqlErrorKind::ResourcesExhausted => StatusCode::SERVICE_UNAVAILABLE,
+        SqlErrorKind::SessionNotOwned => StatusCode::FORBIDDEN,
         SqlErrorKind::General => status_for_sql_error(&message),
     };
     (status, message).into_response()

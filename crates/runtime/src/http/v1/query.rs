@@ -43,6 +43,7 @@ use super::{ResponseMimeType, current_principal_requires_read_only, sql_to_http_
     tag = "SQL",
     params(
         ("Accept" = String, Header, description = "The format of the response, one of 'application/json' (default), 'application/vnd.spiceai.sql.v1+json', 'text/csv' or 'text/plain'."),
+        ("x-session-id" = Option<String>, Header, description = "Run in the session with this id, such as one returned by an Arrow Flight SQL handshake. Omit it and the request runs in a session of its own, derived from the authenticated principal, which is what lets PREPARE, EXECUTE and DEALLOCATE carry over between requests."),
     ),
     request_body(
         description = "SQL query to execute",
@@ -170,6 +171,14 @@ use super::{ResponseMimeType, current_principal_requires_read_only, sql_to_http_
         (status = 400, description = "Invalid SQL query or malformed input", content((
             String,
             example = "Error reading query: invalid UTF-8 sequence"
+        ))),
+        (status = 403, description = "The named session belongs to a different principal", content((
+            String,
+            example = "Session 'a1b2' belongs to a different principal, so this request cannot run in it."
+        ))),
+        (status = 404, description = "The named session does not exist or has expired", content((
+            String,
+            example = "Session 'a1b2' was not found, so the prepared statements it held are gone and this request cannot run in it."
         ))),
         (status = 500, description = "Internal server error", content((
             String,

@@ -51,6 +51,7 @@ const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 mod do_get;
 mod do_put;
 mod prepared_statements;
+mod sessions;
 mod statement_substrait_plan;
 mod statement_update;
 mod trace_id;

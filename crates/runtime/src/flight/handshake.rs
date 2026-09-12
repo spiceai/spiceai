@@ -17,7 +17,6 @@ limitations under the License.
 use arrow_flight::HandshakeResponse;
 use futures::Stream;
 use runtime_auth::FlightBasicAuth;
-use runtime_request_context::{AsyncMarker, RequestContext};
 use std::pin::Pin;
 use std::sync::Arc;
 use tonic::{
@@ -25,7 +24,6 @@ use tonic::{
     metadata::{MetadataMap, MetadataValue},
 };
 
-use crate::datafusion::request_context_extension::get_current_datafusion;
 use runtime_auth::layer::flight as flight_auth;
 use telemetry::timing::TimedStream;
 
@@ -48,17 +46,18 @@ pub(crate) async fn handle(
     // Validate authentication if required
     let auth_token = flight_auth::validate_basic_auth_handshake(metadata, basic_auth)?;
 
-    // Get the base DataFusion context from the request context
-    let request_context = RequestContext::current(AsyncMarker::new().await);
-    let datafusion = get_current_datafusion(&request_context);
+    // Register an id against the credential that just authenticated, so
+    // presenting the id as a bearer token from now on authenticates as that
+    // credential (see `SessionAwareAuth`). Only the id: the context behind it
+    // is built if and when a statement in this session needs one, and the
+    // principal that runs it is recorded as the owner then.
+    let session = session_store.issue(auth_token.clone());
+    let session_id = session.id().to_string();
 
-    // Create a new session from the base context, associating it with the auth token
-    let (session_id, _session_ctx) =
-        session_store.create_session(&datafusion.ctx, auth_token.as_deref());
-
+    // The id is a bearer credential, so it is not logged.
     tracing::debug!(
         authenticated = auth_token.is_some(),
-        "Created new Flight SQL session: {session_id}"
+        "Created a new Flight SQL session"
     );
 
     // Return the session ID in the response payload

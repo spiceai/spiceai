@@ -29,7 +29,6 @@ limitations under the License.
 //! `SESSION_TTL_SECS`) and a maximum of 10 000 sessions are kept.
 
 use datafusion::prelude::SessionContext;
-use http::HeaderMap;
 use moka::sync::Cache;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +40,15 @@ const SESSION_TTL_SECS: u64 = 3600;
 const MAX_SESSIONS: u64 = 10_000;
 
 /// Manages Flight SQL sessions, mapping session IDs to `SessionContext` instances.
+///
+/// Ids are issued by [`SessionStore::create_session`] and only looked up
+/// afterwards: a request naming an id the store does not hold resolves to
+/// nothing rather than having a session created under that id.
+///
+/// That is not isolation on its own. [`crate::FlightSqlService`] runs a request
+/// whose session does not resolve against its shared base context, so two
+/// clients naming different unknown ids share one context — and each other's
+/// prepared statements. Only an issued id gets a context of its own.
 #[derive(Clone)]
 pub struct SessionStore {
     sessions: Cache<String, Arc<SessionContext>>,
@@ -82,7 +90,10 @@ impl SessionStore {
         base_ctx: &SessionContext,
         api_key: Option<&str>,
     ) -> (String, Arc<SessionContext>) {
-        let session_id = Uuid::now_v7().hyphenated().to_string();
+        // A CSPRNG-random UUIDv4, not the time-ordered UUIDv7: this id is
+        // returned to the client and accepted as a bearer session token, so it
+        // must be unpredictable and must not leak its creation time.
+        let session_id = Uuid::new_v4().hyphenated().to_string();
 
         let new_state = builder_from_existing(&base_ctx.state())
             .with_session_id(session_id.clone())
@@ -125,50 +136,6 @@ impl SessionStore {
         self.get_session(&session_id)
     }
 
-    /// Look up or create a session from gRPC request metadata.
-    ///
-    /// Returns `None` when no authorization/session header is present.
-    #[must_use]
-    pub fn get_or_create_session(
-        &self,
-        metadata: &MetadataMap,
-        base_ctx: &SessionContext,
-    ) -> Option<Arc<SessionContext>> {
-        let session_id = extract_session_id(metadata)?;
-        if let Some(session) = self.get_session(&session_id) {
-            return Some(session);
-        }
-        let new_state = builder_from_existing(&base_ctx.state())
-            .with_session_id(session_id.clone())
-            .build();
-        let session_ctx = Arc::new(SessionContext::new_with_state(new_state));
-        self.sessions.insert(session_id, Arc::clone(&session_ctx));
-        self.sessions.run_pending_tasks();
-        Some(session_ctx)
-    }
-
-    /// Look up or create a session from HTTP headers.
-    ///
-    /// Returns `None` when no authorization/session header is present.
-    #[must_use]
-    pub fn get_or_create_session_from_http(
-        &self,
-        headers: &HeaderMap,
-        base_ctx: &SessionContext,
-    ) -> Option<Arc<SessionContext>> {
-        let session_id = extract_session_id_from_headers(headers)?;
-        if let Some(session) = self.get_session(&session_id) {
-            return Some(session);
-        }
-        let new_state = builder_from_existing(&base_ctx.state())
-            .with_session_id(session_id.clone())
-            .build();
-        let session_ctx = Arc::new(SessionContext::new_with_state(new_state));
-        self.sessions.insert(session_id, Arc::clone(&session_ctx));
-        self.sessions.run_pending_tasks();
-        Some(session_ctx)
-    }
-
     /// Remove a session; returns `true` if it existed.
     #[must_use]
     pub fn remove_session(&self, session_id: &str) -> bool {
@@ -207,23 +174,6 @@ fn extract_session_id(metadata: &MetadataMap) -> Option<String> {
     None
 }
 
-fn extract_session_id_from_headers(headers: &HeaderMap) -> Option<String> {
-    if let Some(v) = headers.get("x-session-id")
-        && let Ok(s) = v.to_str()
-    {
-        return Some(s.to_string());
-    }
-    if let Some(v) = headers.get("authorization")
-        && let Ok(s) = v.to_str()
-        && let Some(t) = s
-            .strip_prefix("Bearer ")
-            .or_else(|| s.strip_prefix("bearer "))
-    {
-        return Some(t.to_string());
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +197,34 @@ mod tests {
         assert_eq!(store.session_count(), 1);
         assert!(store.remove_session(&id));
         assert_eq!(store.session_count(), 0);
+    }
+
+    /// Naming an id the store never issued resolves to nothing and creates
+    /// nothing, so two callers that pick the same id do not end up sharing a
+    /// context and its prepared statements.
+    #[test]
+    fn naming_an_unknown_id_creates_nothing() {
+        let store = SessionStore::new();
+        let mut meta = MetadataMap::new();
+        meta.insert(
+            "x-session-id",
+            "shared-guessable-id".parse().expect("valid header value"),
+        );
+
+        assert!(store.get_session_from_metadata(&meta).is_none());
+        assert_eq!(store.session_count(), 0);
+    }
+
+    /// Session ids are handed to clients and accepted as bearer tokens, so they
+    /// must be CSPRNG-random rather than the time-ordered `UUIDv7`, whose value
+    /// leaks its creation time and is partly predictable.
+    #[test]
+    fn an_issued_id_is_a_random_uuid() {
+        let store = SessionStore::new();
+        let (id, _) = store.create_session(&SessionContext::new(), None);
+
+        let uuid = Uuid::parse_str(&id).expect("the id is a UUID");
+        assert_eq!(uuid.get_version(), Some(uuid::Version::Random), "{id}");
     }
 
     #[test]

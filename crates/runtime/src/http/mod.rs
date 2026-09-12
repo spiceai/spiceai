@@ -39,6 +39,7 @@ pub use routes::get_api_doc;
 mod mtls;
 mod response_outcome;
 mod routes;
+pub(crate) mod session_auth;
 
 pub mod v1;
 
@@ -147,7 +148,10 @@ where
             || app.as_ref().and_then(|a| a.runtime.mcp.clone()),
             |r| r.mcp.clone(),
         );
-    let auth_layer = auth_provider.map(AuthLayer::new);
+    // Accept a session id as a bearer token here too, so an id issued by a
+    // Flight SQL handshake authenticates on the HTTP API and vice versa.
+    let auth_layer =
+        session_auth::with_session_awareness(auth_provider, rt.sessions()).map(AuthLayer::new);
     let routes = routes::routes(
         &rt,
         config,

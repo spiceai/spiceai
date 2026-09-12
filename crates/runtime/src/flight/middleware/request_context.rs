@@ -16,14 +16,14 @@ limitations under the License.
 
 use crate::{
     datafusion::{
-        DataFusion, flight_session_extension::FlightSessionExtension,
-        job_executor_context_extension::JobExecutorContextExtension,
+        DataFusion, job_executor_context_extension::JobExecutorContextExtension,
         request_context_extension::DataFusionContextExtension,
+        sql_session_extension::SqlSessionExtension,
     },
-    flight::SessionStore,
     jobs::JobExecutor,
     model::ModelContextExtension,
     secrets,
+    sessions::{SESSION_ID_HEADER, SessionStore},
 };
 use app::App;
 use runtime_request_context::{Protocol, RequestContext};
@@ -119,16 +119,17 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
-        // Try to get or create a session for this request. Capture the owning
-        // principal's stable id (if the request names an existing, owned session)
-        // so the session can be bound to its owner at execution time. This layer
-        // runs before auth, so ownership is *recorded* here and *enforced* later
-        // where the authenticated principal is known.
-        let owner_stable_id = self.session_store.owner_stable_id_from_http(req.headers());
-        let session_ext = self
-            .session_store
-            .get_or_create_session_from_http(req.headers(), &self.df.ctx)
-            .map(|ctx| FlightSessionExtension::new(ctx, owner_stable_id));
+        // Record which session the request names. This layer runs before auth,
+        // so the session is not resolved here — the ownership check needs the
+        // authenticated principal, which is only known once the query runs.
+        //
+        // Settle which session this request belongs to, minting an id when it
+        // names none — the id only; the context is built later, and only if a
+        // statement needs one. gRPC metadata is HTTP/2 headers, so this reads
+        // the same map the HTTP middleware does.
+        let session = crate::sessions::resolve_or_mint(&self.session_store, req.headers());
+        let session_id = session.id().to_string();
+        let session_ext = SqlSessionExtension::new(session);
 
         let app_lock = Arc::clone(&self.app);
         let df = Arc::clone(&self.df);
@@ -153,10 +154,7 @@ where
                 builder = builder.with_extension(JobExecutorContextExtension::new(executor));
             }
 
-            // Add session extension if we have one
-            if let Some(session_ext) = session_ext {
-                builder = builder.with_extension(session_ext);
-            }
+            builder = builder.with_extension(session_ext);
 
             let request_context = Arc::new(builder.from_headers(req.headers()).build());
 
@@ -182,6 +180,17 @@ where
                     // turned a handler's `Status` into a response — so failures carry
                     // the id too.
                     runtime_request_context::attach_trace_id(&mut parts.headers, &request_context);
+                    // Hand the id back so the next request can name this
+                    // session. A cookie too, for the clients that keep one —
+                    // `flight_client` does.
+                    if let Ok(value) = http::HeaderValue::from_str(&session_id) {
+                        parts.headers.insert(SESSION_ID_HEADER, value);
+                    }
+                    if let Ok(value) = http::HeaderValue::from_str(
+                        &crate::sessions::session_cookie_value(&session_id),
+                    ) {
+                        parts.headers.append(http::header::SET_COOKIE, value);
+                    }
                     let body = util::cancel_guard_body::CancelGuardBody::new(body, cancel_guard);
                     Ok(http::Response::from_parts(parts, body))
                 })

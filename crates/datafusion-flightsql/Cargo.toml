@@ -25,7 +25,7 @@ snafu = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
-uuid = { workspace = true, features = ["v7"] }
+uuid = { workspace = true, features = ["v4"] }
 util = { path = "../util" }
 
 [dev-dependencies]
