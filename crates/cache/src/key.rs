@@ -19,6 +19,8 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
 
+pub use crate::namespace_key::namespace_key_prefix;
+
 use async_openai::types::embeddings::CreateEmbeddingRequest;
 use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::ParamValues;
@@ -144,10 +146,13 @@ impl CacheKey<'_> {
     /// `namespace_id` is the principal's stable opaque id (empty for
     /// public/system).
     ///
-    /// The byte stream hashed is:
+    /// The byte stream hashed is the return of [`namespace_key_prefix`]
+    /// followed by the payload, i.e.
     /// `[namespace_tag][namespace_id.len() as u64 LE][namespace_id...][payload...]`
     /// so that `(tag=1, id="abc")` and `(tag=1, id="a")` followed by a
-    /// payload starting with `"bc"` cannot collide.
+    /// payload starting with `"bc"` cannot collide. That prefix-unambiguity
+    /// is a Verus postcondition on [`namespace_key_prefix`], not a
+    /// comment-only claim.
     #[must_use]
     pub fn as_raw_key_in_namespace<T: Hasher>(
         &self,
@@ -155,9 +160,7 @@ impl CacheKey<'_> {
         namespace_tag: u8,
         namespace_id: &[u8],
     ) -> RawCacheKey {
-        hasher.write_u8(namespace_tag);
-        hasher.write_u64(namespace_id.len() as u64);
-        hasher.write(namespace_id);
+        hasher.write(&namespace_key_prefix(namespace_tag, namespace_id));
         self.hash_payload(&mut hasher);
         RawCacheKey(hasher.finish())
     }
@@ -234,6 +237,73 @@ mod tests {
     use std::hash::RandomState;
 
     use super::*;
+
+    #[test]
+    fn as_raw_key_in_namespace_writes_the_verified_prefix_first() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct RecordingHasher {
+            writes: Rc<RefCell<Vec<Vec<u8>>>>,
+        }
+
+        impl Hasher for RecordingHasher {
+            fn write(&mut self, bytes: &[u8]) {
+                self.writes.borrow_mut().push(bytes.to_vec());
+            }
+
+            fn finish(&self) -> u64 {
+                0
+            }
+        }
+
+        let writes = Rc::new(RefCell::new(Vec::new()));
+        let hasher = RecordingHasher {
+            writes: Rc::clone(&writes),
+        };
+        let _ = CacheKey::Query("select 1", None).as_raw_key_in_namespace(hasher, 1, b"alice");
+        let recorded = writes.borrow();
+        assert!(
+            !recorded.is_empty(),
+            "the hasher must see the namespace prefix"
+        );
+        assert_eq!(
+            recorded[0],
+            namespace_key_prefix(1, b"alice"),
+            "the first write must be the verified prefix, not a parallel encoding"
+        );
+    }
+
+    #[test]
+    fn as_raw_key_in_namespace_distinguishes_principals() {
+        use std::hash::BuildHasher;
+        use std::hash::BuildHasherDefault;
+
+        type Xxh3 = BuildHasherDefault<twox_hash::XxHash3_64>;
+        let key_for = |tag: u8, id: &[u8]| {
+            CacheKey::Query("select 1", None).as_raw_key_in_namespace(
+                Xxh3::default().build_hasher(),
+                tag,
+                id,
+            )
+        };
+
+        assert_ne!(
+            key_for(1, b"alice").as_u64(),
+            key_for(1, b"bob").as_u64(),
+            "distinct principals must not share a results-cache key"
+        );
+        assert_ne!(
+            key_for(0, b"").as_u64(),
+            key_for(2, b"").as_u64(),
+            "public and system (both empty id) must not share a results-cache key"
+        );
+        assert_eq!(
+            key_for(1, b"alice").as_u64(),
+            key_for(1, b"alice").as_u64(),
+            "the same namespace and payload must be stable"
+        );
+    }
 
     // explicitly allow this rule, because we're validating that the builtin u64 hash -> .write_u64() path works as expected
     #[expect(clippy::manual_hash_one)]

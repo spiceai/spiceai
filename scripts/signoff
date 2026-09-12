@@ -120,9 +120,11 @@ readonly REQUIRED_CHECKS=(
   "Features Check"           # features.yml
   "Check Rust Licenses"      # license_check.yml
   "E2E Test CI"              # e2e_test_ci.yml (gate job)
-  # verus_verify.yml. The only check that reads the Verus proofs: a normal
-  # `cargo build` erases the specifications, so nothing else here would notice
-  # a postcondition that no longer holds.
+  # verus_verify.yml. The only check that reads the Verus proofs (hash-index
+  # and the results-cache namespace prefix today): a normal `cargo build`
+  # erases the specifications, so nothing else here would notice a
+  # postcondition that no longer holds. The job name is the required-check
+  # context and is kept stable so the trunk ruleset still matches.
   "Verify hash-index proofs"
 )
 # GitHub Actions app id — pins each required check to Actions so a hand-POSTed
