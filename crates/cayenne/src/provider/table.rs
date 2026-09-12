@@ -1462,12 +1462,16 @@ enum ScanViewAction {
 
 /// How a cached [`ScanView`] is reused across scans.
 ///
-/// Derived from the dataset's `refresh_mode`:
+/// Derived from the dataset's `refresh_mode` **and writability**
+/// (`scan_view_reuse_for`):
 ///
-/// - [`Self::UntilInvalidated`] — `full` / `append` / `snapshot` / `caching`.
-///   Serve the cached view until a write bumps `scan_input_version`.
-/// - [`Self::WithinLag`] — `changes`. Serve a view captured within `lag` so
-///   concurrent scans can share one build across a burst of applies.
+/// - [`Self::UntilInvalidated`] — `full` / `append` / `snapshot` / `caching`,
+///   and **writable** `changes` (write-back). Serve the cached view until a
+///   write bumps `scan_input_version`.
+/// - [`Self::WithinLag`] — **read-only** `changes` only. Serve a view
+///   captured within `lag` so concurrent scans can share one build across a
+///   burst of applies. Direct builder users must not pick this for a
+///   write-back table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScanViewReuse {
     /// Serve `latest_complete` until a write advances `scan_input_version`.
@@ -1545,37 +1549,41 @@ impl ScanViewCache {
         });
     }
 
-    /// Wait-free serve of `latest_complete` when `reuse` says it is still valid.
-    /// Double-loads `scan_input_version` around the `ArcSwap` load so a write
-    /// that races the lookup falls through to a recapture rather than serving
-    /// a pre-write view tagged with the post-write version.
+    /// Wait-free serve of a `latest_complete` snapshot already loaded by the
+    /// caller. The caller must load `candidate` **between** `version_before`
+    /// and `version_after`; this does not load `latest_complete` again, so a
+    /// write that publishes after `version_after` cannot swap in a different
+    /// view that this check would still accept.
     fn try_serve_latest(
-        &self,
         reuse: ScanViewReuse,
         version_before: u64,
         version_after: u64,
         structural: u64,
         now: Instant,
+        candidate: Option<Arc<CompletedScanView>>,
     ) -> Option<Arc<ScanView>> {
         // A live schema-evolution leaves the generation odd; never serve across it.
         if structural & 1 == 1 {
             return None;
         }
-        match reuse {
+        let current = candidate?;
+        let servable = match reuse {
             ScanViewReuse::UntilInvalidated => {
-                if version_before != version_after {
-                    return None;
-                }
-                self.serve_if(|current| {
-                    current.order == version_after && current.view.structural_version == structural
-                })
+                version_before == version_after
+                    && current.order == version_after
+                    && current.view.structural_version == structural
             }
-            ScanViewReuse::WithinLag(lag) if !lag.is_zero() => self.serve_if(|current| {
+            ScanViewReuse::WithinLag(lag) if !lag.is_zero() => {
                 now.saturating_duration_since(current.captured_at) <= lag
                     && current.view.structural_version == structural
-            }),
-            ScanViewReuse::WithinLag(_) => None,
+            }
+            ScanViewReuse::WithinLag(_) => false,
+        };
+        if !servable {
+            return None;
         }
+        current.touch(now);
+        Some(Arc::clone(&current.view))
     }
 
     /// Wait-free serve when `latest_complete` has this exact identity.
@@ -27402,20 +27410,24 @@ impl CayenneTableProvider {
         &self,
         reuse: ScanViewReuse,
     ) -> datafusion_common::Result<Arc<ScanView>> {
-        // Wait-free hit: double-load `scan_input_version` around the `ArcSwap`
-        // load so a write that races the lookup recaptures rather than serving
-        // a pre-write view. An odd structural generation is a live schema-
+        // Wait-free hit: sample `scan_input_version`, load `latest_complete`,
+        // sample the version again. The candidate is the view that sat in the
+        // slot between those two samples; `try_serve_latest` does not load
+        // again. A write that bumps the version in that window fails the
+        // before==after check. An odd structural generation is a live schema-
         // evolution and also falls through. No drain, no mutex.
         let version_before = self.scan_input_version.load(Ordering::Acquire);
         let now = Instant::now();
         let structural = self.structural_version.current();
+        let candidate = self.scan_view_cache.latest_complete.load_full();
         let version_after = self.scan_input_version.load(Ordering::Acquire);
-        if let Some(view) = self.scan_view_cache.try_serve_latest(
+        if let Some(view) = ScanViewCache::try_serve_latest(
             reuse,
             version_before,
             version_after,
             structural,
             now,
+            candidate,
         ) {
             return Ok(view);
         }
@@ -46458,6 +46470,26 @@ mod tests {
             provider.cached_snapshot_listing.load_full().is_some(),
             "{mode}: warmup must populate the snapshot listing cache"
         );
+
+        // One-worker baseline on the same fixture: 8 mutex-serialized workers
+        // at ~307 µs/lookup would still beat a 10 ms serial budget. Require
+        // the concurrent run to beat fully-serialized one-worker time.
+        let baseline_t0 = Instant::now();
+        for n in 0..lookups_per_worker {
+            let id = target_ids[n % target_ids.len()];
+            assert_eq!(
+                query_pk_i64(
+                    Arc::clone(&provider) as Arc<dyn TableProvider>,
+                    &ctx,
+                    id,
+                    "value",
+                )
+                .await,
+                vec![id * 10],
+                "{mode}: one-worker baseline PK lookup id={id}"
+            );
+        }
+        let baseline = baseline_t0.elapsed();
         let queries_before = catalog.metastore_query_count();
 
         let errors = Arc::new(AtomicU64::new(0));
@@ -46495,10 +46527,10 @@ mod tests {
             .expect("elapsed ms fits u64")
             .max(1);
         let qps = completed.saturating_mul(1000) / elapsed_ms;
-        // Serial 10 ms × N lookups is the sequential latency budget; concurrent
-        // workers on a wait-free warm hit must beat that.
-        let serial_budget = Duration::from_millis(10)
-            .saturating_mul(u32::try_from(completed).expect("lookup count fits u32"));
+        // Fully serialized: `workers` copies of the one-worker baseline.
+        // Wait-free hits must beat that by at least 2×.
+        let serialized =
+            baseline.saturating_mul(u32::try_from(workers).expect("worker count fits u32"));
         assert_eq!(
             error_count, 0,
             "{mode}: {error_count} PK lookups returned the wrong row"
@@ -46508,12 +46540,8 @@ mod tests {
             "{mode}: warm concurrent PK lookups queried the metastore ({queries_before} -> {queries_after})"
         );
         assert!(
-            elapsed < serial_budget,
-            "{mode}: {completed} concurrent PK lookups took {elapsed:?}, which is no faster than serial 10ms ({serial_budget:?}); qps={qps}"
-        );
-        assert!(
-            qps >= 200,
-            "{mode}: warm concurrent PK lookup QPS was {qps}, want >= 200; elapsed={elapsed:?} completed={completed}"
+            elapsed.saturating_mul(2) < serialized,
+            "{mode}: {workers} workers took {elapsed:?} for {lookups_per_worker} lookups each; one worker took {baseline:?} for {lookups_per_worker}, so fully serialized is {serialized:?}. Want concurrent at least 2× faster (elapsed*2 < serialized); qps={qps}"
         );
     }
 
