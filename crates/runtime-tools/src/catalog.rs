@@ -68,11 +68,12 @@ pub trait SpiceToolCatalog: Send + Sync {
     /// Synchronous listing used to keep the MCP schema snapshot populated.
     ///
     /// Return every tool the catalog can expose without I/O. Empty means the
-    /// snapshot cannot yet name this catalog's tools.
+    /// snapshot cannot yet name this catalog's tools from this method.
     ///
     /// Default is empty so downstream implementers keep compiling. Catalogs
     /// that participate in MCP schema snapshots must override this. Wrappers
-    /// must forward; inheriting the default leaves the snapshot unnamed.
+    /// must forward; inheriting the default leaves the snapshot unnamed
+    /// until a gateway `tools/list` folds in a warmed [`Self::all`] page.
     fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         Vec::new()
     }

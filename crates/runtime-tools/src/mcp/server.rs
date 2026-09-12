@@ -176,9 +176,20 @@ impl McpSchemaSnapshot {
     /// `try_all` here means that refresh either waits and applies after
     /// this write, or this write already sees the refreshed cache.
     fn replace_listed_from_map(&self, tools: &HashMap<String, Tooling>) -> (Vec<Tool>, bool) {
+        self.replace_listed_from_map_with_warm(tools, &[])
+    }
+
+    /// Like [`Self::replace_listed_from_map`], and keep definitions
+    /// collected by async `all()` for catalogs whose `try_all` is the
+    /// empty compatibility default.
+    fn replace_listed_from_map_with_warm(
+        &self,
+        tools: &HashMap<String, Tooling>,
+        warm: &[Arc<dyn SpiceModelTool>],
+    ) -> (Vec<Tool>, bool) {
         let _publish = self.lock_publish();
         self.replace_direct_from_map(tools);
-        let next = mcp_schemas_from_map(tools);
+        let next = mcp_schemas_from_map_with_warm(tools, warm);
         let listed = tools_listed_by_name(&next);
         (listed, self.install_listed_map(next))
     }
@@ -463,6 +474,20 @@ impl RuntimeServer {
         result
     }
 
+    /// Warm catalog caches, then publish the `tools/list` generation.
+    ///
+    /// `all()` fills MCP catalog caches so `try_all` is current under
+    /// the publish lock. Catalogs that implement only async `all`/`get`
+    /// leave `try_all` empty; their already-collected definitions are
+    /// folded into that same generation so they still appear in the page.
+    async fn publish_listed_tools(&self) -> Vec<Tool> {
+        let warm = self.all_tools().await;
+        let map = self.tools.read().await;
+        let (tools, changed) = self.schemas.replace_listed_from_map_with_warm(&map, &warm);
+        self.schemas.bump_if(changed);
+        tools
+    }
+
     fn snapshot_tool(&self, name: &str) -> Option<Tool> {
         // `decode_tool_name` accepts `srv__tool__name` as an alias of
         // canonical `srv__tool_-_name`. Prefer the canonical snapshot
@@ -699,17 +724,7 @@ impl ServerHandler for RuntimeServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
-        Box::pin(async move {
-            // Warm catalog caches so `try_all` is populated, then
-            // snapshot under the publish lock from the live map. A
-            // page collected here and installed later can be older
-            // than a concurrent TTL/reconnect publish.
-            let _warm = self.all_tools().await;
-            let map = self.tools.read().await;
-            let (tools, changed) = self.schemas.replace_listed_from_map(&map);
-            self.schemas.bump_if(changed);
-            Ok(listed_tools_result(tools))
-        })
+        Box::pin(async move { Ok(listed_tools_result(self.publish_listed_tools().await)) })
     }
 }
 
@@ -766,15 +781,48 @@ pub fn mcp_direct_schemas_from_map(tools: &HashMap<String, Tooling>) -> HashMap<
 #[must_use]
 #[expect(clippy::implicit_hasher)]
 pub fn mcp_schemas_from_map(tools: &HashMap<String, Tooling>) -> HashMap<String, Tool> {
+    mcp_schemas_from_map_with_warm(tools, &[])
+}
+
+/// Snapshot schemas from `try_all`, plus async-collected catalog tools
+/// whose catalogs still have the empty `try_all` compatibility default.
+///
+/// Names already supplied by `try_all` are left alone: that page is
+/// read under the publish lock and may be newer than `warm`.
+#[expect(clippy::implicit_hasher)]
+fn mcp_schemas_from_map_with_warm(
+    tools: &HashMap<String, Tooling>,
+    warm: &[Arc<dyn SpiceModelTool>],
+) -> HashMap<String, Tool> {
     let mut schemas = mcp_direct_schemas_from_map(tools);
+    let mut async_only = HashSet::new();
     for tooling in tools.values() {
         if let Tooling::Catalog { tools: catalog, .. } = tooling {
             let catalog_name = catalog.name();
-            for tool in catalog.try_all() {
+            let listed = catalog.try_all();
+            if listed.is_empty() {
+                async_only.insert(catalog_name.to_string());
+                continue;
+            }
+            for tool in listed {
                 let exposed = encode_tool_name(catalog_name, &tool.name());
                 schemas.insert(exposed.clone(), mcp_tool_from_spice(exposed, tool.as_ref()));
             }
         }
+    }
+    if async_only.is_empty() {
+        return schemas;
+    }
+    for tool in warm {
+        let exposed = tool.name();
+        let Some((catalog, _)) = decode_tool_name(exposed.as_ref()) else {
+            continue;
+        };
+        if !async_only.contains(&catalog) {
+            continue;
+        }
+        let name = exposed.into_owned();
+        schemas.insert(name.clone(), mcp_tool_from_spice(name, tool.as_ref()));
     }
     schemas
 }
@@ -893,6 +941,37 @@ mod tests {
         fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
             vec![Arc::new(StubTool(self.tool)) as Arc<dyn SpiceModelTool>]
         }
+    }
+
+    /// Out-of-tree shape: only the pre-`try_get` / `try_all` async API.
+    struct AsyncOnlyCatalog;
+
+    #[async_trait::async_trait]
+    impl SpiceToolCatalog for AsyncOnlyCatalog {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &'static str {
+            "downstream"
+        }
+        async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+            vec![Arc::new(StubTool("lookup")) as Arc<dyn SpiceModelTool>]
+        }
+        async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+            (name == "lookup").then(|| Arc::new(StubTool("lookup")) as Arc<dyn SpiceModelTool>)
+        }
+    }
+
+    fn async_only_catalog_tools() -> HashMap<String, Tooling> {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "downstream".to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(AsyncOnlyCatalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+        tools
     }
 
     struct ZoneAnnotatedTool;
@@ -1441,6 +1520,146 @@ mod tests {
         assert_eq!(
             result_names,
             ["get_readiness", "memory", "search", "sql", "web"]
+        );
+    }
+
+    /// `try_all`'s compatibility default is empty, so a page rebuilt
+    /// only from it drops tools that async `all()` already collected.
+    /// regression test for #14043
+    #[tokio::test]
+    async fn discarded_warm_page_omits_async_only_catalog_tools() {
+        let tools = async_only_catalog_tools();
+        let server = RuntimeServer::new(Arc::new(RwLock::new(tools)));
+        let exposed = encode_tool_name("downstream", "lookup");
+        let warm = server.all_tools().await;
+        assert!(
+            warm.iter().any(|tool| tool.name() == exposed),
+            "all() must collect the downstream catalog tool"
+        );
+        let map = server.tools.read().await;
+        assert!(
+            !mcp_schemas_from_map(&map).contains_key(&exposed),
+            "try_all default is empty, so a try_all-only rebuild drops the warm tool"
+        );
+    }
+
+    /// Gateway `tools/list` used to assign `_warm` and then publish
+    /// from `try_all`. Keep the async-collected definitions in that
+    /// generation so out-of-tree catalogs still appear.
+    /// regression test for #14043
+    #[tokio::test]
+    async fn tools_list_keeps_async_only_catalog_definitions() {
+        let tools = async_only_catalog_tools();
+        let server = RuntimeServer::new(Arc::new(RwLock::new(tools)));
+        let exposed = encode_tool_name("downstream", "lookup");
+        let listed = server.publish_listed_tools().await;
+        assert!(
+            listed.iter().any(|tool| tool.name.as_ref() == exposed),
+            "tools/list must publish the async-collected downstream tool, got {listed:?}"
+        );
+        assert!(
+            server.schemas.get(&exposed).is_some(),
+            "the published generation must name the downstream tool for later tools/call"
+        );
+    }
+
+    /// Streamable HTTP `tools/list` is the path clients actually call.
+    /// regression test for #14043
+    #[tokio::test]
+    async fn streamable_http_tools_list_includes_async_only_catalog() {
+        let tools = Arc::new(RwLock::new(async_only_catalog_tools()));
+        let schemas = McpSchemaSnapshot::new();
+        let factory_tools = Arc::clone(&tools);
+        let factory_schemas = Arc::clone(&schemas);
+        let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            move || {
+                Ok(RuntimeServer::with_schema_snapshot(
+                    Arc::clone(&factory_tools),
+                    Arc::clone(&factory_schemas),
+                ))
+            },
+            Arc::new(
+                rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+            ),
+            rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(true)
+                .disable_allowed_hosts()
+                .with_json_response(true),
+        );
+
+        let (status, json) = post_tools_list(&service).await;
+        assert!(
+            status.is_success(),
+            "tools/list must succeed: {status} {json}"
+        );
+        let exposed = encode_tool_name("downstream", "lookup");
+        let names: Vec<&str> = json
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            names.contains(&exposed.as_str()),
+            "Streamable HTTP tools/list must include the async-only catalog tool {exposed}, got {names:?} from {json}"
+        );
+    }
+
+    /// A catalog that implements `try_all` must still win over the
+    /// pre-lock `all()` sample, or a concurrent Zone publish is
+    /// overwritten by a stale Region warm page.
+    /// regression test for #14043
+    #[tokio::test]
+    async fn tools_list_prefers_try_all_over_stale_warm_for_sync_catalogs() {
+        struct DualEraCatalog;
+
+        #[async_trait::async_trait]
+        impl SpiceToolCatalog for DualEraCatalog {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn name(&self) -> &'static str {
+                "srv"
+            }
+            async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                vec![Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>]
+            }
+            async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                (name == "deploy")
+                    .then(|| Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>)
+            }
+            fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+                (name == "deploy")
+                    .then(|| Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>)
+            }
+            fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+                vec![Arc::new(ZoneAnnotatedTool) as Arc<dyn SpiceModelTool>]
+            }
+        }
+
+        let mut tools = HashMap::new();
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(DualEraCatalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+        let server = RuntimeServer::new(Arc::new(RwLock::new(tools)));
+        let exposed = encode_tool_name("srv", "deploy");
+        let listed = server.publish_listed_tools().await;
+        let listed_schema = listed
+            .iter()
+            .find(|tool| tool.name.as_ref() == exposed)
+            .expect("sync catalog tool must remain on the tools/list page");
+        assert_eq!(
+            x_mcp_header_region(listed_schema),
+            Some("Zone"),
+            "try_all under the publish lock must beat the stale Region warm sample"
         );
     }
 
@@ -2119,6 +2338,57 @@ mod tests {
         S: ServerHandler,
     {
         post_tools_call_param(service, tool_name, "region", region_header, region_body).await
+    }
+
+    async fn post_tools_list<S>(
+        service: &rmcp::transport::streamable_http_server::StreamableHttpService<
+            S,
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+        >,
+    ) -> (http::StatusCode, Value)
+    where
+        S: ServerHandler,
+    {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "runtime-tools-test",
+                    "version": "0.0.0"
+                },
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        });
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/list")
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                body.to_string(),
+            )))
+            .expect("valid tools/list request");
+        let response = service.handle(request).await;
+        let status = response.status();
+        let collected = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("response body");
+        let bytes = collected.to_bytes();
+        let json_str = std::str::from_utf8(&bytes).unwrap_or("<non-utf8>");
+        let json_payload = json_str
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap_or(json_str);
+        let json: Value = serde_json::from_str(json_payload)
+            .unwrap_or_else(|e| panic!("JSON-RPC body ({status}): {e}: {json_str:?}"));
+        (status, json)
     }
 
     async fn post_tools_call_param<S>(
