@@ -185,15 +185,16 @@ jobs:
             fi
             echo "Signing off PR #${PR_NUMBER}: ${checkout_repo}@${checkout_ref}"
           elif [[ -n "${BRANCH// }" ]]; then
-            # Mirror scripts/signoff remote: allow feature/foo, reject whitespace,
-            # quotes, $, `, leading dashes, absolute paths, `..`, and any char
-            # outside [A-Za-z0-9._/-] so dispatch/checkout cannot be broken by the name.
+            # Mirror scripts/signoff remote: allow feature/foo and issue-#123-style
+            # names, reject whitespace, quotes, $, `, leading dashes, absolute
+            # paths, `..`, and any char outside [A-Za-z0-9._/#-] so dispatch/checkout
+            # cannot be broken by the name.
             if [[ "$BRANCH" =~ [[:space:]] || "$BRANCH" == -* || "$BRANCH" == /* || "$BRANCH" == *..* \
                 || "$BRANCH" == *\"* || "$BRANCH" == *\'* || "$BRANCH" == *\$* || "$BRANCH" == *\`* ]]; then
               echo "::error::invalid branch name: '${BRANCH}'"
               exit 1
             fi
-            if [[ ! "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            if [[ ! "$BRANCH" =~ ^[A-Za-z0-9._/#-]+$ ]]; then
               echo "::error::invalid branch name: '${BRANCH}'"
               exit 1
             fi
@@ -206,7 +207,11 @@ jobs:
             # this lookup and the checkout therefore signs a commit the SHA
             # group did not pair on — that race is why the coarse branch-keyed
             # workflow-level group above is still worth having.
-            head_sha=$(gh api "repos/${BASE_REPO}/commits/${BRANCH}" --jq '.sha') \
+            # `#` is a legal git ref char but a URL fragment delimiter, so the
+            # commits-API path needs it percent-encoded or gh silently truncates
+            # the ref there (e.g. 'issue-#123-x' -> 'issue-').
+            branch_encoded=$(jq -rn --arg b "$BRANCH" '$b|@uri')
+            head_sha=$(gh api "repos/${BASE_REPO}/commits/${branch_encoded}" --jq '.sha') \
               || { echo "::error::could not resolve branch '${BRANCH}' on ${BASE_REPO} — is it pushed?"; exit 1; }
             if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
               echo "::error::resolved branch '${BRANCH}' to '${head_sha}', which is not a commit SHA"
