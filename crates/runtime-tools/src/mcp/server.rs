@@ -2353,14 +2353,15 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/list",
-            "params": {},
-            "_meta": {
-                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                "io.modelcontextprotocol/clientInfo": {
-                    "name": "runtime-tools-test",
-                    "version": "0.0.0"
-                },
-                "io.modelcontextprotocol/clientCapabilities": {}
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientInfo": {
+                        "name": "runtime-tools-test",
+                        "version": "0.0.0"
+                    },
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
             }
         });
         let request = http::Request::builder()
