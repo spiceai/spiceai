@@ -325,10 +325,6 @@ pub proof fn lemma_namespace_key_prefix_unambiguous(
 
 /// Low byte of `n` after shifting `shift` bits. Isolated so the
 /// `as u8` truncation is next to the mask that makes it lossless.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the 0xff mask leaves only the low 8 bits"
-)]
 fn le_byte(n: u64, shift: u64) -> (b: u8)
     requires
         shift <= 56,
@@ -351,10 +347,6 @@ pub fn namespace_key_prefix(tag: u8, id: &[u8]) -> (prefix: Vec<u8>)
         prefix@ == spec_namespace_key_prefix(tag, id@),
 {
     let mut prefix: Vec<u8> = Vec::new();
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "Spice is 64-bit; a slice length fits in u64"
-    )]
     let len: u64 = id.len() as u64;
 
     proof {
@@ -391,7 +383,7 @@ pub fn namespace_key_prefix(tag: u8, id: &[u8]) -> (prefix: Vec<u8>)
             assert(id@.subrange(0, i as int + 1) =~= id@.subrange(0, i as int) + seq![id@[i
                 as int]]);
         }
-        i = i + 1;
+        i += 1;
     }
 
     proof {
