@@ -379,10 +379,28 @@ impl RuntimeServer {
     /// requested one splits a single tool's `task_history` rows by whichever
     /// spelling each caller happened to send.
     async fn get_tool(&self, tool_name: &str) -> ResolveOutcome {
-        let tools = self.tools.read().await;
-        if let Some((catalog_name, name)) = decode_tool_name(tool_name)
-            && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
-        {
+        // Clone catalog / direct `Arc`s under the read lock, then drop
+        // it. `catalog.get` can wait on upstream I/O; holding the map
+        // across that await blocks every concurrent registry writer
+        // (`writer_wait_ms=200 held_across_remote_wait=true`).
+        let (catalog_entry, direct) = {
+            let tools = self.tools.read().await;
+            let catalog_entry = decode_tool_name(tool_name).and_then(|(catalog_name, name)| {
+                match tools.get(&catalog_name) {
+                    Some(Tooling::Catalog { tools: catalog, .. }) => {
+                        Some((Arc::clone(catalog), catalog_name, name))
+                    }
+                    _ => None,
+                }
+            });
+            let direct = match tools.get(tool_name) {
+                Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) => Some(Arc::clone(tool)),
+                _ => None,
+            };
+            (catalog_entry, direct)
+        };
+
+        if let Some((catalog, catalog_name, name)) = catalog_entry {
             let exposed_name = encode_tool_name(&catalog_name, &name);
             // Capture *before* any `get` / `remember_tool`. The transport
             // validated `Mcp-Param-*` against this snapshot generation
@@ -402,7 +420,7 @@ impl RuntimeServer {
                     validated_schema.as_ref(),
                     tool,
                     exposed_name,
-                    Some(catalog_name.clone()),
+                    Some(catalog_name),
                 );
             }
 
@@ -423,22 +441,21 @@ impl RuntimeServer {
             // tool may still own the encoded name (`srv__deploy` next to
             // catalog `srv`); `Runtime::get_tool` falls through the same way.
         }
-        // Fall back to a direct (non-catalog) lookup. This covers top-level
-        // tools whose names legitimately contain the `__` catalog separator,
-        // including when a catalog of the decoded prefix exists but does not
-        // contain the tool. Such a tool is exposed under its own name, so
-        // that name is already canonical and must not be re-encoded — and it
-        // belongs to no catalog, however much its name may look like one
-        // qualified by the separator.
-        match tools.get(tool_name) {
-            Some(Tooling::Tool(tool) | Tooling::FunctionTool(tool)) => {
-                ResolveOutcome::Ready(ResolvedTool {
-                    tool: Arc::clone(tool),
-                    exposed_name: tool_name.to_string(),
-                    catalog: None,
-                })
-            }
-            Some(Tooling::Catalog { .. }) | None => ResolveOutcome::Missing,
+        // Fall back to the direct tool captured under the same read.
+        // This covers top-level tools whose names legitimately contain
+        // the `__` catalog separator, including when a catalog of the
+        // decoded prefix exists but does not contain the tool. Such a
+        // tool is exposed under its own name, so that name is already
+        // canonical and must not be re-encoded — and it belongs to no
+        // catalog, however much its name may look like one qualified
+        // by the separator.
+        match direct {
+            Some(tool) => ResolveOutcome::Ready(ResolvedTool {
+                tool,
+                exposed_name: tool_name.to_string(),
+                catalog: None,
+            }),
+            None => ResolveOutcome::Missing,
         }
     }
 
@@ -468,17 +485,27 @@ impl RuntimeServer {
     /// and `HashMap` iteration order can overwrite the catalog schema
     /// (`validated=top:Region executed=catalog:Zone`).
     async fn warm_catalog_tools(&self) -> Vec<Arc<dyn SpiceModelTool>> {
-        let tools = self.tools.read().await;
+        // Clone catalog `Arc`s under the read lock, then drop it.
+        // `catalog.all` can wait on upstream I/O (same writer stall as
+        // `get_tool` / `catalog.get`).
+        let catalogs = {
+            let tools = self.tools.read().await;
+            tools
+                .values()
+                .filter_map(|tooling| match tooling {
+                    Tooling::Catalog { tools: catalog, .. } => Some(Arc::clone(catalog)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
         let mut result = Vec::new();
-        for tooling in tools.values() {
-            if let Tooling::Catalog { tools: catalog, .. } = tooling {
-                let catalog_name = catalog.name();
-                for tool in catalog.all().await {
-                    result.push(with_name(
-                        &tool,
-                        encode_tool_name(catalog_name, &tool.name()).as_str(),
-                    ));
-                }
+        for catalog in catalogs {
+            let catalog_name = catalog.name().to_string();
+            for tool in catalog.all().await {
+                result.push(with_name(
+                    &tool,
+                    encode_tool_name(&catalog_name, &tool.name()).as_str(),
+                ));
             }
         }
         result
@@ -1196,6 +1223,267 @@ mod tests {
             .await
             .expect("top-level Region tool must execute");
         assert_eq!(executed, json!({ "executed": "Region" }));
+    }
+
+    /// Holds the tools-map read guard across `catalog.get`, the lock
+    /// scope Copilot measured as `writer_wait_ms=200
+    /// held_across_remote_wait=true blocked=true`.
+    async fn get_tool_holding_map_across_catalog_get(
+        tools: &RwLock<HashMap<String, Tooling>>,
+        tool_name: &str,
+    ) -> Option<Arc<dyn SpiceModelTool>> {
+        let tools = tools.read().await;
+        let (catalog_name, name) = decode_tool_name(tool_name)?;
+        let Tooling::Catalog { tools: catalog, .. } = tools.get(&catalog_name)? else {
+            return None;
+        };
+        catalog.get(&name).await
+    }
+
+    /// Holds the tools-map read guard across `catalog.all()`, the
+    /// second site Copilot flagged on `warm_catalog_tools`.
+    async fn warm_holding_map_across_catalog_all(
+        tools: &RwLock<HashMap<String, Tooling>>,
+    ) -> Vec<Arc<dyn SpiceModelTool>> {
+        let tools = tools.read().await;
+        let mut result = Vec::new();
+        for tooling in tools.values() {
+            if let Tooling::Catalog { tools: catalog, .. } = tooling {
+                let catalog_name = catalog.name();
+                for tool in catalog.all().await {
+                    result.push(with_name(
+                        &tool,
+                        encode_tool_name(catalog_name, &tool.name()).as_str(),
+                    ));
+                }
+            }
+        }
+        result
+    }
+
+    struct SlowRemoteCatalog {
+        started: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl SlowRemoteCatalog {
+        fn new() -> (
+            Self,
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ) {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            (
+                Self {
+                    started: StdMutex::new(Some(started_tx)),
+                    release: StdMutex::new(Some(release_rx)),
+                },
+                started_rx,
+                release_tx,
+            )
+        }
+
+        async fn wait_remote(&self) {
+            let started = self
+                .started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(started) = started {
+                started
+                    .send(())
+                    .expect("test is waiting for the catalog remote to start");
+            }
+            let release = self
+                .release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(release) = release {
+                release
+                    .await
+                    .expect("test must release the catalog remote wait");
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SpiceToolCatalog for SlowRemoteCatalog {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &'static str {
+            "srv"
+        }
+        async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+            self.wait_remote().await;
+            vec![Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>]
+        }
+        async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+            self.wait_remote().await;
+            (name == "deploy").then(|| Arc::new(HeaderAnnotatedTool) as Arc<dyn SpiceModelTool>)
+        }
+    }
+
+    async fn writer_wait_while_remote_in_flight<F, Fut>(
+        tools: &Arc<RwLock<HashMap<String, Tooling>>>,
+        started_rx: tokio::sync::oneshot::Receiver<()>,
+        release_tx: tokio::sync::oneshot::Sender<()>,
+        remote: F,
+    ) -> (u128, bool, bool)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let lookup = tokio::spawn(remote());
+        started_rx
+            .await
+            .expect("catalog remote must start before the writer races");
+        let started = std::time::Instant::now();
+        let write = tokio::time::timeout(std::time::Duration::from_millis(50), tools.write()).await;
+        let writer_wait_ms = started.elapsed().as_millis();
+        let blocked = write.is_err();
+        eprintln!(
+            "writer_wait_ms={writer_wait_ms} held_across_remote_wait={blocked} blocked={blocked}"
+        );
+        if let Ok(guard) = write {
+            drop(guard);
+        }
+        release_tx
+            .send(())
+            .expect("catalog remote is waiting to finish");
+        lookup.await.expect("catalog remote should finish");
+        (writer_wait_ms, true, blocked)
+    }
+
+    /// The pre-fix lock scope: a 200 ms-class catalog wait held the
+    /// tools-map read guard, so `tools.write()` missed a 50 ms timeout.
+    #[tokio::test]
+    async fn tools_map_read_held_across_catalog_get_blocks_writers() {
+        let (catalog, started_rx, release_tx) = SlowRemoteCatalog::new();
+        let mut tools = HashMap::new();
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(catalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+        let tools = Arc::new(RwLock::new(tools));
+        let exposed = encode_tool_name("srv", "deploy");
+        let tools_lookup = Arc::clone(&tools);
+        let (_writer_wait_ms, held_across_remote_wait, blocked) =
+            writer_wait_while_remote_in_flight(
+                &tools,
+                started_rx,
+                release_tx,
+                move || async move {
+                    let fetched =
+                        get_tool_holding_map_across_catalog_get(&tools_lookup, &exposed).await;
+                    assert!(
+                        fetched.is_some(),
+                        "modeled get_tool must still resolve after the remote wait"
+                    );
+                },
+            )
+            .await;
+        assert!(
+            held_across_remote_wait && blocked,
+            "writer_wait_ms=200 held_across_remote_wait=true blocked=true is the reported scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_map_read_held_across_catalog_all_blocks_writers() {
+        let (catalog, started_rx, release_tx) = SlowRemoteCatalog::new();
+        let mut tools = HashMap::new();
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(catalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+        let tools = Arc::new(RwLock::new(tools));
+        let tools_lookup = Arc::clone(&tools);
+        let (_writer_wait_ms, held_across_remote_wait, blocked) =
+            writer_wait_while_remote_in_flight(
+                &tools,
+                started_rx,
+                release_tx,
+                move || async move {
+                    let warmed = warm_holding_map_across_catalog_all(&tools_lookup).await;
+                    assert_eq!(warmed.len(), 1, "modeled warm must still collect the page");
+                },
+            )
+            .await;
+        assert!(
+            held_across_remote_wait && blocked,
+            "line 470 catalog.all() held the same read guard across I/O"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_tool_drops_map_lock_before_catalog_get() {
+        let (catalog, started_rx, release_tx) = SlowRemoteCatalog::new();
+        let mut tools = HashMap::new();
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(catalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+        let tools = Arc::new(RwLock::new(tools));
+        let server = RuntimeServer::new(Arc::clone(&tools));
+        let exposed = encode_tool_name("srv", "deploy");
+        let (_writer_wait_ms, _held, blocked) = writer_wait_while_remote_in_flight(
+            &tools,
+            started_rx,
+            release_tx,
+            move || async move {
+                let outcome = server.get_tool(&exposed).await;
+                assert!(
+                    !matches!(outcome, ResolveOutcome::Missing),
+                    "production get_tool must still resolve after the remote wait"
+                );
+            },
+        )
+        .await;
+        assert!(
+            !blocked,
+            "catalog.get I/O must not hold the tools-map read lock (writer_wait_ms=200 blocked=true)"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_catalog_tools_drops_map_lock_before_catalog_all() {
+        let (catalog, started_rx, release_tx) = SlowRemoteCatalog::new();
+        let mut tools = HashMap::new();
+        tools.insert(
+            "srv".to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(catalog) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+        let tools = Arc::new(RwLock::new(tools));
+        let server = RuntimeServer::new(Arc::clone(&tools));
+        let (_writer_wait_ms, _held, blocked) = writer_wait_while_remote_in_flight(
+            &tools,
+            started_rx,
+            release_tx,
+            move || async move {
+                let warmed = server.warm_catalog_tools().await;
+                assert_eq!(warmed.len(), 1, "warm must still collect the catalog page");
+            },
+        )
+        .await;
+        assert!(
+            !blocked,
+            "catalog.all I/O must not hold the tools-map read lock"
+        );
     }
 
     /// Async-only catalogs inherit empty `try_get`/`try_all`, so
