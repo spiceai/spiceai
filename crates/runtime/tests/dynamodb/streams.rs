@@ -1259,29 +1259,22 @@ pub fn make_dynamodb_dataset_with_cayenne_acceleration(
         .expect("failed to create temp directory")
         .keep();
     let cayenne_path = temp_dir.join("cayenne_data");
-    let metadata_dir = temp_dir.join("cayenne_metadata");
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Changes),
         engine: Some("cayenne".to_string()),
-        params: Some(DatasetParams::from_string_map(HashMap::from([
-            (
-                "cayenne_file_path".to_string(),
-                cayenne_path
-                    .to_str()
-                    .expect("cayenne_path should be valid UTF-8")
-                    .to_string(),
-            ),
-            (
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir
-                    .to_str()
-                    .expect("metadata_dir should be valid UTF-8")
-                    .to_string(),
-            ),
-        ]))),
+        // The metastore is one per runtime and is left at its default, which for a local
+        // `cayenne_file_path` is `{cayenne_file_path}/metadata` — inside this test's own
+        // temp directory, so it shares nothing with another test.
+        params: Some(DatasetParams::from_string_map(HashMap::from([(
+            "cayenne_file_path".to_string(),
+            cayenne_path
+                .to_str()
+                .expect("cayenne_path should be valid UTF-8")
+                .to_string(),
+        )]))),
         ..Acceleration::default()
     });
     dataset

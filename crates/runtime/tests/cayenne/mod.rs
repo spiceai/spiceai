@@ -330,7 +330,6 @@ fn make_s3_tpch_dataset(
     name: &str,
     partition_by: Option<String>,
     cayenne_data_dir: &std::path::Path,
-    cayenne_metadata_dir: &std::path::Path,
 ) -> Dataset {
     let mut dataset = Dataset::new(
         format!("s3://spiceai-demo-datasets/tpch/{name}/"),
@@ -346,16 +345,10 @@ fn make_s3_tpch_dataset(
         engine: Some("cayenne".to_string()),
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Full),
-        params: Some(Params::from_string_map(HashMap::from([
-            (
-                "cayenne_file_path".to_string(),
-                cayenne_data_dir.to_string_lossy().to_string(),
-            ),
-            (
-                "cayenne_metadata_dir".to_string(),
-                cayenne_metadata_dir.to_string_lossy().to_string(),
-            ),
-        ]))),
+        params: Some(Params::from_string_map(HashMap::from([(
+            "cayenne_file_path".to_string(),
+            cayenne_data_dir.to_string_lossy().to_string(),
+        )]))),
         refresh_sql: None,
         ..Acceleration::default()
     });
@@ -384,37 +377,36 @@ async fn test_cayenne_with_partitioned_tpch() -> Result<(), String> {
             let cayenne_data_dir = temp_dir.path().join("data");
             let cayenne_metadata_dir = temp_dir.path().join("metadata");
 
-            // exclude lineitem, orders and customer to reduce egress
+            // The metastore is one per runtime, so its location is a runtime parameter;
+            // pointing it into the temp dir keeps this test off the process-wide Spice
+            // data path.
+            //
+            // Datasets exclude lineitem, orders and customer to reduce egress.
             let app = AppBuilder::new("test_cayenne_with_partitioned_tpch")
+                .with_runtime_params(HashMap::from([(
+                    "cayenne_metadata_dir".to_string(),
+                    cayenne_metadata_dir.to_string_lossy().to_string(),
+                )]))
                 .with_dataset(make_s3_tpch_dataset(
                     "nation",
                     Some("n_regionkey".to_string()),
                     &cayenne_data_dir,
-                    &cayenne_metadata_dir,
                 ))
-                .with_dataset(make_s3_tpch_dataset(
-                    "region",
-                    None,
-                    &cayenne_data_dir,
-                    &cayenne_metadata_dir,
-                ))
+                .with_dataset(make_s3_tpch_dataset("region", None, &cayenne_data_dir))
                 .with_dataset(make_s3_tpch_dataset(
                     "supplier",
                     Some("bucket(10, s_suppkey)".to_string()),
                     &cayenne_data_dir,
-                    &cayenne_metadata_dir,
                 ))
                 .with_dataset(make_s3_tpch_dataset(
                     "part",
                     Some("bucket(10, p_partkey)".to_string()),
                     &cayenne_data_dir,
-                    &cayenne_metadata_dir,
                 ))
                 .with_dataset(make_s3_tpch_dataset(
                     "partsupp",
                     Some("bucket(10, ps_partkey)".to_string()),
                     &cayenne_data_dir,
-                    &cayenne_metadata_dir,
                 ))
                 .build();
 
@@ -1985,7 +1977,6 @@ const DATALAKE_TEST_REGION: &str = "us-west-2";
 /// Cayenne with the datalake tier enabled at `datalake_location`.
 fn make_datalake_nation_dataset(
     cayenne_data_dir: &std::path::Path,
-    cayenne_metadata_dir: &std::path::Path,
     datalake_location: &str,
     s3_creds: (&str, &str),
     warm_max_bytes: &str,
@@ -2008,10 +1999,6 @@ fn make_datalake_nation_dataset(
         (
             "cayenne_file_path".to_string(),
             cayenne_data_dir.to_string_lossy().to_string(),
-        ),
-        (
-            "cayenne_metadata_dir".to_string(),
-            cayenne_metadata_dir.to_string_lossy().to_string(),
         ),
         (
             "cayenne_datalake_location".to_string(),
@@ -2176,9 +2163,12 @@ async fn datalake_e2e_inner(
     // ---- Phase 1: load, promote, and query across tiers. -------------------
     {
         let app = AppBuilder::new("test_cayenne_datalake_e2e")
+            .with_runtime_params(HashMap::from([(
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.to_string_lossy().to_string(),
+            )]))
             .with_dataset(make_datalake_nation_dataset(
                 data_dir,
-                metadata_dir,
                 location,
                 s3_creds,
                 "1", // tiny trigger: promote as soon as any warm data exists
@@ -2245,9 +2235,12 @@ async fn datalake_e2e_inner(
     // promoted data is still readable from the datalake tier. ----------------
     {
         let app = AppBuilder::new("test_cayenne_datalake_e2e")
+            .with_runtime_params(HashMap::from([(
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.to_string_lossy().to_string(),
+            )]))
             .with_dataset(make_datalake_nation_dataset(
                 data_dir,
-                metadata_dir,
                 location,
                 s3_creds,
                 "999999999999", // changed trigger: reconcile persists it silently

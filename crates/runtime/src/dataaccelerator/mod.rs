@@ -988,8 +988,6 @@ mod accelerator_compat_tests {
                         // Set file_path to use our unique temporary location with timestamp
                         params.insert("cayenne_file_path".to_string(), location.clone());
                     }
-                    // Use test environment's metadata directory for Cayenne
-                    params.insert("cayenne_metadata_dir".to_string(), test_env.metadata_dir());
                     // Use 'error' mode for tests to fail on unsupported types
                     // This matches the new default production behavior
                     params.insert("unsupported_type_action".to_string(), "error".to_string());
@@ -1020,7 +1018,15 @@ mod accelerator_compat_tests {
                     use futures::FutureExt;
                     use std::panic::AssertUnwindSafe;
 
-                    let accelerator = CayenneAccelerator::new();
+                    // The metastore is one per engine instance, configured the way
+                    // `runtime.params.cayenne_metadata_dir` configures it, so this test
+                    // environment's directory is where the catalog lands.
+                    let accelerator = CayenneAccelerator::from_runtime_config(
+                        &data_accelerator_api::CayenneRuntimeConfig {
+                            footer_cache_mb: None,
+                            metadata_dir: Some(test_env.metadata_dir()),
+                        },
+                    );
                     let runtime_env = SessionContext::new().runtime_env();
                     let create_future = AssertUnwindSafe(accelerator.create_external_table(
                         external_table,
@@ -2223,8 +2229,6 @@ mod accelerator_compat_tests {
                         if mode == "file" {
                             params.insert("cayenne_file_path".to_string(), location.clone());
                         }
-                        // Use test environment's metadata directory for Cayenne
-                        params.insert("cayenne_metadata_dir".to_string(), metadata_dir.clone());
                         params.insert("unsupported_type_action".to_string(), "error".to_string());
                         if _mode.contains("metastore=turso") {
                             params.insert("cayenne_metastore".to_string(), "turso".to_string());
@@ -2243,15 +2247,22 @@ mod accelerator_compat_tests {
                         });
 
                         let runtime_env = SessionContext::new().runtime_env();
-                        CayenneAccelerator::new()
-                            .create_external_table(
-                                external_table,
-                                Some(&dataset),
-                                Vec::new(),
-                                Some(runtime_env),
-                            )
-                            .await
-                            .expect("Vortex table should be created")
+                        // The metastore is one per engine instance, configured the way
+                        // `runtime.params.cayenne_metadata_dir` configures it.
+                        CayenneAccelerator::from_runtime_config(
+                            &data_accelerator_api::CayenneRuntimeConfig {
+                                footer_cache_mb: None,
+                                metadata_dir: Some(metadata_dir.clone()),
+                            },
+                        )
+                        .create_external_table(
+                            external_table,
+                            Some(&dataset),
+                            Vec::new(),
+                            Some(runtime_env),
+                        )
+                        .await
+                        .expect("Vortex table should be created")
                     }
                     _ => panic!("Unsupported engine: {:?}", engine),
                 };

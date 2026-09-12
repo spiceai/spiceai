@@ -150,7 +150,10 @@ impl Runtime {
         // snapshot configuration (either all enabled or all disabled).
         let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
             startup_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
+        if let Err(err) =
+            validate_snapshot_consistency(&acceleration_sources, &self.accelerator_engine_registry)
+                .await
+        {
             tracing::error!("{err}");
             return;
         }
@@ -1744,7 +1747,10 @@ impl Runtime {
         // Validate Cayenne snapshot consistency before initializing accelerators.
         let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
             valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
+        if let Err(err) =
+            validate_snapshot_consistency(&acceleration_sources, &self.accelerator_engine_registry)
+                .await
+        {
             tracing::error!("{err}");
             return;
         }

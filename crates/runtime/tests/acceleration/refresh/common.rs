@@ -2,7 +2,9 @@
 
 use crate::postgres::common;
 use crate::postgres::common::get_pg_params;
-use crate::utils::{register_test_connectors, runtime_ready_check};
+use crate::utils::{
+    register_test_connectors, runtime_ready_check, take_cayenne_metastore_runtime_params,
+};
 use crate::{configure_test_datafusion, configure_test_datafusion_request_context};
 use app::AppBuilder;
 use arrow::array::RecordBatch;
@@ -283,13 +285,17 @@ pub(crate) async fn start_test_runtime_iso8601(
 
 async fn start_test_runtime_with_dataset(
     _port: usize,
-    acceleration: Acceleration,
+    mut acceleration: Acceleration,
     mut dataset: Dataset,
 ) -> Result<Arc<Runtime>, anyhow::Error> {
     register_test_connectors().await;
 
+    // The Cayenne metastore is one per runtime, so a caller's temp directory has to
+    // reach the runtime parameters to keep this test off the shared default location.
+    let runtime_params = take_cayenne_metastore_runtime_params(&mut acceleration);
     dataset.acceleration = Some(acceleration);
     let app = AppBuilder::new("test_acceleration_refresh")
+        .with_runtime_params(runtime_params)
         .with_dataset(dataset)
         .build();
 

@@ -240,12 +240,35 @@ impl SnapshotRefreshFixture {
         ])
     }
 
+    /// `runtime.params` pinning the Cayenne metastore beside `local_db_path`.
+    ///
+    /// The metastore is one per runtime rather than per dataset, so writer and reader —
+    /// separate runtimes in this process — each need their own, or the reader bootstraps
+    /// against the writer's catalog instead of the snapshot. Empty for every other
+    /// engine, which keeps its whole store in the `<engine>_file` the params name.
+    fn metastore_runtime_params(&self, local_db_path: &std::path::Path) -> HashMap<String, String> {
+        match self.engine {
+            EngineKind::Cayenne => HashMap::from([(
+                "cayenne_metadata_dir".to_string(),
+                local_db_path
+                    .with_extension("metadata")
+                    .to_string_lossy()
+                    .into_owned(),
+            )]),
+            #[cfg(feature = "duckdb")]
+            EngineKind::DuckDB => HashMap::new(),
+            #[cfg(feature = "sqlite")]
+            EngineKind::Sqlite => HashMap::new(),
+            #[cfg(feature = "turso")]
+            EngineKind::Turso => HashMap::new(),
+        }
+    }
+
     /// Engine-specific acceleration params that pin the on-disk location to
-    /// `local_db_path`. Cayenne is directory-based and uses two distinct
-    /// param names (`cayenne_file_path` for data, `cayenne_metadata_dir` for
-    /// the catalog metastore), so we route to a sibling `metadata/` directory
-    /// to keep writer and reader fully isolated. Other engines are
-    /// single-file and use `<engine>_file`.
+    /// `local_db_path`. Cayenne is directory-based, so `cayenne_file_path` places its
+    /// data directory; its metastore is placed separately by
+    /// [`Self::metastore_runtime_params`]. Other engines are single-file and use
+    /// `<engine>_file`.
     fn engine_accel_params(&self, local_db_path: &std::path::Path) -> HashMap<String, String> {
         let mut params = HashMap::new();
         match self.engine {
@@ -253,11 +276,6 @@ impl SnapshotRefreshFixture {
                 params.insert(
                     "cayenne_file_path".to_string(),
                     local_db_path.to_string_lossy().into_owned(),
-                );
-                let metadata_dir = local_db_path.with_extension("metadata");
-                params.insert(
-                    "cayenne_metadata_dir".to_string(),
-                    metadata_dir.to_string_lossy().into_owned(),
                 );
             }
             #[cfg(feature = "duckdb")]
@@ -480,6 +498,7 @@ async fn run_inner(fixture: &SnapshotRefreshFixture) -> Result<()> {
 
     // ---------------------- start writer ----------------------
     let writer_app = AppBuilder::new(format!("snapshot_writer_{}", fixture.engine.engine_name()))
+        .with_runtime_params(fixture.metastore_runtime_params(&fixture.writer_local_db))
         .with_snapshots(fixture.snapshots_config())
         .with_dataset(fixture.writer_dataset())
         .build();
@@ -503,6 +522,7 @@ async fn run_inner(fixture: &SnapshotRefreshFixture) -> Result<()> {
 
     // ---------------------- start reader ----------------------
     let reader_app = AppBuilder::new(format!("snapshot_reader_{}", fixture.engine.engine_name()))
+        .with_runtime_params(fixture.metastore_runtime_params(&fixture.reader_local_db))
         .with_snapshots(fixture.snapshots_config())
         .with_dataset(fixture.reader_dataset())
         .build();

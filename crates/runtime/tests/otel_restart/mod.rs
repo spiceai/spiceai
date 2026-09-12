@@ -64,7 +64,7 @@ use crate::{
 
 const METRIC: &str = "otel_query_duration_ms";
 
-fn make_dataset(data_dir: &str, metadata_dir: &str) -> Dataset {
+fn make_dataset(data_dir: &str) -> Dataset {
     let mut ds = Dataset::new(format!("sink:{METRIC}"), METRIC.to_string());
     // Required for the runtime to admit writes (the OTLP ingest path only writes to a
     // dataset that `is_writable`).
@@ -74,17 +74,23 @@ fn make_dataset(data_dir: &str, metadata_dir: &str) -> Dataset {
         enabled: true,
         engine: Some("cayenne".to_string()),
         mode: Mode::File,
-        params: Some(Params::from_string_map(HashMap::from([
-            ("cayenne_file_path".to_string(), data_dir.to_string()),
-            ("cayenne_metadata_dir".to_string(), metadata_dir.to_string()),
-        ]))),
+        params: Some(Params::from_string_map(HashMap::from([(
+            "cayenne_file_path".to_string(),
+            data_dir.to_string(),
+        )]))),
         ..Acceleration::default()
     });
     ds
 }
 
-async fn start_runtime(ds: &Dataset) -> Arc<Runtime> {
+async fn start_runtime(ds: &Dataset, metadata_dir: &str) -> Arc<Runtime> {
+    // One metastore serves the whole runtime, so its location is a runtime parameter;
+    // the restart below has to reopen the same one for the schema to survive it.
     let app = AppBuilder::new("otel_restart_regression")
+        .with_runtime_params(HashMap::from([(
+            "cayenne_metadata_dir".to_string(),
+            metadata_dir.to_string(),
+        )]))
         .with_dataset(ds.clone())
         .build();
 
@@ -210,12 +216,12 @@ async fn sink_accelerated_metric_survives_restart_without_schema_mismatch()
         .to_string_lossy()
         .to_string();
 
-    let ds = make_dataset(&data_dir, &metadata_dir);
+    let ds = make_dataset(&data_dir);
 
     // --- Phase 1: ingest metrics that establish, then widen, the acceleration schema. ---
     {
         register_test_connectors().await;
-        let rt = start_runtime(&ds).await;
+        let rt = start_runtime(&ds, &metadata_dir).await;
 
         // First export establishes the base schema (`region`) and registers the sink.
         ingest(&rt, gauge_export(1.0, vec![string_attr("region", "us")])).await?;
@@ -256,7 +262,7 @@ async fn sink_accelerated_metric_survives_restart_without_schema_mismatch()
     // acceleration and lands, rather than being rejected as a removed column.
     {
         register_test_connectors().await;
-        let rt = start_runtime(&ds).await;
+        let rt = start_runtime(&ds, &metadata_dir).await;
 
         ingest(&rt, gauge_export(3.0, vec![string_attr("region", "apac")])).await?;
 

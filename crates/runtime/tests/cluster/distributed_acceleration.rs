@@ -135,6 +135,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
                     scheduler: Some(make_named_scheduler_config(
                         "test_distributed_acceleration_with_bucket_partitioning",
                     )),
+                    params: cayenne_metastore_runtime_params(cayenne_tempdir.path()),
                     ..SpicepodRuntime::default()
                 })
                 .build();
@@ -257,6 +258,7 @@ async fn cluster_distributes_accelerated_table_with_federated_source() -> Result
                 .with_dataset(dataset)
                 .with_runtime(SpicepodRuntime {
                     scheduler: Some(scheduler_cfg),
+                    params: cayenne_metastore_runtime_params(cayenne_tempdir.path()),
                     ..SpicepodRuntime::default()
                 })
                 .build();
@@ -347,6 +349,7 @@ async fn cluster_distributes_accelerated_table_with_column_metadata() -> Result<
                 .with_dataset(dataset)
                 .with_runtime(SpicepodRuntime {
                     scheduler: Some(scheduler_cfg),
+                    params: cayenne_metastore_runtime_params(cayenne_tempdir.path()),
                     ..SpicepodRuntime::default()
                 })
                 .build();
@@ -1176,11 +1179,25 @@ async fn wait_for_row_count(
     }
 }
 
+/// `runtime.params` placing the Cayenne metastore under `base_dir`, the companion to
+/// [`make_accelerated_dataset`]. One metastore serves the whole runtime, so it cannot be
+/// configured per dataset; keeping it under the test's temp dir is what keeps it off the
+/// process-wide Spice data path.
+fn cayenne_metastore_runtime_params(
+    base_dir: &std::path::Path,
+) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([(
+        "cayenne_metadata_dir".to_string(),
+        base_dir.join("metadata").to_string_lossy().to_string(),
+    )])
+}
+
 /// Create a dataset configured with Cayenne file-mode acceleration and `bucket()` partitioning.
 ///
-/// `base_dir` is the root under which Cayenne stores data (`{base_dir}/data/`) and
-/// metadata (`{base_dir}/metadata/`). Partition data files are per-partition, so
-/// multiple executors sharing the same base dir will not collide on data writes.
+/// `base_dir` is the root under which Cayenne stores data (`{base_dir}/data/`).
+/// Partition data files are per-partition, so multiple executors sharing the same base
+/// dir will not collide on data writes. The metastore is one per runtime, so its
+/// location is set as a runtime parameter — see [`cayenne_metastore_runtime_params`].
 fn make_accelerated_dataset(
     source_path: impl Into<String>,
     name: &str,
@@ -1200,16 +1217,10 @@ fn make_accelerated_dataset(
             expression: format!("bucket({num_buckets}, {partition_column})"),
         }],
         params: Some(spicepod::param::Params::from_string_map(
-            std::collections::HashMap::from([
-                (
-                    "cayenne_file_path".to_string(),
-                    base_dir.join("data").to_string_lossy().to_string(),
-                ),
-                (
-                    "cayenne_metadata_dir".to_string(),
-                    base_dir.join("metadata").to_string_lossy().to_string(),
-                ),
-            ]),
+            std::collections::HashMap::from([(
+                "cayenne_file_path".to_string(),
+                base_dir.join("data").to_string_lossy().to_string(),
+            )]),
         )),
         ..Acceleration::default()
     });

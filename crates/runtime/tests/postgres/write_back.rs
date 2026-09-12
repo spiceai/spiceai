@@ -151,16 +151,10 @@ async fn bigint_primary_key_write_back_reaches_the_source() -> Result<(), anyhow
                 .into_iter()
                 .map(|(k, v)| (k, v.expose_secret().to_string()))
                 .collect();
-            let accel_params = HashMap::from([
-                (
-                    "cayenne_file_path".to_string(),
-                    cayenne_dir.display().to_string(),
-                ),
-                (
-                    "cayenne_metadata_dir".to_string(),
-                    metadata_dir.display().to_string(),
-                ),
-            ]);
+            let accel_params = HashMap::from([(
+                "cayenne_file_path".to_string(),
+                cayenne_dir.display().to_string(),
+            )]);
 
             let mut dataset = Dataset::new("postgres:public.wb_counter", "wb_counter");
             dataset.access = AccessMode::ReadWrite;
@@ -181,7 +175,13 @@ async fn bigint_primary_key_write_back_reaches_the_source() -> Result<(), anyhow
             });
 
             configure_test_datafusion();
+            // One metastore serves the whole runtime, so its location is a runtime
+            // parameter; the temp dir keeps this test off the process-wide data path.
             let app = AppBuilder::new("postgres_write_back_test")
+                .with_runtime_params(HashMap::from([(
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.display().to_string(),
+                )]))
                 .with_dataset(dataset)
                 .build();
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);

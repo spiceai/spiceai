@@ -184,6 +184,40 @@ pub(crate) async fn run_query(
     Ok(results)
 }
 
+/// Move a `cayenne_metadata_dir` out of a set of acceleration params and into the
+/// `runtime.params` map it belongs in, returning that map.
+///
+/// The Cayenne metastore is one per runtime, so its location is a runtime parameter and
+/// an `acceleration.params.cayenne_metadata_dir` is ignored (with a warning). Test
+/// helpers that take acceleration params for several engines use this so a Cayenne
+/// caller's directory still lands where the engine reads it, and a caller for any other
+/// engine gets an empty map.
+pub(crate) fn cayenne_metastore_runtime_params(
+    accel_params: &mut std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    accel_params
+        .remove("cayenne_metadata_dir")
+        .map(|dir| std::collections::HashMap::from([("cayenne_metadata_dir".to_string(), dir)]))
+        .unwrap_or_default()
+}
+
+/// [`cayenne_metastore_runtime_params`] for an `Acceleration` that has already been
+/// built, for the shared helpers that receive one rather than a param map.
+pub(crate) fn take_cayenne_metastore_runtime_params(
+    acceleration: &mut spicepod::acceleration::Acceleration,
+) -> std::collections::HashMap<String, String> {
+    let Some(params) = acceleration.params.as_mut() else {
+        return std::collections::HashMap::new();
+    };
+    params
+        .data
+        .remove("cayenne_metadata_dir")
+        .map(|dir| {
+            std::collections::HashMap::from([("cayenne_metadata_dir".to_string(), dir.as_string())])
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) fn to_pretty_display(batches: &[RecordBatch]) -> Result<impl Display, anyhow::Error> {
     let pretty = arrow::util::pretty::pretty_format_batches(batches)
         .map_err(|e| anyhow::Error::msg(e.to_string()))?;

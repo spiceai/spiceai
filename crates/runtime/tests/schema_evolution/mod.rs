@@ -37,8 +37,8 @@ use crate::postgres::common;
 use crate::{
     configure_test_datafusion, init_tracing,
     utils::{
-        register_test_connectors, run_query, runtime_ready_check, test_request_context,
-        to_pretty_display,
+        cayenne_metastore_runtime_params, register_test_connectors, run_query, runtime_ready_check,
+        test_request_context, to_pretty_display,
     },
 };
 
@@ -420,13 +420,14 @@ async fn init_csv_runtime(
 async fn init_csv_runtime_with(
     csv_path: &str,
     engine: &str,
-    accel_params: HashMap<String, String>,
+    mut accel_params: HashMap<String, String>,
     mode: Mode,
     on_schema_change: spicepod::component::dataset::OnSchemaChange,
     refresh_mode: Option<spicepod::acceleration::RefreshMode>,
 ) -> Result<Runtime, anyhow::Error> {
     register_test_connectors().await;
 
+    let runtime_params = cayenne_metastore_runtime_params(&mut accel_params);
     let mut ds = Dataset::new(format!("file:{csv_path}"), "sample");
     ds.on_schema_change = on_schema_change;
     ds.acceleration = Some(Acceleration {
@@ -439,6 +440,7 @@ async fn init_csv_runtime_with(
     });
 
     let app = AppBuilder::new("test_csv_schema_evolution")
+        .with_runtime_params(runtime_params)
         .with_dataset(ds.clone())
         .build();
 
@@ -747,11 +749,12 @@ async fn test_drop_recreate_full_csv_cayenne() -> Result<(), anyhow::Error> {
 async fn init_widen_pg_runtime(
     port: usize,
     engine: &str,
-    accel_params: HashMap<String, String>,
+    mut accel_params: HashMap<String, String>,
     on_schema_change: OnSchemaChange,
 ) -> Result<Runtime, anyhow::Error> {
     register_test_connectors().await;
 
+    let runtime_params = cayenne_metastore_runtime_params(&mut accel_params);
     let mut ds = Dataset::new("postgres:chameleon", "cham");
     ds.params = Some(Params::from_string_map(
         vec![
@@ -776,6 +779,7 @@ async fn init_widen_pg_runtime(
     let ds_clone = ds.clone();
 
     let app = AppBuilder::new("test_schema_evolution_widening")
+        .with_runtime_params(runtime_params)
         .with_dataset(ds)
         .build();
 
