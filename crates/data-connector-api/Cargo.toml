@@ -21,6 +21,7 @@ data-connector-types = { path = "../data-connector-types" }
 data-http-rate-control = { path = "../data-http-rate-control" }
 data_components = { path = "../data_components" }
 dataformat-json = { path = "../dataformat-json" }
+dataformat-orc = { path = "../dataformat-orc" }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
 datafusion-expr.workspace = true

@@ -196,14 +196,16 @@ fn configure_dataset() -> Result<()> {
     {
         let from_path = std::path::Path::new(&from);
         let has_known_ext = from_path.extension().is_some_and(|ext| {
-            ext.eq_ignore_ascii_case("csv") || ext.eq_ignore_ascii_case("parquet")
+            ext.eq_ignore_ascii_case("csv")
+                || ext.eq_ignore_ascii_case("parquet")
+                || ext.eq_ignore_ascii_case("orc")
         });
         if !has_known_ext {
             let file_format =
-                prompt_with_default(&mut reader, "file_format (parquet/csv)", "parquet")?;
-            if file_format != "parquet" && file_format != "csv" {
+                prompt_with_default(&mut reader, "file_format (parquet/csv/orc)", "parquet")?;
+            if file_format != "parquet" && file_format != "csv" && file_format != "orc" {
                 return InvalidArgumentSnafu {
-                    message: "file_format must be either 'parquet' or 'csv'",
+                    message: "file_format must be 'parquet', 'csv', or 'orc'",
                 }
                 .fail();
             }

@@ -825,7 +825,7 @@ dependencies = [
  "futures",
  "once_cell",
  "paste",
- "prost",
+ "prost 0.14.3",
  "prost-types",
  "tonic",
  "tonic-prost",
@@ -2649,7 +2649,7 @@ dependencies = [
  "md-5 0.10.6",
  "object_store 0.13.2",
  "parking_lot",
- "prost",
+ "prost 0.14.3",
  "prost-types",
  "rand 0.10.1",
  "rustc_version",
@@ -2720,7 +2720,7 @@ dependencies = [
  "log",
  "object_store 0.13.2",
  "parking_lot",
- "prost",
+ "prost 0.14.3",
  "prost-types",
  "rand 0.10.1",
  "serde",
@@ -2876,7 +2876,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2896,7 +2896,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2916,7 +2916,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "regex",
@@ -6300,6 +6300,7 @@ dependencies = [
  "data-http-rate-control",
  "data_components",
  "dataformat-json",
+ "dataformat-orc",
  "datafusion",
  "datafusion-datasource",
  "datafusion-expr",
@@ -6490,6 +6491,24 @@ dependencies = [
  "serde_json",
  "snafu",
  "tracing",
+]
+
+[[package]]
+name = "dataformat-orc"
+version = "2.4.0-unstable"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "bytes",
+ "datafusion",
+ "datafusion-datasource",
+ "datafusion-physical-expr",
+ "futures",
+ "object_store 0.13.2",
+ "orc-rust",
+ "snafu",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -6868,7 +6887,7 @@ dependencies = [
  "http 1.4.1",
  "moka",
  "postcard",
- "prost",
+ "prost 0.14.3",
  "serde",
  "snafu",
  "tokio",
@@ -7206,7 +7225,7 @@ dependencies = [
  "datafusion-proto-common",
  "object_store 0.13.2",
  "pbjson 0.9.0",
- "prost",
+ "prost 0.14.3",
  "serde",
  "serde_json",
 ]
@@ -7219,7 +7238,7 @@ dependencies = [
  "arrow",
  "datafusion-common",
  "pbjson 0.9.0",
- "prost",
+ "prost 0.14.3",
  "serde",
 ]
 
@@ -7310,7 +7329,7 @@ dependencies = [
  "itertools 0.14.0",
  "object_store 0.13.2",
  "pbjson-types",
- "prost",
+ "prost 0.14.3",
  "substrait",
  "tokio",
  "url",
@@ -8615,7 +8634,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
- "prost",
+ "prost 0.14.3",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -12156,6 +12175,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lzokay-native"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "792ba667add2798c6c3e988e630f4eb921b5cbc735044825b7111ef1582c8730"
+dependencies = [
+ "byteorder",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "mac"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14413,7 +14442,7 @@ dependencies = [
  "opentelemetry-http",
  "opentelemetry-proto",
  "opentelemetry_sdk",
- "prost",
+ "prost 0.14.3",
  "reqwest 0.13.4",
  "thiserror 2.0.18",
  "tokio",
@@ -14441,7 +14470,7 @@ checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
- "prost",
+ "prost 0.14.3",
  "tonic",
  "tonic-prost",
 ]
@@ -14523,6 +14552,33 @@ checksum = "5df339f526ea9a60e371768d50efc2f2508c7203290731565d1f7a6f71d21747"
 dependencies = [
  "libc",
  "libredox",
+]
+
+[[package]]
+name = "orc-rust"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32b9867c4e7343218682ba11aceae1310c80735ec2beaf6124a0f8f848dad197"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "bytemuck",
+ "bytes",
+ "chrono",
+ "chrono-tz 0.10.4",
+ "fallible-streaming-iterator",
+ "flate2",
+ "futures",
+ "futures-util",
+ "log",
+ "lz4_flex 0.11.6",
+ "lzokay-native",
+ "num",
+ "prost 0.13.5",
+ "snafu",
+ "snap",
+ "tokio",
+ "zstd",
 ]
 
 [[package]]
@@ -14838,7 +14894,7 @@ checksum = "af22d08a625a2213a78dbb0ffa253318c5c79ce3133d32d296655a7bdfb02095"
 dependencies = [
  "heck 0.5.0",
  "itertools 0.14.0",
- "prost",
+ "prost 0.14.3",
  "prost-types",
 ]
 
@@ -14852,7 +14908,7 @@ dependencies = [
  "chrono",
  "pbjson 0.8.0",
  "pbjson-build",
- "prost",
+ "prost 0.14.3",
  "prost-build",
  "serde",
 ]
@@ -15205,7 +15261,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6705a26ad89d241a989a5395641931ba37076f5ab5fbd19ee92402414a43af32"
 dependencies = [
  "arrayvec",
- "hashbrown 0.5.0",
+ "hashbrown 0.17.1",
  "parking_lot",
  "rand 0.8.6",
 ]
@@ -15679,12 +15735,22 @@ dependencies = [
 
 [[package]]
 name = "prost"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+dependencies = [
+ "bytes",
+ "prost-derive 0.13.5",
+]
+
+[[package]]
+name = "prost"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2ea70524a2f82d518bce41317d0fae74151505651af45faf1ffbd6fd33f0568"
 dependencies = [
  "bytes",
- "prost-derive",
+ "prost-derive 0.14.3",
 ]
 
 [[package]]
@@ -15693,13 +15759,13 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.4.1",
- "itertools 0.10.5",
+ "heck 0.5.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph",
  "prettyplease",
- "prost",
+ "prost 0.14.3",
  "prost-types",
  "pulldown-cmark 0.13.4",
  "pulldown-cmark-to-cmark",
@@ -15710,12 +15776,25 @@ dependencies = [
 
 [[package]]
 name = "prost-derive"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+dependencies = [
+ "anyhow",
+ "itertools 0.14.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "prost-derive"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -15727,7 +15806,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8991c4cbdb8bc5b11f0b074ffe286c30e523de90fee5ba8132f1399f23cb3dd7"
 dependencies = [
- "prost",
+ "prost 0.14.3",
 ]
 
 [[package]]
@@ -16735,7 +16814,7 @@ dependencies = [
  "flight_client",
  "futures",
  "insta",
- "prost",
+ "prost 0.14.3",
  "regex",
  "reqwest 0.13.4",
  "rustyline",
@@ -17442,7 +17521,7 @@ dependencies = [
  "podswatcher",
  "postcard",
  "prometheus",
- "prost",
+ "prost 0.14.3",
  "rand 0.10.1",
  "rayon",
  "rcgen",
@@ -17721,7 +17800,7 @@ dependencies = [
  "http 1.4.1",
  "libc",
  "pem",
- "prost",
+ "prost 0.14.3",
  "prost-types",
  "rand 0.10.1",
  "rcgen",
@@ -17772,7 +17851,7 @@ dependencies = [
  "object_store_occ",
  "opentelemetry",
  "parking_lot",
- "prost",
+ "prost 0.14.3",
  "runtime-datafusion",
  "runtime-proto",
  "runtime-request-context",
@@ -18053,7 +18132,7 @@ dependencies = [
  "datafusion-expr",
  "datafusion-physical-plan",
  "datafusion-proto",
- "prost",
+ "prost 0.14.3",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -19200,7 +19279,7 @@ checksum = "4db5a4a562bcc0017c34cd0efbabf447be783f00576a2a516947f884e6a7ed57"
 dependencies = [
  "ahash 0.8.12",
  "annotate-snippets",
- "base64 0.21.7",
+ "base64 0.22.1",
  "encoding_rs_io",
  "nohash-hasher",
  "num-traits",
@@ -19761,7 +19840,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -19881,7 +19960,7 @@ dependencies = [
  "arrow-ipc",
  "chrono",
  "parking_lot",
- "prost",
+ "prost 0.14.3",
  "prost-types",
  "rand 0.8.6",
  "serde_json",
@@ -20015,7 +20094,7 @@ dependencies = [
  "clap",
  "datafusion",
  "datafusion-substrait",
- "prost",
+ "prost 0.14.3",
  "serde",
  "serde_json",
  "snafu",
@@ -20048,7 +20127,7 @@ dependencies = [
  "chrono",
  "dotenv 0.15.0",
  "futures",
- "prost",
+ "prost 0.14.3",
  "prost-types",
  "rand 0.9.4",
  "reqwest 0.12.24",
@@ -20586,7 +20665,7 @@ dependencies = [
  "pbjson-build",
  "pbjson-types",
  "prettyplease",
- "prost",
+ "prost 0.14.3",
  "prost-build",
  "prost-types",
  "regress",
@@ -21134,7 +21213,7 @@ dependencies = [
  "opentelemetry_sdk",
  "otel-arrow",
  "pin-project",
- "prost",
+ "prost 0.14.3",
  "sha2 0.10.9",
  "snafu",
  "sysinfo 0.38.4",
@@ -21430,7 +21509,7 @@ dependencies = [
  "ahash 0.8.12",
  "auto_enums",
  "either",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "itertools 0.13.0",
  "once_cell",
  "pulldown-cmark 0.12.2",
@@ -22090,7 +22169,7 @@ version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fcfab99db777fba2802f0dfa861d1628d1ae916fb199d29819941f139ae85082"
 dependencies = [
- "prost",
+ "prost 0.14.3",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -22104,7 +22183,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0"
 dependencies = [
  "bytes",
- "prost",
+ "prost 0.14.3",
  "tonic",
 ]
 
@@ -22130,7 +22209,7 @@ version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73ab1b02061f83d519bba3caa167f88f261ef05720ab8ebc954ade70de3348e8"
 dependencies = [
- "prost",
+ "prost 0.14.3",
  "prost-types",
  "tonic",
 ]
@@ -22618,7 +22697,7 @@ dependencies = [
  "genawaiter",
  "http 1.4.1",
  "libc",
- "prost",
+ "prost 0.14.3",
  "roaring",
  "serde",
  "serde_json",
@@ -23398,7 +23477,7 @@ source = "git+https://github.com/spiceai/vortex.git?rev=5e477a52254a670bd51a24d8
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
- "prost",
+ "prost 0.14.3",
  "rustc-hash 2.1.2",
  "vortex-array",
  "vortex-buffer",
@@ -23434,7 +23513,7 @@ dependencies = [
  "parking_lot",
  "paste",
  "pin-project-lite",
- "prost",
+ "prost 0.14.3",
  "rand 0.10.1",
  "regex",
  "regex-syntax",
@@ -23616,7 +23695,7 @@ version = "0.1.0"
 source = "git+https://github.com/spiceai/vortex.git?rev=5e477a52254a670bd51a24d8e6fad5b464f4b41f#5e477a52254a670bd51a24d8e6fad5b464f4b41f"
 dependencies = [
  "num-traits",
- "prost",
+ "prost 0.14.3",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
@@ -23630,7 +23709,7 @@ version = "0.1.0"
 source = "git+https://github.com/spiceai/vortex.git?rev=5e477a52254a670bd51a24d8e6fad5b464f4b41f#5e477a52254a670bd51a24d8e6fad5b464f4b41f"
 dependencies = [
  "num-traits",
- "prost",
+ "prost 0.14.3",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
@@ -23647,7 +23726,7 @@ dependencies = [
  "flatbuffers",
  "jiff",
  "object_store 0.13.2",
- "prost",
+ "prost 0.14.3",
  "tokio",
 ]
 
@@ -23660,7 +23739,7 @@ dependencies = [
  "itertools 0.14.0",
  "lending-iterator",
  "num-traits",
- "prost",
+ "prost 0.14.3",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
@@ -23729,7 +23808,7 @@ source = "git+https://github.com/spiceai/vortex.git?rev=5e477a52254a670bd51a24d8
 dependencies = [
  "fsst-rs",
  "num-traits",
- "prost",
+ "prost 0.14.3",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
@@ -23805,7 +23884,7 @@ dependencies = [
  "parking_lot",
  "paste",
  "pin-project-lite",
- "prost",
+ "prost 0.14.3",
  "rustc-hash 2.1.2",
  "sketches-ddsketch",
  "termtree 1.0.0",
@@ -23852,7 +23931,7 @@ version = "0.1.0"
 source = "git+https://github.com/spiceai/vortex.git?rev=5e477a52254a670bd51a24d8e6fad5b464f4b41f#5e477a52254a670bd51a24d8e6fad5b464f4b41f"
 dependencies = [
  "pco",
- "prost",
+ "prost 0.14.3",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
@@ -23865,7 +23944,7 @@ name = "vortex-proto"
 version = "0.1.0"
 source = "git+https://github.com/spiceai/vortex.git?rev=5e477a52254a670bd51a24d8e6fad5b464f4b41f#5e477a52254a670bd51a24d8e6fad5b464f4b41f"
 dependencies = [
- "prost",
+ "prost 0.14.3",
  "prost-types",
 ]
 
@@ -23876,7 +23955,7 @@ source = "git+https://github.com/spiceai/vortex.git?rev=5e477a52254a670bd51a24d8
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
- "prost",
+ "prost 0.14.3",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
@@ -23906,7 +23985,7 @@ version = "0.1.0"
 source = "git+https://github.com/spiceai/vortex.git?rev=5e477a52254a670bd51a24d8e6fad5b464f4b41f#5e477a52254a670bd51a24d8e6fad5b464f4b41f"
 dependencies = [
  "num-traits",
- "prost",
+ "prost 0.14.3",
  "smallvec 1.15.1",
  "vortex-array",
  "vortex-buffer",
@@ -23935,7 +24014,7 @@ source = "git+https://github.com/spiceai/vortex.git?rev=5e477a52254a670bd51a24d8
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
- "prost",
+ "prost 0.14.3",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",
@@ -23971,7 +24050,7 @@ version = "0.1.0"
 source = "git+https://github.com/spiceai/vortex.git?rev=5e477a52254a670bd51a24d8e6fad5b464f4b41f#5e477a52254a670bd51a24d8e6fad5b464f4b41f"
 dependencies = [
  "itertools 0.14.0",
- "prost",
+ "prost 0.14.3",
  "vortex-array",
  "vortex-buffer",
  "vortex-error",

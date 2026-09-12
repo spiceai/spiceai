@@ -25,6 +25,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_tools::schema::expand_views_schema;
 use async_trait::async_trait;
 use dataformat_json::{Format, SpiceJsonFormat};
+use dataformat_orc::OrcFormat;
 use datafusion::catalog::Session;
 use datafusion::common::{Constraints, DFSchema, GetExt, Result as DFResult, ScalarValue};
 use datafusion::config::{ConfigField, TableParquetOptions};
@@ -615,6 +616,7 @@ pub trait ListingTableConnector: DataConnector {
     /// to infer the format from the dataset's file extension. It supports both tabular and
     /// unstructured formats. It supports the following tabular formats:
     ///  - parquet
+    ///  - orc
     ///  - vortex (not available on Windows)
     ///  - csv
     ///
@@ -764,6 +766,15 @@ pub trait ListingTableConnector: DataConnector {
                     FileCompressionType::UNCOMPRESSED,
                 ),
             )),
+            (Some("orc"), _) | (None, Some("orc")) => Ok((
+                Some(Arc::new(OrcFormat::new())),
+                listing_extension(
+                    configured_extension.as_ref(),
+                    path_extension.as_ref(),
+                    ".orc",
+                    FileCompressionType::UNCOMPRESSED,
+                ),
+            )),
             (Some("auto"), ext) => {
                 match ext {
                     Some("csv") => Ok((
@@ -831,6 +842,15 @@ pub trait ListingTableConnector: DataConnector {
                             configured_extension.as_ref(),
                             path_extension.as_ref(),
                             ".parquet",
+                            FileCompressionType::UNCOMPRESSED,
+                        ),
+                    )),
+                    Some("orc") => Ok((
+                        Some(Arc::new(OrcFormat::new())),
+                        listing_extension(
+                            configured_extension.as_ref(),
+                            path_extension.as_ref(),
+                            ".orc",
                             FileCompressionType::UNCOMPRESSED,
                         ),
                     )),
@@ -2250,6 +2270,52 @@ mod tests {
             connector.get_file_format_and_extension(&dataset).await
         {
             assert_eq!(extension, ".parquet");
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_detect_orc_extension() {
+        let (connector, dataset) = setup_connector("test:test.orc".to_string(), HashMap::new());
+
+        if let Ok((Some(file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset).await
+        {
+            assert_eq!(extension, ".orc");
+            assert_eq!(file_format.get_ext(), "orc");
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_orc_from_params() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "orc".to_string());
+        let (connector, dataset) = setup_connector("test:test.csv".to_string(), params);
+
+        if let Ok((Some(file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset).await
+        {
+            assert_eq!(extension, ".orc");
+            assert_eq!(file_format.get_ext(), "orc");
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_auto_detects_orc() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "auto".to_string());
+        let (connector, dataset) = setup_connector("test:test.orc".to_string(), params);
+
+        if let Ok((Some(file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset).await
+        {
+            assert_eq!(extension, ".orc");
+            assert_eq!(file_format.get_ext(), "orc");
         } else {
             panic!("Unexpected error");
         }

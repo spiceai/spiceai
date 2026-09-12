@@ -530,7 +530,7 @@ impl UnreadableTables {
     const SAMPLE: usize = 5;
 
     /// Counts `table`, keeping its name only while the sample has room: a
-    /// database that is entirely ORC would otherwise retain every name to print
+    /// database that is entirely unreadable would otherwise retain every name to print
     /// five of them.
     ///
     /// Names come from Glue, so they are escaped — a name holding a newline would
@@ -557,8 +557,8 @@ impl UnreadableTables {
     /// The one line an operator sees for the tables this database holds that
     /// Spice cannot read, or `None` when it can read all of them.
     ///
-    /// One line per database rather than one per table, so a database of ORC
-    /// tables does not bury everything else in the log. `RefreshableCatalogProvider::refresh`
+    /// One line per database rather than one per table, so a database of
+    /// unreadable tables does not bury everything else in the log. `RefreshableCatalogProvider::refresh`
     /// rebuilds every schema provider on a 60s cycle, so this line is spaced by
     /// [`UnreadableWarnings`] rather than emitted on each one: a standing condition
     /// re-reported every minute for the life of the process is noise, while a set
@@ -775,6 +775,7 @@ mod tests {
     const PARQUET: &str = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat";
     const TEXT: &str = "org.apache.hadoop.mapred.TextInputFormat";
     const ORC: &str = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
+    const AVRO: &str = "org.apache.hadoop.hive.ql.io.avro.AvroContainerInputFormat";
 
     /// The summary `database`'s unreadable `tables` produce, built through the
     /// production [`UnreadableTables`] so the fingerprint under test is the one
@@ -1049,6 +1050,7 @@ mod tests {
         for readable in [
             glue_table("orders", Some(PARQUET)),
             glue_table("events", Some(TEXT)),
+            glue_table("archive", Some(ORC)),
             iceberg_table("ledger"),
         ] {
             assert!(is_readable("public", &readable, &mut unreadable));
@@ -1062,7 +1064,7 @@ mod tests {
         // The three ways `InputFormat::try_from` refuses a table: an unsupported
         // format, a storage descriptor carrying no format, and no descriptor.
         for refused in [
-            glue_table("archive", Some(ORC)),
+            glue_table("archive", Some(AVRO)),
             glue_table("headerless", None),
             table_without_storage_descriptor("legacy"),
         ] {
@@ -1085,7 +1087,7 @@ mod tests {
     /// expression, over a table that is both excluded and unreadable. Calling
     /// each half on its own says nothing about the order they run in, and the
     /// order is the whole behaviour: swapping it makes Spice warn an operator
-    /// about ORC tables their `exclude:` deliberately withholds.
+    /// about Avro tables their `exclude:` deliberately withholds.
     #[test]
     fn an_excluded_table_is_never_reported_as_unreadable() {
         let selector = selector(&[], &["archive.*"]);
@@ -1095,7 +1097,7 @@ mod tests {
         assert!(!is_registrable(
             &selector,
             "archive",
-            &glue_table("orc_dump", Some(ORC)),
+            &glue_table("avro_dump", Some(AVRO)),
             &mut unreadable
         ));
         assert_eq!(
@@ -1125,11 +1127,11 @@ mod tests {
         assert!(!is_registrable(
             &selector,
             "public",
-            &glue_table("orc_dump", Some(ORC)),
+            &glue_table("avro_dump", Some(AVRO)),
             &mut unreadable
         ));
         assert_eq!(unreadable.total, 1);
-        assert_eq!(unreadable.sample, vec!["orc_dump".to_string()]);
+        assert_eq!(unreadable.sample, vec!["avro_dump".to_string()]);
     }
 
     /// The summary is what an operator sees by default, so it has to say how many
