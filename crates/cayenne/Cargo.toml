@@ -113,6 +113,7 @@ result-correctness-duckdb = ["dep:duckdb"]
 result-correctness-chdb = ["dep:chdb-rust"]
 
 [dev-dependencies]
+datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 tpchgen = { workspace = true }
 vortex-io = { workspace = true }
 # Kept only for the `row_converter` byte-identity equivalence test; Cayenne's runtime no
@@ -152,6 +153,10 @@ libc = "0.2"
 #     provider::structural_version --release
 [target.'cfg(cayenne_loom)'.dev-dependencies]
 loom = { workspace = true }
+
+[[bench]]
+harness = false
+name = "in_list_query_e2e"
 
 [[bench]]
 harness = false
