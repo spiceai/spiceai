@@ -15825,6 +15825,16 @@ impl CayenneTableProvider {
             snapshot_sequence,
             "Published staged on-conflict snapshot"
         );
+
+        // The cached ScanView bakes `protected_map`, merged deletions, and the
+        // inlined view. A wait-free UntilInvalidated hit would keep serving that
+        // pre-publish bundle (missing the new snapshot / hiding superseded rows)
+        // unless `scan_input_version` advances. `bump_inlined_generation` already
+        // notifies when an inline tombstone was activated; this covers the
+        // file-only / protected-snapshot-only publish. Callers hold
+        // `listing_fence.write()`, so a concurrent capture cannot observe the
+        // bump without also observing this publish.
+        self.notify_scan_input_change();
     }
 
     fn publish_staged_position_deletion_cache(
@@ -16543,6 +16553,11 @@ impl CayenneTableProvider {
             let _view_guard = self.scan_state_lock.write().await;
             self.mark_maintained_aggregates_stale_on_checkpoint();
             self.publish_on_conflict_update(update);
+            // Bump under the write guard so a concurrent scan cannot hit the
+            // pre-publish ScanView after this unlock. An inline-tombstone
+            // publish already notified via `bump_inlined_structural_epoch`; a
+            // second bump only forces a rebuild.
+            self.notify_scan_input_change();
             return;
         };
 
@@ -16556,6 +16571,10 @@ impl CayenneTableProvider {
                 let update = update.take().unwrap_or_else(OnConflictUpdate::none);
                 self.mark_maintained_aggregates_stale_on_checkpoint();
                 self.publish_on_conflict_update(update);
+                // Same bake as the staged publish: `protected_map` lives on the
+                // cached ScanView. Without this, a post-retention append that
+                // isolates into a new snapshot stays invisible until eviction.
+                self.notify_scan_input_change();
                 return;
             }
         }
