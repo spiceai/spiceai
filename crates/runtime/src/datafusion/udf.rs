@@ -292,6 +292,8 @@ async fn maybe_register_function_as_tool(runtime: &crate::Runtime, decl: &Functi
                 return;
             }
             tools_map.insert(name.clone(), crate::tools::Tooling::FunctionTool(tool));
+            #[cfg(feature = "mcp")]
+            runtime.refresh_mcp_tool_schemas(&tools_map);
             tracing::info!(name = %name, "Exposed user function as tool");
         }
         Err(e) => {
@@ -472,6 +474,8 @@ async fn apply_function_diff_inner(
                 tools_map.remove(name);
             }
         }
+        #[cfg(feature = "mcp")]
+        runtime.refresh_mcp_tool_schemas(&tools_map);
     }
 
     if new_app.functions.is_empty() {
