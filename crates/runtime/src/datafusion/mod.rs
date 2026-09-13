@@ -572,8 +572,8 @@ pub enum Error {
     #[snafu(display(
         "Failed to enable acceleration snapshots for view '{view_name}': {reason}. \
          Set `snapshots: disabled` on the view, reduce its query to a single table scan, \
-         or set `snapshots_consistency: accept_skew` to publish anyway and accept that the \
-         stored rows may span several source positions. \
+         or set `snapshots_consistency: accept_skew` to use the snapshots anyway and accept \
+         that the stored rows may span several source positions. \
          See: https://spiceai.org/docs/components/data-accelerators/snapshots"
     ))]
     AcceleratedViewSnapshotsNotSingleRead { view_name: String, reason: String },
@@ -4906,10 +4906,16 @@ impl DataFusion {
         Ok(register_task)
     }
 
-    /// Decide whether an accelerated view may publish snapshots, and return the veto to
-    /// install for later publishes.
+    /// Decide whether an accelerated view may publish or restore snapshots, and
+    /// return the veto to install for later publishes.
     ///
-    /// `Ok(None)` means publish unconditionally — the operator set
+    /// Called for every snapshot-enabled view, including `bootstrap_only`. A
+    /// bootstrap-only view can restore an archive a peer published with
+    /// `accept_skew`, and the archive does not record that setting, so the same
+    /// single-read proof (or an explicit `accept_skew`) is required before a
+    /// restore is allowed to load.
+    ///
+    /// `Ok(None)` means publish/restore unconditionally — the operator set
     /// `snapshots_consistency: accept_skew` and owns the consequence. `Ok(Some(gate))`
     /// means the view reads once today and each later publish must prove it still does.
     /// An `Err` refuses the view's configuration outright rather than silently
@@ -4928,7 +4934,7 @@ impl DataFusion {
             SnapshotsConsistency::AcceptSkew
         ) {
             tracing::warn!(
-                "View '{table}' publishes snapshots with `snapshots_consistency: accept_skew`, so a snapshot may hold rows captured at different source positions and a cold start will serve them. Remove `snapshots_consistency` to publish only from a single consistent read. See: https://spiceai.org/docs/components/data-accelerators/snapshots"
+                "View '{table}' uses snapshots with `snapshots_consistency: accept_skew`, so a snapshot may hold rows captured at different source positions and a cold start will serve them. Remove `snapshots_consistency` to require a single consistent read. See: https://spiceai.org/docs/components/data-accelerators/snapshots"
             );
             return Ok(None);
         }
@@ -5083,31 +5089,39 @@ impl DataFusion {
                     }
                 );
 
-                if acceleration.snapshot_behavior.create_enabled() {
+                // `bootstrap_only` restores but does not publish. The archive
+                // does not record `snapshots_consistency`, so a default
+                // bootstrap-only view would otherwise serve a multi-read
+                // materialization without opting out. Run the same single-read
+                // proof for every snapshot-enabled view; only install the
+                // publish veto when this view will also write archives.
+                if !acceleration.snapshot_behavior.is_disabled() {
                     let publish_gate = self.view_snapshot_publish_gate(view, table).await?;
 
-                    let snapshot_engine_override = match self
-                        .accelerator_engine_registry
-                        .get_accelerator_engine(acceleration.engine)
-                        .await
-                    {
-                        Some(accel) => accel.snapshot_engine_for_source(view).await,
-                        None => None,
-                    };
+                    if acceleration.snapshot_behavior.create_enabled() {
+                        let snapshot_engine_override = match self
+                            .accelerator_engine_registry
+                            .get_accelerator_engine(acceleration.engine)
+                            .await
+                        {
+                            Some(accel) => accel.snapshot_engine_for_source(view).await,
+                            None => None,
+                        };
 
-                    // `ViewBuilder::try_from` rejects every refresh mode but `full`, so
-                    // that is the mode the trigger is chosen for.
-                    if let Some(snapshot_config) = build_snapshot_creation_config(
-                        view,
-                        acceleration,
-                        RefreshMode::Full,
-                        layout.clone(),
-                        snapshot_engine_override,
-                        publish_gate,
-                    )
-                    .await?
-                    {
-                        builder.snapshot_creation_config(Some(snapshot_config));
+                        // `ViewBuilder::try_from` rejects every refresh mode but `full`, so
+                        // that is the mode the trigger is chosen for.
+                        if let Some(snapshot_config) = build_snapshot_creation_config(
+                            view,
+                            acceleration,
+                            RefreshMode::Full,
+                            layout.clone(),
+                            snapshot_engine_override,
+                            publish_gate,
+                        )
+                        .await?
+                        {
+                            builder.snapshot_creation_config(Some(snapshot_config));
+                        }
                     }
                 }
                 builder.acceleration_layout(layout);
@@ -7697,6 +7711,29 @@ mod tests {
                 outcome,
                 DeferredRefreshOutcome::Abandoned,
                 "no refresh was ever recorded, and none can be now the table is gone"
+            );
+        }
+    }
+
+    #[test]
+    fn a_multi_read_view_snapshot_refusal_names_accept_skew_and_a_way_out() {
+        let message = AcceleratedViewSnapshotsNotSingleReadSnafu {
+            view_name: "sales".to_string(),
+            reason: "the plan joins two tables".to_string(),
+        }
+        .build()
+        .to_string();
+        for expected in [
+            "'sales'",
+            "the plan joins two tables",
+            "`snapshots: disabled`",
+            "`snapshots_consistency: accept_skew`",
+            "use the snapshots anyway",
+            "https://spiceai.org/docs/components/data-accelerators/snapshots",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal must contain {expected:?}: {message}"
             );
         }
     }
