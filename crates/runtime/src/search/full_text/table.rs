@@ -115,18 +115,16 @@ fn build_full_text_database_index_with_directory(
     let directory = if index_store == IndexStore::File {
         if let Some(directory) = directory_override {
             Some(directory)
+        } else if let Some(path) = index_path {
+            Some(PathBuf::from_str(path.as_str()).boxed()?)
         } else {
-            if let Some(path) = index_path {
-                Some(PathBuf::from_str(path.as_str()).boxed()?)
-            } else {
-                // Default case. Example `.spice/data/fts/catalog/schema/table/`.
-                Some(
-                    make_spice_data_sub_directory(
-                        [vec!["fts".to_string()], tbl.to_vec()].concat().as_slice(),
-                    )
-                    .boxed()?,
+            // Default case. Example `.spice/data/fts/catalog/schema/table/`.
+            Some(
+                make_spice_data_sub_directory(
+                    [vec!["fts".to_string()], tbl.to_vec()].concat().as_slice(),
                 )
-            }
+                .boxed()?,
+            )
         }
     } else {
         None
