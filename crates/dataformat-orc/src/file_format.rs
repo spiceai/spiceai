@@ -16,16 +16,14 @@ limitations under the License.
 
 //! [`OrcFormat`]: Apache ORC [`FileFormat`] for listing tables.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, memory::DataSourceExec};
 use datafusion::common::{Statistics, not_impl_err, stats::Precision};
-use datafusion::datasource::file_format::{
-    FileFormat, file_compression_type::FileCompressionType,
-};
+use datafusion::datasource::file_format::{FileFormat, file_compression_type::FileCompressionType};
 use datafusion::datasource::physical_plan::{FileScanConfig, FileSinkConfig, FileSource};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_expr::LexRequirement;
@@ -63,7 +61,10 @@ async fn fetch_schema(
     let metadata = read_metadata_async(&mut reader)
         .await
         .map_err(orc_to_datafusion_error)?;
-    Ok((file.location.clone(), arrow_schema_from_orc_metadata(&metadata)))
+    Ok((
+        file.location.clone(),
+        arrow_schema_from_orc_metadata(&metadata),
+    ))
 }
 
 async fn fetch_row_count(store: &Arc<dyn ObjectStore>, file: &ObjectMeta) -> Result<u64> {
@@ -72,6 +73,43 @@ async fn fetch_row_count(store: &Arc<dyn ObjectStore>, file: &ObjectMeta) -> Res
         .await
         .map_err(orc_to_datafusion_error)?;
     Ok(metadata.number_of_rows())
+}
+
+/// Merge per-file ORC schemas for a listing table.
+///
+/// A column that appears in only some files is filled with typed NULLs at
+/// scan time, so it must be nullable in the merged schema even when every
+/// file that has it declares it required. [`Schema::try_merge`] keeps the
+/// first-seen nullability for a field that is not in every schema.
+fn merge_orc_file_schemas(schemas: Vec<Schema>) -> Result<Schema> {
+    let names_per_file: Vec<HashSet<String>> = schemas
+        .iter()
+        .map(|schema| {
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect()
+        })
+        .collect();
+
+    let merged = Schema::try_merge(schemas)?;
+    let fields = merged
+        .fields()
+        .iter()
+        .map(|field| {
+            let present_in_every_file = names_per_file
+                .iter()
+                .all(|names| names.contains(field.name()));
+            if present_in_every_file || field.is_nullable() {
+                Arc::clone(field)
+            } else {
+                Arc::new(field.as_ref().clone().with_nullable(true))
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Schema::new_with_metadata(fields, merged.metadata().clone()))
 }
 
 /// Apache ORC [`FileFormat`] implementation backed by `orc-rust`.
@@ -122,7 +160,7 @@ impl FileFormat for OrcFormat {
             schemas.push(schema);
         }
 
-        let schema = Schema::try_merge(schemas)?;
+        let schema = merge_orc_file_schemas(schemas)?;
         Ok(Arc::new(schema))
     }
 
@@ -180,8 +218,8 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use datafusion::execution::context::SessionContext;
     use datafusion::prelude::SessionConfig;
-    use object_store::memory::InMemory;
     use object_store::ObjectStore;
+    use object_store::memory::InMemory;
 
     fn sample_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -213,9 +251,7 @@ mod tests {
             .expect("infer schema");
 
         assert_eq!(schema.fields().len(), 2);
-        schema
-            .field_with_name("id")
-            .expect("id field should exist");
+        schema.field_with_name("id").expect("id field should exist");
         schema
             .field_with_name("name")
             .expect("name field should exist");
@@ -261,12 +297,44 @@ mod tests {
             .expect("merged schema");
 
         assert_eq!(schema.fields().len(), 2);
-        schema
-            .field_with_name("id")
-            .expect("id field should exist");
-        schema
+        schema.field_with_name("id").expect("id field should exist");
+        let extra = schema
             .field_with_name("extra")
             .expect("extra field should exist");
+        assert!(
+            extra.is_nullable(),
+            "a column present in only some files must be nullable so scan can backfill NULLs"
+        );
+    }
+
+    #[test]
+    fn merge_orc_file_schemas_marks_partial_fields_nullable() {
+        let only_id = Schema::new(vec![arrow::datatypes::Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]);
+        let id_and_extra = Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int32, false),
+            arrow::datatypes::Field::new("extra", DataType::Utf8, false),
+        ]);
+
+        let merged = merge_orc_file_schemas(vec![only_id, id_and_extra]).expect("merge schemas");
+
+        assert!(
+            !merged
+                .field_with_name("id")
+                .expect("id field")
+                .is_nullable(),
+            "id is in every file as required and must stay required"
+        );
+        assert!(
+            merged
+                .field_with_name("extra")
+                .expect("extra field")
+                .is_nullable(),
+            "extra is missing from some files and must be nullable for NULL backfill"
+        );
     }
 
     #[tokio::test]
@@ -311,8 +379,8 @@ mod tests {
         std::fs::write(&path, write_orc_bytes(&sample_batch())).expect("write fixture");
 
         let ctx = SessionContext::new_with_config(SessionConfig::new());
-        let table_url = ListingTableUrl::parse(format!("file://{}", path.display()))
-            .expect("listing url");
+        let table_url =
+            ListingTableUrl::parse(format!("file://{}", path.display())).expect("listing url");
         let config = ListingTableConfig::new(table_url)
             .with_listing_options(
                 ListingOptions::new(Arc::new(OrcFormat::new())).with_file_extension(".orc"),
@@ -360,7 +428,10 @@ mod tests {
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("reordered name column");
-        assert!(reordered_names.is_null(0), "id=2 was written with a NULL name");
+        assert!(
+            reordered_names.is_null(0),
+            "id=2 was written with a NULL name"
+        );
         let reordered_ids = reordered_batches[0]
             .column(1)
             .as_any()
@@ -379,6 +450,126 @@ mod tests {
             .downcast_ref::<arrow::array::Int64Array>()
             .expect("count column");
         assert_eq!(counts.value(0), 3);
+    }
+
+    /// Regression: `orc-rust` 0.8.0 `ProjectionMask::named_roots` omits names
+    /// absent from the current file. A listing of files with different
+    /// columns must still scan the merged projection, backfilling NULLs.
+    #[tokio::test]
+    async fn listing_scan_backfills_columns_missing_from_some_files() {
+        use datafusion::datasource::listing::{
+            ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let id_only_schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let id_only = RecordBatch::try_new(
+            Arc::clone(&id_only_schema),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .expect("id-only batch");
+
+        let both_schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int32, false),
+            arrow::datatypes::Field::new("extra", DataType::Utf8, false),
+        ]));
+        let both = RecordBatch::try_new(
+            Arc::clone(&both_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![2])),
+                Arc::new(StringArray::from(vec!["x"])),
+            ],
+        )
+        .expect("id+extra batch");
+
+        std::fs::write(dir.path().join("a.orc"), write_orc_bytes(&id_only)).expect("write a.orc");
+        std::fs::write(dir.path().join("b.orc"), write_orc_bytes(&both)).expect("write b.orc");
+
+        let ctx = SessionContext::new_with_config(SessionConfig::new());
+        let table_url = ListingTableUrl::parse(format!("file://{}/", dir.path().display()))
+            .expect("listing url");
+        let config = ListingTableConfig::new(table_url)
+            .with_listing_options(
+                ListingOptions::new(Arc::new(OrcFormat::new())).with_file_extension(".orc"),
+            )
+            .infer_schema(&ctx.state())
+            .await
+            .expect("infer listing schema");
+        let table = ListingTable::try_new(config).expect("listing table");
+        ctx.register_table("merged", Arc::new(table))
+            .expect("register");
+
+        let df = ctx
+            .sql("SELECT id, extra FROM merged ORDER BY id")
+            .await
+            .expect("sql");
+        let batches = df.collect().await.expect("collect");
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 2, "scan must return a row from every file");
+
+        let mut pairs = Vec::new();
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id column");
+            let extras = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("extra column");
+            for i in 0..batch.num_rows() {
+                let extra = if extras.is_null(i) {
+                    None
+                } else {
+                    Some(extras.value(i).to_string())
+                };
+                pairs.push((ids.value(i), extra));
+            }
+        }
+        assert_eq!(
+            pairs,
+            vec![(1, None), (2, Some("x".to_string()))],
+            "a.orc has no extra column; the merged projection must backfill NULL"
+        );
+
+        let extra_only = ctx
+            .sql("SELECT extra FROM merged ORDER BY extra NULLS FIRST")
+            .await
+            .expect("extra-only sql");
+        let extra_batches = extra_only.collect().await.expect("collect extra-only");
+        let extra_rows: usize = extra_batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            extra_rows, 2,
+            "projecting only extra must still visit both files"
+        );
+
+        let mut extras = Vec::new();
+        for batch in &extra_batches {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("extra-only column");
+            for i in 0..batch.num_rows() {
+                extras.push(if col.is_null(i) {
+                    None
+                } else {
+                    Some(col.value(i).to_string())
+                });
+            }
+        }
+        assert_eq!(
+            extras,
+            vec![None, Some("x".to_string())],
+            "SELECT extra must backfill NULL for the file that has no extra column"
+        );
     }
 
     #[tokio::test]

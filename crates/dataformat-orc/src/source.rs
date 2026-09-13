@@ -18,6 +18,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use arrow::array::new_null_array;
 use arrow::datatypes::Schema;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::error::{DataFusionError, Result};
@@ -113,37 +114,29 @@ impl FileSource for OrcSource {
     }
 }
 
-/// Reorder (and, for `COUNT(*)`, drop) ORC columns so the batch matches the
-/// projected file schema. `orc-rust`'s `ProjectionMask::named_roots` emits
-/// columns in file order, which is not necessarily `SELECT` order.
+/// Reorder ORC columns so the batch matches the projected file schema, and
+/// backfill projected fields this file does not have with typed NULL arrays.
+///
+/// `orc-rust` 0.8.0 `ProjectionMask::named_roots` emits columns in file order
+/// (not `SELECT` order) and silently omits names absent from the file. A
+/// listing table whose schema was merged across files therefore cannot look
+/// up every projected field in the batch; missing fields become NULLs.
 fn align_orc_batch(batch: &RecordBatch, schema: &Arc<Schema>) -> Result<RecordBatch> {
-    if schema.fields().is_empty() {
-        return RecordBatch::try_new_with_options(
-            Arc::clone(schema),
-            vec![],
-            &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
-        )
-        .map_err(|err| DataFusionError::ArrowError(Box::new(err), None));
-    }
-
-    let indices = schema
+    let columns: Vec<_> = schema
         .fields()
         .iter()
-        .map(|field| {
-            batch.schema().index_of(field.name()).map_err(|err| {
-                DataFusionError::ArrowError(
-                    Box::new(err),
-                    Some(format!(
-                        "ORC file is missing projected column '{}'",
-                        field.name()
-                    )),
-                )
-            })
+        .map(|field| match batch.column_by_name(field.name()) {
+            Some(column) => Arc::clone(column),
+            None => new_null_array(field.data_type(), batch.num_rows()),
         })
-        .collect::<Result<Vec<_>>>()?;
-    batch
-        .project(&indices)
-        .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))
+        .collect();
+
+    RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))
 }
 
 /// Opens one ORC object and yields a stream of [`arrow::record_batch::RecordBatch`]es.
@@ -161,8 +154,7 @@ impl FileOpener for OrcOpener {
         let file_range = partitioned_file.range.clone();
 
         Ok(Box::pin(async move {
-            let reader =
-                ObjectStoreReader::new(store, partitioned_file.object_meta.clone());
+            let reader = ObjectStoreReader::new(store, partitioned_file.object_meta.clone());
             let builder = ArrowReaderBuilder::try_new_async(reader)
                 .await
                 .map_err(orc_to_datafusion_error)?;
@@ -175,10 +167,8 @@ impl FileOpener for OrcOpener {
                     .iter()
                     .map(|field| field.name().clone())
                     .collect();
-                let projection = ProjectionMask::named_roots(
-                    builder.file_metadata().root_data_type(),
-                    &names,
-                );
+                let projection =
+                    ProjectionMask::named_roots(builder.file_metadata().root_data_type(), &names);
                 builder.with_projection(projection)
             };
 
