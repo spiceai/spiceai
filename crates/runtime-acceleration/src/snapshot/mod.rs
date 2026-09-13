@@ -767,7 +767,7 @@ impl CapturedIndex {
             filename.push_str("__");
             filename.push_str(&sanitize(discriminator));
         }
-        filename.push_str(&format!("__{}", uuid::Uuid::now_v7()));
+        let _ = write!(filename, "__{}", uuid::Uuid::now_v7());
         filename.push_str(".tar");
         filename
     }
@@ -843,6 +843,14 @@ impl SnapshotManager {
     ///
     /// The staging directory is intentionally the only directory this method mutates: callers
     /// must validate the extracted index and atomically install it themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the staging directory cannot be created, the artifact's object store
+    /// URI cannot be resolved, the download fails or is interrupted, the archive cannot be
+    /// written to local disk, the downloaded size or checksum does not match the artifact's
+    /// recorded metadata, the checksum algorithm is unsupported, or the downloaded archive
+    /// cannot be extracted.
     pub async fn download_index_artifact_to_staging(
         &self,
         artifact: &IndexSnapshotRef,
@@ -944,6 +952,13 @@ impl SnapshotManager {
     /// provider is made visible. A missing configured artifact is intentionally ignored: that
     /// preserves the legacy rebuild behavior. A matching artifact which cannot be restored is a
     /// hard failure so the caller never publishes a DB/index generation mismatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a local staging directory cannot be created, downloading or verifying
+    /// a matching artifact fails (see [`Self::download_index_artifact_to_staging`]), the index
+    /// fails to restore from the downloaded artifact, or a configured index has no matching
+    /// artifact in `artifacts`.
     pub async fn restore_indexes_from_snapshot(
         &self,
         artifacts: &[IndexSnapshotRef],
@@ -1294,10 +1309,10 @@ impl SnapshotManager {
                     directory: temp_dir,
                 }),
                 Ok(Err(error)) => {
-                    tracing::warn!(dataset = %self.dataset_name, index = identity.kind, "Failed to stage index snapshot; the database snapshot will be published without this index artifact. Cause: {error}")
+                    tracing::warn!(dataset = %self.dataset_name, index = identity.kind, "Failed to stage index snapshot; the database snapshot will be published without this index artifact. Cause: {error}");
                 }
                 Err(error) => {
-                    tracing::warn!(dataset = %self.dataset_name, index = identity.kind, "Index snapshot staging task failed; the database snapshot will be published without this index artifact. Cause: {error}")
+                    tracing::warn!(dataset = %self.dataset_name, index = identity.kind, "Index snapshot staging task failed; the database snapshot will be published without this index artifact. Cause: {error}");
                 }
             }
         }
@@ -1340,7 +1355,7 @@ impl SnapshotManager {
                     size,
                 }),
                 Err(error) => {
-                    tracing::warn!(dataset = %self.dataset_name, index = captured.identity.kind, "Failed to upload index snapshot; the database snapshot will be published without this index artifact. Cause: {error}")
+                    tracing::warn!(dataset = %self.dataset_name, index = captured.identity.kind, "Failed to upload index snapshot; the database snapshot will be published without this index artifact. Cause: {error}");
                 }
             }
         }
