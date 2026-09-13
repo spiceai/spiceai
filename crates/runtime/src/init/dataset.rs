@@ -2261,9 +2261,10 @@ fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
         return Ok(());
     };
 
-    // `snapshots_consistency` is a view-only publish gate. A dataset always
-    // materializes one source read, so a non-default value would load and then
-    // do nothing — refuse it here rather than accept a no-op that looks valid.
+    // `snapshots_consistency` is a view-only consistency gate (publish and
+    // bootstrap). A dataset always materializes one source read, so a
+    // non-default value would load and then do nothing — refuse it here rather
+    // than accept a no-op that looks valid.
     if acceleration.snapshots_consistency != spicepod::acceleration::SnapshotsConsistency::default()
     {
         return Err(SnapshotsConsistencyNotForDatasetSnafu {

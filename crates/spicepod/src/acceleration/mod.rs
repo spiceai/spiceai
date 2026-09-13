@@ -239,13 +239,15 @@ pub enum SnapshotsCreationPolicy {
     OnChange,
 }
 
-/// Whether an accelerated view may publish a snapshot of a materialization that
-/// spans more than one read of its sources.
+/// Whether an accelerated view may publish or restore a snapshot of a
+/// materialization that spans more than one read of its sources.
 ///
 /// A view materializes a query, and every table it reads resolves its own read view
 /// independently — so a materialization over two reads captures each source at a
 /// different position, and can store rows that never existed together in the source.
-/// Publishing that as a snapshot makes the discrepancy durable and reusable.
+/// Publishing that as a snapshot makes the discrepancy durable and reusable; a
+/// `bootstrap_only` consumer with the default `consistent_read` is refused rather
+/// than serving that archive without opting in.
 ///
 /// Only meaningful for views. A dataset that sets a non-default value is refused at
 /// load: a dataset materializes a single source and always reads it once, so the
@@ -255,11 +257,12 @@ pub enum SnapshotsCreationPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotsConsistency {
     /// Snapshot only a materialization proven to come from a single read (default).
-    /// A view whose query reads more than once is refused at load with an explanation.
+    /// A view whose query reads more than once is refused at load with an explanation,
+    /// whether it would publish or only bootstrap.
     #[default]
     ConsistentRead,
-    /// Snapshot regardless, accepting that the stored rows may span several source
-    /// positions. Choose this only when the view's consumers tolerate that.
+    /// Publish or restore regardless, accepting that the stored rows may span several
+    /// source positions. Choose this only when the view's consumers tolerate that.
     AcceptSkew,
 }
 
@@ -662,8 +665,8 @@ pub struct Acceleration {
     #[serde(default, skip_serializing_if = "is_default_snapshots_creation_policy")]
     pub snapshots_creation_policy: SnapshotsCreationPolicy,
 
-    /// For an accelerated view: whether a snapshot may be published from a
-    /// materialization that spans more than one read of the view's sources.
+    /// For an accelerated view: whether a snapshot may be published or restored
+    /// from a materialization that spans more than one read of the view's sources.
     ///
     /// Options: `consistent_read` (default) / `accept_skew`.
     ///

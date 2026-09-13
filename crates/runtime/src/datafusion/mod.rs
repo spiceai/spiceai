@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -647,6 +647,62 @@ impl Error {
                 | Self::SnapshotCreationBatchesShouldBePositive
         )
     }
+}
+
+/// Outcome of the load-time snapshot consistency policy for an accelerated view.
+///
+/// Applies whenever snapshots are configured — create *or* bootstrap — because a
+/// `bootstrap_only` consumer restores an archive that may have been produced by an
+/// `accept_skew` writer. Archive metadata does not record `snapshots_consistency`,
+/// so the consumer's current SQL and setting are the gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+enum ViewSnapshotConsistencyDecision {
+    /// The operator set `accept_skew`. No single-read gate; a create-enabled view
+    /// publishes unconditionally.
+    AcceptSkew,
+    /// The compiled plan reads once today. A create-enabled view still installs a
+    /// publish-time re-check because the compiled plan can change.
+    ConsistentSingleRead,
+}
+
+#[must_use]
+fn view_snapshot_accept_skew_warning(table: &TableReference) -> String {
+    format!(
+        "View '{table}' uses snapshots with `snapshots_consistency: accept_skew`, so a snapshot may hold rows captured at different source positions and a cold start will serve them. Remove `snapshots_consistency` to require a single consistent read. See: https://spiceai.org/docs/components/data-accelerators/snapshots"
+    )
+}
+
+/// Load-time read-shape policy for any snapshot-enabled view.
+///
+/// Refuses a multi-read view unless the operator set `accept_skew`. Does not
+/// install a publish gate — that is the caller's job when this instance creates.
+async fn view_snapshot_consistency_decision(
+    ctx: &SessionContext,
+    table: &TableReference,
+    sql: &str,
+    consistency: SnapshotsConsistency,
+) -> Result<ViewSnapshotConsistencyDecision> {
+    if matches!(consistency, SnapshotsConsistency::AcceptSkew) {
+        tracing::warn!("{}", view_snapshot_accept_skew_warning(table));
+        return Ok(ViewSnapshotConsistencyDecision::AcceptSkew);
+    }
+
+    let shape = crate::view::analyzed_view_read_shape(ctx, sql)
+        .await
+        .context(AcceleratedViewSnapshotsPlanFailedSnafu {
+            view_name: table.to_string(),
+        })?;
+
+    if let Some(reason) = shape.refusal_reason() {
+        return AcceleratedViewSnapshotsNotSingleReadSnafu {
+            view_name: table.to_string(),
+            reason,
+        }
+        .fail();
+    }
+
+    Ok(ViewSnapshotConsistencyDecision::ConsistentSingleRead)
 }
 
 /// Validates that the acceleration engine is supported in distributed mode.
@@ -4926,41 +4982,29 @@ impl DataFusion {
         view: &View,
         table: &TableReference,
     ) -> Result<Option<Arc<dyn runtime_acceleration::snapshot::SnapshotPublishGate>>> {
-        if matches!(
+        match view_snapshot_consistency_decision(
+            &self.ctx,
+            table,
+            &view.sql,
             view.acceleration
                 .as_ref()
                 .map(|a| a.snapshots_consistency)
                 .unwrap_or_default(),
-            SnapshotsConsistency::AcceptSkew
-        ) {
-            tracing::warn!(
-                "View '{table}' uses snapshots with `snapshots_consistency: accept_skew`, so a snapshot may hold rows captured at different source positions and a cold start will serve them. Remove `snapshots_consistency` to require a single consistent read. See: https://spiceai.org/docs/components/data-accelerators/snapshots"
-            );
-            return Ok(None);
-        }
-
-        let shape = crate::view::analyzed_view_read_shape(&self.ctx, &view.sql)
-            .await
-            .context(AcceleratedViewSnapshotsPlanFailedSnafu {
-                view_name: table.to_string(),
-            })?;
-
-        if let Some(reason) = shape.refusal_reason() {
-            return AcceleratedViewSnapshotsNotSingleReadSnafu {
-                view_name: table.to_string(),
-                reason,
+        )
+        .await?
+        {
+            ViewSnapshotConsistencyDecision::AcceptSkew => Ok(None),
+            ViewSnapshotConsistencyDecision::ConsistentSingleRead => {
+                Ok(Some(Arc::new(crate::view::ViewSnapshotPublishGate::new(
+                    table.clone(),
+                    Arc::clone(&view.sql),
+                    &self.ctx,
+                ))
+                    as Arc<
+                        dyn runtime_acceleration::snapshot::SnapshotPublishGate,
+                    >))
             }
-            .fail();
         }
-
-        Ok(Some(Arc::new(crate::view::ViewSnapshotPublishGate::new(
-            table.clone(),
-            Arc::clone(&view.sql),
-            &self.ctx,
-        ))
-            as Arc<
-                dyn runtime_acceleration::snapshot::SnapshotPublishGate,
-            >))
     }
 
     /// Returns the waiter for the view's initial refresh together with the
@@ -5075,8 +5119,9 @@ impl DataFusion {
         // publish must only capture a materialization that came from a single read,
         // because a query that reads its sources twice captures them at two different
         // positions and can store rows that never existed together; publishing that
-        // makes the discrepancy durable and reusable. That is decided here, and
-        // re-decided by `ViewSnapshotPublishGate` before every publish.
+        // makes the discrepancy durable and reusable. That is decided here for every
+        // snapshot-enabled view — create *or* bootstrap — and re-decided by
+        // `ViewSnapshotPublishGate` before every publish.
         match get_acceleration_layout(view, &self.accelerator_engine_registry).await {
             Ok(layout) if layout.is_enabled() => {
                 ensure!(
@@ -6228,6 +6273,116 @@ mod tests {
     use crate::builder::RuntimeBuilder;
 
     use super::*;
+
+    mod view_snapshot_consistency {
+        use super::super::{
+            view_snapshot_accept_skew_warning, view_snapshot_consistency_decision,
+            AcceleratedViewSnapshotsNotSingleReadSnafu, ViewSnapshotConsistencyDecision,
+        };
+        use super::*;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+
+        fn ctx_with_orders() -> SessionContext {
+            let ctx = SessionContext::new();
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            let table = MemTable::try_new(schema, vec![vec![]]).expect("in-memory test table");
+            ctx.register_table("orders", Arc::new(table))
+                .expect("register orders");
+            ctx
+        }
+
+        #[test]
+        fn accept_skew_warning_names_the_setting_and_a_way_out() {
+            let message = view_snapshot_accept_skew_warning(&TableReference::bare("orders_us"));
+            for expected in [
+                "'orders_us'",
+                "`snapshots_consistency: accept_skew`",
+                "cold start will serve them",
+                "Remove `snapshots_consistency`",
+                "https://spiceai.org/docs/components/data-accelerators/snapshots",
+            ] {
+                assert!(
+                    message.contains(expected),
+                    "the accept_skew warning must contain {expected:?}: {message}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_multi_read_refusal_names_the_view_and_a_way_out() {
+            let message = AcceleratedViewSnapshotsNotSingleReadSnafu {
+                view_name: "orders_self_join".to_string(),
+                reason: "its query reads its sources 2 times ('orders')".to_string(),
+            }
+            .build()
+            .to_string();
+            for expected in [
+                "'orders_self_join'",
+                "reads its sources 2 times",
+                "`snapshots: disabled`",
+                "`snapshots_consistency: accept_skew`",
+                "https://spiceai.org/docs/components/data-accelerators/snapshots",
+            ] {
+                assert!(
+                    message.contains(expected),
+                    "the refusal must contain {expected:?}: {message}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn consistent_read_refuses_a_multi_read_view() {
+            let ctx = ctx_with_orders();
+            let table = TableReference::bare("orders_self_join");
+            let err = view_snapshot_consistency_decision(
+                &ctx,
+                &table,
+                "SELECT a.id FROM orders a JOIN orders b ON a.id = b.id",
+                SnapshotsConsistency::ConsistentRead,
+            )
+            .await
+            .expect_err("a multi-read view under consistent_read must be refused");
+            let message = err.to_string();
+            assert!(
+                message.contains("reads its sources"),
+                "the refusal must name the multi-read cause: {message}"
+            );
+        }
+
+        #[tokio::test]
+        async fn accept_skew_admits_a_multi_read_view() {
+            let ctx = ctx_with_orders();
+            let table = TableReference::bare("orders_self_join");
+            let decision = view_snapshot_consistency_decision(
+                &ctx,
+                &table,
+                "SELECT a.id FROM orders a JOIN orders b ON a.id = b.id",
+                SnapshotsConsistency::AcceptSkew,
+            )
+            .await
+            .expect("accept_skew must admit a multi-read view");
+            assert_eq!(decision, ViewSnapshotConsistencyDecision::AcceptSkew);
+        }
+
+        #[tokio::test]
+        async fn consistent_read_admits_a_single_read_view() {
+            let ctx = ctx_with_orders();
+            let table = TableReference::bare("orders_us");
+            let decision = view_snapshot_consistency_decision(
+                &ctx,
+                &table,
+                "SELECT id FROM orders WHERE id = 1",
+                SnapshotsConsistency::ConsistentRead,
+            )
+            .await
+            .expect("a single-read view under consistent_read must be admitted");
+            assert_eq!(
+                decision,
+                ViewSnapshotConsistencyDecision::ConsistentSingleRead
+            );
+        }
+    }
 
     /// Every way of naming a dataset must give the same lock. The OpenTelemetry ingest uses
     /// the bare name and a Flight `DoPut` uses the fully-qualified one; separate locks would

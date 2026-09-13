@@ -42,7 +42,9 @@ use std::{
 /// The binding half of the accelerated-view snapshot consistency check.
 ///
 /// The load-time check in `create_accelerated_view` exists to fail fast with a message an
-/// operator can act on, but it cannot be the whole answer: the compiled plan follows
+/// operator can act on — including a `bootstrap_only` consumer that would otherwise
+/// restore an `accept_skew` archive without opting out — but it cannot be the whole
+/// answer: the compiled plan follows
 /// catalog state, statistics and federation pushdown, so a view that reads once at
 /// registration can read twice later without its SQL changing. This gate re-asks against
 /// the plan that would run now, immediately before each publish.

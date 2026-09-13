@@ -26,9 +26,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use app::AppBuilder;
+use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 use runtime::Runtime;
-use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
+use runtime::status::ComponentStatus;
+use spicepod::acceleration::{Acceleration, Mode, RefreshMode, SnapshotsConsistency};
 use spicepod::component::dataset::Dataset;
 use spicepod::component::snapshot::{BootstrapOnFailureBehavior, Snapshots};
 use spicepod::component::view::View;
@@ -125,6 +127,22 @@ fn snapshots_config(location: &std::path::Path) -> Snapshots {
 }
 
 fn accelerated_view(name: &str, sql: &str, duckdb_file: &std::path::Path) -> View {
+    accelerated_view_with(
+        name,
+        sql,
+        duckdb_file,
+        spicepod::acceleration::SnapshotBehavior::Enabled,
+        SnapshotsConsistency::default(),
+    )
+}
+
+fn accelerated_view_with(
+    name: &str,
+    sql: &str,
+    duckdb_file: &std::path::Path,
+    snapshots: spicepod::acceleration::SnapshotBehavior,
+    snapshots_consistency: SnapshotsConsistency,
+) -> View {
     let mut view = View::new(name.to_string());
     view.sql = Some(sql.to_string());
     view.acceleration = Some(Acceleration {
@@ -136,10 +154,55 @@ fn accelerated_view(name: &str, sql: &str, duckdb_file: &std::path::Path) -> Vie
             "duckdb_file".to_string(),
             duckdb_file.display().to_string(),
         )]))),
-        snapshots: spicepod::acceleration::SnapshotBehavior::Enabled,
+        snapshots,
+        snapshots_consistency,
         ..Acceleration::default()
     });
     view
+}
+
+const MULTI_READ_SQL: &str = "SELECT a.id FROM orders a JOIN orders b ON a.id = b.id";
+
+async fn assert_multi_read_view_is_refused(
+    rt: &Runtime,
+    snapshot_dir: &std::path::Path,
+    view_name: &str,
+) -> anyhow::Result<()> {
+    let registered = rt
+        .datafusion()
+        .query_builder(&format!("SELECT id FROM {view_name}"))
+        .build()
+        .run()
+        .await;
+    assert!(
+        registered.is_err(),
+        "a multi-read view with snapshots must not load"
+    );
+    assert!(
+        published_snapshots(snapshot_dir).is_empty(),
+        "a refused view must publish nothing"
+    );
+
+    let view_ref = TableReference::bare(view_name);
+    let status = rt
+        .status()
+        .get_view_statuses()
+        .get(&view_ref)
+        .cloned()
+        .unwrap_or(ComponentStatus::NotLoaded);
+    assert_ne!(
+        status,
+        ComponentStatus::Ready,
+        "a refused multi-read view must not report ready, got {status:?}"
+    );
+    if let Some(message) = status.error_message() {
+        assert!(
+            message.contains("reads its sources") || message.contains("snapshots_consistency"),
+            "the refusal must name the multi-read cause or the consistency opt-out, got {message:?}"
+        );
+    }
+
+    Ok(())
 }
 
 fn csv_dataset(csv_path: &std::path::Path) -> Dataset {
@@ -282,7 +345,7 @@ async fn multi_read_view_refuses_snapshots() -> anyhow::Result<()> {
                 .with_dataset(csv_dataset(&csv_path))
                 .with_view(accelerated_view(
                     "orders_self_join",
-                    "SELECT a.id FROM orders a JOIN orders b ON a.id = b.id",
+                    MULTI_READ_SQL,
                     &temp.path().join("multi.db"),
                 ))
                 .with_snapshots(snapshots_config(&snapshot_dir))
@@ -290,21 +353,100 @@ async fn multi_read_view_refuses_snapshots() -> anyhow::Result<()> {
             // Deliberately not waiting for readiness: the refused view never reports
             // ready, so a readiness wait would time out on the very behaviour under test.
             let rt = load_components(app).await?;
+            assert_multi_read_view_is_refused(&rt, &snapshot_dir, "orders_self_join").await?;
 
-            // The view is refused, so it never registers and never publishes.
-            let registered = rt
+            Ok(())
+        })
+        .await
+}
+
+/// `bootstrap_only` does not create snapshots, but it still restores them. A default
+/// `consistent_read` consumer must refuse a multi-read view rather than silently
+/// serving an archive an `accept_skew` writer could have published.
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn multi_read_view_refuses_bootstrap_only_snapshots() -> anyhow::Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let csv_path = temp.path().join("orders.csv");
+            std::fs::write(&csv_path, SOURCE_CSV).expect("write source csv");
+            let snapshot_dir = temp.path().join("snapshots");
+            std::fs::create_dir_all(&snapshot_dir).expect("mkdir snapshots");
+
+            let app = AppBuilder::new("view_snapshot_bootstrap_only_multi_read")
+                .with_dataset(csv_dataset(&csv_path))
+                .with_view(accelerated_view_with(
+                    "orders_self_join",
+                    MULTI_READ_SQL,
+                    &temp.path().join("bootstrap_only.db"),
+                    spicepod::acceleration::SnapshotBehavior::BootstrapOnly,
+                    SnapshotsConsistency::ConsistentRead,
+                ))
+                .with_snapshots(snapshots_config(&snapshot_dir))
+                .build();
+            let rt = load_components(app).await?;
+            assert_multi_read_view_is_refused(&rt, &snapshot_dir, "orders_self_join").await?;
+
+            Ok(())
+        })
+        .await
+}
+
+/// `accept_skew` is the explicit opt-out: a bootstrap-only multi-read view still
+/// loads, and still creates nothing.
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn multi_read_view_bootstrap_only_accept_skew_loads() -> anyhow::Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let csv_path = temp.path().join("orders.csv");
+            std::fs::write(&csv_path, SOURCE_CSV).expect("write source csv");
+            let snapshot_dir = temp.path().join("snapshots");
+            std::fs::create_dir_all(&snapshot_dir).expect("mkdir snapshots");
+
+            let app = AppBuilder::new("view_snapshot_bootstrap_only_accept_skew")
+                .with_dataset(csv_dataset(&csv_path))
+                .with_view(accelerated_view_with(
+                    "orders_self_join",
+                    MULTI_READ_SQL,
+                    &temp.path().join("accept_skew.db"),
+                    spicepod::acceleration::SnapshotBehavior::BootstrapOnly,
+                    SnapshotsConsistency::AcceptSkew,
+                ))
+                .with_snapshots(snapshots_config(&snapshot_dir))
+                .build();
+            let rt = load(app).await?;
+
+            let results = rt
                 .datafusion()
-                .query_builder("SELECT id FROM orders_self_join")
+                .query_builder("SELECT id FROM orders_self_join ORDER BY id")
                 .build()
                 .run()
-                .await;
-            assert!(
-                registered.is_err(),
-                "a multi-read view with snapshots enabled must not load"
+                .await
+                .expect("a bootstrap-only multi-read view with accept_skew must load")
+                .data
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collecting accepted-skew rows");
+            let rows: usize = results
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum();
+            assert_eq!(
+                rows, 3,
+                "the self-join of three distinct ids must return three rows"
             );
             assert!(
                 published_snapshots(&snapshot_dir).is_empty(),
-                "a refused view must publish nothing"
+                "bootstrap_only must not publish, even when accept_skew admits the view"
             );
 
             Ok(())
