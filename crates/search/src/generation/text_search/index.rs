@@ -358,7 +358,7 @@ impl Index for FullTextDatabaseIndex {
             ensure_persisted_schema_matches(
                 install_staging.path(),
                 &staged.schema(),
-                &reader.searcher().schema(),
+                reader.searcher().schema(),
             )?;
 
             // Hold the writer lock across the swap below so a concurrent write can never
@@ -598,12 +598,12 @@ impl FullTextDatabaseIndex {
         )?;
 
         let index = if let Some(path) = &directory {
-            match tantivy::Index::create_in_dir(&path, tantivy_schema.clone()) {
+            match tantivy::Index::create_in_dir(path, tantivy_schema.clone()) {
                 Ok(idx) => idx,
                 Err(TantivyError::IndexAlreadyExists) => {
-                    let persisted = tantivy::index::Index::open_in_dir(&path)
+                    let persisted = tantivy::index::Index::open_in_dir(path)
                         .context(TextSearchIndexingSnafu)?;
-                    ensure_persisted_schema_matches(&path, &persisted.schema(), &tantivy_schema)?;
+                    ensure_persisted_schema_matches(path, &persisted.schema(), &tantivy_schema)?;
                     persisted
                 }
                 Err(e) => return Err(e).context(TextSearchIndexingSnafu),
