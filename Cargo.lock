@@ -6311,6 +6311,7 @@ dependencies = [
  "itertools 0.14.0",
  "linkme",
  "object_store 0.13.2",
+ "orc-rust",
  "paste",
  "reqwest 0.13.4",
  "runtime-checkpoint-api",

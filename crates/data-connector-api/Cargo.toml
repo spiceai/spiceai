@@ -58,6 +58,7 @@ vortex-datafusion.workspace = true
 # `runtime::component::dataset::Dataset` for exactly this reason.
 [dev-dependencies]
 chrono.workspace = true
+orc-rust.workspace = true
 paste.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

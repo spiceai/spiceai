@@ -246,6 +246,8 @@ impl FileFormat for OrcFormat {
         objects: &[ObjectMeta],
     ) -> Result<SchemaRef> {
         let mut schemas = Vec::with_capacity(objects.len());
+        // The listing connector passes every matching collection object (see
+        // `ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT`), not only the newest file.
         // Sort by location so schema field order is deterministic even when
         // the object store lists files in an arbitrary order.
         let mut objects: Vec<&ObjectMeta> = objects.iter().collect();

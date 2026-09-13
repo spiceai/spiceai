@@ -79,6 +79,15 @@ use runtime_object_store::registry::default_runtime_env;
 /// Maximum number of files to scan when validating that the schema source path contains objects with the expected extension.
 const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
 
+/// Maximum matching `ORC` objects whose footers are merged when inferring a
+/// collection schema. The default listing path otherwise passes only the
+/// newest object to [`FileFormat::infer_schema`], which drops columns that
+/// appear only in older files. Scan-time NULL backfill can restore those
+/// columns only when the merged schema already lists them. Set
+/// `schema_source_path` to a smaller prefix if load-time footer reads of a
+/// very large hive table are too expensive.
+const ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT: usize = 10_000;
+
 #[derive(Clone, Debug)]
 /// Wraps a `ListingTable` to short-circuit broad object-store listings when
 /// queries include `location` predicates, and to apply format-selected Hive
@@ -1299,6 +1308,23 @@ pub trait ListingTableConnector: DataConnector {
                     SensitiveListingTableUrl::new(schema_infer_url, url),
                     schema_infer_meta,
                 )
+            } else if table_path.is_collection() && listing_extension_is_orc(extension) {
+                // Confirm matching objects exist (same errors as other formats),
+                // then infer from the collection so `OrcFormat::infer_schema`
+                // receives every matching object, not only the newest file.
+                get_last_modified(
+                    format!("{self}"),
+                    dataset,
+                    extension,
+                    table_path.clone(),
+                    &ctx,
+                    &object_store,
+                )
+                .await?;
+                (
+                    SensitiveListingTableUrl::new(table_path.clone(), url.clone()),
+                    None,
+                )
             } else {
                 // Get the last modified object for the provided ObjectStore to infer the schema.
                 // Report an error if no files matching required extension are found.
@@ -1330,7 +1356,7 @@ pub trait ListingTableConnector: DataConnector {
         );
 
         let session_state = ctx.state();
-        let mut options = ListingOptions::new(file_format)
+        let mut options = ListingOptions::new(Arc::clone(&file_format))
             .with_file_extension(datafusion_listing_file_extension(extension))
             .with_session_config_options(session_state.config());
 
@@ -1341,9 +1367,20 @@ pub trait ListingTableConnector: DataConnector {
                 }
             }));
 
-        let resolved_schema = options
-            .infer_schema(&ctx.state(), schema_infer_url.expose_sensitive_url())
-            .await
+        let infer_listing_url = schema_infer_url.expose_sensitive_url();
+        let resolved_schema =
+            if listing_extension_is_orc(extension) && infer_listing_url.is_collection() {
+                infer_orc_collection_schema(
+                    &ctx.state(),
+                    infer_listing_url,
+                    &object_store,
+                    extension,
+                    &file_format,
+                )
+                .await
+            } else {
+                options.infer_schema(&ctx.state(), infer_listing_url).await
+            }
             .map_err(|e| match e {
                 DataFusionError::ObjectStore(object_store_error) => {
                     self.handle_object_store_error(dataset, *object_store_error)
@@ -1969,6 +2006,10 @@ fn format_selected_listing_extension(default_extension: &str) -> String {
     format!("*{default_extension}")
 }
 
+fn listing_extension_is_orc(extension: &str) -> bool {
+    extension == ".orc" || format_selected_data_suffix(extension) == Some(".orc")
+}
+
 fn format_selected_data_suffix(extension: &str) -> Option<&str> {
     extension
         .strip_prefix('*')
@@ -1991,13 +2032,18 @@ fn object_file_name(location: &Path) -> &str {
         .unwrap_or(location.as_ref())
 }
 
+fn file_name_has_extension(name: &str, extension: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case(extension))
+}
+
 fn is_hive_listing_marker_name(name: &str) -> bool {
     name.is_empty()
         || name.starts_with('_')
         || name.starts_with('.')
         || name == "$folder$"
         || name.ends_with(".$folder$")
-        || name.ends_with(".crc")
+        || file_name_has_extension(name, "crc")
 }
 
 fn listing_path_is_hive_staging(location: &Path) -> bool {
@@ -2014,10 +2060,12 @@ fn listing_object_matches_format_selected(location: &Path, format_ext: &str) -> 
     }
 
     if format_ext.is_empty() {
-        return !name.contains('.') || name.ends_with(".orc") || name.ends_with(".parquet");
+        return !name.contains('.')
+            || file_name_has_extension(name, "orc")
+            || file_name_has_extension(name, "parquet");
     }
 
-    location.as_ref().ends_with(format_ext) || !name.contains('.')
+    file_name_has_extension(name, format_ext.trim_start_matches('.')) || !name.contains('.')
 }
 
 fn file_matches_extension(location: &Path, extension: &str) -> bool {
@@ -2025,6 +2073,28 @@ fn file_matches_extension(location: &Path, extension: &str) -> bool {
         return listing_object_matches_format_selected(location, format_ext);
     }
     location.as_ref().ends_with(extension)
+}
+
+/// List matching `ORC` objects and merge their footers. Used instead of
+/// [`ListingOptions::infer_schema`] on a collection so format-selected
+/// listings (`*.orc`) skip job-marker files and so a last-modified-only
+/// URL cannot hide columns that exist only in other objects.
+async fn infer_orc_collection_schema(
+    state: &dyn Session,
+    table_path: &ListingTableUrl,
+    object_store: &Arc<dyn ObjectStore>,
+    extension: &str,
+    file_format: &Arc<dyn FileFormat>,
+) -> Result<SchemaRef, DataFusionError> {
+    let files = list_matching_listing_files(
+        state,
+        table_path,
+        object_store.as_ref(),
+        extension,
+        ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT,
+    )
+    .await?;
+    file_format.infer_schema(state, object_store, &files).await
 }
 
 async fn list_matching_listing_files(
@@ -2169,7 +2239,7 @@ fn parquet_page_index_options(app: &Arc<App>) -> ParquetPageIndexOptions {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::RecordBatch;
+    use arrow::array::{Array, RecordBatch};
     use chrono::{TimeZone, Utc};
     use datafusion::sql::TableReference;
     use datafusion_table_providers::util::secrets::to_secret_map;
@@ -2241,8 +2311,14 @@ mod tests {
         fn get_object_store_url(
             &self,
             dataset: &DatasetSpec,
-            _url: Option<&str>,
+            url: Option<&str>,
         ) -> DataConnectorResult<Url> {
+            let raw = url.unwrap_or(dataset.from.as_str());
+            if let Ok(parsed) = Url::parse(raw)
+                && parsed.scheme() == "file"
+            {
+                return Ok(parsed);
+            }
             Url::parse("test")
                 .boxed()
                 .context(crate::InvalidConfigurationSnafu {
@@ -2658,6 +2734,187 @@ mod tests {
         );
     }
 
+    fn write_orc_fixture(path: &std::path::Path, batch: &RecordBatch) {
+        let mut out = Vec::new();
+        let mut writer = orc_rust::arrow_writer::ArrowWriterBuilder::new(&mut out, batch.schema())
+            .try_build()
+            .expect("construct ORC writer");
+        writer.write(batch).expect("write ORC batch");
+        writer.close().expect("close ORC writer");
+        std::fs::write(path, out).expect("write ORC fixture");
+    }
+
+    /// Regression: `create_listing_table` used the newest object as
+    /// `schema_infer_url`, so `OrcFormat::infer_schema` saw a one-file
+    /// slice and dropped columns that exist only in older files.
+    #[tokio::test]
+    async fn create_listing_table_merges_orc_collection_schemas_not_only_the_newest_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let id_only_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let id_only = RecordBatch::try_new(
+            Arc::clone(&id_only_schema),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1]))],
+        )
+        .expect("id-only batch");
+
+        let both_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("extra", DataType::Utf8, false),
+        ]));
+        let both = RecordBatch::try_new(
+            Arc::clone(&both_schema),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![2])),
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+            ],
+        )
+        .expect("id+extra batch");
+
+        let older = dir.path().join("older_with_extra.orc");
+        let newer = dir.path().join("newer_id_only.orc");
+        write_orc_fixture(&older, &both);
+        write_orc_fixture(&newer, &id_only);
+        let older_mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let newer_mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&older)
+            .expect("open older ORC")
+            .set_modified(older_mtime)
+            .expect("set older mtime");
+        std::fs::File::options()
+            .write(true)
+            .open(&newer)
+            .expect("open newer ORC")
+            .set_modified(newer_mtime)
+            .expect("set newer mtime");
+
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "orc".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+
+        let url = Url::parse(&table_url).expect("collection url");
+        let table_path = ListingTableUrl::parse(&table_url).expect("listing url");
+        let ctx = SessionContext::new();
+        ctx.runtime_env()
+            .register_object_store(&url, Arc::new(object_store::local::LocalFileSystem::new()));
+        let store = ctx
+            .runtime_env()
+            .object_store(&table_path)
+            .expect("local object store");
+        let last_modified = get_last_modified(
+            "TestConnector".to_string(),
+            &dataset,
+            ".orc",
+            table_path,
+            &ctx,
+            &store,
+        )
+        .await
+        .expect("newest matching ORC object");
+        assert!(
+            last_modified
+                .location
+                .as_ref()
+                .ends_with("newer_id_only.orc"),
+            "newest object must be the id-only file so last-modified-only infer would drop extra: {}",
+            last_modified.location
+        );
+
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("ORC listing format")
+        else {
+            panic!("expected an ORC file format");
+        };
+        assert_eq!(extension, ".orc");
+
+        let newest_only = file_format
+            .infer_schema(
+                &ctx.state(),
+                &store,
+                std::slice::from_ref(&last_modified),
+            )
+            .await
+            .expect("infer from the newest object alone");
+        assert!(
+            newest_only.field_with_name("extra").is_err(),
+            "last-modified-only infer must omit extra so this test still detects the production-path bug: {newest_only:?}"
+        );
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("create_listing_table production path");
+
+        let extra = provider
+            .schema()
+            .field_with_name("extra")
+            .expect("merged schema must include extra from the older file")
+            .clone();
+        assert!(
+            extra.is_nullable(),
+            "a column present in only some ORC files is nullable so scan can NULL-fill"
+        );
+
+        let query_ctx = SessionContext::new();
+        query_ctx
+            .register_table("merged", provider)
+            .expect("register listing table");
+        let batches = query_ctx
+            .sql("SELECT id, extra FROM merged ORDER BY id")
+            .await
+            .expect("select merged columns")
+            .collect()
+            .await
+            .expect("collect merged rows");
+
+        let mut pairs = Vec::new();
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .expect("id column");
+            let extra_col = batch.column(1);
+            for i in 0..batch.num_rows() {
+                let extra = if let Some(arr) = extra_col
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i).to_string())
+                    }
+                } else if let Some(arr) = extra_col
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringViewArray>()
+                {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i).to_string())
+                    }
+                } else {
+                    panic!(
+                        "extra decoded as {}, expected Utf8 or Utf8View",
+                        extra_col.data_type()
+                    );
+                };
+                pairs.push((ids.value(i), extra));
+            }
+        }
+        assert_eq!(
+            pairs,
+            vec![(1, None), (2, Some("x".to_string()))],
+            "production listing path must expose extra and NULL-fill the newer id-only file"
+        );
+    }
+
     /// Glue `OrcInputFormat` / `MapredParquetInputFormat` tables set
     /// `file_extension=*`, which becomes `*.orc` / `*.parquet`. Hive data
     /// objects are often extensionless (`000000_0`); job markers must not be
@@ -2875,6 +3132,8 @@ mod tests {
             ("warehouse/table/.$folder$", "*.orc", false),
             ("warehouse/table/$folder$", "*.orc", false),
             ("warehouse/table/000000_0.crc", "*.orc", false),
+            ("warehouse/table/000000_0.CRC", "*.orc", false),
+            ("warehouse/table/part-00000.ORC", "*.orc", true),
             ("warehouse/table/notes.txt", "*.orc", false),
             ("warehouse/table/part-00000.parquet", "*.orc", false),
             ("warehouse/table/_temporary/000000_0", "*.orc", false),
@@ -2896,6 +3155,15 @@ mod tests {
                 "path={path} extension={extension}"
             );
         }
+    }
+
+    #[test]
+    fn listing_extension_is_orc_matches_suffix_and_format_selected() {
+        assert!(listing_extension_is_orc(".orc"));
+        assert!(listing_extension_is_orc("*.orc"));
+        assert!(!listing_extension_is_orc(".parquet"));
+        assert!(!listing_extension_is_orc("*.parquet"));
+        assert!(!listing_extension_is_orc(".csv"));
     }
 
     #[tokio::test]
