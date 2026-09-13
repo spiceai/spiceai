@@ -739,7 +739,9 @@ pub trait ListingTableConnector: DataConnector {
             detected_extension.and_then(|ext| ext.compression),
         )?;
 
-        let (file_format, default_extension): (Option<Arc<dyn FileFormat>>, String) =
+        // Annotate before `?` so rustc unifies each arm as `Arc<dyn FileFormat>`
+        // instead of pinning the match to the first (`CsvFormat`) arm.
+        let result: DataConnectorResult<(Option<Arc<dyn FileFormat>>, String)> =
             match (file_format_param.as_deref(), inferred_file_extension) {
             (Some("csv"), _) | (None, Some("csv")) => Ok((
                 Some(self.delimiter_separated_format(
@@ -976,15 +978,16 @@ pub trait ListingTableConnector: DataConnector {
                         source: "Missing file format".into(),
                     },
                 ),
-        }?;
+        };
 
         if format_selected_listing {
+            let (file_format, default_extension) = result?;
             Ok((
                 file_format,
                 format_selected_listing_extension(&default_extension),
             ))
         } else {
-            Ok((file_format, default_extension))
+            result
         }
     }
 
