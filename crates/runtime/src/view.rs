@@ -833,10 +833,43 @@ fn push_acceleration_row_policies(
 
 /// Canonical JSON for a structured identity field.
 ///
+/// Object keys are sorted at every nesting level. `serde_json` is compiled with
+/// `preserve_order` in this crate, and `Column::metadata` is a `HashMap`, so
+/// `serde_json::to_string` would otherwise follow the map's per-process iteration
+/// order — a restart could compute a different fingerprint for the same Spicepod
+/// and refuse its own snapshot.
+///
 /// A marker is recorded rather than the field dropped: dropping it would silently widen
 /// what the identity accepts, which is the direction that restores a wrong archive.
 fn identity_value<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_string(value).unwrap_or_else(|e| format!("-- unserializable: {e}"))
+    match serde_json::to_value(value) {
+        Ok(value) => serde_json::to_string(&canonicalize_json_object_keys(value))
+            .unwrap_or_else(|e| format!("-- unserializable: {e}")),
+        Err(e) => format!("-- unserializable: {e}"),
+    }
+}
+
+fn canonicalize_json_object_keys(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> = map
+                .into_iter()
+                .map(|(key, nested)| (key, canonicalize_json_object_keys(nested)))
+                .collect();
+            entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            entries
+                .into_iter()
+                .collect::<serde_json::Map<_, _>>()
+                .into()
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(canonicalize_json_object_keys)
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// Stable hash of a definition string, recorded alongside a source's snapshots so a
@@ -995,6 +1028,103 @@ mod tests {
     use datafusion::sql::{parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
 
     use super::*;
+
+    #[test]
+    fn identity_value_sorts_json_object_keys() {
+        // This crate enables serde_json `preserve_order`, so two objects with the
+        // same keys in different insertion order encode differently unless we
+        // canonicalize. That is the `HashMap` metadata case: a 24-process
+        // harness of `serde_json::to_string` on the same four entries produced
+        // 13 encodings.
+        let z_first: serde_json::Value =
+            serde_json::from_str(r#"{"z":1,"a":{"m":2,"b":3}}"#).expect("parse z-first object");
+        let a_first: serde_json::Value =
+            serde_json::from_str(r#"{"a":{"b":3,"m":2},"z":1}"#).expect("parse a-first object");
+
+        assert_ne!(
+            serde_json::to_string(&z_first).expect("encode z-first"),
+            serde_json::to_string(&a_first).expect("encode a-first"),
+            "precondition: serde_json preserve_order must keep key insertion order"
+        );
+        assert_eq!(
+            identity_value(&z_first),
+            identity_value(&a_first),
+            "the same object must have one identity regardless of key order"
+        );
+        assert_eq!(
+            identity_value(&z_first),
+            r#"{"a":{"b":3,"m":2},"z":1}"#,
+            "object keys are sorted lexicographically at every nesting level"
+        );
+    }
+
+    #[test]
+    fn identity_value_preserves_array_order() {
+        let first: serde_json::Value =
+            serde_json::from_str(r#"[{"z":1},{"a":2}]"#).expect("parse first array");
+        let swapped: serde_json::Value =
+            serde_json::from_str(r#"[{"a":2},{"z":1}]"#).expect("parse swapped array");
+
+        assert_ne!(
+            identity_value(&first),
+            identity_value(&swapped),
+            "array order is part of the identity; only object keys are sorted"
+        );
+        assert_eq!(
+            identity_value(&first),
+            r#"[{"z":1},{"a":2}]"#,
+            "objects inside arrays have sorted keys, but the array itself is not sorted"
+        );
+    }
+
+    #[test]
+    fn column_metadata_insertion_order_does_not_change_the_identity() {
+        // Same four entries, opposite insertion order. `Column::metadata` is a
+        // `HashMap`; without canonicalization, `serde_json::to_string` follows
+        // that map's iteration order and a restart can refuse its own snapshot.
+        let entries = [
+            ("delta", serde_json::json!("4")),
+            ("alpha", serde_json::json!("1")),
+            ("gamma", serde_json::json!("3")),
+            ("beta", serde_json::json!("2")),
+        ];
+        let mut first_metadata = HashMap::new();
+        for (key, value) in &entries {
+            first_metadata.insert((*key).to_string(), value.clone());
+        }
+        let mut second_metadata = HashMap::new();
+        for (key, value) in entries.iter().rev() {
+            second_metadata.insert((*key).to_string(), value.clone());
+        }
+
+        let first = spicepod::semantic::Column::new("body").with_metadata(first_metadata);
+        let second = spicepod::semantic::Column::new("body").with_metadata(second_metadata);
+
+        let first_identity = identity_value(&[first.clone()]);
+        let second_identity = identity_value(&[second.clone()]);
+        assert_eq!(
+            first_identity, second_identity,
+            "the same column metadata must have one identity regardless of HashMap insertion order"
+        );
+        assert!(
+            first_identity
+                .contains(r#""metadata":{"alpha":"1","beta":"2","delta":"4","gamma":"3"}"#),
+            "metadata keys must be encoded in sorted order, got {first_identity}"
+        );
+
+        let fingerprint = |column: spicepod::semantic::Column| {
+            definition_fingerprint(&view_definition_identity(
+                "SELECT body FROM docs",
+                &[column],
+                &HashMap::new(),
+            ))
+        };
+        assert_eq!(
+            fingerprint(first),
+            fingerprint(second),
+            "a view fingerprint must not move when only metadata insertion order changes"
+        );
+    }
 
     mod read_shape {
         use super::*;
@@ -1548,6 +1678,29 @@ mod tests {
             // A different set of columns is a different key.
             assert_ne!(canonical_columns("(a, b)"), canonical_columns("(a, c)"));
             assert_ne!(canonical_columns("a"), canonical_columns("(a, b)"));
+        }
+
+        #[test]
+        fn swapping_column_metadata_moves_the_fingerprint() {
+            let view = TableReference::bare("docs_view");
+            let closure_for = |pairs: &[(&str, i64)]| {
+                let metadata = pairs
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), serde_json::json!(*value)))
+                    .collect();
+                view_definition_closure(
+                    &view,
+                    "SELECT body FROM docs",
+                    &[spicepod::semantic::Column::new("body").with_metadata(metadata)],
+                    &HashMap::new(),
+                    &app_with(&[], &[("docs", "s3://docs")]),
+                )
+            };
+            assert_ne!(
+                definition_fingerprint(&closure_for(&[("alpha", 1), ("beta", 2)])),
+                definition_fingerprint(&closure_for(&[("alpha", 1), ("beta", 3)])),
+                "column metadata that can change stored values is part of the definition"
+            );
         }
     }
 
