@@ -428,6 +428,12 @@ impl RefreshTaskRunner {
     /// definition's result while it still contains rows that definition never produced.
     /// Incremental runs therefore carry the provenance they inherited forward at best, and
     /// only a full replace can restore it.
+    ///
+    /// A runtime `refresh_sql` PATCH is the same class of mismatch as a request-scoped
+    /// override: it changes which rows land without updating the Spicepod fingerprint
+    /// stamped at snapshot-manager construction. A later full refresh with no override
+    /// must not re-assert provenance until the live SQL matches that configured
+    /// definition again.
     async fn create_refresh_from_overrides(
         defaults: Arc<RwLock<Refresh>>,
         overrides_opt: Option<RefreshOverrides>,
@@ -435,6 +441,7 @@ impl RefreshTaskRunner {
         let r = defaults.read().await.clone();
         let inherited = r.materialization_is_configured();
         r.set_materialization_is_configured(false);
+        let live_matches_configured = r.live_refresh_sql_matches_configured();
         let (mut request, overridden) = match overrides_opt {
             Some(overrides) => {
                 let overridden = overrides.changes_materialization();
@@ -444,7 +451,8 @@ impl RefreshTaskRunner {
         };
         // `request.mode` is the mode this run will actually use, overrides applied.
         let replaces_everything = matches!(request.mode, RefreshMode::Full);
-        let configured = !overridden && (replaces_everything || inherited);
+        let configured =
+            !overridden && live_matches_configured && (replaces_everything || inherited);
         // Re-establishing provenance rather than carrying it forward: the mark is retracted
         // and only a real full replacement earns it back. `RefreshTask::run_once` can return
         // success from the unchanged-source skip without writing anything, which would stamp
@@ -480,5 +488,106 @@ impl RefreshTaskRunner {
 impl Drop for RefreshTaskRunner {
     fn drop(&mut self) {
         self.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RefreshTaskRunner;
+    use crate::accelerated::refresh::Refresh;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::sql::TableReference;
+    use runtime_component::dataset::acceleration::RefreshMode;
+    use runtime_datafusion::refresh_sql::{RefreshSQL, parse_refresh_sql};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn orders_refresh_sql(sql: &str) -> RefreshSQL {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        parse_refresh_sql(TableReference::bare("orders"), sql, schema)
+            .expect("test refresh SQL should parse")
+            .0
+    }
+
+    /// `PATCH /v1/datasets/{name}/acceleration` replaces live `Refresh.sql` and
+    /// then a later full refresh arrives with no request override — the
+    /// transition Copilot traced. The runner must not mark that run configured:
+    /// the snapshot fingerprint is still the Spicepod definition.
+    #[tokio::test]
+    async fn patched_refresh_sql_cannot_publish_under_the_startup_fingerprint() {
+        let configured_sql = "SELECT * FROM orders WHERE region = 'us'";
+        let live_sql_after_patch = "SELECT * FROM orders WHERE region = 'eu'";
+
+        let refresh =
+            Refresh::new(RefreshMode::Full).refresh_sql(orders_refresh_sql(configured_sql));
+        refresh.set_materialization_is_configured(true);
+        let defaults = Arc::new(RwLock::new(refresh));
+
+        let (_request, before_patch) =
+            RefreshTaskRunner::create_refresh_from_overrides(Arc::clone(&defaults), None).await;
+        assert!(
+            before_patch,
+            "a full refresh of the Spicepod SQL must still be publishable"
+        );
+        defaults
+            .write()
+            .await
+            .set_materialization_is_configured(true);
+
+        {
+            let mut live = defaults.write().await;
+            live.apply_runtime_refresh_sql(orders_refresh_sql(live_sql_after_patch));
+            assert!(
+                !live.live_refresh_sql_matches_configured(),
+                "live_sql_after_patch must diverge from the Spicepod definition"
+            );
+        }
+
+        let (_request, configured) =
+            RefreshTaskRunner::create_refresh_from_overrides(Arc::clone(&defaults), None).await;
+
+        assert!(
+            !configured,
+            "a full refresh after PATCH /acceleration must not publish under the startup fingerprint"
+        );
+    }
+
+    #[tokio::test]
+    async fn restoring_configured_refresh_sql_can_reestablish_provenance() {
+        let configured_sql = "SELECT * FROM orders WHERE region = 'us'";
+        let refresh =
+            Refresh::new(RefreshMode::Full).refresh_sql(orders_refresh_sql(configured_sql));
+        let defaults = Arc::new(RwLock::new(refresh));
+
+        defaults
+            .write()
+            .await
+            .apply_runtime_refresh_sql(orders_refresh_sql(
+                "SELECT * FROM orders WHERE region = 'eu'",
+            ));
+        let (_request, after_patch) =
+            RefreshTaskRunner::create_refresh_from_overrides(Arc::clone(&defaults), None).await;
+        assert!(
+            !after_patch,
+            "precondition: the patched SQL must not be treated as configured"
+        );
+
+        defaults
+            .write()
+            .await
+            .apply_runtime_refresh_sql(orders_refresh_sql(configured_sql));
+        assert!(
+            defaults.read().await.live_refresh_sql_matches_configured(),
+            "restored live SQL must match the Spicepod definition"
+        );
+        let (_request, after_restore) =
+            RefreshTaskRunner::create_refresh_from_overrides(Arc::clone(&defaults), None).await;
+        assert!(
+            after_restore,
+            "PATCH back to the Spicepod SQL must let a later full refresh publish again"
+        );
     }
 }

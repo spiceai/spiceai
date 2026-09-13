@@ -1557,7 +1557,7 @@ impl AcceleratedTable {
                 refresh_sql.display_sql()
             );
         }
-        refresh.sql = Some(refresh_sql);
+        refresh.apply_runtime_refresh_sql(refresh_sql);
 
         Ok(())
     }

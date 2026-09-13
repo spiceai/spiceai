@@ -4994,16 +4994,14 @@ impl DataFusion {
         .await?
         {
             ViewSnapshotConsistencyDecision::AcceptSkew => Ok(None),
-            ViewSnapshotConsistencyDecision::ConsistentSingleRead => {
-                Ok(Some(Arc::new(crate::view::ViewSnapshotPublishGate::new(
+            ViewSnapshotConsistencyDecision::ConsistentSingleRead => Ok(Some(Arc::new(
+                crate::view::ViewSnapshotPublishGate::new(
                     table.clone(),
                     Arc::clone(&view.sql),
                     &self.ctx,
-                ))
-                    as Arc<
-                        dyn runtime_acceleration::snapshot::SnapshotPublishGate,
-                    >))
-            }
+                ),
+            )
+                as Arc<dyn runtime_acceleration::snapshot::SnapshotPublishGate>)),
         }
     }
 
@@ -6276,8 +6274,8 @@ mod tests {
 
     mod view_snapshot_consistency {
         use super::super::{
-            view_snapshot_accept_skew_warning, view_snapshot_consistency_decision,
             AcceleratedViewSnapshotsNotSingleReadSnafu, ViewSnapshotConsistencyDecision,
+            view_snapshot_accept_skew_warning, view_snapshot_consistency_decision,
         };
         use super::*;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};

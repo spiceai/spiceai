@@ -273,6 +273,12 @@ impl AccelerationSource for Dataset {
         // this stamp existed, and refusing them would strand every snapshot taken before
         // the upgrade. Mismatches are still refused, so everything published from here on
         // is protected.
+        //
+        // This is the Spicepod definition the dataset was loaded from.
+        // `PATCH /v1/datasets/{name}/acceleration` can replace the live
+        // `Refresh.sql` without updating it; publication is then declined until
+        // a refresh runs with SQL that still matches this definition (see
+        // `Refresh::live_refresh_sql_matches_configured`).
         let identity = crate::view::dataset_definition_identity_from_spec(&self.spec);
         Some(
             runtime_acceleration::acceleration_source::SourceDefinition {

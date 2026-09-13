@@ -87,6 +87,15 @@ pub struct Refresh {
     pub(crate) check_interval: Option<Duration>,
     pub(crate) max_jitter: Option<Duration>,
     pub sql: Option<RefreshSQL>,
+    /// The refresh SQL the snapshot fingerprint describes — `to_sql()` of the
+    /// Spicepod `acceleration.refresh_sql` this `Refresh` was first built from.
+    ///
+    /// `PATCH /v1/datasets/{name}/acceleration` replaces [`Self::sql`] without
+    /// updating that fingerprint. A later plain refresh has no request override,
+    /// so without this the runner would mark the patched rows configured and
+    /// publish them under the startup identity. After restart the Spicepod
+    /// produces that same fingerprint and bootstrap would accept the mismatch.
+    configured_sql: Option<String>,
     /// Whether this run must actually re-materialize, rather than take the
     /// "source unchanged since the last fetch" skip.
     ///
@@ -239,8 +248,35 @@ impl Refresh {
 
     #[must_use]
     pub fn refresh_sql(mut self, sql: RefreshSQL) -> Self {
+        // First assignment is the Spicepod definition the snapshot fingerprint
+        // describes. Later [`Self::apply_runtime_refresh_sql`] (PATCH
+        // `/v1/datasets/{name}/acceleration`) replaces `sql` without touching
+        // this, so a subsequent plain refresh can tell it is no longer
+        // publishing the configured definition.
+        if self.configured_sql.is_none() {
+            self.configured_sql = Some(sql.to_sql());
+        }
         self.sql = Some(sql);
         self
+    }
+
+    /// Replace the live refresh SQL, as `PATCH /v1/datasets/{name}/acceleration` does.
+    ///
+    /// Retracts snapshot provenance: the Spicepod fingerprint this `Refresh` was
+    /// built from does not describe the new SQL, and the rows currently in the
+    /// accelerator were produced by the previous one. A later plain refresh
+    /// re-establishes provenance only if the live SQL again matches
+    /// [`Self::live_refresh_sql_matches_configured`].
+    pub fn apply_runtime_refresh_sql(&mut self, sql: RefreshSQL) {
+        self.sql = Some(sql);
+        self.set_materialization_is_configured(false);
+    }
+
+    /// Whether live [`Self::sql`] is still the Spicepod definition the snapshot
+    /// fingerprint describes.
+    #[must_use]
+    pub fn live_refresh_sql_matches_configured(&self) -> bool {
+        self.sql.as_ref().map(RefreshSQL::to_sql) == self.configured_sql
     }
 
     /// Get the display SQL string for logging/status purposes.
@@ -586,6 +622,7 @@ impl Default for Refresh {
             check_interval: None,
             max_jitter: None,
             sql: None,
+            configured_sql: None,
             must_materialize: false,
             override_sql_raw: None,
             mode: RefreshMode::Full,
