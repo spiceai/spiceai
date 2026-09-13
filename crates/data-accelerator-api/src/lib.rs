@@ -857,7 +857,7 @@ pub trait DataAccelerator: Send + Sync {
     /// Whether a `refresh_mode: caching` dataset on this engine should be wrapped so it can
     /// reopen itself after a fatal error (spiceai/spiceai#13513).
     ///
-    /// Only engines with a recoverable fatal state should return `true` — today only DuckDB,
+    /// Only engines with a recoverable fatal state should return `true` — today only `DuckDB`,
     /// whose out-of-memory rollback can invalidate the database. Returning `false` leaves the
     /// caching accelerator unwrapped and unchanged, which is correct for engines that have no
     /// such failure mode: wrapping them would add an inert indirection and needlessly expose
@@ -875,7 +875,7 @@ pub trait DataAccelerator: Send + Sync {
     /// callers use it:
     ///   - `refresh_mode: snapshot`, after a newer snapshot file has replaced
     ///     the primary path, to pick up the new contents; and
-    ///   - fatal-error recovery (e.g. a DuckDB instance that invalidated
+    ///   - fatal-error recovery (e.g. a `DuckDB` instance that invalidated
     ///     itself on an out-of-memory rollback), where the file is unchanged
     ///     and the goal is simply to reopen it into a healthy engine instance.
     ///
