@@ -55,7 +55,7 @@ pub(crate) fn orc_to_datafusion_error(err: orc_rust::error::OrcError) -> DataFus
 }
 
 /// Schema and stats footer reads use a `Version` pin so a listed generation
-/// (or its ETag on an unversioned bucket) cannot be mixed with a replacement.
+/// (or its `ETag` on an unversioned bucket) cannot be mixed with a replacement.
 const SCHEMA_AND_STATS_VERSIONING: Option<ObjectVersionType> = Some(ObjectVersionType::Version);
 
 async fn fetch_schema(
@@ -136,7 +136,7 @@ fn nested_field_sources<'a>(
     sources
         .iter()
         .copied()
-        .filter_map(|source| source.map(|field| child(field)))
+        .filter_map(|source| source.map(&child))
         .collect()
 }
 
@@ -738,7 +738,7 @@ mod tests {
     /// that only has `payload.id` must still scan under a merged type that also
     /// has `payload.extra`, with a typed NULL for the missing child.
     ///
-    /// Fixtures are written by PyArrow, not `orc-rust` — the encoder used by
+    /// Fixtures are written by `PyArrow`, not `orc-rust` — the encoder used by
     /// the other listing tests cannot emit structs.
     #[tokio::test]
     async fn listing_scan_backfills_nested_struct_fields_missing_from_one_file() {
@@ -778,11 +778,12 @@ mod tests {
             .expect("payload")
             .data_type()
         {
-            DataType::Struct(children) => children
-                .iter()
-                .find(|field| field.name() == "extra")
-                .expect("merged schema includes extra")
-                .clone(),
+            DataType::Struct(children) => Arc::clone(
+                children
+                    .iter()
+                    .find(|field| field.name() == "extra")
+                    .expect("merged schema includes extra"),
+            ),
             other => panic!("payload should be a struct, got {other}"),
         };
         assert!(
@@ -837,7 +838,7 @@ mod tests {
     /// listing that has a map in only some files must keep `entries`
     /// required and NULL-fill the map itself on files that omit it.
     ///
-    /// Fixtures are written by PyArrow, not `orc-rust` — the encoder used by
+    /// Fixtures are written by `PyArrow`, not `orc-rust` — the encoder used by
     /// the other listing tests cannot emit maps.
     #[tokio::test]
     async fn listing_scan_backfills_maps_missing_from_one_file() {
@@ -1016,4 +1017,3 @@ mod tests {
         assert_eq!(stats.num_rows, Precision::Exact(0));
     }
 }
-

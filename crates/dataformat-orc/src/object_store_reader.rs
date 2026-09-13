@@ -28,7 +28,7 @@ use orc_rust::reader::AsyncChunkReader;
 /// `(if_match, version)` for a `GetOptions` pin.
 ///
 /// Mirrors `ParquetObjectReader`: a `Version` pin with no version id uses the
-/// listed ETag. Unversioned buckets never carry a version id; without that
+/// listed `ETag`. Unversioned buckets never carry a version id; without that
 /// fallback those reads are unpinned and a replacement mid-scan is decoded as
 /// a mixture of footer and stripes.
 fn pin_for_object(
@@ -49,7 +49,7 @@ fn pin_for_object(
 /// without pulling the whole file into memory.
 ///
 /// When [`ObjectVersionType`] is set, every fetch is a bounded `get_opts` that
-/// names the listed version, or sends `If-Match` when only an ETag is available.
+/// names the listed version, or sends `If-Match` when only an `ETag` is available.
 /// Bounded ranges are required: Azure Blob Storage does not serve suffix ranges.
 pub(crate) struct ObjectStoreReader {
     store: Arc<dyn ObjectStore>,
@@ -93,7 +93,7 @@ impl AsyncChunkReader for ObjectStoreReader {
             };
             self.store
                 .get_opts(&self.file.location, opts)
-                .and_then(|resp| resp.bytes())
+                .and_then(object_store::GetResult::bytes)
                 .map_err(std::io::Error::other)
                 .boxed()
         } else {
