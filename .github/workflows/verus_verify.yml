@@ -22,6 +22,9 @@ name: Verus Verification
 #
 # One job, one required context (`Verify Verus proofs` in REQUIRED_CHECKS).
 # A second job per crate would be a second required check; do not add one.
+# `Verify hash-index proofs` at the end of this file is not a second check: it
+# repeats this job's verdict under the name the live `trunk` ruleset requires
+# until `scripts/signoff install --yes` applies REQUIRED_CHECKS.
 # The job carries NO `paths` filter, deliberately: a required context has to
 # be emitted by every pull request — a workflow that never triggers reports
 # nothing at all, which blocks the PR rather than passing it. So the job
@@ -268,3 +271,29 @@ jobs:
             grep -qE 'verification results:: [1-9][0-9]* verified, 0 errors' \
               "/tmp/verus-${crate_name}.log"
           done
+
+  # The live `trunk` ruleset requires this context rather than
+  # `Verify Verus proofs` until `scripts/signoff install --yes` applies
+  # REQUIRED_CHECKS. A required context that no job reports blocks every pull
+  # request, so this job repeats the `verus-verify` verdict under that name and
+  # the ruleset can switch without stranding pull requests on either side.
+  # Delete it once the ruleset requires `Verify Verus proofs`.
+  verus-verify-ruleset-alias:
+    name: Verify hash-index proofs
+    needs: verus-verify
+    # `always()`, not the default: when `verus-verify` fails or is cancelled a
+    # dependent job is skipped, and a skipped job satisfies a required check.
+    # This one has to run and fail instead.
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Repeat the Verify Verus proofs verdict
+        env:
+          VERIFY_RESULT: ${{ needs.verus-verify.result }}
+        run: |
+          set -euo pipefail
+          if [ "$VERIFY_RESULT" != 'success' ]; then
+            echo "::error::Verify Verus proofs finished '${VERIFY_RESULT}'."
+            exit 1
+          fi
