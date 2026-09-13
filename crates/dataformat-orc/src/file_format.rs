@@ -497,6 +497,17 @@ mod tests {
             !entries.is_nullable(),
             "Arrow MapArray::try_new rejects a nullable entries field; an absent parent map must not mark entries nullable"
         );
+        let DataType::Struct(entry_fields) = entries.data_type() else {
+            panic!("map entries should be a struct");
+        };
+        let key = entry_fields
+            .iter()
+            .find(|field| field.name() == "key")
+            .expect("map key");
+        assert!(
+            !key.is_nullable(),
+            "Arrow requires map keys to stay non-nullable when the parent map is absent from some files"
+        );
     }
 
     #[tokio::test]
@@ -884,6 +895,20 @@ mod tests {
         assert!(
             !entries.is_nullable(),
             "merged map entries must stay required so MapArray::try_new accepts the scan"
+        );
+        let DataType::Struct(entry_fields) = entries.data_type() else {
+            panic!(
+                "map entries should be a struct, got {}",
+                entries.data_type()
+            );
+        };
+        let key = entry_fields
+            .first()
+            .expect("map entries struct has a key field");
+        assert!(
+            !key.is_nullable(),
+            "merged map keys must stay required so MapArray::try_new accepts the scan (field '{}')",
+            key.name()
         );
 
         let config = ListingTableConfig::new(table_url)
