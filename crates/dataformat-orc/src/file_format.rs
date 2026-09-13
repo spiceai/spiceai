@@ -119,11 +119,11 @@ fn field_named<'a>(fields: &'a arrow::datatypes::Fields, name: &str) -> Option<&
 
 fn nested_field_sources<'a>(
     sources: &[Option<&'a Field>],
-    child: impl Fn(&DataType) -> Option<&'a Field>,
+    child: impl Fn(&'a Field) -> Option<&'a Field>,
 ) -> Vec<Option<&'a Field>> {
     sources
         .iter()
-        .map(|source| source.and_then(|field| child(field.data_type())))
+        .map(|source| source.and_then(|field| child(field)))
         .collect()
 }
 
@@ -147,7 +147,7 @@ fn mark_partial_data_type_nullable(merged: &DataType, sources: &[Option<&Field>]
                 .iter()
                 .map(|child| {
                     let child_sources =
-                        nested_field_sources(sources, |data_type| match data_type {
+                        nested_field_sources(sources, |field| match field.data_type() {
                             DataType::Struct(fields) => field_named(fields, child.name()),
                             _ => None,
                         });
@@ -158,23 +158,23 @@ fn mark_partial_data_type_nullable(merged: &DataType, sources: &[Option<&Field>]
         }
         DataType::List(item) => DataType::List(Arc::new(mark_partial_fields_nullable(
             item,
-            &nested_field_sources(sources, |data_type| match data_type {
-                DataType::List(field) => Some(field.as_ref()),
+            &nested_field_sources(sources, |field| match field.data_type() {
+                DataType::List(item) => Some(item.as_ref()),
                 _ => None,
             }),
         ))),
         DataType::LargeList(item) => DataType::LargeList(Arc::new(mark_partial_fields_nullable(
             item,
-            &nested_field_sources(sources, |data_type| match data_type {
-                DataType::LargeList(field) => Some(field.as_ref()),
+            &nested_field_sources(sources, |field| match field.data_type() {
+                DataType::LargeList(item) => Some(item.as_ref()),
                 _ => None,
             }),
         ))),
         DataType::FixedSizeList(item, size) => DataType::FixedSizeList(
             Arc::new(mark_partial_fields_nullable(
                 item,
-                &nested_field_sources(sources, |data_type| match data_type {
-                    DataType::FixedSizeList(field, _) => Some(field.as_ref()),
+                &nested_field_sources(sources, |field| match field.data_type() {
+                    DataType::FixedSizeList(item, _) => Some(item.as_ref()),
                     _ => None,
                 }),
             )),
@@ -183,8 +183,8 @@ fn mark_partial_data_type_nullable(merged: &DataType, sources: &[Option<&Field>]
         DataType::Map(entries, sorted) => DataType::Map(
             Arc::new(mark_partial_fields_nullable(
                 entries,
-                &nested_field_sources(sources, |data_type| match data_type {
-                    DataType::Map(field, _) => Some(field.as_ref()),
+                &nested_field_sources(sources, |field| match field.data_type() {
+                    DataType::Map(entries, _) => Some(entries.as_ref()),
                     _ => None,
                 }),
             )),
