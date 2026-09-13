@@ -335,7 +335,7 @@ pub fn create_cache_write_channel() -> (CacheWriteSender, CacheWriteReceiver) {
 const CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY: u32 = 3;
 
 /// Everything the cache-write task needs to reopen a caching accelerator that has entered a
-/// fatal, self-invalidating state — e.g. a file-mode DuckDB instance that reached
+/// fatal, self-invalidating state — e.g. a file-mode `DuckDB` instance that reached
 /// `duckdb_memory_limit`, failed a transaction, then failed the rollback and invalidated the
 /// database (spiceai/spiceai#13513).
 ///
@@ -344,7 +344,7 @@ const CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY: u32 = 3;
 /// provider *is* `swappable`, both reads and the cache-write path follow the swap with no
 /// further wiring: the dataset resumes serving the rows already on disk instead of failing every
 /// query until the process restarts. Only engines that declare
-/// [`DataAccelerator::supports_caching_recovery`] (today just DuckDB) get a `CachingRecovery`.
+/// [`DataAccelerator::supports_caching_recovery`] (today just `DuckDB`) get a `CachingRecovery`.
 #[derive(Clone)]
 pub struct CachingRecovery {
     /// The live provider. Recovery installs a placeholder here to release the broken provider's
@@ -418,7 +418,7 @@ impl CachingRecovery {
             .rebuild_provider(
                 self.source.as_ref(),
                 placeholder,
-                self.provider_factory.clone(),
+                Arc::clone(&self.provider_factory),
             )
             .await
             .context(RebuildFailedSnafu)?;
@@ -434,7 +434,7 @@ impl CachingRecovery {
 /// state a provider rebuild can recover from (spiceai/spiceai#13513).
 ///
 /// The markers are engine-specific, so this matches on the engine rather than the error text
-/// alone. DuckDB invalidates its whole database when an out-of-memory rollback fails — the
+/// alone. `DuckDB` invalidates its whole database when an out-of-memory rollback fails — the
 /// commit reports `Cannot continue operation` and every later query reports `database has been
 /// invalidated` until the instance is reopened. It is deliberately narrow: an ordinary
 /// out-of-memory error that rolled back cleanly leaves the database usable and must not match.
