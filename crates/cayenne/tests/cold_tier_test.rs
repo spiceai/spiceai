@@ -31,7 +31,7 @@ use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
 use cayenne::{
     CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
-    SlotAdvancer,
+    ScanViewReuse, SlotAdvancer,
 };
 use datafusion::datasource::TableProvider;
 use datafusion::execution::SendableRecordBatchStream;
@@ -659,13 +659,13 @@ async fn test_cold_tier_concurrent_scan_during_promotion_impl(
 
 test_with_backends!(test_cold_tier_stale_tolerant_scan_during_promotion_impl);
 
-/// The double-count seam without any concurrency: a read-only CDC replica scans
-/// at a non-zero freshness tolerance (`with_default_scan_freshness`), so a scan
-/// may be served a `ScanView` captured BEFORE a promotion. The cold file set has
-/// to come from that same captured instant — resolving it live pairs the cached
-/// pre-promotion warm snapshot with the post-promotion cold manifest and counts
-/// every promoted row twice. Single-threaded and deterministic: the promotion
-/// runs to completion between the two queries.
+/// The double-count seam without any concurrency: a `changes` table scans at a
+/// timed reuse lag (`ScanViewReuse::WithinLag`), so a scan may be served a
+/// `ScanView` captured BEFORE a promotion. The cold file set has to come from
+/// that same captured instant — resolving it live pairs the cached pre-promotion
+/// warm snapshot with the post-promotion cold manifest and counts every promoted
+/// row twice. Single-threaded and deterministic: the promotion runs to completion
+/// between the two queries.
 async fn test_cold_tier_stale_tolerant_scan_during_promotion_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
@@ -683,11 +683,11 @@ async fn test_cold_tier_stale_tolerant_scan_during_promotion_impl(
     // A lag far longer than the test runs, so the post-promotion query is
     // definitely served the cached pre-promotion view (the state under test)
     // rather than rebuilding — no timing dependence in either direction. It is a
-    // test device, not a supported setting: the runtime derives ~1s for a read-only
-    // CDC replica, comfortably inside the cold-tier GC's orphan grace.
+    // test device, not a supported setting: the runtime derives ~1s for
+    // `refresh_mode: changes`, comfortably inside the cold-tier GC's orphan grace.
     let table = Arc::new(
         CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .with_default_scan_freshness(std::time::Duration::from_hours(1))
+            .with_scan_view_reuse(ScanViewReuse::WithinLag(std::time::Duration::from_hours(1)))
             .create(options)
             .await?,
     );

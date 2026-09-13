@@ -23,12 +23,12 @@ limitations under the License.
 //! Ordinary CDC churn (append / row-delete / upsert / checkpoint / compaction) does
 //! NOT touch this, and neither do the FENCE-SERIALIZED snapshot events (truncate /
 //! full-table delete / `INSERT OVERWRITE` / reopen): the listing fence already
-//! serializes their capture, so they advance only the additive `scan_input_version`
-//! and are served bounded-stale. Only an off-fence discontinuity that would make a
-//! previously-computed scan view semantically WRONG (not merely stale) advances this.
-//! This lets the demand-driven scan-view cache serve bounded-stale views freely for
-//! everything else while GUARANTEEING that a scan capture straddling a schema-evolve
-//! is discarded and retried rather than built into a pre-evolution bundle.
+//! serializes their capture, so they advance only the additive `scan_input_version`.
+//! Only an off-fence discontinuity that would make a previously-computed scan view
+//! semantically WRONG (not merely stale) advances this. A `WithinLag` serve may
+//! reuse a cached view across ordinary writes, but a capture that straddles a
+//! schema-evolve is discarded and retried rather than built into a pre-evolution
+//! bundle.
 //!
 //! Protocol (odd = mutation in flight, even = stable), a versioned seqlock:
 //! - Forced-event writer: [`StructuralVersion::begin_mutation`] bumps the counter
@@ -42,8 +42,8 @@ limitations under the License.
 //!   the counter is still `v0` afterwards — so a capture that raced a forced event
 //!   is DISCARDED and retried rather than built into a torn or pre-event view.
 //! - Key generation: [`StructuralVersion::current`] is folded into the demand cache's
-//!   `ScanViewKey`, so a live schema-evolution mints a fresh identity (a read-current
-//!   fast-path serve is gated on it); there is no wait/republish gate.
+//!   `ScanViewKey`, so a live schema-evolution mints a fresh identity (both reuse
+//!   fast paths require the generation to match); there is no wait/republish gate.
 //!
 //! The primitive lives here — not smeared across the mutation call sites — with
 //! its own loom model, so the concurrency proof is local and audited once. See
@@ -70,9 +70,8 @@ impl StructuralVersion {
         }
     }
 
-    /// The current structural generation. The demand cache reads this at capture,
-    /// folds it into the `ScanViewKey`, and (on the read-current fast path) compares
-    /// it so a stale-tolerant serve is never a pre-evolution bundle.
+    /// The current structural generation. Folded into the `ScanViewKey`, and
+    /// compared on both reuse fast paths so a serve is never a pre-evolution bundle.
     ///
     /// May observe an ODD (in-flight) value; the demand capture only keys on an even,
     /// validated generation (`read_validated_async` retries an odd/torn read), so an
