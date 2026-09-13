@@ -14,18 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A seqlock-style version gate for FORCED structural table events whose mutation
-//! runs OFF the listing fence and could otherwise tear a straddling scan-view
-//! capture. Today the sole wired writer is **live schema-evolution** (its all-shards
-//! mem-tier flush runs off-fence — see `begin_mutation` at the widen site); the
-//! primitive is deliberately general so other off-fence discontinuities can adopt it.
+//! A seqlock-style version gate for forced events that invalidate cached scan
+//! views. Live schema evolution brackets its off-fence all-shards mem-tier flush
+//! so a straddling capture is retried. File-based retention advances the generation
+//! under the listing write fence after unlinking files: even a lag-tolerant scan
+//! must discard a view whose files can no longer be opened.
 //!
-//! Ordinary CDC churn (append / row-delete / upsert / checkpoint / compaction) does
+//! Ordinary CDC churn (append / logical row-delete / upsert / checkpoint / compaction) does
 //! NOT touch this, and neither do the FENCE-SERIALIZED snapshot events (truncate /
 //! full-table delete / `INSERT OVERWRITE` / reopen): the listing fence already
 //! serializes their capture, so they advance only the additive `scan_input_version`.
-//! Only an off-fence discontinuity that would make a previously-computed scan view
-//! semantically WRONG (not merely stale) advances this. A `WithinLag` serve may
+//! A discontinuity that makes a cached view unusable or semantically wrong,
+//! rather than merely stale, advances this. A `WithinLag` serve may
 //! reuse a cached view across ordinary writes, but a capture that straddles a
 //! schema-evolve is discarded and retried rather than built into a pre-evolution
 //! bundle.

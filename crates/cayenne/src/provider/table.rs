@@ -747,6 +747,16 @@ struct SnapshotScanListingRequest<'a> {
     snapshot_id: &'a str,
     limit: Option<usize>,
     scan_schema: SchemaRef,
+    captured_files: Option<&'a CapturedSnapshotFiles>,
+}
+
+/// The unpruned warm file set captured with a scan's inline and deletion views.
+/// Listing generations belong to this capture, never to a later live directory.
+#[derive(Clone)]
+struct CapturedSnapshotFiles {
+    dir_generation: u64,
+    listing_epoch: u64,
+    files: Arc<Vec<PartitionedFile>>,
 }
 
 /// The live state one sweep reads, owned so it can cross into `spawn_blocking`.
@@ -1216,9 +1226,13 @@ struct RawScanInput {
     /// Inline-memtable view captured under `scan_state_lock.read()` via the bounded
     /// (`MAX_SCAN_CAPTURE_ATTEMPTS`) retry that rebuilds a stale cache and retries.
     inlined_view: Arc<Vec<InlinedViewEntry>>,
-    /// Current snapshot id captured under the read fence — the file set the scan
-    /// reads. Pinned against GC by [`Self::scan_guard`].
+    /// Current snapshot id captured under the read fence and pinned against GC
+    /// by [`Self::scan_guard`]. Its directory can still receive in-place appends.
     current_snapshot_id: String,
+    /// Warm files captured under the same fence as the inline and deletion views.
+    /// A checkpoint may add files to the same directory after capture; those files
+    /// must not be unioned with this view's pre-checkpoint inline rows.
+    warm_files: CapturedSnapshotFiles,
     /// Cold-tier manifest belonging to [`Self::current_snapshot_id`], resolved under
     /// the SAME held read fence (see
     /// [`CayenneTableProvider::cold_manifest_under_held_fence`]). `None` when the
@@ -1268,6 +1282,8 @@ impl RawScanInput {
     fn key(&self, structural_version: u64) -> ScanViewKey {
         ScanViewKey {
             snapshot_id: self.current_snapshot_id.clone(),
+            dir_generation: self.warm_files.dir_generation,
+            listing_epoch: self.warm_files.listing_epoch,
             structural_version,
             structural_epoch: self.structural_epoch,
             maintained_aggregate_epoch: self.maintained_aggregate_epoch,
@@ -1329,6 +1345,8 @@ struct ColdTierScan<'a> {
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct ScanViewKey {
     snapshot_id: String,
+    dir_generation: u64,
+    listing_epoch: u64,
     structural_version: u64,
     structural_epoch: u64,
     maintained_aggregate_epoch: Option<u64>,
@@ -1520,6 +1538,9 @@ struct CachedSnapshotListing {
     dir_generation: u64,
     listing_epoch: u64,
     files: Arc<Vec<PartitionedFile>>,
+    /// Captured file set these statistics enrich, when built for a scan view.
+    /// A query may reuse the enrichment only for that same immutable file set.
+    source_files: Option<Arc<Vec<PartitionedFile>>>,
 }
 
 impl ScanViewCache {
@@ -1872,6 +1893,10 @@ pub struct CayenneTableProvider {
     /// capture now retries when the counter moved. Consumed on first fire.
     #[cfg(test)]
     test_post_scan_input_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam after selecting a scan view, before building its file plan.
+    /// Consumed on first fire, outside the listing fence.
+    #[cfg(test)]
+    test_post_scan_view_selection_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only seam fired after a snapshot-directory LIST is collected and
     /// before it is stored in [`Self::cached_snapshot_listing`], so a test can
     /// add files and refresh listing in the window an in-flight LIST would
@@ -8211,6 +8236,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_scan_input_capture_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_post_scan_view_selection_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_post_snapshot_list_hook: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
@@ -10206,6 +10233,10 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_scan_input_capture_hook: Arc::clone(&self.test_post_scan_input_capture_hook),
             #[cfg(test)]
+            test_post_scan_view_selection_hook: Arc::clone(
+                &self.test_post_scan_view_selection_hook,
+            ),
+            #[cfg(test)]
             test_post_snapshot_list_hook: Arc::clone(&self.test_post_snapshot_list_hook),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             protected_snapshot_age_warning_keys: Arc::clone(
@@ -10666,6 +10697,16 @@ impl CayenneTableProvider {
     pub(crate) fn clear_scan_file_statistics_cache(&self) {
         self.scan_file_statistics.clear();
         self.drop_cached_snapshot_listing();
+    }
+
+    /// Discard views whose captured files have been physically removed.
+    /// The caller holds both `write_lock` and `listing_fence.write()`, serializing
+    /// this generation advance with schema evolution and new captures. Even a
+    /// lag-tolerant read must recapture: these files can no longer be opened.
+    pub(crate) fn invalidate_scan_views_after_file_removal(&self) {
+        self.clear_scan_file_statistics_cache();
+        self.notify_scan_input_change();
+        drop(self.structural_version.begin_mutation());
     }
 
     /// Check the table-wide PK index out for validation. The cell is left empty for
@@ -11699,6 +11740,7 @@ impl CayenneTableProvider {
                 snapshot_id: &snapshot_id,
                 limit: None,
                 scan_schema,
+                captured_files: None,
             })
             .await
             .map_err(|err| CatalogError::InvalidOperationNoSource {
@@ -27173,9 +27215,10 @@ impl CayenneTableProvider {
             })?;
         };
 
-        // Read under the held fence: the current snapshot id (the file set) and the
-        // structural epoch (the version key `changed()` compares).
+        // Capture the complete warm file set under the fence. Pinning a snapshot
+        // directory alone does not exclude files added there by a later checkpoint.
         let current_snapshot_id = self.get_current_snapshot_id();
+        let warm_files = self.capture_warm_files(&current_snapshot_id).await?;
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
 
         // The cold half of the file set, resolved under the SAME held fence as the
@@ -27220,10 +27263,66 @@ impl CayenneTableProvider {
             protected_map,
             inlined_view,
             current_snapshot_id,
+            warm_files,
             cold_files,
             structural_epoch,
             scan_guard,
             read_schema,
+        })
+    }
+
+    /// Capture the unpruned warm listing while holding `listing_fence.read()`.
+    /// Reuse an existing complete listing when its generations match; on a miss,
+    /// enumerate file metadata only. Footer reads and query pruning stay outside
+    /// the fence in `snapshot_files_with_stats`.
+    async fn capture_warm_files(
+        &self,
+        snapshot_id: &str,
+    ) -> datafusion_common::Result<CapturedSnapshotFiles> {
+        let dir_generation = self.current_dir_generation.load(Ordering::Acquire);
+        let listing_epoch = self.listing_cache_epoch.load(Ordering::Acquire);
+        let files = if let Some(cached) = self.cached_snapshot_listing.load_full()
+            && cached.snapshot_id == snapshot_id
+            && cached.dir_generation == dir_generation
+            && cached.listing_epoch == listing_epoch
+        {
+            Arc::clone(&cached.files)
+        } else {
+            let ctx = self.create_session_context();
+            let state = ctx.state();
+            let table_url = ListingTableUrl::parse(Self::snapshot_dir_url(
+                &self.table_metadata.path,
+                &self.table_metadata.table_id,
+                snapshot_id,
+            ))?;
+            let options = Self::create_listing_options(
+                self.context.file_format(),
+                &self.pk_deletion_strategy,
+                state.config(),
+            );
+            let request = SnapshotScanListingRequest {
+                state: &state,
+                table_url: &table_url,
+                options: &options,
+                partition_filters: &[],
+                data_filters: &[],
+                snapshot_id,
+                limit: None,
+                scan_schema: Self::snapshot_scan_schema(&self.table_schema(), &options),
+                captured_files: None,
+            };
+            let store = state.runtime_env().object_store(&table_url)?;
+            Arc::new(
+                self.snapshot_file_list(&request, &store)
+                    .await?
+                    .try_collect()
+                    .await?,
+            )
+        };
+        Ok(CapturedSnapshotFiles {
+            dir_generation,
+            listing_epoch,
+            files,
         })
     }
 
@@ -31866,6 +31965,7 @@ impl CayenneTableProvider {
                     // `target_partitions` ways: with tens of protected snapshots
                     // that multiplies file opens ~50× for no parallelism gain
                     Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
+                    None,
                 )
                 .await?;
 
@@ -32034,6 +32134,7 @@ impl CayenneTableProvider {
             // Internal reads (compaction, keyset) also benefit from keeping small
             // groups whole: merging N small runs otherwise pays N × tp footer opens.
             Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
+            None,
         )
         .await
     }
@@ -32070,6 +32171,7 @@ impl CayenneTableProvider {
         // byte-range splitting the same way (`0` disables the auto opt-out — the
         // main query branch keeps default splitting behavior).
         small_group_repartition_opt_out_bytes: u64,
+        captured_files: Option<&CapturedSnapshotFiles>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         // The reference schema the Vortex decode targets. Internal reads
         // (compaction, keyset, stats) pass `None` -> stored `Utf8`/`Binary`,
@@ -32150,6 +32252,7 @@ impl CayenneTableProvider {
                 snapshot_id,
                 limit: statistic_file_limit,
                 scan_schema: Arc::clone(&scan_schema),
+                captured_files,
             })
             .await?;
 
@@ -32532,7 +32635,10 @@ impl CayenneTableProvider {
         let collect_stats = request.options.collect_stat;
         let has_pending_deletions = self.has_pending_deletions();
         let use_stats_for_limit = collect_stats && !has_pending_deletions;
-        let dir_generation = self.current_dir_generation.load(Ordering::Acquire);
+        let dir_generation = request.captured_files.map_or_else(
+            || self.current_dir_generation.load(Ordering::Acquire),
+            |files| files.dir_generation,
+        );
 
         let listing_pruning_predicate = if collect_stats && !request.data_filters.is_empty() {
             super::file_pruning::build_listing_pruning_predicate(
@@ -32627,6 +32733,28 @@ impl CayenneTableProvider {
         })
     }
 
+    async fn snapshot_file_list<'a>(
+        &'a self,
+        request: &SnapshotScanListingRequest<'a>,
+        store: &'a Arc<dyn ObjectStore>,
+    ) -> datafusion_common::Result<futures::stream::BoxStream<'a, DataFusionResult<PartitionedFile>>>
+    {
+        if self.context.scan_from_manifest()
+            && let Some(files) = self.manifest_partitioned_files(request).await
+        {
+            return Ok(stream::iter(files.into_iter().map(Ok)).boxed());
+        }
+        pruned_partition_list(
+            request.state,
+            store.as_ref(),
+            request.table_url,
+            request.partition_filters,
+            &request.options.file_extension,
+            &request.options.table_partition_cols,
+        )
+        .await
+    }
+
     /// Return the snapshot's files with statistics, using
     /// [`Self::cached_snapshot_listing`] when the snapshot id, directory
     /// generation, and listing-cache epoch still match. A complete listing
@@ -32638,12 +32766,22 @@ impl CayenneTableProvider {
         collect_stats: bool,
         dir_generation: u64,
     ) -> datafusion_common::Result<Arc<Vec<PartitionedFile>>> {
-        let listing_epoch = self.listing_cache_epoch.load(Ordering::Acquire);
+        let listing_epoch = request.captured_files.map_or_else(
+            || self.listing_cache_epoch.load(Ordering::Acquire),
+            |files| files.listing_epoch,
+        );
         if collect_stats
             && let Some(cached) = self.cached_snapshot_listing.load_full()
             && cached.snapshot_id == request.snapshot_id
             && cached.dir_generation == dir_generation
             && cached.listing_epoch == listing_epoch
+            && request.captured_files.is_none_or(|captured| {
+                Arc::ptr_eq(&captured.files, &cached.files)
+                    || cached
+                        .source_files
+                        .as_ref()
+                        .is_some_and(|source| Arc::ptr_eq(&captured.files, source))
+            })
         {
             return Ok(Arc::clone(&cached.files));
         }
@@ -32658,25 +32796,11 @@ impl CayenneTableProvider {
             .execution
             .meta_fetch_concurrency;
 
-        let manifest_files = if self.context.scan_from_manifest() {
-            self.manifest_partitioned_files(request).await
-        } else {
-            None
-        };
         let file_list: futures::stream::BoxStream<'_, DataFusionResult<PartitionedFile>> =
-            match manifest_files {
-                Some(files) => stream::iter(files.into_iter().map(Ok)).boxed(),
-                None => {
-                    pruned_partition_list(
-                        request.state,
-                        store.as_ref(),
-                        request.table_url,
-                        request.partition_filters,
-                        &request.options.file_extension,
-                        &request.options.table_partition_cols,
-                    )
-                    .await?
-                }
+            if let Some(captured) = request.captured_files {
+                stream::iter(captured.files.iter().cloned().map(Ok)).boxed()
+            } else {
+                self.snapshot_file_list(request, &store).await?
             };
 
         let files = file_list
@@ -32713,6 +32837,9 @@ impl CayenneTableProvider {
                         dir_generation,
                         listing_epoch,
                         files: Arc::clone(&files),
+                        source_files: request
+                            .captured_files
+                            .map(|captured| Arc::clone(&captured.files)),
                     })));
             }
         }
@@ -33704,6 +33831,14 @@ impl TableProvider for CayenneTableProvider {
         let scan_view = self
             .scan_view_at_current_input(self.scan_view_reuse)
             .await?;
+        #[cfg(test)]
+        {
+            let hook = self.test_post_scan_view_selection_hook.lock().take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+        let warm_files = scan_view.raw.warm_files.clone();
         let mem_tier_any_rows = scan_view.raw.mem_tier_shards.iter().any(|s| !s.is_empty());
         let maintained_aggregate_epoch = scan_view.raw.maintained_aggregate_epoch;
         let protected_map = Arc::clone(&scan_view.raw.protected_map);
@@ -33912,16 +34047,15 @@ impl TableProvider for CayenneTableProvider {
                 // branch is often the scan's ONLY source, so byte-range
                 // splitting can be its only decode parallelism.
                 0,
+                Some(&warm_files),
             )
             .await;
         self.record_listing_scan_duration(listing_scan_start.elapsed());
         let main_plan = main_plan_result?;
         // The listing fence is NOT held here: `capture_raw_scan_input` released it
         // when the capture returned, and `scan_guard` pins the captured snapshot
-        // dirs against GC for the full scan lifetime (plan-build + execution). Direct
-        // scan planning resolves the file listing eagerly against that pinned
-        // snapshot id, so a concurrent listing flip cannot delete a file this scan
-        // reads (the ref-count keeps it, cleanup skips count > 0).
+        // dirs against GC for the full scan lifetime (plan-build + execution). The
+        // captured warm file set excludes later additions to that same directory.
 
         // Check for protected snapshots that need to be scanned with partial deletion filter.
         let protected_snapshot_plans = self
@@ -36029,6 +36163,16 @@ mod tests {
 
     #[tokio::test]
     async fn file_retention_invalidates_segments_for_deleted_files() {
+        for reuse in [
+            ScanViewReuse::UntilInvalidated,
+            ScanViewReuse::WithinLag(Duration::from_hours(1)),
+            ScanViewReuse::WithinLag(Duration::ZERO),
+        ] {
+            check_file_retention_invalidates_segments_for_deleted_files(reuse).await;
+        }
+    }
+
+    async fn check_file_retention_invalidates_segments_for_deleted_files(reuse: ScanViewReuse) {
         use arrow::array::TimestampNanosecondArray;
         use arrow_schema::TimeUnit;
 
@@ -36057,6 +36201,7 @@ mod tests {
             crate::TimeRetentionFilterBuilder::try_new("event_time", u64::MAX, &schema)
                 .expect("retention builder");
         let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .with_scan_view_reuse(reuse)
             .with_time_retention_filter_builder(retention_builder)
             .create(CreateTableOptions {
                 table_name: "file_retention_segment_cache".to_string(),
@@ -45632,6 +45777,7 @@ mod tests {
                 snapshot_id: &snapshot_id,
                 limit: file_limit,
                 scan_schema: Arc::clone(&scan_schema),
+                captured_files: None,
             })
             .await
             .expect("direct scan file listing should succeed");
@@ -45972,6 +46118,7 @@ mod tests {
                 snapshot_id: &snapshot_id,
                 limit: None,
                 scan_schema: Arc::clone(&scan_schema),
+                captured_files: None,
             })
             .await
             .expect("listing scan with point-lookup filter");
@@ -45993,6 +46140,7 @@ mod tests {
                 snapshot_id: &snapshot_id,
                 limit: None,
                 scan_schema: Arc::clone(&scan_schema),
+                captured_files: None,
             })
             .await
             .expect("cached listing scan with point-lookup filter");
@@ -46016,6 +46164,7 @@ mod tests {
                 snapshot_id: &snapshot_id,
                 limit: None,
                 scan_schema: Arc::clone(&scan_schema),
+                captured_files: None,
             })
             .await
             .expect("listing scan without filter");
@@ -46752,6 +46901,7 @@ mod tests {
             snapshot_id: &snapshot_id,
             limit: file_limit,
             scan_schema: Arc::clone(&scan_schema),
+            captured_files: None,
         };
 
         // The manifest resolver must now return a non-empty set (flag is ON and
@@ -56288,8 +56438,8 @@ mod tests {
         }
     }
 
-    /// File appends can leave the captured view's identity unchanged. After
-    /// validating that identity, the cache must reuse it without another capture.
+    /// A file append changes the captured file set. Its replacement view must
+    /// include the new file, then remain reusable without another capture.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scan_view_cache_reuses_after_file_append() {
         let ctx = SessionContext::new();
@@ -56326,21 +56476,112 @@ mod tests {
             .latest_complete
             .load_full()
             .expect("completed post-append view");
-        assert_eq!(
+        assert_ne!(
             completed.key, first_key,
-            "file append keeps the view identity"
+            "file append changes the captured file set"
         );
-        assert!(Arc::ptr_eq(&first, &completed.view));
+        assert!(!Arc::ptr_eq(&first, &completed.view));
         assert_eq!(
             completed.order,
             provider.scan_input_version.load(Ordering::Acquire),
-            "validated equal-key reuse must advance the cached order"
+            "the replacement view must carry the post-append order"
         );
 
         *provider.test_post_scan_input_capture_hook.lock() = Some(Box::new(|| {
             Box::pin(async { panic!("an unchanged table must reuse without recapturing") })
         }));
         assert_eq!(scan_id_values(&provider).await, vec![(1, 10), (2, 20)]);
+    }
+
+    /// Checkpointing inline rows into the current snapshot must not add a second
+    /// copy to a scan that selected its view before the checkpoint. Exercise both
+    /// a reused lagged view and the selection-to-plan window for every reuse mode.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_checkpoint_keeps_captured_file_set() {
+        for scan_from_manifest in [false, true] {
+            for checkpoint_after_selection in [false, true] {
+                for reuse in [
+                    ScanViewReuse::UntilInvalidated,
+                    ScanViewReuse::WithinLag(Duration::from_hours(1)),
+                    ScanViewReuse::WithinLag(Duration::ZERO),
+                ] {
+                    let ctx = SessionContext::new();
+                    let (mut provider, _catalog, _tmp) =
+                        create_position_based_table_with_vortex_config(
+                            "scan_view_checkpoint",
+                            ctx.runtime_env(),
+                            VortexConfig {
+                                inline_max_rows: 1024,
+                                compaction_background_interval_ms: 0,
+                                scan_from_manifest,
+                                ..VortexConfig::default()
+                            },
+                        )
+                        .await;
+                    provider.scan_view_reuse = reuse;
+                    let provider = Arc::new(provider);
+                    provider.init_scan_view_cache();
+                    let schema = Arc::clone(&provider.table_metadata.schema);
+                    insert_batch(&provider, id_value_batch(schema, &[1, 1, 2], &[10, 10, 20]))
+                        .await;
+                    let expected = vec![(1, 10), (1, 10), (2, 20)];
+                    assert_eq!(scan_id_values(&provider).await, expected);
+                    let before = provider
+                        .scan_view_cache
+                        .latest_complete
+                        .load_full()
+                        .expect("warm pre-checkpoint view");
+                    assert!(!before.view.raw.inlined_view.is_empty());
+                    assert!(before.view.raw.warm_files.files.is_empty());
+                    let snapshot_id = provider.get_current_snapshot_id();
+                    if checkpoint_after_selection {
+                        let writer = Arc::clone(&provider);
+                        *provider.test_post_scan_view_selection_hook.lock() =
+                            Some(Box::new(move || {
+                                Box::pin(async move {
+                                    assert_eq!(
+                                        writer.checkpoint_inlined_data().await.expect("checkpoint"),
+                                        3,
+                                    );
+                                })
+                            }));
+                    } else {
+                        assert_eq!(
+                            provider
+                                .checkpoint_inlined_data()
+                                .await
+                                .expect("checkpoint"),
+                            3,
+                        );
+                    }
+                    assert_eq!(
+                        scan_id_values(&provider).await,
+                        expected,
+                        "{reuse:?}, manifest={scan_from_manifest}, after_selection={checkpoint_after_selection}",
+                    );
+                    assert_eq!(provider.get_current_snapshot_id(), snapshot_id);
+                    assert_eq!(provider.cached_inlined_row_count(), 0);
+                    let after = provider
+                        .scan_view_cache
+                        .latest_complete
+                        .load_full()
+                        .expect("post-checkpoint view");
+                    if reuse == ScanViewReuse::WithinLag(Duration::from_hours(1)) {
+                        assert!(
+                            Arc::ptr_eq(&before.view, &after.view),
+                            "lagged reads must preserve the captured view across a checkpoint",
+                        );
+                    }
+                    // Once refreshed, the checkpointed files supply the same row
+                    // multiset, including the legitimate duplicate from INSERT.
+                    provider
+                        .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+                        .await
+                        .expect("refresh view after checkpoint");
+                    assert_eq!(scan_id_values(&provider).await, expected);
+                }
+            }
+        }
     }
 
     /// Position-based deletes must invalidate a warmed view on a table with no

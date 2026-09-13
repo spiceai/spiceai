@@ -304,6 +304,11 @@ impl FileBasedDeletionSink {
         // file already removed by this partial batch releases its cached
         // segments immediately and cannot disappear from a later directory
         // listing before ever being invalidated.
+        if !retired_cache_paths.is_empty() {
+            // Held write lock + listing fence serialize this forced invalidation
+            // with captures. Cached lagged views cannot retain unlinked files.
+            self.provider.invalidate_scan_views_after_file_removal();
+        }
         self.provider
             .invalidate_retired_paths(retired_cache_paths)
             .await;
