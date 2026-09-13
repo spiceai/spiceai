@@ -2392,13 +2392,20 @@ mod tests {
             .expect("collect decoded strings");
         let mut strings = Vec::new();
         for batch in &decoded {
-            let col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .expect("string1 column");
-            for i in 0..batch.num_rows() {
-                strings.push(col.value(i).to_string());
+            let col = batch.column(0);
+            if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+                for i in 0..batch.num_rows() {
+                    strings.push(arr.value(i).to_string());
+                }
+            } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringViewArray>() {
+                for i in 0..batch.num_rows() {
+                    strings.push(arr.value(i).to_string());
+                }
+            } else {
+                panic!(
+                    "string1 decoded as {}, expected Utf8 or Utf8View",
+                    col.data_type()
+                );
             }
         }
         assert_eq!(
