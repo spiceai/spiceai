@@ -2833,11 +2833,7 @@ mod tests {
         assert_eq!(extension, ".orc");
 
         let newest_only = file_format
-            .infer_schema(
-                &ctx.state(),
-                &store,
-                std::slice::from_ref(&last_modified),
-            )
+            .infer_schema(&ctx.state(), &store, std::slice::from_ref(&last_modified))
             .await
             .expect("infer from the newest object alone");
         assert!(
