@@ -505,7 +505,7 @@ pub async fn create_checkpoint_and_snapshot(
         snapshot_manager
     } else {
         tracing::warn!(
-            "Skipped creating a snapshot of '{dataset_name}', so its snapshot series keeps the previously published contents: the rows now in the acceleration are not known to be this dataset's configured definition applied to its source"
+            "Skipped creating a snapshot of '{dataset_name}', so its snapshot series keeps the previously published contents: the rows now in the acceleration are not known to be its configured definition applied to its source"
         );
         None
     };
