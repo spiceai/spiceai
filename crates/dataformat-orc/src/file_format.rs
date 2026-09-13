@@ -690,59 +690,33 @@ mod tests {
     /// Arrow 58 `Schema::try_merge` unions struct children recursively. A file
     /// that only has `payload.id` must still scan under a merged type that also
     /// has `payload.extra`, with a typed NULL for the missing child.
+    ///
+    /// Fixtures are written by PyArrow, not `orc-rust` — the encoder used by
+    /// the other listing tests cannot emit structs.
     #[tokio::test]
     async fn listing_scan_backfills_nested_struct_fields_missing_from_one_file() {
-        use arrow::array::{Int64Array, StructArray};
-        use arrow::datatypes::Fields;
+        use arrow::array::Int64Array;
         use datafusion::datasource::listing::{
             ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
         };
 
         let dir = tempfile::tempdir().expect("tempdir");
-
-        let id_only_payload_fields = Fields::from(vec![Field::new("id", DataType::Int64, true)]);
-        let id_only_payload = StructArray::try_new(
-            id_only_payload_fields.clone(),
-            vec![Arc::new(Int64Array::from(vec![Some(10)]))],
-            None,
+        std::fs::write(
+            dir.path().join("a.orc"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/orc/payload_id.orc"
+            )),
         )
-        .expect("payload with id only");
-        let id_only = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("payload", DataType::Struct(id_only_payload_fields), true),
-            ])),
-            vec![
-                Arc::new(Int64Array::from(vec![1])),
-                Arc::new(id_only_payload),
-            ],
+        .expect("write a.orc");
+        std::fs::write(
+            dir.path().join("b.orc"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/orc/payload_id_extra.orc"
+            )),
         )
-        .expect("id-only nested batch");
-
-        let both_payload_fields = Fields::from(vec![
-            Field::new("id", DataType::Int64, true),
-            Field::new("extra", DataType::Int64, false),
-        ]);
-        let both_payload = StructArray::try_new(
-            both_payload_fields.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![Some(10)])),
-                Arc::new(Int64Array::from(vec![Some(99)])),
-            ],
-            None,
-        )
-        .expect("payload with extra");
-        let both = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("payload", DataType::Struct(both_payload_fields), true),
-            ])),
-            vec![Arc::new(Int64Array::from(vec![2])), Arc::new(both_payload)],
-        )
-        .expect("nested batch with extra");
-
-        std::fs::write(dir.path().join("a.orc"), write_orc_bytes(&id_only)).expect("write a.orc");
-        std::fs::write(dir.path().join("b.orc"), write_orc_bytes(&both)).expect("write b.orc");
+        .expect("write b.orc");
 
         let ctx = SessionContext::new_with_config(SessionConfig::new());
         let listing = ListingOptions::new(Arc::new(OrcFormat::new())).with_file_extension(".orc");
