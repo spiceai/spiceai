@@ -171,6 +171,31 @@ params:
     }
 
     #[test]
+    fn a_view_parses_snapshots_consistency_accept_skew() {
+        let yaml = r"
+            name: orders_by_region
+            sql: SELECT region, COUNT(*) FROM orders GROUP BY region
+            acceleration:
+              engine: duckdb
+              snapshots: enabled
+              snapshots_consistency: accept_skew
+        ";
+        let view: View = yaml::from_str(yaml).expect("view should deserialize");
+        let acceleration = view
+            .acceleration
+            .as_ref()
+            .expect("acceleration block should parse");
+        assert_eq!(
+            acceleration.snapshots_consistency,
+            crate::acceleration::SnapshotsConsistency::AcceptSkew
+        );
+        assert_eq!(
+            acceleration.snapshots,
+            crate::acceleration::SnapshotBehavior::Enabled
+        );
+    }
+
+    #[test]
     fn params_defaults_to_none_when_absent() {
         let yaml = r"
 name: my_view

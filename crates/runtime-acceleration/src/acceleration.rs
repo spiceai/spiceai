@@ -503,8 +503,10 @@ pub struct Acceleration {
     pub snapshots_creation_policy: SnapshotsCreationPolicy,
 
     /// For an accelerated view: whether a snapshot may be published from a
-    /// materialization that spans more than one read of the view's sources. Inert for
-    /// a dataset, which materializes a single source and always reads it once.
+    /// materialization that spans more than one read of the view's sources. A
+    /// dataset that sets a non-default value is refused at load — a dataset
+    /// materializes a single source and always reads it once, so the option
+    /// cannot apply.
     pub snapshots_consistency: SnapshotsConsistency,
 }
 

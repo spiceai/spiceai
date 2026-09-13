@@ -385,6 +385,14 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display(
+        "Failed to register dataset '{dataset_name}' ({connector}): `snapshots_consistency: accept_skew` is only valid for accelerated views, so it has no effect on a dataset. A dataset always materializes a single source read. Remove `snapshots_consistency` from this dataset. See: https://spiceai.org/docs/components/data-accelerators/snapshots"
+    ))]
+    SnapshotsConsistencyNotForDataset {
+        dataset_name: String,
+        connector: String,
+    },
+
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 

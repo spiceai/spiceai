@@ -36,9 +36,10 @@ use crate::{
     DurableWriteBackUndeclaredPrimaryKeySnafu, DurableWriteBackUnsupportedBySourceSnafu,
     DurableWriteBackWithRetentionSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
     HotReloadRefreshTimedOutSnafu, LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu,
-    Result, Runtime, UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
-    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
-    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
+    Result, Runtime, SnapshotsConsistencyNotForDatasetSnafu, UnableToAttachDataConnectorSnafu,
+    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
+    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
+    UnknownDataConnectorSnafu,
     accelerated::AcceleratedTable,
     component::dataset::{
         Dataset,
@@ -2260,6 +2261,18 @@ fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
         return Ok(());
     };
 
+    // `snapshots_consistency` is a view-only publish gate. A dataset always
+    // materializes one source read, so a non-default value would load and then
+    // do nothing — refuse it here rather than accept a no-op that looks valid.
+    if acceleration.snapshots_consistency != spicepod::acceleration::SnapshotsConsistency::default()
+    {
+        return Err(SnapshotsConsistencyNotForDatasetSnafu {
+            dataset_name: ds.name.to_string(),
+            connector: ds.source().to_string(),
+        }
+        .build());
+    }
+
     // `write_mode: write_back` selects the write-back path on its own, but only a
     // configuration that resolves to DURABLE write-back records markers and runs a
     // delivery worker. One that asks for write-back without them has no path to the
@@ -2675,6 +2688,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn validate_dataset_refuses_accept_skew_snapshots_consistency() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+
+        let accept_skew = spicepod::acceleration::Acceleration {
+            snapshots_consistency: spicepod::acceleration::SnapshotsConsistency::AcceptSkew,
+            ..spicepod::acceleration::Acceleration::default()
+        };
+        let err = validate_dataset(&dataset_with_acceleration(&runtime, accept_skew))
+            .expect_err("accept_skew on a dataset is a no-op and must be refused");
+        assert!(
+            matches!(err, Error::SnapshotsConsistencyNotForDataset { .. }),
+            "expected a snapshots_consistency refusal, got: {err}"
+        );
+        for expected in [
+            "orders",
+            "postgres",
+            "snapshots_consistency: accept_skew",
+            "only valid for accelerated views",
+            "https://spiceai.org/docs/components/data-accelerators/snapshots",
+        ] {
+            assert!(
+                err.to_string().contains(expected),
+                "the refusal must contain {expected:?}: {err}"
+            );
+        }
+
+        let consistent_read = spicepod::acceleration::Acceleration {
+            snapshots_consistency: spicepod::acceleration::SnapshotsConsistency::ConsistentRead,
+            ..spicepod::acceleration::Acceleration::default()
+        };
+        assert!(
+            validate_dataset(&dataset_with_acceleration(&runtime, consistent_read)).is_ok(),
+            "the default snapshots_consistency must still load on a dataset"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_dataset_ignores_accept_skew_on_a_disabled_acceleration() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+
+        let acceleration = spicepod::acceleration::Acceleration {
+            enabled: false,
+            snapshots_consistency: spicepod::acceleration::SnapshotsConsistency::AcceptSkew,
+            ..spicepod::acceleration::Acceleration::default()
+        };
+
+        assert!(
+            validate_dataset(&dataset_with_acceleration(&runtime, acceleration)).is_ok(),
+            "snapshots_consistency on a disabled acceleration is inert, not refused"
+        );
+    }
+
     /// A disabled acceleration accelerates nothing, so its write-back settings
     /// acknowledge nothing for delivery and are not judged — a configuration
     /// write-back could not deliver is unremarkable there.
@@ -2722,6 +2788,30 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn the_snapshots_consistency_rejection_names_the_setting_and_a_way_out() {
+        let message = SnapshotsConsistencyNotForDatasetSnafu {
+            dataset_name: "orders".to_string(),
+            connector: "postgres".to_string(),
+        }
+        .build()
+        .to_string();
+        for expected in [
+            "'orders'",
+            "postgres",
+            "`snapshots_consistency: accept_skew`",
+            "only valid for accelerated views",
+            "Remove `snapshots_consistency`",
+            "https://spiceai.org/docs/components/data-accelerators/snapshots",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the rejection must contain {expected:?}: {message}"
+            );
+        }
+    }
+
     use crate::component::dataset::DatasetSpec;
     use crate::dataconnector::{
         ConnectorParams, DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
