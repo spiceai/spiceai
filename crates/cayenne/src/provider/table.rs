@@ -10699,11 +10699,11 @@ impl CayenneTableProvider {
         self.drop_cached_snapshot_listing();
     }
 
-    /// Discard views whose captured files have been physically removed.
+    /// Discard cached views before physically removing their captured files.
     /// The caller holds both `write_lock` and `listing_fence.write()`, serializing
-    /// this generation advance with schema evolution and new captures. Even a
-    /// lag-tolerant read must recapture: these files can no longer be opened.
-    pub(crate) fn invalidate_scan_views_after_file_removal(&self) {
+    /// this generation advance with schema evolution. Cache misses wait for the
+    /// listing fence, so their captures see the files remaining after retention.
+    pub(crate) fn invalidate_scan_views_before_file_removal(&self) {
         self.clear_scan_file_statistics_cache();
         self.notify_scan_input_change();
         drop(self.structural_version.begin_mutation());
@@ -27573,7 +27573,7 @@ impl CayenneTableProvider {
     }
 
     /// Obtain the [`ScanView`] for this scan from the demand cache.
-    /// A hit is wait-free (`ArcSwap` load + two atomic version reads). A miss
+    /// A hit is wait-free (`ArcSwap` load + atomic version validation). A miss
     /// captures, then takes the in-flight mutex only long enough to dedup or
     /// spawn; the build is awaited outside it.
     ///
@@ -27587,25 +27587,26 @@ impl CayenneTableProvider {
         &self,
         reuse: ScanViewReuse,
     ) -> datafusion_common::Result<Arc<ScanView>> {
-        // Wait-free hit: sample `scan_input_version`, load `latest_complete`,
-        // sample the version again. The candidate is the view that sat in the
-        // slot between those two samples; `try_serve_latest` does not load
-        // again. A write that bumps the version in that window fails the
-        // before==after check. An odd structural generation is a live schema-
-        // evolution and also falls through. No drain, no mutex.
-        let version_before = self.scan_input_version.load(Ordering::Acquire);
+        // Bracket the candidate with both versions. Ordinary writes invalidate
+        // UntilInvalidated; a structural event rejects either reuse mode when it
+        // straddles selection. No drain, no mutex.
         let now = Instant::now();
-        let structural = self.structural_version.current();
-        let candidate = self.scan_view_cache.latest_complete.load_full();
-        let version_after = self.scan_input_version.load(Ordering::Acquire);
-        if let Some(view) = ScanViewCache::try_serve_latest(
-            reuse,
-            version_before,
-            version_after,
-            structural,
-            now,
-            candidate,
-        ) {
+        if let Some((structural, (version_before, candidate, version_after))) =
+            self.structural_version.read_validated(|| {
+                let version_before = self.scan_input_version.load(Ordering::Acquire);
+                let candidate = self.scan_view_cache.latest_complete.load_full();
+                let version_after = self.scan_input_version.load(Ordering::Acquire);
+                (version_before, candidate, version_after)
+            })
+            && let Some(view) = ScanViewCache::try_serve_latest(
+                reuse,
+                version_before,
+                version_after,
+                structural,
+                now,
+                candidate,
+            )
+        {
             return Ok(view);
         }
 
