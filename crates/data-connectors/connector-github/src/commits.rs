@@ -892,24 +892,8 @@ fn gql_schema() -> SchemaRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use app::AppBuilder;
-    use runtime::builder::RuntimeBuilder;
-    use runtime::component::dataset::builder::DatasetBuilder;
+    use crate::test_util::shared_component as create_mock_component;
     use serde_json::json;
-
-    fn create_mock_component(name: &str) -> ConnectorComponent {
-        let app = AppBuilder::new("test").build();
-        let runtime = tokio::runtime::Runtime::new().expect("to create tokio runtime");
-        let spice_runtime = runtime.block_on(async { RuntimeBuilder::new().build().await });
-
-        let dataset = DatasetBuilder::try_new("github".to_string(), name)
-            .expect("to create dataset builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(spice_runtime))
-            .build()
-            .expect("to create dataset");
-        ConnectorComponent::from(&dataset)
-    }
 
     #[test]
     fn test_commits_schema_includes_ref_and_new_metadata() {

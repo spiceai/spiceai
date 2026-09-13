@@ -171,12 +171,13 @@ impl Query {
 
         let sql_raw_cache_key =
             sql_cache_key.as_raw_key_in_namespace(Self::plan_hasher(df), ns_tag, ns_id);
+        let cached_plan_key = Self::cached_plan_key(df, sql, Some((ns_tag, ns_id)));
         let plan: Box<LogicalPlan> = if let Some(plan) = pre_parsed_plan {
             // Reuse the pre-parsed plan to avoid re-parsing. Parameters are
             // already bound from `check_read_only_sql`.
             plan
         } else {
-            match Self::get_plan(df, session, sql, &sql_raw_cache_key, parameters).await {
+            match Self::get_plan(df, session, sql, &cached_plan_key, parameters).await {
                 Ok(plan) => Box::new(plan),
                 Err(e) => {
                     if let super::Error::UnableToExecuteQuery { source } = e {
@@ -250,10 +251,11 @@ impl Query {
             ns_tag,
             ns_id,
         );
+        let cached_plan_key = Self::cached_plan_key(df, sql, Some((ns_tag, ns_id)));
         let plan = if let Some(plan) = pre_parsed_plan {
             plan
         } else {
-            match Self::get_plan(df, session, sql, &raw_cache_key, parameters).await {
+            match Self::get_plan(df, session, sql, &cached_plan_key, parameters).await {
                 Ok(plan) => Box::new(plan),
                 Err(super::Error::UnableToExecuteQuery { source }) => {
                     let code = ErrorCode::from(&source);
@@ -302,6 +304,33 @@ impl Query {
             None => plan,
         };
         Ok(plan)
+    }
+
+    /// The key a cached [`LogicalPlan`] lives under: the SQL text and the
+    /// cache namespace, never the parameter values bound into it.
+    ///
+    /// [`DataFusion::create_logical_plan`] is never given the parameters — it
+    /// plans the placeholders, and [`Self::get_plan`] binds the values into the
+    /// plan it hands back — so one SQL text has exactly one plan whatever is
+    /// bound into it. Mixing the values into this key gives every value tuple
+    /// its own entry, which makes a parameterized query, the case the cache
+    /// exists for, a guaranteed miss, and evicts unrelated plans while it does
+    /// so. The values do key the *results*, which are keyed separately on
+    /// `CacheKey::Query(sql, parameters)` or on the bound
+    /// [`CacheKey::LogicalPlan`].
+    ///
+    /// `namespace` is a `CacheNamespace::hash_inputs` pair; `None` leaves the
+    /// key shared across principals, which the table-allowlist path relies on.
+    pub(super) fn cached_plan_key(
+        df: &DataFusion,
+        sql: &str,
+        namespace: Option<(u8, &[u8])>,
+    ) -> RawCacheKey {
+        let key = CacheKey::Query(sql, None);
+        match namespace {
+            Some((tag, id)) => key.as_raw_key_in_namespace(Self::plan_hasher(df), tag, id),
+            None => key.as_raw_key(Self::plan_hasher(df)),
+        }
     }
 
     /// Return the [`Hasher`] that should be used in caching [`LogicalPlan`]s in [`DataFusion`].
@@ -1894,6 +1923,126 @@ mod tests {
                 assert_eq!(result.cache_status, CacheStatus::CacheHit);
             })
             .await;
+    }
+
+    /// Registers an in-memory table holding one row per id in `ids`, so a
+    /// parameterized predicate over it selects a value the test can check.
+    fn register_id_table(df: &Arc<DataFusion>, name: &'static str, ids: &[i64]) {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(ids.to_vec()))],
+        )
+        .expect("valid record batch");
+        let table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                .expect("valid mem table");
+        df.ctx
+            .register_table(TableReference::bare(name), Arc::new(table))
+            .expect("should register table");
+    }
+
+    /// Runs `sql` bound to `value`, returning how the results cache answered and
+    /// the `id` column of the result.
+    async fn run_id_lookup(
+        df: &Arc<DataFusion>,
+        request_context: &Arc<RequestContext>,
+        sql: &'static str,
+        value: i64,
+    ) -> (CacheStatus, Vec<i64>) {
+        let query = QueryBuilder::new(sql, Arc::clone(df))
+            .parameters(Some(ParamValues::from(vec![ScalarValue::Int64(Some(
+                value,
+            ))])))
+            .build();
+        Arc::clone(request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                let cache_status = result.cache_status;
+                let ids = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should drain")
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("id should be an Int64 column")
+                            .iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                (cache_status, ids)
+            })
+            .await
+    }
+
+    /// One SQL text, many bound values: one cached plan, and a cached result per
+    /// value.
+    ///
+    /// The plan cache exists so a query parses and plans once, and a
+    /// parameterized query is the case it should serve best — the SQL text is
+    /// fixed and only the bound values move. Keying it on `(sql, parameters)`
+    /// gave every distinct value tuple its own entry, so every request
+    /// re-parsed and re-planned and the entries accumulated until they evicted
+    /// each other.
+    ///
+    /// The two halves are asserted together because the fix is a split, and
+    /// either half alone would be the wrong thing: the values must leave the
+    /// *plan* key and stay in the *results* key. A run that reused the plan but
+    /// also reused the previous value's rows would be a correctness bug, not an
+    /// optimization, so the repeats below check that a second request for a
+    /// value is served from the results cache and still returns that value's
+    /// own row.
+    #[tokio::test]
+    async fn a_parameterized_query_caches_one_plan_and_a_result_per_value() {
+        const SQL: &str = "SELECT id FROM plan_cache_params WHERE id = $1";
+
+        let df = prepare_runtime(None).await;
+        register_id_table(&df, "plan_cache_params", &[1, 2, 3, 4, 5]);
+        let plans = df
+            .plans_cache_provider()
+            .expect("the plans cache is installed unconditionally");
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Default), None);
+
+        for value in [1_i64, 2, 3, 4, 5] {
+            let (status, rows) = run_id_lookup(&df, &request_context, SQL, value).await;
+            assert_eq!(status, CacheStatus::CacheMiss, "value {value} is new");
+            assert_eq!(rows, vec![value], "binding {value} must select its own row");
+        }
+
+        // Re-bind values whose plan is now served from the cache. This is where a
+        // plan carrying a previous binding, or a results entry shared across
+        // values, would surface as the wrong row.
+        for value in [1_i64, 3] {
+            let (status, rows) = run_id_lookup(&df, &request_context, SQL, value).await;
+            assert_eq!(
+                status,
+                CacheStatus::CacheHit,
+                "the results cache must still key on the bound value, so a repeat of {value} is a hit"
+            );
+            assert_eq!(
+                rows,
+                vec![value],
+                "binding {value} must select its own row; a different row means one results entry \
+                 is being shared across parameter values"
+            );
+        }
+
+        plans.checkpoint().await;
+        assert_eq!(
+            plans.item_count().await,
+            1,
+            "one SQL text must cache one plan; more than one means the parameter values reached \
+             the plan cache key, so every value tuple re-parses and re-plans"
+        );
     }
 
     #[tokio::test]

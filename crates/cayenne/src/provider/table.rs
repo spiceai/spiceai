@@ -64,7 +64,7 @@ use super::pk_index::{
     CheckedOutShardedPkIndex, ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence,
     PendingPkKeys, PkBloom, PkCheckoutGuard, PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome,
     RowLocation, ShardedPkIndex, approx_captured_file_bytes, deserialize_pk_bloom_sidecar,
-    pk_digest, serialize_pk_bloom_sidecar, shard_of_pk,
+    pk_digest, pk_digest_bytes, serialize_pk_bloom_sidecar, shard_of_pk,
 };
 use super::pk_validation::null_primary_key_message;
 use super::streaming::StreamingExec;
@@ -81,13 +81,13 @@ use crate::provider::scan::{
 use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, InternalSnafu, Result};
 use crate::resource_starvation::ResourceStarvationTracker;
-use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, Int64Array};
+use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, BooleanBufferBuilder, Int64Array};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef};
 use hash_index::PrehashedBuildHasher;
 use snafu::ensure;
 
-use crate::row_converter::{OwnedRow, RowConverter, SortField};
+use crate::row_converter::{RowConverter, SortField};
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use async_trait::async_trait;
 use data_components::delete::{DeletionExec, DeletionSink};
@@ -4262,6 +4262,47 @@ impl std::fmt::Debug for CayenneTableProvider {
         f.debug_struct("CayenneTableProvider")
             .field("table_metadata", &self.table_metadata)
             .finish_non_exhaustive()
+    }
+}
+
+/// The two resident-byte components of a table's PK caches and the slot they are
+/// published into as a sum. Every publish goes through here so the sum is read
+/// and written under one lock (see [`Self::publish_total`]); the provider hands one
+/// to each [`PkCheckoutGuard`] it opens so an abandoned window can restate the
+/// cache's true residency from wherever the guard is dropped.
+struct PkKeysetBytesPublisher {
+    single: Arc<AtomicUsize>,
+    sharded: Arc<AtomicUsize>,
+    publish_lock: Arc<ParkingMutex<()>>,
+    table_memory: Arc<CayenneMemoryAccount>,
+}
+
+impl PkKeysetBytesPublisher {
+    /// Publish the table-wide PK cache's resident bytes and refresh the sum.
+    fn publish_single(&self, bytes: usize) {
+        self.single.store(bytes, Ordering::Relaxed);
+        self.publish_total();
+    }
+
+    /// Publish the sharded PK cache's resident bytes and refresh the sum.
+    fn publish_sharded(&self, bytes: usize) {
+        self.sharded.store(bytes, Ordering::Relaxed);
+        self.publish_total();
+    }
+
+    fn publish_total(&self) {
+        // Read both components AND publish under one lock. The components are
+        // stored before this point, so whichever publisher holds the lock last
+        // reads every completed store and publishes the true sum; splitting the
+        // read from the publish lets a stale total land last and under-report.
+        let _guard = self.publish_lock.lock();
+        let total = self
+            .single
+            .load(Ordering::Relaxed)
+            .saturating_add(self.sharded.load(Ordering::Relaxed));
+        // `set_keyset_bytes` also restates this table's share of the fleet
+        // ceiling, and releases it on drop.
+        self.table_memory.set_keyset_bytes(total);
     }
 }
 
@@ -10502,7 +10543,14 @@ impl CayenneTableProvider {
     /// table and every key committed after it must still reach the restored index.
     fn take_cached_pk_index(&self) -> (Option<CachedPkIndex>, PkCheckoutGuard) {
         let mut guard = self.pk_keyset_cache.lock();
-        let checkout = PkCheckoutGuard::open(&self.pk_keyset_pending);
+        let checkout = PkCheckoutGuard::open(&self.pk_keyset_pending, {
+            let cache = Arc::clone(&self.pk_keyset_cache);
+            let publisher = self.pk_keyset_bytes_publisher();
+            move || {
+                publisher
+                    .publish_single(cache.lock().as_ref().map_or(0, CachedPkIndex::approx_bytes));
+            }
+        });
         (guard.take(), checkout)
     }
 
@@ -10568,29 +10616,28 @@ impl CayenneTableProvider {
 
     /// Publish the table-wide PK cache's resident bytes and refresh the sum.
     fn publish_single_keyset_bytes(&self, bytes: usize) {
-        self.pk_keyset_bytes_single.store(bytes, Ordering::Relaxed);
-        self.publish_keyset_bytes_total();
+        self.pk_keyset_bytes_publisher().publish_single(bytes);
     }
 
     /// Publish the sharded PK cache's resident bytes and refresh the sum.
     fn publish_sharded_keyset_bytes(&self, bytes: usize) {
-        self.pk_keyset_bytes_sharded.store(bytes, Ordering::Relaxed);
-        self.publish_keyset_bytes_total();
+        self.pk_keyset_bytes_publisher().publish_sharded(bytes);
     }
 
     fn publish_keyset_bytes_total(&self) {
-        // Read both components AND publish under one lock. The components are
-        // stored before this point, so whichever publisher holds the lock last
-        // reads every completed store and publishes the true sum; splitting the
-        // read from the publish lets a stale total land last and under-report.
-        let _guard = self.pk_keyset_publish_lock.lock();
-        let total = self
-            .pk_keyset_bytes_single
-            .load(Ordering::Relaxed)
-            .saturating_add(self.pk_keyset_bytes_sharded.load(Ordering::Relaxed));
-        // `set_keyset_bytes` also restates this table's share of the fleet
-        // ceiling, and releases it on drop.
-        self.table_memory.set_keyset_bytes(total);
+        self.pk_keyset_bytes_publisher().publish_total();
+    }
+
+    /// The PK-cache byte accounting, detached from the provider so a
+    /// [`PkCheckoutGuard`] can carry it to wherever the checked-out index ends up
+    /// and republish on the abandon path (see `take_cached_pk_index`).
+    fn pk_keyset_bytes_publisher(&self) -> PkKeysetBytesPublisher {
+        PkKeysetBytesPublisher {
+            single: Arc::clone(&self.pk_keyset_bytes_single),
+            sharded: Arc::clone(&self.pk_keyset_bytes_sharded),
+            publish_lock: Arc::clone(&self.pk_keyset_publish_lock),
+            table_memory: Arc::clone(&self.table_memory),
+        }
     }
 
     /// Deferred cross-partition appends carry their on-conflict metadata and
@@ -11676,16 +11723,21 @@ impl CayenneTableProvider {
             .map(|&idx| Arc::clone(batch.column(idx)))
             .collect();
         let rows = converter.convert_columns(&pk_columns)?;
-        // Per-shard order-preserving selection masks: scatter each row's index
-        // into its computed shard's mask (`masks[shard][row_idx]`).
-        let mut masks: Vec<Vec<bool>> = vec![vec![false; batch.num_rows()]; n];
+        // Each shard's order-preserving selection mask uses one bit per row.
+        let mut masks: Vec<_> = (0..n)
+            .map(|_| {
+                let mut mask = BooleanBufferBuilder::new(batch.num_rows());
+                mask.append_n(batch.num_rows(), false);
+                mask
+            })
+            .collect();
         for (row_idx, row) in rows.iter().enumerate() {
             let shard = shard_of_pk(row.as_ref(), n);
-            masks[shard][row_idx] = true;
+            masks[shard].set_bit(row_idx, true);
         }
         let mut shards = Vec::with_capacity(n);
-        for mask in masks {
-            let predicate = BooleanArray::from(mask);
+        for mut mask in masks {
+            let predicate = BooleanArray::new(mask.finish(), None);
             shards.push(arrow::compute::filter_record_batch(batch, &predicate)?);
         }
         Ok(shards)
@@ -13043,7 +13095,18 @@ impl CayenneTableProvider {
         // exit between here and `store_sharded_pk_index` — close it.
         let (cached, checkout) = {
             let mut guard = self.sharded_pk_keyset_cache.lock();
-            let checkout = PkCheckoutGuard::open(&self.sharded_pk_keyset_pending);
+            let checkout = PkCheckoutGuard::open(&self.sharded_pk_keyset_pending, {
+                let cache = Arc::clone(&self.sharded_pk_keyset_cache);
+                let publisher = self.pk_keyset_bytes_publisher();
+                move || {
+                    publisher.publish_sharded(
+                        cache
+                            .lock()
+                            .as_ref()
+                            .map_or(0, ShardedPkIndex::approx_bytes),
+                    );
+                }
+            });
             (guard.take(), checkout)
         };
         if let Some(cached) = cached {
@@ -13207,7 +13270,7 @@ impl CayenneTableProvider {
         // none). A no-op (no tombstone snapshot, or key not tombstoned).
         let probe_reinsert_over_tombstone =
             |row_idx: usize,
-             key: &OwnedRow,
+             key: &[u8],
              deleted_pk_i64: &mut Vec<i64>,
              deleted_inlined_pk_i64: &mut Vec<i64>,
              deleted_row_keys: &mut Vec<Box<[u8]>>,
@@ -13228,9 +13291,9 @@ impl CayenneTableProvider {
                         }
                     }
                     PkDeletionSnapshot::RowConverterBased { tombstones } => {
-                        if tombstones.get(key.as_ref()).is_some() {
+                        if tombstones.get(key).is_some() {
                             // Box::from once, then clone for the dual-list push (file + inline).
-                            let row_key = bytes_key(key.as_ref());
+                            let row_key = bytes_key(key);
                             deleted_row_keys.push(row_key.clone());
                             deleted_inlined_row_keys.push(row_key);
                             *reinserted_over_tombstone += 1;
@@ -13256,7 +13319,7 @@ impl CayenneTableProvider {
         // mirroring `probe_reinsert_over_tombstone`.
         let push_key_supersede =
             |row_idx: usize,
-             key: &OwnedRow,
+             key: &[u8],
              deleted_pk_i64: &mut Vec<i64>,
              deleted_inlined_pk_i64: &mut Vec<i64>,
              deleted_row_keys: &mut Vec<Box<[u8]>>,
@@ -13270,7 +13333,7 @@ impl CayenneTableProvider {
                         }
                     }
                     PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                        let row_key = bytes_key(key.as_ref());
+                        let row_key = bytes_key(key);
                         deleted_row_keys.push(row_key.clone());
                         deleted_inlined_row_keys.push(row_key);
                     }
@@ -13287,27 +13350,22 @@ impl CayenneTableProvider {
         // scan from every coalesced batch (16K+ envelopes).
         let any_pk_nullable = pk_columns.iter().any(|col| col.null_count() > 0);
 
-        // Build each row's PK key once, then run an IN-BATCH dedup pre-pass:
-        // `ctx.incoming_keys` only covers PRIOR batches, so duplicate PKs WITHIN
-        // this batch must be collapsed here. The survivor per distinct PK is the
-        // single row that runs the conflict/delete logic — Upsert (last_write_wins)
-        // keeps the LAST occurrence, DoNothing* (remove_duplicates) the FIRST.
-        // Non-survivors are dropped BEFORE the loop body so they push no (otherwise
-        // double-counted) delete and are not kept. Composite PKs are handled
-        // natively: the key is the RowConverter encoding over all PK columns. Keys
-        // are hoisted out of the loop (the same per-row `.owned()` clone, just
-        // computed up front) so the pre-pass can borrow them and the loop consume them.
-        let row_pk_keys: Vec<OwnedRow> =
-            (0..batch.num_rows()).map(|i| rows.row(i).owned()).collect();
+        // Deduplicate borrowed row encodings before conflict/delete work. Upsert
+        // (last_write_wins) keeps the last occurrence; DoNothing with duplicate
+        // removal keeps the first. Only retained survivors acquire owned keys
+        // for the downstream keyset and bloom updates.
         // Hash each row's key bytes ONCE into a seeded XXH3-128 digest; this digest
         // is the key's identity for all three probes below (dedup pre-pass,
         // cross-batch `incoming_keys`, and the `existing_keys` keyset), so the
         // per-row hashing cost is paid a single time and the maps reuse it via
         // `PrehashedBuildHasher`.
-        let row_digests: Vec<u128> = row_pk_keys.iter().map(pk_digest).collect();
+        let row_digests: Vec<u128> = rows
+            .iter()
+            .map(|row| pk_digest_bytes(row.as_ref()))
+            .collect();
         let is_survivor: Vec<bool> = if deduplicate_batch {
             let mut survivor: HashMap<u128, usize, PrehashedBuildHasher> =
-                HashMap::with_capacity_and_hasher(row_pk_keys.len(), PrehashedBuildHasher);
+                HashMap::with_capacity_and_hasher(batch.num_rows(), PrehashedBuildHasher);
             for (idx, &digest) in row_digests.iter().enumerate() {
                 if ctx.upsert_options.last_write_wins {
                     survivor.insert(digest, idx); // a later duplicate supersedes
@@ -13315,7 +13373,7 @@ impl CayenneTableProvider {
                     survivor.entry(digest).or_insert(idx); // keep the first
                 }
             }
-            let mut mask = vec![false; row_pk_keys.len()];
+            let mut mask = vec![false; batch.num_rows()];
             for &idx in survivor.values() {
                 mask[idx] = true;
             }
@@ -13324,16 +13382,13 @@ impl CayenneTableProvider {
             Vec::new()
         };
 
-        for (row_idx, key) in row_pk_keys.into_iter().enumerate() {
+        for (row_idx, &digest) in row_digests.iter().enumerate() {
             if any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx)) {
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
                     message: null_primary_key_message(&batch, ctx.pk_indices),
                 });
             }
-
-            // This row's precomputed key identity, reused across all three probes.
-            let digest = row_digests[row_idx];
 
             // Drop in-batch duplicate non-survivors before any conflict/delete work,
             // so exactly one row per PK records a delete and is kept.
@@ -13342,7 +13397,7 @@ impl CayenneTableProvider {
                 continue;
             }
 
-            if ctx.incoming_keys.contains_digest(digest) {
+            if ctx.incoming_keys.contains(&digest) {
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
                     message: "Incoming data contains duplicate primary key across batches"
@@ -13350,6 +13405,7 @@ impl CayenneTableProvider {
                 });
             }
 
+            let key = rows.row(row_idx);
             let keep_row = match ctx.existing {
                 PkExistenceRef::Exact(existing_keys) => {
                     // A key committed by another writer since this keyset was checked
@@ -13377,12 +13433,8 @@ impl CayenneTableProvider {
                                         }
                                     }
                                     PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                                        // Convert the OwnedRow's byte view into a `Box<[u8]>` for the
-                                        // delete-list — `deleted_row_keys` and `deleted_inlined_row_keys`
-                                        // are typed `Vec<Box<[u8]>>` so they can be forwarded to the
-                                        // `commit_on_conflict_deletions` catalog call without a second
-                                        // re-encoding. This is one allocation per conflict row; the
-                                        // arena-indexed key design discussed in iter 3 would amortize it.
+                                        // Delete lists retain their own copy of the encoded key
+                                        // until the catalog commit.
                                         let row_key = bytes_key(key.as_ref());
                                         if is_inlined_conflict {
                                             deleted_inlined_row_keys.push(row_key);
@@ -13440,7 +13492,7 @@ impl CayenneTableProvider {
                         // the uncertainty ends with this batch).
                         push_key_supersede(
                             row_idx,
-                            &key,
+                            key.as_ref(),
                             &mut deleted_pk_i64,
                             &mut deleted_inlined_pk_i64,
                             &mut deleted_row_keys,
@@ -13454,7 +13506,7 @@ impl CayenneTableProvider {
                         // it (otherwise it stays permanently hidden).
                         probe_reinsert_over_tombstone(
                             row_idx,
-                            &key,
+                            key.as_ref(),
                             &mut deleted_pk_i64,
                             &mut deleted_inlined_pk_i64,
                             &mut deleted_row_keys,
@@ -13509,7 +13561,7 @@ impl CayenneTableProvider {
                         // (same shape as the warm bloom HIT above).
                         push_key_supersede(
                             row_idx,
-                            &key,
+                            key.as_ref(),
                             &mut deleted_pk_i64,
                             &mut deleted_inlined_pk_i64,
                             &mut deleted_row_keys,
@@ -13526,7 +13578,7 @@ impl CayenneTableProvider {
                         // fallback.
                         probe_reinsert_over_tombstone(
                             row_idx,
-                            &key,
+                            key.as_ref(),
                             &mut deleted_pk_i64,
                             &mut deleted_inlined_pk_i64,
                             &mut deleted_row_keys,
@@ -13539,7 +13591,7 @@ impl CayenneTableProvider {
             };
 
             if keep_row {
-                kept_keys.insert_with_digest(digest, key);
+                kept_keys.insert_with_digest(digest, key.owned());
             }
             keep_mask.push(keep_row);
         }
@@ -13590,7 +13642,7 @@ impl CayenneTableProvider {
         pending_existence: Option<&PendingPkExistence>,
         pk_indices: &[usize],
         converter: &RowConverter,
-        incoming_keys: &PkDigestSet,
+        incoming_keys: &HashSet<u128, PrehashedBuildHasher>,
     ) -> Result<(Option<RecordBatch>, Option<RecordBatch>, PkDigestSet)> {
         let pk_columns: Vec<_> = pk_indices
             .iter()
@@ -13609,7 +13661,7 @@ impl CayenneTableProvider {
         let mut miss_keys: PkDigestSet = PkDigestSet::with_capacity(batch.num_rows());
         for row_idx in 0..batch.num_rows() {
             let null_pk = any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx));
-            let key = rows.row(row_idx).owned();
+            let key = rows.row(row_idx);
             // A datalake (cold) file MAY hold the key — route it to the HIT path
             // so `apply_on_conflict_to_batch` records the cold supersede. Without
             // this a cold-resident key would fast-path as brand-new and its cold
@@ -13617,7 +13669,7 @@ impl CayenneTableProvider {
             // negatives, so a cold MISS here is safely fast-pathed).
             let cold_hit = cold_existence.is_some_and(|c| c.maybe_contains(key.as_ref()));
             // One hash per row, reused for both existence-set probes below.
-            let digest = pk_digest(&key);
+            let digest = pk_digest_bytes(key.as_ref());
             // A concurrent writer committed this key after the index was checked
             // out, so the bloom cannot hold it — route it to the HIT path, which
             // supersedes the row it committed. Fast-pathing it as brand-new would
@@ -13630,10 +13682,10 @@ impl CayenneTableProvider {
                 && !cold_hit
                 && !pending_hit
                 && !bloom.maybe_contains(key.as_ref())
-                && !incoming_keys.contains_digest(digest)
+                && !incoming_keys.contains(&digest)
                 && !miss_keys.contains_digest(digest);
             if is_miss {
-                miss_keys.insert_with_digest(digest, key);
+                miss_keys.insert_with_digest(digest, key.owned());
             }
             miss_mask.push(is_miss);
         }
@@ -13704,7 +13756,7 @@ impl CayenneTableProvider {
         // Table-global like the cold view: a key routes to exactly one shard, so a
         // shard only ever matches its own keys here.
         let pending_existence = self.pending_sharded_pk_existence();
-        let mut incoming_keys: PkDigestSet = PkDigestSet::default();
+        let mut incoming_keys = HashSet::with_hasher(PrehashedBuildHasher);
         let mut delete_specs: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
         let mut deleted_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
@@ -13769,7 +13821,7 @@ impl CayenneTableProvider {
                     if let Some(miss) = miss
                         && miss.num_rows() > 0
                     {
-                        incoming_keys.extend_ref(&miss_keys);
+                        incoming_keys.extend(miss_keys.digests());
                         kept_keys.absorb(miss_keys);
                         filtered_batches.push(miss);
                     }
@@ -13803,7 +13855,7 @@ impl CayenneTableProvider {
             deleted_inlined_pk_i64.extend(result.deleted_inlined_pk_i64);
             deleted_inlined_row_keys.extend(result.deleted_inlined_row_keys);
             reinserted_over_tombstone += result.reinserted_over_tombstone;
-            incoming_keys.extend_ref(&result.kept_keys);
+            incoming_keys.extend(result.kept_keys.digests());
             kept_keys.absorb(result.kept_keys);
             if let Some(fb) = result.filtered_batch
                 && fb.num_rows() > 0
@@ -16434,7 +16486,7 @@ impl CayenneTableProvider {
     /// from the stream schema (or otherwise unparseable) are skipped with a
     /// warning and the stream is returned unsorted (see
     /// `util::stream_utils::sort_stream`) — never surfaced as an error.
-    fn sort_stream_by_columns(
+    pub(crate) fn sort_stream_by_columns(
         &self,
         stream: SendableRecordBatchStream,
         sort_columns: &[String],
@@ -16458,6 +16510,57 @@ impl CayenneTableProvider {
         let sorted_stream = util::stream_utils::sort_stream(stream, sort_columns, task_ctx)?;
 
         Ok(sorted_stream)
+    }
+
+    /// Orders a whole-table replace by the table's configured `sort_columns`,
+    /// returning the stream to write and the write fan-out that order allows.
+    ///
+    /// A full-refresh table replaces its entire contents on every refresh, so
+    /// compaction — the only other path that orders data — never runs for it
+    /// (`refresh_mode: full` leaves nothing to consolidate). Ordering here is
+    /// what makes `sort_columns` mean anything for such a table: otherwise the
+    /// snapshot keeps arrival order however the column is configured, every
+    /// file's zone maps span the whole key range, and a selective scan prunes
+    /// nothing.
+    ///
+    /// Only an operator-configured order is honoured. An inferred one is a
+    /// guess at the workload, and a full refresh is too expensive to reorder on
+    /// a guess.
+    ///
+    /// Sharding the write would scatter the order across files, which is what
+    /// the order was for, so an ordered replace returns
+    /// [`WritePolicy::MAINTENANCE_SERIAL`] — the same trade the compaction
+    /// rewrite makes. A shard count alone does not achieve this: the fan-out is
+    /// decided by the policy's [`EncodeFanOut`], not by the caller's partition
+    /// count, so a `Sized` policy re-shards the sorted stream round-robin and
+    /// leaves every output file spanning the whole key range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the sort execution itself fails; see
+    /// [`Self::sort_stream_by_columns`] for how unusable columns are handled.
+    pub(crate) fn sort_overwrite_input(
+        &self,
+        data: SendableRecordBatchStream,
+        target_partitions: usize,
+    ) -> Result<(
+        SendableRecordBatchStream,
+        usize,
+        super::delta_encoding::WritePolicy,
+    )> {
+        if !self.context.sort_columns_are_authoritative() {
+            return Ok((data, target_partitions, rewrite_write_policy(false)));
+        }
+
+        let sort_columns = self.context.sort_columns().to_vec();
+        tracing::debug!(
+            table = self.table_metadata.table_name.as_str(),
+            sort_columns = ?sort_columns,
+            "Sorting whole-table replace before writing the new snapshot"
+        );
+        let ctx = self.create_session_context();
+        let sorted = self.sort_stream_by_columns(data, &sort_columns, &ctx.task_ctx())?;
+        Ok((sorted, 1, rewrite_write_policy(true)))
     }
 
     /// Effective sort columns for a snapshot rewrite under default settings.
@@ -24174,6 +24277,12 @@ impl CayenneTableProvider {
         // `DoNothing` table's keyset, and the next insert of that key would be dropped as
         // a duplicate of a row that no longer exists. The exact-count scan costs nothing
         // for the usual time/value retention predicate, which never had a fast path.
+        // Deliberately NOT wrapped in `InlineAwareDeletionSink`, so retention does
+        // not get its mem-tier arm: this is the one `build_deletion_vector_sink`
+        // caller that passes the `write_lock` INTO the sink rather than holding it,
+        // and the wrapper takes that same non-reentrant lock itself. The consequence
+        // is that `retention_sql` does not reach a `mode: memory` tier, which the
+        // accelerator warns about at registration.
         let sink = self
             .build_deletion_vector_sink(
                 &filters,
@@ -27586,19 +27695,23 @@ impl CayenneTableProvider {
         batches: Vec<RecordBatch>,
         incoming_bytes: u64,
         overwrite: bool,
+        deletions: &crate::provider::on_conflict::OnConflictDeletions,
     ) -> Result<u64> {
         self.enforce_memory_limit(incoming_bytes)?;
         if overwrite {
-            self.overwrite_mem_tier(batches, incoming_bytes).await
-        } else {
-            self.append_to_mem_tier(
-                batches,
-                &crate::provider::on_conflict::OnConflictDeletions::default(),
-                incoming_bytes,
-                0,
-            )
-            .await
+            return self.overwrite_mem_tier(batches, incoming_bytes).await;
         }
+
+        let incoming_rows: u64 = batches
+            .iter()
+            .map(|b| b.num_rows() as u64)
+            .fold(0, u64::saturating_add);
+        let superseded = u64::try_from(deletions.total_superseded()).unwrap_or(u64::MAX);
+        // `append_to_mem_tier` answers with the mem-tier epoch, which is not a row
+        // count — returning it would report the epoch as `rows affected`.
+        self.append_to_mem_tier(batches, deletions, incoming_bytes, superseded)
+            .await?;
+        Ok(incoming_rows)
     }
 
     /// Atomically REPLACE the entire RAM mem-tier with `batches` (memory-mode full
@@ -27648,6 +27761,20 @@ impl CayenneTableProvider {
             // bump, so advance the scan-input version (the next capture re-keys over the new tier).
             self.notify_scan_input_change();
         }
+
+        // The replaced tier's keys are gone and the replacement's are not recorded,
+        // so any cached primary-key index now describes rows that no longer exist and
+        // omits every row that does. Drop it; the next append rebuilds it from the
+        // live tier.
+        //
+        // A stale entry is not symmetric. A key the overwrite REMOVED that the cache
+        // still lists only costs a redundant tombstone on re-insert, which masks
+        // nothing — the documented `PkBloom` false-positive invariant. A key the
+        // overwrite INTRODUCED that the cache does not list is the damaging
+        // direction: an upsert reads it as new, supersedes nothing, and leaves two
+        // live rows under one primary key. This path could not produce that before
+        // the memory append started recording keys at all.
+        self.clear_cached_pk_keyset();
         Ok(incoming_rows)
     }
 
@@ -29802,6 +29929,194 @@ impl CayenneTableProvider {
         Ok(removed_rows)
     }
 
+    /// Remove every mem-tier row matching `filters` on a `mode: memory` table, and
+    /// return how many rows that removed (#12008).
+    ///
+    /// The caller must hold `write_lock`, and must be executing the delete rather
+    /// than planning it: the capture, the predicate pass and the swap all happen
+    /// inside this one hold, so no write can land between deciding what to delete
+    /// and deleting it. That is what keeps this path clear of the plan/execute
+    /// window #13828 describes for the durable arm.
+    ///
+    /// RESTRICTED TO MEMORY-RESIDENT MODE, for two reasons. A
+    /// `cdc_durability: memory` table already has this covered: its scanning
+    /// DELETE checkpoints the tier into Vortex first, so the rows are durable and
+    /// the deletion sink sees them. And its tier bytes are RESERVED against the
+    /// process-global mem-tier budget, released only by the checkpoint that flushes
+    /// them — shrinking the tier here would leak that reservation. Memory mode
+    /// skips the global reservation entirely (`write_cdc_in_memory` does not
+    /// reserve, so it must not release), which is what makes rebuilding the tier
+    /// safe.
+    ///
+    /// A predicate that matches nothing rebuilds nothing: every segment keeps its
+    /// `Arc`s, so a no-match delete costs one predicate pass over the tier and no
+    /// batch copy. A predicate that does match pays a visibility probe over the
+    /// matched rows only.
+    pub(crate) async fn delete_mem_tier_rows_matching(
+        &self,
+        filters: &[Expr],
+    ) -> datafusion_common::Result<u64> {
+        if !self.is_memory_resident_mode() || self.mem_tier.is_empty() {
+            return Ok(0);
+        }
+
+        let coerced = self.coerce_filters_for_inlined_delete(filters)?;
+        let physical_filters = self.build_physical_filters_for_inlined_delete(&coerced)?;
+        if physical_filters.is_empty() {
+            // No predicate means every row (the `TableProvider::delete_from`
+            // contract), which is delete-all — handled by `purge_mem_tier_all`,
+            // not here.
+            return Ok(0);
+        }
+
+        let mut visible_deleted: u64 = 0;
+        let mut raw_removed: u64 = 0;
+        // Each shard is rebuilt under ITS OWN publish lock, in index order — the
+        // deadlock-free order every other multi-shard site uses. Memory mode is
+        // single-shard (enforced by the accelerator's memory-mode overrides), so
+        // this is one iteration, and it relies on that: shards are swapped one at a
+        // time, so at N>1 a lock-free scan could capture one shard before the delete
+        // and the next after it. Making this atomic across shards needs more than
+        // per-shard locking, and nothing here provides it.
+        for (shard_id, shard) in self.mem_tier.shards().iter().enumerate() {
+            let _publish = self.mem_tier_publish_locks[shard_id].lock().await;
+            let current = shard.load_full();
+            if current.segments.is_empty() {
+                continue;
+            }
+
+            // The predicate is evaluated EXACTLY ONCE per batch, and both answers
+            // this loop needs come from that one mask. Evaluating it again to count
+            // would not merely cost a second pass: a volatile predicate
+            // (`WHERE random() < 0.5`) answers differently each time, so the count a
+            // client is told would describe a different row set than the one removed.
+            let deletion_maps = Self::mem_tier_deletion_maps(&current);
+            let tier_has_tombstones = Self::mem_tier_has_tombstones(&current);
+            let mut shard_visible: u64 = 0;
+            let (next, removed) = current.retain_rows(|batch, data_sequence| {
+                let Some(matched) = self.delete_match_mask(batch, &physical_filters)? else {
+                    return Ok(batch.clone());
+                };
+                let match_count = matched.true_count();
+                // Nothing to remove: hand the batch back untouched rather than
+                // building an all-true mask and filtering by it, which would
+                // allocate one `ArrayData` per column to reproduce the input.
+                if match_count == 0 {
+                    return Ok(batch.clone());
+                }
+
+                // A tier holding an upsert history carries superseded versions that
+                // no scan serves. Removing one is harmless — it is invisible either
+                // way, and its segment's tombstone stays to hide anything older —
+                // but COUNTING one is not: a user `DELETE` reports an exact
+                // `rows affected`, and a client that upserted a key twice would be
+                // told two rows went. Visibility is therefore resolved over the
+                // MATCHED rows alone — a probe of what is being deleted, not a walk
+                // of the tier. With no tombstone anywhere every row is visible and
+                // even that probe is skipped.
+                shard_visible = shard_visible.saturating_add(if tier_has_tombstones {
+                    let matched_rows = arrow::compute::filter_record_batch(batch, &matched)?;
+                    self.filter_inlined_batch_for_deletions(
+                        matched_rows,
+                        data_sequence,
+                        &deletion_maps,
+                    )
+                    .map_err(|error| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to resolve mem-tier row visibility while deleting from dataset '{}': {error}",
+                            self.table_metadata.table_name
+                        ))
+                    })?
+                    .map_or(0, |visible| visible.num_rows() as u64)
+                } else {
+                    match_count as u64
+                });
+
+                let keep = arrow::compute::not(&matched)?;
+                Ok(arrow::compute::filter_record_batch(batch, &keep)?)
+            })?;
+            if removed == 0 {
+                continue;
+            }
+            visible_deleted = visible_deleted.saturating_add(shard_visible);
+            shard.store(Arc::new(next));
+            raw_removed = raw_removed.saturating_add(removed);
+        }
+
+        // Keyed on the PHYSICAL fact, not on the number reported to the client: a
+        // rebuild that dropped only superseded rows still swapped the tier, and
+        // every scan-view cache keyed on its version has to re-key.
+        if raw_removed > 0 {
+            // Re-sync the resident-row counter from the tier rather than
+            // subtracting from it, exactly as `purge_mem_tier_all` does. Subtracting
+            // is not safe here: the position-based arm of `delete_from` runs
+            // `checkpoint_inlined_data_if_present_for_delete` first, which re-syncs
+            // this counter from the DURABLE inline corpus alone and so zeroes the
+            // mem-tier's contribution — a subtraction on top of that drives it
+            // NEGATIVE, and it gates the `> 0` branch that decides whether a scan
+            // consults the inline corpus at all.
+            //
+            // In memory-resident mode the tier IS the table (the inline corpus is
+            // disabled), so its row count is the whole truth. It counts superseded
+            // versions a scan does not serve, which over-reports rather than under-
+            // reports — the safe direction for a value served as an INEXACT estimate
+            // and as a "might have rows" gate.
+            self.inlined_row_count.store(
+                i64::try_from(self.mem_tier.total_rows()).unwrap_or(i64::MAX),
+                Ordering::Relaxed,
+            );
+            self.notify_scan_input_change();
+            self.clear_scan_file_statistics_cache();
+        }
+        Ok(visible_deleted)
+    }
+
+    /// The rows of `batch` a `DELETE ... WHERE` matches: the conjunction of
+    /// `physical_filters`, with NULL folded to "did not match". `None` when there
+    /// is nothing to decide — an empty batch, or no predicate at all (which means
+    /// every row, and is the delete-all purge's job, not this one's).
+    ///
+    /// SQL deletes a row only where the predicate evaluates TRUE, so NULL and
+    /// FALSE both mean keep. Folding the null mask into the values here is what
+    /// makes the caller's inversion total: `not(NULL)` is NULL, and
+    /// `filter_record_batch` drops a NULL-masked row, so inverting the raw mask
+    /// would silently delete the rows the predicate could not evaluate.
+    fn delete_match_mask(
+        &self,
+        batch: &RecordBatch,
+        physical_filters: &[Arc<dyn PhysicalExpr>],
+    ) -> datafusion_common::Result<Option<arrow::array::BooleanArray>> {
+        if batch.num_rows() == 0 || physical_filters.is_empty() {
+            return Ok(None);
+        }
+
+        let mut matched: Option<arrow::array::BooleanArray> = None;
+        for filter in physical_filters {
+            let value = filter.evaluate(batch)?;
+            let array = value.into_array(batch.num_rows())?;
+            let mask = array
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .ok_or_else(|| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Delete filter for table {} did not evaluate to BooleanArray, got {:?}",
+                        self.table_metadata.table_name,
+                        array.data_type()
+                    ))
+                })?;
+            let mask = if mask.null_count() == 0 {
+                mask.clone()
+            } else {
+                arrow::compute::prep_null_mask_filter(mask)
+            };
+            matched = Some(match matched {
+                None => mask,
+                Some(prev) => arrow::compute::and(&prev, &mask)?,
+            });
+        }
+        Ok(matched)
+    }
+
     /// Fire the installed [`SlotAdvancer`] for `durable_epoch`, if one is wired
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
@@ -30770,31 +31085,13 @@ impl CayenneTableProvider {
 
     fn apply_inlined_delete_filters(
         &self,
-        mut batch: RecordBatch,
+        batch: RecordBatch,
         physical_filters: &[Arc<dyn PhysicalExpr>],
     ) -> datafusion_common::Result<RecordBatch> {
-        for filter in physical_filters {
-            if batch.num_rows() == 0 {
-                break;
-            }
-
-            let filter_value = filter.evaluate(&batch)?;
-            let filter_array = filter_value.into_array(batch.num_rows())?;
-            let filter_array = filter_array
-                .as_any()
-                .downcast_ref::<arrow::array::BooleanArray>()
-                .ok_or_else(|| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Delete filter for table {} did not evaluate to BooleanArray, got {:?}",
-                        self.table_metadata.table_name,
-                        filter_array.data_type()
-                    ))
-                })?;
-
-            batch = arrow::compute::filter_record_batch(&batch, filter_array)?;
+        match self.delete_match_mask(&batch, physical_filters)? {
+            Some(matched) => Ok(arrow::compute::filter_record_batch(&batch, &matched)?),
+            None => Ok(batch),
         }
-
-        Ok(batch)
     }
 
     fn extract_primary_keys_from_batch(
@@ -33728,6 +34025,9 @@ impl TableProvider for CayenneTableProvider {
         // sink inside the execution-time critical section, not here.
         let file_sink = {
             let _guard = self.write_lock.lock().await;
+            // A no-op in `mode: memory`, which has no Vortex tier to checkpoint
+            // into — there the sink reconciles the tier itself at execution time
+            // (`delete_mem_tier_rows_matching`).
             self.checkpoint_mem_tier_for_delete().await?;
             self.build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
                 .await?
@@ -39549,13 +39849,23 @@ mod tests {
         let b1 = int64_id_batch(&[1, 2, 3]);
         let bytes1 = b1.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b1], bytes1, false)
+            .write_batches_memory_mode(
+                vec![b1],
+                bytes1,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("memory-mode append 1");
         let b2 = int64_id_batch(&[4, 5]);
         let bytes2 = b2.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b2], bytes2, false)
+            .write_batches_memory_mode(
+                vec![b2],
+                bytes2,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("memory-mode append 2");
         assert_eq!(
@@ -39593,10 +39903,79 @@ mod tests {
         );
     }
 
-    /// The purge is gated on the delete being a tautology: a filtered delete
-    /// through the same position-based sink must NOT discard the whole tier.
-    /// (Filtered deletes not reaching mem-tier rows is #12008; what matters here
-    /// is that the delete-all fix cannot over-delete.)
+    /// A filtered delete must take the rows it removed off the live-row counter.
+    ///
+    /// `inlined_row_count` gates whether a scan consults the inline corpus at all
+    /// and, with no persisted statistics, is served as the table's inexact row
+    /// estimate. Left unreconciled it only ever grows: a memory-mode table that
+    /// deletes as much as it inserts would report a count that climbs forever.
+    #[tokio::test]
+    async fn filtered_delete_takes_its_rows_off_the_live_row_count() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            memory_mode: true,
+            cdc_mem_tier_shards: 1,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "filtered_delete_live_row_count",
+            Arc::clone(&schema),
+            vortex_config,
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let batch = int64_id_batch(&[1, 2, 3, 4, 5]);
+        let bytes = batch.get_array_memory_size() as u64;
+        provider
+            .write_batches_memory_mode(
+                vec![batch],
+                bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
+            .await
+            .expect("memory-mode append");
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            5,
+            "precondition: the append counted its five rows as live"
+        );
+
+        let delete_plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("id").gt(datafusion_expr::lit(3_i64))],
+            )
+            .await
+            .expect("filtered delete plan");
+        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("filtered delete executed");
+
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3],
+            "precondition: the delete removed the two matching rows"
+        );
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            3,
+            "the live-row count must drop by what the delete removed"
+        );
+    }
+
+    /// A filtered delete through the position-based sink must remove exactly the
+    /// matching mem-tier rows — not nothing (#12008), and not the whole tier (the
+    /// delete-all purge must not fire on a predicate).
+    ///
+    /// A table with no primary key has no key to tombstone, so this is the arm
+    /// that can only be served by rebuilding the tier
+    /// (`delete_mem_tier_rows_matching`).
     #[tokio::test]
     async fn filtered_delete_does_not_purge_the_mem_tier_without_a_primary_key() {
         use arrow::datatypes::{DataType, Field, Schema};
@@ -39620,7 +39999,12 @@ mod tests {
         let batch = int64_id_batch(&[1, 2, 3]);
         let bytes = batch.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![batch], bytes, false)
+            .write_batches_memory_mode(
+                vec![batch],
+                bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("memory-mode append");
 
@@ -39631,13 +40015,24 @@ mod tests {
             )
             .await
             .expect("filtered delete plan");
-        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+        let results = datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
             .await
             .expect("filtered delete executed");
+        let deleted = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .expect("uint64 count column")
+            .value(0);
+        assert_eq!(deleted, 1, "exactly one mem-tier row matches `id = 2`");
 
         assert_eq!(
             scan_sorted_ids(&provider).await,
-            vec![1, 2, 3],
+            vec![1, 3],
+            "a filtered delete must remove the matching mem-tier row, and only it"
+        );
+        assert!(
+            !provider.mem_tier.is_empty(),
             "a filtered delete must not purge the whole mem-tier"
         );
     }
@@ -40146,13 +40541,23 @@ mod tests {
         let b1 = int64_id_batch(&[1, 2, 3]);
         let bytes1 = b1.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b1], bytes1, false)
+            .write_batches_memory_mode(
+                vec![b1],
+                bytes1,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("append 1");
         let b2 = int64_id_batch(&[4, 5]);
         let bytes2 = b2.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b2], bytes2, false)
+            .write_batches_memory_mode(
+                vec![b2],
+                bytes2,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("append 2");
         assert_eq!(
@@ -40165,7 +40570,12 @@ mod tests {
         let b3 = int64_id_batch(&[10, 20, 30, 40]);
         let bytes3 = b3.get_array_memory_size() as u64;
         provider
-            .write_batches_memory_mode(vec![b3], bytes3, true)
+            .write_batches_memory_mode(
+                vec![b3],
+                bytes3,
+                true,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("overwrite");
         assert_eq!(
@@ -40232,7 +40642,12 @@ mod tests {
             "batch ({bytes} bytes) must exceed the cap for the test to be meaningful"
         );
         let err = provider
-            .write_batches_memory_mode(vec![big], bytes, false)
+            .write_batches_memory_mode(
+                vec![big],
+                bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect_err("a write exceeding the memory limit must error");
         assert!(
@@ -40290,7 +40705,12 @@ mod tests {
             "seed ({seed_bytes} bytes) must fit under the cap ({cap})"
         );
         provider
-            .write_batches_memory_mode(vec![seed], seed_bytes, false)
+            .write_batches_memory_mode(
+                vec![seed],
+                seed_bytes,
+                false,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect("seed write under cap");
 
@@ -40303,7 +40723,12 @@ mod tests {
         // Overwrite that would fit *after* replace must still fail while the old
         // tier is resident (peak = resident + incoming).
         let err = provider
-            .write_batches_memory_mode(vec![replacement], replacement_bytes, true)
+            .write_batches_memory_mode(
+                vec![replacement],
+                replacement_bytes,
+                true,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+            )
             .await
             .expect_err("overwrite must count resident bytes toward the hard cap");
         assert!(
@@ -41923,7 +42348,7 @@ mod tests {
         )
         .await;
         let pk_indices = vec![0_usize];
-        let rows: i64 = 200;
+        let rows: i64 = 208;
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
@@ -41932,6 +42357,8 @@ mod tests {
             ],
         )
         .expect("batch built");
+        // Exercise a sliced input and a partial final bitmap byte.
+        let batch = batch.slice(7, 201);
         let converter = provider.build_pk_converter(&pk_indices).expect("converter");
 
         // n=1 is the unsharded fast path: the batch comes back unchanged.
@@ -41956,11 +42383,25 @@ mod tests {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .expect("id column");
+            let values = shard_batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value column");
+            assert!(
+                ids.values().windows(2).all(|pair| pair[0] < pair[1]),
+                "shard selection must preserve input order"
+            );
             let id_rows = converter
                 .convert_columns(&[Arc::clone(shard_batch.column(0))])
                 .expect("convert");
             for row_idx in 0..shard_batch.num_rows() {
                 let id = ids.value(row_idx);
+                assert_eq!(
+                    values.value(row_idx),
+                    id * 10,
+                    "row values must stay aligned"
+                );
                 assert!(seen.insert(id), "id {id} appeared in more than one shard");
                 assert_eq!(
                     shard_of_pk(id_rows.row(row_idx).as_ref(), n),
@@ -60383,7 +60824,7 @@ mod tests {
             ]),
         );
         let upsert_options = on_conflict.get_upsert_options();
-        let incoming_keys = PkDigestSet::default();
+        let incoming_keys = HashSet::with_hasher(PrehashedBuildHasher);
         let mut validation_ctx = OnConflictContext {
             pk_indices: &pk_indices,
             converter: &converter,
@@ -60598,6 +61039,111 @@ mod tests {
                 other.is_some()
             ),
         }
+    }
+
+    /// An abandoned checkout must release the resident-byte accounting its window
+    /// grew — regression test for #13668. Keys committed while the keyset is checked
+    /// out are accounted against the published residency as they land, and only a
+    /// restore overwrites that figure; a validation that is dropped or cancelled
+    /// restores nothing, so the bytes of keys that were just discarded stayed
+    /// reserved against the table's memory account and narrowed every sibling's
+    /// keyset budget.
+    #[tokio::test]
+    async fn an_abandoned_checkout_releases_the_keyset_bytes_its_window_grew() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "pk_checkout_abandoned_bytes",
+            ctx.runtime_env(),
+            VortexConfig::default(),
+        )
+        .await;
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        // A validation checks the (cold) keyset out; while its window is open a
+        // concurrent commit lands three keys, which the log holds for the replay.
+        let (cached, checkout) = provider.take_cached_pk_index();
+        assert!(cached.is_none(), "a fresh table has no cached keyset");
+        provider.record_file_pk_keys(&pk_digest_set_for_ids(&converter, &[7, 8, 9]), 11);
+
+        let held = provider.pk_keyset_bytes_single.load(Ordering::Relaxed);
+        assert!(
+            held > 0,
+            "keys held for the replay are accounted while the window is open"
+        );
+        assert_eq!(
+            provider.table_memory.snapshot().keyset,
+            held,
+            "the held bytes reach the table's memory account"
+        );
+
+        // The validation is dropped without storing an index back.
+        drop(checkout);
+
+        assert_eq!(
+            provider.pk_keyset_bytes_single.load(Ordering::Relaxed),
+            0,
+            "an abandoned window releases the bytes of the keys it discarded"
+        );
+        assert_eq!(
+            provider.table_memory.snapshot().keyset,
+            0,
+            "the memory account no longer carries the phantom reservation"
+        );
+    }
+
+    /// The per-shard index has the same window and the same accounting — the
+    /// sharded twin of the test above (#13668).
+    #[tokio::test]
+    async fn an_abandoned_sharded_checkout_releases_the_keyset_bytes_its_window_grew() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_sharded_checkout_abandoned_bytes",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+        provider.maybe_install_warm_pk_caches().await;
+
+        // An apply checks the per-shard index out; a concurrent commit lands while
+        // the window is open and is held for the replay.
+        let checked_out = provider
+            .build_sharded_pk_index(&pk_indices, &converter, 4)
+            .await
+            .expect("the warm per-shard index is checked out");
+        let before = provider.pk_keyset_bytes_sharded.load(Ordering::Relaxed);
+        provider.record_file_pk_keys(&pk_digest_set_for_ids(&converter, &[7, 8, 9]), 11);
+        assert!(
+            provider.pk_keyset_bytes_sharded.load(Ordering::Relaxed) > before,
+            "keys held for the replay are accounted while the per-shard window is open"
+        );
+
+        // The apply is abandoned without restoring the index.
+        drop(checked_out);
+
+        assert_eq!(
+            provider.pk_keyset_bytes_sharded.load(Ordering::Relaxed),
+            0,
+            "the per-shard cell is empty after the abandon, so its published residency is zero"
+        );
+        assert_eq!(
+            provider.table_memory.snapshot().keyset,
+            provider.pk_keyset_bytes_single.load(Ordering::Relaxed),
+            "the memory account carries only the table-wide keyset's bytes"
+        );
     }
 
     /// The table-wide keyset has the same window and the same latch — regression

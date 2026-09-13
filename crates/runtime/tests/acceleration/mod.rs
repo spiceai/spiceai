@@ -21,6 +21,7 @@ use spicepod::{acceleration::Mode, param::Params};
 use std::sync::Arc;
 
 mod caching_mode;
+mod caching_mode_constraints;
 #[cfg(feature = "duckdb")]
 mod caching_mode_per_principal;
 #[cfg(feature = "duckdb")]
@@ -60,6 +61,8 @@ mod on_conflict;
 mod on_conflict_cayenne;
 #[cfg(feature = "duckdb")]
 mod on_conflict_options;
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
+mod on_zero_results_subqueries;
 mod partition_by_arrow;
 #[cfg(not(target_os = "windows"))]
 mod partition_by_cayenne;
