@@ -5,5 +5,6 @@
 Apache License 2.0. It is **not** written by the `orc-rust` encoder the listing
 reader uses.
 
-The file has two rows. Glue catalog tables stored as `OrcInputFormat` are
-registered through the same listing `file_format: orc` path these bytes exercise.
+The file has two rows (`string1` is `hi` then `bye`). Glue catalog tables
+stored as `OrcInputFormat` are registered through the same listing
+`file_format: orc` path these bytes exercise.

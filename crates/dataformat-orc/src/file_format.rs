@@ -89,6 +89,11 @@ async fn fetch_row_count(store: &Arc<dyn ObjectStore>, file: &ObjectMeta) -> Res
 /// in the merged schema even when every file that has it declares it
 /// required. [`Schema::try_merge`] recursively unions struct children but
 /// keeps the first-seen nullability for a child that is not in every file.
+///
+/// Nested-child nullability is computed only from files that have the
+/// parent. A missing parent already makes that parent nullable; treating
+/// those files as a missing child would mark a map's `entries` field
+/// nullable, which Arrow's `MapArray::try_new` rejects.
 fn merge_orc_file_schemas(schemas: Vec<Schema>) -> Result<Schema> {
     let per_file_fields: Vec<arrow::datatypes::Fields> = schemas
         .iter()
@@ -117,13 +122,21 @@ fn field_named<'a>(fields: &'a arrow::datatypes::Fields, name: &str) -> Option<&
         .map(Arc::as_ref)
 }
 
+/// Per-file sources for a nested child, skipping files that do not have
+/// the parent field.
+///
+/// A missing parent is already marked nullable on that parent. Including
+/// those files as `None` here would mark every nested child nullable —
+/// including a map's `entries` field, which Arrow rejects. `None` is
+/// retained only when the parent exists but does not have this child.
 fn nested_field_sources<'a>(
     sources: &[Option<&'a Field>],
     child: impl Fn(&'a Field) -> Option<&'a Field>,
 ) -> Vec<Option<&'a Field>> {
     sources
         .iter()
-        .map(|source| source.and_then(|field| child(field)))
+        .copied()
+        .filter_map(|source| source.map(|field| child(field)))
         .collect()
 }
 
@@ -449,6 +462,40 @@ mod tests {
         assert!(
             extra.is_nullable(),
             "a nested field present in only some files must be nullable so the scan can NULL-fill it"
+        );
+    }
+
+    #[test]
+    fn merge_orc_file_schemas_keeps_map_entries_non_nullable() {
+        use arrow::datatypes::Fields;
+
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Utf8, true),
+            ])),
+            false,
+        );
+        let map_type = DataType::Map(Arc::new(entries), false);
+        let id_only = Schema::new(vec![Field::new("id", DataType::Int64, true)]);
+        let with_map = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("labels", map_type, false),
+        ]);
+
+        let merged = merge_orc_file_schemas(vec![id_only, with_map]).expect("map merge");
+        let labels = merged.field_with_name("labels").expect("labels");
+        assert!(
+            labels.is_nullable(),
+            "a map present in only some files must be nullable so the scan can NULL-fill it"
+        );
+        let DataType::Map(entries, _) = labels.data_type() else {
+            panic!("labels should stay a map");
+        };
+        assert!(
+            !entries.is_nullable(),
+            "Arrow MapArray::try_new rejects a nullable entries field; an absent parent map must not mark entries nullable"
         );
     }
 
@@ -784,6 +831,118 @@ mod tests {
             vec![(1, None), (2, Some(99))],
             "a.orc only has payload.id; the merged projection must NULL-fill payload.extra"
         );
+    }
+
+    /// Arrow 58 `MapArray::try_new` rejects a nullable `entries` field. A
+    /// listing that has a map in only some files must keep `entries`
+    /// required and NULL-fill the map itself on files that omit it.
+    ///
+    /// Fixtures are written by PyArrow, not `orc-rust` — the encoder used by
+    /// the other listing tests cannot emit maps.
+    #[tokio::test]
+    async fn listing_scan_backfills_maps_missing_from_one_file() {
+        use arrow::array::{Int64Array, MapArray};
+        use datafusion::datasource::listing::{
+            ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("a.orc"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/orc/id_only.orc"
+            )),
+        )
+        .expect("write a.orc");
+        std::fs::write(
+            dir.path().join("b.orc"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/orc/id_and_labels.orc"
+            )),
+        )
+        .expect("write b.orc");
+
+        let ctx = SessionContext::new_with_config(SessionConfig::new());
+        let listing = ListingOptions::new(Arc::new(OrcFormat::new())).with_file_extension(".orc");
+        let table_url = ListingTableUrl::parse(format!("file://{}/", dir.path().display()))
+            .expect("listing url");
+        let schema = listing
+            .infer_schema(&ctx.state(), &table_url)
+            .await
+            .expect("infer listing schema");
+        let labels = schema.field_with_name("labels").expect("labels");
+        assert!(
+            labels.is_nullable(),
+            "labels is missing from a.orc and must be nullable"
+        );
+        let DataType::Map(entries, _) = labels.data_type() else {
+            panic!("labels should be a map, got {}", labels.data_type());
+        };
+        assert!(
+            !entries.is_nullable(),
+            "merged map entries must stay required so MapArray::try_new accepts the scan"
+        );
+
+        let config = ListingTableConfig::new(table_url)
+            .with_listing_options(listing)
+            .with_schema(schema);
+        let table = ListingTable::try_new(config).expect("listing table");
+        ctx.register_table("merged", Arc::new(table))
+            .expect("register");
+
+        let df = ctx
+            .sql("SELECT id, labels FROM merged ORDER BY id")
+            .await
+            .expect("map projection");
+        let batches = df.collect().await.expect("scan evolving maps");
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 2, "scan must return a row from every file");
+
+        let mut pairs = Vec::new();
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column");
+            let maps = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .expect("labels column");
+            for i in 0..batch.num_rows() {
+                pairs.push((ids.value(i), map_env_value(maps, i)));
+            }
+        }
+        assert_eq!(
+            pairs,
+            vec![(1, None), (2, Some("prod".to_string()))],
+            "a.orc has no labels map; the merged projection must NULL-fill it"
+        );
+    }
+
+    fn map_env_value(maps: &arrow::array::MapArray, row: usize) -> Option<String> {
+        if maps.is_null(row) {
+            return None;
+        }
+        let offsets = maps.offsets();
+        let start = usize::try_from(offsets[row]).expect("map start offset fits usize");
+        let end = usize::try_from(offsets[row + 1]).expect("map end offset fits usize");
+        let keys = maps
+            .keys()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("map keys");
+        let values = maps
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("map values");
+        (start..end).find_map(|entry| {
+            (keys.value(entry) == "env").then(|| values.value(entry).to_string())
+        })
     }
 
     #[tokio::test]

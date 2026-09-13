@@ -2378,6 +2378,34 @@ mod tests {
             2,
             "Apache ORC TestOrcFile.test1.orc contains two rows"
         );
+
+        // `OrcFormat::infer_stats` publishes an exact footer row count, and
+        // `AggregateStatistics` can answer unfiltered `COUNT(*)` from those
+        // stats alone. Decode a known Java-writer value so this test cannot
+        // pass without reading stripe data.
+        let decoded = ctx
+            .sql("SELECT CAST(string1 AS VARCHAR) AS s FROM orc_ext ORDER BY s")
+            .await
+            .expect("decode sql")
+            .collect()
+            .await
+            .expect("collect decoded strings");
+        let mut strings = Vec::new();
+        for batch in &decoded {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("string1 column");
+            for i in 0..batch.num_rows() {
+                strings.push(col.value(i).to_string());
+            }
+        }
+        assert_eq!(
+            strings,
+            vec!["bye".to_string(), "hi".to_string()],
+            "Apache ORC TestOrcFile.test1.orc rows are string1='hi' then 'bye'"
+        );
     }
 
     #[derive(Debug)]
