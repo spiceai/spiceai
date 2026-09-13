@@ -684,7 +684,7 @@ async fn test_cold_tier_stale_tolerant_scan_during_promotion_impl(
     // definitely served the cached pre-promotion view (the state under test)
     // rather than rebuilding — no timing dependence in either direction. It is a
     // test device, not a supported setting: the runtime derives ~1s for
-    // `refresh_mode: changes`, comfortably inside the cold-tier GC's orphan grace.
+    // read-only `refresh_mode: changes`, inside the cold-tier GC's orphan grace.
     let table = Arc::new(
         CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
             .with_scan_view_reuse(ScanViewReuse::WithinLag(std::time::Duration::from_hours(1)))

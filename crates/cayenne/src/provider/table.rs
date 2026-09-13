@@ -1384,8 +1384,8 @@ struct CompletedScanView {
     /// "which is newest" pick is still correct; it only decides which completed build
     /// wins the single `latest_complete` slot.
     order: u64,
-    /// When the underlying state was captured. [`ScanViewReuse::WithinLag`] serves
-    /// this view while `now - captured_at <= lag`.
+    /// When the underlying state was captured or revalidated at this key.
+    /// [`ScanViewReuse::WithinLag`] serves this view while `now - captured_at <= lag`.
     captured_at: Instant,
     /// When this slot was last served, as nanoseconds since
     /// [`scan_view_clock_epoch`]. Atomic so a wait-free hit can refresh it
@@ -1525,6 +1525,7 @@ struct CachedSnapshotListing {
 impl ScanViewCache {
     /// Publish `view` as `latest_complete` if it is at least as new as the
     /// currently published slot (`order` is the scan-input version at capture).
+    /// At the same version, retain the most recent validated capture time.
     fn publish_completed(
         &self,
         key: ScanViewKey,
@@ -1544,7 +1545,9 @@ impl ScanViewCache {
             view,
         });
         self.latest_complete.rcu(|current| match current {
-            Some(existing) if existing.order > order => Some(Arc::clone(existing)),
+            Some(existing) if (existing.order, existing.captured_at) >= (order, captured_at) => {
+                Some(Arc::clone(existing))
+            }
             _ => Some(Arc::clone(&completed)),
         });
     }
@@ -1586,22 +1589,23 @@ impl ScanViewCache {
         Some(Arc::clone(&current.view))
     }
 
-    /// Wait-free serve when `latest_complete` has this exact identity.
-    fn serve_if_key(&self, key: &ScanViewKey) -> Option<Arc<ScanView>> {
-        self.serve_if(|current| current.key == *key)
-    }
-
-    fn serve_if(
+    /// Reuse a completed view after a validated capture confirms its identity.
+    /// Renew the version and capture time so subsequent scans can reuse it
+    /// without another capture, including after an unchanged-key invalidation.
+    fn serve_if_key(
         &self,
-        is_servable: impl FnOnce(&CompletedScanView) -> bool,
+        key: &ScanViewKey,
+        order: u64,
+        captured_at: Instant,
     ) -> Option<Arc<ScanView>> {
-        let current = self.latest_complete.load();
-        let current = current.as_ref()?;
-        if !is_servable(current) {
+        let current = self.latest_complete.load_full()?;
+        if current.key != *key {
             return None;
         }
         current.touch(Instant::now());
-        Some(Arc::clone(&current.view))
+        let view = Arc::clone(&current.view);
+        self.publish_completed(key.clone(), order, captured_at, Arc::clone(&view));
+        Some(view)
     }
 
     /// Peek every in-flight build (a `Shared` peek — NO poll), promote the
@@ -26195,8 +26199,12 @@ impl CayenneTableProvider {
     }
 
     fn try_read_inlined_view_for_scan(&self) -> Option<Arc<Vec<InlinedViewEntry>>> {
+        // Empty captures share one identity in `ScanViewKey`, just as nonempty
+        // captures retain the cached view's identity until its contents change.
+        static EMPTY_VIEW: std::sync::LazyLock<Arc<Vec<InlinedViewEntry>>> =
+            std::sync::LazyLock::new(|| Arc::new(Vec::new()));
         if self.cached_inlined_row_count() <= 0 {
-            return Some(Arc::new(Vec::new()));
+            return Some(Arc::clone(&EMPTY_VIEW));
         }
         self.try_read_inlined_view_cached()
     }
@@ -27556,7 +27564,7 @@ impl CayenneTableProvider {
 
             // Another scan may have published while we captured — serve it
             // without taking the in-flight mutex.
-            if let Some(view) = self.scan_view_cache.serve_if_key(&key) {
+            if let Some(view) = self.scan_view_cache.serve_if_key(&key, order, captured_at) {
                 return Ok(view);
             }
 
@@ -27564,14 +27572,16 @@ impl CayenneTableProvider {
             let action = {
                 let mut in_flight = self.scan_view_cache.in_flight.lock();
                 self.scan_view_cache.drain_completed(&mut in_flight);
-                if let Some(view) = self.scan_view_cache.serve_if_key(&key) {
+                if let Some(view) = self.scan_view_cache.serve_if_key(&key, order, captured_at) {
                     ScanViewAction::Serve(view)
                 } else if let Some(pending) = in_flight.iter().find(|entry| entry.key == key) {
                     ScanViewAction::Await {
                         build: pending.build.clone(),
                         key: pending.key.clone(),
-                        order: pending.order,
-                        captured_at: pending.captured_at,
+                        // This scan validated the same identity at its own
+                        // version and time, even when the shared build is older.
+                        order,
+                        captured_at,
                     }
                 } else {
                     let build = self.spawn_scan_view_build(
@@ -56139,6 +56149,245 @@ mod tests {
         );
     }
 
+    /// A validated capture with an unchanged key must renew both invalidation
+    /// metadata and the lag window without rebuilding the view.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_equal_key_renews_capture_metadata() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_equal_key",
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(schema, &[1], &[10])).await;
+        let first = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("warm inline view");
+        assert!(!first.raw.inlined_view.is_empty());
+        provider.notify_scan_input_change();
+        let captured_after = Instant::now();
+        let reused = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("validate unchanged view");
+        assert!(Arc::ptr_eq(&first, &reused));
+        let completed = provider
+            .scan_view_cache
+            .latest_complete
+            .load_full()
+            .expect("completed view");
+        assert_eq!(
+            completed.order,
+            provider.scan_input_version.load(Ordering::Acquire)
+        );
+        assert!(completed.captured_at >= captured_after);
+
+        // A quiet table still renews its lag window when a new capture confirms
+        // the same state, without requiring another write to advance the version.
+        let recaptured_after = Instant::now();
+        let recaptured = provider
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(Duration::ZERO))
+            .await
+            .expect("recapture unchanged view");
+        assert!(Arc::ptr_eq(&first, &recaptured));
+        let renewed = provider
+            .scan_view_cache
+            .latest_complete
+            .load_full()
+            .expect("renewed capture");
+        assert_eq!(renewed.order, completed.order);
+        assert!(renewed.captured_at >= recaptured_after);
+
+        // An older build's driver or an in-flight drain may publish after this
+        // renewal. It must not rewind the freshness window at the same version.
+        provider.scan_view_cache.publish_completed(
+            completed.key.clone(),
+            completed.order,
+            completed.captured_at,
+            Arc::clone(&completed.view),
+        );
+        assert!(Arc::ptr_eq(
+            &renewed,
+            &provider
+                .scan_view_cache
+                .latest_complete
+                .load_full()
+                .expect("retained renewal")
+        ));
+    }
+
+    /// Both a completed build found by draining and a pending same-key build
+    /// inherit the version and time validated by the joining scan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_equal_key_in_flight_renews_capture_metadata() {
+        use futures::FutureExt;
+
+        for build_complete in [false, true] {
+            let ctx = SessionContext::new();
+            let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+                "scan_view_equal_key_in_flight",
+                ctx.runtime_env(),
+                VortexConfig {
+                    inline_max_rows: 1024,
+                    ..VortexConfig::default()
+                },
+            )
+            .await;
+            let schema = Arc::clone(&provider.table_metadata.schema);
+            insert_batch(&provider, id_value_batch(schema, &[1], &[10])).await;
+            let first = provider
+                .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+                .await
+                .expect("warm inline view");
+            assert!(!first.raw.inlined_view.is_empty());
+            let completed = provider
+                .scan_view_cache
+                .latest_complete
+                .load_full()
+                .expect("completed capture");
+            let build: ScanViewBuild = futures::future::ready(Ok(Arc::clone(&first)))
+                .boxed()
+                .shared();
+            if build_complete {
+                assert!(build.clone().now_or_never().is_some());
+            }
+            {
+                let mut in_flight = provider.scan_view_cache.in_flight.lock();
+                in_flight.clear();
+                in_flight.push(InFlightScanView {
+                    key: completed.key.clone(),
+                    order: completed.order,
+                    captured_at: completed.captured_at,
+                    build,
+                });
+            }
+            provider.scan_view_cache.latest_complete.store(None);
+            provider.notify_scan_input_change();
+            let captured_after = Instant::now();
+            let reused = provider
+                .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+                .await
+                .expect("reuse in-flight view");
+            assert!(Arc::ptr_eq(&first, &reused));
+            let renewed = provider
+                .scan_view_cache
+                .latest_complete
+                .load_full()
+                .expect("renewed capture");
+            assert_eq!(
+                renewed.order,
+                provider.scan_input_version.load(Ordering::Acquire)
+            );
+            assert!(renewed.captured_at >= captured_after);
+        }
+    }
+
+    /// File appends can leave the captured view's identity unchanged. After
+    /// validating that identity, the cache must reuse it without another capture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_reuses_after_file_append() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_position_based_table_with_vortex_config(
+            "scan_view_file_append",
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                compaction_background_interval_ms: 0,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let provider = Arc::new(provider);
+        provider.init_scan_view_cache();
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+
+        let first = provider
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await
+            .expect("warm scan view");
+        assert!(
+            first.raw.inlined_view.is_empty(),
+            "fixture must write files"
+        );
+        let first_key = first.raw.key(first.structural_version);
+        let first_order = provider.scan_input_version.load(Ordering::Acquire);
+        insert_batch(&provider, id_value_batch(schema, &[2], &[20])).await;
+        assert!(provider.scan_input_version.load(Ordering::Acquire) > first_order);
+        assert_eq!(scan_id_values(&provider).await, vec![(1, 10), (2, 20)]);
+        let completed = provider
+            .scan_view_cache
+            .latest_complete
+            .load_full()
+            .expect("completed post-append view");
+        assert_eq!(
+            completed.key, first_key,
+            "file append keeps the view identity"
+        );
+        assert!(Arc::ptr_eq(&first, &completed.view));
+        assert_eq!(
+            completed.order,
+            provider.scan_input_version.load(Ordering::Acquire),
+            "validated equal-key reuse must advance the cached order"
+        );
+
+        *provider.test_post_scan_input_capture_hook.lock() = Some(Box::new(|| {
+            Box::pin(async { panic!("an unchanged table must reuse without recapturing") })
+        }));
+        assert_eq!(scan_id_values(&provider).await, vec![(1, 10), (2, 20)]);
+    }
+
+    /// Position-based deletes must invalidate a warmed view on a table with no
+    /// primary key, whose deletion snapshot has no index pointer in the cache key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_cache_position_delete_sees_committed_rows() {
+        for inline_max_rows in [0, 1024] {
+            let ctx = SessionContext::new();
+            let (provider, _catalog, _tmp) = create_position_based_table_with_vortex_config(
+                "scan_view_position_delete",
+                ctx.runtime_env(),
+                VortexConfig {
+                    inline_max_rows,
+                    compaction_background_interval_ms: 0,
+                    ..VortexConfig::default()
+                },
+            )
+            .await;
+            let provider = Arc::new(provider);
+            provider.init_scan_view_cache();
+            let schema = Arc::clone(&provider.table_metadata.schema);
+            insert_batch(&provider, id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])).await;
+            assert!(provider.pk_deletion_strategy().is_position_based());
+            let first = provider
+                .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+                .await
+                .expect("warm pre-delete view");
+            assert_eq!(first.raw.inlined_view.is_empty(), inline_max_rows == 0);
+            let reused = provider
+                .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+                .await
+                .expect("reuse pre-delete view");
+            assert!(
+                Arc::ptr_eq(&first, &reused),
+                "pre-delete cache must be warm"
+            );
+            let delete = provider
+                .delete_from(&ctx.state(), vec![col("id").eq(lit_i64(2))])
+                .await
+                .expect("position delete plan");
+            collect(delete, ctx.task_ctx())
+                .await
+                .expect("execute delete");
+            assert_eq!(scan_id_values(&provider).await, vec![(1, 10), (3, 30)]);
+        }
+    }
+
     fn value_for_id(pairs: &[(i64, i64)], id: i64) -> Option<i64> {
         pairs
             .iter()
@@ -61036,6 +61285,19 @@ mod tests {
         table_name: &str,
         runtime_env: Arc<RuntimeEnv>,
     ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        create_position_based_table_with_vortex_config(
+            table_name,
+            runtime_env,
+            VortexConfig::default(),
+        )
+        .await
+    }
+
+    async fn create_position_based_table_with_vortex_config(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        vortex_config: VortexConfig,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
         use arrow::datatypes::{DataType, Field, Schema};
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -61060,7 +61322,7 @@ mod tests {
             on_conflict: None,
             base_path: data_dir,
             partition_column: None,
-            vortex_config: VortexConfig::default(),
+            vortex_config,
         };
 
         let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)

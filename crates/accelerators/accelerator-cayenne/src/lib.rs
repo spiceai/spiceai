@@ -784,9 +784,9 @@ fn changes_scan_view_lag() -> Duration {
 /// lag-cached view of its own table.
 fn scan_view_reuse_for(source: &dyn AccelerationSource) -> ScanViewReuse {
     let is_readonly_changes = !source.allows_write()
-        && source
-            .acceleration()
-            .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Changes));
+        && source.acceleration().is_some_and(|acceleration| {
+            resolved_refresh_mode(source, acceleration) == RefreshMode::Changes
+        });
     if is_readonly_changes {
         ScanViewReuse::WithinLag(changes_scan_view_lag())
     } else {
@@ -7991,8 +7991,8 @@ mod tests {
 
     /// [`scan_view_reuse_for`]: `WithinLag` only for read-only `refresh_mode: changes`.
     /// Every other refresh mode, plus writable `changes` (write-back), invalidates
-    /// on write. Unset `refresh_mode` and no acceleration configured are the same
-    /// as `UntilInvalidated`.
+    /// on write. An unset mode uses the connector's default; no acceleration
+    /// configured uses `UntilInvalidated`.
     #[test]
     fn scan_view_reuse_for_all_refresh_modes_and_writability() {
         let modes = [
@@ -8004,27 +8004,32 @@ mod tests {
             Some(RefreshMode::Caching),
             Some(RefreshMode::Snapshot),
         ];
-        for mode in modes {
-            for allows_write in [false, true] {
-                let expect_lag = mode == Some(RefreshMode::Changes) && !allows_write;
-                let mut source = TestAccelerationSource::new("t").with_allows_write(allows_write);
-                if let Some(refresh_mode) = mode {
-                    source = source.with_acceleration(Acceleration {
-                        refresh_mode: Some(refresh_mode),
-                        ..Acceleration::default()
-                    });
-                }
-                let reuse = scan_view_reuse_for(&source);
-                if expect_lag {
-                    assert!(
-                        matches!(reuse, ScanViewReuse::WithinLag(_)),
-                        "read-only changes must WithinLag (mode={mode:?}, write={allows_write})"
-                    );
-                } else {
+        let connectors = [
+            (None, RefreshMode::Full),
+            (Some("file"), RefreshMode::Full),
+            (Some("cdc"), RefreshMode::Changes),
+            (Some("debezium"), RefreshMode::Changes),
+            (Some("sink"), RefreshMode::Disabled),
+        ];
+        for (connector, default_mode) in connectors {
+            for mode in modes {
+                for allows_write in [false, true] {
+                    let expect_lag =
+                        mode.unwrap_or(default_mode) == RefreshMode::Changes && !allows_write;
+                    let mut source = TestAccelerationSource::new("t")
+                        .with_allows_write(allows_write)
+                        .with_acceleration(Acceleration {
+                            refresh_mode: mode,
+                            ..Acceleration::default()
+                        });
+                    if let Some(connector) = connector {
+                        source = source.with_connector_name(connector);
+                    }
+                    let reuse = scan_view_reuse_for(&source);
                     assert_eq!(
-                        reuse,
-                        ScanViewReuse::UntilInvalidated,
-                        "must invalidate on write (mode={mode:?}, write={allows_write})"
+                        matches!(reuse, ScanViewReuse::WithinLag(_)),
+                        expect_lag,
+                        "connector={connector:?}, mode={mode:?}, write={allows_write}: {reuse:?}"
                     );
                 }
             }
