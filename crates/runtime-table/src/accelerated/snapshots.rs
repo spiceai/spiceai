@@ -227,6 +227,7 @@ pub fn spawn_snapshot_interval_task(
     snapshot_manager: Option<Arc<SnapshotManager>>,
     accelerator_write_mutex: Arc<Mutex<()>>,
     dataset_name: TableReference,
+    component_label: &'static str,
     checkpoint_schema: Arc<Schema>,
     federated_schema: Arc<Schema>,
     runtime_status: Arc<RuntimeStatus>,
@@ -246,7 +247,7 @@ pub fn spawn_snapshot_interval_task(
     let snapshot_manager = snapshot_manager?;
 
     tracing::info!(
-        "Snapshots for dataset {dataset_name} will be created every {}s",
+        "Snapshots for {component_label} '{dataset_name}' will be created every {}s",
         interval_duration.as_secs()
     );
 
@@ -294,6 +295,7 @@ pub fn spawn_snapshot_interval_task(
             &checkpoint_schema,
             &accelerator_write_mutex,
             &dataset_name,
+            component_label,
             &last_updated_at,
             // Force creation when interval already elapsed.
             // Even though this may create a snapshot identical to the last one, we do this to avoid
@@ -325,6 +327,7 @@ pub fn spawn_snapshot_interval_task(
                 &checkpoint_schema,
                 &accelerator_write_mutex,
                 &dataset_name,
+                component_label,
                 &last_updated_at,
                 ForceCreate(false),
                 accelerator.as_ref(),
@@ -348,6 +351,7 @@ pub fn create_periodic_snapshot_callback(
     snapshot_manager: Option<Arc<SnapshotManager>>,
     accelerator_write_mutex: Arc<Mutex<()>>,
     dataset_name: &TableReference,
+    component_label: &'static str,
     checkpoint_schema: Arc<Schema>,
     federated_schema: Arc<Schema>,
     runtime_status: Arc<RuntimeStatus>,
@@ -367,7 +371,7 @@ pub fn create_periodic_snapshot_callback(
             let dataset_name = dataset_name.clone();
 
             tracing::info!(
-                "Snapshots for dataset {dataset_name} will be created every {batches} batch updates"
+                "Snapshots for {component_label} '{dataset_name}' will be created every {batches} batch updates"
             );
 
             // Track number of processed batches since last snapshot
@@ -404,6 +408,7 @@ pub fn create_periodic_snapshot_callback(
                         &checkpoint_schema_clone,
                         &accelerator_write_mutex_clone,
                         &dataset_name_clone,
+                        component_label,
                         &last_updated_at_clone,
                         ForceCreate(true),
                         accelerator_clone.as_ref(),
@@ -455,6 +460,7 @@ pub fn create_periodic_snapshot_callback(
                             &checkpoint_schema,
                             &accelerator_write_mutex,
                             &dataset_name,
+                            component_label,
                             &last_updated_at,
                             ForceCreate(false),
                             accelerator.as_ref(),
@@ -481,6 +487,7 @@ pub async fn create_checkpoint_and_snapshot(
     checkpoint_schema: &Arc<Schema>,
     accelerator_write_mutex: &Arc<Mutex<()>>,
     dataset_name: &TableReference,
+    component_label: &'static str,
     last_updated_at: &Arc<AtomicI64>,
     force_create: ForceCreate,
     accelerator: Option<&Arc<dyn TableProvider>>,
@@ -505,7 +512,8 @@ pub async fn create_checkpoint_and_snapshot(
         snapshot_manager
     } else {
         tracing::warn!(
-            "Skipped creating a snapshot of '{dataset_name}', so its snapshot series keeps the previously published contents: the rows now in the acceleration are not known to be its configured definition applied to its source"
+            "{}",
+            skipped_snapshot_unproven_definition_warning(component_label, dataset_name)
         );
         None
     };
@@ -531,10 +539,14 @@ pub async fn create_checkpoint_and_snapshot(
             // Expected under shutdown — reporting it at `warn` makes a clean stop
             // look like a failure. See `is_shutdown_cancellation`.
             tracing::debug!(
-                "Did not checkpoint dataset {dataset_name}: the runtime is shutting down ({e})"
+                "{}",
+                checkpoint_shutdown_message(component_label, dataset_name, &e)
             );
         } else {
-            tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
+            tracing::warn!(
+                "{}",
+                checkpoint_failure_message(component_label, dataset_name, &e)
+            );
         }
         return;
     }
@@ -577,6 +589,33 @@ pub async fn create_checkpoint_and_snapshot(
             }
         }
     }
+}
+
+/// Datasets and views share this path, so the wording uses `component_label`
+/// (`"dataset"` / `"view"`) rather than hard-coding one of them.
+fn skipped_snapshot_unproven_definition_warning(
+    component_label: &str,
+    name: &TableReference,
+) -> String {
+    format!(
+        "Skipped creating a snapshot of {component_label} '{name}', so its snapshot series keeps the previously published contents: the rows now in the acceleration are not known to be this {component_label}'s configured definition applied to its source"
+    )
+}
+
+fn checkpoint_shutdown_message(
+    component_label: &str,
+    name: &TableReference,
+    error: impl std::fmt::Display,
+) -> String {
+    format!("Did not checkpoint {component_label} '{name}': the runtime is shutting down ({error})")
+}
+
+fn checkpoint_failure_message(
+    component_label: &str,
+    name: &TableReference,
+    error: impl std::fmt::Display,
+) -> String {
+    format!("Failed to checkpoint {component_label} '{name}': {error}")
 }
 
 /// Gets the row count from the accelerator using the `DataFrame` API.
@@ -623,6 +662,53 @@ async fn get_row_count(
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};
+
+    #[test]
+    fn skipped_snapshot_warning_names_a_view_as_a_view() {
+        let name = TableReference::bare("orders_us");
+        let message = skipped_snapshot_unproven_definition_warning("view", &name);
+        assert!(
+            message.contains("view 'orders_us'"),
+            "a skipped view snapshot must name the view, got {message}"
+        );
+        assert!(
+            message.contains("this view's configured definition"),
+            "the skip reason must use the same component label, got {message}"
+        );
+        assert!(
+            !message.contains("dataset"),
+            "a view must not be reported as a dataset: {message}"
+        );
+    }
+
+    #[test]
+    fn skipped_snapshot_warning_still_names_a_dataset_as_a_dataset() {
+        let name = TableReference::bare("orders");
+        let message = skipped_snapshot_unproven_definition_warning("dataset", &name);
+        assert!(
+            message.contains("dataset 'orders'"),
+            "a skipped dataset snapshot must keep the dataset label, got {message}"
+        );
+        assert!(
+            message.contains("this dataset's configured definition"),
+            "the skip reason must use the same component label, got {message}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_messages_do_not_hard_code_dataset() {
+        let name = TableReference::bare("orders_us");
+        let shutdown = checkpoint_shutdown_message("view", &name, "cancelled");
+        let failure = checkpoint_failure_message("view", &name, "disk full");
+        assert!(
+            shutdown.contains("view 'orders_us'") && !shutdown.contains("dataset"),
+            "checkpoint shutdown debug must use the component label: {shutdown}"
+        );
+        assert!(
+            failure.contains("view 'orders_us'") && !failure.contains("dataset"),
+            "checkpoint failure warning must use the component label: {failure}"
+        );
+    }
 
     /// A live (in-place) widening evolution moves the accelerator ahead of the
     /// start-time federated schema; the checkpoint must record the accelerator's

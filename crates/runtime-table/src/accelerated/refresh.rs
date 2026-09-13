@@ -35,7 +35,7 @@ use cache::Caching;
 use data_accelerator_api::BootstrapStatus;
 use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
-use datafusion::datasource::TableProvider;
+use datafusion::datasource::{TableProvider, TableType};
 use datafusion_expr::Expr;
 use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
@@ -783,6 +783,19 @@ impl Refresher {
         self
     }
 
+    /// How to name this table in a user-facing snapshot message.
+    ///
+    /// The snapshot path is shared by datasets and views. An immediately
+    /// available view provider is a view; everything else is a dataset.
+    fn component_label(&self) -> &'static str {
+        match &*self.federated {
+            FederatedTable::Immediate(provider) if provider.table_type() == TableType::View => {
+                "view"
+            }
+            _ => "dataset",
+        }
+    }
+
     /// Synchronize further refreshes with an existing accelerated table after the initial load completes
     pub fn synchronize_with(&mut self, synchronized_table: SynchronizedTable) -> &mut Self {
         self.synchronize_with = Some(synchronized_table);
@@ -928,6 +941,7 @@ impl Refresher {
         acceleration_refresh_mode: AccelerationRefreshMode,
     ) -> super::Result<Option<tokio::task::JoinHandle<()>>> {
         let dataset_name = self.dataset_name.clone();
+        let component_label = self.component_label();
         let time_column = self.refresh.read().await.time_column.clone();
         let initial_refresh_delay = {
             let refresh = self.refresh.read().await;
@@ -996,6 +1010,7 @@ impl Refresher {
                             snapshot_manager.clone(),
                             Arc::clone(&self.accelerator_write_mutex),
                             dataset_name.clone(),
+                            component_label,
                             Arc::clone(&checkpoint_schema),
                             Arc::clone(&federated_schema),
                             Arc::clone(&self.runtime_status),
@@ -1019,6 +1034,7 @@ impl Refresher {
                             snapshot_manager,
                             Arc::clone(&self.accelerator_write_mutex),
                             &self.dataset_name,
+                            component_label,
                             Arc::clone(&checkpoint_schema),
                             Arc::clone(&federated_schema),
                             Arc::clone(&self.runtime_status),
@@ -1120,6 +1136,7 @@ impl Refresher {
                         snapshot_manager.clone(),
                         Arc::clone(&self.accelerator_write_mutex),
                         dataset_name.clone(),
+                        component_label,
                         Arc::clone(&checkpoint_schema),
                         Arc::clone(&federated_schema),
                         Arc::clone(&self.runtime_status),
@@ -1144,7 +1161,7 @@ impl Refresher {
 
         if create_checkpoint_snapshot_after_refresh && snapshot_manager.is_some() {
             tracing::info!(
-                "Snapshots for dataset {dataset_name} will be created after every refresh"
+                "Snapshots for {component_label} '{dataset_name}' will be created after every refresh"
             );
 
             // Spawn a task to create initial snapshot once runtime is ready
@@ -1179,6 +1196,7 @@ impl Refresher {
                             &checkpoint_schema_clone,
                             &accelerator_write_mutex_clone,
                             &dataset_name_clone,
+                            component_label,
                             &last_updated_at_clone,
                             ForceCreate(true),
                             Some(&accelerator_clone),
@@ -1295,6 +1313,7 @@ impl Refresher {
                                 &checkpoint_schema,
                                 &snapshot_mutex,
                                 &dataset_name,
+                                component_label,
                                 &last_updated_at,
                                 ForceCreate(false),
                                 Some(&accelerator),
