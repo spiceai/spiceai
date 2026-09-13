@@ -25,6 +25,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_tools::schema::expand_views_schema;
 use async_trait::async_trait;
 use dataformat_json::{Format, SpiceJsonFormat};
+use dataformat_orc::OrcFormat;
 use datafusion::catalog::Session;
 use datafusion::common::{Constraints, DFSchema, GetExt, Result as DFResult, ScalarValue};
 use datafusion::config::{ConfigField, TableParquetOptions};
@@ -78,11 +79,20 @@ use runtime_object_store::registry::default_runtime_env;
 /// Maximum number of files to scan when validating that the schema source path contains objects with the expected extension.
 const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
 
+/// Maximum matching `ORC` objects whose footers are merged when inferring a
+/// collection schema. The default listing path otherwise passes only the
+/// newest object to [`FileFormat::infer_schema`], which drops columns that
+/// appear only in older files. Scan-time NULL backfill can restore those
+/// columns only when the merged schema already lists them. Set
+/// `schema_source_path` to a smaller prefix if load-time footer reads of a
+/// very large hive table are too expensive.
+const ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT: usize = 10_000;
+
 #[derive(Clone, Debug)]
 /// Wraps a `ListingTable` to short-circuit broad object-store listings when
-/// queries include `location` predicates. Instead of listing a large prefix, it
-/// directly fetches the specific objects referenced in the predicate, which
-/// significantly reduces LIST calls on large buckets.
+/// queries include `location` predicates, and to apply format-selected Hive
+/// listing (`*.orc` / `*.parquet`) so extensionless data objects are scanned
+/// without picking up job-marker files.
 struct LocationPruningListingTable {
     inner: Arc<ListingTable>,
     object_store: Arc<dyn ObjectStore>,
@@ -93,6 +103,10 @@ struct LocationPruningListingTable {
     /// reliably reconstruct it from `table_schema` when partition columns also
     /// appear in the file (causing duplicates in `table_schema`).
     file_schema: SchemaRef,
+    /// Listing extension from [`ListingTableConnector::get_file_format_and_extension`].
+    /// Format-selected values (`*.orc`, `*.parquet`) list through
+    /// [`file_matches_extension`] instead of `DataFusion`'s suffix filter.
+    listing_extension: String,
 }
 
 impl LocationPruningListingTable {
@@ -101,13 +115,19 @@ impl LocationPruningListingTable {
         object_store: Arc<dyn ObjectStore>,
         table_path: ListingTableUrl,
         file_schema: SchemaRef,
+        listing_extension: impl Into<String>,
     ) -> Self {
         Self {
             inner,
             object_store,
             table_path,
             file_schema,
+            listing_extension: listing_extension.into(),
         }
+    }
+
+    fn uses_format_selected_listing(&self) -> bool {
+        format_selected_data_suffix(&self.listing_extension).is_some()
     }
 
     fn partition_column_types(&self) -> &[(String, datafusion::arrow::datatypes::DataType)] {
@@ -140,131 +160,63 @@ impl LocationPruningListingTable {
         }
         Some(values)
     }
-}
 
-fn parse_partition_values(
-    table_path: &ListingTableUrl,
-    file_path: &Path,
-    table_partition_cols: &[(String, datafusion::arrow::datatypes::DataType)],
-) -> Option<Vec<String>> {
-    // Extract hive-style partition values (e.g., year=2023/month=2) from the
-    // file path relative to the table path, validating the expected partition
-    // column names.
-    let subpath = table_path.strip_prefix(file_path)?;
-
-    let mut part_values = Vec::with_capacity(table_partition_cols.len());
-    for (part, (expected_partition, _)) in subpath.zip(table_partition_cols) {
-        match part.split_once('=') {
-            Some((name, val)) if name == expected_partition => part_values.push(val.to_string()),
-            _ => return None,
-        }
-    }
-    Some(part_values)
-}
-
-#[deny(clippy::missing_trait_methods)]
-#[async_trait]
-impl TableProvider for LocationPruningListingTable {
-    fn schema(&self) -> Arc<Schema> {
-        self.inner.schema()
+    fn partitioned_file_for_meta(&self, meta: ObjectMeta) -> Option<PartitionedFile> {
+        let partition_values = if self.partition_column_types().is_empty() {
+            Vec::new()
+        } else {
+            self.collect_partition_values(&meta)?
+        };
+        Some(PartitionedFile {
+            object_meta: meta,
+            partition_values,
+            range: None,
+            statistics: None,
+            extensions: FileExtensions::new(),
+            metadata_size_hint: None,
+            ordering: None,
+            table_reference: None,
+        })
     }
 
-    fn table_type(&self) -> datafusion::datasource::TableType {
-        self.inner.table_type()
-    }
-
-    fn get_table_definition(&self) -> Option<&str> {
-        self.inner.get_table_definition()
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&datafusion_expr::Expr],
-    ) -> DFResult<Vec<datafusion_expr::TableProviderFilterPushDown>> {
-        self.inner.supports_filters_pushdown(filters)
-    }
-
-    fn constraints(&self) -> Option<&Constraints> {
-        self.inner.constraints()
-    }
-
-    async fn scan(
+    async fn scan_format_selected_listing(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        filters: &[datafusion_expr::Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        let Some(locations) = extract_location_predicates(filters) else {
-            return self.inner.scan(state, projection, filters, limit).await;
-        };
-
-        // Ensure the query runtime uses the same object store configuration (endpoint/region)
-        // as the listing table, even when we bypass listing.
         state.runtime_env().register_object_store(
             self.object_store_url().as_ref(),
             Arc::clone(&self.object_store),
         );
 
-        let mut files: Vec<PartitionedFile> = Vec::with_capacity(locations.len());
+        let mut file_stream = self
+            .table_path
+            .list_all_files(state, self.object_store.as_ref(), "")
+            .await?;
 
-        for loc in locations {
-            let Ok(url) = Url::parse(&loc) else {
-                tracing::warn!(location = loc, "Ignoring invalid location predicate URL");
-                continue;
-            };
-
-            // Enforce that the requested location stays within the configured object store/prefix.
-            let location_listing = match ListingTableUrl::parse(&loc) {
-                Ok(l) => l,
-                Err(err) => {
-                    tracing::warn!(%err, location = loc, "Ignoring location predicate outside table prefix");
-                    continue;
-                }
-            };
-            if location_listing.object_store() != self.object_store_url()
-                || !self.table_path.contains(location_listing.prefix(), false)
-            {
-                tracing::warn!(
-                    location = loc,
-                    "Ignoring location predicate outside table prefix/object store"
-                );
+        let mut files: Vec<PartitionedFile> = Vec::new();
+        while let Some(meta) = file_stream.try_next().await? {
+            if !file_matches_extension(&meta.location, &self.listing_extension) {
                 continue;
             }
-
-            let path = Path::from(url.path().trim_start_matches('/'));
-
-            let meta = match self.object_store.head(&path).await {
-                Ok(m) => m,
-                Err(err) => {
-                    tracing::warn!(%err, location = loc, "Failed to head object for location predicate");
-                    continue;
-                }
-            };
-
-            let Some(partition_values) = self.collect_partition_values(&meta) else {
-                tracing::warn!(
-                    location = loc,
-                    "Unable to parse partition values for location predicate; skipping file"
-                );
-                continue;
-            };
-
-            files.push(PartitionedFile {
-                object_meta: meta,
-                partition_values,
-                range: None,
-                statistics: None,
-                extensions: FileExtensions::new(),
-                metadata_size_hint: None,
-                ordering: None,
-                table_reference: None,
-            });
+            if let Some(file) = self.partitioned_file_for_meta(meta) {
+                files.push(file);
+            }
         }
 
+        self.scan_partitioned_files(state, files, projection, limit)
+            .await
+    }
+
+    async fn scan_partitioned_files(
+        &self,
+        state: &dyn Session,
+        files: Vec<PartitionedFile>,
+        projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
+    ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         if files.is_empty() {
-            // Apply the projection to the schema so that the EmptyExec output
-            // schema matches what the physical planner expects from the scan.
             let schema = if let Some(proj) = projection {
                 Arc::new(self.schema().project(proj)?)
             } else {
@@ -318,6 +270,141 @@ impl TableProvider for LocationPruningListingTable {
             .create_physical_plan(state, config)
             .await
     }
+}
+
+fn parse_partition_values(
+    table_path: &ListingTableUrl,
+    file_path: &Path,
+    table_partition_cols: &[(String, datafusion::arrow::datatypes::DataType)],
+) -> Option<Vec<String>> {
+    // Extract hive-style partition values (e.g., year=2023/month=2) from the
+    // file path relative to the table path, validating the expected partition
+    // column names.
+    let subpath = table_path.strip_prefix(file_path)?;
+
+    let mut part_values = Vec::with_capacity(table_partition_cols.len());
+    for (part, (expected_partition, _)) in subpath.zip(table_partition_cols) {
+        match part.split_once('=') {
+            Some((name, val)) if name == expected_partition => part_values.push(val.to_string()),
+            _ => return None,
+        }
+    }
+    Some(part_values)
+}
+
+#[deny(clippy::missing_trait_methods)]
+#[async_trait]
+impl TableProvider for LocationPruningListingTable {
+    fn schema(&self) -> Arc<Schema> {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> datafusion::datasource::TableType {
+        self.inner.table_type()
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.inner.get_table_definition()
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&datafusion_expr::Expr],
+    ) -> DFResult<Vec<datafusion_expr::TableProviderFilterPushDown>> {
+        // Format-selected listing builds its own file list, so partition
+        // predicates are applied as residual filters rather than pruned here.
+        if self.uses_format_selected_listing() {
+            return Ok(vec![
+                datafusion_expr::TableProviderFilterPushDown::Inexact;
+                filters.len()
+            ]);
+        }
+        self.inner.supports_filters_pushdown(filters)
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.inner.constraints()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[datafusion_expr::Expr],
+        limit: Option<usize>,
+    ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        let Some(locations) = extract_location_predicates(filters) else {
+            if self.uses_format_selected_listing() {
+                return self
+                    .scan_format_selected_listing(state, projection, limit)
+                    .await;
+            }
+            return self.inner.scan(state, projection, filters, limit).await;
+        };
+
+        // Ensure the query runtime uses the same object store configuration (endpoint/region)
+        // as the listing table, even when we bypass listing.
+        state.runtime_env().register_object_store(
+            self.object_store_url().as_ref(),
+            Arc::clone(&self.object_store),
+        );
+
+        let mut files: Vec<PartitionedFile> = Vec::with_capacity(locations.len());
+
+        for loc in locations {
+            let Ok(url) = Url::parse(&loc) else {
+                tracing::warn!(location = loc, "Ignoring invalid location predicate URL");
+                continue;
+            };
+
+            // Enforce that the requested location stays within the configured object store/prefix.
+            let location_listing = match ListingTableUrl::parse(&loc) {
+                Ok(l) => l,
+                Err(err) => {
+                    tracing::warn!(%err, location = loc, "Ignoring location predicate outside table prefix");
+                    continue;
+                }
+            };
+            if location_listing.object_store() != self.object_store_url()
+                || !self.table_path.contains(location_listing.prefix(), false)
+            {
+                tracing::warn!(
+                    location = loc,
+                    "Ignoring location predicate outside table prefix/object store"
+                );
+                continue;
+            }
+
+            let path = Path::from(url.path().trim_start_matches('/'));
+
+            let meta = match self.object_store.head(&path).await {
+                Ok(m) => m,
+                Err(err) => {
+                    tracing::warn!(%err, location = loc, "Failed to head object for location predicate");
+                    continue;
+                }
+            };
+
+            if self.uses_format_selected_listing()
+                && !file_matches_extension(&meta.location, &self.listing_extension)
+            {
+                continue;
+            }
+
+            let Some(file) = self.partitioned_file_for_meta(meta) else {
+                tracing::warn!(
+                    location = loc,
+                    "Unable to parse partition values for location predicate; skipping file"
+                );
+                continue;
+            };
+
+            files.push(file);
+        }
+
+        self.scan_partitioned_files(state, files, projection, limit)
+            .await
+    }
 
     fn get_logical_plan(
         &self,
@@ -346,6 +433,12 @@ impl TableProvider for LocationPruningListingTable {
     }
 
     fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        if self.uses_format_selected_listing() {
+            // The inner `ListingTable` suffixes with an empty extension and
+            // would either miss extensionless objects or treat marker-only
+            // listings as an exact empty table.
+            return None;
+        }
         self.inner.statistics()
     }
 
@@ -615,6 +708,7 @@ pub trait ListingTableConnector: DataConnector {
     /// to infer the format from the dataset's file extension. It supports both tabular and
     /// unstructured formats. It supports the following tabular formats:
     ///  - parquet
+    ///  - orc
     ///  - vortex (not available on Windows)
     ///  - csv
     ///
@@ -630,11 +724,14 @@ pub trait ListingTableConnector: DataConnector {
         Self: Display,
     {
         let params = self.get_params();
-        let configured_extension = params
-            .get("file_extension")
-            .expose()
-            .ok()
-            .and_then(parse_file_extension_param);
+        let file_extension_param = params.get("file_extension").expose().ok();
+        let format_selected_listing =
+            file_extension_param.is_some_and(is_format_selected_file_extension_param);
+        let configured_extension = if format_selected_listing {
+            None
+        } else {
+            file_extension_param.and_then(parse_file_extension_param)
+        };
         let path_extension = detect_file_extension_from_url_or_path(&dataset.from);
         let detected_extension = configured_extension.as_ref().or(path_extension.as_ref());
         let inferred_file_extension =
@@ -651,7 +748,10 @@ pub trait ListingTableConnector: DataConnector {
             detected_extension.and_then(|ext| ext.compression),
         )?;
 
-        match (file_format_param.as_deref(), inferred_file_extension) {
+        // Annotate before `?` so rustc unifies each arm as `Arc<dyn FileFormat>`
+        // instead of pinning the match to the first (`CsvFormat`) arm.
+        let result: DataConnectorResult<(Option<Arc<dyn FileFormat>>, String)> =
+            match (file_format_param.as_deref(), inferred_file_extension) {
             (Some("csv"), _) | (None, Some("csv")) => Ok((
                 Some(self.delimiter_separated_format(
                     params,
@@ -764,6 +864,15 @@ pub trait ListingTableConnector: DataConnector {
                     FileCompressionType::UNCOMPRESSED,
                 ),
             )),
+            (Some("orc"), _) | (None, Some("orc")) => Ok((
+                Some(Arc::new(OrcFormat::new())),
+                listing_extension(
+                    configured_extension.as_ref(),
+                    path_extension.as_ref(),
+                    ".orc",
+                    FileCompressionType::UNCOMPRESSED,
+                ),
+            )),
             (Some("auto"), ext) => {
                 match ext {
                     Some("csv") => Ok((
@@ -834,6 +943,15 @@ pub trait ListingTableConnector: DataConnector {
                             FileCompressionType::UNCOMPRESSED,
                         ),
                     )),
+                    Some("orc") => Ok((
+                        Some(Arc::new(OrcFormat::new())),
+                        listing_extension(
+                            configured_extension.as_ref(),
+                            path_extension.as_ref(),
+                            ".orc",
+                            FileCompressionType::UNCOMPRESSED,
+                        ),
+                    )),
                     #[cfg(not(windows))]
                     Some("vortex") => Ok((
                         Some(
@@ -869,6 +987,16 @@ pub trait ListingTableConnector: DataConnector {
                         source: "Missing file format".into(),
                     },
                 ),
+        };
+
+        if format_selected_listing {
+            let (file_format, default_extension) = result?;
+            Ok((
+                file_format,
+                format_selected_listing_extension(&default_extension),
+            ))
+        } else {
+            result
         }
     }
 
@@ -1180,6 +1308,23 @@ pub trait ListingTableConnector: DataConnector {
                     SensitiveListingTableUrl::new(schema_infer_url, url),
                     schema_infer_meta,
                 )
+            } else if table_path.is_collection() && listing_extension_is_orc(extension) {
+                // Confirm matching objects exist (same errors as other formats),
+                // then infer from the collection so `OrcFormat::infer_schema`
+                // receives every matching object, not only the newest file.
+                get_last_modified(
+                    format!("{self}"),
+                    dataset,
+                    extension,
+                    table_path.clone(),
+                    &ctx,
+                    &object_store,
+                )
+                .await?;
+                (
+                    SensitiveListingTableUrl::new(table_path.clone(), url.clone()),
+                    None,
+                )
             } else {
                 // Get the last modified object for the provided ObjectStore to infer the schema.
                 // Report an error if no files matching required extension are found.
@@ -1211,8 +1356,8 @@ pub trait ListingTableConnector: DataConnector {
         );
 
         let session_state = ctx.state();
-        let mut options = ListingOptions::new(file_format)
-            .with_file_extension(extension)
+        let mut options = ListingOptions::new(Arc::clone(&file_format))
+            .with_file_extension(datafusion_listing_file_extension(extension))
             .with_session_config_options(session_state.config());
 
         options =
@@ -1222,9 +1367,20 @@ pub trait ListingTableConnector: DataConnector {
                 }
             }));
 
-        let resolved_schema = options
-            .infer_schema(&ctx.state(), schema_infer_url.expose_sensitive_url())
-            .await
+        let infer_listing_url = schema_infer_url.expose_sensitive_url();
+        let resolved_schema =
+            if listing_extension_is_orc(extension) && infer_listing_url.is_collection() {
+                infer_orc_collection_schema(
+                    &ctx.state(),
+                    infer_listing_url,
+                    &object_store,
+                    extension,
+                    &file_format,
+                )
+                .await
+            } else {
+                options.infer_schema(&ctx.state(), infer_listing_url).await
+            }
             .map_err(|e| match e {
                 DataFusionError::ObjectStore(object_store_error) => {
                     self.handle_object_store_error(dataset, *object_store_error)
@@ -1244,6 +1400,25 @@ pub trait ListingTableConnector: DataConnector {
         if dataset.get_param("hive_partitioning_enabled", false) && table_path.is_collection() {
             let inferred_partitions = match schema_infer_meta {
                 Some(meta) => infer_partitions_with_types_from_files(&table_path, &[meta]),
+                None if format_selected_data_suffix(extension).is_some() => {
+                    match list_matching_listing_files(
+                        &ctx.state(),
+                        &table_path,
+                        object_store.as_ref(),
+                        extension,
+                        10,
+                    )
+                    .await
+                    {
+                        Ok(files) => infer_partitions_with_types_from_files(&table_path, &files),
+                        Err(e) => {
+                            tracing::debug!(
+                                "Failed to list files for partition inference for {table_path:?}: {e}"
+                            );
+                            Ok(Vec::new())
+                        }
+                    }
+                }
                 None => {
                     infer_partitions_with_types_prefix(&ctx.state(), &table_path, extension).await
                 }
@@ -1334,12 +1509,13 @@ pub trait ListingTableConnector: DataConnector {
             )
         });
 
-        if has_location_metadata {
+        if has_location_metadata || format_selected_data_suffix(extension).is_some() {
             let wrapped = LocationPruningListingTable::new(
                 table_arc,
                 Arc::clone(&object_store),
                 table_path,
                 file_schema,
+                extension,
             );
             Ok(Arc::new(wrapped))
         } else {
@@ -1710,14 +1886,17 @@ async fn get_last_modified(
 
         if let Some(file_ext) = detect_file_extension_from_path(file.location.as_ref()) {
             found_extensions.insert(file_ext.file_extension.clone());
-            if file_matches_extension(&file.location, extension) {
-                if let Some(ref current) = last_modified_file {
-                    if current.last_modified < file.last_modified {
-                        last_modified_file = Some(file);
-                    }
-                } else {
+        } else {
+            found_extensions.insert(object_file_name(&file.location).to_string());
+        }
+
+        if file_matches_extension(&file.location, extension) {
+            if let Some(ref current) = last_modified_file {
+                if current.last_modified < file.last_modified {
                     last_modified_file = Some(file);
                 }
+            } else {
+                last_modified_file = Some(file);
             }
         }
     }
@@ -1816,8 +1995,126 @@ async fn verify_schema_source_path(
     })
 }
 
+/// Glue sets `file_extension` to `*` when `InputFormat` already selected
+/// Parquet or ORC. Listing then accepts the format suffix or extensionless
+/// Hive data objects, and skips job-marker files.
+fn is_format_selected_file_extension_param(value: &str) -> bool {
+    value.trim() == "*"
+}
+
+fn format_selected_listing_extension(default_extension: &str) -> String {
+    format!("*{default_extension}")
+}
+
+fn listing_extension_is_orc(extension: &str) -> bool {
+    extension == ".orc" || format_selected_data_suffix(extension) == Some(".orc")
+}
+
+fn format_selected_data_suffix(extension: &str) -> Option<&str> {
+    extension
+        .strip_prefix('*')
+        .filter(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
+fn datafusion_listing_file_extension(extension: &str) -> &str {
+    if format_selected_data_suffix(extension).is_some() {
+        ""
+    } else {
+        extension
+    }
+}
+
+fn object_file_name(location: &Path) -> &str {
+    location
+        .as_ref()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(location.as_ref())
+}
+
+fn file_name_has_extension(name: &str, extension: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case(extension))
+}
+
+fn is_hive_listing_marker_name(name: &str) -> bool {
+    name.is_empty()
+        || name.starts_with('_')
+        || name.starts_with('.')
+        || name == "$folder$"
+        || name.ends_with(".$folder$")
+        || file_name_has_extension(name, "crc")
+}
+
+fn listing_path_is_hive_staging(location: &Path) -> bool {
+    location
+        .as_ref()
+        .split('/')
+        .any(|segment| segment == "_temporary")
+}
+
+fn listing_object_matches_format_selected(location: &Path, format_ext: &str) -> bool {
+    let name = object_file_name(location);
+    if is_hive_listing_marker_name(name) || listing_path_is_hive_staging(location) {
+        return false;
+    }
+
+    if format_ext.is_empty() {
+        return !name.contains('.')
+            || file_name_has_extension(name, "orc")
+            || file_name_has_extension(name, "parquet");
+    }
+
+    file_name_has_extension(name, format_ext.trim_start_matches('.')) || !name.contains('.')
+}
+
 fn file_matches_extension(location: &Path, extension: &str) -> bool {
+    if let Some(format_ext) = format_selected_data_suffix(extension) {
+        return listing_object_matches_format_selected(location, format_ext);
+    }
     location.as_ref().ends_with(extension)
+}
+
+/// List matching `ORC` objects and merge their footers. Used instead of
+/// [`ListingOptions::infer_schema`] on a collection so format-selected
+/// listings (`*.orc`) skip job-marker files and so a last-modified-only
+/// URL cannot hide columns that exist only in other objects.
+async fn infer_orc_collection_schema(
+    state: &dyn Session,
+    table_path: &ListingTableUrl,
+    object_store: &Arc<dyn ObjectStore>,
+    extension: &str,
+    file_format: &Arc<dyn FileFormat>,
+) -> Result<SchemaRef, DataFusionError> {
+    let files = list_matching_listing_files(
+        state,
+        table_path,
+        object_store.as_ref(),
+        extension,
+        ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT,
+    )
+    .await?;
+    file_format.infer_schema(state, object_store, &files).await
+}
+
+async fn list_matching_listing_files(
+    state: &dyn Session,
+    table_path: &ListingTableUrl,
+    object_store: &dyn ObjectStore,
+    extension: &str,
+    limit: usize,
+) -> Result<Vec<ObjectMeta>, DataFusionError> {
+    let mut file_stream = table_path.list_all_files(state, object_store, "").await?;
+    let mut files = Vec::new();
+    while let Some(file) = file_stream.try_next().await? {
+        if file_matches_extension(&file.location, extension) {
+            files.push(file);
+            if files.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(files)
 }
 
 fn to_listing_table_url(
@@ -1942,7 +2239,7 @@ fn parquet_page_index_options(app: &Arc<App>) -> ParquetPageIndexOptions {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::RecordBatch;
+    use arrow::array::{Array, RecordBatch};
     use chrono::{TimeZone, Utc};
     use datafusion::sql::TableReference;
     use datafusion_table_providers::util::secrets::to_secret_map;
@@ -2014,8 +2311,14 @@ mod tests {
         fn get_object_store_url(
             &self,
             dataset: &DatasetSpec,
-            _url: Option<&str>,
+            url: Option<&str>,
         ) -> DataConnectorResult<Url> {
+            let raw = url.unwrap_or(dataset.from.as_str());
+            if let Ok(parsed) = Url::parse(raw)
+                && parsed.scheme() == "file"
+            {
+                return Ok(parsed);
+            }
             Url::parse("test")
                 .boxed()
                 .context(crate::InvalidConfigurationSnafu {
@@ -2255,6 +2558,452 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_detect_orc_extension() {
+        let (connector, dataset) = setup_connector("test:test.orc".to_string(), HashMap::new());
+
+        if let Ok((Some(file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset).await
+        {
+            assert_eq!(extension, ".orc");
+            assert_eq!(file_format.get_ext(), "orc");
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_orc_from_params() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "orc".to_string());
+        let (connector, dataset) = setup_connector("test:test.csv".to_string(), params);
+
+        if let Ok((Some(file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset).await
+        {
+            assert_eq!(extension, ".orc");
+            assert_eq!(file_format.get_ext(), "orc");
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_auto_detects_orc() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "auto".to_string());
+        let (connector, dataset) = setup_connector("test:test.orc".to_string(), params);
+
+        if let Ok((Some(file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset).await
+        {
+            assert_eq!(extension, ".orc");
+            assert_eq!(file_format.get_ext(), "orc");
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_format_selected_orc() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "orc".to_string());
+        params.insert("file_extension".to_string(), "*".to_string());
+        let (connector, dataset) = setup_connector("test:test/".to_string(), params);
+
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("format-selected ORC listing")
+        else {
+            panic!("expected an ORC file format from file_format=orc");
+        };
+        assert_eq!(extension, "*.orc");
+        assert_eq!(file_format.get_ext(), "orc");
+    }
+
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_format_selected_parquet() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "parquet".to_string());
+        params.insert("file_extension".to_string(), "*".to_string());
+        let (connector, dataset) = setup_connector("test:test/".to_string(), params);
+
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("format-selected Parquet listing")
+        else {
+            panic!("expected a Parquet file format from file_format=parquet");
+        };
+        assert_eq!(extension, "*.parquet");
+        assert_eq!(file_format.get_ext(), "parquet");
+    }
+
+    /// Listing `file_format: orc` must scan an ORC file that was not written by
+    /// the production `orc-rust` encoder. The fixture is Apache ORC's Java-produced
+    /// `TestOrcFile.test1.orc`. Glue `OrcInputFormat` tables are registered through
+    /// this same listing path (`InputFormat::Orc.file_format()` is `"orc"`).
+    #[tokio::test]
+    async fn listing_connector_scans_an_independently_produced_orc_file() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "orc".to_string());
+        let (connector, dataset) = setup_connector("file://unused.orc".to_string(), params);
+
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("listing connector selects ORC")
+        else {
+            panic!("expected an ORC file format from file_format=orc");
+        };
+        assert_eq!(extension, ".orc");
+        assert_eq!(file_format.get_ext(), "orc");
+
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/orc/TestOrcFile.test1.orc"
+        ));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test1.orc");
+        std::fs::write(&path, bytes).expect("write independently produced ORC fixture");
+
+        let ctx = SessionContext::new();
+        let table_url =
+            ListingTableUrl::parse(format!("file://{}", path.display())).expect("listing url");
+        let config = ListingTableConfig::new(table_url)
+            .with_listing_options(ListingOptions::new(file_format).with_file_extension(".orc"))
+            .infer_schema(&ctx.state())
+            .await
+            .expect("infer schema from the independently produced ORC file");
+        let table = ListingTable::try_new(config).expect("listing table");
+        ctx.register_table("orc_ext", Arc::new(table))
+            .expect("register listing table");
+
+        let batches = ctx
+            .sql("SELECT COUNT(*) AS n FROM orc_ext")
+            .await
+            .expect("count sql")
+            .collect()
+            .await
+            .expect("collect count");
+        let counts = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("count column");
+        assert_eq!(
+            counts.value(0),
+            2,
+            "Apache ORC TestOrcFile.test1.orc contains two rows"
+        );
+
+        // `OrcFormat::infer_stats` publishes an exact footer row count, and
+        // `AggregateStatistics` can answer unfiltered `COUNT(*)` from those
+        // stats alone. Decode a known Java-writer value so this test cannot
+        // pass without reading stripe data.
+        let decoded = ctx
+            .sql("SELECT CAST(string1 AS VARCHAR) AS s FROM orc_ext ORDER BY s")
+            .await
+            .expect("decode sql")
+            .collect()
+            .await
+            .expect("collect decoded strings");
+        let mut strings = Vec::new();
+        for batch in &decoded {
+            let col = batch.column(0);
+            if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+                for i in 0..batch.num_rows() {
+                    strings.push(arr.value(i).to_string());
+                }
+            } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringViewArray>() {
+                for i in 0..batch.num_rows() {
+                    strings.push(arr.value(i).to_string());
+                }
+            } else {
+                panic!(
+                    "string1 decoded as {}, expected Utf8 or Utf8View",
+                    col.data_type()
+                );
+            }
+        }
+        assert_eq!(
+            strings,
+            vec!["bye".to_string(), "hi".to_string()],
+            "Apache ORC TestOrcFile.test1.orc rows are string1='hi' then 'bye'"
+        );
+    }
+
+    fn write_orc_fixture(path: &std::path::Path, batch: &RecordBatch) {
+        let mut out = Vec::new();
+        let mut writer = orc_rust::arrow_writer::ArrowWriterBuilder::new(&mut out, batch.schema())
+            .try_build()
+            .expect("construct ORC writer");
+        writer.write(batch).expect("write ORC batch");
+        writer.close().expect("close ORC writer");
+        std::fs::write(path, out).expect("write ORC fixture");
+    }
+
+    /// Regression: `create_listing_table` used the newest object as
+    /// `schema_infer_url`, so `OrcFormat::infer_schema` saw a one-file
+    /// slice and dropped columns that exist only in older files.
+    #[tokio::test]
+    async fn create_listing_table_merges_orc_collection_schemas_not_only_the_newest_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let id_only_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let id_only = RecordBatch::try_new(
+            Arc::clone(&id_only_schema),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1]))],
+        )
+        .expect("id-only batch");
+
+        let both_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("extra", DataType::Utf8, false),
+        ]));
+        let both = RecordBatch::try_new(
+            Arc::clone(&both_schema),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![2])),
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+            ],
+        )
+        .expect("id+extra batch");
+
+        let older = dir.path().join("older_with_extra.orc");
+        let newer = dir.path().join("newer_id_only.orc");
+        write_orc_fixture(&older, &both);
+        write_orc_fixture(&newer, &id_only);
+        let older_mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let newer_mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&older)
+            .expect("open older ORC")
+            .set_modified(older_mtime)
+            .expect("set older mtime");
+        std::fs::File::options()
+            .write(true)
+            .open(&newer)
+            .expect("open newer ORC")
+            .set_modified(newer_mtime)
+            .expect("set newer mtime");
+
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "orc".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+
+        let url = Url::parse(&table_url).expect("collection url");
+        let table_path = ListingTableUrl::parse(&table_url).expect("listing url");
+        let ctx = SessionContext::new();
+        ctx.runtime_env()
+            .register_object_store(&url, Arc::new(object_store::local::LocalFileSystem::new()));
+        let store = ctx
+            .runtime_env()
+            .object_store(&table_path)
+            .expect("local object store");
+        let last_modified = get_last_modified(
+            "TestConnector".to_string(),
+            &dataset,
+            ".orc",
+            table_path,
+            &ctx,
+            &store,
+        )
+        .await
+        .expect("newest matching ORC object");
+        assert!(
+            last_modified
+                .location
+                .as_ref()
+                .ends_with("newer_id_only.orc"),
+            "newest object must be the id-only file so last-modified-only infer would drop extra: {}",
+            last_modified.location
+        );
+
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("ORC listing format")
+        else {
+            panic!("expected an ORC file format");
+        };
+        assert_eq!(extension, ".orc");
+
+        let newest_only = file_format
+            .infer_schema(&ctx.state(), &store, std::slice::from_ref(&last_modified))
+            .await
+            .expect("infer from the newest object alone");
+        assert!(
+            newest_only.field_with_name("extra").is_err(),
+            "last-modified-only infer must omit extra so this test still detects the production-path bug: {newest_only:?}"
+        );
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("create_listing_table production path");
+
+        let extra = provider
+            .schema()
+            .field_with_name("extra")
+            .expect("merged schema must include extra from the older file")
+            .clone();
+        assert!(
+            extra.is_nullable(),
+            "a column present in only some ORC files is nullable so scan can NULL-fill"
+        );
+
+        let query_ctx = SessionContext::new();
+        query_ctx
+            .register_table("merged", provider)
+            .expect("register listing table");
+        let batches = query_ctx
+            .sql("SELECT id, extra FROM merged ORDER BY id")
+            .await
+            .expect("select merged columns")
+            .collect()
+            .await
+            .expect("collect merged rows");
+
+        let mut pairs = Vec::new();
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .expect("id column");
+            let extra_col = batch.column(1);
+            for i in 0..batch.num_rows() {
+                let extra = if let Some(arr) = extra_col
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i).to_string())
+                    }
+                } else if let Some(arr) = extra_col
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringViewArray>()
+                {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i).to_string())
+                    }
+                } else {
+                    panic!(
+                        "extra decoded as {}, expected Utf8 or Utf8View",
+                        extra_col.data_type()
+                    );
+                };
+                pairs.push((ids.value(i), extra));
+            }
+        }
+        assert_eq!(
+            pairs,
+            vec![(1, None), (2, Some("x".to_string()))],
+            "production listing path must expose extra and NULL-fill the newer id-only file"
+        );
+    }
+
+    /// Glue `OrcInputFormat` / `MapredParquetInputFormat` tables set
+    /// `file_extension=*`, which becomes `*.orc` / `*.parquet`. Hive data
+    /// objects are often extensionless (`000000_0`); job markers must not be
+    /// opened as ORC.
+    #[tokio::test]
+    async fn format_selected_listing_scans_extensionless_orc_and_skips_markers() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/orc/TestOrcFile.test1.orc"
+        ));
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("000000_0"), bytes)
+            .expect("write extensionless Hive ORC object");
+        std::fs::write(dir.path().join("_SUCCESS"), b"ok").expect("write _SUCCESS marker");
+        std::fs::write(dir.path().join("_committed_000"), b"x").expect("write _committed marker");
+        std::fs::write(dir.path().join("_started_000"), b"y").expect("write _started marker");
+        std::fs::write(dir.path().join(".$folder$"), b"").expect("write folder placeholder");
+        std::fs::write(dir.path().join("notes.txt"), b"not orc").expect("write unrelated file");
+
+        let ctx = SessionContext::new();
+        let table_url = format!("file://{}/", dir.path().display());
+        let store_url = Url::parse(&table_url).expect("store url");
+        let table_path = ListingTableUrl::parse(&table_url).expect("listing url");
+        ctx.runtime_env().register_object_store(
+            &store_url,
+            Arc::new(object_store::local::LocalFileSystem::new()),
+        );
+
+        let infer_path =
+            ListingTableUrl::parse(format!("file://{}/000000_0", dir.path().display()))
+                .expect("infer url");
+        let file_format = Arc::new(OrcFormat::new());
+        let infer_options = ListingOptions::new(Arc::clone(&file_format) as Arc<dyn FileFormat>)
+            .with_file_extension("");
+        let schema = infer_options
+            .infer_schema(&ctx.state(), &infer_path)
+            .await
+            .expect("infer schema from the extensionless ORC object");
+
+        let listing = ListingTable::try_new(
+            ListingTableConfig::new(table_path.clone())
+                .with_listing_options(
+                    ListingOptions::new(Arc::clone(&file_format) as Arc<dyn FileFormat>)
+                        .with_file_extension(""),
+                )
+                .with_schema(Arc::clone(&schema)),
+        )
+        .expect("listing table");
+
+        let provider = LocationPruningListingTable::new(
+            Arc::new(listing),
+            ctx.runtime_env()
+                .object_store(&table_path)
+                .expect("object store"),
+            table_path,
+            schema,
+            "*.orc",
+        );
+        ctx.register_table("hive_orc", Arc::new(provider))
+            .expect("register format-selected listing");
+
+        let decoded = ctx
+            .sql("SELECT CAST(string1 AS VARCHAR) AS s FROM hive_orc ORDER BY s")
+            .await
+            .expect("decode sql")
+            .collect()
+            .await
+            .expect("collect decoded strings");
+        let mut strings = Vec::new();
+        for batch in &decoded {
+            let col = batch.column(0);
+            if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+                for i in 0..batch.num_rows() {
+                    strings.push(arr.value(i).to_string());
+                }
+            } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringViewArray>() {
+                for i in 0..batch.num_rows() {
+                    strings.push(arr.value(i).to_string());
+                }
+            } else {
+                panic!(
+                    "string1 decoded as {}, expected Utf8 or Utf8View",
+                    col.data_type()
+                );
+            }
+        }
+        assert_eq!(
+            strings,
+            vec!["bye".to_string(), "hi".to_string()],
+            "extensionless Hive ORC object must be scanned and markers must be skipped"
+        );
+    }
+
     #[derive(Debug)]
     struct TestObjectStore {
         meta: Vec<ObjectMeta>,
@@ -2366,6 +3115,111 @@ mod tests {
         .expect("to get last modified");
 
         assert_eq!(last_modified.location.as_ref(), "file_new.parquet");
+    }
+
+    #[test]
+    fn format_selected_listing_accepts_extensionless_hive_objects_and_skips_markers() {
+        let cases = [
+            ("warehouse/table/000000_0", "*.orc", true),
+            ("warehouse/table/part-00000.orc", "*.orc", true),
+            ("warehouse/table/_SUCCESS", "*.orc", false),
+            ("warehouse/table/_committed_000", "*.orc", false),
+            ("warehouse/table/_started_000", "*.orc", false),
+            ("warehouse/table/.$folder$", "*.orc", false),
+            ("warehouse/table/$folder$", "*.orc", false),
+            ("warehouse/table/000000_0.crc", "*.orc", false),
+            ("warehouse/table/000000_0.CRC", "*.orc", false),
+            ("warehouse/table/part-00000.ORC", "*.orc", true),
+            ("warehouse/table/notes.txt", "*.orc", false),
+            ("warehouse/table/part-00000.parquet", "*.orc", false),
+            ("warehouse/table/_temporary/000000_0", "*.orc", false),
+            (
+                "warehouse/table/dt=__HIVE_DEFAULT_PARTITION__/000000_0",
+                "*.orc",
+                true,
+            ),
+            ("warehouse/table/part-00000.parquet", "*.parquet", true),
+            ("warehouse/table/000000_0", "*.parquet", true),
+            ("warehouse/table/_SUCCESS", "*.parquet", false),
+            ("warehouse/table/file.parquet", ".parquet", true),
+            ("warehouse/table/000000_0", ".parquet", false),
+        ];
+        for (path, extension, expected) in cases {
+            assert_eq!(
+                file_matches_extension(&Path::from(path), extension),
+                expected,
+                "path={path} extension={extension}"
+            );
+        }
+    }
+
+    #[test]
+    fn listing_extension_is_orc_matches_suffix_and_format_selected() {
+        assert!(listing_extension_is_orc(".orc"));
+        assert!(listing_extension_is_orc("*.orc"));
+        assert!(!listing_extension_is_orc(".parquet"));
+        assert!(!listing_extension_is_orc("*.parquet"));
+        assert!(!listing_extension_is_orc(".csv"));
+    }
+
+    #[tokio::test]
+    async fn get_last_modified_format_selected_selects_extensionless_hive_object() {
+        let url = Url::parse("s3://bucket/table/").expect("to parse url");
+        let table_path = ListingTableUrl::parse(url).expect("to parse url");
+        let ctx = SessionContext::new();
+        let dataset = DatasetSpec::new("s3://bucket/table/", TableReference::bare("test"));
+
+        let meta_files = vec![
+            create_meta("table/_SUCCESS", 400, 0),
+            create_meta("table/_committed_1", 350, 0),
+            create_meta("table/.$folder$", 300, 0),
+            create_meta("table/notes.txt", 500, 10),
+            create_meta("table/000000_0", 200, 100),
+        ];
+        let test_store = Arc::new(TestObjectStore::new(meta_files)) as Arc<dyn ObjectStore>;
+
+        let last_modified = get_last_modified(
+            "TestListingConnector".to_string(),
+            &dataset,
+            "*.orc",
+            table_path,
+            &ctx,
+            &test_store,
+        )
+        .await
+        .expect("to select the extensionless Hive object");
+
+        assert_eq!(last_modified.location.as_ref(), "table/000000_0");
+    }
+
+    #[tokio::test]
+    async fn get_last_modified_format_selected_errors_when_only_markers_exist() {
+        let url = Url::parse("s3://bucket/table/").expect("to parse url");
+        let table_path = ListingTableUrl::parse(url).expect("to parse url");
+        let ctx = SessionContext::new();
+        let dataset = DatasetSpec::new("s3://bucket/table/", TableReference::bare("test"));
+
+        let meta_files = vec![
+            create_meta("table/_SUCCESS", 400, 0),
+            create_meta("table/.$folder$", 300, 0),
+        ];
+        let test_store = Arc::new(TestObjectStore::new(meta_files)) as Arc<dyn ObjectStore>;
+
+        let err = get_last_modified(
+            "TestListingConnector".to_string(),
+            &dataset,
+            "*.orc",
+            table_path,
+            &ctx,
+            &test_store,
+        )
+        .await
+        .expect_err("markers alone are not a readable listing");
+
+        assert!(
+            matches!(err, DataConnectorError::InvalidConfigurationNoSource { .. }),
+            "only-markers should be a configuration error, got: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -2531,6 +3385,7 @@ mod tests {
                 .expect("object store"),
             table_path.clone(),
             file_schema,
+            ".parquet",
         );
 
         ctx.register_table("test_table", Arc::new(provider))
@@ -2655,6 +3510,7 @@ mod tests {
                 .expect("object store"),
             table_path,
             file_schema,
+            ".parquet",
         );
 
         ctx.register_table("test_table", Arc::new(provider))

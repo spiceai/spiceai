@@ -21,6 +21,7 @@ data-connector-types = { path = "../data-connector-types" }
 data-http-rate-control = { path = "../data-http-rate-control" }
 data_components = { path = "../data_components" }
 dataformat-json = { path = "../dataformat-json" }
+dataformat-orc = { path = "../dataformat-orc" }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
 datafusion-expr.workspace = true
@@ -57,6 +58,7 @@ vortex-datafusion.workspace = true
 # `runtime::component::dataset::Dataset` for exactly this reason.
 [dev-dependencies]
 chrono.workspace = true
+orc-rust.workspace = true
 paste.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

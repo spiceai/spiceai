@@ -202,7 +202,7 @@ impl GlueDataConnector {
                 source: Box::new(e),
             }
         })? {
-            input_format @ (InputFormat::Parquet | InputFormat::Csv) => {
+            input_format @ (InputFormat::Parquet | InputFormat::Csv | InputFormat::Orc) => {
                 create_s3_provider(
                     context,
                     input_format,
@@ -316,14 +316,23 @@ pub enum InputFormat {
     // Json,
     // Xml,
     Parquet,
-    // Orc,
+    Orc,
     Iceberg,
 }
 
 /// The formats above, for the user-facing message naming what Spice can read.
 /// It lives beside the variants so enabling one of the commented-out formats
 /// does not leave a diagnostic claiming Spice cannot read it.
-pub(crate) const SUPPORTED_INPUT_FORMATS: &str = "parquet, csv, iceberg";
+pub(crate) const SUPPORTED_INPUT_FORMATS: &str = "parquet, csv, orc, iceberg";
+
+/// Listing `file_extension` Glue sets when `InputFormat` already selected
+/// Parquet or ORC. Shared listing then accepts extensionless Hive objects.
+const GLUE_FORMAT_SELECTED_FILE_EXTENSION: &str = "*";
+
+fn glue_format_selected_file_extension(input_format: InputFormat) -> Option<&'static str> {
+    matches!(input_format, InputFormat::Parquet | InputFormat::Orc)
+        .then_some(GLUE_FORMAT_SELECTED_FILE_EXTENSION)
+}
 
 impl InputFormat {
     /// Return the file format of the [`InputFormat`]. For
@@ -333,6 +342,7 @@ impl InputFormat {
         match self {
             InputFormat::Csv => "csv",
             InputFormat::Parquet => "parquet",
+            InputFormat::Orc => "orc",
             InputFormat::Iceberg => "iceberg",
         }
     }
@@ -365,6 +375,7 @@ impl TryFrom<&Table> for InputFormat {
         Ok(match input_format {
             "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat" => Self::Parquet,
             "org.apache.hadoop.mapred.TextInputFormat" => Self::Csv,
+            "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat" => Self::Orc,
             input_format => {
                 return Err(Error::InvalidInputFormat {
                     input_format: input_format.to_string(),
@@ -545,10 +556,16 @@ async fn create_s3_provider(
                 params.insert("csv_delimiter".to_string(), delimiter.as_str().into());
             }
         }
-        InputFormat::Parquet => {
+        InputFormat::Parquet | InputFormat::Orc => {
             dataset
                 .params
                 .insert("hive_partitioning_enabled".to_string(), "true".to_string());
+            // Glue's InputFormat is authoritative. Hive often writes
+            // extensionless objects (`000000_0`); `*` tells listing to accept
+            // those plus the format suffix and to skip job-marker files.
+            if let Some(file_extension) = glue_format_selected_file_extension(input_format) {
+                params.insert("file_extension".into(), file_extension.into());
+            }
         }
         InputFormat::Iceberg => {}
     }
@@ -624,5 +641,27 @@ mod tests {
         );
         assert_eq!(ensure_s3_trailing_slash(""), "");
         assert_eq!(ensure_s3_trailing_slash("/local/path"), "/local/path");
+    }
+
+    #[test]
+    fn orc_glue_tables_use_the_listing_orc_format() {
+        assert_eq!(InputFormat::Orc.file_format(), "orc");
+    }
+
+    #[test]
+    fn glue_parquet_and_orc_enable_extensionless_hive_listing() {
+        assert_eq!(
+            glue_format_selected_file_extension(InputFormat::Orc),
+            Some("*")
+        );
+        assert_eq!(
+            glue_format_selected_file_extension(InputFormat::Parquet),
+            Some("*")
+        );
+        assert_eq!(glue_format_selected_file_extension(InputFormat::Csv), None);
+        assert_eq!(
+            glue_format_selected_file_extension(InputFormat::Iceberg),
+            None
+        );
     }
 }
