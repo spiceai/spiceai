@@ -83,9 +83,10 @@ const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
 /// collection schema. The default listing path otherwise passes only the
 /// newest object to [`FileFormat::infer_schema`], which drops columns that
 /// appear only in older files. Scan-time NULL backfill can restore those
-/// columns only when the merged schema already lists them. Set
-/// `schema_source_path` to a smaller prefix if load-time footer reads of a
-/// very large hive table are too expensive.
+/// columns only when the merged schema already lists them. Exceeding this
+/// cap is an error rather than a silent truncation, because a later scan
+/// reads every matching object. Set `schema_source_path` to a smaller
+/// prefix if a collection has more matching objects than this limit.
 const ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug)]
@@ -1385,6 +1386,13 @@ pub trait ListingTableConnector: DataConnector {
                 DataFusionError::ObjectStore(object_store_error) => {
                     self.handle_object_store_error(dataset, *object_store_error)
                 }
+                DataFusionError::Configuration(message) if listing_extension_is_orc(extension) => {
+                    crate::DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: format!("{self}"),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message,
+                    }
+                }
                 e => crate::DataConnectorError::UnableToConnectInternal {
                     dataconnector: format!("{self}"),
                     connector_component: ConnectorComponent::from(dataset),
@@ -2085,6 +2093,10 @@ fn file_matches_extension(location: &Path, extension: &str) -> bool {
 /// [`ListingOptions::infer_schema`] on a collection so format-selected
 /// listings (`*.orc`) skip job-marker files and so a last-modified-only
 /// URL cannot hide columns that exist only in other objects.
+///
+/// Lists one object past [`ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT`] so a
+/// collection larger than the cap errors instead of publishing a truncated
+/// schema. Footer merge for `limit` or fewer files is unchanged.
 async fn infer_orc_collection_schema(
     state: &dyn Session,
     table_path: &ListingTableUrl,
@@ -2097,12 +2109,41 @@ async fn infer_orc_collection_schema(
         table_path,
         object_store.as_ref(),
         extension,
-        ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT,
+        ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT.saturating_add(1),
     )
     .await?;
+    let files = orc_collection_schema_infer_files_within_limit(
+        files,
+        ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT,
+    )?;
     file_format.infer_schema(state, object_store, &files).await
 }
 
+/// Accepts objects collected with `limit + 1` so "exactly `limit`" can be
+/// distinguished from overflow. More than `limit` matching objects is an
+/// error: a later scan reads every match, so a silently truncated schema
+/// would omit columns or incompatible types that first appear after the cap.
+fn orc_collection_schema_infer_files_within_limit(
+    files: Vec<ObjectMeta>,
+    limit: usize,
+) -> Result<Vec<ObjectMeta>, DataFusionError> {
+    if files.len() > limit {
+        return Err(DataFusionError::Configuration(
+            orc_collection_schema_infer_limit_error(limit),
+        ));
+    }
+    Ok(files)
+}
+
+fn orc_collection_schema_infer_limit_error(limit: usize) -> String {
+    format!(
+        "ORC schema inference found more than {limit} matching objects, so the published schema would omit columns or incompatible types that first appear later. Set `schema_source_path` to a narrower prefix with at most {limit} matching objects. See: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+    )
+}
+
+/// Lists objects under `table_path` whose names match `extension`, stopping
+/// after `limit` matches. Callers that must distinguish "exactly `limit`"
+/// from "more than `limit`" should pass `limit + 1`.
 async fn list_matching_listing_files(
     state: &dyn Session,
     table_path: &ListingTableUrl,
@@ -2914,6 +2955,110 @@ mod tests {
             pairs,
             vec![(1, None), (2, Some("x".to_string()))],
             "production listing path must expose extra and NULL-fill the newer id-only file"
+        );
+    }
+
+    #[test]
+    fn orc_collection_schema_infer_limit_error_names_the_cap_and_schema_source_path() {
+        let message =
+            orc_collection_schema_infer_limit_error(ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT);
+        assert!(
+            message.contains(&ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT.to_string()),
+            "cap must appear in: {message}"
+        );
+        assert!(
+            message.contains("`schema_source_path`"),
+            "must tell the user how to narrow the listing: {message}"
+        );
+        assert!(
+            message.contains(
+                "https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+            ),
+            "must link listing connector docs: {message}"
+        );
+    }
+
+    #[test]
+    fn orc_collection_schema_infer_files_within_limit_errors_instead_of_truncating() {
+        let within = vec![
+            create_meta("table/a.orc", 1, 10),
+            create_meta("table/b.orc", 2, 10),
+        ];
+        let accepted = orc_collection_schema_infer_files_within_limit(within, 2)
+            .expect("exactly the cap must still merge footers");
+        assert_eq!(accepted.len(), 2);
+
+        let overflow = vec![
+            create_meta("table/a.orc", 1, 10),
+            create_meta("table/b.orc", 2, 10),
+            create_meta("table/c.orc", 3, 10),
+        ];
+        let err = orc_collection_schema_infer_files_within_limit(overflow, 2)
+            .expect_err("one extra matching object must not be silently dropped");
+        let DataFusionError::Configuration(message) = err else {
+            panic!("cap overflow must be a configuration error, got: {err}");
+        };
+        assert_eq!(message, orc_collection_schema_infer_limit_error(2));
+    }
+
+    /// Regression: listing used to stop at
+    /// [`ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT`] and publish a truncated
+    /// schema. Scan later reads every matching object, so a column that
+    /// first appears after the cap must not be inferred from a silent prefix.
+    #[tokio::test]
+    async fn infer_orc_collection_schema_errors_when_matching_objects_exceed_the_cap() {
+        let url = Url::parse("s3://bucket/table/").expect("to parse url");
+        let table_path = ListingTableUrl::parse(url).expect("to parse url");
+        let ctx = SessionContext::new();
+
+        let meta_files: Vec<ObjectMeta> = (0..=ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT)
+            .map(|i| {
+                create_meta(
+                    &format!("table/part-{i}.orc"),
+                    i64::try_from(i).expect("object index fits i64"),
+                    100,
+                )
+            })
+            .collect();
+        assert_eq!(
+            meta_files.len(),
+            ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT + 1,
+            "must list one object past the cap so silent truncation would succeed"
+        );
+
+        let test_store = Arc::new(TestObjectStore::new(meta_files)) as Arc<dyn ObjectStore>;
+        let listed = list_matching_listing_files(
+            &ctx.state(),
+            &table_path,
+            test_store.as_ref(),
+            ".orc",
+            ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT.saturating_add(1),
+        )
+        .await
+        .expect("list one past the infer cap");
+        assert_eq!(
+            listed.len(),
+            ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT + 1,
+            "must fetch one extra matching object so the overflow is visible"
+        );
+
+        let file_format: Arc<dyn FileFormat> = Arc::new(OrcFormat::new());
+        let err = infer_orc_collection_schema(
+            &ctx.state(),
+            &table_path,
+            &test_store,
+            ".orc",
+            &file_format,
+        )
+        .await
+        .expect_err("exceeding the infer cap must not silently truncate");
+
+        let DataFusionError::Configuration(message) = err else {
+            panic!("cap overflow must be a configuration error, got: {err}");
+        };
+        assert_eq!(
+            message,
+            orc_collection_schema_infer_limit_error(ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT)
         );
     }
 
