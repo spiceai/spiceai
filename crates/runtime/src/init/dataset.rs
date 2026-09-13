@@ -1028,13 +1028,17 @@ impl Runtime {
             // `LayerWalk::Index` also steps into a router's secondary stack, so a table with
             // indexes attached at more than one layer (e.g. both vector and full-text search
             // indexes) must have every layer's indexes collected here, not just the first.
-            let mut seen_indexes = std::collections::HashSet::new();
-            let indexes: Vec<Arc<dyn spice_table::Index + Send + Sync>> =
+            //
+            // Scoped in a block so `seen_indexes` (a `HashSet<*const ()>`, not `Send`) is
+            // dropped before the `.await` below rather than held across it.
+            let indexes: Vec<Arc<dyn spice_table::Index + Send + Sync>> = {
+                let mut seen_indexes = std::collections::HashSet::new();
                 spice_table::nodes(table_provider.as_ref(), spice_table::LayerWalk::Index)
                     .flat_map(spice_table::SpiceTable::indexes)
                     .filter(|index| seen_indexes.insert(Arc::as_ptr(index).cast::<()>()))
                     .cloned()
-                    .collect();
+                    .collect()
+            };
             if !indexes.is_empty()
                 && let Ok(layout) = data_accelerator_api::get_acceleration_layout(
                     ds.as_ref(),
