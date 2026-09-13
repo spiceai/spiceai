@@ -325,6 +325,15 @@ pub enum InputFormat {
 /// does not leave a diagnostic claiming Spice cannot read it.
 pub(crate) const SUPPORTED_INPUT_FORMATS: &str = "parquet, csv, orc, iceberg";
 
+/// Listing `file_extension` Glue sets when `InputFormat` already selected
+/// Parquet or ORC. Shared listing then accepts extensionless Hive objects.
+const GLUE_FORMAT_SELECTED_FILE_EXTENSION: &str = "*";
+
+fn glue_format_selected_file_extension(input_format: InputFormat) -> Option<&'static str> {
+    matches!(input_format, InputFormat::Parquet | InputFormat::Orc)
+        .then_some(GLUE_FORMAT_SELECTED_FILE_EXTENSION)
+}
+
 impl InputFormat {
     /// Return the file format of the [`InputFormat`]. For
     /// [`InputFormat::Iceberg`], it's not a file format but we return a value
@@ -551,6 +560,12 @@ async fn create_s3_provider(
             dataset
                 .params
                 .insert("hive_partitioning_enabled".to_string(), "true".to_string());
+            // Glue's InputFormat is authoritative. Hive often writes
+            // extensionless objects (`000000_0`); `*` tells listing to accept
+            // those plus the format suffix and to skip job-marker files.
+            if let Some(file_extension) = glue_format_selected_file_extension(input_format) {
+                params.insert("file_extension".into(), file_extension.into());
+            }
         }
         InputFormat::Iceberg => {}
     }
@@ -631,5 +646,22 @@ mod tests {
     #[test]
     fn orc_glue_tables_use_the_listing_orc_format() {
         assert_eq!(InputFormat::Orc.file_format(), "orc");
+    }
+
+    #[test]
+    fn glue_parquet_and_orc_enable_extensionless_hive_listing() {
+        assert_eq!(
+            glue_format_selected_file_extension(InputFormat::Orc),
+            Some("*")
+        );
+        assert_eq!(
+            glue_format_selected_file_extension(InputFormat::Parquet),
+            Some("*")
+        );
+        assert_eq!(glue_format_selected_file_extension(InputFormat::Csv), None);
+        assert_eq!(
+            glue_format_selected_file_extension(InputFormat::Iceberg),
+            None
+        );
     }
 }

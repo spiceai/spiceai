@@ -29,7 +29,7 @@ pub use connector::{
 /// All [`super::DataConnectorFactory`] that create [`ListingTableConnector`]s should have at least these parameters returned from the associated [`super::DataConnectorFactory::parameters`].
 pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("file_format")
-        .description("File format: parquet, csv, tsv, json, jsonl, ndjson, ldjson, soda, vortex, orc, or auto. Inferred from the path extension when unset."),
+        .description("File format: parquet, csv, tsv, json, jsonl, ndjson, ldjson, soda, socrata, vortex, orc, or auto. Inferred from the path extension when unset."),
     ParameterSpec::runtime("file_extension"),
     ParameterSpec::runtime("schema_infer_max_records")
         .description("Set a limit in terms of records to scan to infer the schema."),
