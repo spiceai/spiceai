@@ -5199,6 +5199,7 @@ mod write_path_tests {
             Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             Arc::new(AtomicI64::new(0)),
             RuntimeStatus::new(),
+            None,
         );
         (tx, handle)
     }
