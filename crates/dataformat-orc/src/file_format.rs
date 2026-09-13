@@ -940,9 +940,8 @@ mod tests {
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("map values");
-        (start..end).find_map(|entry| {
-            (keys.value(entry) == "env").then(|| values.value(entry).to_string())
-        })
+        (start..end)
+            .find_map(|entry| (keys.value(entry) == "env").then(|| values.value(entry).to_string()))
     }
 
     #[tokio::test]
@@ -1017,3 +1016,4 @@ mod tests {
         assert_eq!(stats.num_rows, Precision::Exact(0));
     }
 }
+
