@@ -16,16 +16,17 @@ limitations under the License.
 
 //! [`OrcFormat`]: Apache ORC [`FileFormat`] for listing tables.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, memory::DataSourceExec};
 use datafusion::common::{Statistics, not_impl_err, stats::Precision};
 use datafusion::datasource::file_format::{FileFormat, file_compression_type::FileCompressionType};
 use datafusion::datasource::physical_plan::{FileScanConfig, FileSinkConfig, FileSource};
 use datafusion::error::{DataFusionError, Result};
+use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use datafusion::physical_expr::LexRequirement;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource::TableSchema;
@@ -53,11 +54,16 @@ pub(crate) fn orc_to_datafusion_error(err: orc_rust::error::OrcError) -> DataFus
     DataFusionError::External(Box::new(err))
 }
 
+/// Schema and stats footer reads use a `Version` pin so a listed generation
+/// (or its ETag on an unversioned bucket) cannot be mixed with a replacement.
+const SCHEMA_AND_STATS_VERSIONING: Option<ObjectVersionType> = Some(ObjectVersionType::Version);
+
 async fn fetch_schema(
     store: &Arc<dyn ObjectStore>,
     file: &ObjectMeta,
 ) -> Result<(object_store::path::Path, Schema)> {
-    let mut reader = ObjectStoreReader::new(Arc::clone(store), file.clone());
+    let mut reader =
+        ObjectStoreReader::new(Arc::clone(store), file.clone(), SCHEMA_AND_STATS_VERSIONING);
     let metadata = read_metadata_async(&mut reader)
         .await
         .map_err(orc_to_datafusion_error)?;
@@ -68,7 +74,8 @@ async fn fetch_schema(
 }
 
 async fn fetch_row_count(store: &Arc<dyn ObjectStore>, file: &ObjectMeta) -> Result<u64> {
-    let mut reader = ObjectStoreReader::new(Arc::clone(store), file.clone());
+    let mut reader =
+        ObjectStoreReader::new(Arc::clone(store), file.clone(), SCHEMA_AND_STATS_VERSIONING);
     let metadata = read_metadata_async(&mut reader)
         .await
         .map_err(orc_to_datafusion_error)?;
@@ -77,39 +84,114 @@ async fn fetch_row_count(store: &Arc<dyn ObjectStore>, file: &ObjectMeta) -> Res
 
 /// Merge per-file ORC schemas for a listing table.
 ///
-/// A column that appears in only some files is filled with typed NULLs at
-/// scan time, so it must be nullable in the merged schema even when every
-/// file that has it declares it required. [`Schema::try_merge`] keeps the
-/// first-seen nullability for a field that is not in every schema.
+/// A field that appears in only some files — including a nested struct
+/// child — is filled with typed NULLs at scan time, so it must be nullable
+/// in the merged schema even when every file that has it declares it
+/// required. [`Schema::try_merge`] recursively unions struct children but
+/// keeps the first-seen nullability for a child that is not in every file.
 fn merge_orc_file_schemas(schemas: Vec<Schema>) -> Result<Schema> {
-    let names_per_file: Vec<HashSet<String>> = schemas
+    let per_file_fields: Vec<arrow::datatypes::Fields> = schemas
         .iter()
-        .map(|schema| {
-            schema
-                .fields()
-                .iter()
-                .map(|field| field.name().clone())
-                .collect()
-        })
+        .map(|schema| schema.fields().clone())
         .collect();
-
     let merged = Schema::try_merge(schemas)?;
     let fields = merged
         .fields()
         .iter()
         .map(|field| {
-            let present_in_every_file = names_per_file
+            let sources: Vec<Option<&Field>> = per_file_fields
                 .iter()
-                .all(|names| names.contains(field.name()));
-            if present_in_every_file || field.is_nullable() {
-                Arc::clone(field)
-            } else {
-                Arc::new(field.as_ref().clone().with_nullable(true))
-            }
+                .map(|fields| field_named(fields, field.name()))
+                .collect();
+            Arc::new(mark_partial_fields_nullable(field, &sources))
         })
         .collect::<Vec<_>>();
 
     Ok(Schema::new_with_metadata(fields, merged.metadata().clone()))
+}
+
+fn field_named<'a>(fields: &'a arrow::datatypes::Fields, name: &str) -> Option<&'a Field> {
+    fields
+        .iter()
+        .find(|field| field.name() == name)
+        .map(Arc::as_ref)
+}
+
+fn nested_field_sources<'a>(
+    sources: &[Option<&'a Field>],
+    child: impl Fn(&DataType) -> Option<&'a Field>,
+) -> Vec<Option<&'a Field>> {
+    sources
+        .iter()
+        .map(|source| source.and_then(|field| child(field.data_type())))
+        .collect()
+}
+
+/// Mark a merged field nullable when any source file lacks it, and do the
+/// same for nested children so scan-time NULL backfill is a valid batch.
+fn mark_partial_fields_nullable(merged: &Field, sources: &[Option<&Field>]) -> Field {
+    let missing_from_some = sources.iter().any(Option::is_none);
+    let nullable = merged.is_nullable() || missing_from_some;
+    Field::new(
+        merged.name(),
+        mark_partial_data_type_nullable(merged.data_type(), sources),
+        nullable,
+    )
+    .with_metadata(merged.metadata().clone())
+}
+
+fn mark_partial_data_type_nullable(merged: &DataType, sources: &[Option<&Field>]) -> DataType {
+    match merged {
+        DataType::Struct(children) => {
+            let children = children
+                .iter()
+                .map(|child| {
+                    let child_sources =
+                        nested_field_sources(sources, |data_type| match data_type {
+                            DataType::Struct(fields) => field_named(fields, child.name()),
+                            _ => None,
+                        });
+                    Arc::new(mark_partial_fields_nullable(child, &child_sources))
+                })
+                .collect();
+            DataType::Struct(children)
+        }
+        DataType::List(item) => DataType::List(Arc::new(mark_partial_fields_nullable(
+            item,
+            &nested_field_sources(sources, |data_type| match data_type {
+                DataType::List(field) => Some(field.as_ref()),
+                _ => None,
+            }),
+        ))),
+        DataType::LargeList(item) => DataType::LargeList(Arc::new(mark_partial_fields_nullable(
+            item,
+            &nested_field_sources(sources, |data_type| match data_type {
+                DataType::LargeList(field) => Some(field.as_ref()),
+                _ => None,
+            }),
+        ))),
+        DataType::FixedSizeList(item, size) => DataType::FixedSizeList(
+            Arc::new(mark_partial_fields_nullable(
+                item,
+                &nested_field_sources(sources, |data_type| match data_type {
+                    DataType::FixedSizeList(field, _) => Some(field.as_ref()),
+                    _ => None,
+                }),
+            )),
+            *size,
+        ),
+        DataType::Map(entries, sorted) => DataType::Map(
+            Arc::new(mark_partial_fields_nullable(
+                entries,
+                &nested_field_sources(sources, |data_type| match data_type {
+                    DataType::Map(field, _) => Some(field.as_ref()),
+                    _ => None,
+                }),
+            )),
+            *sorted,
+        ),
+        other => other.clone(),
+    }
 }
 
 /// Apache ORC [`FileFormat`] implementation backed by `orc-rust`.
@@ -334,6 +416,39 @@ mod tests {
                 .expect("extra field")
                 .is_nullable(),
             "extra is missing from some files and must be nullable for NULL backfill"
+        );
+    }
+
+    #[test]
+    fn merge_orc_file_schemas_marks_nested_struct_children_nullable() {
+        use arrow::datatypes::Fields;
+
+        let first = Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(Fields::from(vec![Field::new("id", DataType::Int64, true)])),
+            true,
+        )]);
+        let second = Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(Fields::from(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("extra", DataType::Int64, false),
+            ])),
+            true,
+        )]);
+
+        let merged = merge_orc_file_schemas(vec![first, second]).expect("nested merge");
+        let payload = merged.field_with_name("payload").expect("payload");
+        let DataType::Struct(children) = payload.data_type() else {
+            panic!("payload should stay a struct");
+        };
+        let extra = children
+            .iter()
+            .find(|field| field.name() == "extra")
+            .expect("Arrow Schema::try_merge keeps nested extra");
+        assert!(
+            extra.is_nullable(),
+            "a nested field present in only some files must be nullable so the scan can NULL-fill it"
         );
     }
 
@@ -570,6 +685,179 @@ mod tests {
             vec![None, Some("x".to_string())],
             "SELECT extra must backfill NULL for the file that has no extra column"
         );
+    }
+
+    /// Arrow 58 `Schema::try_merge` unions struct children recursively. A file
+    /// that only has `payload.id` must still scan under a merged type that also
+    /// has `payload.extra`, with a typed NULL for the missing child.
+    #[tokio::test]
+    async fn listing_scan_backfills_nested_struct_fields_missing_from_one_file() {
+        use arrow::array::{Int64Array, StructArray};
+        use arrow::datatypes::Fields;
+        use datafusion::datasource::listing::{
+            ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let id_only_payload_fields = Fields::from(vec![Field::new("id", DataType::Int64, true)]);
+        let id_only_payload = StructArray::try_new(
+            id_only_payload_fields.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(10)]))],
+            None,
+        )
+        .expect("payload with id only");
+        let id_only = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Struct(id_only_payload_fields), true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(id_only_payload),
+            ],
+        )
+        .expect("id-only nested batch");
+
+        let both_payload_fields = Fields::from(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("extra", DataType::Int64, false),
+        ]);
+        let both_payload = StructArray::try_new(
+            both_payload_fields.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(10)])),
+                Arc::new(Int64Array::from(vec![Some(99)])),
+            ],
+            None,
+        )
+        .expect("payload with extra");
+        let both = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Struct(both_payload_fields), true),
+            ])),
+            vec![Arc::new(Int64Array::from(vec![2])), Arc::new(both_payload)],
+        )
+        .expect("nested batch with extra");
+
+        std::fs::write(dir.path().join("a.orc"), write_orc_bytes(&id_only)).expect("write a.orc");
+        std::fs::write(dir.path().join("b.orc"), write_orc_bytes(&both)).expect("write b.orc");
+
+        let ctx = SessionContext::new_with_config(SessionConfig::new());
+        let listing = ListingOptions::new(Arc::new(OrcFormat::new())).with_file_extension(".orc");
+        let table_url = ListingTableUrl::parse(format!("file://{}/", dir.path().display()))
+            .expect("listing url");
+        let schema = listing
+            .infer_schema(&ctx.state(), &table_url)
+            .await
+            .expect("infer listing schema");
+        let extra = match schema
+            .field_with_name("payload")
+            .expect("payload")
+            .data_type()
+        {
+            DataType::Struct(children) => children
+                .iter()
+                .find(|field| field.name() == "extra")
+                .expect("merged schema includes extra")
+                .clone(),
+            other => panic!("payload should be a struct, got {other}"),
+        };
+        assert!(
+            extra.is_nullable(),
+            "payload.extra is missing from a.orc and must be nullable"
+        );
+
+        let config = ListingTableConfig::new(table_url)
+            .with_listing_options(listing)
+            .with_schema(schema);
+        let table = ListingTable::try_new(config).expect("listing table");
+        ctx.register_table("merged", Arc::new(table))
+            .expect("register");
+
+        let df = ctx
+            .sql("SELECT id, payload.extra AS extra FROM merged ORDER BY id")
+            .await
+            .expect("nested projection");
+        let batches = df.collect().await.expect("scan evolving nested structs");
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 2, "scan must return a row from every file");
+
+        let mut pairs = Vec::new();
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column");
+            let extras = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("extra column");
+            for i in 0..batch.num_rows() {
+                let extra = if extras.is_null(i) {
+                    None
+                } else {
+                    Some(extras.value(i))
+                };
+                pairs.push((ids.value(i), extra));
+            }
+        }
+        assert_eq!(
+            pairs,
+            vec![(1, None), (2, Some(99))],
+            "a.orc only has payload.id; the merged projection must NULL-fill payload.extra"
+        );
+    }
+
+    #[tokio::test]
+    async fn infer_schema_pins_every_request_to_the_listed_object_version() {
+        use crate::test_support::{VersionRecordingStore, write_orc_bytes, write_two_column_batch};
+        use object_store::path::Path;
+        use object_store::{GetRange, ObjectStoreExt};
+
+        const VERSION: &str = "the-version-the-scan-started-from";
+
+        let batch = write_two_column_batch();
+        let store = Arc::new(VersionRecordingStore::new(VERSION));
+        let location = Path::from("versioned.orc");
+        store
+            .put(&location, write_orc_bytes(&batch).into())
+            .await
+            .expect("stores the file");
+        let meta = store.head(&location).await.expect("heads the file");
+        store.forget_reads();
+        let store_handle = Arc::clone(&store);
+
+        let ctx = SessionContext::new();
+        let schema = OrcFormat::new()
+            .infer_schema(&ctx.state(), &(store as Arc<dyn ObjectStore>), &[meta])
+            .await
+            .expect("infer schema");
+        assert!(
+            schema.field_with_name("id").is_ok(),
+            "schema infer must read the footer, not just pin"
+        );
+
+        let reads = store_handle.reads();
+        assert!(
+            !reads.is_empty(),
+            "schema infer issued no request at all, so this asserts nothing"
+        );
+        for options in &reads {
+            assert_eq!(
+                options.version.as_deref(),
+                Some(VERSION),
+                "schema infer did not pin the object version: {options:?}"
+            );
+            assert!(
+                !matches!(options.range, Some(GetRange::Suffix(_))),
+                "a read fell back to a suffix range, which Azure Blob Storage does not serve: \
+                 {options:?}"
+            );
+        }
     }
 
     #[tokio::test]

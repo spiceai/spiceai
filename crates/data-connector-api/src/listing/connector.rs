@@ -2321,6 +2321,65 @@ mod tests {
         }
     }
 
+    /// Listing `file_format: orc` must scan an ORC file that was not written by
+    /// the production `orc-rust` encoder. The fixture is Apache ORC's Java-produced
+    /// `TestOrcFile.test1.orc`. Glue `OrcInputFormat` tables are registered through
+    /// this same listing path (`InputFormat::Orc.file_format()` is `"orc"`).
+    #[tokio::test]
+    async fn listing_connector_scans_an_independently_produced_orc_file() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "orc".to_string());
+        let (connector, dataset) = setup_connector("file://unused.orc".to_string(), params);
+
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("listing connector selects ORC")
+        else {
+            panic!("expected an ORC file format from file_format=orc");
+        };
+        assert_eq!(extension, ".orc");
+        assert_eq!(file_format.get_ext(), "orc");
+
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/orc/TestOrcFile.test1.orc"
+        ));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test1.orc");
+        std::fs::write(&path, bytes).expect("write independently produced ORC fixture");
+
+        let ctx = SessionContext::new();
+        let table_url =
+            ListingTableUrl::parse(format!("file://{}", path.display())).expect("listing url");
+        let config = ListingTableConfig::new(table_url)
+            .with_listing_options(ListingOptions::new(file_format).with_file_extension(".orc"))
+            .infer_schema(&ctx.state())
+            .await
+            .expect("infer schema from the independently produced ORC file");
+        let table = ListingTable::try_new(config).expect("listing table");
+        ctx.register_table("orc_ext", Arc::new(table))
+            .expect("register listing table");
+
+        let batches = ctx
+            .sql("SELECT COUNT(*) AS n FROM orc_ext")
+            .await
+            .expect("count sql")
+            .collect()
+            .await
+            .expect("collect count");
+        let counts = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("count column");
+        assert_eq!(
+            counts.value(0),
+            2,
+            "Apache ORC TestOrcFile.test1.orc contains two rows"
+        );
+    }
+
     #[derive(Debug)]
     struct TestObjectStore {
         meta: Vec<ObjectMeta>,
