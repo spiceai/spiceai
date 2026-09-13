@@ -46185,6 +46185,8 @@ mod tests {
     /// files (the SF-10 path: prune in memory, open one Vortex file).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pk_point_lookup_warm_scan_is_single_digit_ms_with_many_files() {
+        const FILES: i64 = 64;
+        const ROWS_PER_FILE: i64 = 256;
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("value", DataType::Int64, false),
@@ -46207,8 +46209,6 @@ mod tests {
         )
         .await;
         let provider = Arc::new(provider);
-        const FILES: i64 = 64;
-        const ROWS_PER_FILE: i64 = 256;
         for f in 0..FILES {
             let start = f * ROWS_PER_FILE;
             let batch = RecordBatch::try_new(
@@ -46263,6 +46263,8 @@ mod tests {
     /// plan+execute from listing hundreds of files.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pk_point_lookup_warm_scan_is_single_digit_ms_on_large_file() {
+        const ROWS: i64 = 262_144;
+        const PAYLOAD_LEN: usize = 256;
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("value", DataType::Int64, false),
@@ -46286,18 +46288,16 @@ mod tests {
         )
         .await;
         let provider = Arc::new(provider);
-        const ROWS: i64 = 262_144;
-        const PAYLOAD_LEN: usize = 256;
         let ids: Vec<i64> = (0..ROWS).collect();
         let values: Vec<i64> = ids.iter().map(|id| id * 100).collect();
         let mut payload_flat =
             Vec::with_capacity(usize::try_from(ROWS).expect("rows") * PAYLOAD_LEN);
         for id in 0..ROWS {
             let mut buf = [0_u8; PAYLOAD_LEN];
-            let mut x = (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut x = id.cast_unsigned().wrapping_mul(0x9E37_79B9_7F4A_7C15);
             for b in &mut buf {
                 x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                *b = (x >> 33) as u8;
+                *b = u8::try_from((x >> 33) & 0xFF).expect("masked to a byte");
             }
             payload_flat.extend_from_slice(&buf);
         }
@@ -46354,9 +46354,8 @@ mod tests {
     /// Sequential p50 tests do not catch a lock that serializes the warm hit.
     /// This drives 8 workers against many on-disk files after the listing cache
     /// and `ScanView` are warm, and requires: every row is the seeded
-    /// `value = id * 10`, zero metastore queries, and enough completed
-    /// lookups that the workers cannot have been fully serialized at the
-    /// 10 ms sequential budget.
+    /// `value = id * 10`, zero metastore queries, and concurrent elapsed at
+    /// least 2× faster than a one-worker baseline on the same fixture.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn pk_point_lookup_warm_concurrent_throughput_reuses_listing_and_scan_view() {
         const FILES: i64 = 32;
@@ -56815,6 +56814,7 @@ mod tests {
     /// until the freshness window expires.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scan_view_reuse_pk_lookup_returns_correct_value_for_full_and_append() {
+        const ROWS: i64 = 256;
         // 256 rows is below `DEFAULT_INLINE_MAX_ROWS` (1024), so the seed and
         // the post-warmup append stay in the inline corpus — this is the path
         // that must bump `scan_input_version` on a pure inline append, otherwise
@@ -56855,7 +56855,6 @@ mod tests {
             Field::new("name", DataType::Utf8, false),
             Field::new("value", DataType::Int64, false),
         ]));
-        const ROWS: i64 = 256;
         let target_id = ROWS / 2;
         let expected_value = target_id * 100;
 
