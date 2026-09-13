@@ -123,5 +123,6 @@ of the golden.
 | q21 | PASS | subquery scan qualifier (fork #226) |
 | q22 | PASS | string↔numeric type labels reach value compare |
 
-Do not treat these counts as a merge gate. Nightly CI is report-only until a
+Do not treat these counts as a merge gate. CI (`pull_request`,
+`merge_group`, and nightly) is report-only on pass rate until a
 threshold is set from this baseline (and preferably from Mode B).

@@ -4,8 +4,10 @@ Measures [IBM/substrait-compliance](https://github.com/IBM/substrait-compliance)
 TPC-H pass rate against the Spice `DataFusion` fork (Mode A) and sketches the
 product path through FlightSQL `CommandStatementSubstraitPlan` (Mode B).
 
-This is a **DataFusion consumer baseline**, not product CI. Nightly is
-report-only; it does not fail the repository on a low pass rate.
+This is a **DataFusion consumer baseline**. CI (`pull_request`,
+`merge_group`, and nightly) is report-only on pass rate: it does not
+fail the repository on a low pass rate. A harness or build crash still
+fails the job.
 
 ## Pins
 
@@ -18,7 +20,7 @@ report-only; it does not fail the repository on a low pass rate.
 The IBM `examples/datafusion-rust` tree on **`main`** pins
 `datafusion` / `datafusion-substrait` **54.1** and is the layout Mode A
 follows. Test suites and expected-output CSVs come from the pinned
-fork commit; `scripts/fetch-ibm.sh`, the nightly workflow and `SUITE_REF`
+fork commit; `scripts/fetch-ibm.sh`, the CI workflow and `SUITE_REF`
 in `src/main.rs` carry the same pin and move together.
 
 Nothing from the IBM repository is vendored. The suite is cloned at run
@@ -115,13 +117,16 @@ Server: `crates/runtime/src/flight/flightsql/statement_substrait_plan.rs`.
 Open work: catalog mapping from `spice.public.lineitem` onto unqualified
 Isthmus names; `spiced` bring-up in this harness; auth.
 
-## Nightly CI
+## CI
 
-`.github/workflows/substrait_compliance.yml` — `schedule` +
-`workflow_dispatch` only. Per-query FAIL/ERROR already exit 0; a
-harness/build crash fails the job (no `continue-on-error`). Uploads
-the JSON report as an artifact. Do not gate merge on pass rate until
-a threshold is set from this baseline.
+`.github/workflows/substrait_compliance.yml` runs on `pull_request` and
+`merge_group` (gated to harness source, scripts, DataFusion pin,
+toolchain, and workflow paths so repo docs and harness Markdown skip
+the job), plus nightly `schedule` and `workflow_dispatch`. Per-query
+FAIL/ERROR already exit 0; a harness/build crash fails the job (no
+`continue-on-error`). Uploads the JSON and CSV reports as an artifact.
+Do not gate merge on pass rate until a threshold is set from this
+baseline. The job is not in `REQUIRED_CHECKS`.
 
 ## License
 
