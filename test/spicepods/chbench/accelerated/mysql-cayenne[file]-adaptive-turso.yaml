@@ -44,6 +44,8 @@ mysql_connection_params: &mysql_params
   mysql_sslmode: disabled
 
 runtime:
+  query:
+    cte_materialization: auto
   flight:
     ipc_compression: lz4_frame
   caching:
