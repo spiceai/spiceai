@@ -16629,7 +16629,7 @@ impl CayenneTableProvider {
     /// from the stream schema (or otherwise unparseable) are skipped with a
     /// warning and the stream is returned unsorted (see
     /// `util::stream_utils::sort_stream`) — never surfaced as an error.
-    fn sort_stream_by_columns(
+    pub(crate) fn sort_stream_by_columns(
         &self,
         stream: SendableRecordBatchStream,
         sort_columns: &[String],
@@ -16653,6 +16653,57 @@ impl CayenneTableProvider {
         let sorted_stream = util::stream_utils::sort_stream(stream, sort_columns, task_ctx)?;
 
         Ok(sorted_stream)
+    }
+
+    /// Orders a whole-table replace by the table's configured `sort_columns`,
+    /// returning the stream to write and the write fan-out that order allows.
+    ///
+    /// A full-refresh table replaces its entire contents on every refresh, so
+    /// compaction — the only other path that orders data — never runs for it
+    /// (`refresh_mode: full` leaves nothing to consolidate). Ordering here is
+    /// what makes `sort_columns` mean anything for such a table: otherwise the
+    /// snapshot keeps arrival order however the column is configured, every
+    /// file's zone maps span the whole key range, and a selective scan prunes
+    /// nothing.
+    ///
+    /// Only an operator-configured order is honoured. An inferred one is a
+    /// guess at the workload, and a full refresh is too expensive to reorder on
+    /// a guess.
+    ///
+    /// Sharding the write would scatter the order across files, which is what
+    /// the order was for, so an ordered replace returns
+    /// [`WritePolicy::MAINTENANCE_SERIAL`] — the same trade the compaction
+    /// rewrite makes. A shard count alone does not achieve this: the fan-out is
+    /// decided by the policy's [`EncodeFanOut`], not by the caller's partition
+    /// count, so a `Sized` policy re-shards the sorted stream round-robin and
+    /// leaves every output file spanning the whole key range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the sort execution itself fails; see
+    /// [`Self::sort_stream_by_columns`] for how unusable columns are handled.
+    pub(crate) fn sort_overwrite_input(
+        &self,
+        data: SendableRecordBatchStream,
+        target_partitions: usize,
+    ) -> Result<(
+        SendableRecordBatchStream,
+        usize,
+        super::delta_encoding::WritePolicy,
+    )> {
+        if !self.context.sort_columns_are_authoritative() {
+            return Ok((data, target_partitions, rewrite_write_policy(false)));
+        }
+
+        let sort_columns = self.context.sort_columns().to_vec();
+        tracing::debug!(
+            table = self.table_metadata.table_name.as_str(),
+            sort_columns = ?sort_columns,
+            "Sorting whole-table replace before writing the new snapshot"
+        );
+        let ctx = self.create_session_context();
+        let sorted = self.sort_stream_by_columns(data, &sort_columns, &ctx.task_ctx())?;
+        Ok((sorted, 1, rewrite_write_policy(true)))
     }
 
     /// Effective sort columns for a snapshot rewrite under default settings.

@@ -719,13 +719,13 @@ impl Query {
                     } else {
                         let cache_namespace = request_context.cache_namespace();
                         let (ns_tag, ns_id) = cache_namespace.hash_inputs();
-                        let sql_raw_cache_key = CacheKey::Query(sql.as_ref(), parameters.as_ref())
-                            .as_raw_key_in_namespace(Self::plan_hasher(&self.df), ns_tag, ns_id);
+                        let cached_plan_key =
+                            Self::cached_plan_key(&self.df, sql.as_ref(), Some((ns_tag, ns_id)));
                         Query::get_plan(
                             &self.df,
                             &session,
                             sql.as_ref(),
-                            &sql_raw_cache_key,
+                            &cached_plan_key,
                             parameters,
                         )
                         .await?
@@ -1097,6 +1097,7 @@ impl Query {
                     } => {
                         let raw_cache_key = CacheKey::Query(sql.as_ref(), parameters.as_ref())
                             .as_raw_key(Query::plan_hasher(&ctx.df));
+                        let cached_plan_key = Query::cached_plan_key(&ctx.df, sql.as_ref(), None);
                         let plan = if let Some(plan) = pre_parsed_plan {
                             plan
                         } else {
@@ -1109,7 +1110,7 @@ impl Query {
                                 &ctx.df,
                                 &session,
                                 sql.as_ref(),
-                                &raw_cache_key,
+                                &cached_plan_key,
                                 parameters,
                             )
                             .await
