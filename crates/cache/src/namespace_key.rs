@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Machine-checked namespace prefix for results-cache keys.
 //!
-//! [`namespace_key_prefix`] is the byte stream
+//! [`namespace_key_header`] followed by the namespace id is the byte stream
 //! [`crate::key::CacheKey::as_raw_key_in_namespace`] hashes before the
 //! payload. Two requests whose `(namespace_tag, namespace_id)` differ must
 //! not produce the same stream after any payload is appended — otherwise a
@@ -334,19 +334,20 @@ fn le_byte(n: u64, shift: u64) -> (b: u8)
     ((n >> shift) & 0xffu64) as u8
 }
 
-/// Encodes `(namespace_tag, namespace_id)` as
-/// `[tag][id.len() as u64 LE][id...]`.
+/// Encodes the fixed-size header of `(namespace_tag, namespace_id)`:
+/// `[tag][id.len() as u64 LE]`.
 ///
-/// This is the byte stream [`crate::key::CacheKey::as_raw_key_in_namespace`]
-/// writes before hashing the payload. The `ensures` clause pins the body
-/// to [`spec_namespace_key_prefix`]; [`lemma_namespace_key_prefix_unambiguous`]
-/// is the anti-collision property that lemma discharges for every payload.
+/// [`crate::key::CacheKey::as_raw_key_in_namespace`] hashes this header, then
+/// `id`, then the payload. The `ensures` clause pins the header followed by
+/// `id` to [`spec_namespace_key_prefix`], the stream
+/// [`lemma_namespace_key_prefix_unambiguous`] proves unambiguous for every
+/// payload. Returning a fixed-size array rather than a buffer that also holds
+/// `id` keeps the namespaced cache-key path free of heap allocation.
 #[must_use]
-pub fn namespace_key_prefix(tag: u8, id: &[u8]) -> (prefix: Vec<u8>)
+pub fn namespace_key_header(tag: u8, id: &[u8]) -> (header: [u8; 9])
     ensures
-        prefix@ == spec_namespace_key_prefix(tag, id@),
+        header@ + id@ == spec_namespace_key_prefix(tag, id@),
 {
-    let mut prefix: Vec<u8> = Vec::new();
     let len: u64 = id.len() as u64;
 
     proof {
@@ -355,68 +356,58 @@ pub fn namespace_key_prefix(tag: u8, id: &[u8]) -> (prefix: Vec<u8>)
         assert(id@.len() <= 0xffff_ffff_ffff_ffff);
     }
 
-    prefix.push(tag);
-    prefix.push(le_byte(len, 0u64));
-    prefix.push(le_byte(len, 8u64));
-    prefix.push(le_byte(len, 16u64));
-    prefix.push(le_byte(len, 24u64));
-    prefix.push(le_byte(len, 32u64));
-    prefix.push(le_byte(len, 40u64));
-    prefix.push(le_byte(len, 48u64));
-    prefix.push(le_byte(len, 56u64));
+    let header: [u8; 9] = [
+        tag,
+        le_byte(len, 0u64),
+        le_byte(len, 8u64),
+        le_byte(len, 16u64),
+        le_byte(len, 24u64),
+        le_byte(len, 32u64),
+        le_byte(len, 40u64),
+        le_byte(len, 48u64),
+        le_byte(len, 56u64),
+    ];
 
     proof {
         lemma_u64_to_le_bytes_len(len);
-        assert(prefix@ == seq![tag] + spec_u64_to_le_bytes(len));
+        assert(header@ =~= seq![tag] + spec_u64_to_le_bytes(len));
+        assert(header@ + id@ =~= spec_namespace_key_prefix(tag, id@));
     }
 
-    let mut i: usize = 0;
-    while i < id.len()
-        invariant
-            i <= id.len(),
-            len == id@.len() as u64,
-            prefix@ == seq![tag] + spec_u64_to_le_bytes(len) + id@.subrange(0, i as int),
-        decreases id.len() - i,
-    {
-        prefix.push(id[i]);
-        proof {
-            assert(id@.subrange(0, i as int + 1) =~= id@.subrange(0, i as int) + seq![id@[i
-                as int]]);
-        }
-        i += 1;
-    }
-
-    proof {
-        assert(id@.subrange(0, id@.len() as int) =~= id@);
-    }
-
-    prefix
+    header
 }
 
 } // verus!
 
 #[cfg(test)]
 mod tests {
-    use super::namespace_key_prefix;
+    use super::namespace_key_header;
+
+    /// The stream `as_raw_key_in_namespace` hashes ahead of the payload: the
+    /// header, then the id.
+    fn prefix(tag: u8, id: &[u8]) -> Vec<u8> {
+        let mut stream = namespace_key_header(tag, id).to_vec();
+        stream.extend_from_slice(id);
+        stream
+    }
 
     #[test]
     fn prefix_is_tag_then_le_length_then_id() {
-        let prefix = namespace_key_prefix(1, b"abc");
         let mut expected = vec![1_u8];
         expected.extend_from_slice(&3_u64.to_le_bytes());
+        assert_eq!(namespace_key_header(1, b"abc").to_vec(), expected);
         expected.extend_from_slice(b"abc");
-        assert_eq!(prefix, expected);
+        assert_eq!(prefix(1, b"abc"), expected);
     }
 
     #[test]
     fn empty_id_still_carries_a_zero_length() {
-        let prefix = namespace_key_prefix(0, b"");
         let mut expected = vec![0_u8];
         expected.extend_from_slice(&0_u64.to_le_bytes());
-        assert_eq!(prefix, expected);
+        assert_eq!(prefix(0, b""), expected);
         // Public (tag 0) and system (tag 2) share an empty id; the tag is
         // what keeps their streams distinct.
-        assert_ne!(namespace_key_prefix(0, b""), namespace_key_prefix(2, b""));
+        assert_ne!(namespace_key_header(0, b""), namespace_key_header(2, b""));
     }
 
     #[test]
@@ -433,8 +424,8 @@ mod tests {
             "the naive concatenation is the collision the length prefix exists to prevent"
         );
 
-        let left = namespace_key_prefix(1, b"abc");
-        let mut right = namespace_key_prefix(1, b"a");
+        let left = prefix(1, b"abc");
+        let mut right = prefix(1, b"a");
         right.extend_from_slice(b"bc");
         assert_ne!(left, right);
     }

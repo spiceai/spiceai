@@ -19,7 +19,7 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
 
-pub use crate::namespace_key::namespace_key_prefix;
+pub use crate::namespace_key::namespace_key_header;
 
 use async_openai::types::embeddings::CreateEmbeddingRequest;
 use async_openai::types::embeddings::EmbeddingInput;
@@ -146,13 +146,14 @@ impl CacheKey<'_> {
     /// `namespace_id` is the principal's stable opaque id (empty for
     /// public/system).
     ///
-    /// The byte stream hashed is the return of [`namespace_key_prefix`]
-    /// followed by the payload, i.e.
+    /// The byte stream hashed is [`namespace_key_header`], then
+    /// `namespace_id`, then the payload, i.e.
     /// `[namespace_tag][namespace_id.len() as u64 LE][namespace_id...][payload...]`
     /// so that `(tag=1, id="abc")` and `(tag=1, id="a")` followed by a
     /// payload starting with `"bc"` cannot collide. That prefix-unambiguity
-    /// is a Verus postcondition on [`namespace_key_prefix`], not a
-    /// comment-only claim.
+    /// is a Verus postcondition on the header followed by the id (see
+    /// [`namespace_key_header`]), not a comment-only claim. The header is a
+    /// fixed-size array, so computing a namespaced key does not allocate.
     #[must_use]
     pub fn as_raw_key_in_namespace<T: Hasher>(
         &self,
@@ -160,7 +161,8 @@ impl CacheKey<'_> {
         namespace_tag: u8,
         namespace_id: &[u8],
     ) -> RawCacheKey {
-        hasher.write(&namespace_key_prefix(namespace_tag, namespace_id));
+        hasher.write(&namespace_key_header(namespace_tag, namespace_id));
+        hasher.write(namespace_id);
         self.hash_payload(&mut hasher);
         RawCacheKey(hasher.finish())
     }
@@ -264,13 +266,17 @@ mod tests {
         let _ = CacheKey::Query("select 1", None).as_raw_key_in_namespace(hasher, 1, b"alice");
         let recorded = writes.borrow();
         assert!(
-            !recorded.is_empty(),
-            "the hasher must see the namespace prefix"
+            recorded.len() >= 2,
+            "the hasher must see the namespace header and id"
         );
         assert_eq!(
             recorded[0],
-            namespace_key_prefix(1, b"alice"),
-            "the first write must be the verified prefix, not a parallel encoding"
+            namespace_key_header(1, b"alice"),
+            "the first write must be the verified header, not a parallel encoding"
+        );
+        assert_eq!(
+            recorded[1], b"alice",
+            "the id must follow the header that carries its length"
         );
     }
 
