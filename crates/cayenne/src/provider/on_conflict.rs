@@ -480,30 +480,24 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
         self.table.mark_pk_keyset_occ_degraded();
         let mut deleted = self.inner.delete_from(context).await?;
 
-        // Delete-all (TRUNCATE / `DELETE … WHERE TRUE`): the inner sink records
-        // `(file, file-local position)` deletes, and rows resident in the
-        // in-memory tier live in no file — so nothing tombstones them and they
-        // stay visible. A table with no primary key reaches this sink for every
-        // delete (`pk_deletion_strategy` is `PositionBased` exactly then), and in
-        // `mode: memory` the mem-tier is the permanent store, so without this the
-        // table can never be emptied. Mirrors `InlineAwareDeletionSink` below,
-        // which covers the key-based arm. Skipped for filtered deletes, whose
-        // predicate cannot be evaluated against the tier here.
+        // The mem-tier is a tier this sink cannot see: it records `(file,
+        // file-local position)` deletes, and rows resident in RAM live in no file.
+        // A table with no primary key reaches this sink for EVERY delete
+        // (`pk_deletion_strategy` is `PositionBased` exactly then), so without this
+        // a `mode: memory` table could neither be emptied nor filtered.
         //
-        // `purge_mem_tier_all` requires the table `write_lock`, which the inner
+        // `apply_mem_tier_delete` needs the table `write_lock`, which the inner
         // sink takes and releases internally, so acquire it here rather than
-        // nesting. Purge before the `deleted > 0` bookkeeping below: on a table
-        // whose rows are *only* in the mem-tier the inner count is 0, and the
-        // cached scan statistics still need invalidating once the purge changes
-        // the visible row count.
-        if is_delete_all(&self.filters) {
+        // nesting. Before the `deleted > 0` bookkeeping below: on a table whose
+        // rows are ONLY in the mem-tier the inner count is 0, and the cached scan
+        // statistics still need invalidating once this changes the visible count.
+        {
             let _guard = self.table.write_lock.lock().await;
-            let purged = self
-                .table
-                .purge_mem_tier_all()
-                .await
-                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
-            deleted = deleted.saturating_add(purged);
+            deleted = deleted.saturating_add(
+                apply_mem_tier_delete(&self.table, &self.filters)
+                    .await
+                    .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?,
+            );
         }
 
         if deleted > 0 {
@@ -546,6 +540,48 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
             self.table.invalidate_scan_file_statistics();
         }
         Ok(deleted)
+    }
+}
+
+/// The mem-tier arm of a `DELETE`, shared by both deletion sinks.
+///
+/// Neither sink can see the in-memory tier: one addresses `(file, file-local
+/// position)` pairs and the other durable-file plus catalog-inlined rows, and a
+/// RAM-resident row is in none of those. Under `mode: memory` the tier is the
+/// PERMANENT store, so what the sinks miss is the whole table.
+///
+/// Delete-all discards the tier wholesale (#11987, #12072). A filtered delete
+/// evaluates the predicate against the tier and rebuilds it without the matching
+/// rows (#12008), for memory-resident tables only — see
+/// `delete_mem_tier_rows_matching` for why the other memory profile is excluded.
+///
+/// The two arms are not symmetric: the delete-all branch applies to every mode
+/// and carries slot-advancer and budget bookkeeping, while the filtered branch
+/// self-gates on memory residency and carries neither.
+///
+/// Rebuilding is the general mechanism rather than landing an in-RAM tombstone per
+/// matched key. A tombstone is keyed by primary key and hides every row at or
+/// below its sequence, so a key whose live version an upsert wrote after this
+/// delete read the tier would be taken with it — the lost-update shape #13574
+/// closed one tier over. Doing it by key WOULD let the predicate pass run off-lock
+/// (the split `SegmentTombstones` already exists for the CDC delete path, and
+/// `transaction_has_conflict` is the footprint check that would make it safe), and
+/// is the optimization to reach for if this hold ever measures as a problem — but
+/// it cannot serve a table with no primary key, which is exactly the table that
+/// reaches the position-based sink.
+///
+/// The caller must hold the table `write_lock`.
+async fn apply_mem_tier_delete(
+    table: &CayenneTableProvider,
+    filters: &[Expr],
+) -> crate::provider::Result<u64> {
+    if is_delete_all(filters) {
+        table.purge_mem_tier_all().await
+    } else {
+        table
+            .delete_mem_tier_rows_matching(filters)
+            .await
+            .map_err(|error| crate::provider::Error::DataFusion { source: error })
     }
 }
 
@@ -601,21 +637,15 @@ impl DeletionSink for InlineAwareDeletionSink {
             )) as Box<dyn std::error::Error + Send + Sync>
         })?;
 
-        // Delete-all (TRUNCATE / `DELETE … WHERE TRUE`): the file/inline sink
-        // above tombstones only durable file rows and catalog-inlined data, and
-        // cannot enumerate keys — so un-checkpointed rows still resident in the
-        // in-memory CDC mem-tier survive and keep showing up in scans (#11987).
-        // Discard them wholesale here, under the `write_lock` held above so no
-        // concurrent CDC apply mutates the tier. Skipped for per-key deletes,
-        // which land their own key tombstones across every tier.
-        if is_delete_all(&self.filters) {
-            let purged = self
-                .table
-                .purge_mem_tier_all()
+        // The mem-tier is a tier this sink cannot see: the file/inline sink above
+        // tombstones durable file rows and catalog-inlined data only, so rows
+        // resident in RAM survive it. Runs under the `write_lock` held above, so
+        // no concurrent apply mutates the tier between the decision and the swap.
+        deleted = deleted.saturating_add(
+            apply_mem_tier_delete(&self.table, &self.filters)
                 .await
-                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
-            deleted = deleted.saturating_add(purged);
-        }
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?,
+        );
 
         if deleted > 0 {
             // Keyset clear-on-delete avoidance (cycle-4 incremental lever) — see

@@ -64,6 +64,19 @@ LEDGER_ROW_RE = re.compile(
     re.M,
 )
 
+# A ledger row whose branch cell declares the pin temporary, e.g.
+#   | [vortex](#vortex) | `2f1a22ad…` | `in-list-hashed-probe` (TEMPORARY: spiceai/vortex#95) |
+# Pinning a fork at a pull request's branch is the normal way to review a change
+# that spans both repositories, and it must never land: the branch is deleted
+# when that pull request merges, so trunk would name a revision no branch
+# reaches and the next clone could not resolve it. The marker makes the pin
+# reviewable and un-landable at once — this guard fails while it is present.
+TEMPORARY_PIN_RE = re.compile(
+    r"^\|\s*\[(?P<repo>[A-Za-z0-9._-]+)\]\([^)]*\)\s*\|\s*`[0-9a-f]{40}`\s*\|"
+    r"[^|]*\(TEMPORARY:\s*(?P<blocker>[^)]+)\)",
+    re.M,
+)
+
 # Repositories in the spiceai org that are not forks: they have no upstream, so
 # nothing can drop a patch from them and there is nothing to audit. Everything
 # else needs a ledger row, including forks that carry no patch today — "no
@@ -116,6 +129,16 @@ def gap_accounting(ledger_text: str) -> list[str]:
             f"list and update the count, or the ledger hides an unguarded patch"
         ]
     return []
+
+
+def temporary_pins(ledger_text: str) -> list[str]:
+    """Pins the ledger itself declares un-landable, one message each."""
+    return [
+        f"{match['repo']} is pinned to a branch rather than a landed revision: "
+        f"{match['blocker'].strip()} has to merge first, then repoint the pin at the "
+        f"merge commit and drop the TEMPORARY marker"
+        for match in TEMPORARY_PIN_RE.finditer(ledger_text)
+    ]
 
 
 def drift(pinned: dict[str, set[str]], recorded: dict[str, list[str]]) -> list[str]:
@@ -177,6 +200,19 @@ def main() -> int:
             doc_rev = ", ".join(recorded.get(repo, [])) or "-"
             status = "ok" if lock_rev == doc_rev else "DRIFT"
             print(f"{status:6} {repo:28} lock={lock_rev[:12]:14} ledger={doc_rev[:12]}")
+
+    blocking = temporary_pins(ledger_text)
+    if blocking:
+        print(f"\n{len(blocking)} pin(s) not ready to land:\n", file=sys.stderr)
+        for item in blocking:
+            print(f"  - {item}", file=sys.stderr)
+        print(
+            "\nA fork pinned at a pull request's branch is reviewable but not landable: the "
+            "branch goes away when that pull request merges, leaving trunk on a revision no "
+            "branch reaches.",
+            file=sys.stderr,
+        )
+        return 1
 
     errors = drift(pinned, recorded) + gap_accounting(ledger_text)
     if errors:

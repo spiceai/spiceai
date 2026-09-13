@@ -140,6 +140,7 @@ pub mod builder;
 pub(crate) mod caching_retention;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
+pub(crate) mod query_memory_pool;
 pub use runtime_datafusion::composed_catalog;
 // `error` and `refresh_sql` below are named throughout the runtime through these
 // aliases, but they belong to `runtime-datafusion`. Crate-visible so a crate outside
@@ -3317,12 +3318,15 @@ impl DataFusion {
             // served as though it were the whole response.
             //
             // Nothing in the caching read path removes an entry, so the
-            // accelerator is bounded by a retention policy or by nothing at all.
+            // accelerator is bounded by a retention policy, a cache budget, or
+            // nothing at all.
             match caching_retention::caching_retention(
                 acceleration_settings.caching_stale_if_error.is_enabled(),
                 acceleration_settings.caching_ttl,
                 acceleration_settings.caching_stale_while_revalidate_ttl,
                 declared_retention_runs,
+                acceleration_settings.caching_max_size.is_some()
+                    || acceleration_settings.caching_max_items.is_some(),
             ) {
                 caching_retention::CachingRetention::Derive {
                     period,
@@ -3344,9 +3348,13 @@ impl DataFusion {
 
                     accelerated_table_builder.retention(cache_retention);
                 }
-                // The policy built above this block is the dataset's own, and it
-                // is the only thing that can bound a stale-on-error cache.
-                caching_retention::CachingRetention::LeaveDeclared => {}
+                // Nothing to install: the accelerator is already bounded, either
+                // by the dataset's own policy built above this block — which can
+                // bound a stale-on-error cache — or by a cache budget, whose
+                // entry-aware eviction the accelerated-table builder installs
+                // below.
+                caching_retention::CachingRetention::LeaveDeclared
+                | caching_retention::CachingRetention::BoundedByCacheLimit => {}
                 caching_retention::CachingRetention::Unbounded => {
                     tracing::warn!(
                         "{}",
@@ -4252,11 +4260,12 @@ impl DataFusion {
         // - Engines backed by a `PolyTableProvider` (duckdb/sqlite/postgres/cayenne) expose a
         //   federated source, so `AcceleratedTable::table_provider()` wraps the table in a
         //   `FederatedTableProviderAdaptor`.
-        // - The in-memory Arrow accelerator has no federated source, so
-        //   `create_federated_table_source()` returns `None` and `table_provider()` hands back the
-        //   bare `AcceleratedTable`.
+        // - The in-memory Arrow accelerator has no federated source, and neither does any
+        //   dataset that declines to federate (`on_zero_results: use_source`, or federation
+        //   disabled), so `create_federated_table_source()` returns `None` and
+        //   `table_provider()` hands back the bare `AcceleratedTable`.
         // Unwrap the adaptor when present so we can find the parent `AcceleratedTable` in either
-        // case; otherwise a child of an Arrow-accelerated parent would never synchronize. The
+        // case; otherwise a child of such a parent would never synchronize. The
         // downcast borrows `parent_table`, so clone out the inner provider first to release the
         // borrow before falling back to `parent_table` itself.
         let adaptor_inner = parent_table

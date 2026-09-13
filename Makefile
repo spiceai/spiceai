@@ -150,6 +150,11 @@ endif
 # the nightly gate, so select the other two binaries by name rather than every
 # integration test in the `spice` package.
 #
+# `spiced`'s `dependency_logging` uses a loopback S3 endpoint to exercise
+# Iceberg retries through the runtime's dependency logger without credentials.
+# Select it explicitly so the gate checks the diagnostic emitted by the pinned
+# storage dependency as well as the formatter's unit tests.
+#
 # `llms`'s `anthropic_stream_errors` and `list_models_errors` are selected by
 # name for the same reason: each stands a local one-shot HTTP server up on an
 # ephemeral port and drives a provider adapter against it, so they exercise the
@@ -184,7 +189,7 @@ NEXTEST_SELECTION := --all --exclude libnfs \
 # `spice-substrait-compliance` is a binary crate: its unit tests, including the
 # fork-ledger guards (docs/dev/fork_patches.md), live in its bin target, which
 # `kind(=lib)` does not select.
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=llms) & binary(=anthropic_stream_errors)) + (package(=llms) & binary(=list_models_errors)) + binary(=metrics) + (package(=spice-substrait-compliance) & kind(=bin))
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=spiced) & binary(=dependency_logging)) + (package(=llms) & binary(=anthropic_stream_errors)) + (package(=llms) & binary(=list_models_errors)) + binary(=metrics) + (package(=spice-substrait-compliance) & kind(=bin))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
