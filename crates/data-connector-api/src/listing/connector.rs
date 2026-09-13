@@ -153,7 +153,11 @@ impl LocationPruningListingTable {
     }
 
     fn partitioned_file_for_meta(&self, meta: ObjectMeta) -> Option<PartitionedFile> {
-        let partition_values = self.collect_partition_values(&meta)?;
+        let partition_values = if self.partition_column_types().is_empty() {
+            Vec::new()
+        } else {
+            self.collect_partition_values(&meta)?
+        };
         Some(PartitionedFile {
             object_meta: meta,
             partition_values,
@@ -735,7 +739,8 @@ pub trait ListingTableConnector: DataConnector {
             detected_extension.and_then(|ext| ext.compression),
         )?;
 
-        let result = match (file_format_param.as_deref(), inferred_file_extension) {
+        let (file_format, default_extension): (Option<Arc<dyn FileFormat>>, String) =
+            match (file_format_param.as_deref(), inferred_file_extension) {
             (Some("csv"), _) | (None, Some("csv")) => Ok((
                 Some(self.delimiter_separated_format(
                     params,
@@ -971,17 +976,15 @@ pub trait ListingTableConnector: DataConnector {
                         source: "Missing file format".into(),
                     },
                 ),
-        };
+        }?;
 
         if format_selected_listing {
-            result.map(|(file_format, default_extension)| {
-                (
-                    file_format,
-                    format_selected_listing_extension(&default_extension),
-                )
-            })
+            Ok((
+                file_format,
+                format_selected_listing_extension(&default_extension),
+            ))
         } else {
-            result
+            Ok((file_format, default_extension))
         }
     }
 
@@ -2872,6 +2875,11 @@ mod tests {
             ("warehouse/table/notes.txt", "*.orc", false),
             ("warehouse/table/part-00000.parquet", "*.orc", false),
             ("warehouse/table/_temporary/000000_0", "*.orc", false),
+            (
+                "warehouse/table/dt=__HIVE_DEFAULT_PARTITION__/000000_0",
+                "*.orc",
+                true,
+            ),
             ("warehouse/table/part-00000.parquet", "*.parquet", true),
             ("warehouse/table/000000_0", "*.parquet", true),
             ("warehouse/table/_SUCCESS", "*.parquet", false),
