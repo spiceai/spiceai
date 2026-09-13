@@ -61,7 +61,7 @@ Spice provides five APIs and interfaces in a lightweight, portable runtime (sing
 2. **Text-to-SQL (NSQL)**: Natural-language SQL generation grounded in your federated schema with built-in sampling tools — usable from the HTTP API, the SQL REPL, or directly inside agent tool calls.
 3. **OpenAI-Compatible APIs**: Hosted LLM gateway (OpenAI, Anthropic, xAI, Bedrock) and local model serving (CUDA/Metal accelerated). Includes the OpenAI Responses API, web search, and tool calls.
 4. **Iceberg Catalog REST APIs**: A unified Iceberg REST Catalog API for query and write.
-5. **MCP HTTP+SSE APIs**: Model Context Protocol server *and* gateway with Streamable HTTP transport.
+5. **MCP HTTP+SSE APIs**: Model Context Protocol server *and* gateway with Streamable HTTP transport. Dual-era: serves [`2026-07-28`](https://modelcontextprotocol.io/specification/2026-07-28/) (`server/discover`, sessionless) and still answers legacy `initialize`.
 
 ## 🎥 Watch & Learn
 
@@ -141,7 +141,7 @@ Bootstrap accelerated datasets from S3 in **seconds, not minutes**. Cold-start e
 - **Read-only API keys** enforced on Flight DoGet and async query paths
 - **Provider-aware LLM prompt caching** for cost reduction
 - **mTLS** for all internal cluster communication; OpenTelemetry metric export with delta temporality
-- **Streamable HTTP MCP transport**, MCP gateway, MCP server
+- **Streamable HTTP MCP transport** (`2026-07-28` + legacy `initialize`), MCP gateway, MCP server
 - **30+ data connectors** with shared HTTP rate control, dynamic headers, schema decomposition
 
 ## How is Spice different?

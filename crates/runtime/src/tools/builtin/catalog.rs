@@ -247,6 +247,19 @@ impl SpiceToolCatalog for BuiltinToolCatalog {
             .ok()
     }
 
+    fn try_get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+        self.construct_builtin(name, None, None, &HashMap::new())
+            .ok()
+    }
+
+    fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+        SpiceToolsOptions::All
+            .tools_by_name()
+            .iter()
+            .filter_map(|t| self.construct_builtin(t, None, None, &HashMap::new()).ok())
+            .collect()
+    }
+
     fn name(&self) -> &str {
         Self::name()
     }
