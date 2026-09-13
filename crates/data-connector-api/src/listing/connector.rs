@@ -1886,8 +1886,10 @@ async fn get_last_modified(
 
         if let Some(file_ext) = detect_file_extension_from_path(file.location.as_ref()) {
             found_extensions.insert(file_ext.file_extension.clone());
-        } else {
-            found_extensions.insert(object_file_name(&file.location).to_string());
+        } else if !found_extensions.contains(NO_EXTENSION_SENTINEL) {
+            // Hive `_committed_*` / `000000_0` objects share one sentinel so
+            // the mismatch-error summary stays bounded on large tables.
+            found_extensions.insert(NO_EXTENSION_SENTINEL.to_string());
         }
 
         if file_matches_extension(&file.location, extension) {
@@ -2023,6 +2025,10 @@ fn datafusion_listing_file_extension(extension: &str) -> &str {
         extension
     }
 }
+
+/// Shown in the "no matching extension" error for objects with no suffix.
+/// One entry covers every such object so the summary stays bounded.
+const NO_EXTENSION_SENTINEL: &str = "(no extension)";
 
 fn object_file_name(location: &Path) -> &str {
     location
@@ -3216,9 +3222,71 @@ mod tests {
         .await
         .expect_err("markers alone are not a readable listing");
 
+        let DataConnectorError::InvalidConfigurationNoSource { message, .. } = err else {
+            panic!("only-markers should be a configuration error, got: {err:?}");
+        };
         assert!(
-            matches!(err, DataConnectorError::InvalidConfigurationNoSource { .. }),
-            "only-markers should be a configuration error, got: {err:?}"
+            message.contains(&format!("'{NO_EXTENSION_SENTINEL}'")),
+            "extensionless markers must keep the set non-empty via the sentinel: {message}"
+        );
+        assert!(
+            !message.contains("_SUCCESS"),
+            "extensionless object names must not appear in the error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_last_modified_extensionless_objects_use_one_no_extension_sentinel() {
+        // Regression: a large empty Hive table can have tens of thousands of
+        // `_committed_*` / `000000_0` objects. Those share one sentinel in the
+        // mismatch-error summary instead of one HashSet entry per basename.
+        let url = Url::parse("s3://bucket/table/").expect("to parse url");
+        let table_path = ListingTableUrl::parse(url).expect("to parse url");
+        let ctx = SessionContext::new();
+        let dataset = DatasetSpec::new("s3://bucket/table/", TableReference::bare("test"));
+
+        let mut meta_files = vec![
+            create_meta("table/_SUCCESS", 400, 0),
+            create_meta("table/000000_0", 200, 100),
+            create_meta("table/notes.txt", 500, 10),
+        ];
+        for i in 0_i64..64 {
+            meta_files.push(create_meta(&format!("table/_committed_{i}"), 300 + i, 0));
+        }
+        let test_store = Arc::new(TestObjectStore::new(meta_files)) as Arc<dyn ObjectStore>;
+
+        let err = get_last_modified(
+            "TestListingConnector".to_string(),
+            &dataset,
+            ".parquet",
+            table_path,
+            &ctx,
+            &test_store,
+        )
+        .await
+        .expect_err("no object matches .parquet");
+
+        let DataConnectorError::InvalidConfigurationNoSource { message, .. } = err else {
+            panic!("extensionless objects must not look like an empty path, got: {err:?}");
+        };
+        assert!(
+            message.contains(&format!("'{NO_EXTENSION_SENTINEL}'")),
+            "expected one no-extension sentinel in: {message}"
+        );
+        assert_eq!(
+            message.matches(NO_EXTENSION_SENTINEL).count(),
+            1,
+            "sentinel must appear once, got: {message}"
+        );
+        assert!(
+            message.contains("'.txt'"),
+            "real extensions must still be listed: {message}"
+        );
+        assert!(
+            !message.contains("_committed_")
+                && !message.contains("000000_0")
+                && !message.contains("_SUCCESS"),
+            "extensionless basenames must not appear in the error: {message}"
         );
     }
 
