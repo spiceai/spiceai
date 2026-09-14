@@ -235,7 +235,13 @@ runs:
 
         success=0
         for attempt in 1 2 3; do
-          TEMP_ZIP="$(mktemp "${STAGING_ROOT}/protoc.XXXXXX")"
+          # `set -e` is still on in this loop. A failed mktemp here used to abort
+          # the action before the three attempts and the final `df -h`.
+          if ! TEMP_ZIP="$(mktemp "${STAGING_ROOT}/protoc.XXXXXX")"; then
+            echo "::warning::protoc install attempt ${attempt}/3 failed: could not create temp zip under ${STAGING_ROOT}"
+            sleep $((attempt * 2))
+            continue
+          fi
           if download_and_verify "${TEMP_ZIP}" && extract_atomically "${TEMP_ZIP}"; then
             rm -f "${TEMP_ZIP}"
             if protoc_version_ok "${PROTOC_BIN}"; then
