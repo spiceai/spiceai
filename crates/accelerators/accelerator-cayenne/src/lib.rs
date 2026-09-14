@@ -52,7 +52,7 @@ use util::concat_arrays;
 
 use crate::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
 use data_accelerator_api::FilePathError;
-use data_accelerator_api::snapshots::download_snapshot_if_needed;
+use data_accelerator_api::snapshots::{download_snapshot, should_download_snapshot};
 use data_accelerator_api::spice_data_base_path;
 use data_accelerator_api::{
     AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
@@ -3743,6 +3743,17 @@ impl DataAccelerator for CayenneAccelerator {
                 metadata_dir.clone(),
                 path_buf.clone(),
             );
+            let refresh_mode = resolved_refresh_mode(source, acceleration);
+
+            // Decide whether to bootstrap from a snapshot before `get_or_create_catalog`
+            // below opens the local metastore: that call creates `metadata_dir` as a
+            // side effect (it's a fresh SQLite connection), and this decision's "does an
+            // acceleration already exist here" check reads that same directory's
+            // existence. Deciding first means the check sees the true pre-startup state
+            // instead of a directory the catalog open just created.
+            let should_bootstrap =
+                should_download_snapshot(acceleration, source, &snapshot_adapter, refresh_mode);
+
             // Build a CayenneSnapshotEngine so the snapshot tar uses the
             // per-dataset metastore-slice format (no raw cayenne.db file)
             // and so `download_latest_snapshot` imports the slice into the
@@ -3752,6 +3763,8 @@ impl DataAccelerator for CayenneAccelerator {
                 .get("cayenne_metastore")
                 .map_or("sqlite", String::as_str)
                 .to_string();
+            // The catalog is opened unconditionally: normal operation needs it
+            // regardless of the snapshot decision above.
             let snapshot_engine = match self
                 .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
                 .await
@@ -3770,13 +3783,17 @@ impl DataAccelerator for CayenneAccelerator {
                     None
                 }
             };
-            Ok(download_snapshot_if_needed(
+
+            if !should_bootstrap {
+                return Ok(BootstrapStatus::none());
+            }
+
+            Ok(download_snapshot(
                 acceleration,
                 source,
                 snapshot_adapter,
                 AccelerationEngine::Cayenne,
                 snapshot_engine,
-                resolved_refresh_mode(source, acceleration),
             )
             .await)
         } else {
