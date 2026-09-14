@@ -7,12 +7,13 @@ mod flight_prepared_statements {
     use arrow_flight::sql::client::{FlightSqlServiceClient, PreparedStatement};
     use futures::TryStreamExt as _;
     use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
-    use spicepod::component::runtime::ApiKey;
+    use spicepod::component::{caching::SQLResultsCacheConfig, runtime::ApiKey};
     use tonic::transport::Channel;
 
     use crate::{
         flight::{
-            create_flight_client, start_spice_test_app, test_record_batch, write_record_batches,
+            create_flight_client, start_spice_test_app, start_spice_test_app_with_metrics_port,
+            test_record_batch, write_record_batches,
         },
         init_tracing,
         utils::test_request_context,
@@ -1139,5 +1140,171 @@ mod flight_prepared_statements {
                 Ok(())
             })
             .await
+    }
+
+    /// A stale-while-revalidate revalidation of a Flight SQL prepared statement
+    /// must re-bind its parameter values.
+    ///
+    /// Flight SQL is where this matters most: a JDBC or ADBC client binds
+    /// parameters on every query, so the placeholder path is the normal one
+    /// rather than an edge case. The revalidation rebuilds the query from the
+    /// SQL text, which still holds its placeholders -- without the values it
+    /// fails with `Placeholder '$1' was not provided a value for execution`, the
+    /// stale entry is never replaced, and each later request inside the window
+    /// is served a result older than `item_ttl` asked for.
+    ///
+    /// Asserted on `results_cache_swr_revalidations`, the counter an operator
+    /// would actually watch: `stored` rising is the revalidation landing, and
+    /// `query_failed` staying at zero is the placeholder error not happening.
+    /// Both matter -- a run that never revalidated at all would leave `stored`
+    /// at zero too.
+    #[tokio::test]
+    async fn swr_revalidation_of_a_prepared_statement_rebinds_its_values()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some(
+            "integration=debug,runtime::datafusion::query::cache=debug,info",
+        ));
+
+        test_request_context()
+            .scope(async {
+                // `cache_key_type: sql` keys results on the SQL text and the
+                // bound values, so the stale hit lands before a plan exists --
+                // the route with no bound plan for the revalidation to re-run.
+                // Before the app, so the cache's counters initialize against it.
+                let registry = &*PROMETHEUS;
+
+                let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
+                    as Arc<dyn FlightBasicAuth + Send + Sync>;
+                let (channel, _df, _metrics_port) = start_spice_test_app_with_metrics_port(
+                    Some(auth),
+                    None,
+                    None,
+                    Some(SQLResultsCacheConfig {
+                        enabled: true,
+                        item_ttl: Some("1s".to_string()),
+                        stale_while_revalidate_ttl: Some("5m".to_string()),
+                        cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+                        ..Default::default()
+                    }),
+                )
+                .await?;
+
+                // `public.my_table` is registered schema-only, so it holds no
+                // rows until something writes them.
+                let mut put_client = create_flight_client(channel.clone(), Some("valid"))?;
+                write_record_batches(&mut put_client, vec![test_record_batch()?]).await?;
+
+                let mut client = FlightSqlServiceClient::new(channel);
+                client.handshake("", "valid").await?;
+                const SQL: &str = "SELECT a FROM my_table WHERE a = $1";
+                let bind = || {
+                    create_param_batch(
+                        vec![("$1", arrow::datatypes::DataType::Int32, false)],
+                        vec![Arc::new(Int32Array::from(vec![2])) as ArrayRef],
+                    )
+                };
+
+                let populated = execute_parameterized_query(&mut client, SQL, bind()?).await?;
+                assert_eq!(
+                    rows_of(&populated),
+                    vec![2],
+                    "binding 2 must select its own row"
+                );
+
+                // Age the entry past `item_ttl` into the stale-while-revalidate
+                // window. The sleep is the behavior under test (TTL expiry), not
+                // a readiness wait.
+                tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+
+                let stale = execute_parameterized_query(&mut client, SQL, bind()?).await?;
+                assert_eq!(rows_of(&stale), vec![2]);
+
+                // Poll the counter rather than sleeping a fixed interval: the
+                // revalidation runs on a background task.
+                let mut stored = 0.0;
+                let mut failed = 0.0;
+                for _ in 0..100 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    stored = counter(registry, "stored");
+                    failed = counter(registry, "query_failed");
+                    if stored > 0.0 || failed > 0.0 {
+                        break;
+                    }
+                }
+
+                assert!(
+                    failed < 1.0,
+                    "a revalidation failed to execute, which over Flight SQL means the bound \
+                     values were dropped when the query was rebuilt from its SQL text"
+                );
+                assert!(
+                    stored > 0.0,
+                    "no revalidation stored a result, so the stale entry was never replaced"
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// The `a` column of every returned batch.
+    fn rows_of(batches: &[RecordBatch]) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("column `a` is Int32")
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// A `MeterProvider` backed by a scrapable registry, installed once per
+    /// process.
+    ///
+    /// Without this the cache's counters record into the global no-op provider
+    /// and the metrics endpoint exports no `swr_revalidations` series at all --
+    /// which reads exactly like a revalidation that never ran. It must be
+    /// installed before the counters are first touched, so the test forces it
+    /// before starting the app. Mirrors `install_prometheus_meter_provider` in
+    /// tests/metrics.rs; the reader comes from `runtime::prometheus_reader` so
+    /// the test and `spiced` cannot drift on exposition naming.
+    static PROMETHEUS: std::sync::LazyLock<prometheus::Registry> = std::sync::LazyLock::new(|| {
+        let registry = prometheus::Registry::new();
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_resource(opentelemetry_sdk::Resource::builder().build())
+            .with_reader(
+                runtime::prometheus_reader(registry.clone())
+                    .expect("to build the prometheus reader"),
+            )
+            .build();
+        opentelemetry::global::set_meter_provider(provider);
+        registry
+    });
+
+    /// One `results_cache_swr_revalidations` series, read off the registry.
+    ///
+    /// Gathered from the registry rather than scraped over HTTP because the
+    /// exposition name carries a `_total` suffix the exporter chooses; the
+    /// family name here is the one the instrument declares.
+    fn counter(registry: &prometheus::Registry, outcome: &str) -> f64 {
+        registry
+            .gather()
+            .iter()
+            .filter(|family| family.name().starts_with("results_cache_swr_revalidations"))
+            .flat_map(|family| family.get_metric().iter())
+            .filter(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|l| l.name() == "outcome" && l.value() == outcome)
+            })
+            .map(|metric| metric.get_counter().value())
+            .sum()
     }
 }

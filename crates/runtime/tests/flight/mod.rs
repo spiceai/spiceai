@@ -37,7 +37,7 @@ use runtime::{
 };
 use runtime_auth::FlightBasicAuth;
 use runtime_secrets::Secrets;
-use spicepod::component::dataset::Dataset;
+use spicepod::component::{caching::SQLResultsCacheConfig, dataset::Dataset};
 use tokio::{sync::RwLock, time::sleep};
 use tonic::transport::Channel;
 
@@ -61,14 +61,19 @@ async fn start_spice_test_app(
     test_dataset: Option<Dataset>,
 ) -> Result<(Channel, Arc<DataFusion>), anyhow::Error> {
     let (channel, df, _metrics_port) =
-        start_spice_test_app_with_metrics_port(flight_auth, rate_limits, test_dataset).await?;
+        start_spice_test_app_with_metrics_port(flight_auth, rate_limits, test_dataset, None)
+            .await?;
     Ok((channel, df))
 }
 
+/// `sql_cache` installs the SQL results cache. Left `None` the app has no cache
+/// provider at all, so every query reports `CacheDisabled` — which is what the
+/// tests that do not care about caching want.
 async fn start_spice_test_app_with_metrics_port(
     flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
     rate_limits: Option<RateLimits>,
     test_dataset: Option<Dataset>,
+    sql_cache: Option<SQLResultsCacheConfig>,
 ) -> Result<(Channel, Arc<DataFusion>, u16), anyhow::Error> {
     let mut rng = rand::rng();
     let http_port: u16 = rng.random_range(50000..60000);
@@ -93,13 +98,14 @@ async fn start_spice_test_app_with_metrics_port(
         rt_builder = rt_builder.with_rate_limits(rate_limits);
     }
 
-    let app = if let Some(dataset) = test_dataset {
-        app::AppBuilder::new("test_app")
-            .with_dataset(dataset)
-            .build()
-    } else {
-        app::AppBuilder::new("test_app").build()
-    };
+    let mut app_builder = app::AppBuilder::new("test_app");
+    if let Some(dataset) = test_dataset {
+        app_builder = app_builder.with_dataset(dataset);
+    }
+    if let Some(sql_cache) = sql_cache {
+        app_builder = app_builder.with_sql_cache(sql_cache);
+    }
+    let app = app_builder.build();
     let rt = Arc::new(rt_builder.with_app(app).build().await);
 
     let cloned_rt = Arc::clone(&rt);
