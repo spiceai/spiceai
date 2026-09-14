@@ -171,6 +171,15 @@ impl CachedQueryResult {
         }
     }
 
+    /// Whether this entry holds encoded bytes rather than the batches themselves.
+    ///
+    /// Reading an encoded entry decompresses and decodes it, which is CPU work;
+    /// reading a raw one hands out the batches it already holds.
+    #[must_use]
+    pub fn is_encoded(&self) -> bool {
+        matches!(self.data, CachedData::Encoded(_))
+    }
+
     /// Check if the cached data is stale (older than the given TTL).
     #[must_use]
     pub fn is_stale(&self, ttl: Duration, now: Instant) -> bool {

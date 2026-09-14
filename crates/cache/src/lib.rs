@@ -549,10 +549,12 @@ impl TableChangeClock {
     /// with `a`/`b.c`. A hash collision between two genuinely different tables
     /// would only ever *reject* a cacheable result, never serve a stale one.
     fn resolved_key(table_ref: &TableReference) -> u64 {
-        use std::hash::{BuildHasher, Hasher};
+        use std::hash::Hasher;
 
-        let mut hasher =
-            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default().build_hasher();
+        // `XxHash64` keeps its state inline, where the streaming `XxHash3_64`
+        // allocates it, and this runs for every table on every cache hit. The key
+        // only has to agree with itself within this process.
+        let mut hasher = twox_hash::XxHash64::with_seed(0);
         for component in [
             table_ref.catalog().unwrap_or(SPICE_DEFAULT_CATALOG),
             table_ref.schema().unwrap_or(SPICE_DEFAULT_SCHEMA),
