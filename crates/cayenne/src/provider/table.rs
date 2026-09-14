@@ -57299,6 +57299,12 @@ mod tests {
         let _ = collect(insert_plan, ctx.task_ctx())
             .await
             .expect("insert collect");
+        // The seed's deferred catalog updates must finish before the cache-hit
+        // measurement can attribute metastore operations to scans alone.
+        table
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain seed maintenance before warming the scan cache");
         for _ in 0..8 {
             let plan = table
                 .scan(&ctx.state(), Some(&vec![0]), &[], None)
