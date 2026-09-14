@@ -1261,6 +1261,12 @@ pub fn validate_snapshot_consistency(
         let Some(acceleration) = source.acceleration() else {
             continue;
         };
+        // `enabled: false` turns the whole acceleration block off, including
+        // defaulted snapshots. A disabled Cayenne view must not occupy the
+        // shared metastore and abort a snapshot-enabled dataset beside it.
+        if !acceleration.enabled {
+            continue;
+        }
         let Some(engine) = accelerator_for_engine(acceleration.engine) else {
             continue;
         };

@@ -5014,6 +5014,55 @@ impl DataFusion {
             &table.to_string(),
         )?;
 
+        // Refuse a multi-read view before engine `init` restores anything.
+        // `initialize_views_accelerators` skips bootstrap-enabled views for this
+        // reason; running the proof after a restore would leave the archive's
+        // rows (and a local checkpoint of them) on disk for a later start.
+        let mut refresh_attestation = None;
+        if !acceleration.snapshot_behavior.is_disabled() {
+            match view_snapshot_consistency_decision(
+                &self.ctx,
+                table,
+                &view.sql,
+                acceleration.snapshots_consistency,
+            )
+            .await?
+            {
+                ViewSnapshotConsistencyDecision::AcceptSkew => {}
+                ViewSnapshotConsistencyDecision::ConsistentSingleRead => {
+                    if acceleration.snapshot_behavior.create_enabled() {
+                        let attestation = crate::view::ViewRefreshReadAttestation::new();
+                        view_table = crate::view::wrap_view_refresh_attestation(
+                            view_table,
+                            attestation.clone(),
+                        );
+                        refresh_attestation = Some(attestation);
+                    }
+                }
+            }
+        }
+
+        let mut view_bootstrap_status = BootstrapStatus::none();
+        if acceleration.snapshot_behavior.bootstrap_enabled() {
+            let accelerator = self
+                .accelerator_engine_registry()
+                .get_accelerator_engine(acceleration.engine)
+                .await
+                .ok_or_else(|| Error::UnableToCreateView {
+                    reason: format!(
+                        "Failed to initialize view acceleration: unknown engine {}",
+                        acceleration.engine
+                    ),
+                })?;
+            view_bootstrap_status =
+                accelerator
+                    .init(view)
+                    .await
+                    .map_err(|e| Error::UnableToCreateView {
+                        reason: format!("Failed to initialize view acceleration: {e}"),
+                    })?;
+        }
+
         let accelerated_table_provider = self
             .accelerator_engine_registry()
             .create_accelerator_table(
@@ -5056,29 +5105,6 @@ impl DataFusion {
             refresh = refresh.max_jitter(max_jitter);
         }
 
-        // The publish gate must consume the read shape of the plan that
-        // *executes* the refresh. Wrap the federated provider so each scan
-        // records that attestation before `AcceleratedTable` takes ownership.
-        let mut refresh_attestation = None;
-        if acceleration.snapshot_behavior.create_enabled() {
-            match view_snapshot_consistency_decision(
-                &self.ctx,
-                table,
-                &view.sql,
-                acceleration.snapshots_consistency,
-            )
-            .await?
-            {
-                ViewSnapshotConsistencyDecision::AcceptSkew => {}
-                ViewSnapshotConsistencyDecision::ConsistentSingleRead => {
-                    let attestation = crate::view::ViewRefreshReadAttestation::new();
-                    view_table =
-                        crate::view::wrap_view_refresh_attestation(view_table, attestation.clone());
-                    refresh_attestation = Some(attestation);
-                }
-            }
-        }
-
         let mut builder = AcceleratedTable::builder(
             self.runtime_status(),
             table.clone(),
@@ -5104,6 +5130,7 @@ impl DataFusion {
         );
         builder.refresh_on_startup(acceleration.refresh_on_startup);
         builder.ready_state(view.ready_state);
+        builder.bootstrap_status(view_bootstrap_status);
         builder.zero_results_action(acceleration.on_zero_results.clone());
         if acceleration.disable_federation {
             builder.disable_federation();
@@ -5135,27 +5162,9 @@ impl DataFusion {
                     }
                 );
 
-                // `bootstrap_only` restores but does not publish. The archive
-                // does not record `snapshots_consistency`, so a default
-                // bootstrap-only view would otherwise serve a multi-read
-                // materialization without opting out. Run the same single-read
-                // proof for every snapshot-enabled view; only install the
+                // Consistency was decided before bootstrap. Only install the
                 // publish veto when this view will also write archives.
                 if !acceleration.snapshot_behavior.is_disabled() {
-                    if !acceleration.snapshot_behavior.create_enabled() {
-                        // `bootstrap_only`: still refuse a multi-read view at load.
-                        // The archive does not record `snapshots_consistency`, so a
-                        // default consumer would otherwise restore a multi-read
-                        // materialization without opting out.
-                        let _ = view_snapshot_consistency_decision(
-                            &self.ctx,
-                            table,
-                            &view.sql,
-                            acceleration.snapshots_consistency,
-                        )
-                        .await?;
-                    }
-
                     let publish_gate = Self::view_snapshot_publish_gate(table, refresh_attestation);
 
                     if acceleration.snapshot_behavior.create_enabled() {

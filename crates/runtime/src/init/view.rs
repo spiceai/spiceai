@@ -309,6 +309,16 @@ impl Runtime {
                 unreachable!("acceleration is Some and enabled");
             };
 
+            // Engine `init` downloads a snapshot when bootstrap is enabled. Datasets
+            // are not registered yet, so the single-read proof cannot run here. A
+            // `bootstrap_only` / `consistent_read` view would otherwise restore an
+            // `accept_skew` archive, checkpoint it, then be refused — leaving those
+            // rows on disk for a later same-schema start. `create_accelerated_view`
+            // inits after that decision.
+            if acceleration_settings.snapshot_behavior.bootstrap_enabled() {
+                continue;
+            }
+
             let accelerator = match self
                 .accelerator_engine_registry
                 .get_accelerator_engine(acceleration_settings.engine)

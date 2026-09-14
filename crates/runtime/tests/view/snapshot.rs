@@ -395,12 +395,13 @@ async fn multi_read_view_refuses_bootstrap_only_snapshots() -> anyhow::Result<()
             let snapshot_dir = temp.path().join("snapshots");
             std::fs::create_dir_all(&snapshot_dir).expect("mkdir snapshots");
 
+            let duckdb_file = temp.path().join("bootstrap_only.db");
             let app = AppBuilder::new("view_snapshot_bootstrap_only_multi_read")
                 .with_dataset(csv_dataset(&csv_path))
                 .with_view(accelerated_view_with(
                     "orders_self_join",
                     MULTI_READ_SQL,
-                    &temp.path().join("bootstrap_only.db"),
+                    &duckdb_file,
                     spicepod::acceleration::SnapshotBehavior::BootstrapOnly,
                     SnapshotsConsistency::ConsistentRead,
                 ))
@@ -408,6 +409,10 @@ async fn multi_read_view_refuses_bootstrap_only_snapshots() -> anyhow::Result<()
                 .build();
             let rt = load_components(app).await?;
             assert_multi_read_view_is_refused(&rt, &snapshot_dir, "orders_self_join").await?;
+            assert!(
+                !duckdb_file.exists(),
+                "a refused bootstrap_only view must not restore an archive before the consistency decision"
+            );
 
             Ok(())
         })

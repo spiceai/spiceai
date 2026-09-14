@@ -152,10 +152,15 @@ impl Runtime {
         // dataset is exactly the collision these checks refuse. Walking datasets alone
         // leaves it to surface as a corrupted restore instead. (Same shape as #12160,
         // which fixed the DuckDB pool-sizing and `replace_file` walks.)
+        //
+        // Disabled accelerations do not join a store, so they are dropped before
+        // validation: a disabled Cayenne view with defaulted snapshots must not
+        // abort a snapshot-enabled dataset in the shared default metastore.
         let acceleration_sources: Vec<Arc<dyn AccelerationSource>> = startup_datasets
             .iter()
             .map(|ds| ds.clone_arc())
             .chain(valid_views.iter().map(|vv| vv.view.clone_arc()))
+            .filter(|source| source.acceleration().is_some_and(|a| a.enabled))
             .collect();
         if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
@@ -1755,8 +1760,11 @@ impl Runtime {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
 
         // Validate Cayenne snapshot consistency before initializing accelerators.
-        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
-            valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
+        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> = valid_datasets
+            .iter()
+            .map(|ds| ds.clone_arc())
+            .filter(|source| source.acceleration().is_some_and(|a| a.enabled))
+            .collect();
         if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
             return;

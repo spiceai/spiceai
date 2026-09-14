@@ -27,7 +27,8 @@ use crate::accelerated::refresh_completion::{RefreshCompletion, RefreshRequestId
 use crate::accelerated::refresh_task::RefreshTask;
 use crate::accelerated::snapshots::{
     SnapshotCallback, canonical_checkpoint_schema, create_checkpoint_and_snapshot,
-    create_periodic_snapshot_callback, spawn_snapshot_interval_task,
+    create_periodic_snapshot_callback, publish_snapshot_on_refresh_completion,
+    spawn_snapshot_interval_task,
 };
 use crate::federated::FederatedTable;
 use arrow::datatypes::Schema;
@@ -1205,6 +1206,7 @@ impl Refresher {
                             None,
                             refresh_sql.as_deref(),
                             Some(&refresh_clone),
+                            true,
                         )
                         .await;
                     }
@@ -1299,16 +1301,18 @@ impl Refresher {
                             }
                         }
 
-                        if refresh_succeeded && checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
+                        if refresh_succeeded && let Some(checkpointer) = &checkpointer {
                             let refresh_sql = {
                                 let refresh = refresh.read().await;
                                 refresh.sql.as_ref().map(RefreshSQL::to_sql)
                             };
+                            // Persist/retract the local checkpoint fingerprint on every
+                            // successful materialization. Interval and batch triggers
+                            // publish on their own cycle; passing the manager here is
+                            // what lets the checkpoint record (or retract) the stamp
+                            // even when this refresh does not publish.
                             create_checkpoint_and_snapshot(
                                 checkpointer,
-                                // Checkpoint either way; publish only what the configured
-                                // definition can honestly be said to describe, which
-                                // `create_checkpoint_and_snapshot` decides under the lock.
                                 snapshot_manager.as_ref(),
                                 &checkpoint_schema,
                                 &snapshot_mutex,
@@ -1320,6 +1324,10 @@ impl Refresher {
                                 None,
                                 refresh_sql.as_deref(),
                                 Some(&refresh),
+                                publish_snapshot_on_refresh_completion(
+                                    create_checkpoint_snapshot_after_refresh,
+                                    checkpoint_counting_enabled.load(Ordering::Acquire),
+                                ),
                             ).await;
                         }
 

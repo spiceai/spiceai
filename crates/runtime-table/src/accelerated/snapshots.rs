@@ -306,6 +306,7 @@ pub fn spawn_snapshot_interval_task(
             Some(&federated_schema),
             refresh_sql.as_deref(),
             provenance.as_ref(),
+            true,
         )
         .await;
 
@@ -334,6 +335,7 @@ pub fn spawn_snapshot_interval_task(
                 Some(&federated_schema),
                 refresh_sql.as_deref(),
                 provenance.as_ref(),
+                true,
             )
             .await;
         }
@@ -415,6 +417,7 @@ pub fn create_periodic_snapshot_callback(
                         Some(&federated_schema_clone),
                         refresh_sql.as_deref(),
                         provenance_clone.as_ref(),
+                        true,
                     )
                     .await;
                 }
@@ -467,6 +470,7 @@ pub fn create_periodic_snapshot_callback(
                             Some(&federated_schema),
                             refresh_sql.as_deref(),
                             provenance.as_ref(),
+                            true,
                         )
                         .await;
                     }
@@ -494,6 +498,7 @@ pub async fn create_checkpoint_and_snapshot(
     federated_schema: Option<&Arc<Schema>>,
     refresh_sql: Option<&str>,
     provenance: Option<&Arc<RwLock<Refresh>>>,
+    publish_snapshot: bool,
 ) {
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
 
@@ -562,44 +567,63 @@ pub async fn create_checkpoint_and_snapshot(
         return;
     }
 
-    if let Some(snapshot_manager) = snapshot_manager {
-        let updated_at = match last_updated_at.load(Ordering::Acquire) {
-            0 => None,
-            i => Some(i),
-        };
+    if !publish_snapshot {
+        drop(lock_guard);
+        return;
+    }
+    let Some(snapshot_manager) = snapshot_manager else {
+        drop(lock_guard);
+        return;
+    };
 
-        // Get the current row count from the accelerator using the `DataFrame` API.
-        // This must be done after checkpoint while holding the write lock to ensure atomicity.
-        let row_count = if let Some(accelerator) = accelerator {
-            get_row_count(accelerator, dataset_name).await
-        } else {
-            None
-        };
+    let updated_at = match last_updated_at.load(Ordering::Acquire) {
+        0 => None,
+        i => Some(i),
+    };
 
-        match snapshot_manager
-            .create_snapshot(
-                checkpoint_schema,
-                lock_guard,
-                updated_at,
-                row_count,
-                force_create,
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(e) if is_shutdown_cancellation(&e) => {
-                // The snapshot engines carry a cancelled `JoinError` up this path
-                // too, in the same shutdown window as the checkpoint above. Not a
-                // snapshot failure, so it is not counted as one either.
-                tracing::debug!(dataset = %dataset_name, error = %e, "Did not create snapshot: the runtime is shutting down");
-            }
-            Err(e) => {
-                let dataset_label = dataset_name.to_string();
-                snapshot_metrics::record_snapshot_failure(&dataset_label);
-                tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create snapshot");
-            }
+    // Get the current row count from the accelerator using the `DataFrame` API.
+    // This must be done after checkpoint while holding the write lock to ensure atomicity.
+    let row_count = if let Some(accelerator) = accelerator {
+        get_row_count(accelerator, dataset_name).await
+    } else {
+        None
+    };
+
+    match snapshot_manager
+        .create_snapshot(
+            checkpoint_schema,
+            lock_guard,
+            updated_at,
+            row_count,
+            force_create,
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(e) if is_shutdown_cancellation(&e) => {
+            // The snapshot engines carry a cancelled `JoinError` up this path
+            // too, in the same shutdown window as the checkpoint above. Not a
+            // snapshot failure, so it is not counted as one either.
+            tracing::debug!(dataset = %dataset_name, error = %e, "Did not create snapshot: the runtime is shutting down");
+        }
+        Err(e) => {
+            let dataset_label = dataset_name.to_string();
+            snapshot_metrics::record_snapshot_failure(&dataset_label);
+            tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create snapshot");
         }
     }
+}
+
+/// Whether a successful refresh should also publish an archive.
+///
+/// Interval and batch triggers publish on their own cycle. Every successful
+/// refresh still checkpoints so a later `file_create` cannot stamp override-B
+/// rows with fingerprint A that only lived in memory.
+pub(crate) fn publish_snapshot_on_refresh_completion(
+    create_checkpoint_snapshot_after_refresh: bool,
+    checkpoint_counting_enabled: bool,
+) -> bool {
+    create_checkpoint_snapshot_after_refresh && checkpoint_counting_enabled
 }
 
 /// The identity written with a local checkpoint.
@@ -723,7 +747,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// After snapshot A is published, a request-scoped override can replace the
     /// local rows with B while publication is withheld. The next checkpoint must
     /// retract A's stamp; keeping it would let pre-recreation publish B as A.
@@ -743,6 +766,22 @@ mod tests {
             checkpoint_source_fingerprint_to_persist(true, None),
             None,
             "a source with no definition has no stamp to persist"
+        );
+    }
+
+    #[test]
+    fn interval_and_batch_refreshes_checkpoint_without_publishing() {
+        assert!(
+            !publish_snapshot_on_refresh_completion(false, true),
+            "time_interval / batches publish on their own cycle"
+        );
+        assert!(
+            !publish_snapshot_on_refresh_completion(true, false),
+            "refresh-complete must not publish before counting starts"
+        );
+        assert!(
+            publish_snapshot_on_refresh_completion(true, true),
+            "refresh-complete publishes once counting is enabled"
         );
     }
 

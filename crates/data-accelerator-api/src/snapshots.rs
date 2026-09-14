@@ -326,6 +326,9 @@ pub async fn validate_snapshot_paths(
         let Some(acceleration) = source.acceleration() else {
             continue;
         };
+        if !acceleration.enabled {
+            continue;
+        }
 
         if matches!(acceleration.snapshot_behavior, SnapshotBehavior::Disabled) {
             continue;

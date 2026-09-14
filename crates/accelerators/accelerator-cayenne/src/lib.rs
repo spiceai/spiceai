@@ -8062,5 +8062,24 @@ mod tests {
             validate_snapshot_consistency(&agreeing).is_ok(),
             "datasets that agree may share a metadata directory"
         );
+
+        // `enabled: false` turns the acceleration block off. A disabled Cayenne
+        // view that still carries the default snapshot behavior must not
+        // collide with a live snapshot-enabled dataset in the same metastore.
+        let mut disabled_with_default_snapshots = acceleration(true);
+        disabled_with_default_snapshots.enabled = false;
+        let disabled_does_not_occupy_the_store: Vec<Arc<dyn AccelerationSource>> = vec![
+            Arc::new(
+                TestAccelerationSource::new("snapshotting").with_acceleration(acceleration(true)),
+            ),
+            Arc::new(
+                TestAccelerationSource::new("disabled_view")
+                    .with_acceleration(disabled_with_default_snapshots),
+            ),
+        ];
+        assert!(
+            validate_snapshot_consistency(&disabled_does_not_occupy_the_store).is_ok(),
+            "a disabled acceleration must not occupy the shared metastore for snapshot validation"
+        );
     }
 }
