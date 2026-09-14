@@ -269,11 +269,11 @@ impl AccelerationSource for Dataset {
         // change what the rows mean while leaving the schema — the only thing snapshot
         // metadata previously recorded — identical.
         //
-        // Unstamped archives are refused. `snapshot_before_recreate` can publish the
-        // outgoing rows without a stamp when the outgoing definition is not yet on the
-        // archive; after a same-schema `from:` / parameter change that archive becomes
-        // current, and a later cold start must not accept it under the new definition.
-        // Refusing leaves the failure mode a rebuild rather than wrong rows.
+        // Unstamped archives are refused. `snapshot_before_recreate` publishes the
+        // outgoing rows only when their producing fingerprint was persisted with the
+        // materialization and can be recovered; it must not stamp the newly loaded
+        // Spicepod onto old rows. After a same-schema `from:` / parameter change a
+        // later cold start must rebuild rather than serve those rows as current.
         //
         // This is the Spicepod definition the dataset was loaded from.
         // `PATCH /v1/datasets/{name}/acceleration` can replace the live

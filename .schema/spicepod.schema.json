@@ -3143,6 +3143,11 @@
         },
         "snapshots_creation_policy": {
           "$ref": "#/$defs/SnapshotsCreationPolicy"
+        },
+        "snapshots_consistency": {
+          "description": "For an accelerated view: whether a snapshot may be published or restored from a materialization that spans more than one read of the view's sources.\n\nOptions: `consistent_read` (default) / `accept_skew`.\n\nOnly meaningful for views. A dataset that sets `accept_skew` is refused at load.",
+          "$ref": "#/$defs/SnapshotsConsistency",
+          "default": "consistent_read"
         }
       },
       "additionalProperties": false,
@@ -3611,6 +3616,21 @@
       "enum": [
         "always",
         "on_change"
+      ]
+    },
+    "SnapshotsConsistency": {
+      "description": "Whether an accelerated view may publish or restore a snapshot of a materialization that spans more than one read of its sources.",
+      "oneOf": [
+        {
+          "description": "Snapshot only a materialization proven to come from a single read (default). A view whose query reads more than once is refused at load. Each later publish requires the read-shape recorded from the plan that executed the refresh.",
+          "type": "string",
+          "const": "consistent_read"
+        },
+        {
+          "description": "Publish or restore regardless, accepting that the stored rows may span several source positions. Choose this only when the view's consumers tolerate that.",
+          "type": "string",
+          "const": "accept_skew"
+        }
       ]
     },
     "ColumnEmbeddingConfig": {

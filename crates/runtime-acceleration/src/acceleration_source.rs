@@ -49,10 +49,10 @@ pub struct SourceDefinition {
     ///
     /// `false` where an unstamped archive cannot be shown to match the definition now
     /// in force — true of accelerated views (stamped since they existed) and of
-    /// datasets. An unstamped dataset archive may be the outgoing rows of a
-    /// same-schema recreate; accepting it under the new definition would serve
-    /// those rows as current. The upgrade cost of refusing is a rebuild, not
-    /// wrong rows.
+    /// datasets. `snapshot_before_recreate` does not stamp outgoing rows with the
+    /// newly loaded Spicepod; accepting an unstamped archive after a same-schema
+    /// `from:` / parameter change would serve those old rows as current. The
+    /// upgrade cost of refusing is a rebuild, not wrong rows.
     ///
     /// `true` only for a source that can prove those unstamped rows still answer
     /// its current definition. Accepting them still refuses every *mismatch*.

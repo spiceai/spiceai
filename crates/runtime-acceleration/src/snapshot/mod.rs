@@ -1152,6 +1152,26 @@ impl SnapshotManager {
         schema_meta.to_schema_ref().ok()
     }
 
+    /// The source-definition stamp recorded on the current snapshot, if any.
+    ///
+    /// Used by pre-recreation publish: the outgoing rows were produced under
+    /// this identity, not the newly loaded Spicepod. Absence means the
+    /// outgoing fingerprint cannot be recovered and that archive must not be
+    /// published.
+    pub async fn current_stored_source_fingerprint(&self) -> Option<String> {
+        let handle = self.load_metadata().await.ok()??;
+        let dataset_entry = handle.metadata.datasets.get(&self.dataset_name)?;
+        dataset_entry
+            .current_snapshot()
+            .and_then(|entry| entry.snapshot_source_fingerprint.clone())
+            .or_else(|| {
+                dataset_entry
+                    .properties
+                    .get(SOURCE_FINGERPRINT_PROPERTY)
+                    .cloned()
+            })
+    }
+
     /// Returns the `current_snapshot_id` from the remote snapshot metadata for this
     /// dataset, if any. Returns `None` when there is no metadata, no entry for the
     /// dataset, or the dataset has no current snapshot.
@@ -4215,6 +4235,88 @@ mod tests {
         assert!(
             outgoing_stamp.contains("different definition"),
             "{outgoing_stamp}"
+        );
+    }
+
+    /// Same-schema `from:` / params change + cold start: recover the outgoing
+    /// stamp from persisted metadata, never the newly loaded Spicepod. If the
+    /// pre-recreation path stamped `sha256:new-from` onto old rows, bootstrap
+    /// would accept them as current.
+    #[tokio::test]
+    async fn same_schema_recreate_recovers_outgoing_fingerprint_so_cold_start_refuses_old_rows() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+        let schema = sample_schema();
+
+        let manager = build_manager_for_engine(
+            Arc::clone(&store),
+            local_path,
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            &AccelerationEngine::Cayenne,
+            false,
+        );
+
+        assert!(
+            manager.current_stored_source_fingerprint().await.is_none(),
+            "an unstamped series has no outgoing fingerprint to recover"
+        );
+
+        let mut entry = dataset_metadata(&schema, Vec::new(), None);
+        entry.properties.insert(
+            SOURCE_FINGERPRINT_PROPERTY.to_string(),
+            "sha256:old-from".to_string(),
+        );
+        entry.snapshots.push(SnapshotEntry {
+            snapshot_id: 0,
+            timestamp_ms: 1,
+            snapshot: "memory://snapshots/outgoing".to_string(),
+            snapshot_checksum: "abc".to_string(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: 1,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: Some("sha256:old-from".to_string()),
+        });
+        entry.current_snapshot_id = Some(0);
+
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: 1,
+            datasets: HashMap::from([(DATASET_NAME.to_string(), entry.clone())]),
+        };
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        let recovered = manager
+            .current_stored_source_fingerprint()
+            .await
+            .expect("the outgoing fingerprint was persisted with the materialization");
+        assert_eq!(
+            recovered, "sha256:old-from",
+            "pre-recreation must recover the producing definition, not the incoming Spicepod"
+        );
+        assert_ne!(
+            recovered.as_str(),
+            "sha256:new-from",
+            "old_rows_definition_matches_stamp would be false if the incoming fingerprint were used"
+        );
+
+        let incoming =
+            manager.with_source_definition(crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:new-from".to_string(),
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::SourceTable,
+            });
+        let refused = incoming
+            .source_fingerprint_matches(&entry)
+            .expect_err("bootstrap must not accept old rows as current after a same-schema change");
+        assert!(
+            refused.contains("different definition"),
+            "bootstrap_accepts_old_rows_as_current must be false: {refused}"
         );
     }
 

@@ -27,7 +27,9 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use runtime_acceleration::BootstrapStatus;
 use runtime_acceleration::acceleration::{Acceleration, Mode, RefreshMode};
-use runtime_acceleration::acceleration_source::{AccelerationSource, MaterializationSource};
+use runtime_acceleration::acceleration_source::{
+    AccelerationSource, MaterializationSource, SourceDefinition,
+};
 use runtime_acceleration::snapshot::engine::SnapshotEngine;
 use runtime_acceleration::snapshot::{
     AccelerationEngine, AccelerationLayout, ForceCreate, SnapshotBehavior, SnapshotManager, metrics,
@@ -248,14 +250,17 @@ pub async fn snapshot_before_recreate(
         manager
     };
 
-    // Bootstrap refuses unstamped dataset archives. Publishing one here would
-    // replace a stamped series with an unverifiable current, and a later cold
-    // start after a same-schema `from:` / parameter change would have nothing
-    // to match against except "no stamp". Stamp with the outgoing definition
-    // when we have it; skip rather than publish unstamped.
-    let Some(definition) = source.definition_fingerprint() else {
+    // The newly loaded Spicepod is the *incoming* definition. These rows were
+    // produced under the outgoing one. Stamping the incoming fingerprint would
+    // make a later cold start accept those old rows as current after a
+    // same-schema `from:` / params change. Publish only when the outgoing
+    // fingerprint was persisted with the materialization and can be recovered
+    // from snapshot metadata; otherwise skip so the previous series stays current.
+    let Some(definition) =
+        outgoing_definition_for_pre_recreation(manager.current_stored_source_fingerprint().await)
+    else {
         tracing::warn!(
-            "Skipped snapshotting the outgoing acceleration of '{dataset_name}' before recreating it, so the snapshot series keeps its previously published contents: the outgoing definition cannot be recorded on the archive, and an unstamped archive would be refused on the next cold start"
+            "Skipped snapshotting the outgoing acceleration of '{dataset_name}' before recreating it, so the snapshot series keeps its previously published contents: the outgoing definition was not persisted with this materialization, and stamping the newly loaded definition would label those rows as current"
         );
         return;
     };
@@ -351,6 +356,22 @@ pub async fn validate_snapshot_paths(
     Ok(())
 }
 
+/// The definition stamp a pre-recreation archive may carry.
+///
+/// Those rows were produced under the previously persisted fingerprint, not the
+/// newly loaded Spicepod. If that outgoing fingerprint was not persisted with
+/// the materialization, the archive must not be published: stamping the incoming
+/// definition would make a later cold start accept the old rows as current.
+fn outgoing_definition_for_pre_recreation(
+    persisted_outgoing_fingerprint: Option<String>,
+) -> Option<SourceDefinition> {
+    Some(SourceDefinition {
+        fingerprint: persisted_outgoing_fingerprint?,
+        accept_unstamped: false,
+        materialization: MaterializationSource::SourceTable,
+    })
+}
+
 #[derive(Debug, Snafu)]
 pub enum SharedAccelerationSnapshotError {
     #[snafu(display(
@@ -415,6 +436,36 @@ mod tests {
         assert!(
             message.contains("/data/accel.db") && message.contains("duckdb_file"),
             "the message must name the shared file and the parameter that separates them: {message}"
+        );
+    }
+
+    /// Same-schema `from:` / params change: the outgoing file still has the old
+    /// rows. The newly loaded Spicepod fingerprint must not become the stamp —
+    /// that would make a cold-start bootstrap accept those rows as current.
+    #[test]
+    fn pre_recreation_does_not_stamp_outgoing_rows_with_the_incoming_definition() {
+        let incoming = "sha256:new-from";
+        let outgoing = "sha256:old-from";
+
+        assert!(
+            outgoing_definition_for_pre_recreation(None).is_none(),
+            "without a persisted outgoing fingerprint the archive must be skipped, not stamped with {incoming}"
+        );
+
+        let stamped = outgoing_definition_for_pre_recreation(Some(outgoing.to_string())).expect(
+            "a persisted outgoing fingerprint is enough to publish the pre-recreation archive",
+        );
+        assert_eq!(
+            stamped.fingerprint, outgoing,
+            "the stamp must be the definition that produced the rows"
+        );
+        assert_ne!(
+            stamped.fingerprint, incoming,
+            "stamping the newly loaded Spicepod would make old_rows_definition_matches_stamp=false and bootstrap_accepts_old_rows_as_current=true"
+        );
+        assert!(
+            !stamped.accept_unstamped,
+            "a pre-recreation archive must still refuse a later unstamped bootstrap"
         );
     }
 

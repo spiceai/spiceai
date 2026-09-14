@@ -21,9 +21,9 @@ use crate::{
 use ::datafusion::sql::{TableReference, parser, sqlparser::ast};
 use async_trait::async_trait;
 use datafusion::{
-    catalog::{Session, TableProvider},
+    catalog::{ScanArgs, ScanResult, Session, TableProvider},
     common::tree_node::TreeNodeRecursion,
-    datasource::{TableType, ViewTable},
+    datasource::ViewTable,
     error::{DataFusionError, Result},
     logical_expr::{Expr, LogicalPlan},
     physical_plan::ExecutionPlan,
@@ -34,6 +34,7 @@ use runtime_acceleration::snapshot::SnapshotPublishGate;
 use runtime_search::embeddings::{table::EmbeddingTable, warm_index_on_zero_results};
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
+use spice_table::TableLayer;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -116,27 +117,29 @@ impl ViewRefreshReadAttestation {
 
 /// Records the read shape of the [`ExecutionPlan`] that will run this scan, which
 /// is the plan the refresh actually executes.
+///
+/// Stacked as a [`spice_table::TableLayer`] so layer walks see through to the
+/// federated view instead of stopping on a wrapping `TableProvider`.
 pub(crate) fn wrap_view_refresh_attestation(
     inner: Arc<dyn TableProvider>,
     attestation: ViewRefreshReadAttestation,
 ) -> Arc<dyn TableProvider> {
-    Arc::new(AttestingViewProvider { inner, attestation })
+    spice_table::SpiceTable::over(Arc::new(AttestingViewProvider { attestation }), inner)
 }
 
-/// Federated-side wrapper for an accelerated view. `scan` classifies the plan
-/// returned by the inner provider — that is the executing refresh plan — and
-/// stores it for the publish gate. Every other `TableProvider` method is
-/// forwarded: inheriting a default here would drop inner behavior.
+/// Federated-side layer for an accelerated view. `scan_with_args` classifies the
+/// plan returned by the table beneath — that is the executing refresh plan — and
+/// stores it for the publish gate. Every other [`TableLayer`] method keeps its
+/// default and forwards to `below`.
 struct AttestingViewProvider {
-    inner: Arc<dyn TableProvider>,
     attestation: ViewRefreshReadAttestation,
 }
 
 impl std::fmt::Debug for AttestingViewProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AttestingViewProvider")
-            .field("inner", &self.inner)
-            .finish_non_exhaustive()
+            .field("attestation", &self.attestation)
+            .finish()
     }
 }
 
@@ -146,98 +149,18 @@ impl AttestingViewProvider {
     }
 }
 
-#[deny(clippy::missing_trait_methods)]
 #[async_trait]
-impl TableProvider for AttestingViewProvider {
-    fn schema(&self) -> arrow::datatypes::SchemaRef {
-        self.inner.schema()
-    }
-
-    fn table_type(&self) -> TableType {
-        self.inner.table_type()
-    }
-
-    fn constraints(&self) -> Option<&datafusion::common::Constraints> {
-        self.inner.constraints()
-    }
-
-    fn get_table_definition(&self) -> Option<&str> {
-        self.inner.get_table_definition()
-    }
-
-    fn get_logical_plan(&self) -> Option<std::borrow::Cow<'_, LogicalPlan>> {
-        self.inner.get_logical_plan()
-    }
-
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.inner.get_column_default(column)
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let plan = self.inner.scan(state, projection, filters, limit).await?;
-        self.record_executed(plan.as_ref());
-        Ok(plan)
-    }
-
+impl TableLayer for AttestingViewProvider {
     async fn scan_with_args<'a>(
         &self,
+        below: &Arc<dyn TableProvider>,
         state: &dyn Session,
-        args: datafusion::catalog::ScanArgs<'a>,
-    ) -> Result<datafusion::catalog::ScanResult> {
-        let filters = args.filters().unwrap_or(&[]);
-        let projection = args.projection().map(<[usize]>::to_vec);
-        let limit = args.limit();
-        let plan = self
-            .scan(state, projection.as_ref(), filters, limit)
-            .await?;
-        Ok(datafusion::catalog::ScanResult::new(plan))
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
-        self.inner.supports_filters_pushdown(filters)
-    }
-
-    fn statistics(&self) -> Option<datafusion::common::Statistics> {
-        self.inner.statistics()
-    }
-
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        insert_op: datafusion::logical_expr::dml::InsertOp,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.inner.insert_into(state, input, insert_op).await
-    }
-
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.inner.delete_from(state, filters).await
-    }
-
-    async fn update(
-        &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.inner.update(state, assignments, filters).await
-    }
-
-    async fn truncate(&self, state: &dyn Session) -> Result<Arc<dyn ExecutionPlan>> {
-        self.inner.truncate(state).await
+        args: ScanArgs<'a>,
+    ) -> Result<ScanResult> {
+        let result = below.scan_with_args(state, args).await?;
+        let plan = result.into_inner();
+        self.record_executed(plan.as_ref());
+        Ok(ScanResult::new(plan))
     }
 }
 
@@ -383,10 +306,6 @@ fn provider_fans_out(provider: &Arc<dyn TableProvider>) -> bool {
         && let Some(inner) = adaptor.table_provider.as_ref()
     {
         return provider_fans_out(inner);
-    }
-
-    if let Some(attesting) = provider.downcast_ref::<AttestingViewProvider>() {
-        return provider_fans_out(&attesting.inner);
     }
 
     false
