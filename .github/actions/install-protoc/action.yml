@@ -187,7 +187,17 @@ runs:
         extract_atomically() {
           local zip="$1"
           local staging replacing old
-          staging="$(mktemp -d "${STAGING_ROOT}/protoc-extract.XXXXXX")"
+          # Called from `cmd && extract_atomically`, which suppresses `set -e`
+          # inside this function. A failed mktemp then leaves staging empty and
+          # Python extractall("") unpacks into the checkout.
+          if ! staging="$(mktemp -d "${STAGING_ROOT}/protoc-extract.XXXXXX")"; then
+            echo "::warning::failed to create staging directory under ${STAGING_ROOT}"
+            return 1
+          fi
+          if [ -z "${staging}" ] || [ ! -d "${staging}" ]; then
+            echo "::warning::mktemp returned an unusable staging path '${staging}'"
+            return 1
+          fi
           if ! extract_to "${zip}" "${staging}"; then
             echo "::warning::failed extracting ${FILENAME} into ${staging}"
             df -h "${STAGING_ROOT}" "${HOME}" / 2>/dev/null || df -h
