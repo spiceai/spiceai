@@ -962,9 +962,10 @@ impl SnapshotManager {
     /// Restores every configured index with a matching artifact from a downloaded snapshot.
     ///
     /// This is used by snapshot replicas after the database artifact is verified but before its
-    /// provider is made visible. A missing configured artifact is intentionally ignored: that
-    /// preserves the legacy rebuild behavior. A matching artifact which cannot be restored is a
-    /// hard failure so the caller never publishes a DB/index generation mismatch.
+    /// provider is made visible. Partial index snapshotting is not supported: a configured index
+    /// with no matching artifact in `artifacts` is a hard failure ([`IndexNotFoundSnafu`]), the
+    /// same as a matching artifact which cannot be restored, so the caller never publishes a
+    /// DB/index generation mismatch.
     ///
     /// # Errors
     ///
@@ -7397,6 +7398,220 @@ mod tests {
         assert!(
             !declares_nullable_entries(&raw),
             "the published snapshot metadata must not keep a Map declaration MapArray::try_new refuses"
+        );
+    }
+
+    /// An index whose `snapshot_identity` and `restore_from` are test-controlled, for exercising
+    /// `restore_indexes_from_snapshot`'s identity matching and error propagation without a real
+    /// full-text or vector index implementation.
+    #[derive(Debug)]
+    struct MockSnapshotIndex {
+        identity: spice_table::SnapshotIndexIdentity,
+        should_fail: bool,
+        restored_from: Arc<Mutex<Option<PathBuf>>>,
+    }
+
+    #[async_trait]
+    impl spice_table::Index for MockSnapshotIndex {
+        fn name(&self) -> &'static str {
+            "mock_snapshot_index"
+        }
+
+        fn required_columns(&self) -> Vec<String> {
+            self.identity.columns.clone()
+        }
+
+        fn snapshot_identity(&self) -> Option<spice_table::SnapshotIndexIdentity> {
+            Some(self.identity.clone())
+        }
+
+        async fn restore_from(
+            &self,
+            extracted_dir: &std::path::Path,
+        ) -> datafusion::error::Result<()> {
+            if self.should_fail {
+                return Err(datafusion::error::DataFusionError::Internal(
+                    "mock index restore failure".to_string(),
+                ));
+            }
+            *self.restored_from.lock().await = Some(extracted_dir.to_path_buf());
+            Ok(())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Builds a valid, extractable index artifact in `store` for `identity` and returns the
+    /// `IndexSnapshotRef` pointing at it — everything `restore_indexes_from_snapshot` needs to
+    /// download, verify, and extract before calling `Index::restore_from`.
+    async fn write_index_artifact(
+        store: &InMemory,
+        manager: &SnapshotManager,
+        identity: &spice_table::SnapshotIndexIdentity,
+        // Distinguishes this artifact's object path from any other artifact written for the
+        // same identity `kind` in the same test (e.g. two candidates that differ only by
+        // discriminator), so writing one never overwrites another's stored bytes.
+        filename_suffix: &str,
+        marker_contents: &[u8],
+    ) -> IndexSnapshotRef {
+        use crate::snapshot::directory_archive::archive_directories_to_file_with_plan;
+
+        let source_dir = TempDir::new().expect("create source dir");
+        std::fs::write(source_dir.path().join("marker.txt"), marker_contents)
+            .expect("write marker file");
+
+        let archive_dir = TempDir::new().expect("create archive dir");
+        let archive_path = archive_dir.path().join("index.tar");
+        archive_directories_to_file_with_plan(
+            &[(source_dir.path().to_path_buf(), String::new())],
+            &archive_path,
+            &[],
+            &[],
+        )
+        .await
+        .expect("archive index directory");
+
+        let bytes = std::fs::read(&archive_path).expect("read archive");
+        let checksum = compute_sha256_hex(&bytes);
+        let size = bytes.len() as u64;
+        let object_path = Path::from(format!(
+            "{SNAPSHOT_BASE_PATH}/indexes/{}-{filename_suffix}.tar",
+            identity.kind
+        ));
+        store
+            .put(&object_path, bytes.into())
+            .await
+            .expect("write index artifact to store");
+
+        IndexSnapshotRef {
+            index_kind: identity.kind.to_string(),
+            columns: identity.columns.clone(),
+            discriminator: identity.discriminator.clone(),
+            uri: manager.snapshot_uri_for_location(&object_path),
+            checksum,
+            checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            size,
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn restore_indexes_from_snapshot_matches_by_kind_columns_and_discriminator() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        let identity = spice_table::SnapshotIndexIdentity {
+            kind: "full_text",
+            columns: vec!["body".to_string(), "title".to_string()],
+            discriminator: Some("bm25".to_string()),
+        };
+        let matching_artifact =
+            write_index_artifact(&store, &manager, &identity, "matching", b"matching").await;
+        // A same-kind artifact with a different discriminator must not match: identity is
+        // kind + columns + discriminator together, not kind alone.
+        let other_identity = spice_table::SnapshotIndexIdentity {
+            kind: "full_text",
+            columns: vec!["body".to_string(), "title".to_string()],
+            discriminator: Some("other".to_string()),
+        };
+        let other_artifact =
+            write_index_artifact(&store, &manager, &other_identity, "other", b"non-matching").await;
+
+        let restored_from = Arc::new(Mutex::new(None));
+        let index = Arc::new(MockSnapshotIndex {
+            identity,
+            should_fail: false,
+            restored_from: Arc::clone(&restored_from),
+        });
+        manager.set_indexes(vec![index]).await;
+
+        manager
+            .restore_indexes_from_snapshot(&[other_artifact, matching_artifact])
+            .await
+            .expect("restore should succeed using the matching artifact");
+
+        assert!(
+            restored_from.lock().await.is_some(),
+            "restore_from should have been called with the matching artifact's extracted directory"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn restore_indexes_from_snapshot_fails_hard_on_missing_artifact() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        let identity = spice_table::SnapshotIndexIdentity {
+            kind: "full_text",
+            columns: vec!["body".to_string()],
+            discriminator: None,
+        };
+        let index = Arc::new(MockSnapshotIndex {
+            identity,
+            should_fail: false,
+            restored_from: Arc::new(Mutex::new(None)),
+        });
+        manager.set_indexes(vec![index]).await;
+
+        // No artifacts at all: the configured index has nothing to match, which must be a hard
+        // failure (partial index snapshotting is not supported), not a silently-ignored gap.
+        let result = manager.restore_indexes_from_snapshot(&[]).await;
+
+        assert!(
+            matches!(result, Err(SnapshotDownloadError::IndexNotFound { .. })),
+            "expected IndexNotFound for a configured index with no matching artifact, got {result:?}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn restore_indexes_from_snapshot_propagates_restore_failure() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+
+        let identity = spice_table::SnapshotIndexIdentity {
+            kind: "full_text",
+            columns: vec!["body".to_string()],
+            discriminator: None,
+        };
+        let artifact = write_index_artifact(&store, &manager, &identity, "content", b"content").await;
+        let index = Arc::new(MockSnapshotIndex {
+            identity,
+            should_fail: true,
+            restored_from: Arc::new(Mutex::new(None)),
+        });
+        manager.set_indexes(vec![index]).await;
+
+        let result = manager.restore_indexes_from_snapshot(&[artifact]).await;
+
+        assert!(
+            matches!(result, Err(SnapshotDownloadError::IndexRestore { .. })),
+            "an artifact that downloads and extracts fine but fails Index::restore_from must \
+             surface as IndexRestore, not be swallowed, got {result:?}"
         );
     }
 }
