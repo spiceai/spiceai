@@ -4962,47 +4962,21 @@ impl DataFusion {
         Ok(register_task)
     }
 
-    /// Decide whether an accelerated view may publish or restore snapshots, and
-    /// return the veto to install for later publishes.
+    /// The publish veto for a view that will write archives.
     ///
-    /// Called for every snapshot-enabled view, including `bootstrap_only`. A
-    /// bootstrap-only view can restore an archive a peer published with
-    /// `accept_skew`, and the archive does not record that setting, so the same
-    /// single-read proof (or an explicit `accept_skew`) is required before a
-    /// restore is allowed to load.
-    ///
-    /// `Ok(None)` means publish/restore unconditionally — the operator set
-    /// `snapshots_consistency: accept_skew` and owns the consequence. `Ok(Some(gate))`
-    /// means the view reads once today and each later publish must prove it still does.
-    /// An `Err` refuses the view's configuration outright rather than silently
-    /// downgrading it to no snapshots, because the operator asked for snapshots and
-    /// would otherwise never learn they are not happening.
-    async fn view_snapshot_publish_gate(
-        self: &Arc<Self>,
-        view: &View,
+    /// `None` is `accept_skew` (the operator opted out) or a view that does not
+    /// publish. `Some(gate)` consumes the read-shape attested from the plan that
+    /// executed the refresh — it does not re-plan at publish time.
+    fn view_snapshot_publish_gate(
         table: &TableReference,
-    ) -> Result<Option<Arc<dyn runtime_acceleration::snapshot::SnapshotPublishGate>>> {
-        match view_snapshot_consistency_decision(
-            &self.ctx,
-            table,
-            &view.sql,
-            view.acceleration
-                .as_ref()
-                .map(|a| a.snapshots_consistency)
-                .unwrap_or_default(),
-        )
-        .await?
-        {
-            ViewSnapshotConsistencyDecision::AcceptSkew => Ok(None),
-            ViewSnapshotConsistencyDecision::ConsistentSingleRead => Ok(Some(Arc::new(
-                crate::view::ViewSnapshotPublishGate::new(
-                    table.clone(),
-                    Arc::clone(&view.sql),
-                    &self.ctx,
-                ),
-            )
-                as Arc<dyn runtime_acceleration::snapshot::SnapshotPublishGate>)),
-        }
+        refresh_attestation: Option<crate::view::ViewRefreshReadAttestation>,
+    ) -> Option<Arc<dyn runtime_acceleration::snapshot::SnapshotPublishGate>> {
+        refresh_attestation.map(|attestation| {
+            Arc::new(crate::view::ViewSnapshotPublishGate::new(
+                table.clone(),
+                attestation,
+            )) as Arc<dyn runtime_acceleration::snapshot::SnapshotPublishGate>
+        })
     }
 
     /// Returns the waiter for the view's initial refresh together with the
@@ -5023,7 +4997,7 @@ impl DataFusion {
                     name: table.to_string(),
                 })?;
 
-        let view_table =
+        let mut view_table =
             table_provider_with_spicepod_metadata(view_table, &view.metadata, &view.columns);
         let schema = view_table.schema();
 
@@ -5076,6 +5050,29 @@ impl DataFusion {
             refresh = refresh.max_jitter(max_jitter);
         }
 
+        // The publish gate must consume the read shape of the plan that
+        // *executes* the refresh. Wrap the federated provider so each scan
+        // records that attestation before `AcceleratedTable` takes ownership.
+        let mut refresh_attestation = None;
+        if acceleration.snapshot_behavior.create_enabled() {
+            match view_snapshot_consistency_decision(
+                &self.ctx,
+                table,
+                &view.sql,
+                acceleration.snapshots_consistency,
+            )
+            .await?
+            {
+                ViewSnapshotConsistencyDecision::AcceptSkew => {}
+                ViewSnapshotConsistencyDecision::ConsistentSingleRead => {
+                    let attestation = crate::view::ViewRefreshReadAttestation::new();
+                    view_table =
+                        crate::view::wrap_view_refresh_attestation(view_table, attestation.clone());
+                    refresh_attestation = Some(attestation);
+                }
+            }
+        }
+
         let mut builder = AcceleratedTable::builder(
             self.runtime_status(),
             table.clone(),
@@ -5117,9 +5114,9 @@ impl DataFusion {
         // publish must only capture a materialization that came from a single read,
         // because a query that reads its sources twice captures them at two different
         // positions and can store rows that never existed together; publishing that
-        // makes the discrepancy durable and reusable. That is decided here for every
-        // snapshot-enabled view — create *or* bootstrap — and re-decided by
-        // `ViewSnapshotPublishGate` before every publish.
+        // makes the discrepancy durable and reusable. Load-time refuses a multi-read
+        // view; `ViewSnapshotPublishGate` then requires the attestation recorded from
+        // the plan that executed the refresh, not a fresh re-plan at publish time.
         match get_acceleration_layout(view, &self.accelerator_engine_registry).await {
             Ok(layout) if layout.is_enabled() => {
                 ensure!(
@@ -5139,7 +5136,21 @@ impl DataFusion {
                 // proof for every snapshot-enabled view; only install the
                 // publish veto when this view will also write archives.
                 if !acceleration.snapshot_behavior.is_disabled() {
-                    let publish_gate = self.view_snapshot_publish_gate(view, table).await?;
+                    if !acceleration.snapshot_behavior.create_enabled() {
+                        // `bootstrap_only`: still refuse a multi-read view at load.
+                        // The archive does not record `snapshots_consistency`, so a
+                        // default consumer would otherwise restore a multi-read
+                        // materialization without opting out.
+                        let _ = view_snapshot_consistency_decision(
+                            &self.ctx,
+                            table,
+                            &view.sql,
+                            acceleration.snapshots_consistency,
+                        )
+                        .await?;
+                    }
+
+                    let publish_gate = Self::view_snapshot_publish_gate(table, refresh_attestation);
 
                     if acceleration.snapshot_behavior.create_enabled() {
                         let snapshot_engine_override = match self

@@ -675,7 +675,8 @@ enum SnapshotFileStatus {
 /// plan* — which follows catalog state, statistics and federation pushdown, none of
 /// which are fixed when the view is registered. The load-time check exists to give the
 /// operator a fast, actionable error; this gate is what makes the decision binding,
-/// because it re-asks against the plan that would actually run.
+/// because it requires the read-shape attested from the plan that executed the
+/// refresh that produced the rows, not a fresh re-plan at publish time.
 ///
 /// Refusal skips the publish and leaves the previous snapshot as the store's current
 /// one. That is deliberately not an error: the accelerated table is still correct and
@@ -1089,20 +1090,13 @@ impl SnapshotManager {
         self
     }
 
-    /// Whether the stored series was materialized from the same definition this manager
-    /// is bootstrapping into.
-    ///
-    /// A manager with no fingerprint (every dataset) never refuses. A manager that has
-    /// one refuses an archive that carries a different fingerprint *or none at all*:
-    /// absence means the archive predates the fingerprint or was written by something
-    /// that does not track a definition, and neither can be verified against the
-    /// definition now in force.
     /// Whether one snapshot entry was materialized from the definition now in force.
     ///
-    /// A manager with no fingerprint (every dataset today) accepts anything. One that has a
-    /// fingerprint accepts an entry carrying the same value, and refuses an entry carrying a
-    /// different one *or none at all* — an entry that records nothing predates the stamp and
-    /// cannot be shown to match.
+    /// A manager with no fingerprint accepts anything. One that has a fingerprint
+    /// accepts an entry carrying the same value, and treats an entry carrying a
+    /// different one — or none at all, unless `accept_unstamped` is set — as
+    /// unverified. Datasets and views both refuse unstamped archives: absence
+    /// cannot be shown to match the definition now in force.
     fn entry_fingerprint_matches(&self, entry: &SnapshotEntry) -> bool {
         let Some(definition) = self.source_definition.as_ref() else {
             return true;
@@ -4166,7 +4160,8 @@ mod tests {
             meta
         };
 
-        // A manager with no fingerprint (every dataset) never refuses.
+        // A manager with no fingerprint of its own cannot verify a series and
+        // does not refuse. Datasets and views both attach a definition today.
         base.source_fingerprint_matches(&with_fp(None))
             .expect("a manager with no fingerprint accepts an unstamped series");
         base.source_fingerprint_matches(&with_fp(Some("sha256:other")))
@@ -4194,6 +4189,33 @@ mod tests {
             .source_fingerprint_matches(&with_fp(None))
             .expect_err("an unstamped archive cannot be verified");
         assert!(missing.contains(SOURCE_FINGERPRINT_PROPERTY), "{missing}");
+
+        // After a same-schema `from:` / parameter change, an unstamped outgoing
+        // archive (the shape `snapshot_before_recreate` used to publish) must
+        // not bootstrap under the new dataset definition — that would serve the
+        // old rows as current. Refuse so the failure mode is a rebuild.
+        let dataset_manager = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
+            .with_source_definition(crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:new-from".to_string(),
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::SourceTable,
+            });
+        let unstamped_outgoing = dataset_manager
+            .source_fingerprint_matches(&with_fp(None))
+            .expect_err(
+                "an unstamped outgoing dataset archive must not bootstrap under the new definition",
+            );
+        assert!(
+            unstamped_outgoing.contains(SOURCE_FINGERPRINT_PROPERTY),
+            "{unstamped_outgoing}"
+        );
+        let outgoing_stamp = dataset_manager
+            .source_fingerprint_matches(&with_fp(Some("sha256:old-from")))
+            .expect_err("the outgoing definition must not bootstrap under the new one");
+        assert!(
+            outgoing_stamp.contains("different definition"),
+            "{outgoing_stamp}"
+        );
     }
 
     #[tokio::test]

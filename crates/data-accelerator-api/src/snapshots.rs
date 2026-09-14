@@ -248,6 +248,19 @@ pub async fn snapshot_before_recreate(
         manager
     };
 
+    // Bootstrap refuses unstamped dataset archives. Publishing one here would
+    // replace a stamped series with an unverifiable current, and a later cold
+    // start after a same-schema `from:` / parameter change would have nothing
+    // to match against except "no stamp". Stamp with the outgoing definition
+    // when we have it; skip rather than publish unstamped.
+    let Some(definition) = source.definition_fingerprint() else {
+        tracing::warn!(
+            "Skipped snapshotting the outgoing acceleration of '{dataset_name}' before recreating it, so the snapshot series keeps its previously published contents: the outgoing definition cannot be recorded on the archive, and an unstamped archive would be refused on the next cold start"
+        );
+        return;
+    };
+    let manager = manager.with_source_definition(definition);
+
     // If the caller provided an empty schema (e.g. during file_create init when the table
     // provider isn't available yet), try to read the real schema from existing snapshot
     // metadata. If no stored schema exists either, skip the snapshot to avoid storing an

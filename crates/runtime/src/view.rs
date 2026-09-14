@@ -21,11 +21,12 @@ use crate::{
 use ::datafusion::sql::{TableReference, parser, sqlparser::ast};
 use async_trait::async_trait;
 use datafusion::{
-    catalog::TableProvider,
+    catalog::{Session, TableProvider},
     common::tree_node::TreeNodeRecursion,
-    datasource::ViewTable,
+    datasource::{TableType, ViewTable},
     error::{DataFusionError, Result},
-    logical_expr::LogicalPlan,
+    logical_expr::{Expr, LogicalPlan},
+    physical_plan::ExecutionPlan,
     prelude::SessionContext,
 };
 use datafusion_federation::{FederatedPlanNode, FederatedTableProviderAdaptor};
@@ -36,7 +37,7 @@ use snafu::ResultExt;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::{Arc, Weak},
+    sync::Arc,
 };
 
 /// The binding half of the accelerated-view snapshot consistency check.
@@ -44,40 +45,33 @@ use std::{
 /// The load-time check in `create_accelerated_view` exists to fail fast with a message an
 /// operator can act on — including a `bootstrap_only` consumer that would otherwise
 /// restore an `accept_skew` archive without opting out — but it cannot be the whole
-/// answer: the compiled plan follows
-/// catalog state, statistics and federation pushdown, so a view that reads once at
-/// registration can read twice later without its SQL changing. This gate re-asks against
-/// the plan that would run now, immediately before each publish.
+/// answer: the compiled plan follows catalog state, statistics and federation pushdown,
+/// so a view that reads once at registration can read twice later without its SQL
+/// changing.
 ///
-/// What it does and does not establish is worth being exact about. It runs *after* the
-/// refresh has materialized its rows, so it does not prove the plan that produced them was
-/// single-read — a shape that was multi-read during materialization and is single-read by
-/// the time the gate asks would be approved. What it does is deny publication to any view
-/// whose query is multi-read at publish time, which is the shape that persists rather than
-/// flickers: the ones this catches (a self-join, a CTE used twice, a partitioned scan) are
-/// properties of the plan, not of a moment. Closing the gap properly means recording the
-/// classified shape from the plan the refresh actually executed and consuming that here,
-/// which is a change to the refresh path rather than to this gate.
+/// This gate consumes the read-shape recorded from the plan that *executed* the
+/// refresh that produced the rows now on disk. It does not re-plan at publish time:
+/// a catalog or pushdown change after materialization must not approve rows that
+/// came from a multi-read refresh, and must not be required to re-prove a
+/// single-read refresh whose sources have since grown a second scan.
+///
+/// [`AttestingViewProvider`] writes that attestation when the federated view is
+/// scanned. No attestation means no refresh in this process has proven the current
+/// rows came from a single read, so publication is refused.
 ///
 /// Refusing skips one publish; it does not fail the view or the refresh. The accelerated
 /// table stays correct and keeps serving — it just does not add a snapshot this cycle,
 /// and a cold start bootstraps whatever was last published.
 pub(crate) struct ViewSnapshotPublishGate {
     view_name: TableReference,
-    sql: Arc<str>,
-    /// Weak on purpose. The gate is reachable from the session context it plans against
-    /// — context → catalog → the view's provider → refresher → snapshot manager → here —
-    /// so an owning handle would close a reference cycle and make the liveness of every
-    /// registered provider depend on explicit deregistration on every teardown path.
-    ctx: Weak<SessionContext>,
+    attestation: ViewRefreshReadAttestation,
 }
 
 impl ViewSnapshotPublishGate {
-    pub(crate) fn new(view_name: TableReference, sql: Arc<str>, ctx: &Arc<SessionContext>) -> Self {
+    pub(crate) fn new(view_name: TableReference, attestation: ViewRefreshReadAttestation) -> Self {
         Self {
             view_name,
-            sql,
-            ctx: Arc::downgrade(ctx),
+            attestation,
         }
     }
 }
@@ -85,20 +79,165 @@ impl ViewSnapshotPublishGate {
 #[async_trait]
 impl SnapshotPublishGate for ViewSnapshotPublishGate {
     async fn check_publish(&self) -> Result<(), String> {
-        let Some(ctx) = self.ctx.upgrade() else {
-            return Err(format!(
-                "the runtime serving view '{}' is shutting down, so its query cannot be re-checked",
+        match self.attestation.last() {
+            None => Err(format!(
+                "view '{}' has no refresh-plan attestation, so Spice cannot confirm these rows came from a single consistent read of its sources",
                 self.view_name
-            ));
-        };
-        match analyzed_view_read_shape(&ctx, &self.sql).await {
-            Ok(shape) => shape.refusal_reason().map_or(Ok(()), Err),
-            // A plan failure is not proof of a multi-read, but it is not proof of a
-            // single read either, and this gate only ever publishes on proof.
-            Err(e) => Err(format!(
-                "its query could not be planned, so Spice cannot confirm the snapshot would come from a single consistent read. Cause: {e}"
             )),
+            Some(shape) => shape.refusal_reason().map_or(Ok(()), Err),
         }
+    }
+}
+
+/// Last refresh-plan read shape written by the executing scan, read by
+/// [`ViewSnapshotPublishGate`]. `None` means no refresh has attested this process.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ViewRefreshReadAttestation {
+    shape: Arc<parking_lot::RwLock<Option<ViewReadShape>>>,
+}
+
+impl ViewRefreshReadAttestation {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            shape: Arc::new(parking_lot::RwLock::new(None)),
+        }
+    }
+
+    pub(crate) fn record(&self, shape: ViewReadShape) {
+        *self.shape.write() = Some(shape);
+    }
+
+    #[must_use]
+    pub(crate) fn last(&self) -> Option<ViewReadShape> {
+        self.shape.read().clone()
+    }
+}
+
+/// Records the read shape of the [`ExecutionPlan`] that will run this scan, which
+/// is the plan the refresh actually executes.
+pub(crate) fn wrap_view_refresh_attestation(
+    inner: Arc<dyn TableProvider>,
+    attestation: ViewRefreshReadAttestation,
+) -> Arc<dyn TableProvider> {
+    Arc::new(AttestingViewProvider { inner, attestation })
+}
+
+/// Federated-side wrapper for an accelerated view. `scan` classifies the plan
+/// returned by the inner provider — that is the executing refresh plan — and
+/// stores it for the publish gate. Every other `TableProvider` method is
+/// forwarded: inheriting a default here would drop inner behavior.
+struct AttestingViewProvider {
+    inner: Arc<dyn TableProvider>,
+    attestation: ViewRefreshReadAttestation,
+}
+
+impl std::fmt::Debug for AttestingViewProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttestingViewProvider")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AttestingViewProvider {
+    fn record_executed(&self, plan: &dyn ExecutionPlan) {
+        self.attestation.record(classify_executed_read(plan));
+    }
+}
+
+#[deny(clippy::missing_trait_methods)]
+#[async_trait]
+impl TableProvider for AttestingViewProvider {
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
+    }
+
+    fn constraints(&self) -> Option<&datafusion::common::Constraints> {
+        self.inner.constraints()
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.inner.get_table_definition()
+    }
+
+    fn get_logical_plan(&self) -> Option<std::borrow::Cow<'_, LogicalPlan>> {
+        self.inner.get_logical_plan()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.inner.get_column_default(column)
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let plan = self.inner.scan(state, projection, filters, limit).await?;
+        self.record_executed(plan.as_ref());
+        Ok(plan)
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> Result<datafusion::catalog::ScanResult> {
+        let filters = args.filters().unwrap_or(&[]);
+        let projection = args.projection().map(<[usize]>::to_vec);
+        let limit = args.limit();
+        let plan = self
+            .scan(state, projection.as_ref(), filters, limit)
+            .await?;
+        Ok(datafusion::catalog::ScanResult::new(plan))
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        self.inner.statistics()
+    }
+
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: datafusion::logical_expr::dml::InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner.insert_into(state, input, insert_op).await
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner.delete_from(state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner.update(state, assignments, filters).await
+    }
+
+    async fn truncate(&self, state: &dyn Session) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner.truncate(state).await
     }
 }
 
@@ -246,6 +385,10 @@ fn provider_fans_out(provider: &Arc<dyn TableProvider>) -> bool {
         return provider_fans_out(inner);
     }
 
+    if let Some(attesting) = provider.downcast_ref::<AttestingViewProvider>() {
+        return provider_fans_out(&attesting.inner);
+    }
+
     false
 }
 
@@ -324,6 +467,72 @@ pub(crate) fn classify_view_read(plan: &LogicalPlan) -> ViewReadShape {
             }
         }
     }
+}
+
+/// Classify the read shape of the [`ExecutionPlan`] a refresh is about to run.
+///
+/// Counted on the physical plan because that is what executes: a later re-plan of
+/// the same SQL can see a different catalog or pushdown and disagree with the
+/// rows already on disk. Federation that collapsed into one remote statement is
+/// one leaf (or a named federated node), so it is admitted on the same footing
+/// as [`ViewReadShape::FederatedSingleStatement`]. Unknown leaves are treated as
+/// reads so a shape this walk cannot explain is refused rather than published.
+pub(crate) fn classify_executed_read(plan: &dyn ExecutionPlan) -> ViewReadShape {
+    let mut reads = Vec::new();
+    collect_executed_reads(plan, &mut reads);
+    match reads.as_slice() {
+        [] => ViewReadShape::SingleScan { tables: Vec::new() },
+        [ExecutedRead::Federated] => ViewReadShape::FederatedSingleStatement { tables: Vec::new() },
+        [ExecutedRead::Scan { label }] => ViewReadShape::SingleScan {
+            tables: vec![TableReference::bare(label.clone())],
+        },
+        many => ViewReadShape::MultipleReads {
+            reads: many.len(),
+            tables: many
+                .iter()
+                .map(|read| match read {
+                    ExecutedRead::Scan { label } => TableReference::bare(label.clone()),
+                    ExecutedRead::Federated => TableReference::bare("federated"),
+                })
+                .collect(),
+        },
+    }
+}
+
+#[derive(Debug)]
+enum ExecutedRead {
+    Scan { label: String },
+    Federated,
+}
+
+fn collect_executed_reads(plan: &dyn ExecutionPlan, reads: &mut Vec<ExecutedRead>) {
+    let name = plan.name();
+    if is_federated_exec(name) {
+        reads.push(ExecutedRead::Federated);
+        return;
+    }
+
+    let children = plan.children();
+    if children.is_empty() {
+        if !is_non_read_leaf(name) {
+            reads.push(ExecutedRead::Scan {
+                label: name.to_string(),
+            });
+        }
+        return;
+    }
+
+    for child in children {
+        collect_executed_reads(child.as_ref(), reads);
+    }
+}
+
+fn is_federated_exec(name: &str) -> bool {
+    name.contains("Federat") || name.contains("federat")
+}
+
+fn is_non_read_leaf(name: &str) -> bool {
+    matches!(name, "EmptyExec" | "PlaceholderRowExec" | "ValuesExec")
 }
 
 /// The definition string a view's snapshot identity is computed over: its own SQL plus the
@@ -1310,6 +1519,94 @@ mod tests {
             assert!(
                 shape.refusal_reason().is_none(),
                 "a fully pushed-down plan reads once"
+            );
+        }
+
+        #[tokio::test]
+        async fn executed_single_scan_is_admissible() {
+            let ctx = ctx_with_tables(&["orders"]);
+            let df = ctx
+                .sql("SELECT id FROM orders")
+                .await
+                .expect("single-table SQL");
+            let plan = df.create_physical_plan().await.expect("physical plan");
+            let shape = classify_executed_read(plan.as_ref());
+            assert!(
+                shape.refusal_reason().is_none(),
+                "the executing plan of a single-table select reads once: {shape:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn executed_join_is_multiple_reads() {
+            let ctx = ctx_with_tables(&["orders", "customers"]);
+            let df = ctx
+                .sql("SELECT o.id FROM orders o JOIN customers c ON o.id = c.id")
+                .await
+                .expect("join SQL");
+            let plan = df.create_physical_plan().await.expect("physical plan");
+            let shape = classify_executed_read(plan.as_ref());
+            assert!(
+                matches!(shape, ViewReadShape::MultipleReads { reads: 2, .. }),
+                "the executing plan of a two-table join must be two reads: {shape:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn publish_gate_uses_refresh_attestation_not_a_replanned_query() {
+            let attestation = ViewRefreshReadAttestation::new();
+            let gate = ViewSnapshotPublishGate::new(
+                TableReference::bare("orders_us"),
+                attestation.clone(),
+            );
+
+            let missing = gate
+                .check_publish()
+                .await
+                .expect_err("publish without a refresh attestation must refuse");
+            assert!(missing.contains("no refresh-plan attestation"), "{missing}");
+
+            attestation.record(ViewReadShape::MultipleReads {
+                reads: 2,
+                tables: vec![TableReference::bare("orders")],
+            });
+            let refused = gate
+                .check_publish()
+                .await
+                .expect_err("a multi-read executing plan must not publish");
+            assert!(refused.contains("reads its sources 2 times"), "{refused}");
+
+            attestation.record(ViewReadShape::SingleScan {
+                tables: vec![TableReference::bare("orders")],
+            });
+            gate.check_publish()
+                .await
+                .expect("a single-read executing-plan attestation may publish");
+        }
+
+        #[tokio::test]
+        async fn attesting_provider_records_the_executed_scan_shape() {
+            let ctx = ctx_with_tables(&["orders", "customers"]);
+            let logical = ctx
+                .state()
+                .create_logical_plan("SELECT o.id FROM orders o JOIN customers c ON o.id = c.id")
+                .await
+                .expect("logical plan");
+            let view_table = ViewTable::new(logical, Some("join view".to_string()));
+            let attestation = ViewRefreshReadAttestation::new();
+            let wrapped = wrap_view_refresh_attestation(Arc::new(view_table), attestation.clone());
+
+            let _plan = wrapped
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("view scan");
+
+            let shape = attestation
+                .last()
+                .expect("scan records the executing-plan attestation");
+            assert!(
+                matches!(shape, ViewReadShape::MultipleReads { .. }),
+                "the wrapper must attest the executed join as a multi-read: {shape:?}"
             );
         }
 

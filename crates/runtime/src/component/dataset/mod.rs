@@ -269,10 +269,11 @@ impl AccelerationSource for Dataset {
         // change what the rows mean while leaving the schema — the only thing snapshot
         // metadata previously recorded — identical.
         //
-        // Tolerant of unstamped archives, unlike a view: dataset snapshots shipped before
-        // this stamp existed, and refusing them would strand every snapshot taken before
-        // the upgrade. Mismatches are still refused, so everything published from here on
-        // is protected.
+        // Unstamped archives are refused. `snapshot_before_recreate` can publish the
+        // outgoing rows without a stamp when the outgoing definition is not yet on the
+        // archive; after a same-schema `from:` / parameter change that archive becomes
+        // current, and a later cold start must not accept it under the new definition.
+        // Refusing leaves the failure mode a rebuild rather than wrong rows.
         //
         // This is the Spicepod definition the dataset was loaded from.
         // `PATCH /v1/datasets/{name}/acceleration` can replace the live
@@ -283,7 +284,7 @@ impl AccelerationSource for Dataset {
         Some(
             runtime_acceleration::acceleration_source::SourceDefinition {
                 fingerprint: crate::view::definition_fingerprint(&identity),
-                accept_unstamped: true,
+                accept_unstamped: false,
                 materialization:
                     runtime_acceleration::acceleration_source::MaterializationSource::SourceTable,
             },
@@ -376,6 +377,25 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "The column reference \"(foo,bar\" is missing a closing parenthensis."
+        );
+    }
+
+    #[tokio::test]
+    async fn dataset_snapshot_identity_refuses_unstamped_archives() {
+        let dataset = create_dataset_with_params(HashMap::new()).await;
+        let definition =
+            runtime_acceleration::acceleration_source::AccelerationSource::definition_fingerprint(
+                &dataset,
+            )
+            .expect("every dataset stamps its snapshot identity");
+
+        assert!(
+            !definition.accept_unstamped,
+            "an unstamped dataset archive must not bootstrap under a new same-schema definition"
+        );
+        assert_eq!(
+            definition.materialization,
+            runtime_acceleration::acceleration_source::MaterializationSource::SourceTable
         );
     }
 

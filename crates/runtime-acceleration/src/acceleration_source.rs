@@ -47,15 +47,15 @@ pub struct SourceDefinition {
     pub fingerprint: String,
     /// Whether a snapshot recording NO definition may still be restored.
     ///
-    /// `false` where every archive the source could have published carries a stamp, so an
-    /// unstamped one cannot belong to its series — true of accelerated views, for which
-    /// snapshots have never existed without one.
+    /// `false` where an unstamped archive cannot be shown to match the definition now
+    /// in force — true of accelerated views (stamped since they existed) and of
+    /// datasets. An unstamped dataset archive may be the outgoing rows of a
+    /// same-schema recreate; accepting it under the new definition would serve
+    /// those rows as current. The upgrade cost of refusing is a rebuild, not
+    /// wrong rows.
     ///
-    /// `true` where stamping was introduced after archives already existed. Refusing those
-    /// would strand every snapshot taken before the upgrade, for a series whose definition
-    /// has most likely not changed at all — a large, certain cost to close a smaller,
-    /// possible hole. Accepting them still refuses every *mismatch*, so the protection
-    /// applies in full to everything published from here on.
+    /// `true` only for a source that can prove those unstamped rows still answer
+    /// its current definition. Accepting them still refuses every *mismatch*.
     pub accept_unstamped: bool,
     /// What produced these rows. A fingerprint alone cannot answer this: every
     /// definition-bearing source has one, but only a query's rows need a compiled plan
