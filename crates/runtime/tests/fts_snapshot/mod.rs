@@ -407,14 +407,22 @@ async fn fts_snapshot_hot_swap_updates_the_index() -> anyhow::Result<()> {
             );
 
             // --- publish snapshot v2 with different content ---------------------------
+            // Fresh DuckDB file and FTS directory: reusing v1's would also reuse its persisted
+            // checkpoint, and with RefreshMode::Full, no refresh_check_interval, and the default
+            // RefreshOnStartup::Auto, an existing checkpoint disables the startup refresh for
+            // this dataset entirely (see `RefreshTaskBuilder::startup_next_refresh`). The CSV
+            // change below would then never be picked up, and this "v2" would just republish v1
+            // unchanged.
+            let publisher_db_v2 = temp.path().join("publisher_v2.duckdb");
+            let publisher_fts_v2 = temp.path().join("publisher_v2_fts");
             let artifact_count_before_v2 = published_index_artifacts(&snapshot_dir).len();
             std::fs::write(&csv_path, SOURCE_CSV_DIVERGED).expect("write v2 source csv");
             let app = AppBuilder::new("fts_hot_swap_publish_v2")
                 .with_dataset(fts_dataset(
                     "docs",
                     &csv_path,
-                    &publisher_db,
-                    &publisher_fts,
+                    &publisher_db_v2,
+                    &publisher_fts_v2,
                     SnapshotBehavior::CreateOnly,
                     RefreshMode::Full,
                     None,
