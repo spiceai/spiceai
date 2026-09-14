@@ -1474,9 +1474,10 @@ impl RefreshTask {
             );
             self.set_refresh_status(
                 None,
-                status::ComponentStatus::error_with_message(
-                    "snapshot index restore failure".to_string(),
-                ),
+                status::ComponentStatus::error_with_message(format!(
+                    "snapshot index restore failure for snapshot {}: {}",
+                    info.snapshot_id, error
+                )),
             )
             .await;
             return Err(RetryError::transient(
