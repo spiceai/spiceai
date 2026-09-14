@@ -804,24 +804,7 @@ impl CapturedIndex {
 }
 
 fn copy_index_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(destination)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
-        let metadata = std::fs::symlink_metadata(&source_path)?;
-        if metadata.file_type().is_symlink() {
-            return Err(std::io::Error::other(
-                "index directory contains a symbolic link",
-            ));
-        }
-        if metadata.is_dir() {
-            copy_index_directory(&source_path, &destination_path)?;
-        } else if metadata.is_file() {
-            std::fs::copy(source_path, destination_path)?;
-        }
-    }
-    Ok(())
+    util::directory_copy::copy_directory_rejecting_symlinks(source, destination, "index directory")
 }
 
 impl Not for ForceCreate {
