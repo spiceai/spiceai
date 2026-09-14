@@ -1167,6 +1167,12 @@ mod flight_prepared_statements {
 
         test_request_context()
             .scope(async {
+                // `>=` rather than `=` so the result set can grow: an equality
+                // predicate returns the same row whatever else the table holds,
+                // which would make a stale entry indistinguishable from a fresh
+                // one.
+                const SQL: &str = "SELECT a FROM my_table WHERE a >= $1 ORDER BY a";
+
                 let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
                     as Arc<dyn FlightBasicAuth + Send + Sync>;
                 // `cache_key_type: sql` keys results on the SQL text and the
@@ -1192,11 +1198,6 @@ mod flight_prepared_statements {
                 let mut client = FlightSqlServiceClient::new(channel);
                 client.handshake("", "valid").await?;
 
-                // `>=` rather than `=` so the result set can grow: an equality
-                // predicate returns the same row whatever else the table holds,
-                // which would make a stale entry indistinguishable from a fresh
-                // one.
-                const SQL: &str = "SELECT a FROM my_table WHERE a >= $1 ORDER BY a";
                 let bind = || {
                     create_param_batch(
                         vec![("$1", arrow::datatypes::DataType::Int32, false)],
