@@ -12,7 +12,7 @@ mod flight_prepared_statements {
 
     use crate::{
         flight::{
-            create_flight_client, start_spice_test_app, start_spice_test_app_with_metrics_port,
+            create_flight_client, start_spice_test_app, start_spice_test_app_with_cache,
             test_record_batch, write_record_batches,
         },
         init_tracing,
@@ -1150,42 +1150,37 @@ mod flight_prepared_statements {
     /// rather than an edge case. The revalidation rebuilds the query from the
     /// SQL text, which still holds its placeholders -- without the values it
     /// fails with `Placeholder '$1' was not provided a value for execution`, the
-    /// stale entry is never replaced, and each later request inside the window
+    /// stale entry is never replaced, and every later request inside the window
     /// is served a result older than `item_ttl` asked for.
     ///
-    /// Asserted on `results_cache_swr_revalidations`, the counter an operator
-    /// would actually watch: `stored` rising is the revalidation landing, and
-    /// `query_failed` staying at zero is the placeholder error not happening.
-    /// Both matter -- a run that never revalidated at all would leave `stored`
-    /// at zero too.
+    /// The oracle is the ROWS, which is both the user-visible symptom and the
+    /// only signal that belongs to this test alone. A row is added after the
+    /// entry is populated, so the stale result and the revalidated one differ:
+    /// until the revalidation lands the query keeps returning the old set, and
+    /// when it lands the new row appears. A counter could not do this job --
+    /// `results_cache_swr_revalidations` is process-global with no per-test
+    /// label, so a sibling test's revalidation would satisfy it.
     #[tokio::test]
     async fn swr_revalidation_of_a_prepared_statement_rebinds_its_values()
     -> Result<(), anyhow::Error> {
-        let _tracing = init_tracing(Some(
-            "integration=debug,runtime::datafusion::query::cache=debug,info",
-        ));
+        let _tracing = init_tracing(Some("integration=debug,info"));
 
         test_request_context()
             .scope(async {
+                let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
+                    as Arc<dyn FlightBasicAuth + Send + Sync>;
                 // `cache_key_type: sql` keys results on the SQL text and the
                 // bound values, so the stale hit lands before a plan exists --
                 // the route with no bound plan for the revalidation to re-run.
-                // Before the app, so the cache's counters initialize against it.
-                let registry = &*PROMETHEUS;
-
-                let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
-                    as Arc<dyn FlightBasicAuth + Send + Sync>;
-                let (channel, _df, _metrics_port) = start_spice_test_app_with_metrics_port(
+                let (channel, _df) = start_spice_test_app_with_cache(
                     Some(auth),
-                    None,
-                    None,
-                    Some(SQLResultsCacheConfig {
+                    SQLResultsCacheConfig {
                         enabled: true,
                         item_ttl: Some("1s".to_string()),
                         stale_while_revalidate_ttl: Some("5m".to_string()),
                         cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
                         ..Default::default()
-                    }),
+                    },
                 )
                 .await?;
 
@@ -1196,7 +1191,12 @@ mod flight_prepared_statements {
 
                 let mut client = FlightSqlServiceClient::new(channel);
                 client.handshake("", "valid").await?;
-                const SQL: &str = "SELECT a FROM my_table WHERE a = $1";
+
+                // `>=` rather than `=` so the result set can grow: an equality
+                // predicate returns the same row whatever else the table holds,
+                // which would make a stale entry indistinguishable from a fresh
+                // one.
+                const SQL: &str = "SELECT a FROM my_table WHERE a >= $1 ORDER BY a";
                 let bind = || {
                     create_param_batch(
                         vec![("$1", arrow::datatypes::DataType::Int32, false)],
@@ -1207,39 +1207,37 @@ mod flight_prepared_statements {
                 let populated = execute_parameterized_query(&mut client, SQL, bind()?).await?;
                 assert_eq!(
                     rows_of(&populated),
-                    vec![2],
-                    "binding 2 must select its own row"
+                    vec![2, 3],
+                    "binding 2 must select the rows at or above it"
                 );
+
+                // Change what a correct revalidation would return.
+                write_record_batches(&mut put_client, vec![extra_row_batch(4)?]).await?;
 
                 // Age the entry past `item_ttl` into the stale-while-revalidate
                 // window. The sleep is the behavior under test (TTL expiry), not
                 // a readiness wait.
                 tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
 
-                let stale = execute_parameterized_query(&mut client, SQL, bind()?).await?;
-                assert_eq!(rows_of(&stale), vec![2]);
-
-                // Poll the counter rather than sleeping a fixed interval: the
-                // revalidation runs on a background task.
-                let mut stored = 0.0;
-                let mut failed = 0.0;
+                // Poll rather than sleeping a fixed interval: the revalidation
+                // runs on a background task, and each request inside the window
+                // both serves the stale entry and triggers one.
+                let mut rows = Vec::new();
                 for _ in 0..100 {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    stored = counter(registry, "stored");
-                    failed = counter(registry, "query_failed");
-                    if stored > 0.0 || failed > 0.0 {
+                    rows = rows_of(&execute_parameterized_query(&mut client, SQL, bind()?).await?);
+                    if rows == vec![2, 3, 4] {
                         break;
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
 
-                assert!(
-                    failed < 1.0,
-                    "a revalidation failed to execute, which over Flight SQL means the bound \
-                     values were dropped when the query was rebuilt from its SQL text"
-                );
-                assert!(
-                    stored > 0.0,
-                    "no revalidation stored a result, so the stale entry was never replaced"
+                assert_eq!(
+                    rows,
+                    vec![2, 3, 4],
+                    "the stale entry was never replaced, so this prepared statement keeps being \
+                     served a result older than item_ttl asked for -- the revalidation could not \
+                     re-execute because its bound values were dropped when the query was rebuilt \
+                     from its SQL text"
                 );
 
                 Ok(())
@@ -1264,47 +1262,19 @@ mod flight_prepared_statements {
             .collect()
     }
 
-    /// A `MeterProvider` backed by a scrapable registry, installed once per
-    /// process.
-    ///
-    /// Without this the cache's counters record into the global no-op provider
-    /// and the metrics endpoint exports no `swr_revalidations` series at all --
-    /// which reads exactly like a revalidation that never ran. It must be
-    /// installed before the counters are first touched, so the test forces it
-    /// before starting the app. Mirrors `install_prometheus_meter_provider` in
-    /// tests/metrics.rs; the reader comes from `runtime::prometheus_reader` so
-    /// the test and `spiced` cannot drift on exposition naming.
-    static PROMETHEUS: std::sync::LazyLock<prometheus::Registry> = std::sync::LazyLock::new(|| {
-        let registry = prometheus::Registry::new();
-        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-            .with_resource(opentelemetry_sdk::Resource::builder().build())
-            .with_reader(
-                runtime::prometheus_reader(registry.clone())
-                    .expect("to build the prometheus reader"),
-            )
-            .build();
-        opentelemetry::global::set_meter_provider(provider);
-        registry
-    });
-
-    /// One `results_cache_swr_revalidations` series, read off the registry.
-    ///
-    /// Gathered from the registry rather than scraped over HTTP because the
-    /// exposition name carries a `_total` suffix the exporter chooses; the
-    /// family name here is the one the instrument declares.
-    fn counter(registry: &prometheus::Registry, outcome: &str) -> f64 {
-        registry
-            .gather()
-            .iter()
-            .filter(|family| family.name().starts_with("results_cache_swr_revalidations"))
-            .flat_map(|family| family.get_metric().iter())
-            .filter(|metric| {
-                metric
-                    .get_label()
-                    .iter()
-                    .any(|l| l.name() == "outcome" && l.value() == outcome)
-            })
-            .map(|metric| metric.get_counter().value())
-            .sum()
+    /// One extra row for `public.my_table`, matching its `(a, b)` schema.
+    fn extra_row_batch(a: i32) -> Result<RecordBatch, anyhow::Error> {
+        let schema = arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new("b", arrow::datatypes::DataType::Utf8, false),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![a])) as ArrayRef,
+                Arc::new(StringArray::from(vec![format!("row_{a}")])) as ArrayRef,
+            ],
+        )
+        .map_err(Into::into)
     }
 }

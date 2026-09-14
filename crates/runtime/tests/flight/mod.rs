@@ -66,9 +66,20 @@ async fn start_spice_test_app(
     Ok((channel, df))
 }
 
-/// `sql_cache` installs the SQL results cache. Left `None` the app has no cache
-/// provider at all, so every query reports `CacheDisabled` — which is what the
-/// tests that do not care about caching want.
+/// Starts an app whose SQL results cache is configured.
+///
+/// Without a config the app has no cache provider at all and every query
+/// reports `CacheDisabled`, which is what the tests that do not care about
+/// caching want — so they keep passing `None` through the helpers above.
+async fn start_spice_test_app_with_cache(
+    flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+    sql_cache: SQLResultsCacheConfig,
+) -> Result<(Channel, Arc<DataFusion>), anyhow::Error> {
+    let (channel, df, _metrics_port) =
+        start_spice_test_app_with_metrics_port(flight_auth, None, None, Some(sql_cache)).await?;
+    Ok((channel, df))
+}
+
 async fn start_spice_test_app_with_metrics_port(
     flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
     rate_limits: Option<RateLimits>,
