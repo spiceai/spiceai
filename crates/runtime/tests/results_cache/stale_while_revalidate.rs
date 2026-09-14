@@ -79,14 +79,18 @@ async fn start_runtime(app: App) -> (Arc<Runtime>, String) {
     load_rt.load_components().await;
     runtime_ready_check(&rt).await;
 
-    // Bind to pick a free port, then release it for the server to claim.
+    // Bind to pick free ports, then release them for the server to claim.
     let http_listener =
         std::net::TcpListener::bind(SocketAddr::new(LOCALHOST, 0)).expect("bind http port");
-    let http_port = http_listener.local_addr().expect("http addr").port();
-    drop(http_listener);
     let flight_listener =
         std::net::TcpListener::bind(SocketAddr::new(LOCALHOST, 0)).expect("bind flight port");
+    let http_port = http_listener.local_addr().expect("http addr").port();
     let flight_port = flight_listener.local_addr().expect("flight addr").port();
+    // Both reservations are held until both ports are known. Releasing the
+    // first before binding the second lets the OS hand the same ephemeral port
+    // back for it, and `start_servers` then cannot bind both endpoints -- which
+    // surfaces only as this test timing out. tests/metrics.rs does the same.
+    drop(http_listener);
     drop(flight_listener);
 
     let api_config = Config::new()
