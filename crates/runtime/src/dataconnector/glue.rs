@@ -91,6 +91,8 @@ pub enum Error {
         "The input format {input_format} for table '{table}' is not supported. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     InvalidInputFormat { input_format: String, table: String },
+    #[snafu(display("{}", unsupported_transactional_orc_message(table)))]
+    UnsupportedTransactionalOrc { table: String },
     #[snafu(display(
         "No storage descriptor found for table '{table}'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
@@ -348,6 +350,31 @@ impl InputFormat {
     }
 }
 
+/// Hive and Glue store boolean table properties as strings. These are the
+/// values writers emit for a true property (`transactional=true`).
+fn hive_table_parameter_is_true(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "yes" | "1"
+    )
+}
+
+fn is_hive_transactional(table: &Table) -> bool {
+    table
+        .parameters
+        .as_ref()
+        .and_then(|params| params.get("transactional"))
+        .is_some_and(|value| hive_table_parameter_is_true(value))
+}
+
+/// User-facing refusal for Hive ACID ORC. Catalog listing records the table
+/// as unreadable through the same [`InputFormat::try_from`] error.
+fn unsupported_transactional_orc_message(table: &str) -> String {
+    format!(
+        "Cannot read Hive ACID/transactional ORC table '{table}', so queries against it will not resolve. Spice does not support Hive ACID snapshot semantics (`base_*`, `delta_*`, `delete_delta_*`). Use a non-transactional ORC table, or set the Glue table property `transactional` to `false`. See: https://docs.spiceai.org/components/data-connectors/glue"
+    )
+}
+
 impl TryFrom<&Table> for InputFormat {
     type Error = Error;
     fn try_from(table: &Table) -> Result<Self, Self::Error> {
@@ -372,17 +399,23 @@ impl TryFrom<&Table> for InputFormat {
             });
         };
 
-        Ok(match input_format {
-            "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat" => Self::Parquet,
-            "org.apache.hadoop.mapred.TextInputFormat" => Self::Csv,
-            "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat" => Self::Orc,
-            input_format => {
-                return Err(Error::InvalidInputFormat {
-                    input_format: input_format.to_string(),
-                    table: table.name().to_string(),
-                });
+        match input_format {
+            "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat" => Ok(Self::Parquet),
+            "org.apache.hadoop.mapred.TextInputFormat" => Ok(Self::Csv),
+            "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat" => {
+                ensure!(
+                    !is_hive_transactional(table),
+                    UnsupportedTransactionalOrcSnafu {
+                        table: table.name().to_string(),
+                    }
+                );
+                Ok(Self::Orc)
             }
-        })
+            input_format => Err(Error::InvalidInputFormat {
+                input_format: input_format.to_string(),
+                table: table.name().to_string(),
+            }),
+        }
     }
 }
 
@@ -643,9 +676,73 @@ mod tests {
         assert_eq!(ensure_s3_trailing_slash("/local/path"), "/local/path");
     }
 
+    fn orc_glue_table(name: &str, transactional: Option<&str>) -> Table {
+        let descriptor = aws_sdk_glue::types::StorageDescriptor::builder()
+            .input_format("org.apache.hadoop.hive.ql.io.orc.OrcInputFormat")
+            .build();
+        let mut builder = Table::builder().name(name).storage_descriptor(descriptor);
+        if let Some(value) = transactional {
+            builder = builder.parameters("transactional", value);
+        }
+        builder.build().expect("a Glue ORC table with a name")
+    }
+
     #[test]
     fn orc_glue_tables_use_the_listing_orc_format() {
         assert_eq!(InputFormat::Orc.file_format(), "orc");
+    }
+
+    #[test]
+    fn hive_table_parameter_is_true_accepts_hive_truthy_values() {
+        for value in ["true", "TRUE", " True ", "yes", "YES", "1"] {
+            assert!(
+                hive_table_parameter_is_true(value),
+                "{value} is a Hive true table property"
+            );
+        }
+        for value in ["false", "FALSE", "no", "0", "", "maybe"] {
+            assert!(
+                !hive_table_parameter_is_true(value),
+                "{value} is not a Hive true table property"
+            );
+        }
+    }
+
+    #[test]
+    fn transactional_orc_glue_tables_are_refused() {
+        for value in ["true", "TRUE", "yes", "1"] {
+            let table = orc_glue_table("acid_orders", Some(value));
+            let err = InputFormat::try_from(&table)
+                .expect_err("a transactional ORC Glue table must be refused");
+            assert!(
+                matches!(err, Error::UnsupportedTransactionalOrc { ref table } if table == "acid_orders"),
+                "transactional={value} must be UnsupportedTransactionalOrc, got {err:?}"
+            );
+            let message = err.to_string();
+            assert_eq!(
+                message,
+                unsupported_transactional_orc_message("acid_orders")
+            );
+            assert!(
+                !message.contains('\n'),
+                "the refusal must stay on one line: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_transactional_orc_glue_tables_map_to_orc() {
+        for table in [
+            orc_glue_table("orders", None),
+            orc_glue_table("orders", Some("false")),
+            orc_glue_table("orders", Some("0")),
+            orc_glue_table("orders", Some("no")),
+        ] {
+            assert_eq!(
+                InputFormat::try_from(&table).expect("ordinary ORC must map"),
+                InputFormat::Orc
+            );
+        }
     }
 
     #[test]

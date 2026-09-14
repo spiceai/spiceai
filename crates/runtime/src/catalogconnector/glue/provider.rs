@@ -772,6 +772,20 @@ mod tests {
             .expect("a Glue table with a name")
     }
 
+    /// Hive ACID ORC: `OrcInputFormat` plus `transactional=true`. Spice refuses
+    /// these until ACID snapshot merge exists.
+    fn transactional_orc_table(name: &str) -> Table {
+        let descriptor = aws_sdk_glue::types::StorageDescriptor::builder()
+            .input_format(ORC)
+            .build();
+        Table::builder()
+            .name(name)
+            .storage_descriptor(descriptor)
+            .parameters("transactional", "true")
+            .build()
+            .expect("a Glue table with a name")
+    }
+
     const PARQUET: &str = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat";
     const TEXT: &str = "org.apache.hadoop.mapred.TextInputFormat";
     const ORC: &str = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
@@ -1061,23 +1075,26 @@ mod tests {
             unreadable.sample
         );
 
-        // The three ways `InputFormat::try_from` refuses a table: an unsupported
-        // format, a storage descriptor carrying no format, and no descriptor.
+        // The ways `InputFormat::try_from` refuses a table: an unsupported
+        // format, a storage descriptor carrying no format, no descriptor, and
+        // Hive ACID/transactional ORC.
         for refused in [
             glue_table("archive", Some(AVRO)),
             glue_table("headerless", None),
             table_without_storage_descriptor("legacy"),
+            transactional_orc_table("acid_orders"),
         ] {
             assert!(!is_readable("public", &refused, &mut unreadable));
         }
 
-        assert_eq!(unreadable.total, 3);
+        assert_eq!(unreadable.total, 4);
         assert_eq!(
             unreadable.sample,
             vec![
                 "archive".to_string(),
                 "headerless".to_string(),
-                "legacy".to_string()
+                "legacy".to_string(),
+                "acid_orders".to_string()
             ],
             "every table the connector cannot read must be named"
         );
