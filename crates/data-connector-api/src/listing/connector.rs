@@ -1351,7 +1351,24 @@ pub trait ListingTableConnector: DataConnector {
         let ctx: SessionContext = self.get_session_context();
 
         let (schema_infer_url, schema_infer_meta) =
-            if let Some(url) = dataset.params.get("schema_source_path") {
+            if table_path.is_collection() && listing_extension_is_orc(extension) {
+                // Infer from the scan path. `schema_source_path` only replaces
+                // `infer_listing_url` and would publish a prefix schema while
+                // `ListingTable` still scans `table_path`.
+                get_last_modified(
+                    format!("{self}"),
+                    dataset,
+                    extension,
+                    table_path.clone(),
+                    &ctx,
+                    &object_store,
+                )
+                .await?;
+                (
+                    SensitiveListingTableUrl::new(table_path.clone(), url.clone()),
+                    None,
+                )
+            } else if let Some(url) = dataset.params.get("schema_source_path") {
                 let url = self.get_object_store_url(dataset, Some(url))?;
                 let schema_infer_url = ListingTableUrl::parse(&url).boxed().context(
                     crate::UnableToGetSchemaInternalSnafu {
@@ -1371,23 +1388,6 @@ pub trait ListingTableConnector: DataConnector {
                 (
                     SensitiveListingTableUrl::new(schema_infer_url, url),
                     schema_infer_meta,
-                )
-            } else if table_path.is_collection() && listing_extension_is_orc(extension) {
-                // Confirm matching objects exist (same errors as other formats),
-                // then infer from the collection so `OrcFormat::infer_schema`
-                // receives every matching object, not only the newest file.
-                get_last_modified(
-                    format!("{self}"),
-                    dataset,
-                    extension,
-                    table_path.clone(),
-                    &ctx,
-                    &object_store,
-                )
-                .await?;
-                (
-                    SensitiveListingTableUrl::new(table_path.clone(), url.clone()),
-                    None,
                 )
             } else {
                 // Get the last modified object for the provided ObjectStore to infer the schema.
@@ -1433,10 +1433,10 @@ pub trait ListingTableConnector: DataConnector {
 
         let infer_listing_url = schema_infer_url.expose_sensitive_url();
         let resolved_schema =
-            if listing_extension_is_orc(extension) && infer_listing_url.is_collection() {
+            if listing_extension_is_orc(extension) && table_path.is_collection() {
                 infer_orc_collection_schema(
                     &ctx.state(),
-                    infer_listing_url,
+                    &table_path,
                     &object_store,
                     extension,
                     &file_format,
@@ -3026,6 +3026,70 @@ mod tests {
         );
     }
 
+    /// `schema_source_path` only replaces the inference URL. A later scan
+    /// still lists `from`, so inferring from a narrower id-only prefix must
+    /// not unpublish `extra` from objects outside that prefix.
+    #[tokio::test]
+    async fn create_listing_table_does_not_infer_orc_schema_from_schema_source_path_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let schema_dir = dir.path().join("schema");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir(&schema_dir).expect("schema prefix");
+        std::fs::create_dir(&data_dir).expect("data prefix");
+
+        let id_only_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let id_only = RecordBatch::try_new(
+            Arc::clone(&id_only_schema),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1]))],
+        )
+        .expect("id-only batch");
+
+        let both_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("extra", DataType::Utf8, false),
+        ]));
+        let both = RecordBatch::try_new(
+            Arc::clone(&both_schema),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![2])),
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+            ],
+        )
+        .expect("id+extra batch");
+
+        write_orc_fixture(&schema_dir.join("id.orc"), &id_only);
+        write_orc_fixture(&data_dir.join("id_extra.orc"), &both);
+
+        let table_url = format!("file://{}/", dir.path().display());
+        let schema_source_path = format!("file://{}/", schema_dir.display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "orc".to_string());
+        let (connector, mut dataset) = setup_connector(table_url.clone(), params);
+        dataset
+            .params
+            .insert("schema_source_path".to_string(), schema_source_path);
+
+        let url = Url::parse(&table_url).expect("collection url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("ORC listing format")
+        else {
+            panic!("expected an ORC file format");
+        };
+        assert_eq!(extension, ".orc");
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("create_listing_table must not publish a schema_source_path prefix schema");
+
+        provider
+            .schema()
+            .field_with_name("extra")
+            .expect("scan-path merge must keep extra from table/data/id_extra.orc");
+    }
+
     #[test]
     fn orc_collection_schema_infer_limit_error_names_the_cap_and_docs() {
         let message =
@@ -3035,8 +3099,8 @@ mod tests {
             "cap must appear in: {message}"
         );
         assert!(
-            !message.contains("`schema_source_path`"),
-            "must not recommend inference-only schema_source_path: {message}"
+            !message.contains("schema_source_path"),
+            "must not recommend an inference-only prefix: {message}"
         );
         assert!(
             message.contains(
