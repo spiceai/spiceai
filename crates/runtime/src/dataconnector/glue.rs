@@ -371,7 +371,7 @@ fn is_hive_transactional(table: &Table) -> bool {
 /// as unreadable through the same [`InputFormat::try_from`] error.
 fn unsupported_transactional_orc_message(table: &str) -> String {
     format!(
-        "Cannot read Hive ACID/transactional ORC table '{table}', so queries against it will not resolve. Spice does not support Hive ACID snapshot semantics (`base_*`, `delta_*`, `delete_delta_*`). Use a non-transactional ORC table, or set the Glue table property `transactional` to `false`. See: https://docs.spiceai.org/components/data-connectors/glue"
+        "Cannot read Hive ACID/transactional ORC table '{table}', so queries against it will not resolve. Spice does not support Hive ACID snapshot semantics (`base_*`, `delta_*`, `delete_delta_*`). Export or materialize the current snapshot into a genuinely non-transactional ORC location and register that table instead. See: https://docs.spiceai.org/components/data-connectors/glue"
     )
 }
 
@@ -722,6 +722,16 @@ mod tests {
             assert_eq!(
                 message,
                 unsupported_transactional_orc_message("acid_orders")
+            );
+            assert!(
+                message.contains("Export or materialize")
+                    && message.contains("genuinely non-transactional ORC location"),
+                "directs the user to a rewritten snapshot, not a property flip: {message}"
+            );
+            assert!(
+                !message.contains("`transactional` to `false`")
+                    && !message.contains("transactional=false"),
+                "must not suggest flipping Glue `transactional`: {message}"
             );
             assert!(
                 !message.contains('\n'),
