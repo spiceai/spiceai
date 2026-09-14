@@ -68,8 +68,11 @@ runs:
           VERSION="v${VERSION}"
         fi
 
-        # Strip leading 'v' for filename
-        FILE_VERSION="${VERSION#v}"
+        # Tag without leading 'v' is what `protoc --version` prints (libprotoc 28.0-rc1).
+        # The zip filename uses a different RC spelling (28.0-rc-1). Keep them apart:
+        # FILE_VERSION is for assets and the cache path only.
+        REPORTED_VERSION="${VERSION#v}"
+        FILE_VERSION="${REPORTED_VERSION}"
 
         # Handle rc releases (e.g. 28.0rc1 or 28.0-rc1 -> 28.0-rc-1)
         if [[ "${FILE_VERSION}" == *rc* ]]; then
@@ -130,7 +133,7 @@ runs:
           [ -x "${bin}" ] || return 1
           local got
           got="$("${bin}" --version 2>/dev/null | awk '{print $NF}')"
-          [ "${got}" = "${FILE_VERSION}" ]
+          [ "${got}" = "${REPORTED_VERSION}" ]
         }
 
         publish_protoc() {
@@ -229,7 +232,7 @@ runs:
               success=1
               break
             fi
-            echo "::warning::protoc at ${PROTOC_BIN} did not report version ${FILE_VERSION} after extract"
+            echo "::warning::protoc at ${PROTOC_BIN} did not report version ${REPORTED_VERSION} after extract"
           else
             echo "::warning::protoc install attempt ${attempt}/3 failed"
           fi
@@ -283,8 +286,11 @@ runs:
           $Version = "v$Version"
         }
 
-        # Strip leading 'v' for filename
-        $FileVersion = $Version.TrimStart("v")
+        # Tag without leading 'v' is what `protoc --version` prints (libprotoc 28.0-rc1).
+        # The zip filename uses a different RC spelling (28.0-rc-1). Keep them apart:
+        # $FileVersion is for assets and the cache path only.
+        $ReportedVersion = $Version.TrimStart("v")
+        $FileVersion = $ReportedVersion
 
         # Handle rc releases
         $FileVersion = $FileVersion -replace "-?rc(\d+)$", "-rc-`$1"
@@ -329,7 +335,7 @@ runs:
           if (-not (Test-Path $Bin)) { return $false }
           try {
             $got = (& $Bin --version | Out-String).Trim().Split()[-1]
-            return $got -eq $FileVersion
+            return $got -eq $ReportedVersion
           } catch {
             return $false
           }
@@ -376,7 +382,7 @@ runs:
               $success = $true
               break
             }
-            Write-Host "::warning::protoc at $ProtocBin did not report version $FileVersion after extract"
+            Write-Host "::warning::protoc at $ProtocBin did not report version $ReportedVersion after extract"
           } catch {
             Write-Host "::warning::protoc install attempt ${attempt}/3 failed: $_"
             Start-Sleep -Seconds (2 * $attempt)
