@@ -46,7 +46,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::sqlparser::parser::ParserError;
 use flight_client::Error as FlightClientError;
 use futures::stream::{self, BoxStream, StreamExt};
-use futures::{Stream, TryStreamExt};
+use futures::{FutureExt, Stream, TryStreamExt};
 use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
 use middleware::{RequestContextLayer, WriteRateLimitLayer};
@@ -365,8 +365,64 @@ impl Service {
             ..Default::default()
         };
 
-        let data_stream = query_result.data;
+        let mut data_stream = query_result.data;
         let cache_status = query_result.cache_status;
+
+        // Take the batches that are already there, up to a small budget. A result
+        // that ends within it — any small cached result — is encoded here, on the
+        // request's own task, instead of by an encode task: its few messages need
+        // no second task to wait on, no channel, and no egress reservation.
+        let mut taken = Vec::new();
+        let mut taken_bytes = 0;
+        let ended = loop {
+            if taken_bytes > FLIGHT_INLINE_ENCODE_MAX_BYTES {
+                break false;
+            }
+            match data_stream.next().now_or_never() {
+                Some(Some(Ok(batch))) => {
+                    taken_bytes += batch.get_array_memory_size();
+                    taken.push(Ok(batch));
+                }
+                // A failure ends the result, as it ends the encode task below.
+                Some(Some(Err(e))) => {
+                    taken.push(Err(e));
+                    break true;
+                }
+                Some(None) => break true,
+                None => break false,
+            }
+        };
+        if ended {
+            let mut messages = Vec::with_capacity(taken.len() + 1);
+            messages.push(Ok(schema_flight_data));
+            for item in taken {
+                let encoded = item
+                    .map_err(|e| handle_datafusion_error(find_datafusion_root(e)))
+                    .and_then(|batch| {
+                        encode_flight_batch(
+                            batch,
+                            needs_view_cast,
+                            &schema,
+                            &encoder,
+                            &mut dict_tracker,
+                            &options,
+                            &mut compression_context,
+                        )
+                    });
+                match encoded {
+                    Ok((dicts, batch_data)) => {
+                        messages.extend(dicts.into_iter().map(Ok));
+                        messages.push(Ok(batch_data));
+                    }
+                    Err(status) => {
+                        messages.push(Err(status));
+                        break;
+                    }
+                }
+            }
+            return (stream::iter(messages).boxed(), cache_status);
+        }
+        let data_stream = stream::iter(taken).chain(data_stream);
 
         // Charge the encoded FlightData buffered for send against the query
         // memory pool so egress memory is visible to `runtime.query.memory_limit`
@@ -468,6 +524,12 @@ impl Service {
 /// stays bounded, while still letting the encode of batch N overlap the socket
 /// write of batch N-1.
 const FLIGHT_ENCODE_CHANNEL_CAPACITY: usize = 2;
+
+/// How much Arrow data a Flight response whose batches are all already there is
+/// encoded on the request's own task, instead of by an encode task. Small enough
+/// to encode — even with `zstd` IPC compression — well within the time a task may
+/// run without yielding.
+const FLIGHT_INLINE_ENCODE_MAX_BYTES: usize = 16 * 1024;
 
 /// Encode one [`RecordBatch`] into its Flight dictionary + record-batch
 /// messages, applying the `Utf8View`/`BinaryView` → `Large*` cast when the
@@ -1058,5 +1120,203 @@ impl Default for RateLimits {
                 NonZeroU32::new(100).unwrap_or_else(|| unreachable!("100 is always non-zero")),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ArrayRef, DictionaryArray, Int64Array, StringArray, StringViewArray};
+    use arrow::datatypes::{Field, Int32Type, SchemaRef};
+    use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::execution::memory_pool::UnboundedMemoryPool;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use runtime_request_context::Protocol;
+
+    /// The messages a Flight response sent, and the failure that ended it, if any.
+    type Sent = (Vec<FlightData>, Option<(tonic::Code, String)>);
+
+    /// The response for `items`, with every batch ready when asked for, or each one
+    /// having to be waited for.
+    fn respond(
+        schema: &SchemaRef,
+        items: Vec<Result<RecordBatch, DataFusionError>>,
+        ready: bool,
+    ) -> BoxStream<'static, Result<FlightData, Status>> {
+        let items = stream::iter(items);
+        let data: SendableRecordBatchStream = if ready {
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(schema), items))
+        } else {
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(schema),
+                items.then(|item| async move {
+                    tokio::task::yield_now().await;
+                    item
+                }),
+            ))
+        };
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let (response, _) = Service::query_result_to_flight_stream(
+            QueryResult::new(data, CacheStatus::CacheHit),
+            IpcWriteOptions::default(),
+            None,
+            &pool,
+            Arc::new(RequestContext::builder(Protocol::FlightSQL).build()),
+        );
+        response
+    }
+
+    async fn sent(mut response: BoxStream<'static, Result<FlightData, Status>>) -> Sent {
+        let mut messages = Vec::new();
+        while let Some(item) = response.next().await {
+            match item {
+                Ok(message) => messages.push(message),
+                Err(status) => {
+                    return (
+                        messages,
+                        Some((status.code(), status.message().to_string())),
+                    );
+                }
+            }
+        }
+        (messages, None)
+    }
+
+    fn batch(schema: &SchemaRef, columns: Vec<ArrayRef>) -> RecordBatch {
+        RecordBatch::try_new(Arc::clone(schema), columns).expect("record batch")
+    }
+
+    /// A result encoded on the request's task must send exactly the messages the
+    /// encode task sends for it: the schema, dictionaries, batches, and the failure
+    /// that ends it.
+    #[tokio::test]
+    async fn a_ready_result_sends_what_the_encode_task_sends() {
+        let plain: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let views: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::Utf8View,
+            true,
+        )]));
+        let dictionary: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "vendor",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let rows = |ids: Vec<Option<i64>>, names: Vec<Option<&str>>| {
+            batch(
+                &plain,
+                vec![
+                    Arc::new(Int64Array::from(ids)) as ArrayRef,
+                    Arc::new(StringArray::from(names)) as ArrayRef,
+                ],
+            )
+        };
+        let ids: Vec<Option<i64>> = (0..5_000).map(Some).collect();
+        let names = vec![Some("a name long enough to pass the inline budget"); ids.len()];
+        let large = rows(ids, names);
+
+        let cases: Vec<(&str, &SchemaRef, Vec<RecordBatch>, bool)> = vec![
+            (
+                "several batches, one empty, with NULLs",
+                &plain,
+                vec![
+                    rows(vec![Some(1), None], vec![Some("a"), None]),
+                    rows(vec![], vec![]),
+                    rows(vec![Some(3)], vec![Some("c")]),
+                ],
+                false,
+            ),
+            ("an empty result", &plain, vec![], false),
+            (
+                "view columns cast to the advertised types",
+                &views,
+                vec![batch(
+                    &views,
+                    vec![Arc::new(StringViewArray::from(vec![
+                        Some("x"),
+                        None,
+                        Some("a string longer than twelve bytes"),
+                    ])) as ArrayRef],
+                )],
+                false,
+            ),
+            (
+                "a dictionary column",
+                &dictionary,
+                vec![batch(
+                    &dictionary,
+                    vec![Arc::new(DictionaryArray::<Int32Type>::from_iter([
+                        Some("alpha"),
+                        None,
+                        Some("alpha"),
+                        Some("bravo"),
+                    ])) as ArrayRef],
+                )],
+                false,
+            ),
+            (
+                "a result larger than the inline budget",
+                &plain,
+                vec![rows(vec![Some(1)], vec![Some("a")]), large.clone(), large],
+                false,
+            ),
+            (
+                "a failure after the first batch",
+                &plain,
+                vec![rows(vec![Some(1)], vec![Some("a")])],
+                true,
+            ),
+        ];
+
+        for (case, schema, batches, fails) in cases {
+            let items = || {
+                let mut items: Vec<Result<RecordBatch, DataFusionError>> =
+                    batches.iter().cloned().map(Ok).collect();
+                if fails {
+                    items.push(Err(DataFusionError::Execution(
+                        "the source failed".to_string(),
+                    )));
+                }
+                items
+            };
+            let inline = sent(respond(schema, items(), true)).await;
+            let spawned = sent(respond(schema, items(), false)).await;
+            assert!(!inline.0.is_empty(), "{case}: the schema is always sent");
+            assert_eq!(inline, spawned, "{case}");
+        }
+    }
+
+    /// A small result whose batches are all there is sent without waiting on any
+    /// other task.
+    #[tokio::test]
+    async fn a_small_ready_result_is_sent_without_another_task() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let items = vec![Ok(batch(
+            &schema,
+            vec![Arc::new(Int64Array::from(vec![Some(1), Some(2)])) as ArrayRef],
+        ))];
+        let mut response = respond(&schema, items, true);
+
+        // On this single-threaded runtime, a spawned encode task cannot have run yet.
+        let mut messages = Vec::new();
+        while let Some(Some(message)) = response.next().now_or_never() {
+            messages.push(message.expect("a message"));
+        }
+        assert_eq!(
+            messages.len(),
+            2,
+            "the schema and the one batch must both be sent without waiting"
+        );
+        assert!(
+            response
+                .next()
+                .now_or_never()
+                .is_some_and(|end| end.is_none()),
+            "the response must end without waiting"
+        );
     }
 }

@@ -15,14 +15,15 @@ limitations under the License.
 */
 
 use super::{
-    BindingParametersSnafu, Query, QueryResult, QueryTracker, attach_query_tracker_to_stream,
+    BindingParametersSnafu, Query, QueryMethod, QueryResult, QueryTracker, ResultsCacheMode,
+    finish_served_records,
 };
 use crate::datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode};
 use cache::{
-    EntryValidity, RevalidationOutcome,
+    EntryValidity, QueryResultsCacheProvider, RevalidationOutcome,
     key::{CacheKey, RawCacheKey},
     result::CacheStatus,
-    result::query::CachedStream,
+    result::query::{CachedQueryResult, CachedStream},
     to_cached_record_batch_stream,
 };
 use datafusion::{
@@ -38,7 +39,6 @@ use runtime_request_context::{
 use snafu::ResultExt;
 use std::sync::OnceLock;
 use std::{collections::HashSet, hash::Hasher, sync::Arc};
-use tracing::Span;
 
 /// Returns `Plan` if the result is not cached and needs to be executed, otherwise returns `Cached`
 pub(super) enum PlanOrCached {
@@ -107,6 +107,197 @@ fn record_revalidation_outcome(outcome: RevalidationOutcome) {
     cache::metrics::sql_results::SWR_REVALIDATIONS.add(1, &[outcome.key_value()]);
 }
 
+impl CacheResponse {
+    /// Nothing servable was found under `raw_key`.
+    fn miss(raw_key: RawCacheKey, tracker: Option<QueryTracker>) -> Self {
+        Self::from(CacheResult::MissOrSkipped, CacheStatus::CacheMiss)
+            .with_query_tracker(tracker)
+            .with_raw_key(Some(raw_key))
+    }
+}
+
+/// Whether a request looks the results cache up under a given kind of key.
+///
+/// A request consults the cache under exactly one kind — its plan, its SQL
+/// text, or the key its client supplied — chosen by its cache key type.
+enum KeyUse {
+    LookUp,
+    /// `no-cache`: the request does not use the results cache at all.
+    Bypass,
+    /// The request's cache key type is looked up under another kind of key.
+    WrongKeyType,
+}
+
+impl KeyUse {
+    fn of(cache_control: CacheControl, key: &CacheKey<'_>) -> Self {
+        match (cache_control, key) {
+            (
+                CacheControl::Cache(CacheKeyType::Default)
+                | CacheControl::MaxStale(CacheKeyType::Default, _)
+                | CacheControl::MinFresh(CacheKeyType::Default, _)
+                | CacheControl::OnlyIfCached(CacheKeyType::Default),
+                CacheKey::LogicalPlan(_),
+            )
+            | (
+                CacheControl::Cache(CacheKeyType::Raw)
+                | CacheControl::MaxStale(CacheKeyType::Raw, _)
+                | CacheControl::MinFresh(CacheKeyType::Raw, _)
+                | CacheControl::OnlyIfCached(CacheKeyType::Raw),
+                CacheKey::Query(_, _),
+            )
+            | (
+                CacheControl::Cache(CacheKeyType::ClientSupplied)
+                | CacheControl::MaxStale(CacheKeyType::ClientSupplied, _)
+                | CacheControl::MinFresh(CacheKeyType::ClientSupplied, _)
+                | CacheControl::OnlyIfCached(CacheKeyType::ClientSupplied),
+                CacheKey::ClientSupplied(_),
+            ) => Self::LookUp,
+            (CacheControl::NoCache, _) => Self::Bypass,
+            _ => Self::WrongKeyType,
+        }
+    }
+}
+
+/// An entry found under a request's key that may be served to it.
+pub(super) struct ServableEntry {
+    cached_result: CachedQueryResult,
+    entry_validity: EntryValidity,
+    cache_status: CacheStatus,
+    /// Whether serving the entry must start a background revalidation.
+    revalidate: bool,
+}
+
+/// Looks `raw_key` up and decides whether the entry found may be served to a
+/// request with `cache_control`.
+///
+/// An entry beyond the stale-while-revalidate window is not servable. One past
+/// its TTL, or whose tables changed after it read them, is served stale and
+/// marked for revalidation.
+async fn find_servable_entry(
+    cache_provider: &QueryResultsCacheProvider,
+    cache_control: CacheControl,
+    raw_key: &RawCacheKey,
+) -> super::Result<Option<ServableEntry>> {
+    // `get_raw_key_with_validity`, not `get_raw_key`: this is the path that
+    // implements stale-while-revalidate, so it is the one that can serve an
+    // entry a table invalidation has marked stale and start the background
+    // revalidation replacing it, instead of taking the miss.
+    let (cached_result, entry_validity) =
+        match cache_provider.get_raw_key_with_validity(raw_key).await {
+            Ok(Some(hit)) => hit,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(super::Error::FailedToAccessCache { source: e }),
+        };
+
+    // Determine cache status based on stale-while-revalidate configuration
+    let mut cache_status = CacheStatus::CacheHit;
+    let mut revalidate = false;
+
+    // Determine the effective stale-while-revalidate duration from either:
+    // 1. The request's max-stale directive (client explicitly willing to accept stale data)
+    // 2. The cache provider's stale_while_revalidate_ttl configuration (server-side policy)
+    let stale_duration = match cache_control {
+        CacheControl::MaxStale(_, Some(duration)) => Some(duration),
+        CacheControl::MaxStale(_, None) => None, // max-stale without value means accept any staleness
+        _ => cache_provider.stale_while_revalidate_ttl(),
+    };
+
+    // Check if stale-while-revalidate is enabled (from request or cache provider config)
+    if let Some(stale_duration) = stale_duration {
+        let ttl = cache_provider.ttl();
+        let now = std::time::Instant::now();
+        let max_age = ttl + stale_duration;
+
+        // If beyond the stale-while-revalidate window, treat as cache miss
+        if cached_result.is_stale(max_age, now) {
+            tracing::debug!(
+                "Cache entry is beyond stale-while-revalidate window (max_age: {:?}), treating as cache miss",
+                max_age
+            );
+            return Ok(None);
+        }
+
+        // If stale (beyond TTL but within stale-while-revalidate window), trigger background revalidation
+        if cached_result.is_stale(ttl, now) {
+            tracing::debug!(
+                "Cache entry is stale (beyond TTL), triggering background revalidation for stale-while-revalidate"
+            );
+            cache_status = CacheStatus::CacheStaleWhileRevalidate;
+            revalidate = true;
+        }
+    }
+
+    // An accelerated refresh, or DML, landing after this entry read its
+    // tables leaves the entry resident but stale rather than evicting it
+    // whenever `stale_while_revalidate_ttl` is configured — see
+    // `QueryResultsCacheProvider::entry_validity`. Serving it here, and
+    // revalidating behind it, is what keeps a refresh from turning every
+    // dependent entry into a synchronous miss on the same tick.
+    if entry_validity == EntryValidity::StaleWhileRevalidate {
+        tracing::debug!(
+            "A table this cache entry read was refreshed, serving it stale and triggering background revalidation"
+        );
+        cache_status = CacheStatus::CacheStaleWhileRevalidate;
+        revalidate = true;
+    }
+
+    Ok(Some(ServableEntry {
+        cached_result,
+        entry_validity,
+        cache_status,
+        revalidate,
+    }))
+}
+
+/// How serving a servable entry ended.
+enum Served {
+    Hit(QueryResult),
+    /// The entry could not be decoded. The tracker is handed back so the query
+    /// can still be planned, executed and tracked like a miss.
+    Undecodable(Option<QueryTracker>),
+}
+
+/// What looking a query up in the results cache found before anything was
+/// planned. See [`Query::probe_results_cache`].
+pub(super) enum CacheProbe {
+    /// No lookup was made, so the planned path makes its own.
+    Skipped,
+    /// The key was looked up and held nothing servable.
+    Missed(RawCacheKey),
+    /// An entry the request can be served.
+    Hit(Box<ProbedHit>),
+}
+
+impl CacheProbe {
+    /// Whether the request can be served where it arrived, without the query
+    /// runtime.
+    ///
+    /// Only a hit on an entry held as batches qualifies, since serving it hands
+    /// out batches the cache already holds. Decoding an encoded entry is CPU
+    /// work, and a miss has a query to plan and execute, so both belong on the
+    /// query runtime.
+    pub(super) fn is_servable_in_place(&self) -> bool {
+        matches!(self, Self::Hit(hit) if !hit.entry.cached_result.is_encoded())
+    }
+}
+
+/// A results-cache entry found before planning, with what serving it needs.
+pub(super) struct ProbedHit {
+    raw_key: RawCacheKey,
+    entry: ServableEntry,
+    sql: Arc<str>,
+    /// The plan the key was computed from, kept only when serving the entry
+    /// starts a revalidation, which then re-executes the plan rather than
+    /// re-parsing the SQL.
+    revalidation_plan: Option<LogicalPlan>,
+}
+
+impl ProbedHit {
+    pub(super) fn raw_key(&self) -> RawCacheKey {
+        self.raw_key
+    }
+}
+
 impl Query {
     /// Returns a `LogicalPlan` if the result is not cached and needs to be executed, otherwise returns a cached `QueryResult`.
     ///
@@ -124,6 +315,12 @@ impl Query {
     ///    [`cache::WRITE_CAPABLE_EXTENSION_NAMES`] (currently `DdlExtension`
     ///    and `DmlExtension`). New write-capable extension nodes must be
     ///    added there to keep this property.
+    ///
+    /// `already_looked_up` is the key [`Self::probe_results_cache`] found
+    /// nothing servable under, when it made a lookup. That key is not looked up
+    /// again: the request has already been counted, and counting it twice would
+    /// skew the cache's request and miss metrics.
+    #[expect(clippy::too_many_arguments)]
     pub(super) async fn get_plan_or_cached(
         df: &Arc<DataFusion>,
         session: &SessionState,
@@ -132,6 +329,7 @@ impl Query {
         parameters: Option<ParamValues>,
         tracker: Option<QueryTracker>,
         pre_parsed_plan: Option<Box<LogicalPlan>>,
+        already_looked_up: Option<RawCacheKey>,
     ) -> super::Result<PlanOrCached> {
         let cache_control = request_context.cache_control();
         let cache_namespace = request_context.cache_namespace();
@@ -159,6 +357,7 @@ impl Query {
             tracker,
             &sql_or_user_cache_key,
             sql,
+            already_looked_up,
         )
         .await?
         {
@@ -205,6 +404,7 @@ impl Query {
             tracker,
             &CacheKey::LogicalPlan(&plan),
             sql,
+            already_looked_up,
         )
         .await?
         {
@@ -344,9 +544,10 @@ impl Query {
     async fn try_get_cached_result<'a>(
         df: &Arc<DataFusion>,
         request_context: &Arc<RequestContext>,
-        mut tracker: Option<QueryTracker>,
+        tracker: Option<QueryTracker>,
         key: &'a CacheKey<'a>,
         sql: &str,
+        already_looked_up: Option<RawCacheKey>,
     ) -> super::Result<CacheResponse> {
         let Some(cache_provider) = df.results_cache_provider() else {
             return Ok(
@@ -358,36 +559,16 @@ impl Query {
         let cache_control = request_context.cache_control();
 
         // Validate that the provided cache key is the correct type for this request
-        match (cache_control, &key) {
-            (
-                CacheControl::Cache(CacheKeyType::Default)
-                | CacheControl::MaxStale(CacheKeyType::Default, _)
-                | CacheControl::MinFresh(CacheKeyType::Default, _)
-                | CacheControl::OnlyIfCached(CacheKeyType::Default),
-                CacheKey::LogicalPlan(_),
-            )
-            | (
-                CacheControl::Cache(CacheKeyType::Raw)
-                | CacheControl::MaxStale(CacheKeyType::Raw, _)
-                | CacheControl::MinFresh(CacheKeyType::Raw, _)
-                | CacheControl::OnlyIfCached(CacheKeyType::Raw),
-                CacheKey::Query(_, _),
-            )
-            | (
-                CacheControl::Cache(CacheKeyType::ClientSupplied)
-                | CacheControl::MaxStale(CacheKeyType::ClientSupplied, _)
-                | CacheControl::MinFresh(CacheKeyType::ClientSupplied, _)
-                | CacheControl::OnlyIfCached(CacheKeyType::ClientSupplied),
-                CacheKey::ClientSupplied(_),
-            ) => { /* Valid cache key type for this cache control */ }
-            (CacheControl::NoCache, _) => {
+        match KeyUse::of(cache_control, key) {
+            KeyUse::LookUp => {}
+            KeyUse::Bypass => {
                 return Ok(CacheResponse::from(
                     CacheResult::MissOrSkipped,
                     CacheStatus::CacheBypass,
                 )
                 .with_query_tracker(tracker));
             }
-            _ => {
+            KeyUse::WrongKeyType => {
                 return Ok(CacheResponse::from(
                     CacheResult::WrongCacheKeyType,
                     CacheStatus::CacheMiss,
@@ -402,86 +583,194 @@ impl Query {
             key.as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
         };
 
-        // `get_raw_key_with_validity`, not `get_raw_key`: this is the path that
-        // implements stale-while-revalidate, so it is the one that can serve an
-        // entry a table invalidation has marked stale and start the background
-        // revalidation replacing it, instead of taking the miss.
-        let (cached_result, entry_validity) =
-            match cache_provider.get_raw_key_with_validity(&raw_key).await {
-                Ok(Some(hit)) => hit,
-                Ok(None) => {
-                    return Ok(CacheResponse::from(
-                        CacheResult::MissOrSkipped,
-                        CacheStatus::CacheMiss,
-                    )
-                    .with_query_tracker(tracker)
-                    .with_raw_key(Some(raw_key)));
-                }
-                Err(e) => return Err(super::Error::FailedToAccessCache { source: e }),
-            };
+        // Looked up before planning, and nothing servable was there.
+        if already_looked_up == Some(raw_key) {
+            return Ok(CacheResponse::miss(raw_key, tracker));
+        }
 
-        // Determine cache status based on stale-while-revalidate configuration
-        let mut cache_status = CacheStatus::CacheHit;
-        let mut revalidate = false;
-
-        // Determine the effective stale-while-revalidate duration from either:
-        // 1. The request's max-stale directive (client explicitly willing to accept stale data)
-        // 2. The cache provider's stale_while_revalidate_ttl configuration (server-side policy)
-        let stale_duration = match cache_control {
-            CacheControl::MaxStale(_, Some(duration)) => Some(duration),
-            CacheControl::MaxStale(_, None) => None, // max-stale without value means accept any staleness
-            _ => cache_provider.stale_while_revalidate_ttl(),
+        let Some(entry) = find_servable_entry(&cache_provider, cache_control, &raw_key).await?
+        else {
+            return Ok(CacheResponse::miss(raw_key, tracker));
         };
 
-        // Check if stale-while-revalidate is enabled (from request or cache provider config)
-        if let Some(stale_duration) = stale_duration {
-            let ttl = cache_provider.ttl();
-            let now = std::time::Instant::now();
-            let max_age = ttl + stale_duration;
+        // Extract plan from cache key if available to avoid re-parsing
+        let plan = match key {
+            CacheKey::LogicalPlan(p) => Some(*p),
+            _ => None,
+        };
+        let cache_status = entry.cache_status;
+        match Self::serve_entry(df, request_context, tracker, sql, plan, raw_key, entry).await {
+            Served::Hit(query_result) => Ok(CacheResponse::from(
+                CacheResult::Hit(query_result),
+                cache_status,
+            )
+            .with_raw_key(Some(raw_key))),
+            Served::Undecodable(tracker) => Ok(CacheResponse::miss(raw_key, tracker)),
+        }
+    }
 
-            // If beyond the stale-while-revalidate window, treat as cache miss
-            if cached_result.is_stale(max_age, now) {
-                tracing::debug!(
-                    "Cache entry is beyond stale-while-revalidate window (max_age: {:?}), treating as cache miss",
-                    max_age
-                );
-                return Ok(
-                    CacheResponse::from(CacheResult::MissOrSkipped, CacheStatus::CacheMiss)
-                        .with_query_tracker(tracker)
-                        .with_raw_key(Some(raw_key)),
-                );
+    /// Looks the query up in the results cache before anything is planned.
+    ///
+    /// Makes the one lookup the planned path would make for this request —
+    /// under its SQL text, its client-supplied key, or its plan, as its cache
+    /// key type selects — so that a hit is served without planning, cloning
+    /// session state, or crossing onto the query runtime. A plan-keyed lookup
+    /// is only made when the plan is already cached, since planning is the work
+    /// this exists to avoid.
+    ///
+    /// A key looked up here is not looked up again: a miss reports it, for
+    /// [`Self::get_plan_or_cached`] to skip.
+    pub(super) async fn probe_results_cache(&self, request_context: &RequestContext) -> CacheProbe {
+        let QueryMethod::Text {
+            sql,
+            parameters,
+            table_allowlist: None,
+            pre_parsed_plan,
+        } = &self.sql
+        else {
+            return CacheProbe::Skipped;
+        };
+        if self.results_cache_mode != ResultsCacheMode::Default {
+            return CacheProbe::Skipped;
+        }
+        let Some(cache_provider) = self.df.results_cache_provider() else {
+            return CacheProbe::Skipped;
+        };
+        let cache_control = request_context.cache_control();
+        let Some(cache_key_type) = cache_control.cache_key_type() else {
+            return CacheProbe::Skipped;
+        };
+        let cache_namespace = request_context.cache_namespace();
+        let (ns_tag, ns_id) = cache_namespace.hash_inputs();
+
+        let mut cached_plan = None;
+        let raw_key = match cache_key_type {
+            CacheKeyType::Raw => CacheKey::Query(sql.as_ref(), parameters.as_ref())
+                .as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id),
+            CacheKeyType::ClientSupplied => {
+                let Some(user_key) = request_context.scoped_client_supplied_cache_key() else {
+                    return CacheProbe::Skipped;
+                };
+                CacheKey::ClientSupplied(&user_key).as_raw_key_in_namespace(
+                    cache_provider.hasher(),
+                    ns_tag,
+                    ns_id,
+                )
             }
+            CacheKeyType::Default => {
+                // A pre-parsed plan already has its parameters bound.
+                let plan = if let Some(plan) = pre_parsed_plan {
+                    plan.as_ref()
+                } else {
+                    let Some(plan) =
+                        Self::cached_plan(&self.df, sql, parameters.as_ref(), (ns_tag, ns_id))
+                            .await
+                    else {
+                        return CacheProbe::Skipped;
+                    };
+                    cached_plan.insert(plan)
+                };
+                CacheKey::LogicalPlan(plan).as_raw_key_in_namespace(
+                    cache_provider.hasher(),
+                    ns_tag,
+                    ns_id,
+                )
+            }
+        };
 
-            // If stale (beyond TTL but within stale-while-revalidate window), trigger background revalidation
-            if cached_result.is_stale(ttl, now) {
-                tracing::debug!(
-                    "Cache entry is stale (beyond TTL), triggering background revalidation for stale-while-revalidate"
-                );
-                cache_status = CacheStatus::CacheStaleWhileRevalidate;
-                revalidate = true;
+        match find_servable_entry(&cache_provider, cache_control, &raw_key).await {
+            Ok(Some(entry)) => {
+                let revalidation_plan = match cache_key_type {
+                    CacheKeyType::Default if entry.revalidate => {
+                        cached_plan.or_else(|| pre_parsed_plan.as_deref().cloned())
+                    }
+                    _ => None,
+                };
+                CacheProbe::Hit(Box::new(ProbedHit {
+                    raw_key,
+                    entry,
+                    sql: Arc::clone(sql),
+                    revalidation_plan,
+                }))
+            }
+            Ok(None) => CacheProbe::Missed(raw_key),
+            // Left for the planned path, which reports it against the query.
+            Err(_) => CacheProbe::Skipped,
+        }
+    }
+
+    /// The plan the plans cache holds for `sql` in `namespace`, with
+    /// `parameters` bound into it: what [`Self::get_plan`] returns when it does
+    /// not have to plan. `None` when it would, or when binding fails.
+    async fn cached_plan(
+        df: &DataFusion,
+        sql: &str,
+        parameters: Option<&ParamValues>,
+        namespace: (u8, &[u8]),
+    ) -> Option<LogicalPlan> {
+        let plans_cache = df.plans_cache_provider()?;
+        let plan = plans_cache
+            .get_raw_key(&Self::cached_plan_key(df, sql, Some(namespace)).as_u64())
+            .await?;
+        match parameters {
+            Some(parameters) => plan.with_param_values(parameters.clone()).ok(),
+            None => Some(plan),
+        }
+    }
+
+    /// Serves a hit [`Self::probe_results_cache`] found.
+    ///
+    /// `None` when the entry cannot be decoded, with the query's tracker left in
+    /// place so it can still be planned, executed and tracked like a miss.
+    pub(super) async fn serve_probed_hit(
+        &mut self,
+        request_context: &Arc<RequestContext>,
+        hit: ProbedHit,
+    ) -> Option<QueryResult> {
+        let ProbedHit {
+            raw_key,
+            entry,
+            sql,
+            revalidation_plan,
+        } = hit;
+        match Self::serve_entry(
+            &self.df,
+            request_context,
+            self.tracker.take(),
+            &sql,
+            revalidation_plan.as_ref(),
+            raw_key,
+            entry,
+        )
+        .await
+        {
+            Served::Hit(query_result) => Some(query_result),
+            Served::Undecodable(tracker) => {
+                self.tracker = tracker;
+                None
             }
         }
+    }
 
-        // An accelerated refresh, or DML, landing after this entry read its
-        // tables leaves the entry resident but stale rather than evicting it
-        // whenever `stale_while_revalidate_ttl` is configured — see
-        // `QueryResultsCacheProvider::entry_validity`. Serving it here, and
-        // revalidating behind it, is what keeps a refresh from turning every
-        // dependent entry into a synchronous miss on the same tick.
-        if entry_validity == EntryValidity::StaleWhileRevalidate {
-            tracing::debug!(
-                "A table this cache entry read was refreshed, serving it stale and triggering background revalidation"
-            );
-            cache_status = CacheStatus::CacheStaleWhileRevalidate;
-            revalidate = true;
-        }
+    /// Streams `entry` to the request, starting the background revalidation it
+    /// was marked for.
+    async fn serve_entry(
+        df: &Arc<DataFusion>,
+        request_context: &Arc<RequestContext>,
+        tracker: Option<QueryTracker>,
+        sql: &str,
+        plan: Option<&LogicalPlan>,
+        raw_key: RawCacheKey,
+        entry: ServableEntry,
+    ) -> Served {
+        let ServableEntry {
+            cached_result,
+            entry_validity,
+            cache_status,
+            revalidate,
+        } = entry;
 
         if revalidate {
-            // Extract plan from cache key if available to avoid re-parsing
-            let plan = match key {
-                CacheKey::LogicalPlan(p) => Some(*p),
-                _ => None,
-            };
             Self::trigger_background_query_revalidation(
                 Arc::clone(df),
                 sql,
@@ -492,19 +781,11 @@ impl Query {
             );
         }
 
-        tracker = tracker.map(|t| {
-            t.datasets(cached_result.input_tables.arc())
-                .results_cache_hit(true)
-        });
-
         let records = match cached_result.records().await {
             Ok(records) => records,
             Err(e) => {
                 tracing::error!("Failed to decode cached query result: {e}");
-                return Ok(CacheResponse::from(
-                    CacheResult::MissOrSkipped,
-                    cache_status,
-                ));
+                return Served::Undecodable(tracker);
             }
         };
 
@@ -517,21 +798,23 @@ impl Query {
             cache::metrics::sql_results::INVALIDATION_STALE_HITS.add(1, &[]);
         }
 
-        let record_batch_stream = CachedStream::new(records, cached_result.schema.arc());
+        // The whole result is in memory, so the query is finished as it is served.
+        let schema = cached_result.schema.arc();
+        if let Some(tracker) = tracker {
+            finish_served_records(
+                request_context,
+                tracker
+                    .datasets(cached_result.input_tables.arc())
+                    .results_cache_hit(true),
+                Arc::clone(&schema),
+                &records,
+            );
+        }
 
-        Ok(CacheResponse::from(
-            CacheResult::Hit(QueryResult::new(
-                attach_query_tracker_to_stream(
-                    Span::current(),
-                    Arc::clone(request_context),
-                    tracker,
-                    Box::pin(record_batch_stream),
-                ),
-                cache_status,
-            )),
+        Served::Hit(QueryResult::new(
+            Box::pin(CachedStream::new(records, schema)),
             cache_status,
-        )
-        .with_raw_key(Some(raw_key)))
+        ))
     }
 
     pub(super) fn should_cache_results(
@@ -2697,5 +2980,148 @@ mod tests {
             .await;
 
         tracing::info!("Single-in-flight test completed successfully");
+    }
+
+    /// A hit on an entry held as batches is served where the request arrived: it
+    /// has nothing to plan or execute, so it must not wait on the query runtime.
+    /// Every worker of that runtime is held while the hit is requested, so a query
+    /// that still crossed onto it could not finish.
+    #[tokio::test]
+    async fn a_hit_is_served_without_the_query_runtime() {
+        use spicepod::component::caching::CacheKeyType as ConfiguredCacheKeyType;
+
+        for (configured, cache_control, client_key) in [
+            (
+                ConfiguredCacheKeyType::Plan,
+                CacheControl::Cache(CacheKeyType::Default),
+                None,
+            ),
+            (
+                ConfiguredCacheKeyType::Sql,
+                CacheControl::Cache(CacheKeyType::Raw),
+                None,
+            ),
+            (
+                ConfiguredCacheKeyType::Sql,
+                CacheControl::Cache(CacheKeyType::ClientSupplied),
+                Some("served-in-place".to_string()),
+            ),
+        ] {
+            let df = prepare_runtime(Some(SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                cache_key_type: configured,
+                ..Default::default()
+            }))
+            .await;
+            let query_runtime = runtime_async::ManagedTokioRuntime::try_new()
+                .expect("the query runtime should start");
+            let query_runtime_handle = query_runtime.handle().clone();
+            df.set_cpu_runtime(query_runtime);
+            let request_context = create_test_request_context(cache_control, client_key);
+
+            let first = Arc::clone(&request_context)
+                .scope(run_i64_query(&df, "SELECT 7", ResultsCacheMode::Default))
+                .await;
+            assert_eq!(
+                first,
+                (CacheStatus::CacheMiss, 7),
+                "{cache_control:?}: the first run executes on the query runtime and stores the result"
+            );
+
+            // Hold every worker of the query runtime until the hit has been served.
+            let workers = query_runtime_handle.metrics().num_workers();
+            let release = Arc::new(std::sync::Barrier::new(workers + 1));
+            let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            for _ in 0..workers {
+                let release = Arc::clone(&release);
+                let held = Arc::clone(&held);
+                query_runtime_handle.spawn(async move {
+                    held.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    release.wait();
+                });
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while held.load(std::sync::atomic::Ordering::SeqCst) < workers {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "only {} of {workers} query runtime workers were held",
+                    held.load(std::sync::atomic::Ordering::SeqCst)
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            let hit = tokio::time::timeout(
+                Duration::from_secs(10),
+                Arc::clone(&request_context).scope(run_i64_query(
+                    &df,
+                    "SELECT 7",
+                    ResultsCacheMode::Default,
+                )),
+            )
+            .await;
+            release.wait();
+
+            let Ok(hit) = hit else {
+                panic!("{cache_control:?}: a cache hit waited on the busy query runtime");
+            };
+            assert_eq!(
+                hit,
+                (CacheStatus::CacheHit, 7),
+                "{cache_control:?}: the second run is served from the cache"
+            );
+        }
+    }
+
+    /// A cached result served over HTTP is sent whole — one body of known length —
+    /// since all of it is in memory. The response is only built whole when the
+    /// stream around the cached batches reports its end as soon as they are read;
+    /// a wrapper that answers "not ready" there sends every hit chunked instead.
+    #[tokio::test]
+    async fn a_served_hit_is_sent_over_http_with_a_known_length() {
+        use http_body::Body as _;
+        use http_body_util::BodyExt;
+
+        let df = prepare_runtime(None).await;
+        register_id_table(&df, "served_over_http", &[1, 2, 3]);
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Default), None);
+        let respond = || {
+            Arc::clone(&request_context).scope(crate::http::v1::sql_to_http_response(
+                Arc::clone(&df),
+                Arc::from("SELECT id FROM served_over_http ORDER BY id"),
+                None,
+                crate::http::v1::ResponseMimeType::Json,
+                false,
+            ))
+        };
+        let cache_status = |response: &axum::response::Response| {
+            response
+                .headers()
+                .get("results-cache-status")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+
+        let miss = respond().await;
+        assert_eq!(cache_status(&miss).as_deref(), Some("MISS"));
+        miss.into_body()
+            .collect()
+            .await
+            .expect("the miss to be read in full, which stores it");
+
+        let hit = respond().await;
+        assert_eq!(cache_status(&hit).as_deref(), Some("HIT"));
+        assert_eq!(
+            hit.body().size_hint().exact(),
+            Some(28),
+            "a cache hit held in memory must be sent whole, with its length known"
+        );
+        let body = hit
+            .into_body()
+            .collect()
+            .await
+            .expect("the hit to be read in full")
+            .to_bytes();
+        assert_eq!(body.as_ref(), br#"[{"id":1},{"id":2},{"id":3}]"#);
     }
 }

@@ -33,6 +33,9 @@ pub(crate) struct QueryTracker {
     /// Metrics are recorded either way; when `false` the tracker skips only the
     /// work that table consumes: the events and the captured-output preview.
     pub(crate) task_history_enabled: bool,
+    /// Whether this query's output preview is recorded anywhere. When it is not, the
+    /// tracker does not build one.
+    pub(crate) captured_output_enabled: bool,
     pub(crate) schema: Option<SchemaRef>,
     pub(crate) query_duration_secs: Option<f32>,
     pub(crate) query_execution_duration_secs: Option<f32>,
@@ -62,7 +65,20 @@ impl QueryTracker {
         self.finish(request_context, "");
     }
 
-    pub fn finish(mut self, request_context: &RequestContext, captured_output: &str) {
+    pub fn finish(self, request_context: &RequestContext, captured_output: &str) {
+        let dimensions = request_context.to_dimensions();
+        self.finish_with_dimensions(request_context, captured_output, dimensions);
+    }
+
+    /// [`Self::finish`] for a caller that has already built this query's
+    /// [`RequestContext::to_dimensions`], which then end its labels instead of being
+    /// built a second time.
+    pub(crate) fn finish_with_dimensions(
+        mut self,
+        request_context: &RequestContext,
+        captured_output: &str,
+        dimensions: Vec<KeyValue>,
+    ) {
         let query_duration = self.query_duration_timer.elapsed();
         let query_execution_duration = self.query_execution_duration_timer.elapsed();
 
@@ -99,21 +115,19 @@ impl QueryTracker {
         dataset_names.sort();
         let datasets_label = dataset_names.join(",");
 
-        let mut labels = vec![
-            KeyValue::new("tags", tags.join(",")),
-            KeyValue::new("datasets", datasets_label.clone()),
-        ];
-
-        labels.extend(request_context.to_dimensions());
+        // Room for `err_code`, which a failure adds below.
+        let mut labels = Vec::with_capacity(dimensions.len() + 3);
+        labels.push(KeyValue::new("tags", tags.join(",")));
+        labels.push(KeyValue::new("datasets", datasets_label.clone()));
+        labels.extend(dimensions);
 
         // Record the execution count here (rather than at query submission) so it
         // shares the same `datasets`/`tags` dimensions as the duration metrics
         // below. `finish` is the single terminal step for every tracked query
         // (normal completion, cache hit, and error paths all route through it),
         // so this counts each execution exactly once.
-        runtime_metrics::telemetry::track_query_count(&labels);
-        runtime_metrics::telemetry::track_query_duration(query_duration, &labels);
-        runtime_metrics::telemetry::track_query_execution_duration(
+        runtime_metrics::telemetry::track_query_finished(
+            query_duration,
             query_execution_duration,
             &labels,
         );
@@ -264,6 +278,7 @@ mod tests {
         let request_context = RequestContextBuilder::new(Protocol::Internal).build();
         let tracker = QueryTracker {
             task_history_enabled: false,
+            captured_output_enabled: false,
             schema: None,
             query_duration_secs: None,
             query_execution_duration_secs: None,

@@ -382,6 +382,10 @@ impl RuntimeBuilder {
         let dataset_parallelism = spicepod_rt.dataset_load_parallelism;
 
         let task_history = spicepod_rt.task_history.enabled;
+        let task_history_captured_output = task_history_records_output_preview(
+            &spicepod_rt.task_history,
+            spicepod_rt.tracing.as_ref(),
+        );
 
         let runtime_ready_state = spicepod_rt.ready_state;
 
@@ -756,6 +760,7 @@ impl RuntimeBuilder {
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
+        .with_task_history_captured_output(task_history_captured_output)
         .with_caching(caching)
         .with_metrics(metrics)
         .with_resource_monitor(resource_monitor.clone())
@@ -2037,9 +2042,65 @@ fn parse_cayenne_optimizer_rules(
     }
 }
 
+/// Whether a query's output preview reaches anything that records it: the
+/// `captured_output` column of `runtime.task_history`, or a Zipkin export of the task
+/// spans, which carries the preview whatever `captured_output` says.
+///
+/// A `captured_output` the runtime cannot read counts as recorded, so a misconfigured
+/// value costs a preview rather than losing one.
+fn task_history_records_output_preview(
+    task_history: &spicepod::component::runtime::TaskHistory,
+    tracing: Option<&spicepod::component::runtime::TracingConfig>,
+) -> bool {
+    !matches!(
+        task_history.get_captured_output(),
+        Ok(spicepod::component::runtime::TaskHistoryCapturedOutput::None)
+    ) || tracing.is_some_and(|tracing| tracing.zipkin_enabled)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// A query's output preview is built only when something records it.
+    #[test]
+    fn a_query_output_preview_is_built_only_when_it_is_recorded() {
+        use spicepod::component::runtime::{TaskHistory, TracingConfig};
+
+        let captured = |captured_output: &str| TaskHistory {
+            captured_output: captured_output.into(),
+            ..TaskHistory::default()
+        };
+        let zipkin = TracingConfig {
+            zipkin_enabled: true,
+            zipkin_endpoint: Some("http://localhost:9411/api/v2/spans".to_string()),
+        };
+        let no_zipkin = TracingConfig {
+            zipkin_enabled: false,
+            zipkin_endpoint: None,
+        };
+
+        assert!(
+            !task_history_records_output_preview(&TaskHistory::default(), None),
+            "the default `captured_output: none` records no preview"
+        );
+        assert!(!task_history_records_output_preview(
+            &captured("none"),
+            Some(&no_zipkin)
+        ));
+        assert!(task_history_records_output_preview(
+            &captured("truncated"),
+            None
+        ));
+        assert!(
+            task_history_records_output_preview(&captured("none"), Some(&zipkin)),
+            "a Zipkin export carries the preview whatever `captured_output` says"
+        );
+        assert!(
+            task_history_records_output_preview(&captured("everything"), None),
+            "a value the runtime cannot read keeps the preview"
+        );
+    }
 
     #[cfg(not(windows))]
     fn dataset_with_cayenne(

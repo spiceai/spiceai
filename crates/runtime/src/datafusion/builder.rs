@@ -343,6 +343,7 @@ pub struct DataFusionBuilder {
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     query_admission_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
+    task_history_captured_output: bool,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
     cluster_config: Option<Arc<ResolvedClusterConfig>>,
@@ -433,6 +434,7 @@ impl DataFusionBuilder {
             accelerated_refresh_semaphore: None,
             query_admission_semaphore: None,
             task_history_enabled: true,
+            task_history_captured_output: true,
             caching: None,
             spill_compression: None,
             cluster_config: None,
@@ -459,6 +461,14 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_task_history(mut self, task_history: bool) -> Self {
         self.task_history_enabled = task_history;
+        self
+    }
+
+    /// Whether a query's output preview is recorded anywhere; see
+    /// `DataFusion::task_history_captured_output`.
+    #[must_use]
+    pub fn with_task_history_captured_output(mut self, captured_output: bool) -> Self {
+        self.task_history_captured_output = captured_output;
         self
     }
 
@@ -1303,6 +1313,7 @@ impl DataFusionBuilder {
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             query_admission_semaphore: self.query_admission_semaphore,
             task_history_enabled: self.task_history_enabled,
+            task_history_captured_output: self.task_history_captured_output,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
             refresh_runtime: OnceLock::new(),
