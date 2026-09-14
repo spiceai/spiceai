@@ -503,11 +503,14 @@ pub(crate) fn view_definition_closure(
         &mut definition,
         &view_definition_identity(sql, columns, params),
     );
-    for (dependency_name, dependency_sql) in closure {
+    for (dependency_name, dependency_identity) in closure {
         definition.push_str("\n-- depends on ");
         push_len_prefixed(&mut definition, &dependency_name);
         definition.push('\n');
-        push_len_prefixed(&mut definition, dependency_sql.trim());
+        // Already a `view_definition_identity` / `dataset_definition_identity`.
+        // Trimming it would collapse a last field that differs only by
+        // equal-length trailing whitespace (quoted YAML can preserve space vs tab).
+        push_len_prefixed(&mut definition, &dependency_identity);
     }
     definition
 }
@@ -1498,6 +1501,33 @@ mod tests {
                 definition_fingerprint(&with_space),
                 definition_fingerprint(&with_tab),
                 "a trailing space vs tab in a quoted parameter must not share a fingerprint"
+            );
+        }
+
+        #[test]
+        fn closure_fingerprint_follows_dependency_param_trailing_whitespace() {
+            // The nested identity is already canonical. Re-trimming it when
+            // folding into the outer closure collapses a dependency param that
+            // differs only by a trailing space vs tab.
+            let outer = TableReference::bare("outer");
+            let closure_for = |selector: &str| {
+                let mut inner = spicepod::component::view::View::new("inner".to_string());
+                inner.sql = Some("SELECT body FROM docs".to_string());
+                inner.params = Some(spicepod::param::Params::from_string_map(HashMap::from([(
+                    "selector".to_string(),
+                    selector.to_string(),
+                )])));
+                let app = app::AppBuilder::new("closure_test")
+                    .with_view(inner)
+                    .build();
+                view_definition_closure(&outer, "SELECT * FROM inner", &[], &HashMap::new(), &app)
+            };
+            let with_space = closure_for("x ");
+            let with_tab = closure_for("x\t");
+            assert_ne!(
+                definition_fingerprint(&with_space),
+                definition_fingerprint(&with_tab),
+                "a dependency view param that differs only by trailing space vs tab must change the outer fingerprint"
             );
         }
 
