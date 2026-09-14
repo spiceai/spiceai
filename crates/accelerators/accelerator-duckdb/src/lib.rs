@@ -818,6 +818,13 @@ impl DataAccelerator for DuckDBAccelerator {
                     )
                     .await;
 
+                    // Pre-recreation reads the local checkpoint through the shared
+                    // pool. Evict it before deleting the file, or the next open of
+                    // this path reuses connections bound to the removed inode.
+                    self.duckdb_factory
+                        .invalidate_file_instance(path.clone())
+                        .await;
+
                     tracing::warn!(
                         "DuckDB acceleration mode is 'file_create', removing existing file: {}",
                         path

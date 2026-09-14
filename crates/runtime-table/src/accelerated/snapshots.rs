@@ -508,6 +508,17 @@ pub async fn create_checkpoint_and_snapshot(
         // whose rows are never produced by a request-scoped refresh).
         None => true,
     };
+    // Asked under the same write mutex as the rows: the stamp written into the
+    // local checkpoint is the identity of *these* rows. A withheld override
+    // retracts the previous stamp (`None`) so a later pre-recreation cannot
+    // publish override-B rows under remote snapshot A's fingerprint.
+    let configured_fingerprint = snapshot_manager.and_then(|manager| {
+        manager
+            .source_definition_fingerprint()
+            .map(ToString::to_string)
+    });
+    let persist_fingerprint =
+        checkpoint_source_fingerprint_to_persist(publishable, configured_fingerprint.as_deref());
     let snapshot_manager = if publishable {
         snapshot_manager
     } else {
@@ -532,7 +543,7 @@ pub async fn create_checkpoint_and_snapshot(
         checkpoint_schema
     };
     if let Err(e) = checkpointer
-        .checkpoint(checkpoint_schema, refresh_sql)
+        .checkpoint(checkpoint_schema, refresh_sql, persist_fingerprint)
         .await
     {
         if is_shutdown_cancellation(e.as_ref()) {
@@ -588,6 +599,23 @@ pub async fn create_checkpoint_and_snapshot(
                 tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create snapshot");
             }
         }
+    }
+}
+
+/// The identity written with a local checkpoint.
+///
+/// When the rows are not known to be the configured definition (`publishable`
+/// is false — a request-scoped override), the previous stamp is retracted so
+/// a later pre-recreation cannot publish those rows as the configured
+/// definition. When they are, the configured fingerprint travels with the rows.
+fn checkpoint_source_fingerprint_to_persist(
+    publishable: bool,
+    configured_fingerprint: Option<&str>,
+) -> Option<&str> {
+    if publishable {
+        configured_fingerprint
+    } else {
+        None
     }
 }
 
@@ -692,6 +720,29 @@ mod tests {
         assert!(
             message.contains("this dataset's configured definition"),
             "the skip reason must use the same component label, got {message}"
+        );
+    }
+
+    #[test]
+    /// After snapshot A is published, a request-scoped override can replace the
+    /// local rows with B while publication is withheld. The next checkpoint must
+    /// retract A's stamp; keeping it would let pre-recreation publish B as A.
+    #[test]
+    fn override_retracts_the_local_checkpoint_fingerprint() {
+        assert_eq!(
+            checkpoint_source_fingerprint_to_persist(false, Some("sha256:A")),
+            None,
+            "override-B rows must not keep remote/configured stamp A"
+        );
+        assert_eq!(
+            checkpoint_source_fingerprint_to_persist(true, Some("sha256:A")),
+            Some("sha256:A"),
+            "configured rows persist the identity that produced them"
+        );
+        assert_eq!(
+            checkpoint_source_fingerprint_to_persist(true, None),
+            None,
+            "a source with no definition has no stamp to persist"
         );
     }
 

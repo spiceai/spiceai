@@ -163,11 +163,48 @@ fn accelerated_view_with(
 
 const MULTI_READ_SQL: &str = "SELECT a.id FROM orders a JOIN orders b ON a.id = b.id";
 
+async fn wait_until_view_status_error(
+    rt: &Runtime,
+    view_name: &str,
+) -> anyhow::Result<ComponentStatus> {
+    let view_ref = TableReference::bare(view_name);
+    let timeout = Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last = ComponentStatus::NotLoaded;
+    while std::time::Instant::now() < deadline {
+        last = rt
+            .status()
+            .get_view_statuses()
+            .get(&view_ref)
+            .cloned()
+            .unwrap_or(ComponentStatus::NotLoaded);
+        if last.is_error() {
+            return Ok(last);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(anyhow::anyhow!(
+        "timed out after {timeout:?} waiting for view '{view_name}' to reach ComponentStatus::Error; last observed {last:?}"
+    ))
+}
+
 async fn assert_multi_read_view_is_refused(
     rt: &Runtime,
     snapshot_dir: &std::path::Path,
     view_name: &str,
 ) -> anyhow::Result<()> {
+    // `load_view` spawns registration and returns; an immediate query can fail
+    // while the view is still `NotLoaded` / `Initializing`. Wait until this
+    // view is actually refused before checking the message or the store.
+    let status = wait_until_view_status_error(rt, view_name).await?;
+    let message = status.error_message().ok_or_else(|| {
+        anyhow::anyhow!("a refused multi-read view must report why it failed, got {status:?}")
+    })?;
+    assert!(
+        message.contains("reads its sources") || message.contains("snapshots_consistency"),
+        "the refusal must name the multi-read cause or the consistency opt-out, got {message:?}"
+    );
+
     let registered = rt
         .datafusion()
         .query_builder(&format!("SELECT id FROM {view_name}"))
@@ -182,25 +219,6 @@ async fn assert_multi_read_view_is_refused(
         published_snapshots(snapshot_dir).is_empty(),
         "a refused view must publish nothing"
     );
-
-    let view_ref = TableReference::bare(view_name);
-    let status = rt
-        .status()
-        .get_view_statuses()
-        .get(&view_ref)
-        .cloned()
-        .unwrap_or(ComponentStatus::NotLoaded);
-    assert_ne!(
-        status,
-        ComponentStatus::Ready,
-        "a refused multi-read view must not report ready, got {status:?}"
-    );
-    if let Some(message) = status.error_message() {
-        assert!(
-            message.contains("reads its sources") || message.contains("snapshots_consistency"),
-            "the refusal must name the multi-read cause or the consistency opt-out, got {message:?}"
-        );
-    }
 
     Ok(())
 }

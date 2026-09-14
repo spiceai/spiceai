@@ -111,6 +111,15 @@ impl TursoDatasetCheckpointer {
             .map_err(store_error)?;
         }
 
+        if !columns.contains(&"source_fingerprint".to_string()) {
+            conn.execute(
+                &format!("ALTER TABLE {CHECKPOINT_TABLE_NAME} ADD COLUMN source_fingerprint TEXT"),
+                (),
+            )
+            .await
+            .map_err(store_error)?;
+        }
+
         Ok(())
     }
 
@@ -163,22 +172,29 @@ impl TursoDatasetCheckpointer {
         &self,
         schema: &SchemaRef,
         refresh_sql: Option<&str>,
+        source_fingerprint: Option<&str>,
     ) -> Result<(), CheckpointError> {
         let pool = &self.pool;
         let _schema_guard = pool.acquire_schema_read_lock().await;
         let conn = pool.connect().await.map_err(store_error)?;
         let schema_json = serialize_schema(schema).map_err(store_error)?;
         let refresh_sql_owned = refresh_sql.map(ToString::to_string);
+        let source_fingerprint_owned = source_fingerprint.map(ToString::to_string);
 
         let upsert = format!(
-            "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, schema_json, refresh_sql, updated_at)
-             VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
+            "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, schema_json, refresh_sql, source_fingerprint, updated_at)
+             VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
              ON CONFLICT (dataset_name) DO UPDATE
-             SET schema_json = ?2, refresh_sql = ?3, updated_at = CURRENT_TIMESTAMP"
+             SET schema_json = ?2, refresh_sql = ?3, source_fingerprint = ?4, updated_at = CURRENT_TIMESTAMP"
         );
         conn.execute(
             &upsert,
-            turso::params![self.dataset_name.clone(), schema_json, refresh_sql_owned],
+            turso::params![
+                self.dataset_name.clone(),
+                schema_json,
+                refresh_sql_owned,
+                source_fingerprint_owned
+            ],
         )
         .await
         .map_err(store_error)?;
@@ -244,6 +260,26 @@ impl TursoDatasetCheckpointer {
         }
     }
 
+    async fn get_source_fingerprint_inner(&self) -> Result<Option<String>, CheckpointError> {
+        let pool = &self.pool;
+        let conn = pool.connect().await.map_err(store_error)?;
+
+        let query = format!(
+            "SELECT source_fingerprint FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?"
+        );
+        let mut rows = conn
+            .query(&query, turso::params![self.dataset_name.clone()])
+            .await
+            .map_err(store_error)?;
+
+        if let Some(row) = rows.next().await.map_err(store_error)? {
+            let source_fingerprint: Option<String> = row.get(0).map_err(store_error)?;
+            Ok(source_fingerprint)
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn delete_inner(&self) -> Result<(), CheckpointError> {
         let pool = &self.pool;
         let _schema_guard = pool.acquire_schema_read_lock().await;
@@ -268,8 +304,9 @@ impl DatasetCheckpointer for TursoDatasetCheckpointer {
         &self,
         schema: &SchemaRef,
         refresh_sql: Option<&str>,
+        source_fingerprint: Option<&str>,
     ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
-        self.checkpoint_inner(schema, refresh_sql)
+        self.checkpoint_inner(schema, refresh_sql, source_fingerprint)
             .await
             .map_err(Into::into)
     }
@@ -297,6 +334,14 @@ impl DatasetCheckpointer for TursoDatasetCheckpointer {
         &self,
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
         self.get_refresh_sql_inner().await.map_err(Into::into)
+    }
+
+    async fn get_source_fingerprint(
+        &self,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
+        self.get_source_fingerprint_inner()
+            .await
+            .map_err(Into::into)
     }
 
     async fn delete(&self) -> runtime_acceleration::dataset_checkpoint::Result<()> {
@@ -340,7 +385,7 @@ mod tests {
         ]));
 
         checkpoint
-            .checkpoint(&original, Some("SELECT 1"))
+            .checkpoint(&original, Some("SELECT 1"), Some("sha256:A"))
             .await
             .expect("seed checkpoint");
 
@@ -385,6 +430,16 @@ mod tests {
             reader.get_refresh_sql().await.expect("read refresh sql"),
             Some("SELECT 1".to_string()),
             "a schema-only write must preserve the stored refresh SQL"
+        );
+
+        assert_eq!(
+            reader
+                .get_source_fingerprint()
+                .await
+                .expect("read source fingerprint")
+                .as_deref(),
+            Some("sha256:A"),
+            "a schema-only write must preserve the persisted producing identity"
         );
     }
 

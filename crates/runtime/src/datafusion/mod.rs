@@ -4133,10 +4133,16 @@ impl DataFusion {
             .await?;
 
         // Engine DDL committed; persist the canonical schema (preserving the stored
-        // refresh_sql) so restarts classify against the evolved schema.
+        // refresh_sql and source fingerprint) so restarts classify against the
+        // evolved schema without retracting the producing identity.
         let refresh_sql = checkpoint.get_refresh_sql().await.ok().flatten();
+        let source_fingerprint = checkpoint.get_source_fingerprint().await.ok().flatten();
         checkpoint
-            .checkpoint(&plan.evolved_schema, refresh_sql.as_deref())
+            .checkpoint(
+                &plan.evolved_schema,
+                refresh_sql.as_deref(),
+                source_fingerprint.as_deref(),
+            )
             .await?;
         Ok(())
     }

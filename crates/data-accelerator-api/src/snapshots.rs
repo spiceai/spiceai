@@ -254,11 +254,18 @@ pub async fn snapshot_before_recreate(
     // produced under the outgoing one. Stamping the incoming fingerprint would
     // make a later cold start accept those old rows as current after a
     // same-schema `from:` / params change. Publish only when the outgoing
-    // fingerprint was persisted with the materialization and can be recovered
-    // from snapshot metadata; otherwise skip so the previous series stays current.
-    let Some(definition) =
-        outgoing_definition_for_pre_recreation(manager.current_stored_source_fingerprint().await)
-    else {
+    // fingerprint was persisted with the *local* checkpoint — the remote
+    // snapshot stamp is the last published identity, which after a withheld
+    // override is not what these rows are.
+    let local_fingerprint = local_materialization_fingerprint(
+        source,
+        acceleration.snapshot_behavior.clone(),
+        &dataset_name,
+    )
+    .await;
+    let Some(definition) = outgoing_definition_for_pre_recreation(
+        pre_recreation_stamp_fingerprint(local_fingerprint.as_deref(), None),
+    ) else {
         tracing::warn!(
             "Skipped snapshotting the outgoing acceleration of '{dataset_name}' before recreating it, so the snapshot series keeps its previously published contents: the outgoing definition was not persisted with this materialization, and stamping the newly loaded definition would label those rows as current"
         );
@@ -356,12 +363,61 @@ pub async fn validate_snapshot_paths(
     Ok(())
 }
 
+/// The identity persisted with the local acceleration, if any.
+///
+/// Opens the local checkpoint rather than reading remote snapshot metadata:
+/// after snapshot A is published and a request-scoped override replaces the
+/// local rows with B (publication withheld), the remote store still holds A.
+async fn local_materialization_fingerprint(
+    source: &dyn AccelerationSource,
+    snapshot_behavior: SnapshotBehavior,
+    dataset_name: &str,
+) -> Option<String> {
+    let factory = source.checkpointer_factory(snapshot_behavior);
+    match factory().await {
+        Ok(checkpointer) => match checkpointer.get_source_fingerprint().await {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                tracing::debug!(
+                    dataset = %dataset_name,
+                    error = %error,
+                    "Could not read the local acceleration's persisted definition, so the pre-recreation snapshot will be skipped"
+                );
+                None
+            }
+        },
+        Err(error) => {
+            tracing::debug!(
+                dataset = %dataset_name,
+                error = %error,
+                "Could not open the local acceleration checkpoint, so the pre-recreation snapshot will be skipped"
+            );
+            None
+        }
+    }
+}
+
+/// The fingerprint a pre-recreation archive may carry.
+///
+/// Only the identity persisted with the local checkpoint is used.
+/// `remote_snapshot_fingerprint` is accepted so the override-B / stamp-A
+/// failure mode is testable: after A is published and a request-scoped
+/// override replaces the local rows with B, the remote store still holds A.
+/// Consulting that remote value would publish B stamped as A.
+fn pre_recreation_stamp_fingerprint(
+    local_checkpoint_fingerprint: Option<&str>,
+    _remote_snapshot_fingerprint: Option<&str>,
+) -> Option<String> {
+    local_checkpoint_fingerprint.map(ToString::to_string)
+}
+
 /// The definition stamp a pre-recreation archive may carry.
 ///
 /// Those rows were produced under the previously persisted fingerprint, not the
 /// newly loaded Spicepod. If that outgoing fingerprint was not persisted with
-/// the materialization, the archive must not be published: stamping the incoming
-/// definition would make a later cold start accept the old rows as current.
+/// the local materialization, the archive must not be published: stamping the
+/// incoming definition would make a later cold start accept the old rows as
+/// current.
 fn outgoing_definition_for_pre_recreation(
     persisted_outgoing_fingerprint: Option<String>,
 ) -> Option<SourceDefinition> {
@@ -436,6 +492,39 @@ mod tests {
         assert!(
             message.contains("/data/accel.db") && message.contains("duckdb_file"),
             "the message must name the shared file and the parameter that separates them: {message}"
+        );
+    }
+
+    /// After snapshot A is published, a request-scoped override can replace the
+    /// local acceleration with rows B while publication is withheld. The remote
+    /// store still holds A's fingerprint; the local checkpoint does not. The
+    /// stamp must come from local provenance only — using remote A would
+    /// publish B as A.
+    #[test]
+    fn pre_recreation_does_not_stamp_override_rows_with_the_remote_snapshot() {
+        assert!(
+            pre_recreation_stamp_fingerprint(None, Some("sha256:A")).is_none(),
+            "pre_recreate_uses_remote_fingerprint=false local_materialization_provenance_is_consulted=true: override-B rows must not inherit remote snapshot A's stamp"
+        );
+        assert!(
+            outgoing_definition_for_pre_recreation(pre_recreation_stamp_fingerprint(
+                None,
+                Some("sha256:A")
+            ))
+            .is_none(),
+            "a pre-recreation archive of override-B rows must be skipped, not stamped as A"
+        );
+
+        assert_eq!(
+            pre_recreation_stamp_fingerprint(Some("sha256:A"), Some("sha256:A")).as_deref(),
+            Some("sha256:A"),
+            "configured local rows may be stamped with the identity persisted beside them"
+        );
+
+        assert_eq!(
+            pre_recreation_stamp_fingerprint(Some("sha256:B"), Some("sha256:A")).as_deref(),
+            Some("sha256:B"),
+            "when local provenance exists it is used even if the remote snapshot disagrees"
         );
     }
 

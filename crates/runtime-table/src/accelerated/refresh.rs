@@ -1648,6 +1648,7 @@ mod tests {
             &self,
             _schema: &SchemaRef,
             _refresh_sql: Option<&str>,
+            _source_fingerprint: Option<&str>,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // Not needed for this test
             Ok(())
@@ -1678,6 +1679,12 @@ mod tests {
             &self,
         ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(self.stored_refresh_sql.clone())
+        }
+
+        async fn get_source_fingerprint(
+            &self,
+        ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
         }
 
         async fn delete(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

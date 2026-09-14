@@ -1090,6 +1090,14 @@ impl SnapshotManager {
         self
     }
 
+    /// The configured definition identity this manager stamps on a publish, if any.
+    #[must_use]
+    pub fn source_definition_fingerprint(&self) -> Option<&str> {
+        self.source_definition
+            .as_ref()
+            .map(|definition| definition.fingerprint.as_str())
+    }
+
     /// Whether one snapshot entry was materialized from the definition now in force.
     ///
     /// A manager with no fingerprint accepts anything. One that has a fingerprint
@@ -1152,12 +1160,12 @@ impl SnapshotManager {
         schema_meta.to_schema_ref().ok()
     }
 
-    /// The source-definition stamp recorded on the current snapshot, if any.
+    /// The source-definition stamp recorded on the current *remote* snapshot, if any.
     ///
-    /// Used by pre-recreation publish: the outgoing rows were produced under
-    /// this identity, not the newly loaded Spicepod. Absence means the
-    /// outgoing fingerprint cannot be recovered and that archive must not be
-    /// published.
+    /// This is the series pointer, not the identity of the local acceleration.
+    /// Pre-recreation must not use it: after a withheld override the remote
+    /// stamp still names the last published identity, which is not what the
+    /// local rows are.
     pub async fn current_stored_source_fingerprint(&self) -> Option<String> {
         let handle = self.load_metadata().await.ok()??;
         let dataset_entry = handle.metadata.datasets.get(&self.dataset_name)?;
@@ -2208,7 +2216,11 @@ impl SnapshotManager {
                 "Bootstrapping dataset checkpoint from snapshot metadata"
             );
             checkpointer
-                .checkpoint(&metadata_schema, None)
+                .checkpoint(
+                    &metadata_schema,
+                    None,
+                    entry.snapshot_source_fingerprint.as_deref(),
+                )
                 .await
                 .map_err(|source| SnapshotDownloadError::CheckpointerBootstrap { source })?;
             metadata_schema
@@ -3432,6 +3444,7 @@ mod tests {
             &self,
             _schema: &SchemaRef,
             _refresh_sql: Option<&str>,
+            _source_fingerprint: Option<&str>,
         ) -> DatasetCheckpointResult<()> {
             Ok(())
         }
@@ -3449,6 +3462,10 @@ mod tests {
         }
 
         async fn get_refresh_sql(&self) -> DatasetCheckpointResult<Option<String>> {
+            Ok(None)
+        }
+
+        async fn get_source_fingerprint(&self) -> DatasetCheckpointResult<Option<String>> {
             Ok(None)
         }
 
@@ -4238,10 +4255,11 @@ mod tests {
         );
     }
 
-    /// Same-schema `from:` / params change + cold start: recover the outgoing
-    /// stamp from persisted metadata, never the newly loaded Spicepod. If the
-    /// pre-recreation path stamped `sha256:new-from` onto old rows, bootstrap
-    /// would accept them as current.
+    /// Same-schema `from:` / params change + cold start: the remote series
+    /// stamp is the last published identity. Bootstrap must refuse those
+    /// rows under a newly loaded Spicepod, which is what
+    /// `source_fingerprint_matches` establishes. Pre-recreation itself now
+    /// reads the local checkpoint, not this remote stamp.
     #[tokio::test]
     async fn same_schema_recreate_recovers_outgoing_fingerprint_so_cold_start_refuses_old_rows() {
         let store = Arc::new(InMemory::new());
@@ -7435,6 +7453,7 @@ mod tests {
             &self,
             schema: &SchemaRef,
             _refresh_sql: Option<&str>,
+            _source_fingerprint: Option<&str>,
         ) -> DatasetCheckpointResult<()> {
             *self.checkpointed.lock().await = Some(Arc::clone(schema));
             Ok(())
@@ -7457,6 +7476,10 @@ mod tests {
         }
 
         async fn get_refresh_sql(&self) -> DatasetCheckpointResult<Option<String>> {
+            Ok(None)
+        }
+
+        async fn get_source_fingerprint(&self) -> DatasetCheckpointResult<Option<String>> {
             Ok(None)
         }
 
