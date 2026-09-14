@@ -1461,32 +1461,6 @@ impl RefreshTask {
             ));
         }
 
-        if let Err(error) = state
-            .manager
-            .restore_indexes_from_snapshot(&info.index_snapshots)
-            .await
-        {
-            tracing::error!(
-                dataset = %self.dataset_name,
-                snapshot_id = info.snapshot_id,
-                error = %error,
-                "refresh_mode: snapshot - failed to restore index artifacts; refusing to publish the database snapshot"
-            );
-            self.set_refresh_status(
-                None,
-                status::ComponentStatus::error_with_message(format!(
-                    "snapshot index restore failure for snapshot {}: {}",
-                    info.snapshot_id, error
-                )),
-            )
-            .await;
-            return Err(RetryError::transient(
-                super::Error::FailedToRefreshDataset {
-                    source: datafusion::error::DataFusionError::External(Box::new(error)),
-                },
-            ));
-        }
-
         // The accelerator write mutex was taken above, before the download,
         // so the entire reload + swap remains serialized with concurrent
         // accelerator writes.
@@ -1557,12 +1531,52 @@ impl RefreshTask {
             ));
         }
 
+        // Restore any full-text/vector index artifacts only now, immediately before the
+        // provider swap that publishes them. `new_provider` has already passed every fallible
+        // check (download, checksum, schema compatibility on both the metadata-recorded and the
+        // actually-embedded schema), so the only step left between mutating the live index and
+        // making the new database generation visible is `swap` itself — and `swap` can only fail
+        // on a schema mismatch already ruled out above. This ordering closes the window where a
+        // later failure (accelerator reload, schema check) would leave the live index pointing at
+        // a newer generation than the still-live (old) database, which could return rows that
+        // don't correspond to the visible data.
+        if let Err(error) = state
+            .manager
+            .restore_indexes_from_snapshot(&info.index_snapshots)
+            .await
+        {
+            tracing::error!(
+                dataset = %self.dataset_name,
+                snapshot_id = info.snapshot_id,
+                error = %error,
+                "refresh_mode: snapshot - failed to restore index artifacts; refusing to publish the database snapshot"
+            );
+            self.set_refresh_status(
+                None,
+                status::ComponentStatus::error_with_message(format!(
+                    "snapshot index restore failure for snapshot {}: {}",
+                    info.snapshot_id, error
+                )),
+            )
+            .await;
+            return Err(RetryError::transient(
+                super::Error::FailedToRefreshDataset {
+                    source: datafusion::error::DataFusionError::External(Box::new(error)),
+                },
+            ));
+        }
+
         if let Err(swap_err) = state.swappable_provider.swap(new_provider) {
+            // Any index artifacts were already restored above, so a swap failure here leaves
+            // the live index at the new snapshot generation while queries keep serving the old
+            // database generation. `swap` only rejects on a schema mismatch already ruled out
+            // by the checks above, so this should be unreachable in practice; it is treated as
+            // permanent because retrying cannot repair the mismatch on its own.
             tracing::error!(
                 dataset = %self.dataset_name,
                 snapshot_id = info.snapshot_id,
                 error = %swap_err,
-                "refresh_mode: snapshot - swap rejected by SwappableTableProvider"
+                "refresh_mode: snapshot - swap rejected by SwappableTableProvider after index artifacts were already restored; the live index and database generations may now be mismatched"
             );
             self.set_refresh_status(
                 None,
