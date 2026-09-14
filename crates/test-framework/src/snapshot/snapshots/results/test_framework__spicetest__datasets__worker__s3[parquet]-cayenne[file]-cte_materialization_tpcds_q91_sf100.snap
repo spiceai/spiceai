@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q91"
+---
++------------------+------------------+-----------------+--------------+
+| Call_Center      | Call_Center_Name | Manager         | Returns_Loss |
++------------------+------------------+-----------------+--------------+
+| AAAAAAAAMBAAAAAA | North Midwest_2  | Andrew West     | 41960.27     |
+| AAAAAAAANAAAAAAA | NY Metro_1       | Jack Little     | 30719.19     |
+| AAAAAAAAGBAAAAAA | Hawaii/Alaska_1  | Travis Wilson   | 29229.58     |
+| AAAAAAAAKAAAAAAA | Hawaii/Alaska    | Ronnie Trinidad | 25942.06     |
+| AAAAAAAAIAAAAAAA | California       | Wayne Ray       | 25638.84     |
+| AAAAAAAAEAAAAAAA | North Midwest    | Larry Mccray    | 23947.03     |
+| AAAAAAAAMBAAAAAA | North Midwest_2  | Andrew West     | 23857.25     |
+| AAAAAAAAEBAAAAAA | California_1     | Jason Brito     | 23448.31     |
+| AAAAAAAAKBAAAAAA | Mid Atlantic_2   | Dion Speer      | 22540.95     |
+| AAAAAAAAOAAAAAAA | Mid Atlantic_1   | Charles Hinkle  | 21820.24     |
++------------------+------------------+-----------------+--------------+
