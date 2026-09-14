@@ -215,24 +215,7 @@ fn rollback_writer(writer: &mut tantivy::IndexWriter) -> Result<(), TantivyError
 }
 
 fn copy_snapshot_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(destination)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
-        let metadata = std::fs::symlink_metadata(&source_path)?;
-        if metadata.file_type().is_symlink() {
-            return Err(std::io::Error::other(
-                "snapshot index contains a symbolic link",
-            ));
-        }
-        if metadata.is_dir() {
-            copy_snapshot_directory(&source_path, &destination_path)?;
-        } else if metadata.is_file() {
-            std::fs::copy(source_path, destination_path)?;
-        }
-    }
-    Ok(())
+    util::directory_copy::copy_directory_rejecting_symlinks(source, destination, "snapshot index")
 }
 
 #[derive(Clone)]
@@ -389,15 +372,43 @@ impl Index for FullTextDatabaseIndex {
                 });
             }
 
+            // From here `directory` holds the new generation on disk. Reopening it or building a
+            // writer for it can still fail; without a rollback that failure would be returned to
+            // the caller while the live index already points at a directory nothing has
+            // validated, with the pre-restore generation only reachable via `old_directory`. Roll
+            // back to `old_directory` on either failure so the live index keeps serving the
+            // last-known-good generation instead of a half-installed one.
+            let broken_directory = directory.with_extension(format!(
+                "snapshot-broken-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_nanos())
+            ));
+            let rollback_to_old_directory = || {
+                if std::fs::rename(&directory, &broken_directory).is_ok() {
+                    let _ = std::fs::rename(&old_directory, &directory);
+                    let _ = std::fs::remove_dir_all(&broken_directory);
+                }
+            };
+
             // The old writer's in-memory segment/opstamp state predates the swap above:
             // committing through it would write a `meta.json` that doesn't know the installed
             // segments exist, silently discarding them on the next write. Re-open the
             // (now-installed) directory and take a fresh writer so the next commit builds on the
             // restored state rather than the pre-restore one.
-            let reopened =
-                tantivy::Index::open_in_dir(&directory).context(TextSearchIndexingSnafu)?;
+            let reopened = tantivy::Index::open_in_dir(&directory)
+                .map_err(|source| {
+                    rollback_to_old_directory();
+                    source
+                })
+                .context(TextSearchIndexingSnafu)?;
             let new_writer = reopened
                 .writer(MEMORY_BUDGET_FOR_INDEX_WRITER)
+                .map_err(|source| {
+                    rollback_to_old_directory();
+                    source
+                })
                 .context(IndexCreationSnafu)?;
             new_writer.set_merge_policy(Box::new(index_merge_policy()));
             *writer_guard = new_writer;
