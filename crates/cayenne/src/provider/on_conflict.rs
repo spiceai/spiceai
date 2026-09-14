@@ -40,6 +40,7 @@ use datafusion_catalog::Session;
 use datafusion_expr::Expr;
 use datafusion_physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion_table_providers::util::on_conflict::OnConflict;
+use hash_index::PrehashedBuildHasher;
 use parking_lot::Mutex as ParkingMutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
@@ -1186,7 +1187,7 @@ pub(crate) struct OnConflictContext<'a> {
     /// classified as a new primary key. `None` when nothing was committed during
     /// this checkout — the common case.
     pub(crate) pending: Option<&'a PendingPkExistence>,
-    pub(crate) incoming_keys: &'a PkDigestSet,
+    pub(crate) incoming_keys: &'a HashSet<u128, PrehashedBuildHasher>,
 }
 
 pub(crate) struct OnConflictValidationStream {
@@ -1198,7 +1199,7 @@ pub(crate) struct OnConflictValidationStream {
     pub(crate) on_conflict: OnConflict,
     pub(crate) upsert_options: UpsertOptions,
     existing_keys: Option<CachedPkIndex>,
-    pub(crate) incoming_keys: PkDigestSet,
+    pub(crate) incoming_keys: HashSet<u128, PrehashedBuildHasher>,
     pub(crate) kept_keys: PkDigestSet,
     pub(crate) delete_specs: HashMap<Arc<str>, Vec<u64>>,
     pub(crate) deleted_pk_i64: Vec<i64>,
@@ -1249,7 +1250,7 @@ impl OnConflictValidationStream {
             on_conflict,
             upsert_options,
             existing_keys: Some(existing_keys),
-            incoming_keys: PkDigestSet::with_capacity(1024),
+            incoming_keys: HashSet::with_capacity_and_hasher(1024, PrehashedBuildHasher),
             kept_keys: PkDigestSet::with_capacity(1024),
             delete_specs: HashMap::new(),
             deleted_pk_i64: Vec::new(),
@@ -1333,7 +1334,7 @@ impl OnConflictValidationStream {
             .extend(deleted_inlined_row_keys);
         self.reinserted_over_tombstone += reinserted_over_tombstone;
 
-        self.incoming_keys.extend_ref(&kept_keys);
+        self.incoming_keys.extend(kept_keys.digests());
         self.kept_keys.absorb(kept_keys);
 
         Ok(filtered_batch)

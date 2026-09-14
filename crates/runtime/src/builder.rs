@@ -752,6 +752,7 @@ impl RuntimeBuilder {
         .eager_aggregation(query.eager_aggregation)
         .eager_aggregation_min_reduction_factor(query.eager_aggregation_min_reduction_factor)
         .eager_aggregation_max_pushed_groups(query.eager_aggregation_max_pushed_groups)
+        .cte_materialization(query.cte_materialization)
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
@@ -820,6 +821,8 @@ impl RuntimeBuilder {
             embeds: Arc::new(RwLock::new(HashMap::new())),
             rerankers: Arc::new(RwLock::new(HashMap::new())),
             tools: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "mcp")]
+            mcp_schemas: runtime_tools::mcp::server::McpSchemaSnapshot::new(),
             tool_factories: Arc::new(Mutex::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
             secrets,
