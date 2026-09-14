@@ -576,6 +576,36 @@ pub enum SnapshotUploadError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[snafu(display("Failed to freeze index {index} for snapshot: {source}"))]
+    IndexFreeze {
+        index: String,
+        source: datafusion::error::DataFusionError,
+    },
+    #[snafu(display("Failed to create local staging directory for index {index} snapshot: {source}"))]
+    IndexStagingDir {
+        index: String,
+        source: std::io::Error,
+    },
+    #[snafu(display("Failed to copy index {index} snapshot into staging: {source}"))]
+    IndexStagingCopy {
+        index: String,
+        source: std::io::Error,
+    },
+    #[snafu(display("Index {index} snapshot staging task failed: {source}"))]
+    IndexStagingTask {
+        index: String,
+        source: tokio::task::JoinError,
+    },
+    #[snafu(display("Failed to archive index {index} snapshot: {source}"))]
+    IndexArchive {
+        index: String,
+        source: crate::snapshot::directory_archive::ArchiveError,
+    },
+    #[snafu(display("Failed to upload index {index} snapshot: {source}"))]
+    IndexUpload {
+        index: String,
+        source: Box<SnapshotUploadError>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1275,56 +1305,70 @@ impl SnapshotManager {
         *self.indexes.write().await = indexes;
     }
 
-    async fn capture_indexes(&self) -> Vec<CapturedIndex> {
+    /// Captures every configured, snapshotable index's durable state into local staging
+    /// directories.
+    ///
+    /// Partial index snapshotting is not supported: a database snapshot and its index
+    /// artifacts must always describe the same generation, so `restore_indexes_from_snapshot`
+    /// can match every configured index by identity later. If any configured index fails to
+    /// freeze or stage here, the whole capture fails rather than silently publishing a database
+    /// snapshot with a missing index artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a configured, snapshotable index fails to freeze its durable state,
+    /// if a local staging directory cannot be created, or if copying the frozen directory into
+    /// staging fails.
+    async fn capture_indexes(&self) -> Result<Vec<CapturedIndex>, SnapshotUploadError> {
         let indexes = self.indexes.read().await.clone();
         let mut captured = Vec::new();
         for index in indexes {
             let Some(identity) = index.snapshot_identity() else {
                 continue;
             };
-            let directory = match index.freeze_for_snapshot().await {
-                Ok(directory) => directory,
-                Err(error) => {
-                    tracing::warn!(dataset = %self.dataset_name, index = identity.kind, "Failed to freeze index for snapshot; the database snapshot will be published without this index artifact. Cause: {error}");
-                    continue;
-                }
-            };
-            let temp_dir = match tempfile::tempdir() {
-                Ok(temp_dir) => temp_dir,
-                Err(error) => {
-                    tracing::warn!(dataset = %self.dataset_name, index = identity.kind, "Failed to create staging for index snapshot; the database snapshot will be published without this index artifact. Cause: {error}");
-                    continue;
-                }
-            };
+            let directory = index.freeze_for_snapshot().await.context(IndexFreezeSnafu {
+                index: identity.kind,
+            })?;
+            let temp_dir = tempfile::tempdir().context(IndexStagingDirSnafu {
+                index: identity.kind,
+            })?;
             let destination = temp_dir.path().join("index");
-            let copy_result = tokio::task::spawn_blocking({
+            tokio::task::spawn_blocking({
                 let directory = directory.clone();
                 let destination = destination.clone();
                 move || copy_index_directory(&directory, &destination)
             })
-            .await;
-            match copy_result {
-                Ok(Ok(())) => captured.push(CapturedIndex {
-                    identity,
-                    directory: temp_dir,
-                }),
-                Ok(Err(error)) => {
-                    tracing::warn!(dataset = %self.dataset_name, index = identity.kind, "Failed to stage index snapshot; the database snapshot will be published without this index artifact. Cause: {error}");
-                }
-                Err(error) => {
-                    tracing::warn!(dataset = %self.dataset_name, index = identity.kind, "Index snapshot staging task failed; the database snapshot will be published without this index artifact. Cause: {error}");
-                }
-            }
+            .await
+            .context(IndexStagingTaskSnafu {
+                index: identity.kind,
+            })?
+            .context(IndexStagingCopySnafu {
+                index: identity.kind,
+            })?;
+            captured.push(CapturedIndex {
+                identity,
+                directory: temp_dir,
+            });
         }
-        captured
+        Ok(captured)
     }
 
+    /// Archives and uploads every captured index snapshot.
+    ///
+    /// Partial index snapshotting is not supported (see [`Self::capture_indexes`]): if any
+    /// captured index fails to archive or upload, the whole operation fails so the caller never
+    /// commits `current-snapshot-id` metadata that points at a partial artifact list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if archiving a captured index's staging directory fails, or if
+    /// uploading the resulting archive fails.
     async fn upload_captured_indexes(
         &self,
         captured: Vec<CapturedIndex>,
         layout: &SnapshotPathLayout<'_>,
         now: DateTime<Utc>,
-    ) -> Vec<IndexSnapshotRef> {
+    ) -> Result<Vec<IndexSnapshotRef>, SnapshotUploadError> {
         use crate::snapshot::directory_archive::archive_directories_to_file_with_plan;
 
         let mut artifacts = Vec::new();
@@ -1333,33 +1377,29 @@ impl SnapshotManager {
             let object_location = layout.index_location(&self.snapshots_location, now, &filename);
             let archive = captured.directory.path().join("index.tar");
             let source = captured.directory.path().join("index");
-            if let Err(error) = archive_directories_to_file_with_plan(
-                &[(source, String::new())],
-                &archive,
-                &[],
-                &[],
-            )
-            .await
-            {
-                tracing::warn!(dataset = %self.dataset_name, index = captured.identity.kind, "Failed to archive index snapshot; the database snapshot will be published without this index artifact. Cause: {error}");
-                continue;
-            }
-            match self.upload_snapshot_file(&archive, &object_location).await {
-                Ok((size, checksum)) => artifacts.push(IndexSnapshotRef {
-                    index_kind: captured.identity.kind.to_string(),
-                    columns: captured.identity.columns,
-                    discriminator: captured.identity.discriminator,
-                    uri: self.snapshot_uri_for_location(&object_location),
-                    checksum,
-                    checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
-                    size,
-                }),
-                Err(error) => {
-                    tracing::warn!(dataset = %self.dataset_name, index = captured.identity.kind, "Failed to upload index snapshot; the database snapshot will be published without this index artifact. Cause: {error}");
-                }
-            }
+            archive_directories_to_file_with_plan(&[(source, String::new())], &archive, &[], &[])
+                .await
+                .context(IndexArchiveSnafu {
+                    index: captured.identity.kind,
+                })?;
+            let (size, checksum) = self
+                .upload_snapshot_file(&archive, &object_location)
+                .await
+                .map_err(|source| SnapshotUploadError::IndexUpload {
+                    index: captured.identity.kind.to_string(),
+                    source: Box::new(source),
+                })?;
+            artifacts.push(IndexSnapshotRef {
+                index_kind: captured.identity.kind.to_string(),
+                columns: captured.identity.columns,
+                discriminator: captured.identity.discriminator,
+                uri: self.snapshot_uri_for_location(&object_location),
+                checksum,
+                checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+                size,
+            });
         }
-        artifacts
+        Ok(artifacts)
     }
 
     /// Replaces the snapshot engine. Used by accelerators (notably Cayenne)
@@ -1605,7 +1645,9 @@ impl SnapshotManager {
 
         // Freeze and copy index directories while the shared accelerator write lock is held.
         // The database snapshot methods consume the guard when their own stable copy is ready.
-        let captured_indexes = self.capture_indexes().await;
+        // Partial index snapshotting is not supported (see `capture_indexes`), so a failure here
+        // aborts before the database is even copied.
+        let captured_indexes = self.capture_indexes().await?;
 
         let (total_bytes, checksum) = match &self.layout {
             AccelerationLayout::None => {
@@ -1623,11 +1665,13 @@ impl SnapshotManager {
             }
         };
 
-        // Uploading index artifacts is deliberately best-effort: a failed auxiliary artifact
-        // must not discard an otherwise valid database snapshot.
+        // Partial index snapshotting is not supported (see `upload_captured_indexes`): if any
+        // captured index fails to archive or upload, this aborts before `current-snapshot-id`
+        // metadata is advanced, so a later `restore_indexes_from_snapshot` never sees a
+        // snapshot with a missing index artifact.
         let index_snapshots = self
             .upload_captured_indexes(captured_indexes, &layout, now)
-            .await;
+            .await?;
 
         self.update_metadata_after_upload(
             &destination_location,
