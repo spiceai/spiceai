@@ -210,17 +210,19 @@ mod tests {
             .activate(Some(&principal("a")), &base)
             .expect("the first principal activates it");
 
+        // `expect_err` would need the `Ok` side to be `Debug`, and a
+        // `SessionContext` is not.
         let ext = SqlSessionExtension::new(store.open(session.id()));
-        assert!(matches!(
-            ext.activate(Some(&principal("b")), &base)
-                .expect_err("a second principal is refused"),
-            SessionError::NotOwned { .. }
-        ));
-        assert!(matches!(
-            ext.existing(Some(&principal("b")))
-                .expect_err("and cannot read it either"),
-            SessionError::NotOwned { .. }
-        ));
+        match ext.activate(Some(&principal("b")), &base) {
+            Err(SessionError::NotOwned { .. }) => {}
+            Err(other) => panic!("expected NotOwned, got {other}"),
+            Ok(_) => panic!("a second principal must not activate it"),
+        }
+        match ext.existing(Some(&principal("b"))) {
+            Err(SessionError::NotOwned { .. }) => {}
+            Err(other) => panic!("expected NotOwned, got {other}"),
+            Ok(_) => panic!("a second principal must not read it"),
+        }
     }
 
     /// A runtime with no `runtime.auth` records no owner, so the session stays

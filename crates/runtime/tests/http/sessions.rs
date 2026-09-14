@@ -124,28 +124,38 @@ async fn start_with_sql_cache(
 }
 
 impl TestRuntime {
-    /// A client that keeps cookies, so a session the runtime mints on the first
-    /// request is carried into the next — what a browser or any cookie-keeping
-    /// client does, and the only way an id the caller never saw can persist.
-    fn cookie_client() -> Result<Client, anyhow::Error> {
-        Ok(Client::builder().cookie_store(true).build()?)
-    }
-
-    /// Posts `sql` with `client`, so a caller can keep one across requests.
-    async fn sql_with(
+    /// Posts `sql` carrying `cookie` verbatim as the `Cookie` header, and
+    /// returns the status, body, and what the response set for `x-session-id`
+    /// and `session-id` — the exchange a cookie-keeping client performs.
+    async fn sql_with_cookie(
         &self,
-        client: &Client,
         key: &str,
+        cookie: Option<&str>,
         sql: &str,
-    ) -> Result<(StatusCode, String), anyhow::Error> {
-        let response = client
+    ) -> Result<(StatusCode, String, Option<String>, Option<String>), anyhow::Error> {
+        let mut request = Client::new()
             .post(format!("{}/v1/sql", self.http_url))
             .bearer_auth(key)
-            .body(sql.to_string())
-            .send()
-            .await?;
+            .body(sql.to_string());
+        if let Some(cookie) = cookie {
+            request = request.header(reqwest::header::COOKIE, cookie);
+        }
+
+        let response = request.send().await?;
         let status = response.status();
-        Ok((status, response.text().await?))
+        let header_id = response
+            .headers()
+            .get("x-session-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let set_cookie = response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with("session-id="))
+            .map(str::to_string);
+        Ok((status, response.text().await?, header_id, set_cookie))
     }
 
     /// Posts `sql` to `/v1/sql`, in `session` when one is given.
@@ -282,8 +292,8 @@ async fn prepared_statements_span_requests_in_a_named_session() -> Result<(), an
 }
 
 /// A client that names no session is given one, handed back in `x-session-id`
-/// and a `session-id` cookie. A client that keeps the cookie is carried into
-/// the same session on its next request without having to read anything.
+/// and a `session-id` cookie. Sending that cookie back is all it takes to be
+/// carried into the same session — what a browser, or `spice sql`, does.
 #[tokio::test]
 async fn a_minted_session_is_carried_by_the_cookie() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -291,37 +301,26 @@ async fn a_minted_session_is_carried_by_the_cookie() -> Result<(), anyhow::Error
     test_request_context()
         .scope(async {
             let rt = start(&["k:rw"]).await?;
-            let client = TestRuntime::cookie_client()?;
 
-            let response = client
-                .post(format!("{}/v1/sql", rt.http_url))
-                .bearer_auth("k")
-                .body("SELECT 1 AS n")
-                .send()
-                .await?;
-            let minted = response
-                .headers()
-                .get("x-session-id")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-                .expect("the response names the session it was given");
+            let (status, body, header_id, set_cookie) =
+                rt.sql_with_cookie("k", None, "SELECT 1 AS n").await?;
+            assert!(status.is_success(), "{status} {body}");
+            let minted = header_id.expect("the response names the session it was given");
+            let set_cookie = set_cookie.expect("and sets it as a cookie");
             assert!(
-                response
-                    .headers()
-                    .get_all("set-cookie")
-                    .iter()
-                    .filter_map(|value| value.to_str().ok())
-                    .any(|value| value.contains(&format!("session-id={minted}"))),
-                "and sets it as a cookie so a client need not read the header"
+                set_cookie.contains(&format!("session-id={minted}")),
+                "the cookie carries the same id as the header: {set_cookie}"
             );
-            response.text().await?;
 
-            let (status, body) = rt
-                .sql_with(&client, "k", "PREPARE p AS SELECT 2 AS n")
+            // What a cookie-keeping client sends back on its next request.
+            let cookie = format!("session-id={minted}");
+
+            let (status, body, ..) = rt
+                .sql_with_cookie("k", Some(&cookie), "PREPARE p AS SELECT 2 AS n")
                 .await?;
             assert!(status.is_success(), "{status} {body}");
 
-            let (status, body) = rt.sql_with(&client, "k", "EXECUTE p").await?;
+            let (status, body, ..) = rt.sql_with_cookie("k", Some(&cookie), "EXECUTE p").await?;
             assert!(status.is_success(), "{status} {body}");
             assert_eq!(
                 serde_json::from_str::<Value>(&body)?,
@@ -329,12 +328,10 @@ async fn a_minted_session_is_carried_by_the_cookie() -> Result<(), anyhow::Error
                 "the cookie carried the caller back into its own session"
             );
 
-            // A client that drops the cookie is given a session of its own, so
-            // the statement is not there.
-            let (status, body) = rt.sql("k", None, "EXECUTE p").await?;
+            let (status, body, ..) = rt.sql_with_cookie("k", None, "EXECUTE p").await?;
             assert!(
                 !status.is_success() && body.contains("'p' does not exist"),
-                "a request naming no session gets a fresh one: {status} {body}"
+                "and a request sending no cookie is given a fresh session: {status} {body}"
             );
 
             Ok(())
@@ -351,21 +348,35 @@ async fn two_callers_do_not_share_prepared_statements() -> Result<(), anyhow::Er
     test_request_context()
         .scope(async {
             let rt = start(&["a:rw", "b:rw"]).await?;
-            let first = TestRuntime::cookie_client()?;
-            let second = TestRuntime::cookie_client()?;
 
-            let (status, body) = rt
-                .sql_with(&first, "a", "PREPARE mine AS SELECT 'a data' AS v")
+            let (_, _, first_id, _) = rt.sql_with_cookie("a", None, "SELECT 1").await?;
+            let (_, _, second_id, _) = rt.sql_with_cookie("b", None, "SELECT 1").await?;
+            let first = format!(
+                "session-id={}",
+                first_id.expect("the first caller is given a session")
+            );
+            let second = format!(
+                "session-id={}",
+                second_id.expect("the second caller is given one of its own")
+            );
+            assert_ne!(first, second);
+
+            let (status, body, ..) = rt
+                .sql_with_cookie("a", Some(&first), "PREPARE mine AS SELECT 'a data' AS v")
                 .await?;
             assert!(status.is_success(), "{status} {body}");
 
-            let (status, body) = rt.sql_with(&second, "b", "EXECUTE mine").await?;
+            let (status, body, ..) = rt
+                .sql_with_cookie("b", Some(&second), "EXECUTE mine")
+                .await?;
             assert!(
                 !status.is_success() && body.contains("'mine' does not exist"),
                 "the other caller must not reach it: {status} {body}"
             );
 
-            let (status, body) = rt.sql_with(&first, "a", "EXECUTE mine").await?;
+            let (status, body, ..) = rt
+                .sql_with_cookie("a", Some(&first), "EXECUTE mine")
+                .await?;
             assert!(status.is_success(), "{status} {body}");
             assert_eq!(
                 serde_json::from_str::<Value>(&body)?,

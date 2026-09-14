@@ -95,6 +95,13 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
                 .connect()
                 .await
                 .expect("to connect to flight endpoint");
+            // `repl::get_records` takes the cookie-keeping channel the REPL
+            // builds, so the runtime's `session-id` cookie survives between
+            // statements.
+            let channel = flight_client::cookie::CookieService::new(
+                channel,
+                Arc::new(flight_client::cookie::CookieStore::new()),
+            );
             let client = FlightServiceClient::new(channel);
 
             let result = repl::get_records(
