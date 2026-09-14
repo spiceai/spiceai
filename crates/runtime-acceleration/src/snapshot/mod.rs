@@ -7372,6 +7372,7 @@ mod tests {
             snapshot_engine: None,
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),

@@ -1102,8 +1102,8 @@ mod tests {
         let first = spicepod::semantic::Column::new("body").with_metadata(first_metadata);
         let second = spicepod::semantic::Column::new("body").with_metadata(second_metadata);
 
-        let first_identity = identity_value(&[first.clone()]);
-        let second_identity = identity_value(&[second.clone()]);
+        let first_identity = identity_value(std::slice::from_ref(&first));
+        let second_identity = identity_value(std::slice::from_ref(&second));
         assert_eq!(
             first_identity, second_identity,
             "the same column metadata must have one identity regardless of HashMap insertion order"
