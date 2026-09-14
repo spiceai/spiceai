@@ -147,7 +147,7 @@ impl LocationPruningListingTable {
         Arc::clone(&self.file_schema)
     }
 
-    fn collect_partition_values(&self, meta: &ObjectMeta) -> Option<Vec<ScalarValue>> {
+    fn collect_partition_values(&self, meta: &ObjectMeta) -> DFResult<Vec<ScalarValue>> {
         let parts = parse_partition_values(
             &self.table_path,
             &meta.location,
@@ -155,20 +155,31 @@ impl LocationPruningListingTable {
         )?;
 
         let mut values = Vec::with_capacity(self.partition_column_types().len());
-        for (value, (_, dtype)) in parts.into_iter().zip(self.partition_column_types()) {
-            let scalar = ScalarValue::try_from_string(value.clone(), dtype).ok()?;
-            values.push(scalar);
+        for (value, (name, dtype)) in parts.into_iter().zip(self.partition_column_types()) {
+            match ScalarValue::try_from_string(value.clone(), dtype) {
+                Ok(scalar) => values.push(scalar),
+                Err(_) => {
+                    return Err(DataFusionError::Configuration(
+                        hive_partition_value_type_error(
+                            meta.location.as_ref(),
+                            name,
+                            &value,
+                            dtype,
+                        ),
+                    ));
+                }
+            }
         }
-        Some(values)
+        Ok(values)
     }
 
-    fn partitioned_file_for_meta(&self, meta: ObjectMeta) -> Option<PartitionedFile> {
+    fn partitioned_file_for_meta(&self, meta: ObjectMeta) -> DFResult<PartitionedFile> {
         let partition_values = if self.partition_column_types().is_empty() {
             Vec::new()
         } else {
             self.collect_partition_values(&meta)?
         };
-        Some(PartitionedFile {
+        Ok(PartitionedFile {
             object_meta: meta,
             partition_values,
             range: None,
@@ -178,6 +189,25 @@ impl LocationPruningListingTable {
             ordering: None,
             table_reference: None,
         })
+    }
+
+    async fn format_selected_listing_files(
+        &self,
+        state: &dyn Session,
+    ) -> DFResult<Vec<PartitionedFile>> {
+        let mut file_stream = self
+            .table_path
+            .list_all_files(state, self.object_store.as_ref(), "")
+            .await?;
+
+        let mut files: Vec<PartitionedFile> = Vec::new();
+        while let Some(meta) = file_stream.try_next().await? {
+            if !file_matches_extension(&meta.location, &self.listing_extension) {
+                continue;
+            }
+            files.push(self.partitioned_file_for_meta(meta)?);
+        }
+        Ok(files)
     }
 
     async fn scan_format_selected_listing(
@@ -191,21 +221,7 @@ impl LocationPruningListingTable {
             Arc::clone(&self.object_store),
         );
 
-        let mut file_stream = self
-            .table_path
-            .list_all_files(state, self.object_store.as_ref(), "")
-            .await?;
-
-        let mut files: Vec<PartitionedFile> = Vec::new();
-        while let Some(meta) = file_stream.try_next().await? {
-            if !file_matches_extension(&meta.location, &self.listing_extension) {
-                continue;
-            }
-            if let Some(file) = self.partitioned_file_for_meta(meta) {
-                files.push(file);
-            }
-        }
-
+        let files = self.format_selected_listing_files(state).await?;
         self.scan_partitioned_files(state, files, projection, limit)
             .await
     }
@@ -277,20 +293,75 @@ fn parse_partition_values(
     table_path: &ListingTableUrl,
     file_path: &Path,
     table_partition_cols: &[(String, datafusion::arrow::datatypes::DataType)],
-) -> Option<Vec<String>> {
+) -> DFResult<Vec<String>> {
     // Extract hive-style partition values (e.g., year=2023/month=2) from the
     // file path relative to the table path, validating the expected partition
-    // column names.
-    let subpath = table_path.strip_prefix(file_path)?;
+    // column names. A matching object that lacks those segments is an error:
+    // omitting it would return incomplete query results.
+    let location = file_path.as_ref();
+    let expected_columns: Vec<&str> = table_partition_cols
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let Some(subpath) = table_path.strip_prefix(file_path) else {
+        return Err(DataFusionError::Configuration(hive_partition_prefix_error(
+            location,
+            table_path.prefix().as_ref(),
+        )));
+    };
 
     let mut part_values = Vec::with_capacity(table_partition_cols.len());
     for (part, (expected_partition, _)) in subpath.zip(table_partition_cols) {
         match part.split_once('=') {
             Some((name, val)) if name == expected_partition => part_values.push(val.to_string()),
-            _ => return None,
+            _ => {
+                return Err(DataFusionError::Configuration(hive_partition_parse_error(
+                    location,
+                    &expected_columns,
+                )));
+            }
         }
     }
-    Some(part_values)
+    if part_values.len() != table_partition_cols.len() {
+        return Err(DataFusionError::Configuration(hive_partition_parse_error(
+            location,
+            &expected_columns,
+        )));
+    }
+    Ok(part_values)
+}
+
+fn hive_partition_parse_error(location: &str, expected_columns: &[&str]) -> String {
+    let columns = expected_columns
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let example = expected_columns
+        .iter()
+        .map(|name| format!("{name}=value"))
+        .collect::<Vec<_>>()
+        .join("/");
+    format!(
+        "Object '{location}' does not contain Hive partition segments for columns {columns}, so this scan would omit matching files and return incomplete results. Every matching object must include `key=value` path segments for those columns (for example `{example}/file.orc`). See: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+    )
+}
+
+fn hive_partition_prefix_error(location: &str, table_prefix: &str) -> String {
+    format!(
+        "Object '{location}' is not under table path '{table_prefix}', so Hive partition values cannot be parsed and this scan would omit matching files. Keep matching objects under the dataset path. See: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+    )
+}
+
+fn hive_partition_value_type_error(
+    location: &str,
+    column: &str,
+    value: &str,
+    dtype: &DataType,
+) -> String {
+    format!(
+        "Object '{location}' has Hive partition value '{value}' for column '{column}' that cannot be converted to {dtype}, so this scan would omit matching files and return incomplete results. Use a `key=value` path segment whose value matches the partition column type. See: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+    )
 }
 
 #[deny(clippy::missing_trait_methods)]
@@ -392,15 +463,7 @@ impl TableProvider for LocationPruningListingTable {
                 continue;
             }
 
-            let Some(file) = self.partitioned_file_for_meta(meta) else {
-                tracing::warn!(
-                    location = loc,
-                    "Unable to parse partition values for location predicate; skipping file"
-                );
-                continue;
-            };
-
-            files.push(file);
+            files.push(self.partitioned_file_for_meta(meta)?);
         }
 
         self.scan_partitioned_files(state, files, projection, limit)
@@ -3304,6 +3367,136 @@ mod tests {
         }
     }
 
+    fn hive_dt_partition_cols() -> Vec<(String, DataType)> {
+        vec![("dt".to_string(), DataType::Utf8)]
+    }
+
+    fn format_selected_hive_listing_table(
+        ctx: &SessionContext,
+        store: Arc<dyn ObjectStore>,
+        partition_cols: Vec<(String, DataType)>,
+    ) -> LocationPruningListingTable {
+        let table_path = ListingTableUrl::parse("s3://bucket/table/").expect("listing url");
+        ctx.runtime_env()
+            .register_object_store(table_path.object_store().as_ref(), Arc::clone(&store));
+
+        let file_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let options = ListingOptions::new(Arc::new(OrcFormat::new()) as Arc<dyn FileFormat>)
+            .with_file_extension("")
+            .with_table_partition_cols(partition_cols);
+        let listing = ListingTable::try_new(
+            ListingTableConfig::new(table_path.clone())
+                .with_listing_options(options)
+                .with_schema(Arc::clone(&file_schema)),
+        )
+        .expect("listing table");
+        LocationPruningListingTable::new(Arc::new(listing), store, table_path, file_schema, "*.orc")
+    }
+
+    #[test]
+    fn hive_partition_parse_error_names_the_object_and_expected_columns() {
+        let message = hive_partition_parse_error("table/late.orc", &["dt"]);
+        assert!(
+            message.contains("'table/late.orc'"),
+            "object location must appear in: {message}"
+        );
+        assert!(
+            message.contains("'dt'"),
+            "expected partition columns must appear in: {message}"
+        );
+        assert!(
+            message.contains("`key=value`"),
+            "must tell the user how to fix the path: {message}"
+        );
+        assert!(
+            message.contains(
+                "https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+            ),
+            "must link listing connector docs: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_partition_values_reads_hive_key_value_segments() {
+        let table_path = ListingTableUrl::parse("s3://bucket/table/").expect("listing url");
+        let file = Path::from("table/dt=2024-01-01/good.orc");
+        let values = parse_partition_values(&table_path, &file, &hive_dt_partition_cols())
+            .expect("well-formed hive path");
+        assert_eq!(values, vec!["2024-01-01".to_string()]);
+    }
+
+    #[test]
+    fn parse_partition_values_errors_when_matching_object_lacks_hive_segments() {
+        let table_path = ListingTableUrl::parse("s3://bucket/table/").expect("listing url");
+        let file = Path::from("table/late.orc");
+        let err = parse_partition_values(&table_path, &file, &hive_dt_partition_cols())
+            .expect_err("late.orc has no dt= segment");
+        let DataFusionError::Configuration(message) = err else {
+            panic!("must be a configuration error, got: {err}");
+        };
+        assert_eq!(
+            message,
+            hive_partition_parse_error("table/late.orc", &["dt"])
+        );
+    }
+
+    /// Regression: format-selected listing used to skip matching objects whose
+    /// Hive path lacked the inferred `key=value` segments, so a mixed layout
+    /// (`dt=2024-01-01/good.orc` plus sibling `late.orc`) returned only the
+    /// well-formed file.
+    #[tokio::test]
+    async fn format_selected_listing_scan_errors_when_a_matching_object_lacks_hive_partition_segments()
+     {
+        let ctx = SessionContext::new();
+        let store = Arc::new(TestObjectStore::new(vec![
+            create_meta("table/dt=2024-01-01/good.orc", 1, 10),
+            create_meta("table/late.orc", 2, 10),
+            create_meta("table/_SUCCESS", 3, 0),
+        ])) as Arc<dyn ObjectStore>;
+        let provider = format_selected_hive_listing_table(&ctx, store, hive_dt_partition_cols());
+
+        let err = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect_err("late.orc must fail the scan, not be omitted");
+        let DataFusionError::Configuration(message) = err else {
+            panic!("must be a configuration error, got: {err}");
+        };
+        assert_eq!(
+            message,
+            hive_partition_parse_error("table/late.orc", &["dt"])
+        );
+    }
+
+    #[tokio::test]
+    async fn format_selected_listing_files_include_well_formed_hive_objects_and_skip_markers() {
+        let ctx = SessionContext::new();
+        let store = Arc::new(TestObjectStore::new(vec![
+            create_meta("table/dt=2024-01-01/good.orc", 1, 10),
+            create_meta("table/_SUCCESS", 2, 0),
+            create_meta("table/notes.txt", 3, 10),
+        ])) as Arc<dyn ObjectStore>;
+        let provider = format_selected_hive_listing_table(&ctx, store, hive_dt_partition_cols());
+
+        let files = provider
+            .format_selected_listing_files(&ctx.state())
+            .await
+            .expect("well-formed hive object must be listed");
+        assert_eq!(
+            files.len(),
+            1,
+            "markers and unmatched extensions must not be treated as partition errors"
+        );
+        assert_eq!(
+            files[0].object_meta.location.as_ref(),
+            "table/dt=2024-01-01/good.orc"
+        );
+        assert_eq!(
+            files[0].partition_values,
+            vec![ScalarValue::Utf8(Some("2024-01-01".to_string()))]
+        );
+    }
+
     #[test]
     fn listing_extension_is_orc_matches_suffix_and_format_selected() {
         assert!(listing_extension_is_orc(".orc"));
@@ -3632,6 +3825,70 @@ mod tests {
                 .list_called
                 .load(std::sync::atomic::Ordering::SeqCst),
             "Listing should not be invoked when location predicates are present"
+        );
+    }
+
+    /// Location predicates used to warn and skip a matching object whose Hive
+    /// path could not be parsed, which is the same silent-omit as the
+    /// format-selected listing scan.
+    #[tokio::test]
+    async fn location_predicate_scan_errors_when_hive_partition_segments_are_missing() {
+        let ctx = SessionContext::new();
+        let no_list_store = Arc::new(NoListObjectStore::new(create_meta(
+            "prefix/late.orc",
+            100,
+            128,
+        )));
+        let store_url = Url::parse("s3://bucket").expect("store url");
+        ctx.runtime_env().register_object_store(
+            &store_url,
+            Arc::clone(&no_list_store) as Arc<dyn ObjectStore>,
+        );
+
+        let table_path =
+            ListingTableUrl::parse("s3://bucket/prefix/").expect("to parse listing table url");
+        let file_format = Arc::new(ParquetFormat::default());
+        let options = ListingOptions::new(file_format)
+            .with_file_extension(".parquet")
+            .with_table_partition_cols(hive_dt_partition_cols());
+
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("value", arrow_schema::DataType::Utf8, true),
+            MetadataColumn::Location(Some("s3://bucket/".into())).field(),
+        ]));
+
+        let listing = ListingTable::try_new(
+            ListingTableConfig::new(table_path.clone())
+                .with_listing_options(options)
+                .with_schema(Arc::clone(&file_schema)),
+        )
+        .expect("create listing table");
+
+        let provider = LocationPruningListingTable::new(
+            Arc::new(listing),
+            ctx.runtime_env()
+                .object_store(&table_path)
+                .expect("object store"),
+            table_path,
+            file_schema,
+            ".parquet",
+        );
+
+        ctx.register_table("test_table", Arc::new(provider))
+            .expect("register table");
+
+        let df = ctx
+            .sql("SELECT value FROM test_table WHERE _location = 's3://bucket/prefix/late.orc'")
+            .await
+            .expect("execute query");
+        let err = df
+            .create_physical_plan()
+            .await
+            .expect_err("late.orc must fail the location-predicate scan, not be omitted");
+        let message = err.to_string();
+        assert!(
+            message.contains(&hive_partition_parse_error("prefix/late.orc", &["dt"])),
+            "location-predicate scan must surface the hive parse error, got: {message}"
         );
     }
 
