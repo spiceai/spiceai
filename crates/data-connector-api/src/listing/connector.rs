@@ -85,8 +85,8 @@ const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
 /// appear only in older files. Scan-time NULL backfill can restore those
 /// columns only when the merged schema already lists them. Exceeding this
 /// cap is an error rather than a silent truncation, because a later scan
-/// reads every matching object. Set `schema_source_path` to a smaller
-/// prefix if a collection has more matching objects than this limit.
+/// reads every matching object. A narrower inference-only prefix would
+/// publish an incomplete schema for that full scan.
 const ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug)]
@@ -2205,7 +2205,7 @@ fn orc_collection_schema_infer_files_within_limit(
 
 fn orc_collection_schema_infer_limit_error(limit: usize) -> String {
     format!(
-        "ORC schema inference found more than {limit} matching objects, so the published schema would omit columns or incompatible types that first appear later. Set `schema_source_path` to a narrower prefix with at most {limit} matching objects. See: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+        "ORC schema inference found more than {limit} matching objects, so the collection is too large for automatic ORC footer merge. A later scan reads every matching object, and a truncated inferred schema would omit columns or incompatible types that first appear after the cap. See: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
     )
 }
 
@@ -3027,7 +3027,7 @@ mod tests {
     }
 
     #[test]
-    fn orc_collection_schema_infer_limit_error_names_the_cap_and_schema_source_path() {
+    fn orc_collection_schema_infer_limit_error_names_the_cap_and_docs() {
         let message =
             orc_collection_schema_infer_limit_error(ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT);
         assert!(
@@ -3035,14 +3035,18 @@ mod tests {
             "cap must appear in: {message}"
         );
         assert!(
-            message.contains("`schema_source_path`"),
-            "must tell the user how to narrow the listing: {message}"
+            !message.contains("`schema_source_path`"),
+            "must not recommend inference-only schema_source_path: {message}"
         );
         assert!(
             message.contains(
                 "https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
             ),
             "must link listing connector docs: {message}"
+        );
+        assert!(
+            message.contains("later scan reads every matching object"),
+            "must explain why truncated inference is rejected: {message}"
         );
     }
 
