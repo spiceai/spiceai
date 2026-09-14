@@ -881,10 +881,16 @@ fn canonicalize_json_object_keys(value: serde_json::Value) -> serde_json::Value 
 ///
 /// Shared by both source kinds so a dataset's identity (its `from:` plus `refresh_sql`)
 /// and a view's (its definition closure) cannot drift into different hash schemes.
+///
+/// Hashed verbatim. SQL and refresh SQL are already normalized when their identity
+/// fields are built. Trimming the finished string would collapse a length-prefixed
+/// identity whose last value differs only by equal-length trailing whitespace —
+/// quoted YAML can preserve a trailing space vs tab — so two incompatible
+/// row-shaping configs would share a fingerprint.
 #[must_use]
 pub(crate) fn definition_fingerprint(definition: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(definition.trim().as_bytes());
+    hasher.update(definition.as_bytes());
     format!("sha256:{:x}", hasher.finalize())
 }
 
@@ -1453,10 +1459,45 @@ mod tests {
             let eu = definition_fingerprint("SELECT id FROM orders WHERE region = 'eu'");
             assert_ne!(us, eu);
 
-            // Stable across the surrounding whitespace a YAML block scalar adds.
+            // YAML block scalars add surrounding whitespace to SQL. That is
+            // normalized when the identity is built, not by hashing a trimmed
+            // identity string.
             assert_eq!(
-                definition_fingerprint("SELECT id FROM orders"),
-                definition_fingerprint("  SELECT id FROM orders\n")
+                definition_fingerprint(&view_definition_identity(
+                    "SELECT id FROM orders",
+                    &[],
+                    &HashMap::new(),
+                )),
+                definition_fingerprint(&view_definition_identity(
+                    "  SELECT id FROM orders\n",
+                    &[],
+                    &HashMap::new(),
+                )),
+            );
+        }
+
+        #[test]
+        fn fingerprint_distinguishes_equal_length_trailing_whitespace() {
+            // Length-prefixed identity: the last field's trailing byte is part of
+            // the value. Quoted YAML can preserve a trailing space vs tab of the
+            // same length; hashing a trimmed identity would collapse them.
+            let with_space = dataset_definition_identity(
+                "s3://bucket",
+                &BTreeMap::from([("param.selector".to_string(), "x ".to_string())]),
+            );
+            let with_tab = dataset_definition_identity(
+                "s3://bucket",
+                &BTreeMap::from([("param.selector".to_string(), "x\t".to_string())]),
+            );
+            assert_eq!(
+                with_space.len(),
+                with_tab.len(),
+                "precondition: encodings must be the same length so only the trailing byte differs"
+            );
+            assert_ne!(
+                definition_fingerprint(&with_space),
+                definition_fingerprint(&with_tab),
+                "a trailing space vs tab in a quoted parameter must not share a fingerprint"
             );
         }
 
