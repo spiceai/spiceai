@@ -25,7 +25,7 @@ use datafusion::{
     common::tree_node::TreeNodeRecursion,
     datasource::ViewTable,
     error::{DataFusionError, Result},
-    logical_expr::{Expr, LogicalPlan},
+    logical_expr::LogicalPlan,
     physical_plan::ExecutionPlan,
     prelude::SessionContext,
 };
