@@ -2079,8 +2079,13 @@ fn format_selected_listing_extension(default_extension: &str) -> String {
     format!("*{default_extension}")
 }
 
+/// True when listing should take the ORC collection schema-merge path.
+/// `file_extension` keeps the user's casing (`.ORC`), so the suffix is
+/// compared case-insensitively — same rule as [`file_name_has_extension`].
 fn listing_extension_is_orc(extension: &str) -> bool {
-    extension == ".orc" || format_selected_data_suffix(extension) == Some(".orc")
+    format_selected_data_suffix(extension)
+        .unwrap_or(extension)
+        .eq_ignore_ascii_case(".orc")
 }
 
 fn format_selected_data_suffix(extension: &str) -> Option<&str> {
@@ -3500,10 +3505,36 @@ mod tests {
     #[test]
     fn listing_extension_is_orc_matches_suffix_and_format_selected() {
         assert!(listing_extension_is_orc(".orc"));
+        assert!(listing_extension_is_orc(".ORC"));
+        assert!(listing_extension_is_orc(".Orc"));
         assert!(listing_extension_is_orc("*.orc"));
+        assert!(listing_extension_is_orc("*.ORC"));
         assert!(!listing_extension_is_orc(".parquet"));
         assert!(!listing_extension_is_orc("*.parquet"));
+        assert!(!listing_extension_is_orc(".PARQUET"));
         assert!(!listing_extension_is_orc(".csv"));
+        assert!(!listing_extension_is_orc("*"));
+    }
+
+    #[tokio::test]
+    async fn uppercase_file_extension_orc_selects_collection_schema_merge() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "orc".to_string());
+        params.insert("file_extension".to_string(), "ORC".to_string());
+        let (connector, dataset) = setup_connector("test:test/".to_string(), params);
+
+        let (Some(_file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("ORC listing with file_extension=ORC")
+        else {
+            panic!("expected an ORC file format");
+        };
+        assert_eq!(extension, ".ORC", "file_extension keeps the user's casing");
+        assert!(
+            listing_extension_is_orc(&extension),
+            "`.ORC` must take the collection schema-merge path, not newest-object-only"
+        );
     }
 
     #[tokio::test]
