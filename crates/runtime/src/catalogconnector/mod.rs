@@ -150,7 +150,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// the argument count are. A backend that also answers per *call* is the
 /// exception: reach for [`stub_udf_called_with`] there, since the arguments are
 /// then part of the question.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "duckdb", feature = "snowflake")))]
 pub(crate) fn stub_udf(name: &str, arity: usize) -> datafusion::logical_expr::Expr {
     use datafusion::prelude::col;
 
@@ -161,7 +161,7 @@ pub(crate) fn stub_udf(name: &str, arity: usize) -> datafusion::logical_expr::Ex
 /// [`FunctionSupport`](datafusion_table_providers::util::supported_functions::FunctionSupport)
 /// answers per *call* — where a literal argument is what decides whether the
 /// dialect can render it.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "duckdb", feature = "snowflake")))]
 pub(crate) fn stub_udf_called_with(
     name: &str,
     args: Vec<datafusion::logical_expr::Expr>,

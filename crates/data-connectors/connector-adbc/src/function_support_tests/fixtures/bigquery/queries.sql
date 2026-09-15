@@ -1,0 +1,18739 @@
+-- query 000
+SELECT
+  *
+FROM (VALUES
+  ('value0000',  300, 100, 80, 60),
+  ('value0001',  250, 90, 70, 50),
+  ('value0002', 220, 85, 65, 45),
+  ('value0003', 260, 95, 75, 55)) AS v0000(region, v0001, v0002, v0003, v0004)
+
+-- query 001
+SELECT
+  *
+FROM (VALUES
+  ('value0000', 100, 80, 60, 300),
+  ('value0001', 90, 70, 50, 250),
+  ('value0002', 85, 65, 45, 220),
+  ('value0003', 95, 75, 55, 260)) AS v0000(region, v0002, v0003, v0004, v0001)
+
+-- query 002
+SELECT
+  *
+FROM (VALUES
+  ('value0000', 300),
+  ('value0001', 250),
+  ('value0002', 220),
+  ('value0003', 260)) AS v0000(region, v0001)
+
+-- query 003
+SELECT
+  *
+FROM (VALUES
+  ('value0000', 100, 80, 60),
+  ('value0001', 90, 70, 50),
+  ('value0002', 85, 65, 45),
+  ('value0003', 95, 75, 55)) AS v0000(region, v0002, v0003, v0004)
+
+-- query 004
+SELECT
+  *
+FROM (VALUES
+  ('value0004', 1030),
+  ('value0005', -30),
+  ('value0006', -40),
+  ('value0007 value0008', -90)) AS v0000(v0005, v0006)
+
+-- query 005
+SELECT
+  v0007 AS v0008
+FROM v0009
+ORDER BY
+  v0010 DESC
+LIMIT 1
+
+-- query 006
+SELECT
+  v0011 AS v0012
+FROM v0009
+ORDER BY
+  v0010 DESC
+LIMIT 1
+
+-- query 007
+SELECT
+  v0013 AS v0014
+FROM v0009
+ORDER BY
+  v0010 DESC
+LIMIT 1
+
+-- query 008
+SELECT
+  v0015 AS v0016,
+  0.90 AS target
+FROM v0009
+WHERE
+  NOT v0015 IS NULL
+ORDER BY
+  v0010 DESC
+LIMIT 1
+
+-- query 009
+SELECT
+  CAST(v0010 AS TIMESTAMP) AS date,
+  v0007 AS v0008,
+  v0017 AS v0018
+FROM v0009
+WHERE
+  v0010 >= CAST('2026-04-23' AS DATE)
+ORDER BY
+  v0010
+
+-- query 010
+SELECT
+  CAST(v0010 AS TIMESTAMP) AS date,
+  v0011 AS v0012
+FROM v0009
+WHERE
+  v0010 >= CAST('2026-04-23' AS DATE)
+ORDER BY
+  v0010
+
+-- query 011
+SELECT
+  CAST(v0010 AS TIMESTAMP) AS date,
+  v0019 AS v0020,
+  v0021 AS v0022
+FROM v0009
+WHERE
+  v0010 >= CAST('2026-07-08' AS DATE)
+ORDER BY
+  v0010
+
+-- query 012
+SELECT
+  'value0009 value0010' AS category,
+  SUM(v0023) AS v0006
+FROM v0009
+WHERE
+  v0010 >= CAST('2026-06-22' AS DATE)
+UNION ALL
+SELECT
+  'value0009 value0011' AS category,
+  -1 * SUM(v0024) AS v0006
+FROM v0009
+WHERE
+  v0010 >= CAST('2026-06-22' AS DATE)
+UNION ALL
+SELECT
+  'value0012 value0013' AS category,
+  SUM(v0023) - SUM(v0024) AS v0006
+FROM v0009
+WHERE
+  v0010 >= CAST('2026-06-22' AS DATE)
+
+-- query 013
+SELECT
+  CAST(v0010 AS TIMESTAMP) AS date,
+  v0007,
+  v0017,
+  v0011,
+  v0019,
+  v0021,
+  v0015
+FROM v0009
+WHERE
+  v0010 >= CAST('2026-07-08' AS DATE)
+ORDER BY
+  v0010 DESC
+
+-- query 014
+SELECT
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+       AND CAST(v0025 AS DATE) <= today()
+      THEN v0026 ELSE 0
+    END
+  ) / 100.0 AS v0027,
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+       AND CAST(v0025 AS DATE) <= today() - INTERVAL '7 days'
+      THEN v0026 ELSE 0
+    END
+  ) / 100.0 AS v0028
+FROM v0029
+WHERE
+  v0030 = 1
+  AND v0031 <> 'value0014'
+  AND type IN ('value0015', 'value0016')
+  AND v0025 IS NOT NULL
+  AND CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+  AND CAST(v0025 AS DATE) <= today()
+
+-- query 015
+SELECT
+  SUM(CASE
+    WHEN CAST(v0032.v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+     AND CAST(v0032.v0025 AS DATE) <= today()
+    THEN CASE WHEN v0032.type = 'value0015' THEN v0032.v0033 ELSE v0032.v0026 END
+    ELSE 0
+  END) / 100.0 AS v0034,
+  SUM(CASE
+    WHEN CAST(v0032.v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+     AND CAST(v0032.v0025 AS DATE) <= CAST(today() - INTERVAL '7 days' AS DATE)
+    THEN CASE WHEN v0032.type = 'value0015' THEN v0032.v0033 ELSE v0032.v0026 END
+    ELSE 0
+  END) / 100.0 AS v0035
+FROM v0029 v0032
+WHERE v0032.v0030 = 1
+  AND v0032.v0031 = 'value0017'
+  AND v0032.type IN ('value0015', 'value0016')
+  AND v0032.v0036 IN (
+    'value0018',
+    'value0019',
+    'value0020'
+  )
+  AND CAST(v0032.v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+
+-- query 016
+WITH
+  v0037 AS (
+    SELECT
+      v0000.v0038 AS v0039,
+      MIN(v0040.v0041) AS v0042
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0021'
+      AND v0040.v0047 IS NULL
+      AND v0040.v0041 >= CAST(today() - INTERVAL '21 days' AS TIMESTAMP)
+      AND v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+    GROUP BY v0000.v0038
+  ),
+  v0048 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0022'
+      AND v0040.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+  ),
+  v0049 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+      AND v0000.v0050 IN (
+        'value0023',
+        'value0024',
+        'value0025'
+      )
+  ),
+  v0051 AS (
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0026') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0027'
+      AND json_get_str(v0000.Metadata, 'value0026') IS NOT NULL
+    UNION
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0028') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0029'
+      AND json_get_str(v0000.Metadata, 'value0028') IS NOT NULL
+  ),
+  v0052 AS (
+    SELECT v0039 FROM v0048
+    UNION SELECT v0039 FROM v0049
+    UNION SELECT v0039 FROM v0051
+  ),
+  v0053 AS (
+    SELECT
+      v0054.v0042 AS v0055
+    FROM v0056 v0057
+    JOIN v0037 v0054 ON v0054.v0039 = v0057.v0058
+    LEFT JOIN v0052 v0059 ON v0059.v0039 = v0057.v0058
+    WHERE v0057.v0060 IS NULL
+      AND v0059.v0039 IS NULL
+  )
+SELECT
+  SUM(
+    CASE
+      WHEN CAST(v0055 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+       AND CAST(v0055 AS DATE) <= today()
+      THEN 1 ELSE 0
+    END
+  ) AS v0061,
+  SUM(
+    CASE
+      WHEN CAST(v0055 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+       AND CAST(v0055 AS DATE) <= today() - INTERVAL '7 days'
+      THEN 1 ELSE 0
+    END
+  ) AS v0062
+FROM v0053
+WHERE CAST(v0055 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+
+-- query 017
+WITH
+  v0037 AS (
+    SELECT
+      v0000.v0038 AS v0039,
+      MIN(v0040.v0041) AS v0042
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0021'
+      AND v0040.v0047 IS NULL
+      AND v0040.v0041 >= CAST(today() - INTERVAL '21 days' AS TIMESTAMP)
+      AND v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+    GROUP BY v0000.v0038
+  ),
+  v0048 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0022'
+      AND v0040.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+  ),
+  v0049 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+      AND v0000.v0050 IN (
+        'value0023',
+        'value0024',
+        'value0025'
+      )
+  ),
+  v0051 AS (
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0026') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0027'
+      AND json_get_str(v0000.Metadata, 'value0026') IS NOT NULL
+    UNION
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0028') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0029'
+      AND json_get_str(v0000.Metadata, 'value0028') IS NOT NULL
+  ),
+  v0052 AS (
+    SELECT v0039 FROM v0048
+    UNION SELECT v0039 FROM v0049
+    UNION SELECT v0039 FROM v0051
+  ),
+  v0053 AS (
+    SELECT
+      v0057.v0006,
+      v0054.v0042 AS v0055
+    FROM v0056 v0057
+    JOIN v0037 v0054 ON v0054.v0039 = v0057.v0058
+    LEFT JOIN v0052 v0059 ON v0059.v0039 = v0057.v0058
+    WHERE v0057.v0060 IS NULL
+      AND v0059.v0039 IS NULL
+  )
+SELECT
+  SUM(
+    CASE
+      WHEN CAST(v0055 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+       AND CAST(v0055 AS DATE) <= today()
+      THEN v0006 ELSE 0
+    END
+  ) / 100.0 AS v0063,
+  SUM(
+    CASE
+      WHEN CAST(v0055 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+       AND CAST(v0055 AS DATE) <= today() - INTERVAL '7 days'
+      THEN v0006 ELSE 0
+    END
+  ) / 100.0 AS v0062
+FROM v0053
+WHERE CAST(v0055 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+
+-- query 018
+WITH v0064 AS (
+  SELECT
+    CAST(DATE_TRUNC('WEEK', CAST(v0025 AS TIMESTAMP)) AS DATE) AS v0065,
+    SUM(v0026) / 100.0 AS v0066,
+    SUM(CASE WHEN v0031 = 'value0017' THEN v0033 ELSE 0 END) / 100.0 AS v0067
+  FROM v0029
+  WHERE v0030 = 1
+    AND v0031 <> 'value0014'
+    AND type = 'value0015'
+    AND v0036 IN (
+      'value0018',
+      'value0019',
+      'value0020'
+    )
+    AND NOT v0025 IS NULL
+    AND CAST(v0025 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE - INTERVAL '84' DAYS AS TIMESTAMP)) AS DATE)
+  GROUP BY 1
+),
+v0068 AS (
+  SELECT
+    CAST(DATE_TRUNC('WEEK', CAST(v0032.v0025 AS TIMESTAMP)) AS DATE) AS v0065,
+    SUM(v0032.v0026) / 100.0 AS v0069
+  FROM v0029 v0032
+  WHERE v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0032.type = 'value0016'
+    AND v0032.v0036 IN (
+      'value0018',
+      'value0019',
+      'value0020'
+    )
+    AND NOT v0032.v0025 IS NULL
+    AND CAST(v0032.v0025 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE - INTERVAL '84' DAYS AS TIMESTAMP)) AS DATE)
+  GROUP BY 1
+),
+v0070 AS (
+  SELECT
+    CAST(DATE_TRUNC('WEEK', CAST(v0032.v0025 AS TIMESTAMP)) AS DATE) AS v0065,
+    SUM(v0032.v0033) / 100.0 AS v0071
+  FROM v0029 v0032
+  WHERE v0032.v0030 = 1
+    AND v0032.v0031 = 'value0017'
+    AND v0032.type = 'value0016'
+    AND v0032.v0036 IN (
+      'value0018',
+      'value0019',
+      'value0020'
+    )
+    AND NOT v0032.v0025 IS NULL
+    AND CAST(v0032.v0025 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE - INTERVAL '84' DAYS AS TIMESTAMP)) AS DATE)
+  GROUP BY 1
+),
+weeks AS (
+  SELECT DISTINCT v0065 FROM (
+    SELECT v0065 FROM v0064
+    UNION ALL
+    SELECT v0065 FROM v0068
+    UNION ALL
+    SELECT v0065 FROM v0070
+  ) v0072
+)
+SELECT
+  CAST(v0073.v0065 AS TEXT) AS v0074,
+  COALESCE(v0075.v0066, 0) + COALESCE(v0076.v0069, 0) AS v0027,
+  COALESCE(v0075.v0067, 0) + COALESCE(v0077.v0071, 0) AS v0078,
+  COALESCE(v0075.v0067, 0) AS v0067,
+  COALESCE(v0077.v0071, 0) AS v0071
+FROM weeks v0073
+LEFT JOIN v0064 v0075 ON v0075.v0065 = v0073.v0065
+LEFT JOIN v0068 v0076 ON v0076.v0065 = v0073.v0065
+LEFT JOIN v0070 v0077 ON v0077.v0065 = v0073.v0065
+ORDER BY v0074 DESC
+
+-- query 019
+SELECT
+  1.0 * SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+       AND CAST(v0025 AS DATE) <= today()
+       AND v0031 = 'value0017'
+      THEN 1 ELSE 0
+    END
+  ) / NULLIF(
+    SUM(
+      CASE
+        WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+         AND CAST(v0025 AS DATE) <= today()
+        THEN 1 ELSE 0
+      END
+    ) - SUM(
+      CASE
+        WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+         AND CAST(v0025 AS DATE) <= today()
+         AND v0031 = 'value0014'
+        THEN 1 ELSE 0
+      END
+    ),
+    0
+  ) AS v0079,
+  1.0 * SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+       AND CAST(v0025 AS DATE) <= today() - INTERVAL '7 days'
+       AND v0031 = 'value0017'
+      THEN 1 ELSE 0
+    END
+  ) / NULLIF(
+    SUM(
+      CASE
+        WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+         AND CAST(v0025 AS DATE) <= today() - INTERVAL '7 days'
+        THEN 1 ELSE 0
+      END
+    ) - SUM(
+      CASE
+        WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+         AND CAST(v0025 AS DATE) <= today() - INTERVAL '7 days'
+         AND v0031 = 'value0014'
+        THEN 1 ELSE 0
+      END
+    ),
+    0
+  ) AS v0080
+FROM v0029
+WHERE
+  v0030 = 1
+  AND v0036 IN ('value0018', 'value0019', 'value0020')
+  AND type = 'value0015'
+  AND NOT v0025 IS NULL
+  AND CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+  AND CAST(v0025 AS DATE) <= today()
+
+-- query 020
+WITH v0081 AS (
+  SELECT DISTINCT
+    v0082,
+    category
+  FROM v0083
+  WHERE CAST(v0084 AS DATE) >= today() - INTERVAL '30 days'
+    AND CAST(v0084 AS DATE) <= today()
+    AND v0030 = 1
+    AND category IN ('value0030', 'value0031')
+),
+v0085 AS (
+  SELECT
+    json_get_str(data, 'value0032') AS v0086,
+    LOWER(json_get_str(data, 'value0033')) AS v0087,
+    CAST(json_get_str(data, 'value0034') AS TIMESTAMP) AS v0088
+  FROM v0089
+  WHERE type = 'value0035'
+    AND CAST(v0090 AS DATE) >= today() - INTERVAL '30 days'
+),
+v0091 AS (
+  SELECT v0086, MAX(v0088) AS v0092
+  FROM v0085
+  GROUP BY v0086
+),
+v0093 AS (
+  SELECT v0094.v0086, v0094.v0087 AS v0095
+  FROM v0085 v0094
+  INNER JOIN v0091 v0096 ON v0096.v0086 = v0094.v0086 AND v0096.v0092 = v0094.v0088
+),
+v0097 AS (
+  SELECT v0000.category, v0098.v0095
+  FROM v0081 v0000
+  LEFT JOIN v0093 v0098 ON v0098.v0086 = v0000.v0082
+)
+SELECT
+  'value0036 value0037 value0038' AS metric,
+  1 AS v0099,
+  CAST(COUNT(CASE WHEN v0095 = 'value0039' THEN 1 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v0100,
+  COUNT(CASE WHEN v0095 = 'value0039' THEN 1 END) AS v0101,
+  COUNT(*) AS v0102,
+  0.15 AS v0103,
+  0.15 - (CAST(COUNT(CASE WHEN v0095 = 'value0039' THEN 1 END) AS DOUBLE) / NULLIF(COUNT(*), 0)) AS v0104
+FROM v0097
+
+-- query 021
+WITH v0105 AS (
+  SELECT
+    json_get_str(data, 'value0040') AS v0106,
+    MIN(CAST(v0090 AS DATE)) AS v0107
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_get_str(data, 'value0033') = 'value0041'
+    AND CAST(v0090 AS DATE) >= today() - INTERVAL '45 days'
+  GROUP BY json_get_str(data, 'value0040')
+),
+v0108 AS (
+  SELECT
+    SUBSTRING(CAST(
+      CASE WHEN v0032.type = 'value0016' THEN v0054.v0107
+           ELSE CAST(v0032.v0025 AS DATE) END AS VARCHAR), 6, 5) AS day,
+    SUM(CASE
+          WHEN v0032.type = 'value0016'
+           AND v0054.v0107 = CAST(v0032.v0025 AS DATE)
+          THEN v0032.v0033 ELSE 0 END) / 100.0 AS v0109,
+    SUM(CASE
+          WHEN v0032.type = 'value0016'
+           AND v0054.v0107 > CAST(v0032.v0025 AS DATE)
+          THEN v0032.v0033 ELSE 0 END) / 100.0 AS v0110,
+    SUM(CASE WHEN v0032.type = 'value0015' THEN v0032.v0033 ELSE 0 END) / 100.0 AS v0067
+  FROM v0029 v0032
+  LEFT JOIN v0105 v0054
+    ON v0054.v0106 = v0032.v0111
+  WHERE v0032.v0030 = 1
+    AND v0032.type IN ('value0016', 'value0015')
+    AND v0032.v0031 = 'value0017'
+    AND (
+      (v0032.type = 'value0015'
+        AND v0032.v0025 IS NOT NULL
+        AND CAST(v0032.v0025 AS DATE) >= today() - INTERVAL '30 days')
+      OR (v0032.type = 'value0016'
+        AND v0054.v0107 IS NOT NULL
+        AND v0054.v0107 >= today() - INTERVAL '30 days')
+    )
+  GROUP BY SUBSTRING(CAST(
+    CASE WHEN v0032.type = 'value0016' THEN v0054.v0107
+         ELSE CAST(v0032.v0025 AS DATE) END AS VARCHAR), 6, 5)
+)
+SELECT day, v0109, v0110, v0067
+FROM v0108
+ORDER BY day
+
+-- query 022
+WITH v0112 AS (
+  SELECT
+    CAST(v0025 AS DATE) AS v0113,
+    SUM(v0033) / 100.0 AS v0067
+  FROM v0029
+  WHERE
+    v0030 = 1
+    AND v0031 = 'value0017'
+    AND type = 'value0015'
+    AND v0036 IN (
+      'value0018',
+      'value0019',
+      'value0020'
+    )
+    AND NOT v0025 IS NULL
+    AND CAST(v0025 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '21' DAYS
+    AND CAST(v0025 AS DATE) <= CURRENT_DATE
+  GROUP BY
+    1
+), v0114 AS (
+  SELECT
+    CAST(v0025 AS DATE) AS v0113,
+    SUM(v0033) / 100.0 AS v0071
+  FROM v0029
+  WHERE
+    v0030 = 1
+    AND v0031 = 'value0017'
+    AND type = 'value0016'
+    AND v0036 IN (
+      'value0018',
+      'value0019',
+      'value0020'
+    )
+    AND NOT v0025 IS NULL
+    AND CAST(v0025 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '21' DAYS
+    AND CAST(v0025 AS DATE) < CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE)
+  GROUP BY
+    1
+), v0115 AS (
+  SELECT
+    CAST(v0025 AS DATE) AS v0113,
+    SUM(CASE WHEN json_get_str(metadata, 'value0042') = 'value0043' THEN v0026 ELSE 0 END) / 100.0 AS v0116,
+    SUM(CASE WHEN json_get_str(metadata, 'value0042') = 'value0044' THEN v0026 ELSE 0 END) / 100.0 AS v0117
+  FROM v0029
+  WHERE
+    v0030 = 1
+    AND v0031 <> 'value0014'
+    AND type = 'value0016'
+    AND v0036 IN (
+      'value0018',
+      'value0019',
+      'value0020'
+    )
+    AND NOT v0025 IS NULL
+    AND CAST(v0025 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE)
+    AND CAST(v0025 AS DATE) <= CURRENT_DATE
+  GROUP BY
+    1
+), v0118 AS (
+  SELECT
+    CAST(v0090 AS DATE) AS v0113,
+    JSON_GET_STR(data, 'value0033') AS status,
+    JSON_GET_STR(data, 'value0045') AS v0119,
+    JSON_GET_FLOAT(data, 'value0046') AS v0120,
+    SUBSTR(JSON_GET_STR(data, 'value0032'), 9) AS v0121
+  FROM v0089
+  WHERE
+    type = 'value0035'
+    AND JSON_GET_STR(data, 'value0047') = 'value0048'
+    AND JSON_GET_STR(data, 'value0049') = 'value0050-value0051'
+    AND JSON_GET_STR(data, 'value0032') LIKE 'value0052.%'
+    AND CAST(v0090 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '21' DAYS
+), v0122 AS (
+  SELECT
+    v0058,
+    MAX(JSON_GET_STR(metadata, 'value0042')) AS v0123
+  FROM v0029
+  WHERE
+    type = 'value0016'
+    AND CAST(v0025 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '35' DAYS
+  GROUP BY
+    v0058
+), v0124 AS (
+  SELECT
+    MIN(v0125.v0113) AS v0113,
+    v0125.v0119,
+    MAX(v0125.v0120) AS v0120,
+    MAX(v0126.v0123) AS v0123
+  FROM v0118 AS v0125
+  LEFT JOIN v0122 AS v0126
+    ON v0126.v0058 = v0125.v0121
+  WHERE
+    v0125.status = 'value0053'
+  GROUP BY
+    v0125.v0119
+), v0127 AS (
+  SELECT
+    v0119,
+    MAX(v0120) AS v0128
+  FROM v0118
+  WHERE
+    status = 'value0039'
+  GROUP BY
+    v0119
+), v0129 AS (
+  SELECT
+    v0032.v0113 AS v0130,
+    v0032.v0123,
+    v0032.v0120 AS v0131,
+    COALESCE(v0132.v0128, 0) AS v0133
+  FROM v0124 AS v0032
+  LEFT JOIN v0127 AS v0132
+    ON v0132.v0119 = v0032.v0119
+), v0134 AS (
+  SELECT
+    1 AS v0135,
+    'value0054' AS v0136
+  UNION ALL
+  SELECT
+    2,
+    'value0055'
+  UNION ALL
+  SELECT
+    3,
+    'value0056'
+  UNION ALL
+  SELECT
+    4,
+    'value0057'
+  UNION ALL
+  SELECT
+    5,
+    'value0058'
+  UNION ALL
+  SELECT
+    6,
+    'value0059'
+  UNION ALL
+  SELECT
+    7,
+    'value0060'
+), v0137 AS (
+  SELECT
+    v0067,
+    CASE
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) = CAST(v0113 AS TIMESTAMP)
+      THEN 1
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '1' DAY = CAST(v0113 AS TIMESTAMP)
+      THEN 2
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '2' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 3
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '3' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 4
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '4' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 5
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '5' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 6
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '6' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 7
+    END AS v0135,
+    CASE
+      WHEN CAST(v0113 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE)
+      THEN 'value0061'
+      ELSE 'value0062'
+    END AS bucket
+  FROM v0112
+), v0138 AS (
+  SELECT
+    v0071,
+    CASE
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) = CAST(v0113 AS TIMESTAMP)
+      THEN 1
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '1' DAY = CAST(v0113 AS TIMESTAMP)
+      THEN 2
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '2' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 3
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '3' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 4
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '4' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 5
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '5' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 6
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '6' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 7
+    END AS v0135
+  FROM v0114
+), v0139 AS (
+  SELECT
+    v0116,
+    v0117,
+    CASE
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) = CAST(v0113 AS TIMESTAMP)
+      THEN 1
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '1' DAY = CAST(v0113 AS TIMESTAMP)
+      THEN 2
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '2' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 3
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '3' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 4
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '4' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 5
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '5' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 6
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '6' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 7
+    END AS v0135
+  FROM v0115
+), v0140 AS (
+  SELECT
+    CASE
+      WHEN DATE_TRUNC('WEEK', CAST(v0130 AS TIMESTAMP)) = CAST(v0130 AS TIMESTAMP)
+      THEN 1
+      WHEN DATE_TRUNC('WEEK', CAST(v0130 AS TIMESTAMP)) + INTERVAL '1' DAY = CAST(v0130 AS TIMESTAMP)
+      THEN 2
+      WHEN DATE_TRUNC('WEEK', CAST(v0130 AS TIMESTAMP)) + INTERVAL '2' DAYS = CAST(v0130 AS TIMESTAMP)
+      THEN 3
+      WHEN DATE_TRUNC('WEEK', CAST(v0130 AS TIMESTAMP)) + INTERVAL '3' DAYS = CAST(v0130 AS TIMESTAMP)
+      THEN 4
+      WHEN DATE_TRUNC('WEEK', CAST(v0130 AS TIMESTAMP)) + INTERVAL '4' DAYS = CAST(v0130 AS TIMESTAMP)
+      THEN 5
+      WHEN DATE_TRUNC('WEEK', CAST(v0130 AS TIMESTAMP)) + INTERVAL '5' DAYS = CAST(v0130 AS TIMESTAMP)
+      THEN 6
+      WHEN DATE_TRUNC('WEEK', CAST(v0130 AS TIMESTAMP)) + INTERVAL '6' DAYS = CAST(v0130 AS TIMESTAMP)
+      THEN 7
+    END AS v0135,
+    SUM(CASE WHEN v0123 = 'value0043' THEN v0131 ELSE 0 END) AS v0141,
+    SUM(CASE WHEN v0123 = 'value0043' THEN v0133 ELSE 0 END) AS v0142,
+    SUM(CASE WHEN v0123 = 'value0044' THEN v0131 ELSE 0 END) AS v0143,
+    SUM(CASE WHEN v0123 = 'value0044' THEN v0133 ELSE 0 END) AS v0144
+  FROM v0129
+  WHERE
+    v0130 >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '21' DAYS
+    AND v0130 < CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE)
+  GROUP BY
+    1
+), v0145 AS (
+  SELECT
+    v0135,
+    SUM(CASE WHEN bucket = 'value0061' THEN v0067 ELSE 0 END) AS v0146,
+    SUM(CASE WHEN bucket = 'value0062' THEN v0067 ELSE 0 END) AS v0147
+  FROM v0137
+  GROUP BY v0135
+), v0148 AS (
+  SELECT
+    v0135,
+    SUM(v0071) AS v0149
+  FROM v0138
+  GROUP BY v0135
+), v0150 AS (
+  SELECT
+    v0135,
+    SUM(v0116) AS v0151,
+    SUM(v0117) AS v0152
+  FROM v0139
+  GROUP BY v0135
+), v0153 AS (
+  SELECT
+    v0154.v0135,
+    v0154.v0136,
+    COALESCE(v0155.v0146, 0) AS v0146,
+    (COALESCE(v0155.v0147, 0) + COALESCE(v0156.v0149, 0)) / 3.0 AS v0157,
+    COALESCE(v0158.v0151, 0) AS v0151,
+    COALESCE(v0158.v0152, 0) AS v0152,
+    COALESCE(v0159.v0142, 0) / NULLIF(v0159.v0141, 0) AS v0160,
+    COALESCE(v0159.v0144, 0) / NULLIF(v0159.v0143, 0) AS v0161
+  FROM v0134 AS v0154
+  LEFT JOIN v0145 AS v0155 ON v0155.v0135 = v0154.v0135
+  LEFT JOIN v0148 AS v0156 ON v0156.v0135 = v0154.v0135
+  LEFT JOIN v0150 AS v0158 ON v0158.v0135 = v0154.v0135
+  LEFT JOIN v0140 AS v0159 ON v0159.v0135 = v0154.v0135
+), v0162 AS (
+  SELECT
+    v0135,
+    v0136,
+    v0157,
+    CASE
+      WHEN v0146 + v0151 + v0152 > 0
+      THEN v0146 + v0151 * (
+        1 - COALESCE(v0160, 0)
+      ) + v0152 * (
+        1 - COALESCE(v0161, 0)
+      )
+      ELSE 0
+    END AS v0163
+  FROM v0153
+)
+SELECT
+  v0135,
+  v0136,
+  SUM(v0157) OVER (ORDER BY v0135 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v0164,
+  SUM(v0163) OVER (ORDER BY v0135 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v0165
+FROM v0162
+ORDER BY
+  v0135
+
+-- query 023
+WITH v0166 AS (
+  SELECT
+    CAST(CAST(v0032.v0025 AS DATE) AS TIMESTAMP) AS v0113,
+    SUM(v0032.v0033) / 100.0 AS v0167
+  FROM v0029 AS v0032
+  WHERE
+    v0032.v0030 = 1
+    AND v0032.v0031 = 'value0017'
+    AND v0032.type = 'value0015'
+    AND NOT v0032.v0025 IS NULL
+    AND CAST(v0032.v0025 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '21' DAYS
+    AND CAST(v0032.v0025 AS DATE) <= CURRENT_DATE
+  GROUP BY
+    CAST(CAST(v0032.v0025 AS DATE) AS TIMESTAMP)
+), v0168 AS (
+  SELECT
+    v0113,
+    v0167,
+    CASE
+      WHEN DATE_TRUNC('WEEK', v0113) = v0113
+      THEN 1
+      WHEN DATE_TRUNC('WEEK', v0113) + INTERVAL '1' DAY = v0113
+      THEN 2
+      WHEN DATE_TRUNC('WEEK', v0113) + INTERVAL '2' DAYS = v0113
+      THEN 3
+      WHEN DATE_TRUNC('WEEK', v0113) + INTERVAL '3' DAYS = v0113
+      THEN 4
+      WHEN DATE_TRUNC('WEEK', v0113) + INTERVAL '4' DAYS = v0113
+      THEN 5
+      WHEN DATE_TRUNC('WEEK', v0113) + INTERVAL '5' DAYS = v0113
+      THEN 6
+      WHEN DATE_TRUNC('WEEK', v0113) + INTERVAL '6' DAYS = v0113
+      THEN 7
+    END AS v0135,
+    CASE
+      WHEN DATE_TRUNC('WEEK', v0113) = v0113
+      THEN 'value0054'
+      WHEN DATE_TRUNC('WEEK', v0113) + INTERVAL '1' DAY = v0113
+      THEN 'value0055'
+      WHEN DATE_TRUNC('WEEK', v0113) + INTERVAL '2' DAYS = v0113
+      THEN 'value0056'
+      WHEN DATE_TRUNC('WEEK', v0113) + INTERVAL '3' DAYS = v0113
+      THEN 'value0057'
+      WHEN DATE_TRUNC('WEEK', v0113) + INTERVAL '4' DAYS = v0113
+      THEN 'value0058'
+      WHEN DATE_TRUNC('WEEK', v0113) + INTERVAL '5' DAYS = v0113
+      THEN 'value0059'
+      WHEN DATE_TRUNC('WEEK', v0113) + INTERVAL '6' DAYS = v0113
+      THEN 'value0060'
+    END AS v0136,
+    CASE
+      WHEN v0113 >= DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP))
+      THEN 'value0061'
+      ELSE 'value0062'
+    END AS bucket
+  FROM v0166
+), v0169 AS (
+  SELECT
+    v0135,
+    v0136,
+    SUM(CASE WHEN bucket = 'value0061' THEN v0167 ELSE 0 END) AS v0167,
+    SUM(CASE WHEN bucket = 'value0062' THEN v0167 ELSE 0 END) / 3.0 AS v0164
+  FROM v0168
+  GROUP BY
+    v0135,
+    v0136
+)
+SELECT
+  v0135,
+  v0136,
+  SUM(v0167) OVER (ORDER BY v0135 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v0167,
+  SUM(v0164) OVER (ORDER BY v0135 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v0164
+FROM v0169
+ORDER BY
+  v0135
+
+-- query 024
+WITH v0105 AS (
+  SELECT
+    json_get_str(data, 'value0040') AS v0106,
+    MIN(CAST(v0090 AS DATE)) AS v0107
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_get_str(data, 'value0033') = 'value0041'
+    AND CAST(v0090 AS DATE) >= today() - INTERVAL '30 days'
+  GROUP BY json_get_str(data, 'value0040')
+),
+v0170 AS (
+  SELECT DISTINCT
+    v0075.v0058 AS v0171,
+    v0057.v0172 AS v0173
+  FROM v0056 v0057
+  INNER JOIN v0174 v0155 ON v0155.id = v0057.v0175
+  INNER JOIN v0176 v0075 ON v0075.id = v0155.v0177
+  WHERE v0057.v0060 IS NULL
+    AND v0057.v0172 >= today() - INTERVAL '14 days'
+    AND v0057.v0172 <= today() + INTERVAL '11 days'
+),
+v0178 AS (
+  SELECT
+    v0032.type,
+    v0032.v0031,
+    v0032.v0171,
+    v0032.v0033,
+    v0032.v0026,
+    v0054.v0107,
+    CASE WHEN v0032.type = 'value0016' THEN v0054.v0107
+         ELSE CAST(v0032.v0025 AS DATE) END AS v0179,
+    CASE WHEN v0032.v0031 = 'value0017' THEN 1 ELSE 0 END AS v0180,
+    v0032.v0033 AS v0181
+  FROM v0029 v0032
+  LEFT JOIN v0105 v0054
+    ON v0054.v0106 = v0032.v0111
+  WHERE
+    v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0032.v0036 IN (
+      'value0018',
+      'value0019',
+      'value0020'
+    )
+    AND v0032.type IN ('value0015', 'value0016')
+    AND (
+      (v0032.type = 'value0015'
+        AND v0032.v0025 IS NOT NULL
+        AND CAST(v0032.v0025 AS DATE) >= today() - INTERVAL '14 days')
+      OR (v0032.type = 'value0016'
+        AND v0054.v0107 IS NOT NULL
+        AND v0054.v0107 >= today() - INTERVAL '14 days')
+    )
+),
+v0108 AS (
+  SELECT
+    SUBSTRING(CAST(v0182.v0179 AS VARCHAR), 6, 5) AS day,
+    COUNT(*) AS v0183,
+    SUM(v0182.v0180) AS v0020,
+    SUM(CASE WHEN v0182.v0180 = 1 THEN v0182.v0181 ELSE 0 END) / 100 AS v0184,
+    SUM(CASE WHEN v0182.v0180 = 1 AND v0185.v0171 IS NOT NULL THEN v0182.v0181 ELSE 0 END) / 100 AS v0186
+  FROM v0178 v0182
+  LEFT JOIN v0170 v0185
+    ON v0185.v0171 = v0182.v0171
+   AND v0185.v0173 = v0182.v0179
+  GROUP BY SUBSTRING(CAST(v0182.v0179 AS VARCHAR), 6, 5)
+),
+v0187 AS (
+  SELECT
+    SUBSTRING(CAST(v0172 AS VARCHAR), 6, 5) AS day,
+    SUM(v0006) / 100 AS v0188
+  FROM v0056
+  WHERE
+    v0060 IS NULL
+    AND v0172 >= today() - INTERVAL '14 days'
+    AND v0172 <= today() + INTERVAL '11 days'
+  GROUP BY SUBSTRING(CAST(v0172 AS VARCHAR), 6, 5)
+)
+SELECT
+  COALESCE(v0075.day, v0113.day) AS day,
+  v0075.v0183,
+  v0075.v0020,
+  v0075.v0184,
+  v0075.v0186,
+  v0113.v0188
+FROM v0108 v0075
+FULL OUTER JOIN v0187 v0113 ON v0075.day = v0113.day
+ORDER BY COALESCE(v0075.day, v0113.day)
+
+-- query 025
+WITH v0105 AS (
+  SELECT
+    json_get_str(data, 'value0040') AS v0106,
+    MIN(CAST(v0090 AS DATE)) AS v0107
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_get_str(data, 'value0033') = 'value0041'
+    AND CAST(v0090 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE) - INTERVAL '14 weeks'
+  GROUP BY json_get_str(data, 'value0040')
+),
+v0108 AS (
+  SELECT
+    CAST(date_trunc('week', CAST(
+      CASE WHEN v0032.type = 'value0016' THEN v0054.v0107
+           ELSE CAST(v0032.v0025 AS DATE) END AS TIMESTAMP)) AS DATE) AS v0065,
+    SUM(CASE
+          WHEN v0032.type = 'value0015'
+           AND v0032.v0036 IN ('value0018', 'value0020')
+          THEN v0032.v0033 ELSE 0 END) / 100.0 AS v0189,
+    SUM(CASE
+          WHEN v0032.type = 'value0015'
+           AND v0032.v0036 = 'value0019'
+          THEN v0032.v0033 ELSE 0 END) / 100.0 AS v0190,
+    SUM(CASE
+          WHEN v0032.type = 'value0016'
+          THEN v0032.v0033 ELSE 0 END) / 100.0 AS v0191
+  FROM v0029 v0032
+  LEFT JOIN v0105 v0054
+    ON v0054.v0106 = v0032.v0111
+  WHERE v0032.v0030 = 1
+    AND v0032.v0031 = 'value0017'
+    AND v0032.type IN ('value0016', 'value0015')
+    AND (
+      (v0032.type = 'value0015'
+        AND v0032.v0025 IS NOT NULL
+        AND CAST(v0032.v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE) - INTERVAL '14 weeks'
+        AND CAST(v0032.v0025 AS DATE) < CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE) + INTERVAL '7 days')
+      OR (v0032.type = 'value0016'
+        AND v0054.v0107 IS NOT NULL
+        AND v0054.v0107 >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE) - INTERVAL '14 weeks'
+        AND v0054.v0107 < CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE) + INTERVAL '7 days')
+    )
+  GROUP BY CAST(date_trunc('week', CAST(
+    CASE WHEN v0032.type = 'value0016' THEN v0054.v0107
+         ELSE CAST(v0032.v0025 AS DATE) END AS TIMESTAMP)) AS DATE)
+)
+SELECT
+  CAST(v0065 AS VARCHAR) AS week,
+  v0189,
+  v0190,
+  v0191
+FROM v0108
+WHERE v0065 >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE) - INTERVAL '14 weeks'
+ORDER BY v0065
+
+-- query 026
+SELECT
+  CAST(CAST(v0192 AS DATE) AS VARCHAR) AS v0193,
+  SUM(
+    CASE
+      WHEN v0194 IN ('value0063', 'value0064')
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0195,
+  SUM(
+    CASE
+      WHEN v0194 IN (
+        'value0065',
+        'value0066'
+      )
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0196,
+  SUM(
+    CASE
+      WHEN v0194 = 'value0067'
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0197
+FROM v0056
+WHERE
+  v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND v0192 >= current_date - INTERVAL '7 days'
+GROUP BY
+  CAST(CAST(v0192 AS DATE) AS VARCHAR)
+ORDER BY
+  v0193 ASC
+
+-- query 027
+WITH
+  v0037 AS (
+    SELECT
+      v0000.v0038 AS v0039,
+      MIN(v0198.Timestamp) AS v0042
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    JOIN v0199 v0198 ON v0198.v0200 = v0040.v0200
+    WHERE v0040.v0046 = 'value0021'
+      AND v0040.v0047 IS NULL
+      AND v0040.v0041 >= CAST('2026-05-15 00:00:00' AS TIMESTAMP)
+      AND v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+      AND v0198.Account = 'value0068'
+      AND v0198.v0047 IS NULL
+    GROUP BY v0000.v0038
+  ),
+  v0048 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0022'
+      AND v0040.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+  ),
+  v0049 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+      AND v0000.v0050 IN (
+        'value0023',
+        'value0024',
+        'value0025'
+      )
+  ),
+  v0051 AS (
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0026') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0027'
+      AND json_get_str(v0000.Metadata, 'value0026') IS NOT NULL
+    UNION
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0028') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0029'
+      AND json_get_str(v0000.Metadata, 'value0028') IS NOT NULL
+  ),
+  v0052 AS (
+    SELECT v0039 FROM v0048
+    UNION SELECT v0039 FROM v0049
+    UNION SELECT v0039 FROM v0051
+  ),
+  v0053 AS (
+    SELECT
+      v0057.v0201,
+      CAST(v0054.v0042 AS DATE) AS v0202
+    FROM v0037 v0054
+    LEFT JOIN v0052 v0059 ON v0059.v0039 = v0054.v0039
+    JOIN v0056 v0057 ON v0057.v0058 = v0054.v0039
+    WHERE v0059.v0039 IS NULL
+      AND v0057.v0060 IS NULL
+      AND v0054.v0042 >= CAST(CURRENT_DATE - INTERVAL '90 days' AS TIMESTAMP)
+  )
+SELECT
+  CAST(v0202 AS VARCHAR) AS v0203,
+  SUM(CASE WHEN v0201 = 0 THEN 1 ELSE 0 END) AS v0204,
+  SUM(CASE WHEN v0201 > 0 THEN 1 ELSE 0 END) AS v0205
+FROM v0053
+GROUP BY v0202
+ORDER BY v0203 ASC
+
+-- query 028
+WITH
+  v0037 AS (
+    SELECT
+      v0000.v0038 AS v0039,
+      MIN(v0198.Timestamp) AS v0042
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    JOIN v0199 v0198 ON v0198.v0200 = v0040.v0200
+    WHERE v0040.v0046 = 'value0021'
+      AND v0040.v0047 IS NULL
+      AND v0040.v0041 >= CAST('2026-05-11 00:00:00' AS TIMESTAMP)
+      AND v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+      AND v0198.Account = 'value0068'
+      AND v0198.v0047 IS NULL
+    GROUP BY v0000.v0038
+  ),
+  v0048 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0022'
+      AND v0040.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+  ),
+  v0049 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+      AND v0000.v0050 IN (
+        'value0023',
+        'value0024',
+        'value0025'
+      )
+  ),
+  v0051 AS (
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0026') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0027'
+      AND json_get_str(v0000.Metadata, 'value0026') IS NOT NULL
+    UNION
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0028') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0029'
+      AND json_get_str(v0000.Metadata, 'value0028') IS NOT NULL
+  ),
+  v0052 AS (
+    SELECT v0039 FROM v0048
+    UNION SELECT v0039 FROM v0049
+    UNION SELECT v0039 FROM v0051
+  ),
+  v0053 AS (
+    SELECT
+      v0054.v0042 AS v0055
+    FROM v0056 v0057
+    JOIN v0037 v0054 ON v0054.v0039 = v0057.v0058
+    LEFT JOIN v0052 v0059 ON v0059.v0039 = v0057.v0058
+    WHERE v0057.v0060 IS NULL
+      AND v0059.v0039 IS NULL
+      AND v0054.v0042 >= CAST('2026-05-11 00:00:00' AS TIMESTAMP)
+  )
+SELECT
+  CAST(CAST(date_trunc('week', v0055) AS DATE) AS VARCHAR) AS v0065,
+  COUNT(*) AS v0206
+FROM v0053
+GROUP BY date_trunc('week', v0055)
+ORDER BY v0065 ASC
+
+-- query 029
+WITH
+  v0207 AS (
+    SELECT
+      v0075.id AS v0177,
+      CAST(date_trunc('day', CAST(v0075.v0084 AS TIMESTAMP)) AS DATE) AS v0208
+    FROM v0209 v0075
+    WHERE
+      v0075.v0060 IS NULL
+      AND v0075.v0084 >= '2026-07-07 00:00:00'
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0211 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0212 v0155
+    JOIN v0213 v0073
+      ON v0073.v0175 = v0155.id
+      AND v0073.type = 'value0072'
+      AND v0073.v0060 IS NULL
+    WHERE v0155.v0060 IS NULL
+  ),
+  v0214 AS (
+    SELECT DISTINCT v0177
+    FROM v0215
+    WHERE v0060 IS NULL
+  ),
+  v0216 AS (
+    SELECT DISTINCT v0094.v0177
+    FROM v0215 v0094
+    WHERE v0094.v0031 = 'value0073'
+      AND v0094.v0060 IS NULL
+  ),
+  v0217 AS (
+    SELECT DISTINCT v0218.v0177
+    FROM v0219 v0218
+    JOIN v0056 v0057 ON v0057.id = v0218.v0220
+    WHERE v0218.v0221 IS NOT NULL
+      AND v0057.v0201 = 0
+  ),
+  v0037 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0021'
+      AND v0040.v0047 IS NULL
+      AND v0040.v0041 >= CAST('2026-07-01 00:00:00' AS TIMESTAMP)
+      AND v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+  ),
+  v0048 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0022'
+      AND v0040.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+  ),
+  v0049 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+      AND v0000.v0050 IN (
+        'value0023',
+        'value0024',
+        'value0025'
+      )
+  ),
+  v0051 AS (
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0026') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0027'
+      AND json_get_str(v0000.Metadata, 'value0026') IS NOT NULL
+    UNION
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0028') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0029'
+      AND json_get_str(v0000.Metadata, 'value0028') IS NOT NULL
+  ),
+  v0052 AS (
+    SELECT v0039 FROM v0048
+    UNION SELECT v0039 FROM v0049
+    UNION SELECT v0039 FROM v0051
+  ),
+  v0222 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0056 v0057
+    JOIN v0212 v0155 ON v0155.id = v0057.v0175
+    JOIN v0037 v0054 ON v0054.v0039 = v0057.v0058
+    LEFT JOIN v0052 v0059 ON v0059.v0039 = v0057.v0058
+    WHERE v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+      AND v0059.v0039 IS NULL
+  ),
+  v0223 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0056 v0057
+    JOIN v0212 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0031 = 'value0074'
+      AND v0057.v0224 IS NULL
+      AND v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+  ),
+  v0225 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0056 v0057
+    JOIN v0212 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0031 IN (
+        'value0075',
+        'value0076'
+      )
+      AND v0057.v0224 IS NULL
+      AND v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+  )
+SELECT
+  CAST(v0126.v0208 AS VARCHAR) AS v0226,
+  COUNT(*) AS v0227,
+  SUM(CASE WHEN v0228.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0229,
+  SUM(CASE WHEN v0230.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0231,
+  SUM(CASE WHEN v0232.v0177 IS NOT NULL THEN 1 ELSE 0 END) AS v0233,
+  SUM(CASE WHEN v0077.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0234,
+  SUM(CASE WHEN v0235.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0236,
+  SUM(CASE WHEN v0237.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0238,
+  SUM(CASE WHEN v0239.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0240
+FROM v0207 v0126
+LEFT JOIN v0211       v0228  ON v0228.v0177  = v0126.v0177
+LEFT JOIN v0214    v0230  ON v0230.v0177  = v0126.v0177
+LEFT JOIN v0216         v0232 ON v0232.v0177 = v0126.v0177
+LEFT JOIN v0217        v0077  ON v0077.v0177  = v0126.v0177
+LEFT JOIN v0222          v0235  ON v0235.v0177  = v0126.v0177
+LEFT JOIN v0223  v0237  ON v0237.v0177  = v0126.v0177
+LEFT JOIN v0225  v0239  ON v0239.v0177  = v0126.v0177
+GROUP BY v0126.v0208
+ORDER BY v0126.v0208 DESC
+
+-- query 030
+WITH
+  v0207 AS (
+    SELECT
+      v0075.id AS v0177,
+      CAST(date_trunc('day', CAST(v0075.v0084 AS TIMESTAMP)) AS DATE) AS v0208
+    FROM v0209 v0075
+    WHERE
+      v0075.v0060 IS NULL
+      AND v0075.v0084 >= '2026-07-07 00:00:00'
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0211 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0212 v0155
+    JOIN v0213 v0073
+      ON v0073.v0175 = v0155.id
+      AND v0073.type = 'value0072'
+      AND v0073.v0060 IS NULL
+    WHERE v0155.v0060 IS NULL
+  ),
+  v0214 AS (
+    SELECT DISTINCT v0177
+    FROM v0215
+    WHERE v0060 IS NULL
+  ),
+  v0216 AS (
+    SELECT DISTINCT v0094.v0177
+    FROM v0215 v0094
+    WHERE v0094.v0031 = 'value0073'
+      AND v0094.v0060 IS NULL
+  ),
+  v0217 AS (
+    SELECT DISTINCT v0218.v0177
+    FROM v0219 v0218
+    JOIN v0056 v0057 ON v0057.id = v0218.v0220
+    WHERE v0218.v0221 IS NOT NULL
+      AND v0057.v0201 = 0
+  ),
+  v0037 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0021'
+      AND v0040.v0047 IS NULL
+      AND v0040.v0041 >= CAST('2026-07-01 00:00:00' AS TIMESTAMP)
+      AND v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+  ),
+  v0048 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0022'
+      AND v0040.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+  ),
+  v0049 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+      AND v0000.v0050 IN (
+        'value0023',
+        'value0024',
+        'value0025'
+      )
+  ),
+  v0051 AS (
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0026') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0027'
+      AND json_get_str(v0000.Metadata, 'value0026') IS NOT NULL
+    UNION
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0028') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0029'
+      AND json_get_str(v0000.Metadata, 'value0028') IS NOT NULL
+  ),
+  v0052 AS (
+    SELECT v0039 FROM v0048
+    UNION SELECT v0039 FROM v0049
+    UNION SELECT v0039 FROM v0051
+  ),
+  v0222 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0056 v0057
+    JOIN v0212 v0155 ON v0155.id = v0057.v0175
+    JOIN v0037 v0054 ON v0054.v0039 = v0057.v0058
+    LEFT JOIN v0052 v0059 ON v0059.v0039 = v0057.v0058
+    WHERE v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+      AND v0059.v0039 IS NULL
+  ),
+  v0223 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0056 v0057
+    JOIN v0212 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0031 = 'value0074'
+      AND v0057.v0224 IS NULL
+      AND v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+  ),
+  v0225 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0056 v0057
+    JOIN v0212 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0031 IN (
+        'value0075',
+        'value0076'
+      )
+      AND v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+  ),
+  v0241 AS (
+    SELECT
+      v0126.v0208,
+      COUNT(*) AS v0227,
+      SUM(CASE WHEN v0228.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0229,
+      SUM(CASE WHEN v0230.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0231,
+      SUM(CASE WHEN v0232.v0177 IS NOT NULL THEN 1 ELSE 0 END) AS v0233,
+      SUM(CASE WHEN v0077.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0234,
+      SUM(CASE WHEN v0235.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0236,
+      SUM(CASE WHEN v0237.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0238,
+      SUM(CASE WHEN v0239.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0240
+    FROM v0207 v0126
+    LEFT JOIN v0211       v0228  ON v0228.v0177  = v0126.v0177
+    LEFT JOIN v0214    v0230  ON v0230.v0177  = v0126.v0177
+    LEFT JOIN v0216         v0232 ON v0232.v0177 = v0126.v0177
+    LEFT JOIN v0217        v0077  ON v0077.v0177  = v0126.v0177
+    LEFT JOIN v0222          v0235  ON v0235.v0177  = v0126.v0177
+    LEFT JOIN v0223  v0237  ON v0237.v0177  = v0126.v0177
+    LEFT JOIN v0225  v0239  ON v0239.v0177  = v0126.v0177
+    GROUP BY v0126.v0208
+  )
+SELECT
+  CAST(v0208 AS VARCHAR) AS v0226,
+  1.0 AS v0227,
+  CASE WHEN v0227 = 0 THEN NULL ELSE CAST(v0229      AS DOUBLE) / v0227 END AS v0229,
+  CASE WHEN v0227 = 0 THEN NULL ELSE CAST(v0231   AS DOUBLE) / v0227 END AS v0231,
+  CASE WHEN v0227 = 0 THEN NULL ELSE CAST(v0233 AS DOUBLE) / v0227 END AS v0233,
+  CASE WHEN v0227 = 0 THEN NULL ELSE CAST(v0234 AS DOUBLE) / v0227 END AS v0234,
+  CASE WHEN v0227 = 0 THEN NULL ELSE CAST(v0236         AS DOUBLE) / v0227 END AS v0236,
+  CASE WHEN v0227 = 0 THEN NULL ELSE CAST(v0238 AS DOUBLE) / v0227 END AS v0238,
+  CASE WHEN v0227 = 0 THEN NULL ELSE CAST(v0240 AS DOUBLE) / v0227 END AS v0240
+FROM v0241
+ORDER BY v0208 DESC
+
+-- query 031
+WITH v0242 AS (
+  SELECT
+    CAST(DATE_TRUNC('MONTH', CAST(v0057.v0172 AS TIMESTAMP)) AS DATE) AS v0243,
+    COUNT(*) AS v0244,
+    SUM(CAST(v0006 AS DOUBLE)) / 100.0 AS v0245
+  FROM v0246 v0057
+  WHERE v0057.v0060 IS NULL
+    AND v0057.v0172 >= DATE '2023-01-01'
+  GROUP BY 1
+),
+v0037 AS (
+  SELECT
+    v0000.v0038 AS v0039,
+    MIN(v0198.Timestamp) AS v0042
+  FROM v0043 v0040
+  JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+  JOIN v0199 v0198 ON v0198.v0200 = v0040.v0200
+  WHERE v0040.v0046 = 'value0021'
+    AND v0040.v0047 IS NULL
+    AND v0040.v0041 >= CAST('2023-01-01 00:00:00' AS TIMESTAMP)
+    AND v0000.v0047 IS NULL
+    AND v0000.v0038 IS NOT NULL
+    AND v0198.Account = 'value0068'
+    AND v0198.v0047 IS NULL
+  GROUP BY v0000.v0038
+),
+v0048 AS (
+  SELECT DISTINCT v0000.v0038 AS v0039
+  FROM v0043 v0040
+  JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+  WHERE v0040.v0046 = 'value0022'
+    AND v0040.v0047 IS NULL
+    AND v0000.v0038 IS NOT NULL
+),
+v0049 AS (
+  SELECT DISTINCT v0000.v0038 AS v0039
+  FROM v0044 v0000
+  WHERE v0000.v0047 IS NULL
+    AND v0000.v0038 IS NOT NULL
+    AND v0000.v0050 IN (
+      'value0023',
+      'value0024',
+      'value0025'
+    )
+),
+v0051 AS (
+  SELECT DISTINCT json_get_str(v0000.Metadata, 'value0026') AS v0039
+  FROM v0044 v0000
+  WHERE v0000.v0047 IS NULL
+    AND v0000.v0050 = 'value0027'
+    AND json_get_str(v0000.Metadata, 'value0026') IS NOT NULL
+  UNION
+  SELECT DISTINCT json_get_str(v0000.Metadata, 'value0028') AS v0039
+  FROM v0044 v0000
+  WHERE v0000.v0047 IS NULL
+    AND v0000.v0050 = 'value0029'
+    AND json_get_str(v0000.Metadata, 'value0028') IS NOT NULL
+),
+v0052 AS (
+  SELECT v0039 FROM v0048
+  UNION SELECT v0039 FROM v0049
+  UNION SELECT v0039 FROM v0051
+),
+v0247 AS (
+  SELECT
+    CAST(DATE_TRUNC('MONTH', v0054.v0042) AS DATE) AS v0243,
+    COUNT(*) AS v0248
+  FROM v0037 v0054
+  LEFT JOIN v0052 v0059 ON v0059.v0039 = v0054.v0039
+  WHERE v0059.v0039 IS NULL
+  GROUP BY 1
+),
+v0249 AS (
+  SELECT DISTINCT
+    CAST(DATE_TRUNC('MONTH', CAST(v0057.v0172 AS TIMESTAMP)) AS DATE) AS v0243,
+    v0075.v0058 AS v0171
+  FROM v0246 v0057
+  INNER JOIN v0174 v0155 ON v0155.id = v0057.v0175
+  INNER JOIN v0176 v0075 ON v0075.id = v0155.v0177
+  WHERE v0057.v0060 IS NULL
+    AND v0057.v0172 >= DATE '2023-01-01'
+),
+v0250 AS (
+  SELECT v0243, v0171
+  FROM v0249
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY v0171 ORDER BY v0243 DESC) = 1
+),
+v0251 AS (
+  SELECT
+    v0113.v0243,
+    v0252.v0171,
+    GREATEST(MAX(COALESCE(v0252.v0253, 0)), 0) AS v0254
+  FROM v0250 v0113
+  INNER JOIN v0255 v0252 ON v0252.v0171 = v0113.v0171
+  GROUP BY v0113.v0243, v0252.v0171
+),
+v0256 AS (
+  SELECT v0243, SUM(v0254) AS v0257 FROM v0251 GROUP BY v0243
+),
+v0258 AS (
+  SELECT v0075.v0058 AS v0171
+  FROM v0246 v0057
+  INNER JOIN v0174 v0155 ON v0155.id = v0057.v0175
+  INNER JOIN v0176 v0075 ON v0075.id = v0155.v0177
+  WHERE v0057.v0060 IS NULL
+  GROUP BY v0075.v0058
+  HAVING MAX(v0057.v0201) = 0
+),
+v0259 AS (
+  SELECT
+    v0075.v0058 AS v0171,
+    SUM(CAST(v0057.v0006 AS DOUBLE)) AS v0260
+  FROM v0246 v0057
+  INNER JOIN v0174 v0155 ON v0155.id = v0057.v0175
+  INNER JOIN v0176 v0075 ON v0075.id = v0155.v0177
+  INNER JOIN v0258 v0261 ON v0261.v0171 = v0075.v0058
+  WHERE v0057.v0201 = 0
+    AND v0057.v0060 IS NULL
+    AND v0057.v0172 <= CURRENT_DATE
+    AND v0057.v0031 NOT IN (
+      'value0077',
+      'value0078',
+      'value0079'
+    )
+  GROUP BY v0075.v0058
+),
+v0262 AS (
+  SELECT
+    v0263.v0243,
+    SUM(v0264.v0260) / 100.0 AS v0265
+  FROM v0250 v0263
+  INNER JOIN v0259 v0264 USING (v0171)
+  GROUP BY v0263.v0243
+),
+v0266 AS (
+  SELECT DISTINCT v0243 FROM (
+    SELECT v0243 FROM v0242
+    UNION ALL
+    SELECT v0243 FROM v0247
+    UNION ALL
+    SELECT v0243 FROM v0262
+  ) v0072
+)
+SELECT
+  CAST(v0096.v0243 AS TEXT) AS v0267,
+  v0268.v0248 AS v0269,
+  v0270.v0244,
+  v0270.v0245,
+  COALESCE(v0271.v0257, 0) / 100.0 AS v0272,
+  CASE WHEN v0270.v0245 > 0
+    THEN (COALESCE(v0271.v0257, 0) / 100.0) / v0270.v0245
+    ELSE NULL END AS v0273,
+  CASE WHEN v0270.v0245 > 0
+    THEN v0274.v0265 / v0270.v0245
+    ELSE NULL END AS v0275
+FROM v0266 v0096
+LEFT JOIN v0242 v0270 ON v0270.v0243 = v0096.v0243
+LEFT JOIN v0247 v0268 ON v0268.v0243 = v0096.v0243
+LEFT JOIN v0256 v0271 ON v0271.v0243 = v0096.v0243
+LEFT JOIN v0262 v0274 ON v0274.v0243 = v0096.v0243
+WHERE v0096.v0243 <= CAST(DATE_TRUNC('MONTH', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE)
+ORDER BY v0096.v0243 DESC
+
+-- query 032
+WITH v0276 AS (
+  SELECT
+    CAST(DATE_TRUNC('MONTH', CAST(v0057.v0172 AS TIMESTAMP)) AS DATE) AS v0243,
+    CASE WHEN v0057.v0201 > 10 THEN 10 ELSE v0057.v0201 END AS v0277,
+    v0075.v0058 AS v0171,
+    CAST(v0057.v0006 AS DOUBLE) / 100.0 AS v0278
+  FROM v0246 AS v0057
+  INNER JOIN v0174 AS v0155 ON v0155.id = v0057.v0175
+  INNER JOIN v0176 AS v0075 ON v0075.id = v0155.v0177
+  WHERE v0057.v0060 IS NULL
+    AND v0057.v0172 >= CAST('2024-01-01' AS DATE)
+    AND v0057.v0031 NOT IN ('value0075', 'value0076', 'value0080')
+), v0279 AS (
+  SELECT
+    v0171,
+    MAX(v0243) AS v0280
+  FROM v0276
+  GROUP BY v0171
+), v0281 AS (
+  SELECT
+    v0282.v0243,
+    v0282.v0277,
+    v0282.v0171,
+    MAX(CAST(v0252.v0253 AS DOUBLE)) / 100.0 AS v0283
+  FROM v0276 AS v0282
+  INNER JOIN v0279 AS v0284
+    ON v0284.v0171 = v0282.v0171
+    AND v0282.v0243 = v0284.v0280
+  LEFT JOIN v0255 AS v0252 ON v0252.v0171 = v0282.v0171
+  GROUP BY v0282.v0243, v0282.v0277, v0282.v0171
+), v0285 AS (
+  SELECT v0243, v0277, SUM(v0278) AS v0286
+  FROM v0276
+  GROUP BY v0243, v0277
+), v0287 AS (
+  SELECT
+    v0288.v0243,
+    v0288.v0277,
+    SUM(CASE WHEN v0288.v0283 > 0 THEN v0288.v0283 END) AS v0289
+  FROM v0281 AS v0288
+  GROUP BY v0288.v0243, v0288.v0277
+)
+SELECT
+  CAST(v0290.v0243 AS TEXT) AS v0267,
+  MAX(CASE WHEN v0290.v0277 = 0  THEN v0290.v0289 / NULLIF(v0291.v0286, 0) END) AS "v0292",
+  MAX(CASE WHEN v0290.v0277 = 1  THEN v0290.v0289 / NULLIF(v0291.v0286, 0) END) AS "v0293",
+  MAX(CASE WHEN v0290.v0277 = 2  THEN v0290.v0289 / NULLIF(v0291.v0286, 0) END) AS "v0294",
+  MAX(CASE WHEN v0290.v0277 = 3  THEN v0290.v0289 / NULLIF(v0291.v0286, 0) END) AS "v0295",
+  MAX(CASE WHEN v0290.v0277 = 4  THEN v0290.v0289 / NULLIF(v0291.v0286, 0) END) AS "v0296",
+  MAX(CASE WHEN v0290.v0277 = 5  THEN v0290.v0289 / NULLIF(v0291.v0286, 0) END) AS "v0297",
+  MAX(CASE WHEN v0290.v0277 = 6  THEN v0290.v0289 / NULLIF(v0291.v0286, 0) END) AS "v0298",
+  MAX(CASE WHEN v0290.v0277 = 7  THEN v0290.v0289 / NULLIF(v0291.v0286, 0) END) AS "v0299",
+  MAX(CASE WHEN v0290.v0277 = 8  THEN v0290.v0289 / NULLIF(v0291.v0286, 0) END) AS "v0300",
+  MAX(CASE WHEN v0290.v0277 = 9  THEN v0290.v0289 / NULLIF(v0291.v0286, 0) END) AS "v0301",
+  MAX(CASE WHEN v0290.v0277 = 10 THEN v0290.v0289 / NULLIF(v0291.v0286, 0) END) AS "v0302"
+FROM v0287 AS v0290
+JOIN v0285 AS v0291 ON v0291.v0243 = v0290.v0243 AND v0291.v0277 = v0290.v0277
+WHERE v0290.v0243 < CAST(DATE_TRUNC('MONTH', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE)
+GROUP BY v0290.v0243
+ORDER BY v0290.v0243 DESC
+LIMIT 200
+
+-- query 033
+WITH v0285 AS (
+  SELECT
+    CAST(DATE_TRUNC('MONTH', CAST(v0172 AS TIMESTAMP)) AS DATE) AS v0303,
+    SUM(v0006) / 100.0 AS v0304
+  FROM v0246
+  WHERE
+    v0060 IS NULL
+    AND v0031 NOT IN ('value0081', 'value0082', 'value0083')
+    AND v0172 >= CAST('2024-01-01' AS DATE)
+    AND v0172 < CAST(DATE_TRUNC('MONTH', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE)
+  GROUP BY
+    1
+), v0305 AS (
+  SELECT
+    "v0306" AS v0171,
+    SUM(
+      CASE
+        WHEN Account = 'value0068'
+        THEN COALESCE(v0307, 0) - COALESCE(v0308, 0)
+        ELSE 0
+      END
+    ) AS v0309
+  FROM v0310
+  WHERE
+    Account IN ('value0068')
+    AND v0311 IN ('value0084', 'value0085')
+    AND Timestamp <= CAST(CURRENT_DATE - INTERVAL '2' DAY AS TIMESTAMP)
+    AND NOT (
+      v0311 = 'value0084'
+      AND COALESCE(v0307, 0) > 0
+      AND Timestamp >= CAST(CURRENT_DATE - INTERVAL '2' DAY AS TIMESTAMP) - INTERVAL '1' DAY
+    )
+  GROUP BY
+    "v0306"
+), v0312 AS (
+  SELECT
+    v0171,
+    (
+      CASE WHEN COALESCE(v0309, 0) < 0 THEN 0 ELSE COALESCE(v0309, 0) END
+    ) / 100.0 AS v0313
+  FROM v0305
+), v0314 AS (
+  SELECT
+    v0075.v0058 AS v0171,
+    v0057.v0172 AS v0315,
+    CAST(v0057.v0201 AS INT) AS v0316
+  FROM v0246 AS v0057
+  JOIN v0317 AS v0318
+    ON v0057.v0319 = v0318.id
+  JOIN v0176 AS v0075
+    ON v0318.v0177 = v0075.id
+  WHERE
+    v0057.v0060 IS NULL AND v0075.v0060 IS NULL AND v0318.v0060 IS NULL
+    AND v0057.v0031 NOT IN ('value0081', 'value0082', 'value0083')
+  QUALIFY
+    ROW_NUMBER() OVER (PARTITION BY v0075.v0058 ORDER BY v0057.v0172 DESC) = 1
+), v0320 AS (
+  SELECT
+    CAST(DATE_TRUNC('MONTH', CAST(v0321.v0315 AS TIMESTAMP)) AS DATE) AS v0303,
+    CASE WHEN v0321.v0316 >= 10 THEN 10 ELSE v0321.v0316 END AS v0277,
+    SUM(v0252.v0313) AS v0313
+  FROM v0314 AS v0321
+  LEFT JOIN v0312 AS v0252
+    ON v0252.v0171 = v0321.v0171
+  WHERE
+    v0321.v0315 < CAST(DATE_TRUNC('MONTH', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE)
+  GROUP BY
+    1,
+    2
+)
+SELECT
+  CAST(v0073.v0303 AS TEXT) AS v0322,
+  SUM(CASE WHEN v0057.v0277 = 0 THEN COALESCE(v0057.v0313, 0) END) / NULLIF(v0073.v0304, 0) AS v0292,
+  SUM(CASE WHEN v0057.v0277 = 1 THEN COALESCE(v0057.v0313, 0) END) / NULLIF(v0073.v0304, 0) AS v0293,
+  SUM(CASE WHEN v0057.v0277 = 2 THEN COALESCE(v0057.v0313, 0) END) / NULLIF(v0073.v0304, 0) AS v0294,
+  SUM(CASE WHEN v0057.v0277 = 3 THEN COALESCE(v0057.v0313, 0) END) / NULLIF(v0073.v0304, 0) AS v0295,
+  SUM(CASE WHEN v0057.v0277 = 4 THEN COALESCE(v0057.v0313, 0) END) / NULLIF(v0073.v0304, 0) AS v0296,
+  SUM(CASE WHEN v0057.v0277 = 5 THEN COALESCE(v0057.v0313, 0) END) / NULLIF(v0073.v0304, 0) AS v0297,
+  SUM(CASE WHEN v0057.v0277 = 6 THEN COALESCE(v0057.v0313, 0) END) / NULLIF(v0073.v0304, 0) AS v0298,
+  SUM(CASE WHEN v0057.v0277 = 7 THEN COALESCE(v0057.v0313, 0) END) / NULLIF(v0073.v0304, 0) AS v0299,
+  SUM(CASE WHEN v0057.v0277 = 8 THEN COALESCE(v0057.v0313, 0) END) / NULLIF(v0073.v0304, 0) AS v0300,
+  SUM(CASE WHEN v0057.v0277 = 9 THEN COALESCE(v0057.v0313, 0) END) / NULLIF(v0073.v0304, 0) AS v0301,
+  SUM(CASE WHEN v0057.v0277 = 10 THEN COALESCE(v0057.v0313, 0) END) / NULLIF(v0073.v0304, 0) AS v0302
+FROM v0285 AS v0073
+LEFT JOIN v0320 AS v0057
+  ON v0057.v0303 = v0073.v0303
+GROUP BY
+  v0073.v0303,
+  v0073.v0304
+ORDER BY
+  v0073.v0303 DESC
+
+-- query 034
+WITH v0064 AS (
+  SELECT
+    DATE_TRUNC('MONTH', CAST(v0323 AS TIMESTAMP)) AS v0324,
+    SUM(CASE WHEN v0325 = 'value0086' THEN 1 ELSE 0 END) AS v0195,
+    SUM(CASE WHEN v0325 = 'value0087' THEN 1 ELSE 0 END) AS v0197
+  FROM v0326
+  WHERE v0030 = 1
+    AND v0323 >= DATE_TRUNC('MONTH', CURRENT_DATE) - INTERVAL '11 months'
+  GROUP BY 1
+),
+v0327 AS (
+  SELECT
+    JSON_GET_STR(data, 'value0045') AS v0119,
+    DATE_TRUNC('MONTH', CAST(JSON_GET_STR(data, 'value0088') AS TIMESTAMP)) AS v0324,
+    JSON_GET_STR(data, 'value0033') AS status,
+    JSON_GET_STR(data, 'value0089') AS v0328
+  FROM v0089
+  WHERE type = 'value0035'
+    AND CAST(v0090 AS DATE) >= CAST(DATE_TRUNC('MONTH', CURRENT_DATE) - INTERVAL '11 months' AS DATE)
+    AND JSON_GET_STR(data, 'value0047') = 'value0048'
+    AND JSON_GET_STR(data, 'value0090') LIKE 'value0052%'
+),
+v0329 AS (
+  SELECT
+    v0119,
+    v0324,
+    status,
+    v0328,
+    ROW_NUMBER() OVER (
+      PARTITION BY v0119
+      ORDER BY CASE status
+        WHEN 'value0039' THEN 1
+        WHEN 'value0041' THEN 2
+        WHEN 'value0091' THEN 3
+        WHEN 'value0053' THEN 4
+        ELSE 5
+      END
+    ) AS v0330
+  FROM v0327
+),
+v0331 AS (
+  SELECT
+    v0324,
+    COUNT(*) AS v0331
+  FROM v0329
+  WHERE v0330 = 1
+    AND status = 'value0039'
+    AND (
+      v0328 LIKE 'value0092%'
+      OR v0328 LIKE 'value0093%'
+      OR v0328 LIKE 'value0094%'
+      OR v0328 LIKE 'value0095%'
+    )
+  GROUP BY 1
+)
+SELECT
+  COALESCE(v0064.v0324, v0331.v0324) AS v0324,
+  COALESCE(v0064.v0195, 0) AS v0195,
+  COALESCE(v0064.v0197, 0) AS v0197,
+  COALESCE(v0331.v0331, 0) AS v0331
+FROM v0064
+FULL OUTER JOIN v0331 ON v0064.v0324 = v0331.v0324
+ORDER BY 1
+
+-- query 035
+WITH v0332 AS (
+  SELECT
+    JSON_GET_STR(data, 'value0045') AS v0119,
+    DATE_TRUNC('MONTH', CAST(JSON_GET_STR(data, 'value0088') AS TIMESTAMP)) AS v0333,
+    JSON_GET_STR(data, 'value0033') AS status,
+    JSON_GET_STR(data, 'value0089') AS v0328
+  FROM v0089
+  WHERE
+    type = 'value0035'
+    AND v0090 >= CAST('2025-09-01' AS TIMESTAMP)
+    AND v0090 < CAST('2026-09-01' AS TIMESTAMP)
+    AND JSON_GET_STR(data, 'value0047') = 'value0048'
+    AND JSON_GET_STR(data, 'value0090') LIKE 'value0052%'
+), v0334 AS (
+  SELECT
+    v0119,
+    v0333,
+    status,
+    v0328,
+    ROW_NUMBER() OVER (
+      PARTITION BY v0119
+      ORDER BY CASE status
+        WHEN 'value0039'
+        THEN 1
+        WHEN 'value0041'
+        THEN 2
+        WHEN 'value0091'
+        THEN 3
+        WHEN 'value0053'
+        THEN 4
+        ELSE 5
+      END
+    ) AS v0330
+  FROM v0332
+), final AS (
+  SELECT
+    v0119,
+    v0333,
+    status,
+    CASE
+      WHEN v0328 IS NULL OR v0328 = ''
+      THEN 'value0096'
+      WHEN REGEXP_MATCH(v0328, '^R[0-9]{2}') IS NOT NULL
+      THEN SUBSTRING(v0328, 1, 3)
+      WHEN LOWER(v0328) LIKE '%value0097%'
+      THEN 'value0098'
+      WHEN LOWER(v0328) LIKE '%value0099 value0100%'
+      THEN 'value0101'
+      WHEN LOWER(v0328) LIKE '%value0102%'
+      THEN 'value0103'
+      ELSE 'value0104'
+    END AS v0335
+  FROM v0334
+  WHERE
+    v0330 = 1
+)
+SELECT
+  SUBSTRING(CAST(v0333 AS TEXT), 1, 7) AS month,
+  COUNT(*) AS v0336,
+  COUNT(CASE WHEN status = 'value0039' AND v0335 = 'value0098' THEN 1 END) AS v0337,
+  COUNT(
+    CASE
+      WHEN status = 'value0039' AND v0335 IN ('value0092', 'value0093', 'value0094', 'value0095')
+      THEN 1
+    END
+  ) AS v0338,
+  CAST(COUNT(CASE WHEN status = 'value0039' AND v0335 = 'value0098' THEN 1 END) AS DOUBLE) / COUNT(*) AS v0339,
+  CAST(COUNT(
+    CASE
+      WHEN status = 'value0039' AND v0335 IN ('value0092', 'value0093', 'value0094', 'value0095')
+      THEN 1
+    END
+  ) AS DOUBLE) / COUNT(*) AS v0340
+FROM final
+GROUP BY
+  v0333
+ORDER BY
+  v0333 DESC
+
+-- query 036
+WITH
+  v0207 AS (
+    SELECT
+      v0075.id AS v0177,
+      v0075.v0058 AS v0171,
+      CAST(date_trunc('day', CAST(v0075.v0084 AS TIMESTAMP)) AS DATE) AS v0208
+    FROM v0209 v0075
+    WHERE
+      v0075.v0060 IS NULL
+      AND v0075.v0084 >= '2026-07-07 00:00:00'
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0211 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0212 v0155
+    JOIN v0213 v0073
+      ON v0073.v0175 = v0155.id
+      AND v0073.type = 'value0072'
+      AND v0073.v0060 IS NULL
+    WHERE v0155.v0060 IS NULL
+  ),
+  v0214 AS (
+    SELECT DISTINCT v0177
+    FROM v0215
+    WHERE v0060 IS NULL
+  ),
+  v0216 AS (
+    SELECT DISTINCT v0094.v0177
+    FROM v0215 v0094
+    WHERE v0094.v0031 = 'value0073'
+      AND v0094.v0060 IS NULL
+  ),
+  v0217 AS (
+    SELECT DISTINCT v0218.v0177
+    FROM v0219 v0218
+    JOIN v0056 v0057 ON v0057.id = v0218.v0220
+    WHERE v0218.v0221 IS NOT NULL
+      AND v0057.v0201 = 0
+  ),
+  v0037 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0021'
+      AND v0040.v0047 IS NULL
+      AND v0040.v0041 >= CAST('2026-07-01 00:00:00' AS TIMESTAMP)
+      AND v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+  ),
+  v0048 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0022'
+      AND v0040.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+  ),
+  v0049 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+      AND v0000.v0050 IN (
+        'value0023',
+        'value0024',
+        'value0025'
+      )
+  ),
+  v0051 AS (
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0026') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0027'
+      AND json_get_str(v0000.Metadata, 'value0026') IS NOT NULL
+    UNION
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0028') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0029'
+      AND json_get_str(v0000.Metadata, 'value0028') IS NOT NULL
+  ),
+  v0052 AS (
+    SELECT v0039 FROM v0048
+    UNION SELECT v0039 FROM v0049
+    UNION SELECT v0039 FROM v0051
+  ),
+  v0222 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0056 v0057
+    JOIN v0212 v0155 ON v0155.id = v0057.v0175
+    JOIN v0037 v0054 ON v0054.v0039 = v0057.v0058
+    LEFT JOIN v0052 v0059 ON v0059.v0039 = v0057.v0058
+    WHERE v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+      AND v0059.v0039 IS NULL
+  ),
+  v0223 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0056 v0057
+    JOIN v0212 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0031 = 'value0074'
+      AND v0057.v0224 IS NULL
+      AND v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+  ),
+  v0225 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0056 v0057
+    JOIN v0212 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0031 IN (
+        'value0075',
+        'value0076'
+      )
+      AND v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+  )
+SELECT
+  CAST(v0126.v0208 AS VARCHAR) AS v0226,
+  COUNT(*) AS v0227,
+  SUM(CASE WHEN v0228.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0229,
+  SUM(CASE WHEN v0230.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0231,
+  SUM(CASE WHEN v0232.v0177 IS NOT NULL THEN 1 ELSE 0 END) AS v0233,
+  SUM(CASE WHEN v0077.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0234,
+  SUM(CASE WHEN v0235.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0236,
+  SUM(CASE WHEN v0237.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0238,
+  SUM(CASE WHEN v0239.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0240
+FROM v0207 v0126
+LEFT JOIN v0211       v0228  ON v0228.v0177  = v0126.v0177
+LEFT JOIN v0214    v0230  ON v0230.v0177  = v0126.v0177
+LEFT JOIN v0216         v0232 ON v0232.v0177 = v0126.v0177
+LEFT JOIN v0217        v0077  ON v0077.v0177  = v0126.v0177
+LEFT JOIN v0222          v0235  ON v0235.v0177  = v0126.v0177
+LEFT JOIN v0223  v0237  ON v0237.v0177  = v0126.v0177
+LEFT JOIN v0225  v0239  ON v0239.v0177  = v0126.v0177
+GROUP BY v0126.v0208
+ORDER BY v0126.v0208 DESC
+
+-- query 037
+WITH v0341 AS (
+  SELECT
+    v0058,
+    v0342,
+    extract(HOUR FROM v0342) AS v0343,
+    CASE WHEN json_get_str(v0210, 'value0105 value0106') = 'value0070' THEN 'value0070' ELSE 'value0069' END AS v0344,
+    CASE WHEN v0342 >= CURRENT_DATE THEN 1 ELSE 0 END AS v0345,
+    CASE WHEN v0342 >= CURRENT_DATE - INTERVAL '3 days'
+          AND v0342 <  CURRENT_DATE THEN 1 ELSE 0 END AS v0346
+  FROM v0209
+  WHERE v0347 = 'value0107'
+    AND v0060 IS NULL
+    AND v0342 >= CURRENT_DATE - INTERVAL '5 days'
+),
+v0348 AS (
+  SELECT v0343, v0344, COUNT(DISTINCT v0058) AS v0075 FROM v0341 WHERE v0345 = 1 GROUP BY v0343, v0344
+),
+past AS (
+  SELECT v0343, v0344, CAST(COUNT(DISTINCT v0058) AS DOUBLE) / 3.0 AS v0075 FROM v0341 WHERE v0346 = 1 GROUP BY v0343, v0344
+),
+v0097 AS (
+  SELECT v0343, v0344, CAST(v0075 AS DOUBLE) AS v0075, 'value0108' AS bucket FROM v0348
+  UNION ALL
+  SELECT v0343, v0344, v0075, 'value0109' AS bucket FROM past
+),
+v0349 AS (
+  SELECT
+    v0343 AS hour,
+    COALESCE(SUM(CASE WHEN v0344='value0069'     AND bucket='value0108'  THEN v0075 END), 0)  AS v0350,
+    COALESCE(SUM(CASE WHEN v0344='value0069'     AND bucket='value0109' THEN v0075 END), 0)  AS v0351,
+    COALESCE(SUM(CASE WHEN v0344='value0070' AND bucket='value0108'  THEN v0075 END), 0)  AS v0352,
+    COALESCE(SUM(CASE WHEN v0344='value0070' AND bucket='value0109' THEN v0075 END), 0)  AS v0353
+  FROM v0097
+  GROUP BY v0343
+)
+SELECT
+  hour,
+  SUM(v0350)         OVER (ORDER BY hour) AS v0350,
+  SUM(v0351)     OVER (ORDER BY hour) AS v0351,
+  SUM(v0352)     OVER (ORDER BY hour) AS v0352,
+  SUM(v0353) OVER (ORDER BY hour) AS v0353
+FROM v0349
+ORDER BY hour ASC
+
+-- query 038
+WITH
+  v0037 AS (
+    SELECT
+      v0000.v0038 AS v0039,
+      MIN(v0198.Timestamp) AS v0042
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    JOIN v0199 v0198 ON v0198.v0200 = v0040.v0200
+    WHERE v0040.v0046 = 'value0021'
+      AND v0040.v0047 IS NULL
+      AND v0040.v0041 >= CAST('2026-08-15 00:00:00' AS TIMESTAMP)
+      AND v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+      AND v0198.Account = 'value0068'
+      AND v0198.v0047 IS NULL
+    GROUP BY v0000.v0038
+  ),
+  v0048 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0022'
+      AND v0040.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+  ),
+  v0049 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+      AND v0000.v0050 IN (
+        'value0023',
+        'value0024',
+        'value0025'
+      )
+  ),
+  v0051 AS (
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0026') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0027'
+      AND json_get_str(v0000.Metadata, 'value0026') IS NOT NULL
+    UNION
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0028') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0029'
+      AND json_get_str(v0000.Metadata, 'value0028') IS NOT NULL
+  ),
+  v0052 AS (
+    SELECT v0039 FROM v0048
+    UNION SELECT v0039 FROM v0049
+    UNION SELECT v0039 FROM v0051
+  ),
+  v0354 AS (
+    SELECT
+      extract(HOUR FROM v0057.v0084) AS v0343,
+      CAST(v0057.v0084 AS DATE) AS v0113
+    FROM v0056 v0057
+    JOIN v0174 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+      AND CAST(v0057.v0084 AS DATE) >= CURRENT_DATE - INTERVAL '4 days'
+      AND CAST(v0057.v0084 AS DATE) <= CURRENT_DATE
+  ),
+  v0355 AS (
+    SELECT
+      extract(HOUR FROM v0054.v0042) AS v0343,
+      CAST(v0054.v0042 AS DATE) AS v0113
+    FROM v0056 v0057
+    JOIN v0037 v0054 ON v0054.v0039 = v0057.v0058
+    LEFT JOIN v0052 v0059 ON v0059.v0039 = v0057.v0058
+    JOIN v0174 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+      AND v0059.v0039 IS NULL
+      AND CAST(v0054.v0042 AS DATE) >= CURRENT_DATE - INTERVAL '4 days'
+      AND CAST(v0054.v0042 AS DATE) <= CURRENT_DATE
+  ),
+  hours AS (
+    SELECT 0 AS v0343 UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3
+    UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7
+    UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10 UNION ALL SELECT 11
+    UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+    UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19
+    UNION ALL SELECT 20 UNION ALL SELECT 21 UNION ALL SELECT 22 UNION ALL SELECT 23
+  ),
+  v0349 AS (
+    SELECT
+      v0356.v0343 AS hour,
+      (SELECT COUNT(*) FROM v0354  WHERE v0354.v0113  = CURRENT_DATE AND v0354.v0343  = v0356.v0343) AS v0357,
+      CAST((SELECT COUNT(*) FROM v0354  WHERE v0354.v0113  BETWEEN CURRENT_DATE - INTERVAL '3 days' AND CURRENT_DATE - INTERVAL '1 day' AND v0354.v0343  = v0356.v0343) AS DOUBLE) / 3.0 AS v0358,
+      (SELECT COUNT(*) FROM v0355 WHERE v0355.v0113 = CURRENT_DATE AND v0355.v0343 = v0356.v0343) AS v0359,
+      CAST((SELECT COUNT(*) FROM v0355 WHERE v0355.v0113 BETWEEN CURRENT_DATE - INTERVAL '3 days' AND CURRENT_DATE - INTERVAL '1 day' AND v0355.v0343 = v0356.v0343) AS DOUBLE) / 3.0 AS v0360
+    FROM hours v0356
+  )
+SELECT
+  hour,
+  SUM(v0357)  OVER (ORDER BY hour) AS v0357,
+  SUM(v0358)    OVER (ORDER BY hour) AS v0358,
+  SUM(v0359) OVER (ORDER BY hour) AS v0359,
+  SUM(v0360)   OVER (ORDER BY hour) AS v0360
+FROM v0349
+ORDER BY hour ASC
+
+-- query 039
+WITH
+  v0037 AS (
+    SELECT
+      v0000.v0038 AS v0039,
+      MIN(v0198.Timestamp) AS v0042
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    JOIN v0199 v0198 ON v0198.v0200 = v0040.v0200
+    WHERE v0040.v0046 = 'value0021'
+      AND v0040.v0047 IS NULL
+      AND v0040.v0041 >= CAST('2026-07-01 00:00:00' AS TIMESTAMP)
+      AND v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+      AND v0198.Account = 'value0068'
+      AND v0198.v0047 IS NULL
+    GROUP BY v0000.v0038
+  ),
+  v0048 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0022'
+      AND v0040.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+  ),
+  v0049 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+      AND v0000.v0050 IN (
+        'value0023',
+        'value0024',
+        'value0025'
+      )
+  ),
+  v0051 AS (
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0026') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0027'
+      AND json_get_str(v0000.Metadata, 'value0026') IS NOT NULL
+    UNION
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0028') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0029'
+      AND json_get_str(v0000.Metadata, 'value0028') IS NOT NULL
+  ),
+  v0052 AS (
+    SELECT v0039 FROM v0048
+    UNION SELECT v0039 FROM v0049
+    UNION SELECT v0039 FROM v0051
+  ),
+  v0053 AS (
+    SELECT
+      v0057.v0201,
+      CAST(v0054.v0042 AS DATE) AS v0113
+    FROM v0037 v0054
+    LEFT JOIN v0052 v0059 ON v0059.v0039 = v0054.v0039
+    JOIN v0056 v0057 ON v0057.v0058 = v0054.v0039
+    WHERE v0059.v0039 IS NULL
+      AND v0057.v0060 IS NULL
+      AND CAST(v0054.v0042 AS DATE) >= DATE '2026-07-10'
+  )
+SELECT
+  lpad(CAST(date_part('month', v0113) AS VARCHAR), 2, '0') || '-' ||
+  lpad(CAST(date_part('day', v0113) AS VARCHAR), 2, '0') AS v0361,
+  SUM(CASE WHEN v0201 = 0 THEN 1 ELSE 0 END) AS v0362,
+  SUM(CASE WHEN v0201 > 0 THEN 1 ELSE 0 END) AS v0363,
+  COUNT(*) AS v0364
+FROM v0053
+GROUP BY v0113
+ORDER BY v0113 DESC
+
+-- query 040
+WITH
+  v0037 AS (
+    SELECT
+      v0000.v0038 AS v0039,
+      MIN(v0198.Timestamp) AS v0042
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    JOIN v0199 v0198 ON v0198.v0200 = v0040.v0200
+    WHERE v0040.v0046 = 'value0021'
+      AND v0040.v0047 IS NULL
+      AND v0040.v0041 >= CAST('2025-08-11 00:00:00' AS TIMESTAMP)
+      AND v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+      AND v0198.Account = 'value0068'
+      AND v0198.v0047 IS NULL
+    GROUP BY v0000.v0038
+  ),
+  v0048 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0022'
+      AND v0040.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+  ),
+  v0049 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+      AND v0000.v0050 IN (
+        'value0023',
+        'value0024',
+        'value0025'
+      )
+  ),
+  v0051 AS (
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0026') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0027'
+      AND json_get_str(v0000.Metadata, 'value0026') IS NOT NULL
+    UNION
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0028') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0029'
+      AND json_get_str(v0000.Metadata, 'value0028') IS NOT NULL
+  ),
+  v0052 AS (
+    SELECT v0039 FROM v0048
+    UNION SELECT v0039 FROM v0049
+    UNION SELECT v0039 FROM v0051
+  ),
+  v0053 AS (
+    SELECT
+      CAST(v0054.v0042 AS DATE) AS v0365
+    FROM v0056 v0057
+    JOIN v0037 v0054 ON v0054.v0039 = v0057.v0058
+    LEFT JOIN v0052 v0059 ON v0059.v0039 = v0057.v0058
+    WHERE v0057.v0060 IS NULL
+      AND v0059.v0039 IS NULL
+      AND CAST(v0054.v0042 AS DATE) >= DATE '2025-08-11'
+  )
+SELECT
+  CAST(CAST(date_trunc('week', CAST(v0365 AS TIMESTAMP)) AS DATE) AS VARCHAR) AS v0065,
+  COUNT(*) AS v0364
+FROM v0053
+GROUP BY CAST(CAST(date_trunc('week', CAST(v0365 AS TIMESTAMP)) AS DATE) AS VARCHAR)
+ORDER BY v0065 ASC
+
+-- query 041
+WITH v0366 AS (
+  SELECT v0177, MIN(v0367) AS v0368
+  FROM v0369
+  WHERE v0060 IS NULL AND v0367 IS NOT NULL
+  GROUP BY v0177
+),
+v0370 AS (
+  SELECT v0094.v0177, v0094.v0031, v0094.v0367
+  FROM v0369 v0094
+  JOIN v0366 v0132
+    ON v0094.v0177 = v0132.v0177
+   AND v0094.v0367 = v0132.v0368
+  WHERE v0094.v0060 IS NULL
+    AND (
+      v0094.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+      OR (
+        v0094.v0367 >= CURRENT_DATE - INTERVAL '37' DAYS
+        AND v0094.v0367 < CURRENT_DATE - INTERVAL '30' DAYS
+      )
+    )
+)
+SELECT
+  CASE
+    WHEN v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+    THEN CAST(CAST(v0367 AS DATE) AS TEXT)
+    ELSE CAST(CAST(v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+  END AS v0371,
+  SUM(
+    COUNT(DISTINCT
+      CASE
+        WHEN v0031 = 'value0073'
+        AND v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN v0177
+      END
+    )
+  ) OVER (
+    ORDER BY MIN(
+      CASE
+        WHEN v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN CAST(CAST(v0367 AS DATE) AS TEXT)
+        ELSE CAST(CAST(v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+      END
+    )
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS v0372,
+  SUM(
+    COUNT(DISTINCT
+      CASE
+        WHEN v0031 = 'value0110'
+        AND v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN v0177
+      END
+    )
+  ) OVER (
+    ORDER BY MIN(
+      CASE
+        WHEN v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN CAST(CAST(v0367 AS DATE) AS TEXT)
+        ELSE CAST(CAST(v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+      END
+    )
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS v0373,
+  SUM(
+    COUNT(DISTINCT
+      CASE
+        WHEN v0031 = 'value0073'
+        AND v0367 < CURRENT_DATE - INTERVAL '30' DAYS
+        THEN v0177
+      END
+    )
+  ) OVER (
+    ORDER BY MIN(
+      CASE
+        WHEN v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN CAST(CAST(v0367 AS DATE) AS TEXT)
+        ELSE CAST(CAST(v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+      END
+    )
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS v0374,
+  SUM(
+    COUNT(DISTINCT
+      CASE
+        WHEN v0031 = 'value0110'
+        AND v0367 < CURRENT_DATE - INTERVAL '30' DAYS
+        THEN v0177
+      END
+    )
+  ) OVER (
+    ORDER BY MIN(
+      CASE
+        WHEN v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN CAST(CAST(v0367 AS DATE) AS TEXT)
+        ELSE CAST(CAST(v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+      END
+    )
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS v0375
+FROM v0370
+GROUP BY 1
+ORDER BY 1
+
+-- query 042
+WITH v0376 AS (
+  SELECT
+    v0377.v0177,
+    MIN(v0057.v0042) AS v0378
+  FROM v0246 AS v0057
+  JOIN v0369 AS v0377
+    ON v0377.id = v0057.v0379
+  WHERE v0057.v0060 IS NULL
+    AND v0057.v0380 IS NOT NULL
+  GROUP BY v0377.v0177
+),
+v0381 AS (
+  SELECT
+    v0377.v0367,
+    v0377.v0031
+  FROM v0369 AS v0377
+  JOIN v0376 AS v0382
+    ON v0382.v0177 = v0377.v0177
+  WHERE
+    v0377.v0060 IS NULL
+    AND v0377.version = 2
+    AND v0377.v0367 IS NOT NULL
+    AND v0382.v0378 < v0377.v0367
+    AND (
+      (v0377.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS)
+      OR (
+        v0377.v0367 >= CURRENT_DATE - INTERVAL '37' DAYS
+        AND v0377.v0367 < CURRENT_DATE - INTERVAL '30' DAYS
+      )
+    )
+)
+SELECT
+  CASE
+    WHEN v0383.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+    THEN CAST(CAST(v0383.v0367 AS DATE) AS TEXT)
+    ELSE CAST(CAST(v0383.v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+  END AS v0371,
+  SUM(
+    SUM(
+      CASE
+        WHEN v0383.v0031 = 'value0073'
+        AND v0383.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN 1
+        ELSE 0
+      END
+    )
+  ) OVER (
+    ORDER BY MIN(
+      CASE
+        WHEN v0383.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN CAST(CAST(v0383.v0367 AS DATE) AS TEXT)
+        ELSE CAST(CAST(v0383.v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+      END
+    )
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS v0372,
+  SUM(
+    SUM(
+      CASE
+        WHEN v0383.v0031 = 'value0110'
+        AND v0383.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN 1
+        ELSE 0
+      END
+    )
+  ) OVER (
+    ORDER BY MIN(
+      CASE
+        WHEN v0383.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN CAST(CAST(v0383.v0367 AS DATE) AS TEXT)
+        ELSE CAST(CAST(v0383.v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+      END
+    )
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS v0373,
+  SUM(
+    SUM(
+      CASE
+        WHEN v0383.v0031 = 'value0073'
+        AND v0383.v0367 < CURRENT_DATE - INTERVAL '30' DAYS
+        THEN 1
+        ELSE 0
+      END
+    )
+  ) OVER (
+    ORDER BY MIN(
+      CASE
+        WHEN v0383.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN CAST(CAST(v0383.v0367 AS DATE) AS TEXT)
+        ELSE CAST(CAST(v0383.v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+      END
+    )
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS v0374,
+  SUM(
+    SUM(
+      CASE
+        WHEN v0383.v0031 = 'value0110'
+        AND v0383.v0367 < CURRENT_DATE - INTERVAL '30' DAYS
+        THEN 1
+        ELSE 0
+      END
+    )
+  ) OVER (
+    ORDER BY MIN(
+      CASE
+        WHEN v0383.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN CAST(CAST(v0383.v0367 AS DATE) AS TEXT)
+        ELSE CAST(CAST(v0383.v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+      END
+    )
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS v0375
+FROM v0381 AS v0383
+GROUP BY
+  1
+ORDER BY
+  1
+
+-- query 043
+WITH
+  v0207 AS (
+    SELECT
+      v0075.id AS v0177,
+      CAST(date_trunc('week', CAST(v0075.v0084 AS TIMESTAMP)) AS DATE) AS v0384,
+      CASE
+        WHEN v0075.v0210 LIKE '%value0069%' THEN 'value0069'
+        WHEN v0075.v0210 LIKE '%value0070%' THEN 'value0070'
+      END AS v0385
+    FROM v0176 v0075
+    WHERE
+      v0075.v0060 IS NULL
+      AND v0075.v0084 >= DATE '2026-05-18'
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0386 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0246 v0057
+    JOIN v0174 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+  ),
+  v0037 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0021'
+      AND v0040.v0047 IS NULL
+      AND v0040.v0041 >= CAST('2026-05-11 00:00:00' AS TIMESTAMP)
+      AND v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+  ),
+  v0048 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0043 v0040
+    JOIN v0044 v0000 ON v0000.v0045 = v0040.v0045
+    WHERE v0040.v0046 = 'value0022'
+      AND v0040.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+  ),
+  v0049 AS (
+    SELECT DISTINCT v0000.v0038 AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0038 IS NOT NULL
+      AND v0000.v0050 IN (
+        'value0023',
+        'value0024',
+        'value0025'
+      )
+  ),
+  v0051 AS (
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0026') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0027'
+      AND json_get_str(v0000.Metadata, 'value0026') IS NOT NULL
+    UNION
+    SELECT DISTINCT json_get_str(v0000.Metadata, 'value0028') AS v0039
+    FROM v0044 v0000
+    WHERE v0000.v0047 IS NULL
+      AND v0000.v0050 = 'value0029'
+      AND json_get_str(v0000.Metadata, 'value0028') IS NOT NULL
+  ),
+  v0052 AS (
+    SELECT v0039 FROM v0048
+    UNION SELECT v0039 FROM v0049
+    UNION SELECT v0039 FROM v0051
+  ),
+  v0222 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0246 v0057
+    JOIN v0174 v0155 ON v0155.id = v0057.v0175
+    JOIN v0037 v0054 ON v0054.v0039 = v0057.v0058
+    LEFT JOIN v0052 v0059 ON v0059.v0039 = v0057.v0058
+    WHERE v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+      AND v0059.v0039 IS NULL
+  )
+SELECT
+  CAST(v0126.v0384 AS VARCHAR) AS week,
+  v0126.v0385,
+  COUNT(*) AS v0227,
+  SUM(CASE WHEN v0387.v0177 IS NOT NULL THEN 1 ELSE 0 END) AS v0388,
+  SUM(CASE WHEN v0235.v0177 IS NOT NULL THEN 1 ELSE 0 END) AS v0206,
+  CAST(SUM(CASE WHEN v0235.v0177 IS NOT NULL THEN 1 ELSE 0 END) AS DOUBLE)
+    / NULLIF(SUM(CASE WHEN v0387.v0177 IS NOT NULL THEN 1 ELSE 0 END), 0) AS v0389
+FROM v0207 v0126
+LEFT JOIN v0386 v0387 ON v0387.v0177 = v0126.v0177
+LEFT JOIN v0222    v0235 ON v0235.v0177 = v0126.v0177
+GROUP BY v0126.v0384, v0126.v0385
+ORDER BY v0126.v0384 DESC, v0126.v0385
+
+-- query 044
+WITH v0390 AS (
+  SELECT
+    DATE_TRUNC('MONTH', CAST(v0113.v0323 AS TIMESTAMP)) AS v0243,
+    COUNT(DISTINCT v0113.v0058) AS v0391
+  FROM v0326 AS v0113
+  JOIN v0392 AS v0393
+    ON v0393.v0121 = v0113.v0121
+  JOIN v0394 AS v0075
+    ON v0075.id = v0393.v0395
+  WHERE
+    v0113.v0325 = 'value0087'
+    AND v0113.v0030 = 1
+    AND v0075.v0060 IS NULL
+    AND LOWER(v0075.v0396) = 'value0111'
+    AND CAST(v0113.v0323 AS DATE) >= CAST('2026-01-01' AS DATE)
+  GROUP BY
+    1
+), v0397 AS (
+  SELECT
+    DATE_TRUNC('MONTH', CAST(v0398 AS TIMESTAMP)) AS v0243,
+    COUNT(DISTINCT v0399) AS v0391
+  FROM v0400
+  WHERE
+    v0401 = 'value0112'
+    AND v0402 = 'value0113'
+    AND CAST(v0398 AS DATE) >= CAST('2025-12-01' AS DATE)
+  GROUP BY
+    1
+), v0403 AS (
+  SELECT
+    v0348.v0243,
+    v0348.v0391 AS v0404,
+    v0405.v0391 AS v0406
+  FROM v0397 v0348
+  LEFT JOIN v0397 v0405
+    ON EXTRACT(YEAR FROM v0405.v0243) * 12 + EXTRACT(MONTH FROM v0405.v0243)
+     = EXTRACT(YEAR FROM v0348.v0243) * 12 + EXTRACT(MONTH FROM v0348.v0243) - 1
+), v0407 AS (
+  SELECT
+    v0113.v0243 AS v0323,
+    v0113.v0391 AS v0408,
+    v0409.v0406,
+    v0409.v0404,
+    10000.0 * v0113.v0391 / NULLIF(v0409.v0406, 0) AS v0410,
+    CASE
+      WHEN 10000.0 * v0113.v0391 / NULLIF(v0409.v0406, 0) >= 150 AND v0113.v0391 >= 100
+      THEN 1
+      ELSE 0
+    END AS v0411,
+    CASE
+      WHEN 10000.0 * v0113.v0391 / NULLIF(v0409.v0406, 0) >= 300 AND v0113.v0391 >= 300
+      THEN 1
+      ELSE 0
+    END AS v0412
+  FROM v0390 AS v0113
+  JOIN v0403 AS v0409
+    ON v0409.v0243 = v0113.v0243
+), v0413 AS (
+  SELECT
+    v0323,
+    v0408,
+    v0406,
+    v0404,
+    v0410,
+    v0411,
+    v0412,
+    SUM(CASE WHEN v0411 = 0 THEN 1 ELSE 0 END) OVER (ORDER BY v0323 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v0414,
+    SUM(CASE WHEN v0412 = 0 THEN 1 ELSE 0 END) OVER (ORDER BY v0323 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v0415
+  FROM v0407
+), v0416 AS (
+  SELECT
+    v0323,
+    v0408,
+    v0406,
+    v0404,
+    v0410,
+    v0411,
+    v0412,
+    CASE
+      WHEN v0411 = 1
+      THEN SUM(v0411) OVER (
+        PARTITION BY v0414
+        ORDER BY v0323
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      )
+      ELSE 0
+    END AS v0417,
+    CASE
+      WHEN v0412 = 1
+      THEN SUM(v0412) OVER (
+        PARTITION BY v0415
+        ORDER BY v0323
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      )
+      ELSE 0
+    END AS v0418
+  FROM v0413
+), v0419 AS (
+  SELECT
+    v0323,
+    v0408,
+    v0406,
+    v0404,
+    v0410,
+    v0411,
+    v0412,
+    v0417,
+    v0418,
+    CASE
+      WHEN v0411 = 1 AND v0412 = 0
+      THEN CASE
+        WHEN v0417 = 1
+        THEN 0
+        WHEN v0417 = 2
+        THEN 1000
+        WHEN v0417 = 3
+        THEN 2000
+        WHEN v0417 BETWEEN 4 AND 6
+        THEN 5000
+        WHEN v0417 BETWEEN 7 AND 11
+        THEN 25000
+        WHEN v0417 BETWEEN 12 AND 18
+        THEN 50000
+        WHEN v0417 >= 19
+        THEN 100000
+        ELSE 0
+      END
+      ELSE 0
+    END AS v0420,
+    CASE
+      WHEN v0412 = 1
+      THEN CASE
+        WHEN v0417 = 1
+        THEN 0
+        WHEN v0417 = 2
+        THEN 1000
+        WHEN v0417 = 3
+        THEN 2000
+        WHEN v0417 BETWEEN 4 AND 6
+        THEN 10000
+        WHEN v0417 BETWEEN 7 AND 11
+        THEN 50000
+        WHEN v0417 BETWEEN 12 AND 18
+        THEN 100000
+        WHEN v0417 >= 19
+        THEN 200000
+        ELSE 0
+      END
+      ELSE 0
+    END AS v0421,
+    CASE
+      WHEN v0411 = 1 AND v0417 >= 4 AND v0408 > 300
+      THEN (
+        v0408 - 300
+      ) * 5
+      ELSE 0
+    END AS v0422
+  FROM v0416
+)
+SELECT
+  LPAD(CAST(EXTRACT(MONTH FROM v0323) AS VARCHAR), 2, '0') || '-'
+    || LPAD(CAST(EXTRACT(DAY FROM v0323) AS VARCHAR), 2, '0') || '-'
+    || CAST(EXTRACT(YEAR FROM v0323) AS VARCHAR) AS v0323,
+  v0408,
+  v0406,
+  v0404,
+  v0410,
+  v0411,
+  v0412,
+  v0417,
+  v0418,
+  v0420,
+  v0421,
+  v0422,
+  v0420 + v0421 + v0422 AS v0423
+FROM v0419
+WHERE
+  v0323 >= CAST(CAST('2026-01-01' AS DATE) AS TIMESTAMP)
+ORDER BY
+  v0323 DESC
+
+-- query 045
+WITH v0424 AS (
+  SELECT
+    DATE_TRUNC('MONTH', CAST(v0113.v0323 AS TIMESTAMP)) AS v0243,
+    COUNT(DISTINCT v0113.v0058) AS v0391
+  FROM v0326 AS v0113
+  JOIN v0392 AS v0393
+    ON v0393.v0121 = v0113.v0121
+  JOIN v0394 AS v0075
+    ON v0075.id = v0393.v0395
+  WHERE
+    v0113.v0325 = 'value0087'
+    AND v0113.v0030 = 1
+    AND v0075.v0060 IS NULL
+    AND LOWER(v0075.v0396) = 'value0114'
+    AND CAST(v0113.v0323 AS DATE) >= CAST('2026-01-01' AS DATE)
+  GROUP BY
+    1
+), v0425 AS (
+  SELECT
+    DATE_TRUNC('MONTH', CAST(v0398 AS TIMESTAMP)) AS v0243,
+    COUNT(DISTINCT v0399) AS v0391
+  FROM v0400
+  WHERE
+    v0401 = 'value0112'
+    AND v0402 = 'value0115'
+    AND CAST(v0398 AS DATE) >= CAST('2026-01-01' AS DATE)
+  GROUP BY
+    1
+), v0407 AS (
+  SELECT
+    v0113.v0243 AS v0323,
+    v0113.v0391 AS v0408,
+    v0075.v0391 AS v0426,
+    10000.0 * v0113.v0391 / NULLIF(v0075.v0391, 0) AS v0410,
+    CASE
+      WHEN 10000.0 * v0113.v0391 / NULLIF(v0075.v0391, 0) >= 90 AND v0113.v0391 >= 100
+      THEN 1
+      ELSE 0
+    END AS v0427,
+    CASE
+      WHEN 10000.0 * v0113.v0391 / NULLIF(v0075.v0391, 0) >= 180 AND v0113.v0391 >= 1000
+      THEN 1
+      ELSE 0
+    END AS v0428
+  FROM v0424 AS v0113
+  JOIN v0425 AS v0075
+    ON v0075.v0243 = v0113.v0243
+), v0413 AS (
+  SELECT
+    v0323,
+    v0408,
+    v0426,
+    v0410,
+    v0427,
+    v0428,
+    SUM(CASE WHEN v0427 = 0 THEN 1 ELSE 0 END) OVER (ORDER BY v0323 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v0429,
+    SUM(CASE WHEN v0428 = 0 THEN 1 ELSE 0 END) OVER (ORDER BY v0323 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v0430
+  FROM v0407
+), v0416 AS (
+  SELECT
+    v0323,
+    v0408,
+    v0426,
+    v0410,
+    v0427,
+    v0428,
+    CASE
+      WHEN v0427 = 1
+      THEN SUM(v0427) OVER (
+        PARTITION BY v0429
+        ORDER BY v0323
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      )
+      ELSE 0
+    END AS v0431,
+    CASE
+      WHEN v0428 = 1
+      THEN SUM(v0428) OVER (
+        PARTITION BY v0430
+        ORDER BY v0323
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      )
+      ELSE 0
+    END AS v0432
+  FROM v0413
+)
+SELECT
+  LPAD(CAST(EXTRACT(MONTH FROM v0323) AS VARCHAR), 2, '0') || '-'
+    || LPAD(CAST(EXTRACT(DAY FROM v0323) AS VARCHAR), 2, '0') || '-'
+    || CAST(EXTRACT(YEAR FROM v0323) AS VARCHAR) AS v0323,
+  v0408,
+  v0426,
+  v0410,
+  v0427,
+  v0428,
+  v0431,
+  v0432,
+  CASE
+    WHEN v0431 > 0
+    THEN CASE
+      WHEN v0432 = 0 AND v0431 > 4
+      THEN v0408 * 50
+      WHEN v0432 > 0
+      THEN v0408 * 50
+      ELSE 0
+    END
+    ELSE 0
+  END AS v0433,
+  CASE WHEN v0431 > 9 OR v0432 > 6 THEN 25000 ELSE 0 END AS v0434,
+  CASE
+    WHEN v0431 > 0
+    THEN CASE
+      WHEN v0432 = 0 AND v0431 > 4
+      THEN v0408 * 50
+      WHEN v0432 > 0
+      THEN v0408 * 50
+      ELSE 0
+    END
+    ELSE 0
+  END + CASE WHEN v0431 > 9 OR v0432 > 6 THEN 25000 ELSE 0 END AS v0423
+FROM v0416
+ORDER BY
+  v0323 DESC
+
+-- query 046
+WITH
+  v0207 AS (
+    SELECT
+      v0075.id AS v0177,
+      CAST(date_trunc('day', CAST(v0075.v0084 AS TIMESTAMP)) AS DATE) AS v0208
+    FROM v0176 v0075
+    WHERE
+      v0075.v0060 IS NULL
+      AND v0075.v0084 >= '2026-07-07 00:00:00'
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0435 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0174 v0155
+    JOIN v0436 v0073
+      ON v0073.v0175 = v0155.id
+      AND v0073.type = 'value0072'
+      AND v0073.v0060 IS NULL
+    WHERE v0155.v0060 IS NULL
+  )
+SELECT
+  substr(CAST(v0126.v0208 AS VARCHAR), 6, 5) AS v0226,
+  COUNT(*) AS v0437,
+  SUM(CASE WHEN v0438.v0177 IS NOT NULL THEN 1 ELSE 0 END) AS v0439,
+  SUM(CASE WHEN v0438.v0177 IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) AS v0440
+FROM v0207 v0126
+LEFT JOIN v0435 v0438 ON v0438.v0177 = v0126.v0177
+GROUP BY v0126.v0208
+ORDER BY v0126.v0208
+
+-- query 047
+WITH RECURSIVE
+  v0441(hours) AS (
+    SELECT CAST(0 AS BIGINT) AS hours
+    UNION ALL
+    SELECT hours + 24 FROM v0441 WHERE hours < 720
+  ),
+  v0207 AS (
+    SELECT
+      v0075.id AS v0177,
+      CAST(v0075.v0084 AS TIMESTAMP) AS v0442,
+      date_trunc('week', CAST(v0075.v0084 AS TIMESTAMP)) AS v0443
+    FROM v0176 v0075
+    WHERE
+      v0075.v0060 IS NULL
+      AND v0075.v0084 >= '2026-07-07 00:00:00'
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0435 AS (
+    SELECT
+      v0155.v0177,
+      CAST(MIN(v0073.v0084) AS TIMESTAMP) AS v0444
+    FROM v0174 v0155
+    JOIN v0436 v0073
+      ON v0073.v0175 = v0155.id
+      AND v0073.type = 'value0072'
+      AND v0073.v0060 IS NULL
+    WHERE v0155.v0060 IS NULL
+    GROUP BY v0155.v0177
+  ),
+  v0445 AS (
+    SELECT
+      v0126.v0443,
+      CAST((unix_seconds(v0438.v0444) - unix_seconds(v0126.v0442)) / 3600 AS BIGINT) AS v0446
+    FROM v0207 v0126
+    JOIN v0435 v0438 ON v0438.v0177 = v0126.v0177
+  ),
+  v0447 AS (
+    SELECT v0443, COUNT(*) AS v0437 FROM v0207 GROUP BY v0443
+  ),
+  v0448 AS (
+    SELECT v0443, COUNT(*) AS v0449
+    FROM v0445
+    WHERE v0446 <= 720
+    GROUP BY v0443
+  ),
+  v0450 AS (
+    SELECT
+      v0443,
+      LEAST(
+        CAST(720 AS BIGINT),
+        CAST((unix_seconds(TIMESTAMP '2026-08-06 23:59:59') - unix_seconds(CAST(v0443 AS TIMESTAMP))) / 3600 AS BIGINT)
+      ) AS v0451
+    FROM v0447
+  ),
+  v0452 AS (
+    SELECT v0075.v0443, v0453.hours
+    FROM v0450 v0075
+    CROSS JOIN v0441 v0453
+    WHERE v0453.hours <= v0075.v0451
+  ),
+  v0454 AS (
+    SELECT
+      v0453.v0443,
+      v0453.hours,
+      v0455.v0446,
+      v0456.v0449
+    FROM v0452 v0453
+    JOIN v0445 v0455 ON v0455.v0443 = v0453.v0443
+    JOIN v0448 v0456 ON v0456.v0443 = v0453.v0443
+  ),
+  v0457 AS (
+    SELECT
+      v0443,
+      hours,
+      SUM(CASE WHEN v0446 <= hours THEN 1 ELSE 0 END) * 100.0 / NULLIF(MAX(v0449), 0) AS v0458
+    FROM v0454
+    GROUP BY v0443, hours
+  )
+SELECT
+  CAST(hours / 24 AS INTEGER) AS v0459,
+  MAX(CASE WHEN v0443 = TIMESTAMP '2026-07-06 00:00:00' THEN v0458 END) AS "Week of v0460 6",
+  MAX(CASE WHEN v0443 = TIMESTAMP '2026-07-13 00:00:00' THEN v0458 END) AS "Week of v0460 13",
+  MAX(CASE WHEN v0443 = TIMESTAMP '2026-07-20 00:00:00' THEN v0458 END) AS "Week of v0460 20",
+  MAX(CASE WHEN v0443 = TIMESTAMP '2026-07-27 00:00:00' THEN v0458 END) AS "Week of v0460 27",
+  MAX(CASE WHEN v0443 = TIMESTAMP '2026-08-03 00:00:00' THEN v0458 END) AS "Week of v0461 3"
+FROM v0457
+GROUP BY hours
+ORDER BY hours
+
+-- query 048
+WITH
+  v0462 AS (
+    SELECT v0075.id AS v0177
+    FROM v0176 v0075
+    WHERE v0075.v0060 IS NULL
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0435 AS (
+    SELECT
+      v0155.v0177,
+      CAST(date_trunc('day', CAST(MIN(v0073.v0090) AS TIMESTAMP)) AS DATE) AS v0208
+    FROM v0436 v0073
+    JOIN v0174 v0155 ON v0155.id = v0073.v0175 AND v0155.v0060 IS NULL
+    JOIN v0462 v0463 ON v0463.v0177 = v0155.v0177
+    WHERE v0073.type = 'value0072'
+      AND v0073.v0060 IS NULL
+      AND CAST(v0073.v0090 AS TIMESTAMP) >= TIMESTAMP '2026-07-07 00:00:00'
+    GROUP BY v0155.v0177
+  ),
+  v0464 AS (
+    SELECT DISTINCT v0177
+    FROM v0369
+    WHERE v0060 IS NULL
+  )
+SELECT
+  substr(CAST(v0438.v0208 AS VARCHAR), 6, 5) AS v0226,
+  COUNT(*) AS v0465,
+  SUM(CASE WHEN v0230.v0177 IS NOT NULL THEN 1 ELSE 0 END) AS v0439,
+  SUM(CASE WHEN v0230.v0177 IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) AS v0440
+FROM v0435 v0438
+LEFT JOIN v0464 v0230 ON v0230.v0177 = v0438.v0177
+GROUP BY v0438.v0208
+ORDER BY v0438.v0208
+
+-- query 049
+WITH RECURSIVE
+  v0441(hours) AS (
+    SELECT CAST(0 AS BIGINT) AS hours
+    UNION ALL
+    SELECT hours + 24 FROM v0441 WHERE hours < 720
+  ),
+  v0462 AS (
+    SELECT v0075.id AS v0177
+    FROM v0176 v0075
+    WHERE v0075.v0060 IS NULL
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0466 AS (
+    SELECT
+      v0155.v0177,
+      CAST(MIN(v0438.v0090) AS TIMESTAMP) AS v0467
+    FROM v0468 v0438
+    JOIN v0469 v0470 ON v0470.id = v0438.v0471
+    JOIN v0436 v0073
+      ON v0073.id = v0470.v0472
+      AND v0073.type = 'value0072'
+      AND v0073.v0060 IS NULL
+    JOIN v0174 v0155 ON v0155.id = v0073.v0175 AND v0155.v0060 IS NULL
+    JOIN v0462 v0463 ON v0463.v0177 = v0155.v0177
+    WHERE v0438.v0473 = 'value0116'
+      AND v0438.v0031 = 'value0117'
+      AND v0438.v0060 IS NULL
+      AND CAST(v0438.v0090 AS TIMESTAMP) >= TIMESTAMP '2026-07-07 00:00:00'
+    GROUP BY v0155.v0177
+  ),
+  v0464 AS (
+    SELECT v0177, CAST(MIN(v0025) AS TIMESTAMP) AS v0474
+    FROM v0369
+    WHERE v0060 IS NULL
+    GROUP BY v0177
+  ),
+  v0445 AS (
+    SELECT
+      date_trunc('week', v0475.v0467) AS v0476,
+      CAST((unix_seconds(v0230.v0474) - unix_seconds(v0475.v0467)) / 3600 AS BIGINT) AS v0477
+    FROM v0466 v0475
+    JOIN v0464 v0230
+      ON v0230.v0177 = v0475.v0177
+      AND v0230.v0474 >= v0475.v0467
+  ),
+  v0448 AS (
+    SELECT v0476, COUNT(*) AS v0449
+    FROM v0445
+    WHERE v0477 <= 720
+    GROUP BY 1
+  ),
+  v0450 AS (
+    SELECT
+      v0476,
+      LEAST(
+        CAST(720 AS BIGINT),
+        CAST((unix_seconds(TIMESTAMP '2026-08-06 23:59:59') - unix_seconds(CAST(v0476 AS TIMESTAMP))) / 3600 AS BIGINT)
+      ) AS v0451
+    FROM v0448
+  ),
+  v0452 AS (
+    SELECT v0075.v0476, v0453.hours
+    FROM v0450 v0075
+    CROSS JOIN v0441 v0453
+    WHERE v0453.hours <= v0075.v0451
+  ),
+  v0454 AS (
+    SELECT
+      v0453.v0476,
+      v0453.hours,
+      v0455.v0477,
+      v0075.v0449
+    FROM v0452 v0453
+    JOIN v0445 v0455 ON v0455.v0476 = v0453.v0476
+    JOIN v0448 v0075 ON v0075.v0476 = v0453.v0476
+  ),
+  v0457 AS (
+    SELECT
+      v0476,
+      hours,
+      SUM(CASE WHEN v0477 <= hours THEN 1 ELSE 0 END) * 100.0 / NULLIF(MAX(v0449), 0) AS v0458
+    FROM v0454
+    GROUP BY v0476, hours
+  )
+SELECT
+  CAST(hours / 24 AS INTEGER) AS v0459,
+  MAX(CASE WHEN v0476 = TIMESTAMP '2026-07-06 00:00:00' THEN v0458 END) AS "Week of v0460 6",
+  MAX(CASE WHEN v0476 = TIMESTAMP '2026-07-13 00:00:00' THEN v0458 END) AS "Week of v0460 13",
+  MAX(CASE WHEN v0476 = TIMESTAMP '2026-07-20 00:00:00' THEN v0458 END) AS "Week of v0460 20",
+  MAX(CASE WHEN v0476 = TIMESTAMP '2026-07-27 00:00:00' THEN v0458 END) AS "Week of v0460 27",
+  MAX(CASE WHEN v0476 = TIMESTAMP '2026-08-03 00:00:00' THEN v0458 END) AS "Week of v0461 3"
+FROM v0457
+GROUP BY hours
+ORDER BY hours
+
+-- query 050
+WITH
+  v0462 AS (
+    SELECT v0075.id AS v0177
+    FROM v0176 v0075
+    WHERE v0075.v0060 IS NULL
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0478 AS (
+    SELECT
+      v0094.v0177,
+      CAST(v0094.v0367 AS TIMESTAMP) AS v0479,
+      CAST(CAST(v0094.v0367 AS TIMESTAMP) AS DATE) AS v0480
+    FROM v0369 v0094
+    JOIN v0462 v0463 ON v0463.v0177 = v0094.v0177
+    WHERE v0094.v0031 = 'value0073'
+      AND v0094.v0060 IS NULL
+      AND CAST(v0094.v0367 AS DATE) >= DATE '2026-07-09'
+      AND CAST(v0094.v0367 AS DATE) <= DATE '2026-08-07'
+      AND NOT EXISTS (
+        SELECT 1 FROM v0481 v0482
+        WHERE v0482.v0177 = v0094.v0177
+          AND v0482.v0221 IS NOT NULL
+          AND v0482.v0221 < v0094.v0367
+      )
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY v0094.v0177 ORDER BY v0094.v0367 ASC) = 1
+  ),
+  v0483 AS (
+    SELECT
+      v0218.v0177,
+      CAST(MIN(v0218.v0221) AS TIMESTAMP) AS v0221
+    FROM v0481 v0218
+    JOIN v0246 v0057 ON v0057.id = v0218.v0220
+    JOIN v0478 v0125
+      ON v0125.v0177 = v0218.v0177
+      AND v0218.v0221 >= v0125.v0479
+    WHERE v0218.v0221 IS NOT NULL
+      AND v0057.v0201 = 0
+    GROUP BY v0218.v0177
+  )
+SELECT
+  lpad(CAST(date_part('month', v0125.v0480) AS VARCHAR), 2, '0')
+    || '-' ||
+    lpad(CAST(date_part('day', v0125.v0480) AS VARCHAR), 2, '0') AS v0484,
+  COUNT(*) AS v0485,
+  SUM(CASE WHEN v0077.v0221 IS NOT NULL THEN 1 ELSE 0 END) AS v0486,
+  SUM(CASE WHEN v0077.v0221 IS NOT NULL THEN 1 ELSE 0 END) * 100.0
+    / NULLIF(COUNT(*), 0) AS v0440
+FROM v0478 v0125
+LEFT JOIN v0483 v0077 ON v0077.v0177 = v0125.v0177
+GROUP BY v0125.v0480
+ORDER BY v0125.v0480
+
+-- query 051
+WITH RECURSIVE
+  v0441(hours) AS (
+    SELECT CAST(0 AS BIGINT) AS hours
+    UNION ALL
+    SELECT hours + 24 FROM v0441 WHERE hours < 720
+  ),
+  v0462 AS (
+    SELECT v0075.id AS v0177
+    FROM v0176 v0075
+    WHERE v0075.v0060 IS NULL
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0478 AS (
+    SELECT
+      v0094.v0177,
+      CAST(v0094.v0367 AS TIMESTAMP) AS v0479,
+      date_trunc('week', CAST(v0094.v0367 AS TIMESTAMP)) AS v0487
+    FROM v0369 v0094
+    JOIN v0462 v0463 ON v0463.v0177 = v0094.v0177
+    WHERE v0094.v0031 = 'value0073'
+      AND v0094.v0060 IS NULL
+      AND CAST(v0094.v0367 AS TIMESTAMP) >= TIMESTAMP '2026-07-07 00:00:00'
+      AND NOT EXISTS (
+        SELECT 1 FROM v0481 v0482
+        WHERE v0482.v0177 = v0094.v0177
+          AND v0482.v0221 IS NOT NULL
+          AND v0482.v0221 < v0094.v0367
+      )
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY v0094.v0177 ORDER BY v0094.v0367 ASC) = 1
+  ),
+  v0483 AS (
+    SELECT
+      v0218.v0177,
+      CAST(MIN(v0218.v0221) AS TIMESTAMP) AS v0221
+    FROM v0481 v0218
+    JOIN v0246 v0057 ON v0057.id = v0218.v0220
+    JOIN v0478 v0125
+      ON v0125.v0177 = v0218.v0177
+      AND v0218.v0221 >= v0125.v0479
+    WHERE v0218.v0221 IS NOT NULL
+      AND v0057.v0201 = 0
+    GROUP BY v0218.v0177
+  ),
+  v0445 AS (
+    SELECT
+      v0125.v0487,
+      CAST((unix_seconds(v0077.v0221) - unix_seconds(v0125.v0479)) / 3600 AS BIGINT) AS v0488
+    FROM v0478 v0125
+    JOIN v0483 v0077 ON v0077.v0177 = v0125.v0177
+  ),
+  v0448 AS (
+    SELECT v0487, COUNT(*) AS v0449
+    FROM v0445
+    GROUP BY 1
+  ),
+  v0450 AS (
+    SELECT
+      v0487,
+      LEAST(
+        CAST(720 AS BIGINT),
+        CAST((unix_seconds(TIMESTAMP '2026-08-06 23:59:59') - unix_seconds(CAST(v0487 AS TIMESTAMP))) / 3600 AS BIGINT)
+      ) AS v0451
+    FROM v0448
+  ),
+  v0452 AS (
+    SELECT v0075.v0487, v0453.hours
+    FROM v0450 v0075
+    CROSS JOIN v0441 v0453
+    WHERE v0453.hours <= v0075.v0451
+  ),
+  v0454 AS (
+    SELECT
+      v0453.v0487,
+      v0453.hours,
+      v0455.v0488,
+      v0000.v0449
+    FROM v0452 v0453
+    LEFT JOIN v0445 v0455 ON v0455.v0487 = v0453.v0487
+    JOIN v0448 v0000 ON v0000.v0487 = v0453.v0487
+  ),
+  v0457 AS (
+    SELECT
+      v0487,
+      hours,
+      SUM(CASE WHEN v0488 <= hours THEN 1 ELSE 0 END) * 100.0 / NULLIF(MAX(v0449), 0) AS v0458
+    FROM v0454
+    GROUP BY v0487, hours
+  )
+SELECT
+  CAST(hours / 24 AS INTEGER) AS v0459,
+  MAX(CASE WHEN v0487 = TIMESTAMP '2026-07-06 00:00:00' THEN v0458 END) AS "Week of v0460 6",
+  MAX(CASE WHEN v0487 = TIMESTAMP '2026-07-13 00:00:00' THEN v0458 END) AS "Week of v0460 13",
+  MAX(CASE WHEN v0487 = TIMESTAMP '2026-07-20 00:00:00' THEN v0458 END) AS "Week of v0460 20",
+  MAX(CASE WHEN v0487 = TIMESTAMP '2026-07-27 00:00:00' THEN v0458 END) AS "Week of v0460 27",
+  MAX(CASE WHEN v0487 = TIMESTAMP '2026-08-03 00:00:00' THEN v0458 END) AS "Week of v0461 3"
+FROM v0457
+GROUP BY hours
+ORDER BY hours
+
+-- query 052
+WITH
+  v0207 AS (
+    SELECT
+      v0075.id AS v0177,
+      CAST(date_trunc('day', CAST(v0075.v0084 AS TIMESTAMP)) AS DATE) AS v0208
+    FROM v0176 v0075
+    WHERE
+      v0075.v0060 IS NULL
+      AND v0075.v0084 >= '2026-07-07 00:00:00'
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0478 AS (
+    SELECT DISTINCT v0094.v0177
+    FROM v0369 v0094
+    WHERE v0094.v0031 = 'value0073'
+      AND v0094.v0060 IS NULL
+  )
+SELECT
+  substr(CAST(v0126.v0208 AS VARCHAR), 6, 5) AS v0226,
+  COUNT(*) AS v0437,
+  SUM(CASE WHEN v0125.v0177 IS NOT NULL THEN 1 ELSE 0 END) AS v0439,
+  SUM(CASE WHEN v0125.v0177 IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) AS v0440
+FROM v0207 v0126
+LEFT JOIN v0478 v0125 ON v0125.v0177 = v0126.v0177
+GROUP BY v0126.v0208
+ORDER BY v0126.v0208
+
+-- query 053
+WITH RECURSIVE
+  v0441(hours) AS (
+    SELECT CAST(0 AS BIGINT) AS hours
+    UNION ALL
+    SELECT hours + 24 FROM v0441 WHERE hours < 720
+  ),
+  v0207 AS (
+    SELECT
+      v0075.id AS v0177,
+      CAST(v0075.v0084 AS TIMESTAMP) AS v0442,
+      date_trunc('week', CAST(v0075.v0084 AS TIMESTAMP)) AS v0443
+    FROM v0176 v0075
+    WHERE
+      v0075.v0060 IS NULL
+      AND v0075.v0084 >= '2026-07-07 00:00:00'
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0478 AS (
+    SELECT
+      v0094.v0177,
+      CAST(v0094.v0367 AS TIMESTAMP) AS v0479
+    FROM v0369 v0094
+    JOIN v0207 v0126 ON v0126.v0177 = v0094.v0177
+    WHERE v0094.v0031 = 'value0073'
+      AND v0094.v0060 IS NULL
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY v0094.v0177 ORDER BY v0094.v0367 ASC) = 1
+  ),
+  v0445 AS (
+    SELECT
+      v0126.v0443,
+      CAST((unix_seconds(v0125.v0479) - unix_seconds(v0126.v0442)) / 3600 AS BIGINT) AS v0489
+    FROM v0207 v0126
+    JOIN v0478 v0125 ON v0125.v0177 = v0126.v0177
+    WHERE v0125.v0479 >= v0126.v0442
+  ),
+  v0490 AS (
+    SELECT v0443, COUNT(*) AS v0491
+    FROM v0445
+    GROUP BY 1
+  ),
+  v0450 AS (
+    SELECT
+      v0443,
+      LEAST(
+        CAST(720 AS BIGINT),
+        CAST((unix_seconds(TIMESTAMP '2026-08-06 23:59:59') - unix_seconds(CAST(v0443 AS TIMESTAMP))) / 3600 AS BIGINT)
+      ) AS v0451
+    FROM v0490
+  ),
+  v0452 AS (
+    SELECT v0075.v0443, v0453.hours
+    FROM v0450 v0075
+    CROSS JOIN v0441 v0453
+    WHERE v0453.hours <= v0075.v0451
+  ),
+  v0454 AS (
+    SELECT
+      v0453.v0443,
+      v0453.hours,
+      v0455.v0489,
+      v0000.v0491
+    FROM v0452 v0453
+    LEFT JOIN v0445 v0455 ON v0455.v0443 = v0453.v0443
+    JOIN v0490 v0000 ON v0000.v0443 = v0453.v0443
+  ),
+  v0457 AS (
+    SELECT
+      v0443,
+      hours,
+      SUM(CASE WHEN v0489 <= hours THEN 1 ELSE 0 END) * 100.0 / NULLIF(MAX(v0491), 0) AS v0458
+    FROM v0454
+    GROUP BY v0443, hours
+  )
+SELECT
+  CAST(hours / 24 AS INTEGER) AS v0459,
+  MAX(CASE WHEN v0443 = TIMESTAMP '2026-07-06 00:00:00' THEN v0458 END) AS "Week of v0460 6",
+  MAX(CASE WHEN v0443 = TIMESTAMP '2026-07-13 00:00:00' THEN v0458 END) AS "Week of v0460 13",
+  MAX(CASE WHEN v0443 = TIMESTAMP '2026-07-20 00:00:00' THEN v0458 END) AS "Week of v0460 20",
+  MAX(CASE WHEN v0443 = TIMESTAMP '2026-07-27 00:00:00' THEN v0458 END) AS "Week of v0460 27",
+  MAX(CASE WHEN v0443 = TIMESTAMP '2026-08-03 00:00:00' THEN v0458 END) AS "Week of v0461 3"
+FROM v0457
+GROUP BY hours
+ORDER BY hours
+
+-- query 054
+WITH
+  v0207 AS (
+    SELECT
+      v0075.id AS v0177,
+      CAST(date_trunc('day', CAST(v0075.v0084 AS TIMESTAMP)) AS DATE) AS v0208
+    FROM v0176 v0075
+    WHERE
+      v0075.v0060 IS NULL
+      AND v0075.v0084 >= '2026-07-07 00:00:00'
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0483 AS (
+    SELECT DISTINCT v0218.v0177
+    FROM v0481 v0218
+    JOIN v0246 v0057 ON v0057.id = v0218.v0220
+    WHERE v0218.v0221 IS NOT NULL
+      AND v0057.v0201 = 0
+  )
+SELECT
+  substr(CAST(v0126.v0208 AS VARCHAR), 6, 5) AS v0226,
+  COUNT(*) AS v0437,
+  SUM(CASE WHEN v0077.v0177 IS NOT NULL THEN 1 ELSE 0 END) AS v0439,
+  SUM(CASE WHEN v0077.v0177 IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) AS v0440
+FROM v0207 v0126
+LEFT JOIN v0483 v0077 ON v0077.v0177 = v0126.v0177
+GROUP BY v0126.v0208
+ORDER BY v0126.v0208
+
+-- query 055
+WITH RECURSIVE
+  v0441(hours) AS (
+    SELECT CAST(0 AS BIGINT) AS hours
+    UNION ALL
+    SELECT hours + 24 FROM v0441 WHERE hours < 720
+  ),
+  v0207 AS (
+    SELECT
+      v0075.id AS v0177,
+      CAST(v0075.v0084 AS TIMESTAMP) AS v0442,
+      date_trunc('week', CAST(v0075.v0084 AS TIMESTAMP)) AS v0443
+    FROM v0176 v0075
+    WHERE
+      v0075.v0060 IS NULL
+      AND v0075.v0084 >= '2026-07-07 00:00:00'
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0483 AS (
+    SELECT
+      v0218.v0177,
+      MIN(CAST(v0218.v0221 AS TIMESTAMP)) AS v0221
+    FROM v0481 v0218
+    JOIN v0246 v0057 ON v0057.id = v0218.v0220
+    JOIN v0207 v0126 ON v0126.v0177 = v0218.v0177
+    WHERE v0218.v0221 IS NOT NULL
+      AND v0057.v0201 = 0
+    GROUP BY 1
+  ),
+  v0445 AS (
+    SELECT
+      v0126.v0443,
+      CAST((unix_seconds(v0077.v0221) - unix_seconds(v0126.v0442)) / 3600 AS BIGINT) AS v0488
+    FROM v0207 v0126
+    JOIN v0483 v0077 ON v0077.v0177 = v0126.v0177
+    WHERE v0077.v0221 >= v0126.v0442
+  ),
+  v0492 AS (
+    SELECT v0443, COUNT(*) AS v0493
+    FROM v0445
+    GROUP BY 1
+  ),
+  v0450 AS (
+    SELECT
+      v0443,
+      LEAST(
+        CAST(720 AS BIGINT),
+        CAST((unix_seconds(TIMESTAMP '2026-08-06 23:59:59') - unix_seconds(CAST(v0443 AS TIMESTAMP))) / 3600 AS BIGINT)
+      ) AS v0451
+    FROM v0492
+  ),
+  v0452 AS (
+    SELECT v0075.v0443, v0453.hours
+    FROM v0450 v0075
+    CROSS JOIN v0441 v0453
+    WHERE v0453.hours <= v0075.v0451
+  ),
+  v0454 AS (
+    SELECT
+      v0453.v0443,
+      v0453.hours,
+      v0455.v0488,
+      v0000.v0493
+    FROM v0452 v0453
+    LEFT JOIN v0445 v0455 ON v0455.v0443 = v0453.v0443
+    JOIN v0492 v0000 ON v0000.v0443 = v0453.v0443
+  ),
+  v0457 AS (
+    SELECT
+      v0443,
+      hours,
+      SUM(CASE WHEN v0488 <= hours THEN 1 ELSE 0 END) * 100.0 / NULLIF(MAX(v0493), 0) AS v0458
+    FROM v0454
+    GROUP BY v0443, hours
+  )
+SELECT
+  CAST(hours / 24 AS INTEGER) AS v0459,
+  MAX(CASE WHEN v0443 = TIMESTAMP '2026-07-06 00:00:00' THEN v0458 END) AS "Week of v0460 6",
+  MAX(CASE WHEN v0443 = TIMESTAMP '2026-07-13 00:00:00' THEN v0458 END) AS "Week of v0460 13",
+  MAX(CASE WHEN v0443 = TIMESTAMP '2026-07-20 00:00:00' THEN v0458 END) AS "Week of v0460 20",
+  MAX(CASE WHEN v0443 = TIMESTAMP '2026-07-27 00:00:00' THEN v0458 END) AS "Week of v0460 27",
+  MAX(CASE WHEN v0443 = TIMESTAMP '2026-08-03 00:00:00' THEN v0458 END) AS "Week of v0461 3"
+FROM v0457
+GROUP BY hours
+ORDER BY hours
+
+-- query 056
+SELECT
+  COUNT(*) AS v0494
+FROM v0326
+WHERE
+  v0030 = 1
+  AND v0495 = 'value0118'
+  AND CAST(v0323 AS TIMESTAMP) >= CAST('2026-04-30 00:00:00' AS TIMESTAMP)
+
+-- query 057
+SELECT
+  COUNT(*) AS v0496
+FROM v0326
+WHERE
+  v0030 = 1
+  AND v0495 = 'value0119'
+  AND CAST(v0323 AS TIMESTAMP) >= CAST('2026-04-30 00:00:00' AS TIMESTAMP)
+
+-- query 058
+SELECT
+  COUNT(*) AS v0497
+FROM v0326
+WHERE
+  v0030 = 1
+  AND v0495 = 'value0120'
+  AND CAST(v0323 AS TIMESTAMP) >= CAST('2026-04-30 00:00:00' AS TIMESTAMP)
+
+-- query 059
+SELECT COUNT(*) AS v0498
+FROM v0089
+WHERE type = 'value0035'
+  AND json_get_str(data, 'value0033') = 'value0039'
+  AND (
+    json_get_str(data, 'value0089') LIKE 'value0092%'
+    OR json_get_str(data, 'value0089') LIKE 'value0093%'
+    OR json_get_str(data, 'value0089') LIKE 'value0094%'
+    OR json_get_str(data, 'value0089') LIKE 'value0095%'
+  )
+  AND v0090 >= CAST('2026-04-30 00:00:00' AS TIMESTAMP)
+
+-- query 060
+SELECT
+  COALESCE(SUM(v0006), 0) / 100.0 AS v0499
+FROM v0326
+WHERE
+  v0030 = 1 AND v0495 = 'value0118'
+
+-- query 061
+SELECT
+  SUM(CASE WHEN v0495 = 'value0119' THEN 1 ELSE 0 END) * 100.0
+    / NULLIF(SUM(CASE WHEN v0495 IN ('value0119', 'value0120') THEN 1 ELSE 0 END), 0) AS v0500
+FROM v0326
+WHERE v0030 = 1
+  AND CAST(v0501 AS TIMESTAMP) >= TIMESTAMP '2026-04-30 00:00:00'
+
+-- query 062
+SELECT
+  SUM(v0006 / 100.0) AS v0502
+FROM v0326
+WHERE
+  v0030 = 1
+  AND v0495 = 'value0120'
+  AND CAST(v0323 AS TIMESTAMP) >= CAST('2026-04-30 00:00:00' AS TIMESTAMP)
+
+-- query 063
+SELECT SUM(json_get_float(data, 'value0046')) AS v0503
+FROM v0089
+WHERE type = 'value0035'
+  AND json_get_str(data, 'value0033') = 'value0039'
+  AND (
+    json_get_str(data, 'value0089') LIKE 'value0092%'
+    OR json_get_str(data, 'value0089') LIKE 'value0093%'
+    OR json_get_str(data, 'value0089') LIKE 'value0094%'
+    OR json_get_str(data, 'value0089') LIKE 'value0095%'
+  )
+  AND v0090 >= CAST('2026-04-30 00:00:00' AS TIMESTAMP)
+
+-- query 064
+SELECT
+  v0504,
+  CASE v0504
+    WHEN 'value0092' THEN 'value0121 value0122 value0123 value0124'
+    WHEN 'value0093' THEN 'value0125 value0126'
+    WHEN 'value0094' THEN 'value0124 value0127 value0128 value0129'
+    WHEN 'value0095' THEN 'value0124 value0127 value0128 value0130 value0131 value0132 value0133'
+  END AS v0505,
+  CASE v0504
+    WHEN 'value0092' THEN 'value0124 value0134 a value0135 value0136 (e.g. value0137 value0138)'
+    WHEN 'value0093' THEN 'value0124 value0139 value0140 value0141 value0142 value0143 value0144 value0145'
+    WHEN 'value0094' THEN 'value0124 value0146 value0138 value0147 value0148 value0149'
+    WHEN 'value0095' THEN 'value0129 value0130 value0150 value0151 value0152 value0046, value0153, value0154 value0155'
+  END AS v0506,
+  v0507,
+  v0508
+FROM (
+  SELECT
+    CASE
+      WHEN json_get_str(data, 'value0089') LIKE 'value0092%' THEN 'value0092'
+      WHEN json_get_str(data, 'value0089') LIKE 'value0093%' THEN 'value0093'
+      WHEN json_get_str(data, 'value0089') LIKE 'value0094%' THEN 'value0094'
+      WHEN json_get_str(data, 'value0089') LIKE 'value0095%' THEN 'value0095'
+    END AS v0504,
+    COUNT(*) AS v0507,
+    SUM(CAST(json_get_float(data, 'value0046') AS DOUBLE)) AS v0508
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_get_str(data, 'value0033') = 'value0039'
+    AND (
+      json_get_str(data, 'value0089') LIKE 'value0092%'
+      OR json_get_str(data, 'value0089') LIKE 'value0093%'
+      OR json_get_str(data, 'value0089') LIKE 'value0094%'
+      OR json_get_str(data, 'value0089') LIKE 'value0095%'
+    )
+    AND v0090 >= CAST('2026-04-30 00:00:00' AS TIMESTAMP)
+  GROUP BY 1
+) v0000
+ORDER BY v0507 DESC
+
+-- query 065
+WITH v0064 AS (
+  SELECT
+    DATE_TRUNC('MONTH', CAST(v0323 AS TIMESTAMP)) AS v0324,
+    SUM(CASE WHEN v0325 = 'value0086' THEN 1 ELSE 0 END) AS v0195,
+    SUM(CASE WHEN v0325 = 'value0087' THEN 1 ELSE 0 END) AS v0197,
+    SUM(CASE WHEN v0325 = 'value0156' THEN 1 ELSE 0 END) AS v0196,
+    SUM(CASE WHEN v0325 = 'value0157' THEN 1 ELSE 0 END) AS v0509
+  FROM v0326
+  WHERE v0030 = 1
+    AND v0323 >= DATE_TRUNC('MONTH', CURRENT_DATE) - INTERVAL '11 months'
+  GROUP BY 1
+),
+v0331 AS (
+  SELECT
+    CAST(DATE_TRUNC('MONTH', v0090) AS TIMESTAMP) AS v0324,
+    COUNT(*) AS v0331
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_get_str(data, 'value0033') = 'value0039'
+    AND (
+      json_get_str(data, 'value0089') LIKE 'value0092%'
+      OR json_get_str(data, 'value0089') LIKE 'value0093%'
+      OR json_get_str(data, 'value0089') LIKE 'value0094%'
+      OR json_get_str(data, 'value0089') LIKE 'value0095%'
+    )
+    AND CAST(v0090 AS DATE) >= CAST(DATE_TRUNC('MONTH', CURRENT_DATE) - INTERVAL '11 months' AS DATE)
+  GROUP BY 1
+)
+SELECT
+  COALESCE(v0064.v0324, v0331.v0324) AS v0324,
+  COALESCE(v0064.v0195, 0) AS v0195,
+  COALESCE(v0064.v0197, 0) AS v0197,
+  COALESCE(v0064.v0196, 0) AS v0196,
+  COALESCE(v0064.v0509, 0) AS v0509,
+  COALESCE(v0331.v0331, 0) AS v0331
+FROM v0064
+FULL OUTER JOIN v0331 ON v0064.v0324 = v0331.v0324
+ORDER BY 1
+
+-- query 066
+WITH v0510 AS (
+  SELECT
+    DATE_TRUNC('MONTH', CAST(COALESCE(v0501, v0323) AS TIMESTAMP)) AS month,
+    SUM(CASE WHEN v0495 = 'value0119' THEN v0006 ELSE 0 END) / 100.0 AS v0511,
+    SUM(CASE WHEN v0495 = 'value0120' THEN v0006 ELSE 0 END) / 100.0 AS v0512,
+    SUM(CASE WHEN v0495 = 'value0118' THEN v0006 ELSE 0 END) / 100.0 AS v0499,
+    0.0 AS v0513
+  FROM v0326
+  WHERE v0030 = 1
+    AND v0323 >= DATE_TRUNC('MONTH', CURRENT_DATE) - INTERVAL '11 months'
+  GROUP BY 1
+  UNION ALL
+  SELECT
+    DATE_TRUNC('MONTH', v0090) AS month,
+    0.0 AS v0511,
+    0.0 AS v0512,
+    0.0 AS v0499,
+    SUM(CAST(json_get_float(data, 'value0046') AS DOUBLE)) AS v0513
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_get_str(data, 'value0033') = 'value0039'
+    AND (
+      json_get_str(data, 'value0089') LIKE 'value0092%'
+      OR json_get_str(data, 'value0089') LIKE 'value0093%'
+      OR json_get_str(data, 'value0089') LIKE 'value0094%'
+      OR json_get_str(data, 'value0089') LIKE 'value0095%'
+    )
+    AND CAST(v0090 AS DATE) >= CAST(DATE_TRUNC('MONTH', CURRENT_DATE) - INTERVAL '11 months' AS DATE)
+  GROUP BY 1
+)
+SELECT
+  month,
+  SUM(v0511) AS v0511,
+  SUM(v0512) AS v0512,
+  SUM(v0499) AS v0499,
+  SUM(v0513) AS v0513
+FROM v0510
+GROUP BY 1
+ORDER BY 1
+
+-- query 067
+SELECT
+  DATE_TRUNC('MONTH', CAST(v0501 AS TIMESTAMP)) AS month,
+  100.0 * SUM(CASE WHEN v0495 = 'value0119' THEN 1 ELSE 0 END) / NULLIF(
+    SUM(CASE WHEN v0495 IN ('value0119', 'value0120') THEN 1 ELSE 0 END),
+    0
+  ) AS v0500,
+  SUM(CASE WHEN v0495 IN ('value0119', 'value0120') THEN 1 ELSE 0 END) AS v0514
+FROM v0326
+WHERE
+  v0030 = 1
+  AND v0495 IN ('value0119', 'value0120')
+  AND v0501 >= DATE_TRUNC('MONTH', CURRENT_DATE) - INTERVAL '11 months'
+GROUP BY
+  DATE_TRUNC('MONTH', CAST(v0501 AS TIMESTAMP))
+ORDER BY
+  month
+
+-- query 068
+SELECT
+  CASE
+    WHEN CAST(v0323 AS TIMESTAMP) >= CAST('2026-06-29 00:00:00' AS TIMESTAMP)
+    THEN '0-30 days'
+    WHEN CAST(v0323 AS TIMESTAMP) >= CAST('2026-05-30 00:00:00' AS TIMESTAMP)
+    THEN '31-60 days'
+    WHEN CAST(v0323 AS TIMESTAMP) >= CAST('2026-04-30 00:00:00' AS TIMESTAMP)
+    THEN '61-90 days'
+    ELSE '90+ days'
+  END AS v0515,
+  COUNT(*) AS v0516,
+  SUM(v0006) / 100.0 AS v0517
+FROM v0326
+WHERE
+  v0030 = 1 AND v0495 = 'value0118'
+GROUP BY
+  CASE
+    WHEN CAST(v0323 AS TIMESTAMP) >= CAST('2026-06-29 00:00:00' AS TIMESTAMP)
+    THEN '0-30 days'
+    WHEN CAST(v0323 AS TIMESTAMP) >= CAST('2026-05-30 00:00:00' AS TIMESTAMP)
+    THEN '31-60 days'
+    WHEN CAST(v0323 AS TIMESTAMP) >= CAST('2026-04-30 00:00:00' AS TIMESTAMP)
+    THEN '61-90 days'
+    ELSE '90+ days'
+  END
+ORDER BY
+  CASE v0515
+    WHEN '0-30 days'
+    THEN 1
+    WHEN '31-60 days'
+    THEN 2
+    WHEN '61-90 days'
+    THEN 3
+    WHEN '90+ days'
+    THEN 4
+  END
+
+-- query 069
+SELECT
+  v0325,
+  v0518,
+  CASE
+    WHEN v0519 IS NULL OR v0519 = '' THEN v0518
+    ELSE v0518 || ' — ' || v0519
+  END AS v0520,
+  COUNT(*) AS v0516,
+  SUM(CASE WHEN v0495 = 'value0119' THEN v0006 ELSE 0 END) / 100.0 AS v0521,
+  SUM(CASE WHEN v0495 = 'value0120' THEN v0006 ELSE 0 END) / 100.0 AS v0522
+FROM v0326
+WHERE NOT v0518 IS NULL
+  AND v0518 <> ''
+  AND v0323 >= DATE_TRUNC('MONTH', CURRENT_DATE) - INTERVAL '11 months'
+GROUP BY v0325, v0518, v0519
+ORDER BY v0516 DESC
+
+-- query 070
+WITH v0523 AS (
+  SELECT v0075.id
+  FROM v0176 v0075
+  WHERE v0075.v0084 >= '2026-04-29'
+    AND v0075.v0060 IS NULL
+    AND (v0075.v0524 = 0 OR v0075.v0524 IS NULL)
+),
+v0525 AS (
+  SELECT DISTINCT v0155.v0177
+  FROM v0174 v0155
+  WHERE v0155.v0060 IS NULL
+)
+SELECT
+  COUNT(*) - COUNT(v0040.v0177) AS v0526
+FROM v0523 v0527
+LEFT JOIN v0525 v0040 ON v0040.v0177 = v0527.id
+
+-- query 071
+WITH v0523 AS (
+  SELECT v0075.id
+  FROM v0176 v0075
+  WHERE v0075.v0084 >= '2026-04-29'
+    AND v0075.v0060 IS NULL
+    AND (v0075.v0524 = 0 OR v0075.v0524 IS NULL)
+),
+v0525 AS (
+  SELECT DISTINCT v0155.v0177
+  FROM v0174 v0155
+  WHERE v0155.v0060 IS NULL
+)
+SELECT
+  COUNT(v0040.v0177) AS v0525
+FROM v0523 v0527
+LEFT JOIN v0525 v0040 ON v0040.v0177 = v0527.id
+
+-- query 072
+WITH v0523 AS (
+  SELECT v0075.id
+  FROM v0176 v0075
+  WHERE v0075.v0084 >= '2026-04-29'
+    AND v0075.v0060 IS NULL
+    AND (v0075.v0524 = 0 OR v0075.v0524 IS NULL)
+),
+v0525 AS (
+  SELECT DISTINCT v0155.v0177
+  FROM v0174 v0155
+  WHERE v0155.v0060 IS NULL
+)
+SELECT
+  100.0 * (COUNT(*) - COUNT(v0040.v0177)) / NULLIF(COUNT(*), 0) AS v0528
+FROM v0523 v0527
+LEFT JOIN v0525 v0040 ON v0040.v0177 = v0527.id
+
+-- query 073
+WITH v0523 AS (
+  SELECT v0075.id
+  FROM v0176 v0075
+  WHERE v0075.v0084 >= '2026-04-29'
+    AND v0075.v0060 IS NULL
+    AND (v0075.v0524 = 0 OR v0075.v0524 IS NULL)
+),
+v0525 AS (
+  SELECT DISTINCT v0155.v0177
+  FROM v0174 v0155
+  WHERE v0155.v0060 IS NULL
+)
+SELECT
+  100.0 * COUNT(v0040.v0177) / NULLIF(COUNT(*), 0) AS v0529
+FROM v0523 v0527
+LEFT JOIN v0525 v0040 ON v0040.v0177 = v0527.id
+
+-- query 074
+SELECT
+  COUNT(*) AS v0530
+FROM v0436
+WHERE
+  v0060 IS NULL
+  AND type = 'value0072'
+  AND v0084 >= '2026-04-29'
+
+-- query 075
+SELECT
+  COUNT(*) AS v0531
+FROM v0436
+WHERE
+  v0060 IS NULL
+  AND type = 'value0158'
+  AND v0084 >= '2026-04-29'
+
+-- query 076
+SELECT
+  100.0 * COUNT(
+    DISTINCT CASE
+      WHEN v0438.type = 'value0159' AND v0438.v0031 = 'value0117'
+      THEN v0073.id
+    END
+  ) / NULLIF(COUNT(DISTINCT v0073.id), 0) AS v0532
+FROM v0436 AS v0073
+LEFT JOIN v0469 AS v0470
+  ON v0470.v0472 = v0073.id AND v0470.v0060 IS NULL
+LEFT JOIN v0468 AS v0438
+  ON v0438.v0471 = v0470.id AND v0438.v0060 IS NULL
+WHERE
+  v0073.v0060 IS NULL
+  AND v0073.type = 'value0072'
+  AND v0073.v0084 >= '2026-04-29'
+
+-- query 077
+SELECT
+  100.0 * COUNT(
+    DISTINCT CASE
+      WHEN v0438.type = 'value0160'
+      AND v0438.v0031 = 'value0117'
+      THEN v0073.id
+    END
+  ) / NULLIF(COUNT(DISTINCT v0073.id), 0) AS v0533
+FROM v0436 AS v0073
+LEFT JOIN v0469 AS v0470
+  ON v0470.v0472 = v0073.id AND v0470.v0060 IS NULL
+LEFT JOIN v0468 AS v0438
+  ON v0438.v0471 = v0470.id AND v0438.v0060 IS NULL
+WHERE
+  v0073.v0060 IS NULL
+  AND v0073.type = 'value0158'
+  AND v0073.v0084 >= '2026-04-29'
+
+-- query 078
+SELECT
+  100.0 * COUNT(DISTINCT CASE WHEN v0155.v0031 = 'value0161' THEN v0073.id END) / NULLIF(COUNT(DISTINCT v0073.id), 0) AS v0534
+FROM v0436 AS v0073
+LEFT JOIN v0174 AS v0155
+  ON v0155.id = v0073.v0175 AND v0155.v0060 IS NULL
+WHERE
+  v0073.v0060 IS NULL
+  AND v0073.type = 'value0072'
+  AND v0073.v0084 >= '2026-04-29'
+
+-- query 079
+SELECT
+  100.0 * COUNT(CASE WHEN v0031 = 'value0162' THEN 1 END) / NULLIF(COUNT(*), 0) AS v0535
+FROM v0436
+WHERE v0060 IS NULL
+  AND type = 'value0158'
+  AND v0084 >= '2026-04-29'
+
+-- query 080
+SELECT CAST(NULL AS DOUBLE) AS v0536
+
+-- query 081
+WITH v0537 AS (
+  SELECT
+    id AS v0472,
+    v0175,
+    CAST(v0084 AS DATE) AS day
+  FROM v0436
+  WHERE type = 'value0072'
+    AND v0060 IS NULL
+    AND v0084 >= DATE '2026-07-24'
+),
+v0538 AS (
+  SELECT
+    v0470.v0472,
+    v0438.type AS v0539,
+    v0438.v0031 AS v0540
+  FROM v0469 AS v0470
+  JOIN v0468 AS v0438
+    ON v0438.v0471 = v0470.id
+   AND v0438.v0060 IS NULL
+  WHERE v0470.v0060 IS NULL
+    AND v0470.v0472 IN (SELECT v0472 FROM v0537)
+),
+v0541 AS (
+  SELECT
+    v0537.v0472,
+    v0537.day,
+    v0537.v0175,
+    MAX(CASE WHEN v0126.v0539 = 'value0163'         AND v0126.v0540 = 'value0117' THEN 1 ELSE 0 END) AS v0542,
+    MAX(CASE WHEN v0126.v0539 = 'value0164'           AND v0126.v0540 = 'value0117' THEN 1 ELSE 0 END) AS v0543,
+    MAX(CASE WHEN v0126.v0539 = 'value0165'                 AND v0126.v0540 = 'value0117' THEN 1 ELSE 0 END) AS v0544,
+    MAX(CASE WHEN v0126.v0539 = 'value0166'              AND v0126.v0540 = 'value0117' THEN 1 ELSE 0 END) AS v0545,
+    MAX(CASE WHEN v0126.v0539 = 'value0167'    AND v0126.v0540 = 'value0117' THEN 1 ELSE 0 END) AS v0546,
+    MAX(CASE WHEN v0126.v0539 = 'value0168'      AND v0126.v0540 = 'value0117' THEN 1 ELSE 0 END) AS v0547,
+    MAX(CASE WHEN v0126.v0539 = 'value0159'        AND v0126.v0540 = 'value0117' THEN 1 ELSE 0 END) AS v0548
+  FROM v0537
+  LEFT JOIN v0538 AS v0126 ON v0126.v0472 = v0537.v0472
+  GROUP BY v0537.v0472, v0537.day, v0537.v0175
+),
+v0549 AS (
+  SELECT
+    v0175,
+    MAX(CASE WHEN v0192 IS NOT NULL THEN 1 ELSE 0 END) AS v0550
+  FROM v0246
+  WHERE v0060 IS NULL
+    AND v0175 IN (SELECT v0175 FROM v0537 WHERE v0175 IS NOT NULL)
+  GROUP BY v0175
+)
+SELECT
+  CAST(v0541.day AS VARCHAR)         AS date,
+  COUNT(*)                              AS v0551,
+  SUM(v0542)                            AS v0552,
+  SUM(v0543)                            AS v0553,
+  SUM(v0544)                      AS v0544,
+  SUM(v0545)                          AS v0545,
+  SUM(v0546)                             AS v0554,
+  SUM(v0547)                       AS v0555,
+  SUM(v0548)                   AS v0548,
+  SUM(COALESCE(v0556.v0550, 0))     AS v0550
+FROM v0541
+LEFT JOIN v0549 AS v0556 ON v0556.v0175 = v0541.v0175
+GROUP BY v0541.day
+ORDER BY v0541.day DESC
+
+-- query 082
+WITH v0537 AS (
+  SELECT
+    id AS v0472,
+    v0175,
+    CAST(date_trunc('week', CAST(v0084 AS TIMESTAMP)) AS DATE) AS v0074
+  FROM v0436
+  WHERE type = 'value0072'
+    AND v0060 IS NULL
+    AND v0084 >= DATE '2026-05-11'
+),
+v0538 AS (
+  SELECT
+    v0470.v0472,
+    v0438.type AS v0539,
+    v0438.v0031 AS v0540
+  FROM v0469 AS v0470
+  JOIN v0468 AS v0438
+    ON v0438.v0471 = v0470.id
+   AND v0438.v0060 IS NULL
+  WHERE v0470.v0060 IS NULL
+    AND v0470.v0472 IN (SELECT v0472 FROM v0537)
+),
+v0541 AS (
+  SELECT
+    v0537.v0472,
+    v0537.v0074,
+    v0537.v0175,
+    MAX(CASE WHEN v0126.v0539 = 'value0163'         AND v0126.v0540 = 'value0117' THEN 1 ELSE 0 END) AS v0542,
+    MAX(CASE WHEN v0126.v0539 = 'value0164'           AND v0126.v0540 = 'value0117' THEN 1 ELSE 0 END) AS v0543,
+    MAX(CASE WHEN v0126.v0539 = 'value0165'                 AND v0126.v0540 = 'value0117' THEN 1 ELSE 0 END) AS v0557,
+    MAX(CASE WHEN v0126.v0539 = 'value0166'              AND v0126.v0540 = 'value0117' THEN 1 ELSE 0 END) AS v0558,
+    MAX(CASE WHEN v0126.v0539 = 'value0167'    AND v0126.v0540 = 'value0117' THEN 1 ELSE 0 END) AS v0546,
+    MAX(CASE WHEN v0126.v0539 = 'value0168'      AND v0126.v0540 = 'value0117' THEN 1 ELSE 0 END) AS v0547,
+    MAX(CASE WHEN v0126.v0539 = 'value0159'        AND v0126.v0540 = 'value0117' THEN 1 ELSE 0 END) AS v0559
+  FROM v0537
+  LEFT JOIN v0538 AS v0126 ON v0126.v0472 = v0537.v0472
+  GROUP BY v0537.v0472, v0537.v0074, v0537.v0175
+),
+v0549 AS (
+  SELECT
+    v0175,
+    MAX(CASE WHEN v0192 IS NOT NULL THEN 1 ELSE 0 END) AS v0560
+  FROM v0246
+  WHERE v0060 IS NULL
+    AND v0175 IN (SELECT v0175 FROM v0537 WHERE v0175 IS NOT NULL)
+  GROUP BY v0175
+)
+SELECT
+  CAST(v0074 AS VARCHAR)                       AS v0065,
+  COUNT(*)                                  AS v0551,
+  SUM(v0542)                                AS v0552,
+  SUM(v0546)                                 AS v0554,
+  SUM(v0547)                           AS v0555,
+  SUM(v0558)                            AS v0545,
+  SUM(v0543)                                AS v0553,
+  SUM(v0557)                        AS v0544,
+  SUM(v0559)                     AS v0548,
+  SUM(COALESCE(v0556.v0560, 0))       AS v0550
+FROM v0541
+LEFT JOIN v0549 AS v0556 ON v0556.v0175 = v0541.v0175
+GROUP BY v0074
+ORDER BY v0074 DESC
+
+-- query 083
+SELECT
+  '1. value0169' AS stage,
+  COUNT(*) AS v0561
+FROM v0436
+WHERE
+  v0060 IS NULL
+  AND type = 'value0158'
+  AND v0084 >= '2026-04-29'
+UNION ALL
+SELECT
+  '2. value0128 value0170 value0123 value0171',
+  COUNT(DISTINCT v0073.id)
+FROM v0436 AS v0073
+LEFT JOIN v0174 AS v0155
+  ON v0155.id = v0073.v0175 AND v0155.v0060 IS NULL
+WHERE
+  v0073.v0060 IS NULL
+  AND v0073.type = 'value0158'
+  AND v0073.v0084 >= '2026-04-29'
+  AND (
+    v0155.v0031 IS NULL OR v0155.v0031 <> 'value0161'
+  )
+UNION ALL
+SELECT
+  '3. value0172 value0173',
+  COUNT(DISTINCT v0073.id)
+FROM v0436 AS v0073
+JOIN v0469 AS v0470
+  ON v0470.v0472 = v0073.id AND v0470.v0060 IS NULL
+JOIN v0468 AS v0438
+  ON v0438.v0471 = v0470.id AND v0438.v0060 IS NULL
+WHERE
+  v0073.v0060 IS NULL
+  AND v0073.type = 'value0158'
+  AND v0073.v0084 >= '2026-04-29'
+  AND v0438.type = 'value0160'
+  AND v0438.v0031 = 'value0117'
+ORDER BY
+  stage
+
+-- query 084
+WITH v0562 AS (
+  SELECT
+    v0058,
+    MIN(v0177) AS v0177,
+    MIN(v0479) AS v0479,
+    MAX(
+      CASE v0031
+        WHEN 'value0174' THEN 4
+        WHEN 'value0175' THEN 3
+        WHEN 'value0176' THEN 2
+        WHEN 'value0177' THEN 1
+        ELSE 0
+      END
+    ) AS v0563
+  FROM v0481
+  WHERE CAST(v0479 AS DATE) >= DATE '2026-05-06'
+  GROUP BY v0058
+),
+v0564 AS (
+  SELECT
+    v0177,
+    v0367,
+    CAST(json_get_str(v0565, 'value0178', 'value0179') AS DATE) AS v0566,
+    CAST(json_get_str(v0565, 'value0178', 'value0180') AS DATE) AS v0567
+  FROM v0369
+  WHERE v0031 = 'value0073'
+    AND v0565 LIKE '%value0179%'
+    AND CAST(v0367 AS DATE) >= DATE '2026-05-06'
+),
+v0568 AS (
+  SELECT
+    v0125.v0058,
+    v0125.v0563,
+    CAST(v0094.v0566 AS INTEGER) - CAST(v0094.v0567 AS INTEGER) AS v0569
+  FROM v0562 v0125
+  JOIN v0564 v0094
+    ON v0125.v0177 = v0094.v0177
+   AND v0125.v0479 BETWEEN v0094.v0367 AND v0094.v0367 + INTERVAL '10 minutes'
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY v0125.v0058
+    ORDER BY to_unixtime(v0125.v0479) - to_unixtime(v0094.v0367) ASC
+  ) = 1
+),
+v0241 AS (
+  SELECT
+    v0569,
+    COUNT(CASE WHEN v0563 IN (3, 4) THEN 1 END) AS v0486,
+    COUNT(CASE WHEN v0563 = 2 THEN 1 END) AS v0570,
+    COUNT(CASE WHEN v0563 = 1 THEN 1 END) AS v0571
+  FROM v0568
+  WHERE v0569 BETWEEN 1 AND 30
+  GROUP BY v0569
+)
+SELECT
+  v0569                                                                  AS v0569,
+  v0486 + v0570                                                        AS v0572,
+  v0486                                                                   AS v0486,
+  v0570                                                                   AS v0570,
+  v0571                                                                    AS v0571,
+  CASE WHEN (v0486 + v0570) > 0
+       THEN CAST(v0486 AS DOUBLE) / CAST(v0486 + v0570 AS DOUBLE)
+       ELSE NULL END                                                         AS v0573,
+  CASE WHEN (v0486 + v0570) > 0
+       THEN CAST(v0570 AS DOUBLE) / CAST(v0486 + v0570 AS DOUBLE)
+       ELSE NULL END                                                         AS v0535
+FROM v0241
+ORDER BY v0569
+
+-- query 085
+WITH v0574 AS (
+  SELECT
+    v0058,
+    MAX(
+      CASE v0031
+        WHEN 'value0174' THEN 4
+        WHEN 'value0175'  THEN 3
+        WHEN 'value0176' THEN 2
+        WHEN 'value0177'   THEN 1
+        ELSE 0
+      END
+    ) AS v0563,
+    ARRAY_AGG(v0177   ORDER BY v0479 ASC) AS v0575,
+    ARRAY_AGG(v0479  ORDER BY v0479 ASC) AS v0576,
+    ARRAY_AGG(v0221 ORDER BY v0479 ASC) AS v0577,
+    ARRAY_AGG(v0578 ORDER BY v0479 ASC) AS v0579,
+    ARRAY_AGG(v0580  ORDER BY v0479 ASC) AS v0581
+  FROM v0481
+  WHERE CAST(v0479 AS DATE) >= DATE '2026-07-01'
+    AND CAST(v0479 AS DATE) <= DATE '2026-07-31'
+  GROUP BY v0058
+),
+v0485 AS (
+  SELECT
+    v0058,
+    v0563,
+    array_element(v0575,   1) AS v0177,
+    array_element(v0576,  1) AS v0479,
+    array_element(v0577, 1) AS v0221,
+    array_element(v0579, 1) AS v0578,
+    array_element(v0581,  1) AS v0580,
+    array_length(v0575)       AS v0582
+  FROM v0574
+),
+v0583 AS (
+  SELECT v0584.v0177, MIN(v0057.v0084) AS v0585
+  FROM v0246 v0057
+  JOIN v0369 v0584 ON v0584.id = v0057.v0379
+  WHERE v0057.v0201 = 0
+  GROUP BY v0584.v0177
+),
+v0564 AS (
+  SELECT
+    v0177,
+    v0367,
+    CAST(json_get_str(v0565, 'value0178', 'value0179') AS DATE) AS v0566,
+    CAST(json_get_str(v0565, 'value0178', 'value0180') AS DATE) AS v0567
+  FROM v0369
+  WHERE v0031 = 'value0073'
+    AND v0565 LIKE '%value0179%'
+    AND CAST(v0367 AS DATE) >= DATE '2026-07-01'
+    AND CAST(v0367 AS DATE) <= DATE '2026-07-31'
+),
+v0586 AS (
+  SELECT
+    v0125.v0058,
+    v0125.v0563,
+    v0125.v0479,
+    v0125.v0221,
+    v0125.v0578,
+    v0125.v0580,
+    CAST(v0094.v0566 AS INTEGER) - CAST(v0094.v0567 AS INTEGER) AS v0569
+  FROM v0485 v0125
+  JOIN v0564 v0094
+    ON v0125.v0177 = v0094.v0177
+   AND v0125.v0479 BETWEEN v0094.v0367 AND v0094.v0367 + INTERVAL '10 minutes'
+  LEFT JOIN v0583 v0587 ON v0587.v0177 = v0125.v0177
+  WHERE (v0587.v0585 IS NULL OR v0125.v0479 <= v0587.v0585 + INTERVAL '10 minutes')
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY v0125.v0058
+    ORDER BY to_unixtime(v0125.v0479) - to_unixtime(v0094.v0367) ASC
+  ) = 1
+),
+v0588 AS (
+  SELECT
+    CASE
+      WHEN v0569 BETWEEN 1 AND 3 THEN '01-03 days'
+      WHEN v0569 BETWEEN 4 AND 6 THEN '04-06 days'
+      WHEN v0569 BETWEEN 7 AND 9 THEN '07-09 days'
+      WHEN v0569 BETWEEN 10 AND 12 THEN '10-12 days'
+      WHEN v0569 BETWEEN 13 AND 15 THEN '13-15 days'
+      WHEN v0569 BETWEEN 16 AND 18 THEN '16-18 days'
+      WHEN v0569 BETWEEN 19 AND 21 THEN '19-21 days'
+      WHEN v0569 BETWEEN 22 AND 24 THEN '22-24 days'
+      WHEN v0569 BETWEEN 25 AND 27 THEN '25-27 days'
+      WHEN v0569 BETWEEN 28 AND 30 THEN '28-30 days'
+    END AS v0589,
+    v0479,
+    CASE
+      WHEN v0563 IN (3, 4)
+      THEN CAST(to_unixtime(COALESCE(v0221, v0580)) - to_unixtime(v0479) AS INTEGER) / 3600
+      ELSE NULL
+    END AS v0590,
+    CASE
+      WHEN v0563 = 2
+      THEN CAST(to_unixtime(COALESCE(v0578, v0580)) - to_unixtime(v0479) AS INTEGER) / 3600
+      ELSE NULL
+    END AS v0591
+  FROM v0586
+  WHERE v0569 BETWEEN 1 AND 30
+),
+hours AS (
+  SELECT 0 AS v0356 UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3
+  UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7
+  UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10 UNION ALL SELECT 11
+  UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+  UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19
+  UNION ALL SELECT 20 UNION ALL SELECT 21 UNION ALL SELECT 22 UNION ALL SELECT 23
+),
+v0592 AS (
+  SELECT v0593.v0589, v0356.v0356 AS hour, v0593.v0590, v0593.v0591
+  FROM v0588 v0593
+  CROSS JOIN hours v0356
+  WHERE v0593.v0589 IS NOT NULL
+),
+v0241 AS (
+  SELECT
+    v0589,
+    hour,
+    COUNT(CASE WHEN v0590 = hour THEN 1 END) AS v0594,
+    COUNT(CASE
+      WHEN (v0590 IS NULL OR v0590 >= hour)
+       AND (v0591 IS NULL OR v0591 >= hour)
+      THEN 1 END) AS v0595
+  FROM v0592
+  GROUP BY v0589, hour
+),
+v0596 AS (
+  SELECT
+    hour,
+    v0589,
+    CASE WHEN v0595 > 0
+         THEN CAST(v0594 AS DOUBLE) / CAST(v0595 AS DOUBLE)
+         ELSE NULL END AS v0597
+  FROM v0241
+)
+SELECT
+  hour,
+  MAX(CASE WHEN v0589 = '01-03 days' THEN v0597 END) AS "01-03 days",
+  MAX(CASE WHEN v0589 = '04-06 days' THEN v0597 END) AS "04-06 days",
+  MAX(CASE WHEN v0589 = '07-09 days' THEN v0597 END) AS "07-09 days",
+  MAX(CASE WHEN v0589 = '10-12 days' THEN v0597 END) AS "10-12 days",
+  MAX(CASE WHEN v0589 = '13-15 days' THEN v0597 END) AS "13-15 days",
+  MAX(CASE WHEN v0589 = '16-18 days' THEN v0597 END) AS "16-18 days",
+  MAX(CASE WHEN v0589 = '19-21 days' THEN v0597 END) AS "19-21 days",
+  MAX(CASE WHEN v0589 = '22-24 days' THEN v0597 END) AS "22-24 days",
+  MAX(CASE WHEN v0589 = '25-27 days' THEN v0597 END) AS "25-27 days",
+  MAX(CASE WHEN v0589 = '28-30 days' THEN v0597 END) AS "28-30 days"
+FROM v0596
+GROUP BY hour
+ORDER BY hour
+
+-- query 086
+WITH v0574 AS (
+  SELECT
+    v0058,
+    MAX(
+      CASE v0031
+        WHEN 'value0174' THEN 4
+        WHEN 'value0175'  THEN 3
+        WHEN 'value0176' THEN 2
+        WHEN 'value0177'   THEN 1
+        ELSE 0
+      END
+    ) AS v0563,
+    ARRAY_AGG(v0177   ORDER BY v0479 ASC) AS v0575,
+    ARRAY_AGG(v0479  ORDER BY v0479 ASC) AS v0576,
+    ARRAY_AGG(v0221 ORDER BY v0479 ASC) AS v0577,
+    ARRAY_AGG(v0578 ORDER BY v0479 ASC) AS v0579,
+    ARRAY_AGG(v0580  ORDER BY v0479 ASC) AS v0581
+  FROM v0481
+  WHERE CAST(v0479 AS DATE) >= DATE '2026-07-01'
+    AND CAST(v0479 AS DATE) <= DATE '2026-07-31'
+  GROUP BY v0058
+),
+v0485 AS (
+  SELECT
+    v0058,
+    v0563,
+    array_element(v0575,   1) AS v0177,
+    array_element(v0576,  1) AS v0479,
+    array_element(v0577, 1) AS v0221,
+    array_element(v0579, 1) AS v0578,
+    array_element(v0581,  1) AS v0580
+  FROM v0574
+),
+v0583 AS (
+  SELECT v0584.v0177, MIN(v0057.v0084) AS v0585
+  FROM v0246 v0057
+  JOIN v0369 v0584 ON v0584.id = v0057.v0379
+  WHERE v0057.v0201 = 0
+  GROUP BY v0584.v0177
+),
+v0564 AS (
+  SELECT
+    v0177,
+    v0367,
+    CAST(json_get_str(v0565, 'value0178', 'value0179') AS DATE) AS v0566,
+    CAST(json_get_str(v0565, 'value0178', 'value0180') AS DATE) AS v0567
+  FROM v0369
+  WHERE v0031 = 'value0073'
+    AND v0565 LIKE '%value0179%'
+    AND CAST(v0367 AS DATE) >= DATE '2026-07-01'
+    AND CAST(v0367 AS DATE) <= DATE '2026-07-31'
+),
+v0586 AS (
+  SELECT
+    v0125.v0058,
+    v0125.v0563,
+    v0125.v0479,
+    v0125.v0221,
+    v0125.v0578,
+    v0125.v0580,
+    CAST(v0094.v0566 AS INTEGER) - CAST(v0094.v0567 AS INTEGER) AS v0569
+  FROM v0485 v0125
+  JOIN v0564 v0094
+    ON v0125.v0177 = v0094.v0177
+   AND v0125.v0479 BETWEEN v0094.v0367 AND v0094.v0367 + INTERVAL '10 minutes'
+  LEFT JOIN v0583 v0587 ON v0587.v0177 = v0125.v0177
+  WHERE (v0587.v0585 IS NULL OR v0125.v0479 <= v0587.v0585 + INTERVAL '10 minutes')
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY v0125.v0058
+    ORDER BY to_unixtime(v0125.v0479) - to_unixtime(v0094.v0367) ASC
+  ) = 1
+),
+v0588 AS (
+  SELECT
+    CASE
+      WHEN v0569 BETWEEN 1 AND 3 THEN '01-03 days'
+      WHEN v0569 BETWEEN 4 AND 6 THEN '04-06 days'
+      WHEN v0569 BETWEEN 7 AND 9 THEN '07-09 days'
+      WHEN v0569 BETWEEN 10 AND 12 THEN '10-12 days'
+      WHEN v0569 BETWEEN 13 AND 15 THEN '13-15 days'
+      WHEN v0569 BETWEEN 16 AND 18 THEN '16-18 days'
+      WHEN v0569 BETWEEN 19 AND 21 THEN '19-21 days'
+      WHEN v0569 BETWEEN 22 AND 24 THEN '22-24 days'
+      WHEN v0569 BETWEEN 25 AND 27 THEN '25-27 days'
+      WHEN v0569 BETWEEN 28 AND 30 THEN '28-30 days'
+    END AS v0589,
+    v0479,
+    CASE
+      WHEN v0563 IN (3, 4)
+      THEN CAST(to_unixtime(COALESCE(v0221, v0580)) - to_unixtime(v0479) AS INTEGER) / 3600
+      ELSE NULL
+    END AS v0590
+  FROM v0586
+  WHERE v0569 BETWEEN 1 AND 30
+),
+hours AS (
+  SELECT 0 AS v0356 UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3
+  UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7
+  UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10 UNION ALL SELECT 11
+  UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+  UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19
+  UNION ALL SELECT 20 UNION ALL SELECT 21 UNION ALL SELECT 22 UNION ALL SELECT 23
+),
+v0592 AS (
+  SELECT v0593.v0589, v0356.v0356 AS hour, v0593.v0590
+  FROM v0588 v0593
+  CROSS JOIN hours v0356
+  WHERE v0593.v0589 IS NOT NULL
+),
+v0241 AS (
+  SELECT
+    v0589,
+    hour,
+    COUNT(CASE WHEN v0590 = hour THEN 1 END) AS v0594
+  FROM v0592
+  GROUP BY v0589, hour
+),
+totals AS (
+  SELECT v0589, COUNT(*) AS v0598
+  FROM v0588
+  WHERE v0589 IS NOT NULL
+  GROUP BY v0589
+),
+v0599 AS (
+  SELECT
+    v0057.v0589,
+    v0057.hour,
+    CASE WHEN v0000.v0598 > 0
+         THEN CAST(SUM(v0057.v0594) OVER (PARTITION BY v0057.v0589 ORDER BY v0057.hour) AS DOUBLE)
+              / CAST(v0000.v0598 AS DOUBLE)
+         ELSE NULL END AS v0600
+  FROM v0241 v0057
+  JOIN totals v0000 ON v0057.v0589 = v0000.v0589
+)
+SELECT
+  hour,
+  MAX(CASE WHEN v0589 = '01-03 days' THEN v0600 END) AS "01-03 days",
+  MAX(CASE WHEN v0589 = '04-06 days' THEN v0600 END) AS "04-06 days",
+  MAX(CASE WHEN v0589 = '07-09 days' THEN v0600 END) AS "07-09 days",
+  MAX(CASE WHEN v0589 = '10-12 days' THEN v0600 END) AS "10-12 days",
+  MAX(CASE WHEN v0589 = '13-15 days' THEN v0600 END) AS "13-15 days",
+  MAX(CASE WHEN v0589 = '16-18 days' THEN v0600 END) AS "16-18 days",
+  MAX(CASE WHEN v0589 = '19-21 days' THEN v0600 END) AS "19-21 days",
+  MAX(CASE WHEN v0589 = '22-24 days' THEN v0600 END) AS "22-24 days",
+  MAX(CASE WHEN v0589 = '25-27 days' THEN v0600 END) AS "25-27 days",
+  MAX(CASE WHEN v0589 = '28-30 days' THEN v0600 END) AS "28-30 days"
+FROM v0599
+GROUP BY hour
+ORDER BY hour
+
+-- query 087
+WITH v0574 AS (
+  SELECT
+    v0058,
+    MAX(
+      CASE v0031
+        WHEN 'value0174' THEN 4
+        WHEN 'value0175'  THEN 3
+        WHEN 'value0176' THEN 2
+        WHEN 'value0177'   THEN 1
+        ELSE 0
+      END
+    ) AS v0563,
+    ARRAY_AGG(v0177   ORDER BY v0479 ASC) AS v0575,
+    ARRAY_AGG(v0479  ORDER BY v0479 ASC) AS v0576,
+    ARRAY_AGG(v0221 ORDER BY v0479 ASC) AS v0577,
+    ARRAY_AGG(v0578 ORDER BY v0479 ASC) AS v0579,
+    ARRAY_AGG(v0580  ORDER BY v0479 ASC) AS v0581
+  FROM v0481
+  WHERE CAST(v0479 AS DATE) >= DATE '2026-07-01'
+    AND CAST(v0479 AS DATE) <= DATE '2026-07-31'
+  GROUP BY v0058
+),
+v0485 AS (
+  SELECT
+    v0058,
+    v0563,
+    array_element(v0575,   1) AS v0177,
+    array_element(v0576,  1) AS v0479,
+    array_element(v0577, 1) AS v0221,
+    array_element(v0579, 1) AS v0578,
+    array_element(v0581,  1) AS v0580
+  FROM v0574
+),
+v0583 AS (
+  SELECT v0584.v0177, MIN(v0057.v0084) AS v0585
+  FROM v0246 v0057
+  JOIN v0369 v0584 ON v0584.id = v0057.v0379
+  WHERE v0057.v0201 = 0
+  GROUP BY v0584.v0177
+),
+v0564 AS (
+  SELECT
+    v0177,
+    v0367,
+    CAST(json_get_str(v0565, 'value0178', 'value0179') AS DATE) AS v0566,
+    CAST(json_get_str(v0565, 'value0178', 'value0180') AS DATE) AS v0567
+  FROM v0369
+  WHERE v0031 = 'value0073'
+    AND v0565 LIKE '%value0179%'
+    AND CAST(v0367 AS DATE) >= DATE '2026-07-01'
+    AND CAST(v0367 AS DATE) <= DATE '2026-07-31'
+),
+v0586 AS (
+  SELECT
+    v0125.v0058,
+    v0125.v0563,
+    v0125.v0479,
+    v0125.v0221,
+    v0125.v0578,
+    v0125.v0580,
+    CAST(v0094.v0566 AS INTEGER) - CAST(v0094.v0567 AS INTEGER) AS v0569
+  FROM v0485 v0125
+  JOIN v0564 v0094
+    ON v0125.v0177 = v0094.v0177
+   AND v0125.v0479 BETWEEN v0094.v0367 AND v0094.v0367 + INTERVAL '10 minutes'
+  LEFT JOIN v0583 v0587 ON v0587.v0177 = v0125.v0177
+  WHERE (v0587.v0585 IS NULL OR v0125.v0479 <= v0587.v0585 + INTERVAL '10 minutes')
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY v0125.v0058
+    ORDER BY to_unixtime(v0125.v0479) - to_unixtime(v0094.v0367) ASC
+  ) = 1
+),
+v0588 AS (
+  SELECT
+    CASE
+      WHEN v0569 BETWEEN 1 AND 3 THEN '01-03 days'
+      WHEN v0569 BETWEEN 4 AND 6 THEN '04-06 days'
+      WHEN v0569 BETWEEN 7 AND 9 THEN '07-09 days'
+      WHEN v0569 BETWEEN 10 AND 12 THEN '10-12 days'
+      WHEN v0569 BETWEEN 13 AND 15 THEN '13-15 days'
+      WHEN v0569 BETWEEN 16 AND 18 THEN '16-18 days'
+      WHEN v0569 BETWEEN 19 AND 21 THEN '19-21 days'
+      WHEN v0569 BETWEEN 22 AND 24 THEN '22-24 days'
+      WHEN v0569 BETWEEN 25 AND 27 THEN '25-27 days'
+      WHEN v0569 BETWEEN 28 AND 30 THEN '28-30 days'
+    END AS v0589,
+    v0479,
+    CASE
+      WHEN v0563 IN (3, 4)
+      THEN CAST(to_unixtime(COALESCE(v0221, v0580)) - to_unixtime(v0479) AS INTEGER) / 3600
+      ELSE NULL
+    END AS v0590,
+    CASE
+      WHEN v0563 = 2
+      THEN CAST(to_unixtime(COALESCE(v0578, v0580)) - to_unixtime(v0479) AS INTEGER) / 3600
+      ELSE NULL
+    END AS v0591
+  FROM v0586
+  WHERE v0569 BETWEEN 1 AND 30
+),
+hours AS (
+  SELECT 0 AS v0356 UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3
+  UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7
+  UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10 UNION ALL SELECT 11
+  UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+  UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19
+  UNION ALL SELECT 20 UNION ALL SELECT 21 UNION ALL SELECT 22 UNION ALL SELECT 23
+),
+v0592 AS (
+  SELECT v0593.v0589, v0356.v0356 AS hour, v0593.v0590, v0593.v0591
+  FROM v0588 v0593
+  CROSS JOIN hours v0356
+  WHERE v0593.v0589 IS NOT NULL
+),
+v0241 AS (
+  SELECT
+    v0589,
+    hour,
+    COUNT(CASE WHEN v0590 = hour THEN 1 END) AS v0594,
+    COUNT(CASE
+      WHEN (v0590 IS NULL OR v0590 >= hour)
+       AND (v0591 IS NULL OR v0591 >= hour)
+      THEN 1 END) AS v0595
+  FROM v0592
+  GROUP BY v0589, hour
+),
+v0596 AS (
+  SELECT
+    hour,
+    v0589,
+    CASE WHEN v0595 > 0
+         THEN 1.0 - (CAST(v0594 AS DOUBLE) / CAST(v0595 AS DOUBLE))
+         ELSE 1.0 END AS v0601
+  FROM v0241
+),
+v0602 AS (
+  SELECT
+    hour,
+    v0589,
+    EXP(
+      SUM(LN(GREATEST(v0601, 1e-9))) OVER (
+        PARTITION BY v0589 ORDER BY hour
+      )
+    ) AS v0603
+  FROM v0596
+)
+SELECT
+  hour,
+  MAX(CASE WHEN v0589 = '01-03 days' THEN v0603 END) AS "01-03 days",
+  MAX(CASE WHEN v0589 = '04-06 days' THEN v0603 END) AS "04-06 days",
+  MAX(CASE WHEN v0589 = '07-09 days' THEN v0603 END) AS "07-09 days",
+  MAX(CASE WHEN v0589 = '10-12 days' THEN v0603 END) AS "10-12 days",
+  MAX(CASE WHEN v0589 = '13-15 days' THEN v0603 END) AS "13-15 days",
+  MAX(CASE WHEN v0589 = '16-18 days' THEN v0603 END) AS "16-18 days",
+  MAX(CASE WHEN v0589 = '19-21 days' THEN v0603 END) AS "19-21 days",
+  MAX(CASE WHEN v0589 = '22-24 days' THEN v0603 END) AS "22-24 days",
+  MAX(CASE WHEN v0589 = '25-27 days' THEN v0603 END) AS "25-27 days",
+  MAX(CASE WHEN v0589 = '28-30 days' THEN v0603 END) AS "28-30 days"
+FROM v0602
+GROUP BY hour
+ORDER BY hour
+
+-- query 088
+SELECT
+  CAST(v0348.v0010 AS VARCHAR) AS v0113,
+  v0348.v0604 AS v0605,
+  v0405.v0604 AS v0606
+FROM v0607 v0348, v0607 v0405
+WHERE v0348.v0608 = 'value0181'
+  AND v0405.v0608 = 'value0181'
+  AND v0405.v0010 = v0348.v0010 - INTERVAL '7 days'
+  AND v0348.v0010 >= current_date - INTERVAL '30 days'
+ORDER BY v0348.v0010
+
+-- query 089
+SELECT
+  CAST(v0348.v0010 AS VARCHAR) AS v0113,
+  SUM(CASE WHEN v0348.account = 'value0182' THEN v0348.v0604 END) AS v0609,
+  SUM(CASE WHEN v0348.account = 'value0183' THEN v0348.v0604 END) AS v0610,
+  SUM(CASE WHEN v0348.account = 'value0182' THEN v0405.v0604 END) AS v0611
+FROM v0607 v0348, v0607 v0405
+WHERE v0348.v0608 = 'value0184'
+  AND v0405.v0608 = 'value0184'
+  AND v0405.account = v0348.account
+  AND v0405.v0010 = v0348.v0010 - INTERVAL '7 days'
+  AND v0348.v0010 >= current_date - INTERVAL '30 days'
+GROUP BY v0348.v0010
+ORDER BY v0348.v0010
+
+-- query 090
+SELECT
+  CAST(v0010 AS VARCHAR) AS v0113,
+  SUM(CASE WHEN account = 'value0185 value0186 (value0187)' THEN v0604 END) AS Program,
+  SUM(CASE WHEN account = 'value0185 value0186 (value0188)' THEN v0604 END) AS v0612
+FROM v0607
+WHERE v0608 = 'value0189'
+  AND v0010 >= current_date - INTERVAL '30 days'
+GROUP BY v0010
+ORDER BY v0010
+
+-- query 091
+SELECT
+  CAST(CAST(v0042 AS DATE) AS TEXT) AS v0613,
+  COUNT(*) AS v0614,
+  SUM(CASE WHEN NOT v0192 IS NULL THEN 1 ELSE 0 END) AS v0061,
+  CAST(SUM(CASE WHEN NOT v0192 IS NULL THEN 1 ELSE 0 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v0615
+FROM v0246
+WHERE
+  v0060 IS NULL
+  AND NOT v0042 IS NULL
+  AND v0042 >= CURRENT_DATE - INTERVAL '30' DAYS
+GROUP BY
+  CAST(CAST(v0042 AS DATE) AS TEXT)
+ORDER BY
+  v0613 ASC
+
+-- query 092
+WITH
+  v0462 AS (
+    SELECT v0075.id AS v0177
+    FROM v0176 v0075
+    WHERE v0075.v0060 IS NULL
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0435 AS (
+    SELECT
+      v0155.v0177,
+      CAST(MIN(v0073.v0090) AS TIMESTAMP) AS v0444,
+      CAST(date_trunc('day', CAST(MIN(v0073.v0090) AS TIMESTAMP)) AS DATE) AS v0208
+    FROM v0436 v0073
+    JOIN v0174 v0155 ON v0155.id = v0073.v0175 AND v0155.v0060 IS NULL
+    JOIN v0462 v0463 ON v0463.v0177 = v0155.v0177
+    WHERE v0073.type = 'value0072'
+      AND v0073.v0060 IS NULL
+      AND CAST(v0073.v0090 AS TIMESTAMP) >= TIMESTAMP '2026-07-07 00:00:00'
+    GROUP BY v0155.v0177
+  ),
+  v0616 AS (
+    SELECT v0094.v0177, CAST(MIN(v0094.v0367) AS TIMESTAMP) AS v0042
+    FROM v0369 v0094
+    WHERE v0094.v0060 IS NULL
+      AND v0094.v0031 = 'value0073'
+      AND json_get(v0094.v0565, 'value0190', 'value0191') IS NULL
+    GROUP BY v0094.v0177
+  )
+SELECT
+  substr(CAST(v0438.v0208 AS VARCHAR), 6, 5) AS v0226,
+  COUNT(*) AS v0465,
+  SUM(CASE WHEN v0054.v0177 IS NOT NULL AND v0054.v0042 >= v0438.v0444 THEN 1 ELSE 0 END) AS v0617,
+  SUM(CASE WHEN v0054.v0177 IS NOT NULL AND v0054.v0042 >= v0438.v0444 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) AS v0440
+FROM v0435 v0438
+LEFT JOIN v0616 v0054 ON v0054.v0177 = v0438.v0177
+GROUP BY v0438.v0208
+ORDER BY v0438.v0208
+
+-- query 093
+WITH RECURSIVE
+  v0441(hours) AS (
+    SELECT CAST(0 AS BIGINT) AS hours
+    UNION ALL
+    SELECT hours + 24 FROM v0441 WHERE hours < 720
+  ),
+  v0462 AS (
+    SELECT v0075.id AS v0177
+    FROM v0176 v0075
+    WHERE v0075.v0060 IS NULL
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0435 AS (
+    SELECT
+      v0155.v0177,
+      CAST(MIN(v0073.v0090) AS TIMESTAMP) AS v0444
+    FROM v0436 v0073
+    JOIN v0174 v0155 ON v0155.id = v0073.v0175 AND v0155.v0060 IS NULL
+    JOIN v0462 v0463 ON v0463.v0177 = v0155.v0177
+    WHERE v0073.type = 'value0072'
+      AND v0073.v0060 IS NULL
+      AND CAST(v0073.v0090 AS TIMESTAMP) >= TIMESTAMP '2026-07-07 00:00:00'
+    GROUP BY v0155.v0177
+  ),
+  v0616 AS (
+    SELECT v0094.v0177, CAST(MIN(v0094.v0367) AS TIMESTAMP) AS v0042
+    FROM v0369 v0094
+    WHERE v0094.v0060 IS NULL
+      AND v0094.v0031 = 'value0073'
+      AND json_get(v0094.v0565, 'value0190', 'value0191') IS NULL
+    GROUP BY v0094.v0177
+  ),
+  v0445 AS (
+    SELECT
+      date_trunc('week', v0438.v0444) AS v0476,
+      CAST((unix_seconds(v0054.v0042) - unix_seconds(v0438.v0444)) / 3600 AS BIGINT) AS v0618
+    FROM v0435 v0438
+    JOIN v0616 v0054
+      ON v0054.v0177 = v0438.v0177
+      AND v0054.v0042 >= v0438.v0444
+  ),
+  v0448 AS (
+    SELECT v0476, COUNT(*) AS v0449
+    FROM v0445
+    WHERE v0618 <= 720
+    GROUP BY 1
+  ),
+  v0450 AS (
+    SELECT
+      v0476,
+      LEAST(
+        CAST(720 AS BIGINT),
+        CAST((unix_seconds(TIMESTAMP '2026-08-06 23:59:59') - unix_seconds(CAST(v0476 AS TIMESTAMP))) / 3600 AS BIGINT)
+      ) AS v0451
+    FROM v0448
+  ),
+  v0452 AS (
+    SELECT v0075.v0476, v0453.hours
+    FROM v0450 v0075
+    CROSS JOIN v0441 v0453
+    WHERE v0453.hours <= v0075.v0451
+  ),
+  v0454 AS (
+    SELECT
+      v0453.v0476,
+      v0453.hours,
+      v0455.v0618,
+      v0075.v0449
+    FROM v0452 v0453
+    JOIN v0445 v0455 ON v0455.v0476 = v0453.v0476
+    JOIN v0448 v0075 ON v0075.v0476 = v0453.v0476
+  ),
+  v0457 AS (
+    SELECT
+      v0476,
+      hours,
+      SUM(CASE WHEN v0618 <= hours THEN 1 ELSE 0 END) * 100.0 / NULLIF(MAX(v0449), 0) AS v0458
+    FROM v0454
+    GROUP BY v0476, hours
+  )
+SELECT
+  CAST(hours / 24 AS INTEGER) AS v0459,
+  MAX(CASE WHEN v0476 = TIMESTAMP '2026-07-06 00:00:00' THEN v0458 END) AS "Week of v0460 6",
+  MAX(CASE WHEN v0476 = TIMESTAMP '2026-07-13 00:00:00' THEN v0458 END) AS "Week of v0460 13",
+  MAX(CASE WHEN v0476 = TIMESTAMP '2026-07-20 00:00:00' THEN v0458 END) AS "Week of v0460 20",
+  MAX(CASE WHEN v0476 = TIMESTAMP '2026-07-27 00:00:00' THEN v0458 END) AS "Week of v0460 27",
+  MAX(CASE WHEN v0476 = TIMESTAMP '2026-08-03 00:00:00' THEN v0458 END) AS "Week of v0461 3"
+FROM v0457
+GROUP BY hours
+ORDER BY hours
+
+-- query 094
+WITH v0619 AS (
+  SELECT
+    v0075.id AS v0620,
+    v0075.v0058 AS v0177,
+    v0155.id AS v0175
+  FROM v0176 AS v0075
+  JOIN v0174 AS v0155
+    ON v0155.v0177 = v0075.id AND v0155.v0060 IS NULL
+  WHERE
+    v0075.v0060 IS NULL
+), v0621 AS (
+  SELECT
+    v0463.v0177,
+    v0463.v0620,
+    v0057.id AS v0622,
+    v0057.v0172 AS v0623,
+    LEAD(v0057.v0172) OVER (PARTITION BY v0463.v0620 ORDER BY v0057.v0172, v0057.id) AS v0624
+  FROM v0246 AS v0057
+  JOIN v0619 AS v0463
+    ON v0463.v0175 = v0057.v0175
+  WHERE
+    v0057.v0031 = 'value0077'
+    AND v0057.v0060 IS NULL
+    AND v0057.v0172 >= CAST(DATE_TRUNC('WEEK', CURRENT_DATE) AS DATE) - INTERVAL '32' WEEKS
+), v0625 AS (
+  SELECT
+    v0463.v0620,
+    MAX(v0057.v0090) AS v0626
+  FROM v0246 AS v0057
+  JOIN v0619 AS v0463
+    ON v0463.v0175 = v0057.v0175
+  WHERE
+    v0057.v0060 IS NULL
+  GROUP BY
+    v0463.v0620
+), v0627 AS (
+  SELECT
+    v0094.v0177,
+    v0094.v0620,
+    v0094.v0622,
+    v0094.v0623,
+    v0113.v0031 AS v0628,
+    v0113.v0629,
+    CAST(v0113.v0367 AS DATE) AS v0630
+  FROM v0621 AS v0094
+  JOIN v0369 AS v0113
+    ON v0113.v0177 = v0094.v0620
+    AND v0113.v0367 > CAST(v0094.v0623 AS TIMESTAMP)
+    AND v0113.v0060 IS NULL
+  WHERE
+    v0094.v0624 IS NULL
+    OR v0094.v0624 >= CAST(v0113.v0367 AS DATE)
+  QUALIFY
+    ROW_NUMBER() OVER (PARTITION BY v0094.v0622 ORDER BY v0113.v0367 ASC) = 1
+), v0631 AS (
+  SELECT DISTINCT
+    v0561.v0177,
+    v0561.v0623,
+    v0561.v0630,
+    CAST(DATE_TRUNC('WEEK', CAST(v0561.v0623 AS TIMESTAMP)) AS DATE) AS v0632
+  FROM v0627 AS v0561
+  LEFT JOIN v0625 AS v0096
+    ON v0096.v0620 = v0561.v0620
+  WHERE
+    v0561.v0628 = 'value0110'
+    AND v0561.v0629 = 'value0192'
+    AND (
+      v0096.v0626 IS NULL
+      OR v0096.v0626 <= CAST(v0561.v0630 AS TIMESTAMP)
+    )
+), v0633 AS (
+  SELECT
+    v0075.v0058 AS v0177,
+    v0634.id AS v0635,
+    CAST(v0634.v0323 AS DATE) AS v0636,
+    v0634.v0006 AS v0637
+  FROM v0326 AS v0634
+  JOIN v0176 AS v0075
+    ON v0075.id = v0634.v0177 AND v0075.v0060 IS NULL
+  WHERE
+    v0634.v0060 IS NULL
+    AND CAST(v0634.v0323 AS DATE) >= CAST(DATE_TRUNC('WEEK', CURRENT_DATE) AS DATE) - INTERVAL '32' WEEKS
+), v0638 AS (
+  SELECT
+    v0113.v0177,
+    v0155.v0635,
+    v0155.v0637,
+    ROW_NUMBER() OVER (PARTITION BY v0113.v0177, v0155.v0635 ORDER BY v0113.v0632) AS v0330,
+    MIN(v0113.v0632) OVER (PARTITION BY v0113.v0177) AS v0639
+  FROM v0631 AS v0113
+  JOIN v0633 AS v0155
+    ON v0155.v0177 = v0113.v0177
+    AND v0155.v0636 > v0113.v0623
+    AND v0155.v0636 >= v0113.v0630
+), v0640 AS (
+  SELECT
+    v0177,
+    v0639,
+    SUM(v0637) / 100.0 AS v0641
+  FROM v0638
+  WHERE
+    v0330 = 1
+  GROUP BY
+    v0177,
+    v0639
+), v0642 AS (
+  SELECT
+    v0639 AS v0632,
+    SUM(v0641) AS v0641
+  FROM v0640
+  GROUP BY
+    v0639
+)
+SELECT
+  CAST(v0113.v0632 AS TEXT) AS week,
+  COUNT(DISTINCT v0643.v0177) AS v0644,
+  COUNT(DISTINCT v0113.v0177) AS v0645,
+  CAST(COUNT(DISTINCT v0643.v0177) AS DOUBLE) / COUNT(DISTINCT v0113.v0177) AS v0646,
+  COALESCE(MAX(v0647.v0641), 0) AS v0641
+FROM v0631 AS v0113
+LEFT JOIN v0640 AS v0643
+  ON v0643.v0177 = v0113.v0177 AND v0643.v0639 = v0113.v0632
+LEFT JOIN v0642 AS v0647
+  ON v0647.v0632 = v0113.v0632
+GROUP BY
+  v0113.v0632
+ORDER BY
+  v0113.v0632 ASC
+
+-- query 095
+WITH v0648 AS (
+  SELECT
+    CAST(DATE_TRUNC('WEEK', v0649) AS DATE) AS v0074,
+    COUNT(*) AS v0650
+  FROM v0651
+  WHERE
+    NOT v0649 IS NULL
+  GROUP BY
+    1
+), v0652 AS (
+  SELECT
+    CAST(DATE_TRUNC('WEEK', v0578) AS DATE) AS v0074,
+    COUNT(*) AS v0653
+  FROM v0651
+  WHERE
+    NOT v0578 IS NULL
+  GROUP BY
+    1
+), v0654 AS (
+  SELECT
+    v0074
+  FROM v0648
+  UNION ALL
+  SELECT
+    v0074
+  FROM v0652
+), v0655 AS (
+  SELECT DISTINCT
+    v0074
+  FROM v0654
+), v0656 AS (
+  SELECT
+    v0073.v0074,
+    COALESCE(v0057.v0650, 0) AS v0650,
+    COALESCE(v0075.v0653, 0) AS v0653
+  FROM v0655 AS v0073
+  LEFT JOIN v0648 AS v0057
+    ON v0073.v0074 = v0057.v0074
+  LEFT JOIN v0652 AS v0075
+    ON v0073.v0074 = v0075.v0074
+), v0657 AS (
+  SELECT
+    v0074,
+    v0650,
+    v0653,
+    SUM(v0650) OVER (ORDER BY v0074 ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v0658,
+    SUM(v0653) OVER (ORDER BY v0074 ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v0659
+  FROM v0656
+)
+SELECT
+  CAST(v0074 AS TEXT) AS v0065,
+  v0653 AS v0660,
+  (
+    v0658 - v0650
+  ) - (
+    v0659 - v0653
+  ) AS v0661,
+  CAST(v0653 AS DOUBLE) / NULLIF((
+    v0658 - v0650
+  ) - (
+    v0659 - v0653
+  ), 0) AS v0662
+FROM v0657
+WHERE
+  v0074 >= CAST('2026-01-05' AS DATE) AND v0074 < CAST('2026-08-17' AS DATE)
+ORDER BY
+  v0074
+
+-- query 096
+SELECT
+  SUM(CASE WHEN v0192 >= current_date - INTERVAL '7 days' THEN 1 ELSE 0 END) AS v0061,
+  SUM(CASE WHEN v0192 >= current_date - INTERVAL '14 days' AND v0192 < current_date - INTERVAL '7 days' THEN 1 ELSE 0 END) AS v0062
+FROM v0246
+WHERE v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND v0192 >= current_date - INTERVAL '14 days'
+  AND v0194 = 'value0067'
+
+-- query 097
+SELECT
+  SUM(CASE WHEN v0192 >= current_date - INTERVAL '7 days' THEN v0006 ELSE 0 END) / 100.0 AS v0063,
+  SUM(CASE WHEN v0192 >= current_date - INTERVAL '14 days' AND v0192 < current_date - INTERVAL '7 days' THEN v0006 ELSE 0 END) / 100.0 AS v0062
+FROM v0246
+WHERE v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND v0192 >= current_date - INTERVAL '14 days'
+  AND v0194 = 'value0067'
+
+-- query 098
+SELECT
+  SUM(CASE WHEN v0192 >= current_date - INTERVAL '7 days' THEN 1 ELSE 0 END) AS v0061,
+  SUM(CASE WHEN v0192 >= current_date - INTERVAL '14 days' AND v0192 < current_date - INTERVAL '7 days' THEN 1 ELSE 0 END) AS v0062
+FROM v0246
+WHERE v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND v0192 >= current_date - INTERVAL '14 days'
+  AND v0194 IN (
+    'value0065',
+    'value0066'
+  )
+
+-- query 099
+SELECT
+  SUM(CASE WHEN v0192 >= current_date - INTERVAL '7 days' THEN v0006 ELSE 0 END) / 100.0 AS v0063,
+  SUM(CASE WHEN v0192 >= current_date - INTERVAL '14 days' AND v0192 < current_date - INTERVAL '7 days' THEN v0006 ELSE 0 END) / 100.0 AS v0062
+FROM v0246
+WHERE v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND v0192 >= current_date - INTERVAL '14 days'
+  AND v0194 IN (
+    'value0065',
+    'value0066'
+  )
+
+-- query 100
+SELECT
+  SUM(CASE WHEN v0192 >= current_date - INTERVAL '7 days' THEN 1 ELSE 0 END) AS v0061,
+  SUM(CASE WHEN v0192 >= current_date - INTERVAL '14 days' AND v0192 < current_date - INTERVAL '7 days' THEN 1 ELSE 0 END) AS v0062
+FROM v0246
+WHERE v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND v0192 >= current_date - INTERVAL '14 days'
+  AND v0194 IN (
+    'value0063',
+    'value0064'
+  )
+
+-- query 101
+SELECT
+  SUM(CASE WHEN v0192 >= current_date - INTERVAL '7 days' THEN v0006 ELSE 0 END) / 100.0 AS v0063,
+  SUM(CASE WHEN v0192 >= current_date - INTERVAL '14 days' AND v0192 < current_date - INTERVAL '7 days' THEN v0006 ELSE 0 END) / 100.0 AS v0062
+FROM v0246
+WHERE v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND v0192 >= current_date - INTERVAL '14 days'
+  AND v0194 IN (
+    'value0063',
+    'value0064'
+  )
+
+-- query 102
+SELECT 'value0193 value0194 value0195 value0196' AS v0519, COUNT(*) AS v0391
+FROM v0369
+WHERE v0060 IS NULL
+  AND v0031 = 'value0110'
+  AND v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+  AND v0565 NOT LIKE '%value0197%'
+  AND v0663 = 'value0198'
+UNION ALL
+SELECT 'value0199 value0200 value0201', COUNT(*)
+FROM v0369
+WHERE v0060 IS NULL
+  AND v0031 = 'value0110'
+  AND v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+  AND v0565 NOT LIKE '%value0197%'
+  AND v0664 = 'value0198'
+UNION ALL
+SELECT 'value0202 value0201', COUNT(*)
+FROM v0369
+WHERE v0060 IS NULL
+  AND v0031 = 'value0110'
+  AND v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+  AND v0565 NOT LIKE '%value0197%'
+  AND v0665 = 'value0198'
+UNION ALL
+SELECT 'value0199 value0200 value0203', COUNT(*)
+FROM v0369
+WHERE v0060 IS NULL
+  AND v0031 = 'value0110'
+  AND v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+  AND v0565 NOT LIKE '%value0197%'
+  AND v0666 = 'value0198'
+UNION ALL
+SELECT 'value0202 value0203', COUNT(*)
+FROM v0369
+WHERE v0060 IS NULL
+  AND v0031 = 'value0110'
+  AND v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+  AND v0565 NOT LIKE '%value0197%'
+  AND v0667 = 'value0198'
+UNION ALL
+SELECT 'value0204 value0205 value0206', COUNT(*)
+FROM v0369
+WHERE v0060 IS NULL
+  AND v0031 = 'value0110'
+  AND v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+  AND v0565 NOT LIKE '%value0197%'
+  AND v0663 != 'value0198'
+  AND v0664 != 'value0198'
+  AND v0665 != 'value0198'
+  AND v0666 != 'value0198'
+  AND v0667 != 'value0198'
+  AND v0668 != 'value0198'
+ORDER BY 2 DESC
+
+-- query 103
+SELECT
+  CASE
+    WHEN v0629 = 'value0192' THEN 'value0204 value0207'
+    WHEN v0629 = 'value0208' THEN 'value0209 value0210 value0211'
+    WHEN v0629 = 'value0212' THEN 'value0209 value0213'
+    ELSE 'value0214'
+  END AS v0519,
+  COUNT(*) AS v0391
+FROM v0369
+WHERE v0060 IS NULL
+  AND v0031 = 'value0110'
+  AND v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+  AND v0565 LIKE '%"value0197": "value0215"%'
+GROUP BY 1
+ORDER BY 2 DESC
+
+-- query 104
+SELECT
+  CAST(regexp_replace(regexp_replace(CAST((CAST(v0172 AS DATE) - CAST(v0042 AS DATE)) AS VARCHAR), '^\\d+-\\d+ ', ''), ' .*$', '') AS INTEGER) AS v0569,
+  COUNT(*) AS v0391
+FROM v0246
+WHERE v0060 IS NULL
+  AND v0042 IS NOT NULL
+  AND v0172 IS NOT NULL
+  AND v0042 >= CURRENT_DATE - INTERVAL '30' DAYS
+  AND CAST(regexp_replace(regexp_replace(CAST((CAST(v0172 AS DATE) - CAST(v0042 AS DATE)) AS VARCHAR), '^\\d+-\\d+ ', ''), ' .*$', '') AS INTEGER) > 0
+GROUP BY 1
+ORDER BY 1
+
+-- query 105
+SELECT
+  CAST(CAST(v0192 AS DATE) AS VARCHAR) AS v0193,
+  SUM(
+    CASE
+      WHEN v0194 IN ('value0063', 'value0064')
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0195,
+  SUM(
+    CASE
+      WHEN v0194 IN (
+        'value0065',
+        'value0066'
+      )
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0196,
+  SUM(
+    CASE
+      WHEN v0194 = 'value0067'
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0197
+FROM v0246
+WHERE
+  v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND v0192 >= current_date - INTERVAL '30 days'
+GROUP BY
+  CAST(CAST(v0192 AS DATE) AS VARCHAR)
+ORDER BY
+  v0193 ASC
+
+-- query 106
+SELECT
+  CAST(CAST(COALESCE(v0669, v0670) AS DATE) AS VARCHAR) AS v0671,
+  SUM(
+    CASE
+      WHEN v0194 IN ('value0063', 'value0064')
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0195,
+  SUM(
+    CASE
+      WHEN v0194 IN (
+        'value0065',
+        'value0066'
+      )
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0196,
+  SUM(
+    CASE
+      WHEN v0194 = 'value0067'
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0197
+FROM v0246
+WHERE
+  v0060 IS NULL
+  AND (
+    (v0669 IS NOT NULL AND v0669 >= current_date - INTERVAL '30 days')
+    OR
+    (v0670 IS NOT NULL AND v0670 >= current_date - INTERVAL '30 days')
+  )
+GROUP BY
+  CAST(CAST(COALESCE(v0669, v0670) AS DATE) AS VARCHAR)
+ORDER BY
+  v0671 ASC
+
+-- query 107
+SELECT
+  CAST(CAST(
+    CASE
+      WHEN CAST(v0192 AS DATE) <= current_date - INTERVAL '7 days'
+      THEN CAST(v0192 AS DATE) + INTERVAL '7 days'
+      ELSE CAST(v0192 AS DATE)
+    END AS DATE) AS VARCHAR) AS v0113,
+  COUNT(CASE WHEN CAST(v0192 AS DATE) > current_date - INTERVAL '7 days' THEN 1 END) AS v0672,
+  COUNT(CASE WHEN CAST(v0192 AS DATE) <= current_date - INTERVAL '7 days' THEN 1 END) AS v0673,
+  SUM(CASE WHEN CAST(v0192 AS DATE) > current_date - INTERVAL '7 days' THEN v0006 ELSE 0 END) / 100.0 AS v0674,
+  SUM(CASE WHEN CAST(v0192 AS DATE) <= current_date - INTERVAL '7 days' THEN v0006 ELSE 0 END) / 100.0 AS v0675
+FROM v0246
+WHERE v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND CAST(v0192 AS DATE) > current_date - INTERVAL '14 days'
+GROUP BY 1
+ORDER BY v0113
+
+-- query 108
+SELECT
+  CASE
+    WHEN v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+    THEN CAST(CAST(v0367 AS DATE) AS TEXT)
+    ELSE CAST(CAST(v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+  END AS v0371,
+  SUM(
+    SUM(
+      CASE
+        WHEN v0031 = 'value0073'
+        AND v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN 1
+        ELSE 0
+      END
+    )
+  ) OVER (
+    ORDER BY MIN(
+      CASE
+        WHEN v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN CAST(CAST(v0367 AS DATE) AS TEXT)
+        ELSE CAST(CAST(v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+      END
+    )
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS v0372,
+  SUM(
+    SUM(
+      CASE
+        WHEN v0031 = 'value0110'
+        AND v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN 1
+        ELSE 0
+      END
+    )
+  ) OVER (
+    ORDER BY MIN(
+      CASE
+        WHEN v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN CAST(CAST(v0367 AS DATE) AS TEXT)
+        ELSE CAST(CAST(v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+      END
+    )
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS v0373,
+  SUM(
+    SUM(
+      CASE
+        WHEN v0031 = 'value0073'
+        AND v0367 < CURRENT_DATE - INTERVAL '30' DAYS
+        THEN 1
+        ELSE 0
+      END
+    )
+  ) OVER (
+    ORDER BY MIN(
+      CASE
+        WHEN v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN CAST(CAST(v0367 AS DATE) AS TEXT)
+        ELSE CAST(CAST(v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+      END
+    )
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS v0374,
+  SUM(
+    SUM(
+      CASE
+        WHEN v0031 = 'value0110'
+        AND v0367 < CURRENT_DATE - INTERVAL '30' DAYS
+        THEN 1
+        ELSE 0
+      END
+    )
+  ) OVER (
+    ORDER BY MIN(
+      CASE
+        WHEN v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN CAST(CAST(v0367 AS DATE) AS TEXT)
+        ELSE CAST(CAST(v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+      END
+    )
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS v0375
+FROM v0369
+WHERE
+  v0060 IS NULL
+  AND NOT v0367 IS NULL
+  AND (
+    (
+      v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+    )
+    OR (
+      v0367 >= CURRENT_DATE - INTERVAL '37' DAYS
+      AND v0367 < CURRENT_DATE - INTERVAL '30' DAYS
+    )
+  )
+GROUP BY
+  1
+ORDER BY
+  1
+
+-- query 109
+SELECT
+  CASE
+    WHEN v0377.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+    THEN CAST(CAST(v0377.v0367 AS DATE) AS TEXT)
+    ELSE CAST(CAST(v0377.v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+  END AS v0371,
+  SUM(
+    SUM(
+      CASE
+        WHEN v0377.v0031 = 'value0073'
+        AND v0377.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN 1
+        ELSE 0
+      END
+    )
+  ) OVER (
+    ORDER BY MIN(
+      CASE
+        WHEN v0377.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN CAST(CAST(v0377.v0367 AS DATE) AS TEXT)
+        ELSE CAST(CAST(v0377.v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+      END
+    )
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS v0372,
+  SUM(
+    SUM(
+      CASE
+        WHEN v0377.v0031 = 'value0110'
+        AND v0377.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN 1
+        ELSE 0
+      END
+    )
+  ) OVER (
+    ORDER BY MIN(
+      CASE
+        WHEN v0377.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN CAST(CAST(v0377.v0367 AS DATE) AS TEXT)
+        ELSE CAST(CAST(v0377.v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+      END
+    )
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS v0373,
+  SUM(
+    SUM(
+      CASE
+        WHEN v0377.v0031 = 'value0073'
+        AND v0377.v0367 < CURRENT_DATE - INTERVAL '30' DAYS
+        THEN 1
+        ELSE 0
+      END
+    )
+  ) OVER (
+    ORDER BY MIN(
+      CASE
+        WHEN v0377.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN CAST(CAST(v0377.v0367 AS DATE) AS TEXT)
+        ELSE CAST(CAST(v0377.v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+      END
+    )
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS v0374,
+  SUM(
+    SUM(
+      CASE
+        WHEN v0377.v0031 = 'value0110'
+        AND v0377.v0367 < CURRENT_DATE - INTERVAL '30' DAYS
+        THEN 1
+        ELSE 0
+      END
+    )
+  ) OVER (
+    ORDER BY MIN(
+      CASE
+        WHEN v0377.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+        THEN CAST(CAST(v0377.v0367 AS DATE) AS TEXT)
+        ELSE CAST(CAST(v0377.v0367 + INTERVAL '30' DAYS AS DATE) AS TEXT)
+      END
+    )
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS v0375
+FROM v0369 AS v0377
+WHERE
+  v0377.v0060 IS NULL
+  AND v0377.version = 2
+  AND NOT v0377.v0367 IS NULL
+  AND (
+    (
+      v0377.v0367 >= CURRENT_DATE - INTERVAL '7' DAYS
+    )
+    OR (
+      v0377.v0367 >= CURRENT_DATE - INTERVAL '37' DAYS
+      AND v0377.v0367 < CURRENT_DATE - INTERVAL '30' DAYS
+    )
+  )
+  AND EXISTS(
+    SELECT
+      1
+    FROM v0369 AS v0676
+    WHERE
+      v0676.v0177 = v0377.v0177
+      AND v0676.v0367 < v0377.v0367
+      AND v0676.v0060 IS NULL
+  )
+GROUP BY
+  1
+ORDER BY
+  1
+
+-- query 110
+SELECT
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+       AND CAST(v0025 AS DATE) <= today()
+      THEN v0026 ELSE 0
+    END
+  ) / 100.0 AS v0027,
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+       AND CAST(v0025 AS DATE) <= today() - INTERVAL '7 days'
+      THEN v0026 ELSE 0
+    END
+  ) / 100.0 AS v0028
+FROM v0029
+WHERE
+  v0030 = 1
+  AND v0031 <> 'value0014'
+  AND v0036 IN ('value0020', 'value0019', 'value0018')
+  AND type IN ('value0015', 'value0016')
+  AND v0025 IS NOT NULL
+  AND CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+  AND CAST(v0025 AS DATE) <= today()
+
+-- query 111
+SELECT
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+       AND CAST(v0025 AS DATE) <= today()
+      THEN v0026 ELSE 0
+    END
+  ) / 100.0 AS v0677,
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+       AND CAST(v0025 AS DATE) <= today() - INTERVAL '7 days'
+      THEN v0026 ELSE 0
+    END
+  ) / 100.0 AS v0678
+FROM v0029
+WHERE
+  v0030 = 1
+  AND v0031 <> 'value0014'
+  AND v0036 = 'value0018'
+  AND type IN ('value0015', 'value0016')
+  AND v0025 IS NOT NULL
+  AND CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+  AND CAST(v0025 AS DATE) <= today()
+
+-- query 112
+SELECT
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+       AND CAST(v0025 AS DATE) <= today()
+      THEN v0026 ELSE 0
+    END
+  ) / 100.0 AS v0679,
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+       AND CAST(v0025 AS DATE) <= today() - INTERVAL '7 days'
+      THEN v0026 ELSE 0
+    END
+  ) / 100.0 AS v0680
+FROM v0029
+WHERE
+  v0030 = 1
+  AND v0031 <> 'value0014'
+  AND v0036 = 'value0019'
+  AND type IN ('value0015', 'value0016')
+  AND v0025 IS NOT NULL
+  AND CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+  AND CAST(v0025 AS DATE) <= today()
+
+-- query 113
+SELECT
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+       AND CAST(v0025 AS DATE) <= today()
+      THEN v0026 ELSE 0
+    END
+  ) / 100.0 AS v0681,
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+       AND CAST(v0025 AS DATE) <= today() - INTERVAL '7 days'
+      THEN v0026 ELSE 0
+    END
+  ) / 100.0 AS v0682
+FROM v0029
+WHERE
+  v0030 = 1
+  AND v0031 <> 'value0014'
+  AND v0036 = 'value0020'
+  AND type IN ('value0015', 'value0016')
+  AND v0025 IS NOT NULL
+  AND CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+  AND CAST(v0025 AS DATE) <= today()
+
+-- query 114
+WITH v0105 AS (
+  SELECT
+    json_get_str(data, 'value0040') AS v0106,
+    MIN(CAST(v0090 AS DATE)) AS v0107
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_get_str(data, 'value0033') = 'value0041'
+    AND CAST(v0090 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '14 days' AS TIMESTAMP)) AS DATE)
+  GROUP BY json_get_str(data, 'value0040')
+)
+SELECT
+  SUM(
+    CASE
+      WHEN v0032.v0031 = 'value0017'
+       AND (CASE WHEN v0032.type = 'value0016' THEN v0054.v0107 ELSE CAST(v0032.v0025 AS DATE) END)
+             >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+       AND (CASE WHEN v0032.type = 'value0016' THEN v0054.v0107 ELSE CAST(v0032.v0025 AS DATE) END)
+             <= today()
+      THEN v0032.v0033
+      ELSE 0
+    END
+  ) / 100 AS v0034,
+  SUM(
+    CASE
+      WHEN v0032.v0031 = 'value0017'
+       AND (CASE WHEN v0032.type = 'value0016' THEN v0054.v0107 ELSE CAST(v0032.v0025 AS DATE) END)
+             >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+       AND (CASE WHEN v0032.type = 'value0016' THEN v0054.v0107 ELSE CAST(v0032.v0025 AS DATE) END)
+             <= today() - INTERVAL '7 days'
+      THEN v0032.v0033
+      ELSE 0
+    END
+  ) / 100 AS v0035
+FROM v0029 v0032
+LEFT JOIN v0105 v0054 ON v0054.v0106 = v0032.v0111
+WHERE
+  v0032.v0030 = 1
+  AND v0032.v0031 <> 'value0014'
+  AND v0032.v0036 IN (
+    'value0018',
+    'value0019',
+    'value0020'
+  )
+  AND v0032.type IN ('value0015', 'value0016')
+  AND (
+    (v0032.type = 'value0015'
+      AND v0032.v0025 IS NOT NULL
+      AND CAST(v0032.v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+      AND CAST(v0032.v0025 AS DATE) <= today())
+    OR (v0032.type = 'value0016'
+      AND v0054.v0107 IS NOT NULL
+      AND v0054.v0107 >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+      AND v0054.v0107 <= today())
+  )
+
+-- query 115
+WITH v0105 AS (
+  SELECT
+    json_get_str(data, 'value0040') AS v0106,
+    MIN(CAST(v0090 AS DATE)) AS v0107
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_get_str(data, 'value0033') = 'value0041'
+    AND CAST(v0090 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '14 days' AS TIMESTAMP)) AS DATE)
+  GROUP BY json_get_str(data, 'value0040')
+)
+SELECT
+  SUM(
+    CASE
+      WHEN v0032.v0031 = 'value0017'
+       AND (CASE WHEN v0032.type = 'value0016' THEN v0054.v0107 ELSE CAST(v0032.v0025 AS DATE) END)
+             >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+       AND (CASE WHEN v0032.type = 'value0016' THEN v0054.v0107 ELSE CAST(v0032.v0025 AS DATE) END)
+             <= today()
+      THEN v0032.v0033
+      ELSE 0
+    END
+  ) / 100.0 AS v0683,
+  SUM(
+    CASE
+      WHEN v0032.v0031 = 'value0017'
+       AND (CASE WHEN v0032.type = 'value0016' THEN v0054.v0107 ELSE CAST(v0032.v0025 AS DATE) END)
+             >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+       AND (CASE WHEN v0032.type = 'value0016' THEN v0054.v0107 ELSE CAST(v0032.v0025 AS DATE) END)
+             <= today() - INTERVAL '7 days'
+      THEN v0032.v0033
+      ELSE 0
+    END
+  ) / 100.0 AS v0684
+FROM v0029 v0032
+LEFT JOIN v0105 v0054 ON v0054.v0106 = v0032.v0111
+WHERE
+  v0032.v0030 = 1
+  AND v0032.v0031 <> 'value0014'
+  AND v0032.v0036 = 'value0018'
+  AND v0032.type IN ('value0015', 'value0016')
+  AND (
+    (v0032.type = 'value0015'
+      AND v0032.v0025 IS NOT NULL
+      AND CAST(v0032.v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+      AND CAST(v0032.v0025 AS DATE) <= today())
+    OR (v0032.type = 'value0016'
+      AND v0054.v0107 IS NOT NULL
+      AND v0054.v0107 >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+      AND v0054.v0107 <= today())
+  )
+
+-- query 116
+WITH v0105 AS (
+  SELECT
+    json_get_str(data, 'value0040') AS v0106,
+    MIN(CAST(v0090 AS DATE)) AS v0107
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_get_str(data, 'value0033') = 'value0041'
+    AND CAST(v0090 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '14 days' AS TIMESTAMP)) AS DATE)
+  GROUP BY json_get_str(data, 'value0040')
+)
+SELECT
+  SUM(
+    CASE
+      WHEN v0032.v0031 = 'value0017'
+       AND (CASE WHEN v0032.type = 'value0016' THEN v0054.v0107 ELSE CAST(v0032.v0025 AS DATE) END)
+             >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+       AND (CASE WHEN v0032.type = 'value0016' THEN v0054.v0107 ELSE CAST(v0032.v0025 AS DATE) END)
+             <= today()
+      THEN v0032.v0033
+      ELSE 0
+    END
+  ) / 100.0 AS v0685,
+  SUM(
+    CASE
+      WHEN v0032.v0031 = 'value0017'
+       AND (CASE WHEN v0032.type = 'value0016' THEN v0054.v0107 ELSE CAST(v0032.v0025 AS DATE) END)
+             >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+       AND (CASE WHEN v0032.type = 'value0016' THEN v0054.v0107 ELSE CAST(v0032.v0025 AS DATE) END)
+             <= today() - INTERVAL '7 days'
+      THEN v0032.v0033
+      ELSE 0
+    END
+  ) / 100.0 AS v0686
+FROM v0029 v0032
+LEFT JOIN v0105 v0054 ON v0054.v0106 = v0032.v0111
+WHERE
+  v0032.v0030 = 1
+  AND v0032.v0031 <> 'value0014'
+  AND v0032.v0036 = 'value0019'
+  AND v0032.type IN ('value0015', 'value0016')
+  AND (
+    (v0032.type = 'value0015'
+      AND v0032.v0025 IS NOT NULL
+      AND CAST(v0032.v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+      AND CAST(v0032.v0025 AS DATE) <= today())
+    OR (v0032.type = 'value0016'
+      AND v0054.v0107 IS NOT NULL
+      AND v0054.v0107 >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+      AND v0054.v0107 <= today())
+  )
+
+-- query 117
+WITH v0105 AS (
+  SELECT
+    json_get_str(data, 'value0040') AS v0106,
+    MIN(CAST(v0090 AS DATE)) AS v0107
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_get_str(data, 'value0033') = 'value0041'
+    AND CAST(v0090 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '14 days' AS TIMESTAMP)) AS DATE)
+  GROUP BY json_get_str(data, 'value0040')
+)
+SELECT
+  SUM(
+    CASE
+      WHEN v0032.v0031 = 'value0017'
+       AND (CASE WHEN v0032.type = 'value0016' THEN v0054.v0107 ELSE CAST(v0032.v0025 AS DATE) END)
+             >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+       AND (CASE WHEN v0032.type = 'value0016' THEN v0054.v0107 ELSE CAST(v0032.v0025 AS DATE) END)
+             <= today()
+      THEN v0032.v0033
+      ELSE 0
+    END
+  ) / 100.0 AS v0687,
+  SUM(
+    CASE
+      WHEN v0032.v0031 = 'value0017'
+       AND (CASE WHEN v0032.type = 'value0016' THEN v0054.v0107 ELSE CAST(v0032.v0025 AS DATE) END)
+             >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+       AND (CASE WHEN v0032.type = 'value0016' THEN v0054.v0107 ELSE CAST(v0032.v0025 AS DATE) END)
+             <= today() - INTERVAL '7 days'
+      THEN v0032.v0033
+      ELSE 0
+    END
+  ) / 100.0 AS v0688
+FROM v0029 v0032
+LEFT JOIN v0105 v0054 ON v0054.v0106 = v0032.v0111
+WHERE
+  v0032.v0030 = 1
+  AND v0032.v0031 <> 'value0014'
+  AND v0032.v0036 = 'value0020'
+  AND v0032.type IN ('value0015', 'value0016')
+  AND (
+    (v0032.type = 'value0015'
+      AND v0032.v0025 IS NOT NULL
+      AND CAST(v0032.v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+      AND CAST(v0032.v0025 AS DATE) <= today())
+    OR (v0032.type = 'value0016'
+      AND v0054.v0107 IS NOT NULL
+      AND v0054.v0107 >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+      AND v0054.v0107 <= today())
+  )
+
+-- query 118
+SELECT
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+       AND CAST(v0025 AS DATE) <= today()
+       AND v0031 = 'value0017'
+      THEN 1 ELSE 0
+    END
+  )::DOUBLE / NULLIF(
+    SUM(
+      CASE
+        WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+         AND CAST(v0025 AS DATE) <= today()
+        THEN 1 ELSE 0
+      END
+    ) - SUM(
+      CASE
+        WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+         AND CAST(v0025 AS DATE) <= today()
+         AND v0031 = 'value0014'
+        THEN 1 ELSE 0
+      END
+    ),
+    0
+  ) AS v0079,
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+       AND CAST(v0025 AS DATE) <= today() - INTERVAL '7 days'
+       AND v0031 = 'value0017'
+      THEN 1 ELSE 0
+    END
+  )::DOUBLE / NULLIF(
+    SUM(
+      CASE
+        WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+         AND CAST(v0025 AS DATE) <= today() - INTERVAL '7 days'
+        THEN 1 ELSE 0
+      END
+    ) - SUM(
+      CASE
+        WHEN CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+         AND CAST(v0025 AS DATE) <= today() - INTERVAL '7 days'
+         AND v0031 = 'value0014'
+        THEN 1 ELSE 0
+      END
+    ),
+    0
+  ) AS v0080
+FROM v0029
+WHERE
+  v0030 = 1
+  AND v0036 IN ('value0018', 'value0019', 'value0020')
+  AND type = 'value0015'
+  AND NOT v0025 IS NULL
+  AND CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+  AND CAST(v0025 AS DATE) <= today()
+
+-- query 119
+SELECT
+  COUNT(DISTINCT CASE WHEN v0172 = today() THEN v0058 END) AS v0689,
+  COUNT(DISTINCT CASE WHEN v0172 = today() - INTERVAL '7 days' THEN v0058 END) AS v0690
+FROM v0056
+WHERE
+  v0060 IS NULL
+  AND v0172 IN (today(), today() - INTERVAL '7 days')
+
+-- query 120
+SELECT
+  SUM(CASE
+        WHEN CAST(v0032.v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+         AND CAST(v0032.v0025 AS DATE) <= today()
+        THEN 1 ELSE 0
+      END) AS v0691,
+  SUM(CASE
+        WHEN CAST(v0032.v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+         AND CAST(v0032.v0025 AS DATE) <= today() - INTERVAL '7 days'
+        THEN 1 ELSE 0
+      END) AS v0692
+FROM v0029 v0032
+WHERE
+  v0032.v0030 = 1
+  AND v0032.v0031 = 'value0017'
+  AND v0032.type = 'value0015'
+  AND v0032.v0025 IS NOT NULL
+  AND CAST(v0032.v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+  AND CAST(v0032.v0025 AS DATE) <= today()
+
+-- query 121
+WITH v0105 AS (
+  SELECT
+    json_get_str(data, 'value0040') AS v0106,
+    MIN(CAST(v0090 AS DATE)) AS v0107
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_get_str(data, 'value0033') = 'value0041'
+    AND CAST(v0090 AS DATE) >= today() - INTERVAL '30 days'
+  GROUP BY json_get_str(data, 'value0040')
+),
+v0108 AS (
+  SELECT
+    SUBSTRING(CAST(
+      CASE WHEN v0032.type = 'value0016' THEN v0054.v0107
+           ELSE CAST(v0032.v0025 AS DATE) END AS VARCHAR), 6, 5) AS day,
+    COUNT(*) AS v0183,
+    SUM(CASE WHEN v0032.v0031 = 'value0017' THEN 1 ELSE 0 END) AS v0020,
+    SUM(CASE WHEN v0032.v0031 = 'value0017' THEN v0032.v0033 ELSE 0 END) / 100 AS v0184
+  FROM v0029 v0032
+  LEFT JOIN v0105 v0054
+    ON v0054.v0106 = v0032.v0111
+  WHERE
+    v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0032.v0036 IN (
+      'value0018',
+      'value0019',
+      'value0020'
+    )
+    AND v0032.type IN ('value0015', 'value0016')
+    AND (
+      (v0032.type = 'value0015'
+        AND v0032.v0025 IS NOT NULL
+        AND CAST(v0032.v0025 AS DATE) >= today() - INTERVAL '14 days')
+      OR (v0032.type = 'value0016'
+        AND v0054.v0107 IS NOT NULL
+        AND v0054.v0107 >= today() - INTERVAL '14 days')
+    )
+  GROUP BY SUBSTRING(CAST(
+    CASE WHEN v0032.type = 'value0016' THEN v0054.v0107
+         ELSE CAST(v0032.v0025 AS DATE) END AS VARCHAR), 6, 5)
+),
+v0187 AS (
+  SELECT
+    SUBSTRING(CAST(v0172 AS VARCHAR), 6, 5) AS day,
+    SUM(v0006) / 100 AS v0188
+  FROM v0056
+  WHERE
+    v0060 IS NULL
+    AND v0172 >= today() - INTERVAL '14 days'
+    AND v0172 <= today() + INTERVAL '11 days'
+  GROUP BY SUBSTRING(CAST(v0172 AS VARCHAR), 6, 5)
+)
+SELECT
+  COALESCE(v0075.day, v0113.day) AS day,
+  v0075.v0183,
+  v0075.v0020,
+  v0075.v0184,
+  v0113.v0188
+FROM v0108 v0075
+FULL OUTER JOIN v0187 v0113 ON v0075.day = v0113.day
+ORDER BY COALESCE(v0075.day, v0113.day)
+
+-- query 122
+WITH v0105 AS (
+  SELECT
+    json_get_str(data, 'value0040') AS v0106,
+    MIN(CAST(v0090 AS DATE)) AS v0107
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_get_str(data, 'value0033') = 'value0041'
+    AND CAST(v0090 AS DATE) >= today() - INTERVAL '30 days'
+  GROUP BY json_get_str(data, 'value0040')
+),
+v0693 AS (
+  SELECT
+    v0032.v0058 AS v0121,
+    CASE WHEN v0032.type = 'value0016' THEN v0054.v0107
+         ELSE CAST(v0032.v0025 AS DATE) END AS v0179
+  FROM v0029 v0032
+  LEFT JOIN v0105 v0054
+    ON v0054.v0106 = v0032.v0111
+  WHERE v0032.v0030 = 1
+    AND v0032.v0031 = 'value0017'
+    AND v0032.v0036 IN (
+      'value0018',
+      'value0019',
+      'value0020'
+    )
+    AND v0032.type IN ('value0015', 'value0016')
+    AND (
+      (v0032.type = 'value0015'
+        AND v0032.v0025 IS NOT NULL
+        AND CAST(v0032.v0025 AS DATE) >= today() - INTERVAL '14 days')
+      OR (v0032.type = 'value0016'
+        AND v0054.v0107 IS NOT NULL
+        AND v0054.v0107 >= today() - INTERVAL '14 days')
+    )
+),
+v0108 AS (
+  SELECT
+    SUBSTRING(CAST(v0694.v0179 AS VARCHAR), 6, 5) AS day,
+    -1 * SUM(CASE
+      WHEN v0000.v0050 IN ('value0216','value0217')
+        AND v0040.Account = 'value0218'
+      THEN COALESCE(v0040.v0307, 0) - COALESCE(v0040.v0308, 0)
+      ELSE 0
+    END) / 100.0 AS v0695,
+    -1 * SUM(CASE
+      WHEN v0000.v0050 IN ('value0219','value0220')
+        AND v0040.Account = 'value0068'
+      THEN COALESCE(v0040.v0307, 0) - COALESCE(v0040.v0308, 0)
+      ELSE 0
+    END) / 100.0 AS v0696,
+    -1 * SUM(CASE
+      WHEN v0000.v0050 IN ('value0221','value0222')
+        AND v0040.Account = 'value0223'
+      THEN COALESCE(v0040.v0307, 0) - COALESCE(v0040.v0308, 0)
+      ELSE 0
+    END) / 100.0 AS v0697,
+    -1 * SUM(CASE
+      WHEN v0000.v0050 = 'value0224'
+        AND v0040.Account = 'value0225'
+      THEN COALESCE(v0040.v0307, 0) - COALESCE(v0040.v0308, 0)
+      ELSE 0
+    END) / 100.0 AS v0698
+  FROM v0699 v0000
+  JOIN v0310 v0040
+    ON v0040.v0045 = v0000.v0045
+   AND v0040.v0047 IS NULL
+  JOIN v0693 v0694
+    ON v0694.v0121 = v0000.v0700
+  WHERE v0000.v0047 IS NULL
+    AND v0040.v0311 = 'value0084'
+    AND v0000.v0050 IN (
+      'value0216','value0217',
+      'value0219','value0220',
+      'value0221','value0222',
+      'value0224'
+    )
+  GROUP BY SUBSTRING(CAST(v0694.v0179 AS VARCHAR), 6, 5)
+),
+v0187 AS (
+  SELECT
+    SUBSTRING(CAST(v0172 AS VARCHAR), 6, 5) AS day,
+    SUM(v0006) / 100 AS v0188
+  FROM v0056
+  WHERE v0060 IS NULL
+    AND v0172 >= today() - INTERVAL '14 days'
+    AND v0172 <= today() + INTERVAL '11 days'
+  GROUP BY SUBSTRING(CAST(v0172 AS VARCHAR), 6, 5)
+)
+SELECT
+  COALESCE(v0075.day, v0113.day) AS day,
+  v0075.v0695,
+  v0075.v0696,
+  v0075.v0697,
+  v0075.v0698,
+  v0113.v0188,
+  GREATEST(
+    0,
+    COALESCE(v0113.v0188, 0)
+      - COALESCE(v0075.v0695, 0)
+      - COALESCE(v0075.v0696, 0)
+      - COALESCE(v0075.v0697, 0)
+      - COALESCE(v0075.v0698, 0)
+  ) AS v0701
+FROM v0108 v0075
+FULL OUTER JOIN v0187 v0113 ON v0075.day = v0113.day
+ORDER BY COALESCE(v0075.day, v0113.day)
+
+-- query 123
+WITH v0105 AS (
+  SELECT
+    json_get_str(data, 'value0040') AS v0106,
+    MIN(CAST(v0090 AS DATE)) AS v0107
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_get_str(data, 'value0033') = 'value0041'
+    AND CAST(v0090 AS DATE) >= today() - INTERVAL '45 days'
+  GROUP BY json_get_str(data, 'value0040')
+),
+v0108 AS (
+  SELECT
+    SUBSTRING(CAST(
+      CASE WHEN v0032.type = 'value0016' THEN v0054.v0107
+           ELSE CAST(v0032.v0025 AS DATE) END AS VARCHAR), 6, 5) AS day,
+    SUM(CASE
+          WHEN v0032.type = 'value0016'
+           AND v0054.v0107 = CAST(v0032.v0025 AS DATE)
+          THEN v0032.v0033 ELSE 0 END) / 100.0 AS v0109,
+    SUM(CASE
+          WHEN v0032.type = 'value0016'
+           AND v0054.v0107 > CAST(v0032.v0025 AS DATE)
+          THEN v0032.v0033 ELSE 0 END) / 100.0 AS v0110,
+    SUM(CASE WHEN v0032.type = 'value0015' THEN v0032.v0033 ELSE 0 END) / 100.0 AS v0067
+  FROM v0029 v0032
+  LEFT JOIN v0105 v0054
+    ON v0054.v0106 = v0032.v0111
+  WHERE v0032.v0030 = 1
+    AND v0032.v0031 = 'value0017'
+    AND v0032.type IN ('value0016', 'value0015')
+    AND (
+      (v0032.type = 'value0015'
+        AND v0032.v0025 IS NOT NULL
+        AND CAST(v0032.v0025 AS DATE) >= today() - INTERVAL '30 days')
+      OR (v0032.type = 'value0016'
+        AND v0054.v0107 IS NOT NULL
+        AND v0054.v0107 >= today() - INTERVAL '30 days')
+    )
+  GROUP BY SUBSTRING(CAST(
+    CASE WHEN v0032.type = 'value0016' THEN v0054.v0107
+         ELSE CAST(v0032.v0025 AS DATE) END AS VARCHAR), 6, 5)
+)
+SELECT day, v0109, v0110, v0067
+FROM v0108
+ORDER BY day
+
+-- query 124
+WITH v0702 AS (
+  SELECT
+    SUM(CASE WHEN json_get_str(metadata, 'value0042') = 'value0043' THEN v0033 ELSE 0 END) * 1.0
+      / NULLIF(SUM(CASE WHEN json_get_str(metadata, 'value0042') IN ('value0043','value0044') THEN v0033 ELSE 0 END), 0) AS v0703,
+    SUM(CASE WHEN json_get_str(metadata, 'value0042') = 'value0044' THEN v0033 ELSE 0 END) * 1.0
+      / NULLIF(SUM(CASE WHEN json_get_str(metadata, 'value0042') IN ('value0043','value0044') THEN v0033 ELSE 0 END), 0) AS v0704
+  FROM v0426
+  WHERE CAST(v0025 AS DATE) >= today() - INTERVAL '28 days'
+    AND CAST(v0025 AS DATE) < today()
+    AND type = 'value0016'
+    AND v0031 = 'value0017'
+    AND v0030 = 1
+    AND v0036 = 'value0018'
+),
+v0705 AS (
+  SELECT v0058, MAX(version) AS v0706
+  FROM v0426
+  WHERE CAST(v0025 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '21' DAYS
+    AND CAST(v0025 AS DATE) <  CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE)
+    AND v0030 = 1
+    AND v0031 <> 'value0014'
+    AND type = 'value0016'
+  GROUP BY v0058
+),
+v0707 AS (
+  SELECT v0032.v0058, v0032.v0026 / 100.0 AS v0708
+  FROM v0426 v0032
+  INNER JOIN v0705 v0096 ON v0096.v0058 = v0032.v0058 AND v0096.v0706 = v0032.version
+  WHERE v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0032.type = 'value0016'
+),
+v0085 AS (
+  SELECT
+    REPLACE(json_get_str(data, 'value0032'), 'value0052.', '') AS v0058,
+    LOWER(json_get_str(data, 'value0033')) AS v0087,
+    CAST(json_get_str(data, 'value0034') AS TIMESTAMP) AS v0088
+  FROM v0089
+  WHERE type = 'value0035'
+    AND CAST(v0090 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '21' DAYS
+    AND json_get_str(data, 'value0032') LIKE 'value0052.%'
+),
+v0091 AS (
+  SELECT v0058, MAX(v0088) AS v0092 FROM v0085 GROUP BY v0058
+),
+v0093 AS (
+  SELECT v0094.v0058, v0094.v0087 AS v0095
+  FROM v0085 v0094
+  INNER JOIN v0091 v0096 ON v0096.v0058 = v0094.v0058 AND v0096.v0092 = v0094.v0088
+),
+v0709 AS (
+  SELECT
+    SUM(CASE WHEN v0098.v0095 = 'value0039' THEN v0032.v0708 ELSE 0 END)
+      / NULLIF(SUM(v0032.v0708), 0) AS v0710
+  FROM v0707 v0032
+  LEFT JOIN v0093 v0098 ON v0098.v0058 = v0032.v0058
+),
+v0187 AS (
+  SELECT
+    CAST(v0172 AS DATE) AS v0711,
+    SUM(v0006) / 100.0 AS v0188
+  FROM v0246
+  WHERE v0060 IS NULL
+    AND v0172 >  today()
+    AND v0172 <= today() + INTERVAL '7 days'
+  GROUP BY CAST(v0172 AS DATE)
+),
+v0712 AS (
+  SELECT
+    v0711,
+    v0188,
+    CAST(CAST(v0711 AS TIMESTAMP) - CAST('1970-01-04' AS TIMESTAMP) AS VARCHAR) AS v0713
+  FROM v0187
+),
+v0714 AS (
+  SELECT
+    v0711,
+    v0188,
+    CAST(SUBSTRING(v0713, 7, POSITION(':' IN v0713) - 7) AS BIGINT) / 24 AS v0715
+  FROM v0712
+),
+v0716 AS (
+  SELECT
+    v0711,
+    v0188,
+    CAST(v0715 - TRUNC(CAST(v0715 AS DOUBLE) / 7.0) * 7 AS INTEGER) AS dow
+  FROM v0714
+),
+v0717 AS (
+  SELECT
+    v0711,
+    v0188,
+    CAST(
+      CASE dow
+        WHEN 6 THEN v0711 + INTERVAL '2 days'
+        WHEN 0 THEN v0711 + INTERVAL '1 day'
+        ELSE v0711
+      END
+    AS DATE) AS v0718,
+    CAST(
+      CASE dow
+        WHEN 5 THEN v0711 + INTERVAL '3 days'
+        WHEN 6 THEN v0711 + INTERVAL '3 days'
+        WHEN 0 THEN v0711 + INTERVAL '2 days'
+        ELSE v0711 + INTERVAL '1 day'
+      END
+    AS DATE) AS v0719
+  FROM v0716
+),
+v0720 AS (
+  SELECT
+    v0126.v0718 AS v0721,
+    v0126.v0188 * v0702.v0703 AS v0722,
+    0.0 AS v0723
+  FROM v0717 v0126, v0702
+  UNION ALL
+  SELECT
+    v0126.v0719 AS v0721,
+    0.0 AS v0722,
+    v0126.v0188 * v0702.v0704 AS v0723
+  FROM v0717 v0126, v0702
+),
+v0724 AS (
+  SELECT
+    v0721 AS v0113,
+    SUM(v0722) AS v0725,
+    SUM(v0723) AS v0726,
+    SUM(v0722) + SUM(v0723) AS v0727
+  FROM v0720
+  WHERE v0721 >  today()
+    AND v0721 <= today() + INTERVAL '9 days'
+  GROUP BY v0721
+)
+SELECT
+  SUBSTRING(CAST(v0113 AS VARCHAR), 6, 5) AS day,
+  v0725,
+  v0726,
+  v0727,
+  v0727 * v0709.v0710 AS v0728,
+  v0709.v0710 AS v0729
+FROM v0724, v0709
+ORDER BY v0113
+
+-- query 125
+WITH v0730 AS (
+  SELECT 1 AS v0731, CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE) AS v0113
+  UNION ALL SELECT 2, CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '1 day' AS DATE)
+  UNION ALL SELECT 3, CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '2 day' AS DATE)
+  UNION ALL SELECT 4, CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '3 day' AS DATE)
+  UNION ALL SELECT 5, CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '4 day' AS DATE)
+  UNION ALL SELECT 6, CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '5 day' AS DATE)
+  UNION ALL SELECT 7, CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '6 day' AS DATE)
+),
+days AS (
+  SELECT
+    CAST(v0025 AS DATE) AS v0113,
+    SUM(v0026) / 100.0 AS v0732
+  FROM v0029
+  WHERE
+    v0030 = 1
+    AND v0031 <> 'value0014'
+    AND v0036 = 'value0018'
+    AND type IN ('value0015', 'value0016')
+    AND v0025 IS NOT NULL
+    AND CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+    AND CAST(v0025 AS DATE) < CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '7 days' AS DATE)
+  GROUP BY 1
+)
+SELECT
+  CASE v0132.v0731
+    WHEN 1 THEN 'value0054' WHEN 2 THEN 'value0055' WHEN 3 THEN 'value0056'
+    WHEN 4 THEN 'value0057' WHEN 5 THEN 'value0058' WHEN 6 THEN 'value0059' WHEN 7 THEN 'value0060'
+  END AS day,
+  v0348.v0732 AS v0733,
+  prior.v0732 AS v0734
+FROM v0730 v0132
+LEFT JOIN days v0348 ON v0348.v0113 = v0132.v0113
+LEFT JOIN days prior ON prior.v0113 = CAST(v0132.v0113 - INTERVAL '7 days' AS DATE)
+ORDER BY v0132.v0731
+
+-- query 126
+WITH v0730 AS (
+  SELECT 1 AS v0731, CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE) AS v0113
+  UNION ALL SELECT 2, CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '1 day' AS DATE)
+  UNION ALL SELECT 3, CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '2 day' AS DATE)
+  UNION ALL SELECT 4, CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '3 day' AS DATE)
+  UNION ALL SELECT 5, CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '4 day' AS DATE)
+  UNION ALL SELECT 6, CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '5 day' AS DATE)
+  UNION ALL SELECT 7, CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '6 day' AS DATE)
+),
+days AS (
+  SELECT
+    CAST(v0025 AS DATE) AS v0113,
+    COUNT(*) AS v0735
+  FROM v0029
+  WHERE
+    v0030 = 1
+    AND v0031 <> 'value0014'
+    AND v0036 = 'value0018'
+    AND type IN ('value0015', 'value0016')
+    AND v0025 IS NOT NULL
+    AND CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() - INTERVAL '7 days' AS TIMESTAMP)) AS DATE)
+    AND CAST(v0025 AS DATE) < CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '7 days' AS DATE)
+  GROUP BY 1
+)
+SELECT
+  CASE v0132.v0731
+    WHEN 1 THEN 'value0054' WHEN 2 THEN 'value0055' WHEN 3 THEN 'value0056'
+    WHEN 4 THEN 'value0057' WHEN 5 THEN 'value0058' WHEN 6 THEN 'value0059' WHEN 7 THEN 'value0060'
+  END AS day,
+  v0348.v0735 AS v0733,
+  prior.v0735 AS v0734
+FROM v0730 v0132
+LEFT JOIN days v0348 ON v0348.v0113 = v0132.v0113
+LEFT JOIN days prior ON prior.v0113 = CAST(v0132.v0113 - INTERVAL '7 days' AS DATE)
+ORDER BY v0132.v0731
+
+-- query 127
+WITH v0736 AS (
+  SELECT DISTINCT
+    v0058,
+    CASE WHEN json_get_str(metadata, 'value0042') = 'value0043' THEN 'value0226'
+         WHEN json_get_str(metadata, 'value0042') = 'value0044' THEN 'value0227' END AS v0737,
+    CAST(v0025 AS DATE) AS v0113,
+    v0026
+  FROM v0029
+  WHERE CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+    AND CAST(v0025 AS DATE) < CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '7 days' AS DATE)
+    AND v0030 = 1
+    AND v0031 <> 'value0014'
+    AND type = 'value0016'
+    AND json_get_str(metadata, 'value0228') = 'value0229'
+    AND json_get_str(metadata, 'value0042') IN ('value0043','value0044')
+),
+v0085 AS (
+  SELECT
+    REPLACE(json_get_str(data, 'value0032'), 'value0052.', '') AS v0058,
+    LOWER(json_get_str(data, 'value0033')) AS v0087,
+    CAST(json_get_str(data, 'value0034') AS TIMESTAMP) AS v0088
+  FROM v0089
+  WHERE type = 'value0035'
+    AND CAST(v0090 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+    AND json_get_str(data, 'value0032') LIKE 'value0052.%'
+),
+v0091 AS (SELECT v0058, MAX(v0088) AS v0092 FROM v0085 GROUP BY v0058),
+v0093 AS (
+  SELECT v0094.v0058, v0094.v0087 AS v0095
+  FROM v0085 v0094 INNER JOIN v0091 v0096 ON v0096.v0058 = v0094.v0058 AND v0096.v0092 = v0094.v0088
+),
+v0568 AS (
+  SELECT v0000.v0113, v0000.v0737, v0000.v0026, v0098.v0095
+  FROM v0736 v0000 LEFT JOIN v0093 v0098 ON v0098.v0058 = v0000.v0058
+)
+SELECT
+  SUBSTRING(CAST(v0113 AS VARCHAR), 6, 5) AS day,
+  SUM(v0026) / 100.0 AS v0183,
+  SUM(CASE WHEN v0095='value0039' THEN v0026 END) / 100.0 AS returns
+FROM v0568
+GROUP BY v0113
+ORDER BY v0113
+
+-- query 128
+WITH v0736 AS (
+  SELECT DISTINCT
+    v0058,
+    CASE WHEN json_get_str(metadata, 'value0042') = 'value0043' THEN 'value0226'
+         WHEN json_get_str(metadata, 'value0042') = 'value0044' THEN 'value0227' END AS v0737,
+    CAST(v0025 AS DATE) AS v0113,
+    v0026
+  FROM v0029
+  WHERE CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+    AND CAST(v0025 AS DATE) < CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '7 days' AS DATE)
+    AND v0030 = 1
+    AND v0031 <> 'value0014'
+    AND type = 'value0016'
+    AND json_get_str(metadata, 'value0228') IS NULL
+    AND json_get_str(metadata, 'value0042') IN ('value0043','value0044')
+),
+v0085 AS (
+  SELECT
+    REPLACE(json_get_str(data, 'value0032'), 'value0052.', '') AS v0058,
+    LOWER(json_get_str(data, 'value0033')) AS v0087,
+    CAST(json_get_str(data, 'value0034') AS TIMESTAMP) AS v0088
+  FROM v0089
+  WHERE type = 'value0035'
+    AND CAST(v0090 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+    AND json_get_str(data, 'value0032') LIKE 'value0052.%'
+),
+v0091 AS (SELECT v0058, MAX(v0088) AS v0092 FROM v0085 GROUP BY v0058),
+v0093 AS (
+  SELECT v0094.v0058, v0094.v0087 AS v0095
+  FROM v0085 v0094 INNER JOIN v0091 v0096 ON v0096.v0058 = v0094.v0058 AND v0096.v0092 = v0094.v0088
+),
+v0568 AS (
+  SELECT v0000.v0113, v0000.v0737, v0000.v0026, v0098.v0095
+  FROM v0736 v0000 LEFT JOIN v0093 v0098 ON v0098.v0058 = v0000.v0058
+)
+SELECT
+  SUBSTRING(CAST(v0113 AS VARCHAR), 6, 5) AS day,
+  SUM(v0026) / 100.0 AS v0183,
+  SUM(CASE WHEN v0095='value0039' THEN v0026 END) / 100.0 AS returns
+FROM v0568
+GROUP BY v0113
+ORDER BY v0113
+
+-- query 129
+WITH v0736 AS (
+  SELECT DISTINCT
+    v0058,
+    CASE WHEN json_get_str(metadata, 'value0042') = 'value0043' THEN 'value0226'
+         WHEN json_get_str(metadata, 'value0042') = 'value0044' THEN 'value0227' END AS v0737,
+    CAST(v0025 AS DATE) AS v0113
+  FROM v0029
+  WHERE CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+    AND CAST(v0025 AS DATE) < CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '7 days' AS DATE)
+    AND v0030 = 1
+    AND v0031 <> 'value0014'
+    AND type = 'value0016'
+    AND json_get_str(metadata, 'value0228') = 'value0229'
+    AND json_get_str(metadata, 'value0042') IN ('value0043','value0044')
+),
+v0085 AS (
+  SELECT
+    REPLACE(json_get_str(data, 'value0032'), 'value0052.', '') AS v0058,
+    LOWER(json_get_str(data, 'value0033')) AS v0087,
+    CAST(json_get_str(data, 'value0034') AS TIMESTAMP) AS v0088
+  FROM v0089
+  WHERE type = 'value0035'
+    AND CAST(v0090 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+    AND json_get_str(data, 'value0032') LIKE 'value0052.%'
+),
+v0091 AS (SELECT v0058, MAX(v0088) AS v0092 FROM v0085 GROUP BY v0058),
+v0093 AS (
+  SELECT v0094.v0058, v0094.v0087 AS v0095
+  FROM v0085 v0094 INNER JOIN v0091 v0096 ON v0096.v0058 = v0094.v0058 AND v0096.v0092 = v0094.v0088
+),
+v0568 AS (
+  SELECT v0000.v0113, v0000.v0737, v0098.v0095
+  FROM v0736 v0000 LEFT JOIN v0093 v0098 ON v0098.v0058 = v0000.v0058
+)
+SELECT
+  SUBSTRING(CAST(v0113 AS VARCHAR), 6, 5) AS day,
+  COUNT(*) AS v0183,
+  COUNT(CASE WHEN v0095='value0039' THEN 1 END) AS returns
+FROM v0568
+GROUP BY v0113
+ORDER BY v0113
+
+-- query 130
+WITH v0736 AS (
+  SELECT DISTINCT
+    v0058,
+    CASE WHEN json_get_str(metadata, 'value0042') = 'value0043' THEN 'value0226'
+         WHEN json_get_str(metadata, 'value0042') = 'value0044' THEN 'value0227' END AS v0737,
+    CAST(v0025 AS DATE) AS v0113
+  FROM v0029
+  WHERE CAST(v0025 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+    AND CAST(v0025 AS DATE) < CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) + INTERVAL '7 days' AS DATE)
+    AND v0030 = 1
+    AND v0031 <> 'value0014'
+    AND type = 'value0016'
+    AND json_get_str(metadata, 'value0228') IS NULL
+    AND json_get_str(metadata, 'value0042') IN ('value0043','value0044')
+),
+v0085 AS (
+  SELECT
+    REPLACE(json_get_str(data, 'value0032'), 'value0052.', '') AS v0058,
+    LOWER(json_get_str(data, 'value0033')) AS v0087,
+    CAST(json_get_str(data, 'value0034') AS TIMESTAMP) AS v0088
+  FROM v0089
+  WHERE type = 'value0035'
+    AND CAST(v0090 AS DATE) >= CAST(date_trunc('week', CAST(today() AS TIMESTAMP)) AS DATE)
+    AND json_get_str(data, 'value0032') LIKE 'value0052.%'
+),
+v0091 AS (SELECT v0058, MAX(v0088) AS v0092 FROM v0085 GROUP BY v0058),
+v0093 AS (
+  SELECT v0094.v0058, v0094.v0087 AS v0095
+  FROM v0085 v0094 INNER JOIN v0091 v0096 ON v0096.v0058 = v0094.v0058 AND v0096.v0092 = v0094.v0088
+),
+v0568 AS (
+  SELECT v0000.v0113, v0000.v0737, v0098.v0095
+  FROM v0736 v0000 LEFT JOIN v0093 v0098 ON v0098.v0058 = v0000.v0058
+)
+SELECT
+  SUBSTRING(CAST(v0113 AS VARCHAR), 6, 5) AS day,
+  COUNT(*) AS v0183,
+  COUNT(CASE WHEN v0095='value0039' THEN 1 END) AS returns
+FROM v0568
+GROUP BY v0113
+ORDER BY v0113
+
+-- query 131
+SELECT
+  v0738,
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) = today() - INTERVAL '7 days'
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0739,
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) = today()
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0740,
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) = today() - INTERVAL '7 days'
+      AND v0031 = 'value0017'
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0741,
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) = today()
+      AND v0031 = 'value0017'
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0742,
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) = today() - INTERVAL '7 days'
+      AND v0031 = 'value0017'
+      THEN v0033
+      ELSE 0
+    END
+  ) / 100 AS v0743,
+  SUM(
+    CASE
+      WHEN CAST(v0025 AS DATE) = today()
+      AND v0031 = 'value0017'
+      THEN v0033
+      ELSE 0
+    END
+  ) / 100 AS v0744
+FROM v0029
+WHERE
+  v0030 = 1
+  AND v0031 <> 'value0014'
+  AND type = 'value0015'
+  AND NOT v0025 IS NULL
+  AND CAST(v0025 AS DATE) IN (today(), today() - INTERVAL '7 days')
+GROUP BY v0738
+ORDER BY
+  GREATEST(
+    SUM(CASE WHEN CAST(v0025 AS DATE) = today() - INTERVAL '7 days' THEN 1 ELSE 0 END),
+    SUM(CASE WHEN CAST(v0025 AS DATE) = today() THEN 1 ELSE 0 END)
+  ) DESC
+
+-- query 132
+WITH v0105 AS (
+  SELECT
+    json_get_str(data, 'value0040') AS v0106,
+    MIN(CAST(v0090 AS DATE)) AS v0107
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_get_str(data, 'value0033') = 'value0041'
+    AND CAST(v0090 AS DATE) >= CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '28' DAYS
+  GROUP BY json_get_str(data, 'value0040')
+),
+v0166 AS (
+  SELECT
+    CAST(CAST(
+      CASE WHEN v0032.type = 'value0016' THEN v0054.v0107
+           ELSE CAST(v0032.v0025 AS DATE) END
+      AS DATE) AS TIMESTAMP) AS v0113,
+    SUM(v0032.v0033) / 100.0 AS v0167
+  FROM v0029 v0032
+  LEFT JOIN v0105 v0054 ON v0054.v0106 = v0032.v0111
+  WHERE
+    v0032.v0030 = 1
+    AND v0032.v0031 = 'value0017'
+    AND v0032.type IN ('value0016', 'value0015')
+    AND (
+      (v0032.type = 'value0015'
+        AND v0032.v0025 IS NOT NULL
+        AND CAST(v0032.v0025 AS DATE) >= CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '21' DAYS
+        AND CAST(v0032.v0025 AS DATE) <= CURRENT_DATE)
+      OR (v0032.type = 'value0016'
+        AND v0054.v0107 IS NOT NULL
+        AND v0054.v0107 >= CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '21' DAYS
+        AND v0054.v0107 <= CURRENT_DATE)
+    )
+  GROUP BY CAST(CAST(
+    CASE WHEN v0032.type = 'value0016' THEN v0054.v0107
+         ELSE CAST(v0032.v0025 AS DATE) END
+    AS DATE) AS TIMESTAMP)
+), v0168 AS (
+  SELECT
+    v0113,
+    v0167,
+    CASE
+      WHEN date_trunc('week', v0113) = v0113 THEN 1
+      WHEN date_trunc('week', v0113) + INTERVAL '1' DAY = v0113 THEN 2
+      WHEN date_trunc('week', v0113) + INTERVAL '2' DAYS = v0113 THEN 3
+      WHEN date_trunc('week', v0113) + INTERVAL '3' DAYS = v0113 THEN 4
+      WHEN date_trunc('week', v0113) + INTERVAL '4' DAYS = v0113 THEN 5
+      WHEN date_trunc('week', v0113) + INTERVAL '5' DAYS = v0113 THEN 6
+      WHEN date_trunc('week', v0113) + INTERVAL '6' DAYS = v0113 THEN 7
+    END AS v0135,
+    CASE
+      WHEN date_trunc('week', v0113) = v0113 THEN 'value0054'
+      WHEN date_trunc('week', v0113) + INTERVAL '1' DAY = v0113 THEN 'value0055'
+      WHEN date_trunc('week', v0113) + INTERVAL '2' DAYS = v0113 THEN 'value0056'
+      WHEN date_trunc('week', v0113) + INTERVAL '3' DAYS = v0113 THEN 'value0057'
+      WHEN date_trunc('week', v0113) + INTERVAL '4' DAYS = v0113 THEN 'value0058'
+      WHEN date_trunc('week', v0113) + INTERVAL '5' DAYS = v0113 THEN 'value0059'
+      WHEN date_trunc('week', v0113) + INTERVAL '6' DAYS = v0113 THEN 'value0060'
+    END AS v0136,
+    CASE WHEN v0113 >= date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) THEN 'value0061' ELSE 'value0062' END AS bucket
+  FROM v0166
+), v0169 AS (
+  SELECT
+    v0135,
+    v0136,
+    SUM(CASE WHEN bucket = 'value0061' THEN v0167 ELSE 0 END) AS v0167,
+    SUM(CASE WHEN bucket = 'value0062' THEN v0167 ELSE 0 END) / 3.0 AS v0164
+  FROM v0168
+  GROUP BY v0135, v0136
+)
+SELECT
+  v0135,
+  v0136,
+  SUM(v0167) OVER (ORDER BY v0135 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v0167,
+  SUM(v0164) OVER (ORDER BY v0135 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v0164
+FROM v0169
+ORDER BY v0135
+
+-- query 133
+SELECT
+  CAST(CAST(DATE_TRUNC('WEEK', CAST(v0025 AS TIMESTAMP)) AS DATE) AS TEXT) AS v0065,
+  SUM(v0026) / 100.0 AS v0745,
+  SUM(
+    CASE WHEN v0031 = 'value0017' THEN v0033 ELSE 0 END
+  ) / 100.0 AS v0746,
+  SUM(
+    CASE WHEN v0738 = 'value0087' AND v0031 = 'value0017' THEN v0033 ELSE 0 END
+  ) / 100.0 AS v0747,
+  SUM(
+    CASE WHEN v0738 = 'value0086' AND v0031 = 'value0017' THEN v0033 ELSE 0 END
+  ) / 100.0 AS v0748,
+  100.0 * SUM(
+    CASE WHEN v0738 = 'value0087' AND v0031 = 'value0017' THEN v0033 ELSE 0 END
+  ) / NULLIF(
+    SUM(CASE WHEN v0738 = 'value0087' THEN v0026 ELSE 0 END),
+    0
+  ) AS v0749,
+  100.0 * SUM(
+    CASE WHEN v0738 = 'value0086' AND v0031 = 'value0017' THEN v0033 ELSE 0 END
+  ) / NULLIF(
+    SUM(CASE WHEN v0738 = 'value0086' THEN v0026 ELSE 0 END),
+    0
+  ) AS v0750
+FROM v0029
+WHERE
+  v0030 = 1
+  AND v0031 <> 'value0014'
+  AND type = 'value0015'
+  AND NOT v0025 IS NULL
+  AND CAST(v0025 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE - INTERVAL '84' DAYS AS TIMESTAMP)) AS DATE)
+GROUP BY
+  1
+ORDER BY
+  1 DESC
+
+-- query 134
+WITH v0705 AS (
+  SELECT v0058, MAX(version) AS v0706
+  FROM v0029
+  WHERE CAST(v0025 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE - INTERVAL '84' DAYS AS TIMESTAMP)) AS DATE)
+    AND v0030 = 1
+    AND v0031 <> 'value0014'
+    AND type = 'value0016'
+  GROUP BY v0058
+),
+v0707 AS (
+  SELECT
+    v0032.v0058,
+    CAST(DATE_TRUNC('WEEK', CAST(v0032.v0025 AS TIMESTAMP)) AS DATE) AS v0065,
+    v0032.v0026
+  FROM v0029 v0032
+  INNER JOIN v0705 v0096 ON v0096.v0058 = v0032.v0058 AND v0096.v0706 = v0032.version
+  WHERE v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0032.type = 'value0016'
+),
+v0085 AS (
+  SELECT
+    REPLACE(json_get_str(data, 'value0032'), 'value0052.', '') AS v0058,
+    LOWER(json_get_str(data, 'value0033')) AS v0087,
+    CAST(json_get_str(data, 'value0034') AS TIMESTAMP) AS v0088
+  FROM v0089
+  WHERE type = 'value0035'
+    AND CAST(v0090 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE - INTERVAL '84' DAYS AS TIMESTAMP)) AS DATE)
+    AND json_get_str(data, 'value0032') LIKE 'value0052.%'
+),
+v0091 AS (
+  SELECT v0058, MAX(v0088) AS v0092 FROM v0085 GROUP BY v0058
+),
+v0093 AS (
+  SELECT v0094.v0058, v0094.v0087 AS v0095
+  FROM v0085 v0094
+  INNER JOIN v0091 v0096 ON v0096.v0058 = v0094.v0058 AND v0096.v0092 = v0094.v0088
+),
+v0097 AS (
+  SELECT
+    v0032.v0065,
+    v0032.v0026 / 100.0 AS v0708,
+    v0098.v0095
+  FROM v0707 v0032
+  LEFT JOIN v0093 v0098 ON v0098.v0058 = v0032.v0058
+)
+SELECT
+  CAST(v0065 AS TEXT) AS v0065,
+  SUM(v0708) AS v0069,
+  SUM(CASE WHEN v0095 = 'value0041' THEN v0708 ELSE 0 END) AS v0071,
+  SUM(CASE WHEN v0095 = 'value0039' THEN v0708 ELSE 0 END) AS v0751,
+  SUM(CASE WHEN v0095 IS NULL OR v0095 NOT IN ('value0041', 'value0039') THEN v0708 ELSE 0 END) AS v0752,
+  COUNT(*) AS v0753,
+  COUNT(CASE WHEN v0095 = 'value0041' THEN 1 END) AS v0754,
+  COUNT(CASE WHEN v0095 = 'value0039' THEN 1 END) AS v0755,
+  COUNT(CASE WHEN v0095 IS NULL OR v0095 NOT IN ('value0041', 'value0039') THEN 1 END) AS v0756,
+  100.0 * SUM(CASE WHEN v0095 = 'value0039' THEN v0708 ELSE 0 END) / NULLIF(SUM(v0708), 0) AS v0757
+FROM v0097
+GROUP BY v0065
+ORDER BY v0065 DESC
+
+-- query 135
+WITH v0112 AS (
+  SELECT
+    CAST(v0025 AS DATE) AS v0113,
+    SUM(v0033) / 100.0 AS v0067
+  FROM v0029
+  WHERE
+    v0030 = 1
+    AND v0031 = 'value0017'
+    AND type = 'value0015'
+    AND v0036 IN (
+      'value0018',
+      'value0019',
+      'value0020'
+    )
+    AND NOT v0025 IS NULL
+    AND CAST(v0025 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE)
+    AND CAST(v0025 AS DATE) <= CURRENT_DATE
+  GROUP BY
+    1
+), v0115 AS (
+  SELECT
+    CAST(v0025 AS DATE) AS v0113,
+    SUM(
+      CASE
+        WHEN JSON_GET_STR(metadata, 'value0042') = 'value0043'
+        THEN v0026
+        ELSE 0
+      END
+    ) / 100.0 AS v0116,
+    SUM(
+      CASE
+        WHEN JSON_GET_STR(metadata, 'value0042') = 'value0044'
+        THEN v0026
+        ELSE 0
+      END
+    ) / 100.0 AS v0117
+  FROM v0029
+  WHERE
+    v0030 = 1
+    AND v0031 <> 'value0014'
+    AND type = 'value0016'
+    AND v0036 IN (
+      'value0018',
+      'value0019',
+      'value0020'
+    )
+    AND NOT v0025 IS NULL
+    AND CAST(v0025 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE)
+    AND CAST(v0025 AS DATE) <= CURRENT_DATE
+  GROUP BY
+    1
+), v0118 AS (
+  SELECT
+    CAST(v0090 AS DATE) AS v0113,
+    JSON_GET_STR(data, 'value0033') AS status,
+    JSON_GET_STR(data, 'value0045') AS v0119,
+    JSON_GET_FLOAT(data, 'value0046') AS v0120,
+    SUBSTRING(JSON_GET_STR(data, 'value0032'), 9) AS v0121
+  FROM v0089
+  WHERE
+    type = 'value0035'
+    AND JSON_GET_STR(data, 'value0047') = 'value0048'
+    AND JSON_GET_STR(data, 'value0049') = 'value0050-value0051'
+    AND JSON_GET_STR(data, 'value0032') LIKE 'value0052.%'
+    AND CAST(v0090 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '21' DAYS
+), v0122 AS (
+  SELECT
+    v0058,
+    MAX(JSON_GET_STR(metadata, 'value0042')) AS v0123
+  FROM v0029
+  WHERE
+    type = 'value0016'
+    AND CAST(v0025 AS DATE) >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '35' DAYS
+  GROUP BY
+    v0058
+), v0124 AS (
+  SELECT
+    MIN(v0125.v0113) AS v0113,
+    v0125.v0119,
+    MAX(v0125.v0120) AS v0120,
+    MAX(v0126.v0123) AS v0123
+  FROM v0118 AS v0125
+  LEFT JOIN v0122 AS v0126
+    ON v0126.v0058 = v0125.v0121
+  WHERE
+    v0125.status = 'value0053'
+  GROUP BY
+    v0125.v0119
+), v0127 AS (
+  SELECT
+    v0119,
+    MAX(v0120) AS v0128
+  FROM v0118
+  WHERE
+    status = 'value0039'
+  GROUP BY
+    v0119
+), v0129 AS (
+  SELECT
+    v0032.v0113 AS v0130,
+    v0032.v0123,
+    v0032.v0120 AS v0131,
+    COALESCE(v0132.v0128, 0) AS v0133
+  FROM v0124 AS v0032
+  LEFT JOIN v0127 AS v0132
+    ON v0132.v0119 = v0032.v0119
+), v0134 AS (
+  SELECT
+    1 AS v0135,
+    'value0054' AS v0136
+  UNION ALL
+  SELECT
+    2,
+    'value0055'
+  UNION ALL
+  SELECT
+    3,
+    'value0056'
+  UNION ALL
+  SELECT
+    4,
+    'value0057'
+  UNION ALL
+  SELECT
+    5,
+    'value0058'
+  UNION ALL
+  SELECT
+    6,
+    'value0059'
+  UNION ALL
+  SELECT
+    7,
+    'value0060'
+), v0145 AS (
+  SELECT
+    CASE
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) = CAST(v0113 AS TIMESTAMP)
+      THEN 1
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '1' DAY = CAST(v0113 AS TIMESTAMP)
+      THEN 2
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '2' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 3
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '3' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 4
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '4' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 5
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '5' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 6
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '6' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 7
+    END AS v0135,
+    SUM(v0067) AS v0146
+  FROM v0112
+  GROUP BY
+    1
+), v0150 AS (
+  SELECT
+    CASE
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) = CAST(v0113 AS TIMESTAMP)
+      THEN 1
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '1' DAY = CAST(v0113 AS TIMESTAMP)
+      THEN 2
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '2' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 3
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '3' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 4
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '4' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 5
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '5' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 6
+      WHEN DATE_TRUNC('WEEK', CAST(v0113 AS TIMESTAMP)) + INTERVAL '6' DAYS = CAST(v0113 AS TIMESTAMP)
+      THEN 7
+    END AS v0135,
+    SUM(v0116) AS v0151,
+    SUM(v0117) AS v0152
+  FROM v0115
+  GROUP BY
+    1
+), v0140 AS (
+  SELECT
+    CASE
+      WHEN DATE_TRUNC('WEEK', CAST(v0130 AS TIMESTAMP)) = CAST(v0130 AS TIMESTAMP)
+      THEN 1
+      WHEN DATE_TRUNC('WEEK', CAST(v0130 AS TIMESTAMP)) + INTERVAL '1' DAY = CAST(v0130 AS TIMESTAMP)
+      THEN 2
+      WHEN DATE_TRUNC('WEEK', CAST(v0130 AS TIMESTAMP)) + INTERVAL '2' DAYS = CAST(v0130 AS TIMESTAMP)
+      THEN 3
+      WHEN DATE_TRUNC('WEEK', CAST(v0130 AS TIMESTAMP)) + INTERVAL '3' DAYS = CAST(v0130 AS TIMESTAMP)
+      THEN 4
+      WHEN DATE_TRUNC('WEEK', CAST(v0130 AS TIMESTAMP)) + INTERVAL '4' DAYS = CAST(v0130 AS TIMESTAMP)
+      THEN 5
+      WHEN DATE_TRUNC('WEEK', CAST(v0130 AS TIMESTAMP)) + INTERVAL '5' DAYS = CAST(v0130 AS TIMESTAMP)
+      THEN 6
+      WHEN DATE_TRUNC('WEEK', CAST(v0130 AS TIMESTAMP)) + INTERVAL '6' DAYS = CAST(v0130 AS TIMESTAMP)
+      THEN 7
+    END AS v0135,
+    SUM(CASE WHEN v0123 = 'value0043' THEN v0131 ELSE 0 END) AS v0141,
+    SUM(CASE WHEN v0123 = 'value0043' THEN v0133 ELSE 0 END) AS v0142,
+    SUM(CASE WHEN v0123 = 'value0044' THEN v0131 ELSE 0 END) AS v0143,
+    SUM(CASE WHEN v0123 = 'value0044' THEN v0133 ELSE 0 END) AS v0144
+  FROM v0129
+  WHERE
+    v0130 >= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '21' DAYS
+    AND v0130 < CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE)
+  GROUP BY
+    1
+), v0758 AS (
+  SELECT
+    v0154.v0135,
+    v0154.v0136,
+    COALESCE(v0155.v0146, 0) AS v0759,
+    COALESCE(v0158.v0151, 0) AS v0760,
+    COALESCE(v0159.v0142, 0) / NULLIF(v0159.v0141, 0) AS v0761,
+    COALESCE(v0158.v0152, 0) AS v0762,
+    COALESCE(v0159.v0144, 0) / NULLIF(v0159.v0143, 0) AS v0763,
+    COALESCE(v0155.v0146, 0)
+      + COALESCE(v0158.v0151, 0) * (1 - COALESCE(v0159.v0142, 0) / NULLIF(v0159.v0141, 0))
+      + COALESCE(v0158.v0152, 0) * (1 - COALESCE(v0159.v0144, 0) / NULLIF(v0159.v0143, 0)) AS v0764
+  FROM v0134 AS v0154
+  LEFT JOIN v0145 AS v0155
+    ON v0155.v0135 = v0154.v0135
+  LEFT JOIN v0150 AS v0158
+    ON v0158.v0135 = v0154.v0135
+  LEFT JOIN v0140 AS v0159
+    ON v0159.v0135 = v0154.v0135
+), v0765 AS (
+  SELECT
+    CASE
+      WHEN DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) = CAST(CURRENT_DATE AS TIMESTAMP) THEN 1
+      WHEN DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) + INTERVAL '1' DAY = CAST(CURRENT_DATE AS TIMESTAMP) THEN 2
+      WHEN DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) + INTERVAL '2' DAYS = CAST(CURRENT_DATE AS TIMESTAMP) THEN 3
+      WHEN DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) + INTERVAL '3' DAYS = CAST(CURRENT_DATE AS TIMESTAMP) THEN 4
+      WHEN DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) + INTERVAL '4' DAYS = CAST(CURRENT_DATE AS TIMESTAMP) THEN 5
+      WHEN DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) + INTERVAL '5' DAYS = CAST(CURRENT_DATE AS TIMESTAMP) THEN 6
+      WHEN DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) + INTERVAL '6' DAYS = CAST(CURRENT_DATE AS TIMESTAMP) THEN 7
+    END AS v0766
+)
+SELECT
+  v0634.v0135,
+  v0634.v0136,
+  v0634.v0759,
+  v0634.v0760,
+  v0634.v0761,
+  v0634.v0762,
+  v0634.v0763,
+  v0634.v0764,
+  CASE
+    WHEN v0634.v0135 <= (SELECT v0766 FROM v0765)
+      THEN SUM(COALESCE(v0634.v0764, 0)) OVER (ORDER BY v0634.v0135)
+  END AS v0767
+FROM v0758 AS v0634
+ORDER BY
+  v0634.v0135
+
+-- query 136
+SELECT
+  SUM(CASE WHEN v0192 >= date_trunc('week', current_date) THEN 1 ELSE 0 END) AS v0061,
+  SUM(CASE WHEN v0192 >= date_trunc('week', current_date) - INTERVAL '7 days'
+            AND v0192 <  date_trunc('week', current_date) - INTERVAL '7 days' + (current_date - date_trunc('week', current_date))
+           THEN 1 ELSE 0 END) AS v0062
+FROM v0056
+WHERE v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND v0192 >= date_trunc('week', current_date) - INTERVAL '7 days'
+
+-- query 137
+SELECT
+  SUM(CASE WHEN v0192 >= date_trunc('week', current_date) THEN v0006 ELSE 0 END) / 100.0 AS v0063,
+  SUM(CASE WHEN v0192 >= date_trunc('week', current_date) - INTERVAL '7 days'
+            AND v0192 <  date_trunc('week', current_date) - INTERVAL '7 days' + (current_date - date_trunc('week', current_date))
+           THEN v0006 ELSE 0 END) / 100.0 AS v0062
+FROM v0056
+WHERE v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND v0192 >= date_trunc('week', current_date) - INTERVAL '7 days'
+
+-- query 138
+SELECT
+  SUM(CASE WHEN v0192 >= date_trunc('week', current_date) THEN 1 ELSE 0 END) AS v0061,
+  SUM(CASE WHEN v0192 >= date_trunc('week', current_date) - INTERVAL '7 days'
+            AND v0192 <  date_trunc('week', current_date) - INTERVAL '7 days' + (current_date - date_trunc('week', current_date))
+           THEN 1 ELSE 0 END) AS v0062
+FROM v0056
+WHERE v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND v0192 >= date_trunc('week', current_date) - INTERVAL '7 days'
+  AND v0194 = 'value0067'
+
+-- query 139
+SELECT
+  SUM(CASE WHEN v0192 >= date_trunc('week', current_date) THEN v0006 ELSE 0 END) / 100.0 AS v0063,
+  SUM(CASE WHEN v0192 >= date_trunc('week', current_date) - INTERVAL '7 days'
+            AND v0192 <  date_trunc('week', current_date) - INTERVAL '7 days' + (current_date - date_trunc('week', current_date))
+           THEN v0006 ELSE 0 END) / 100.0 AS v0062
+FROM v0056
+WHERE v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND v0192 >= date_trunc('week', current_date) - INTERVAL '7 days'
+  AND v0194 = 'value0067'
+
+-- query 140
+SELECT
+  SUM(CASE WHEN v0192 >= date_trunc('week', current_date) THEN 1 ELSE 0 END) AS v0061,
+  SUM(CASE WHEN v0192 >= date_trunc('week', current_date) - INTERVAL '7 days'
+            AND v0192 <  date_trunc('week', current_date) - INTERVAL '7 days' + (current_date - date_trunc('week', current_date))
+           THEN 1 ELSE 0 END) AS v0062
+FROM v0056
+WHERE v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND v0192 >= date_trunc('week', current_date) - INTERVAL '7 days'
+  AND v0194 IN (
+    'value0065',
+    'value0066'
+  )
+
+-- query 141
+SELECT
+  SUM(CASE WHEN v0192 >= date_trunc('week', current_date) THEN v0006 ELSE 0 END) / 100.0 AS v0063,
+  SUM(CASE WHEN v0192 >= date_trunc('week', current_date) - INTERVAL '7 days'
+            AND v0192 <  date_trunc('week', current_date) - INTERVAL '7 days' + (current_date - date_trunc('week', current_date))
+           THEN v0006 ELSE 0 END) / 100.0 AS v0062
+FROM v0056
+WHERE v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND v0192 >= date_trunc('week', current_date) - INTERVAL '7 days'
+  AND v0194 IN (
+    'value0065',
+    'value0066'
+  )
+
+-- query 142
+SELECT
+  SUM(CASE WHEN v0192 >= date_trunc('week', current_date) THEN 1 ELSE 0 END) AS v0061,
+  SUM(CASE WHEN v0192 >= date_trunc('week', current_date) - INTERVAL '7 days'
+            AND v0192 <  date_trunc('week', current_date) - INTERVAL '7 days' + (current_date - date_trunc('week', current_date))
+           THEN 1 ELSE 0 END) AS v0062
+FROM v0056
+WHERE v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND v0192 >= date_trunc('week', current_date) - INTERVAL '7 days'
+  AND v0194 IN (
+    'value0063',
+    'value0064'
+  )
+
+-- query 143
+SELECT
+  SUM(CASE WHEN v0192 >= date_trunc('week', current_date) THEN v0006 ELSE 0 END) / 100.0 AS v0063,
+  SUM(CASE WHEN v0192 >= date_trunc('week', current_date) - INTERVAL '7 days'
+            AND v0192 <  date_trunc('week', current_date) - INTERVAL '7 days' + (current_date - date_trunc('week', current_date))
+           THEN v0006 ELSE 0 END) / 100.0 AS v0062
+FROM v0056
+WHERE v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND v0192 >= date_trunc('week', current_date) - INTERVAL '7 days'
+  AND v0194 IN (
+    'value0063',
+    'value0064'
+  )
+
+-- query 144
+SELECT 'value0193 value0194 value0195 value0196' AS v0519, COUNT(*) AS v0391
+FROM v0215
+WHERE v0060 IS NULL
+  AND v0031 = 'value0110'
+  AND v0367 >= date_trunc('week', current_date)
+  AND v0565 NOT LIKE '%value0197%'
+  AND v0663 = 'value0198'
+UNION ALL
+SELECT 'value0199 value0200 value0201', COUNT(*)
+FROM v0215
+WHERE v0060 IS NULL
+  AND v0031 = 'value0110'
+  AND v0367 >= date_trunc('week', current_date)
+  AND v0565 NOT LIKE '%value0197%'
+  AND v0664 = 'value0198'
+UNION ALL
+SELECT 'value0202 value0201', COUNT(*)
+FROM v0215
+WHERE v0060 IS NULL
+  AND v0031 = 'value0110'
+  AND v0367 >= date_trunc('week', current_date)
+  AND v0565 NOT LIKE '%value0197%'
+  AND v0665 = 'value0198'
+UNION ALL
+SELECT 'value0199 value0200 value0203', COUNT(*)
+FROM v0215
+WHERE v0060 IS NULL
+  AND v0031 = 'value0110'
+  AND v0367 >= date_trunc('week', current_date)
+  AND v0565 NOT LIKE '%value0197%'
+  AND v0666 = 'value0198'
+UNION ALL
+SELECT 'value0202 value0203', COUNT(*)
+FROM v0215
+WHERE v0060 IS NULL
+  AND v0031 = 'value0110'
+  AND v0367 >= date_trunc('week', current_date)
+  AND v0565 NOT LIKE '%value0197%'
+  AND v0667 = 'value0198'
+UNION ALL
+SELECT 'value0204 value0205 value0206', COUNT(*)
+FROM v0215
+WHERE v0060 IS NULL
+  AND v0031 = 'value0110'
+  AND v0367 >= date_trunc('week', current_date)
+  AND v0565 NOT LIKE '%value0197%'
+  AND v0663 != 'value0198'
+  AND v0664 != 'value0198'
+  AND v0665 != 'value0198'
+  AND v0666 != 'value0198'
+  AND v0667 != 'value0198'
+  AND v0668 != 'value0198'
+ORDER BY 2 DESC
+
+-- query 145
+SELECT
+  CASE
+    WHEN v0629 = 'value0192' THEN 'value0204 value0207'
+    WHEN v0629 = 'value0208' THEN 'value0209 value0210 value0211'
+    WHEN v0629 = 'value0212' THEN 'value0209 value0213'
+    ELSE 'value0214'
+  END AS v0519,
+  COUNT(*) AS v0391
+FROM v0215
+WHERE v0060 IS NULL
+  AND v0031 = 'value0110'
+  AND v0367 >= date_trunc('week', current_date)
+  AND v0565 LIKE '%"value0197": "value0215"%'
+GROUP BY 1
+ORDER BY 2 DESC
+
+-- query 146
+SELECT
+  CAST(regexp_replace(regexp_replace(CAST((CAST(v0172 AS DATE) - CAST(v0042 AS DATE)) AS VARCHAR), '^\\d+-\\d+ ', ''), ' .*$', '') AS INTEGER) AS v0569,
+  COUNT(*) AS v0391
+FROM v0056
+WHERE v0060 IS NULL
+  AND v0042 IS NOT NULL
+  AND v0172 IS NOT NULL
+  AND v0042 >= CURRENT_DATE - INTERVAL '30' DAYS
+  AND CAST(regexp_replace(regexp_replace(CAST((CAST(v0172 AS DATE) - CAST(v0042 AS DATE)) AS VARCHAR), '^\\d+-\\d+ ', ''), ' .*$', '') AS INTEGER) > 0
+GROUP BY 1
+ORDER BY 1
+
+-- query 147
+SELECT
+  CAST(v0006 / 1000 AS INTEGER) * 10 AS v0120,
+  COUNT(*) AS v0391
+FROM v0056
+WHERE v0060 IS NULL
+  AND v0042 IS NOT NULL
+  AND v0172 IS NOT NULL
+  AND v0042 >= CURRENT_DATE - INTERVAL '30' DAYS
+  AND v0006 > 0
+GROUP BY 1
+ORDER BY 1
+
+-- query 148
+SELECT
+  CAST(CAST(COALESCE(v0669, v0670) AS DATE) AS VARCHAR) AS v0671,
+  SUM(
+    CASE
+      WHEN v0194 IN ('value0063', 'value0064')
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0195,
+  SUM(
+    CASE
+      WHEN v0194 IN (
+        'value0065',
+        'value0066'
+      )
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0196,
+  SUM(
+    CASE
+      WHEN v0194 = 'value0067'
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0197
+FROM v0056
+WHERE
+  v0060 IS NULL
+  AND (
+    (v0669 IS NOT NULL AND v0669 >= current_date - INTERVAL '7 days')
+    OR
+    (v0670 IS NOT NULL AND v0670 >= current_date - INTERVAL '7 days')
+  )
+GROUP BY
+  CAST(CAST(COALESCE(v0669, v0670) AS DATE) AS VARCHAR)
+ORDER BY
+  v0671 ASC
+
+-- query 149
+SELECT
+  CAST(CAST(
+    CASE
+      WHEN CAST(v0192 AS DATE) < date_trunc('week', current_date)
+      THEN CAST(v0192 AS DATE) + INTERVAL '7 days'
+      ELSE CAST(v0192 AS DATE)
+    END AS DATE) AS VARCHAR) AS v0113,
+  COUNT(CASE WHEN CAST(v0192 AS DATE) >= date_trunc('week', current_date) THEN 1 END) AS v0672,
+  COUNT(CASE WHEN CAST(v0192 AS DATE) < date_trunc('week', current_date) THEN 1 END) AS v0673,
+  SUM(CASE WHEN CAST(v0192 AS DATE) >= date_trunc('week', current_date) THEN v0006 ELSE 0 END) / 100.0 AS v0674,
+  SUM(CASE WHEN CAST(v0192 AS DATE) < date_trunc('week', current_date) THEN v0006 ELSE 0 END) / 100.0 AS v0675
+FROM v0056
+WHERE v0060 IS NULL
+  AND v0192 IS NOT NULL
+  AND (
+    (CAST(v0192 AS DATE) >= date_trunc('week', current_date) - INTERVAL '7 days'
+     AND CAST(v0192 AS DATE) <= current_date - INTERVAL '7 days')
+    OR CAST(v0192 AS DATE) >= date_trunc('week', current_date)
+  )
+GROUP BY 1
+ORDER BY v0113
+
+-- query 150
+WITH
+  v0207 AS (
+    SELECT
+      v0075.id AS v0177,
+      CAST(date_trunc('day', CAST(v0075.v0084 AS TIMESTAMP)) AS DATE) AS v0208
+    FROM v0209 v0075
+    WHERE
+      v0075.v0060 IS NULL
+      AND v0075.v0084 >= '2026-07-07 00:00:00'
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0211 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0212 v0155
+    JOIN v0213 v0073
+      ON v0073.v0175 = v0155.id
+      AND v0073.type = 'value0072'
+      AND v0073.v0060 IS NULL
+    WHERE v0155.v0060 IS NULL
+  ),
+  v0214 AS (
+    SELECT DISTINCT v0177
+    FROM v0215
+    WHERE v0060 IS NULL
+  ),
+  v0216 AS (
+    SELECT DISTINCT v0094.v0177
+    FROM v0215 v0094
+    WHERE v0094.v0031 = 'value0073'
+      AND v0094.v0060 IS NULL
+  ),
+  v0217 AS (
+    SELECT DISTINCT v0218.v0177
+    FROM v0219 v0218
+    JOIN v0056 v0057 ON v0057.id = v0218.v0220
+    WHERE v0218.v0221 IS NOT NULL
+      AND v0057.v0201 = 0
+  ),
+  v0222 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0056 v0057
+    JOIN v0212 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0224 IS NOT NULL
+      AND v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+  ),
+  v0223 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0056 v0057
+    JOIN v0212 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0031 = 'value0074'
+      AND v0057.v0224 IS NULL
+      AND v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+  ),
+  v0225 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0056 v0057
+    JOIN v0212 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0031 IN (
+        'value0075',
+        'value0076'
+      )
+      AND v0057.v0224 IS NULL
+      AND v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+  )
+SELECT
+  CAST(v0126.v0208 AS VARCHAR) AS v0226,
+  COUNT(*) AS v0227,
+  SUM(CASE WHEN v0228.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0229,
+  SUM(CASE WHEN v0230.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0231,
+  SUM(CASE WHEN v0232.v0177 IS NOT NULL THEN 1 ELSE 0 END) AS v0233,
+  SUM(CASE WHEN v0077.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0234,
+  SUM(CASE WHEN v0235.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0236,
+  SUM(CASE WHEN v0237.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0238,
+  SUM(CASE WHEN v0239.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0240
+FROM v0207 v0126
+LEFT JOIN v0211       v0228  ON v0228.v0177  = v0126.v0177
+LEFT JOIN v0214    v0230  ON v0230.v0177  = v0126.v0177
+LEFT JOIN v0216         v0232 ON v0232.v0177 = v0126.v0177
+LEFT JOIN v0217        v0077  ON v0077.v0177  = v0126.v0177
+LEFT JOIN v0222          v0235  ON v0235.v0177  = v0126.v0177
+LEFT JOIN v0223  v0237  ON v0237.v0177  = v0126.v0177
+LEFT JOIN v0225  v0239  ON v0239.v0177  = v0126.v0177
+GROUP BY v0126.v0208
+ORDER BY v0126.v0208 DESC
+
+-- query 151
+WITH
+  v0207 AS (
+    SELECT
+      v0075.id AS v0177,
+      CAST(date_trunc('day', CAST(v0075.v0084 AS TIMESTAMP)) AS DATE) AS v0208
+    FROM v0209 v0075
+    WHERE
+      v0075.v0060 IS NULL
+      AND v0075.v0084 >= '2026-07-07 00:00:00'
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0211 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0212 v0155
+    JOIN v0213 v0073
+      ON v0073.v0175 = v0155.id
+      AND v0073.type = 'value0072'
+      AND v0073.v0060 IS NULL
+    WHERE v0155.v0060 IS NULL
+  ),
+  v0214 AS (
+    SELECT DISTINCT v0177
+    FROM v0215
+    WHERE v0060 IS NULL
+  ),
+  v0216 AS (
+    SELECT DISTINCT v0094.v0177
+    FROM v0215 v0094
+    WHERE v0094.v0031 = 'value0073'
+      AND v0094.v0060 IS NULL
+  ),
+  v0217 AS (
+    SELECT DISTINCT v0218.v0177
+    FROM v0219 v0218
+    JOIN v0056 v0057 ON v0057.id = v0218.v0220
+    WHERE v0218.v0221 IS NOT NULL
+      AND v0057.v0201 = 0
+  ),
+  v0222 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0056 v0057
+    JOIN v0212 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0224 IS NOT NULL
+      AND v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+  ),
+  v0223 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0056 v0057
+    JOIN v0212 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0031 = 'value0074'
+      AND v0057.v0224 IS NULL
+      AND v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+  ),
+  v0225 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0056 v0057
+    JOIN v0212 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0031 IN (
+        'value0075',
+        'value0076'
+      )
+      AND v0057.v0224 IS NULL
+      AND v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+  ),
+  v0241 AS (
+    SELECT
+      v0126.v0208,
+      COUNT(*) AS v0227,
+      SUM(CASE WHEN v0228.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0229,
+      SUM(CASE WHEN v0230.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0231,
+      SUM(CASE WHEN v0232.v0177 IS NOT NULL THEN 1 ELSE 0 END) AS v0233,
+      SUM(CASE WHEN v0077.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0234,
+      SUM(CASE WHEN v0235.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0236,
+      SUM(CASE WHEN v0237.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0238,
+      SUM(CASE WHEN v0239.v0177  IS NOT NULL THEN 1 ELSE 0 END) AS v0240
+    FROM v0207 v0126
+    LEFT JOIN v0211       v0228  ON v0228.v0177  = v0126.v0177
+    LEFT JOIN v0214    v0230  ON v0230.v0177  = v0126.v0177
+    LEFT JOIN v0216         v0232 ON v0232.v0177 = v0126.v0177
+    LEFT JOIN v0217        v0077  ON v0077.v0177  = v0126.v0177
+    LEFT JOIN v0222          v0235  ON v0235.v0177  = v0126.v0177
+    LEFT JOIN v0223  v0237  ON v0237.v0177  = v0126.v0177
+    LEFT JOIN v0225  v0239  ON v0239.v0177  = v0126.v0177
+    GROUP BY v0126.v0208
+  )
+SELECT
+  CAST(v0208 AS VARCHAR) AS v0226,
+  1.0 AS v0227,
+  CASE WHEN v0227 = 0 THEN NULL ELSE CAST(v0229      AS DOUBLE) / v0227 END AS v0229,
+  CASE WHEN v0227 = 0 THEN NULL ELSE CAST(v0231   AS DOUBLE) / v0227 END AS v0231,
+  CASE WHEN v0227 = 0 THEN NULL ELSE CAST(v0233 AS DOUBLE) / v0227 END AS v0233,
+  CASE WHEN v0227 = 0 THEN NULL ELSE CAST(v0234 AS DOUBLE) / v0227 END AS v0234,
+  CASE WHEN v0227 = 0 THEN NULL ELSE CAST(v0236         AS DOUBLE) / v0227 END AS v0236,
+  CASE WHEN v0227 = 0 THEN NULL ELSE CAST(v0238 AS DOUBLE) / v0227 END AS v0238,
+  CASE WHEN v0227 = 0 THEN NULL ELSE CAST(v0240 AS DOUBLE) / v0227 END AS v0240
+FROM v0241
+ORDER BY v0208 DESC
+
+-- query 152
+WITH
+  v0207 AS (
+    SELECT
+      v0075.id AS v0177,
+      CAST(date_trunc('week', CAST(v0075.v0084 AS TIMESTAMP)) AS DATE) AS v0384,
+      CASE
+        WHEN v0075.v0210 LIKE '%value0069%' THEN 'value0069'
+        WHEN v0075.v0210 LIKE '%value0070%' THEN 'value0070'
+      END AS v0385
+    FROM v0176 v0075
+    WHERE
+      v0075.v0060 IS NULL
+      AND v0075.v0084 >= DATE '2026-05-18'
+      AND (v0075.v0210 LIKE '%value0069%' OR v0075.v0210 LIKE '%value0070%')
+      AND v0075.v0210 NOT LIKE '%value0071%'
+  ),
+  v0386 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0246 v0057
+    JOIN v0174 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+  ),
+  v0222 AS (
+    SELECT DISTINCT v0155.v0177
+    FROM v0246 v0057
+    JOIN v0174 v0155 ON v0155.id = v0057.v0175
+    WHERE v0057.v0224 IS NOT NULL
+      AND v0057.v0201 = 0
+      AND v0057.v0060 IS NULL
+      AND v0155.v0060 IS NULL
+  )
+SELECT
+  CAST(v0126.v0384 AS VARCHAR) AS week,
+  v0126.v0385,
+  COUNT(*) AS v0227,
+  SUM(CASE WHEN v0387.v0177 IS NOT NULL THEN 1 ELSE 0 END) AS v0388,
+  SUM(CASE WHEN v0235.v0177 IS NOT NULL THEN 1 ELSE 0 END) AS v0206,
+  CAST(SUM(CASE WHEN v0235.v0177 IS NOT NULL THEN 1 ELSE 0 END) AS DOUBLE)
+    / NULLIF(SUM(CASE WHEN v0387.v0177 IS NOT NULL THEN 1 ELSE 0 END), 0) AS v0389
+FROM v0207 v0126
+LEFT JOIN v0386 v0387 ON v0387.v0177 = v0126.v0177
+LEFT JOIN v0222    v0235 ON v0235.v0177 = v0126.v0177
+GROUP BY v0126.v0384, v0126.v0385
+ORDER BY v0126.v0384 DESC, v0126.v0385
+
+-- query 153
+WITH v0354 AS (
+  SELECT
+    extract(HOUR FROM v0057.v0084) AS v0343,
+    CAST(v0057.v0084 AS DATE) AS v0113
+  FROM v0056 v0057
+  JOIN v0174 v0155 ON v0155.id = v0057.v0175
+  WHERE v0057.v0201 = 0
+    AND v0057.v0060 IS NULL
+    AND v0155.v0060 IS NULL
+    AND CAST(v0057.v0084 AS DATE) >= CURRENT_DATE - INTERVAL '4 days'
+    AND CAST(v0057.v0084 AS DATE) <= CURRENT_DATE
+),
+v0355 AS (
+  SELECT
+    extract(HOUR FROM v0057.v0224) AS v0343,
+    CAST(v0057.v0224 AS DATE) AS v0113
+  FROM v0056 v0057
+  JOIN v0174 v0155 ON v0155.id = v0057.v0175
+  WHERE v0057.v0224 IS NOT NULL
+    AND v0057.v0201 = 0
+    AND v0057.v0060 IS NULL
+    AND v0155.v0060 IS NULL
+    AND CAST(v0057.v0224 AS DATE) >= CURRENT_DATE - INTERVAL '4 days'
+    AND CAST(v0057.v0224 AS DATE) <= CURRENT_DATE
+),
+hours AS (
+  SELECT 0 AS v0343 UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3
+  UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7
+  UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10 UNION ALL SELECT 11
+  UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+  UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19
+  UNION ALL SELECT 20 UNION ALL SELECT 21 UNION ALL SELECT 22 UNION ALL SELECT 23
+),
+v0349 AS (
+  SELECT
+    v0356.v0343 AS hour,
+    (SELECT COUNT(*) FROM v0354  WHERE v0354.v0113  = CURRENT_DATE AND v0354.v0343  = v0356.v0343) AS v0357,
+    CAST((SELECT COUNT(*) FROM v0354  WHERE v0354.v0113  BETWEEN CURRENT_DATE - INTERVAL '3 days' AND CURRENT_DATE - INTERVAL '1 day' AND v0354.v0343  = v0356.v0343) AS DOUBLE) / 3.0 AS v0358,
+    (SELECT COUNT(*) FROM v0355 WHERE v0355.v0113 = CURRENT_DATE AND v0355.v0343 = v0356.v0343) AS v0359,
+    CAST((SELECT COUNT(*) FROM v0355 WHERE v0355.v0113 BETWEEN CURRENT_DATE - INTERVAL '3 days' AND CURRENT_DATE - INTERVAL '1 day' AND v0355.v0343 = v0356.v0343) AS DOUBLE) / 3.0 AS v0360
+  FROM hours v0356
+)
+SELECT
+  hour,
+  SUM(v0357)  OVER (ORDER BY hour) AS v0357,
+  SUM(v0358)    OVER (ORDER BY hour) AS v0358,
+  SUM(v0359) OVER (ORDER BY hour) AS v0359,
+  SUM(v0360)   OVER (ORDER BY hour) AS v0360
+FROM v0349
+ORDER BY hour ASC
+
+-- query 154
+WITH v0000 AS (
+  SELECT
+    CAST(v0224 AS DATE) AS v0113,
+    v0201
+  FROM v0246
+  WHERE v0224 IS NOT NULL
+    AND v0060 IS NULL
+    AND CAST(v0224 AS DATE) >= DATE '2026-07-10'
+)
+SELECT
+  lpad(CAST(date_part('month', v0113) AS VARCHAR), 2, '0') || '-' ||
+  lpad(CAST(date_part('day', v0113) AS VARCHAR), 2, '0') AS v0361,
+  SUM(CASE WHEN v0201 = 0 THEN 1 ELSE 0 END) AS v0362,
+  SUM(CASE WHEN v0201 > 0 THEN 1 ELSE 0 END) AS v0363,
+  COUNT(*) AS v0364
+FROM v0000
+GROUP BY v0113
+ORDER BY v0113 DESC
+
+-- query 155
+SELECT
+  date_trunc('week', v0224) AS v0065,
+  COUNT(*) AS v0364
+FROM v0246
+WHERE v0224 IS NOT NULL
+  AND v0060 IS NULL
+  AND v0224 >= DATE '2025-08-11'
+GROUP BY date_trunc('week', v0224)
+ORDER BY v0065 ASC
+
+-- query 156
+WITH v0768 AS (
+  SELECT
+    CAST(DATE_TRUNC('WEEK', CAST(v0057.v0172 AS TIMESTAMP)) AS DATE) AS v0074,
+    COUNT(*) AS v0244,
+    SUM(CAST(v0006 AS DOUBLE)) / 100.0 AS v0245
+  FROM v0056 v0057
+  WHERE v0057.v0060 IS NULL
+    AND v0057.v0172 >= DATE '2023-01-01'
+  GROUP BY 1
+),
+v0769 AS (
+  SELECT
+    CAST(DATE_TRUNC('WEEK', CAST(v0057.v0084 AS TIMESTAMP)) AS DATE) AS v0074,
+    COUNT(CASE WHEN v0057.v0224 IS NOT NULL THEN 1 END) AS v0248
+  FROM v0056 v0057
+  WHERE v0057.v0060 IS NULL
+    AND v0057.v0084 >= DATE '2023-01-01'
+  GROUP BY 1
+),
+v0249 AS (
+  SELECT DISTINCT
+    CAST(DATE_TRUNC('WEEK', CAST(v0057.v0172 AS TIMESTAMP)) AS DATE) AS v0074,
+    v0075.v0058 AS v0171
+  FROM v0056 v0057
+  INNER JOIN v0174 v0155 ON v0155.id = v0057.v0175
+  INNER JOIN v0176 v0075 ON v0075.id = v0155.v0177
+  WHERE v0057.v0060 IS NULL
+    AND v0057.v0172 >= DATE '2023-01-01'
+),
+v0770 AS (
+  SELECT v0074, v0171
+  FROM v0249
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY v0171 ORDER BY v0074 DESC) = 1
+),
+v0771 AS (
+  SELECT
+    v0113.v0074,
+    v0252.v0171,
+    MAX(v0252.v0253) AS v0254
+  FROM v0770 v0113
+  INNER JOIN v0255 v0252 ON v0252.v0171 = v0113.v0171
+  GROUP BY v0113.v0074, v0252.v0171
+),
+v0772 AS (
+  SELECT v0074, SUM(v0254) AS v0257 FROM v0771 GROUP BY v0074
+),
+v0654 AS (
+  SELECT DISTINCT v0074 FROM (
+    SELECT v0074 FROM v0768
+    UNION ALL
+    SELECT v0074 FROM v0769
+  ) v0072
+)
+SELECT
+  CAST(v0073.v0074 AS TEXT) AS v0065,
+  v0537.v0248 AS v0269,
+  v0773.v0244,
+  v0773.v0245,
+  COALESCE(v0647.v0257, 0) / 100.0 AS v0272,
+  CASE WHEN v0773.v0245 > 0
+    THEN (COALESCE(v0647.v0257, 0) / 100.0) / v0773.v0245
+    ELSE NULL END AS v0273
+FROM v0654 v0073
+LEFT JOIN v0768 v0773 ON v0773.v0074 = v0073.v0074
+LEFT JOIN v0769 v0537 ON v0537.v0074 = v0073.v0074
+LEFT JOIN v0772 v0647 ON v0647.v0074 = v0073.v0074
+WHERE v0073.v0074 <= CAST(DATE_TRUNC('WEEK', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE)
+  AND v0073.v0074 <> DATE '2026-05-11'
+ORDER BY v0073.v0074 DESC
+
+-- query 157
+WITH v0242 AS (
+  SELECT
+    CAST(DATE_TRUNC('MONTH', CAST(v0057.v0172 AS TIMESTAMP)) AS DATE) AS v0243,
+    COUNT(*) AS v0244,
+    SUM(CAST(v0006 AS DOUBLE)) / 100.0 AS v0245
+  FROM v0246 v0057
+  WHERE v0057.v0060 IS NULL
+    AND v0057.v0172 >= DATE '2023-01-01'
+  GROUP BY 1
+),
+v0247 AS (
+  SELECT
+    CAST(DATE_TRUNC('MONTH', CAST(v0057.v0084 AS TIMESTAMP)) AS DATE) AS v0243,
+    COUNT(CASE WHEN v0057.v0224 IS NOT NULL THEN 1 END) AS v0248
+  FROM v0246 v0057
+  WHERE v0057.v0060 IS NULL
+    AND v0057.v0084 >= DATE '2023-01-01'
+  GROUP BY 1
+),
+v0249 AS (
+  SELECT DISTINCT
+    CAST(DATE_TRUNC('MONTH', CAST(v0057.v0172 AS TIMESTAMP)) AS DATE) AS v0243,
+    v0075.v0058 AS v0171
+  FROM v0246 v0057
+  INNER JOIN v0174 v0155 ON v0155.id = v0057.v0175
+  INNER JOIN v0176 v0075 ON v0075.id = v0155.v0177
+  WHERE v0057.v0060 IS NULL
+    AND v0057.v0172 >= DATE '2023-01-01'
+),
+v0250 AS (
+  SELECT v0243, v0171
+  FROM v0249
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY v0171 ORDER BY v0243 DESC) = 1
+),
+v0251 AS (
+  SELECT
+    v0113.v0243,
+    v0252.v0171,
+    MAX(v0252.v0253) AS v0254
+  FROM v0250 v0113
+  INNER JOIN v0255 v0252 ON v0252.v0171 = v0113.v0171
+  GROUP BY v0113.v0243, v0252.v0171
+),
+v0256 AS (
+  SELECT v0243, SUM(v0254) AS v0257 FROM v0251 GROUP BY v0243
+),
+v0266 AS (
+  SELECT DISTINCT v0243 FROM (
+    SELECT v0243 FROM v0242
+    UNION ALL
+    SELECT v0243 FROM v0247
+  ) v0072
+)
+SELECT
+  CAST(v0096.v0243 AS TEXT) AS v0267,
+  v0268.v0248 AS v0269,
+  v0270.v0244,
+  v0270.v0245,
+  COALESCE(v0271.v0257, 0) / 100.0 AS v0272,
+  CASE WHEN v0270.v0245 > 0
+    THEN (COALESCE(v0271.v0257, 0) / 100.0) / v0270.v0245
+    ELSE NULL END AS v0273
+FROM v0266 v0096
+LEFT JOIN v0242 v0270 ON v0270.v0243 = v0096.v0243
+LEFT JOIN v0247 v0268 ON v0268.v0243 = v0096.v0243
+LEFT JOIN v0256 v0271 ON v0271.v0243 = v0096.v0243
+WHERE v0096.v0243 <= CAST(DATE_TRUNC('MONTH', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE)
+ORDER BY v0096.v0243 DESC
+
+-- query 158
+SELECT
+  SUM(CASE WHEN v0495 = 'value0119' THEN 1 ELSE 0 END) * 1.0
+    / NULLIF(SUM(CASE WHEN v0495 IN ('value0119', 'value0120') THEN 1 ELSE 0 END), 0) AS v0500
+FROM v0326
+WHERE v0030 = 1
+  AND CAST(v0501 AS TIMESTAMP) >= TIMESTAMP '2026-04-30 00:00:00'
+
+-- query 159
+WITH v0064 AS (
+  SELECT
+    DATE_TRUNC('MONTH', CAST(v0323 AS TIMESTAMP)) AS v0324,
+    SUM(CASE WHEN v0325 = 'value0086' THEN 1 ELSE 0 END) AS v0195,
+    SUM(CASE WHEN v0325 = 'value0087' THEN 1 ELSE 0 END) AS v0197,
+    SUM(CASE WHEN v0325 = 'value0156' THEN 1 ELSE 0 END) AS v0196
+  FROM v0326
+  WHERE v0030 = 1
+    AND v0323 >= DATE_TRUNC('MONTH', CURRENT_DATE) - INTERVAL '11 months'
+  GROUP BY 1
+),
+v0331 AS (
+  SELECT
+    CAST(DATE_TRUNC('MONTH', v0090) AS TIMESTAMP) AS v0324,
+    COUNT(*) AS v0331
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_get_str(data, 'value0033') = 'value0039'
+    AND (
+      json_get_str(data, 'value0089') LIKE 'value0092%'
+      OR json_get_str(data, 'value0089') LIKE 'value0093%'
+      OR json_get_str(data, 'value0089') LIKE 'value0094%'
+      OR json_get_str(data, 'value0089') LIKE 'value0095%'
+    )
+    AND CAST(v0090 AS DATE) >= CAST(DATE_TRUNC('MONTH', CURRENT_DATE) - INTERVAL '11 months' AS DATE)
+  GROUP BY 1
+)
+SELECT
+  COALESCE(v0064.v0324, v0331.v0324) AS v0324,
+  COALESCE(v0064.v0195, 0) AS v0195,
+  COALESCE(v0064.v0197, 0) AS v0197,
+  COALESCE(v0331.v0331, 0) + COALESCE(v0064.v0196, 0) AS v0331
+FROM v0064
+FULL OUTER JOIN v0331 ON v0064.v0324 = v0331.v0324
+ORDER BY 1
+
+-- query 160
+WITH v0332 AS (
+  SELECT
+    JSON_GET_STR(data, 'value0045') AS v0119,
+    DATE_TRUNC('MONTH', CAST(JSON_GET_STR(data, 'value0088') AS TIMESTAMP)) AS v0333,
+    JSON_GET_STR(data, 'value0033') AS status,
+    JSON_GET_STR(data, 'value0089') AS v0328
+  FROM v0089
+  WHERE
+    type = 'value0035'
+    AND v0090 >= CAST('2025-09-01' AS TIMESTAMP)
+    AND v0090 < CAST('2026-08-01' AS TIMESTAMP)
+    AND JSON_GET_STR(data, 'value0047') = 'value0048'
+    AND JSON_GET_STR(data, 'value0090') LIKE 'value0052%'
+), v0334 AS (
+  SELECT
+    v0119,
+    v0333,
+    status,
+    v0328,
+    ROW_NUMBER() OVER (
+      PARTITION BY v0119
+      ORDER BY CASE status
+        WHEN 'value0039'
+        THEN 1
+        WHEN 'value0041'
+        THEN 2
+        WHEN 'value0091'
+        THEN 3
+        WHEN 'value0053'
+        THEN 4
+        ELSE 5
+      END
+    ) AS v0330
+  FROM v0332
+), final AS (
+  SELECT
+    v0119,
+    v0333,
+    status,
+    CASE
+      WHEN v0328 IS NULL OR v0328 = ''
+      THEN 'value0096'
+      WHEN REGEXP_LIKE(v0328, '^R[0-9]{2}')
+      THEN SUBSTRING(v0328, 1, 3)
+      WHEN LOWER(v0328) LIKE '%value0097%'
+      THEN 'value0098'
+      WHEN LOWER(v0328) LIKE '%value0099 value0100%'
+      THEN 'value0101'
+      WHEN LOWER(v0328) LIKE '%value0102%'
+      THEN 'value0103'
+      ELSE 'value0104'
+    END AS v0335
+  FROM v0334
+  WHERE
+    v0330 = 1
+)
+SELECT
+  SUBSTRING(CAST(v0333 AS TEXT), 6, 5) AS month,
+  COUNT(*) AS v0336,
+  COUNT(CASE WHEN status = 'value0039' AND v0335 = 'value0098' THEN 1 END) AS v0337,
+  COUNT(
+    CASE
+      WHEN status = 'value0039' AND v0335 IN ('value0092', 'value0093', 'value0094', 'value0095')
+      THEN 1
+    END
+  ) AS v0338,
+  CAST(COUNT(CASE WHEN status = 'value0039' AND v0335 = 'value0098' THEN 1 END) AS DOUBLE) / COUNT(*) AS v0339,
+  CAST(COUNT(
+    CASE
+      WHEN status = 'value0039' AND v0335 IN ('value0092', 'value0093', 'value0094', 'value0095')
+      THEN 1
+    END
+  ) AS DOUBLE) / COUNT(*) AS v0340
+FROM final
+GROUP BY
+  v0333
+ORDER BY
+  v0333
+
+-- query 161
+WITH v0332 AS (
+  SELECT
+    JSON_GET_STR(data, 'value0045') AS v0119,
+    DATE_TRUNC('MONTH', CAST(JSON_GET_STR(data, 'value0088') AS TIMESTAMP)) AS v0333,
+    JSON_GET_STR(data, 'value0033') AS status,
+    JSON_GET_STR(data, 'value0089') AS v0328
+  FROM v0089
+  WHERE
+    type = 'value0035'
+    AND v0090 >= CAST('2025-09-01' AS TIMESTAMP)
+    AND v0090 < CAST('2026-08-01' AS TIMESTAMP)
+    AND JSON_GET_STR(data, 'value0047') = 'value0048'
+    AND JSON_GET_STR(data, 'value0090') LIKE 'value0052%'
+), v0334 AS (
+  SELECT
+    v0119,
+    v0333,
+    status,
+    v0328,
+    ROW_NUMBER() OVER (
+      PARTITION BY v0119
+      ORDER BY CASE status
+        WHEN 'value0039'
+        THEN 1
+        WHEN 'value0041'
+        THEN 2
+        WHEN 'value0091'
+        THEN 3
+        WHEN 'value0053'
+        THEN 4
+        ELSE 5
+      END
+    ) AS v0330
+  FROM v0332
+), final AS (
+  SELECT
+    v0119,
+    v0333,
+    status,
+    CASE
+      WHEN v0328 IS NULL OR v0328 = ''
+      THEN 'value0096'
+      WHEN REGEXP_LIKE(v0328, '^R[0-9]{2}')
+      THEN SUBSTRING(v0328, 1, 3)
+      WHEN LOWER(v0328) LIKE '%value0097%'
+      THEN 'value0098'
+      WHEN LOWER(v0328) LIKE '%value0099 value0100%'
+      THEN 'value0101'
+      WHEN LOWER(v0328) LIKE '%value0102%'
+      THEN 'value0103'
+      ELSE 'value0104'
+    END AS v0335
+  FROM v0334
+  WHERE
+    v0330 = 1
+), v0774 AS (
+  SELECT
+    v0333,
+    COUNT(*) AS v0775,
+    COUNT(CASE WHEN status = 'value0053' THEN 1 END) AS v0571,
+    COUNT(CASE WHEN status = 'value0039' THEN 1 END) AS v0776,
+    COUNT(CASE WHEN status = 'value0039' AND v0335 = 'value0098' THEN 1 END) AS v0777,
+    COUNT(
+      CASE
+        WHEN status = 'value0039'
+        AND v0335 IN ('value0092', 'value0093', 'value0094', 'value0095')
+        THEN 1
+      END
+    ) AS v0778,
+    COUNT(
+      CASE
+        WHEN status = 'value0039'
+        AND NOT v0335 IN ('value0098', 'value0092', 'value0093', 'value0094', 'value0095')
+        THEN 1
+      END
+    ) AS v0779
+  FROM final
+  GROUP BY
+    v0333
+), v0780 AS (
+  SELECT
+    DATE_TRUNC('MONTH', v0090) AS v0333,
+    COUNT(*) AS v0781
+  FROM v0426
+  WHERE
+    v0090 >= CAST('2025-09-01' AS DATE)
+    AND v0090 < CAST('2026-08-01' AS DATE)
+    AND type = 'value0016'
+    AND v0031 = 'value0017'
+  GROUP BY
+    v0333
+)
+SELECT
+  CAST(v0057.v0333 AS TEXT) AS month,
+  v0057.v0775,
+  COALESCE(v0032.v0781, 0) AS v0781,
+  v0057.v0571,
+  v0057.v0776,
+  v0057.v0777,
+  v0057.v0778,
+  v0057.v0779
+FROM v0774 AS v0057
+LEFT JOIN v0780 AS v0032
+  ON v0057.v0333 = v0032.v0333
+ORDER BY
+  v0057.v0333
+
+-- query 162
+WITH v0390 AS (
+  SELECT
+    DATE_TRUNC('MONTH', CAST(v0113.v0323 AS TIMESTAMP)) AS v0243,
+    COUNT(DISTINCT v0113.v0058) AS v0391
+  FROM v0326 AS v0113
+  JOIN v0392 AS v0393
+    ON v0393.v0121 = v0113.v0121
+  JOIN v0394 AS v0075
+    ON v0075.id = v0393.v0395
+  WHERE
+    v0113.v0325 = 'value0087'
+    AND v0113.v0030 = 1
+    AND v0075.v0060 IS NULL
+    AND LOWER(v0075.v0396) = 'value0111'
+    AND CAST(v0113.v0323 AS DATE) >= CAST('2026-01-01' AS DATE)
+  GROUP BY
+    1
+), v0397 AS (
+  SELECT
+    DATE_TRUNC('MONTH', CAST(v0398 AS TIMESTAMP)) AS v0243,
+    COUNT(DISTINCT v0399) AS v0391
+  FROM v0400
+  WHERE
+    v0401 = 'value0112'
+    AND v0402 = 'value0113'
+    AND CAST(v0398 AS DATE) >= CAST('2025-12-01' AS DATE)
+  GROUP BY
+    1
+), v0403 AS (
+  SELECT
+    v0348.v0243,
+    v0348.v0391 AS v0404,
+    v0405.v0391 AS v0406
+  FROM v0397 v0348
+  LEFT JOIN v0397 v0405
+    ON EXTRACT(YEAR FROM v0405.v0243) * 12 + EXTRACT(MONTH FROM v0405.v0243)
+     = EXTRACT(YEAR FROM v0348.v0243) * 12 + EXTRACT(MONTH FROM v0348.v0243) - 1
+), v0407 AS (
+  SELECT
+    v0113.v0243 AS v0323,
+    v0113.v0391 AS v0408,
+    v0409.v0406,
+    v0409.v0404,
+    10000.0 * v0113.v0391 / NULLIF(v0409.v0406, 0) AS v0410,
+    CASE
+      WHEN 10000.0 * v0113.v0391 / NULLIF(v0409.v0406, 0) >= 150 AND v0113.v0391 >= 100
+      THEN 1
+      ELSE 0
+    END AS v0411,
+    CASE
+      WHEN 10000.0 * v0113.v0391 / NULLIF(v0409.v0406, 0) >= 300 AND v0113.v0391 >= 300
+      THEN 1
+      ELSE 0
+    END AS v0412
+  FROM v0390 AS v0113
+  JOIN v0403 AS v0409
+    ON v0409.v0243 = v0113.v0243
+), v0413 AS (
+  SELECT
+    v0323,
+    v0408,
+    v0406,
+    v0404,
+    v0410,
+    v0411,
+    v0412,
+    SUM(CASE WHEN v0411 = 0 THEN 1 ELSE 0 END) OVER (ORDER BY v0323 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v0414,
+    SUM(CASE WHEN v0412 = 0 THEN 1 ELSE 0 END) OVER (ORDER BY v0323 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v0415
+  FROM v0407
+), v0416 AS (
+  SELECT
+    v0323,
+    v0408,
+    v0406,
+    v0404,
+    v0410,
+    v0411,
+    v0412,
+    CASE
+      WHEN v0411 = 1
+      THEN SUM(v0411) OVER (
+        PARTITION BY v0414
+        ORDER BY v0323
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      )
+      ELSE 0
+    END AS v0417,
+    CASE
+      WHEN v0412 = 1
+      THEN SUM(v0412) OVER (
+        PARTITION BY v0415
+        ORDER BY v0323
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      )
+      ELSE 0
+    END AS v0418
+  FROM v0413
+), v0419 AS (
+  SELECT
+    v0323,
+    v0408,
+    v0406,
+    v0404,
+    v0410,
+    v0411,
+    v0412,
+    v0417,
+    v0418,
+    CASE
+      WHEN v0411 = 1 AND v0412 = 0
+      THEN CASE
+        WHEN v0417 = 1
+        THEN 0
+        WHEN v0417 = 2
+        THEN 1000
+        WHEN v0417 = 3
+        THEN 2000
+        WHEN v0417 BETWEEN 4 AND 6
+        THEN 5000
+        WHEN v0417 BETWEEN 7 AND 11
+        THEN 25000
+        WHEN v0417 BETWEEN 12 AND 18
+        THEN 50000
+        WHEN v0417 >= 19
+        THEN 100000
+        ELSE 0
+      END
+      ELSE 0
+    END AS v0420,
+    CASE
+      WHEN v0412 = 1
+      THEN CASE
+        WHEN v0417 = 1
+        THEN 0
+        WHEN v0417 = 2
+        THEN 1000
+        WHEN v0417 = 3
+        THEN 2000
+        WHEN v0417 BETWEEN 4 AND 6
+        THEN 10000
+        WHEN v0417 BETWEEN 7 AND 11
+        THEN 50000
+        WHEN v0417 BETWEEN 12 AND 18
+        THEN 100000
+        WHEN v0417 >= 19
+        THEN 200000
+        ELSE 0
+      END
+      ELSE 0
+    END AS v0421,
+    CASE
+      WHEN v0411 = 1 AND v0417 >= 4 AND v0408 > 300
+      THEN (
+        v0408 - 300
+      ) * 5
+      ELSE 0
+    END AS v0422
+  FROM v0416
+), v0782 AS (
+  SELECT
+    v0132.*,
+    AVG(v0410) OVER (
+      ORDER BY v0323
+      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+    ) AS v0783,
+    STDDEV_SAMP(v0410) OVER (
+      ORDER BY v0323
+      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+    ) AS v0784
+  FROM v0419 AS v0132
+)
+SELECT
+  LPAD(CAST(EXTRACT(MONTH FROM v0323) AS VARCHAR), 2, '0') || '-'
+    || LPAD(CAST(EXTRACT(DAY FROM v0323) AS VARCHAR), 2, '0') || '-'
+    || CAST(EXTRACT(YEAR FROM v0323) AS VARCHAR) AS v0323,
+  v0408,
+  v0406,
+  v0404,
+  v0410,
+  (v0410 - v0783) / NULLIF(v0784, 0) AS v0785,
+  v0411,
+  v0412,
+  v0417,
+  v0418,
+  v0420,
+  v0421,
+  v0422,
+  v0420 + v0421 + v0422 AS v0423
+FROM v0782
+WHERE
+  v0323 >= CAST(CAST('2026-01-01' AS DATE) AS TIMESTAMP)
+ORDER BY
+  v0323 DESC
+
+-- query 163
+WITH v0424 AS (
+  SELECT
+    DATE_TRUNC('MONTH', CAST(v0113.v0323 AS TIMESTAMP)) AS v0243,
+    COUNT(DISTINCT v0113.v0058) AS v0391
+  FROM v0326 AS v0113
+  JOIN v0392 AS v0393
+    ON v0393.v0121 = v0113.v0121
+  JOIN v0394 AS v0075
+    ON v0075.id = v0393.v0395
+  WHERE
+    v0113.v0325 = 'value0087'
+    AND v0113.v0030 = 1
+    AND v0075.v0060 IS NULL
+    AND LOWER(v0075.v0396) = 'value0114'
+    AND CAST(v0113.v0323 AS DATE) >= CAST('2026-01-01' AS DATE)
+  GROUP BY
+    1
+), v0425 AS (
+  SELECT
+    DATE_TRUNC('MONTH', CAST(v0398 AS TIMESTAMP)) AS v0243,
+    COUNT(DISTINCT v0399) AS v0391
+  FROM v0400
+  WHERE
+    v0401 = 'value0112'
+    AND v0402 = 'value0115'
+    AND CAST(v0398 AS DATE) >= CAST('2026-01-01' AS DATE)
+  GROUP BY
+    1
+), v0407 AS (
+  SELECT
+    v0113.v0243 AS v0323,
+    v0113.v0391 AS v0408,
+    v0075.v0391 AS v0426,
+    10000.0 * v0113.v0391 / NULLIF(v0075.v0391, 0) AS v0410,
+    CASE
+      WHEN 10000.0 * v0113.v0391 / NULLIF(v0075.v0391, 0) >= 90 AND v0113.v0391 >= 100
+      THEN 1
+      ELSE 0
+    END AS v0427,
+    CASE
+      WHEN 10000.0 * v0113.v0391 / NULLIF(v0075.v0391, 0) >= 180 AND v0113.v0391 >= 1000
+      THEN 1
+      ELSE 0
+    END AS v0428
+  FROM v0424 AS v0113
+  JOIN v0425 AS v0075
+    ON v0075.v0243 = v0113.v0243
+), v0413 AS (
+  SELECT
+    v0323,
+    v0408,
+    v0426,
+    v0410,
+    v0427,
+    v0428,
+    SUM(CASE WHEN v0427 = 0 THEN 1 ELSE 0 END) OVER (ORDER BY v0323 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v0429,
+    SUM(CASE WHEN v0428 = 0 THEN 1 ELSE 0 END) OVER (ORDER BY v0323 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v0430
+  FROM v0407
+), v0416 AS (
+  SELECT
+    v0323,
+    v0408,
+    v0426,
+    v0410,
+    v0427,
+    v0428,
+    CASE
+      WHEN v0427 = 1
+      THEN SUM(v0427) OVER (
+        PARTITION BY v0429
+        ORDER BY v0323
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      )
+      ELSE 0
+    END AS v0431,
+    CASE
+      WHEN v0428 = 1
+      THEN SUM(v0428) OVER (
+        PARTITION BY v0430
+        ORDER BY v0323
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      )
+      ELSE 0
+    END AS v0432
+  FROM v0413
+), v0782 AS (
+  SELECT
+    v0096.*,
+    AVG(v0410) OVER (
+      ORDER BY v0323
+      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+    ) AS v0783,
+    STDDEV_SAMP(v0410) OVER (
+      ORDER BY v0323
+      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+    ) AS v0784
+  FROM v0416 AS v0096
+)
+SELECT
+  LPAD(CAST(EXTRACT(MONTH FROM v0323) AS VARCHAR), 2, '0') || '-'
+    || LPAD(CAST(EXTRACT(DAY FROM v0323) AS VARCHAR), 2, '0') || '-'
+    || CAST(EXTRACT(YEAR FROM v0323) AS VARCHAR) AS v0323,
+  v0408,
+  v0426,
+  v0410,
+  (v0410 - v0783) / NULLIF(v0784, 0) AS v0785,
+  v0427,
+  v0428,
+  v0431,
+  v0432,
+  CASE
+    WHEN v0431 > 0
+    THEN CASE
+      WHEN v0432 = 0 AND v0431 > 4
+      THEN v0408 * 50
+      WHEN v0432 > 0
+      THEN v0408 * 50
+      ELSE 0
+    END
+    ELSE 0
+  END AS v0433,
+  CASE WHEN v0431 > 9 OR v0432 > 6 THEN 25000 ELSE 0 END AS v0434,
+  CASE
+    WHEN v0431 > 0
+    THEN CASE
+      WHEN v0432 = 0 AND v0431 > 4
+      THEN v0408 * 50
+      WHEN v0432 > 0
+      THEN v0408 * 50
+      ELSE 0
+    END
+    ELSE 0
+  END + CASE WHEN v0431 > 9 OR v0432 > 6 THEN 25000 ELSE 0 END AS v0423
+FROM v0782
+ORDER BY
+  v0323 DESC
+
+-- query 164
+WITH v0786 AS (
+  SELECT
+    v0177,
+    MAX(v0367) AS v0787
+  FROM v0215
+  WHERE
+    v0060 IS NULL
+    AND v0031 = 'value0110'
+    AND v0629 = 'value0192'
+    AND CAST(v0367 AS DATE) >= CAST('2026-04-06' AS DATE)
+    AND CAST(v0367 AS DATE) <= CAST('2026-07-27' AS DATE)
+  GROUP BY
+    v0177
+), v0788 AS (
+  SELECT
+    v0177,
+    MAX(v0367) AS v0787
+  FROM v0215
+  WHERE
+    v0060 IS NULL
+    AND v0031 = 'value0073'
+    AND LOWER(v0565) LIKE '%value0230%'
+    AND CAST(v0367 AS DATE) >= CAST('2026-04-06' AS DATE)
+    AND CAST(v0367 AS DATE) <= CAST('2026-07-27' AS DATE)
+    AND NOT v0177 IN (
+      SELECT
+        v0177
+      FROM v0786
+    )
+  GROUP BY
+    v0177
+), v0789 AS (
+  SELECT
+    v0155.v0177,
+    MIN(v0057.v0090) AS v0787
+  FROM v0056 AS v0057
+  JOIN v0212 AS v0155
+    ON v0155.id = v0057.v0175
+  WHERE
+    v0057.v0060 IS NULL
+    AND v0057.v0201 > 0
+    AND CAST(v0057.v0090 AS DATE) >= CAST('2025-04-01' AS DATE)
+    AND CAST(v0057.v0090 AS DATE) <= CAST('2025-07-31' AS DATE)
+  GROUP BY
+    v0155.v0177
+), v0790 AS (
+  SELECT
+    v0113.v0177,
+    CAST(CAST(MIN(v0126.v0578) AS DATE) - CAST(v0113.v0787 AS DATE) AS INT) AS v0791
+  FROM v0786 AS v0113
+  JOIN v0651 AS v0126
+    ON v0126.v0177 = v0113.v0177
+    AND v0126.v0060 IS NULL
+    AND NOT v0126.v0578 IS NULL
+    AND v0126.v0578 >= v0113.v0787
+  GROUP BY
+    v0113.v0177,
+    v0113.v0787
+), v0792 AS (
+  SELECT
+    v0057.v0177,
+    CAST(CAST(MIN(v0126.v0578) AS DATE) - CAST(v0057.v0787 AS DATE) AS INT) AS v0791
+  FROM v0788 AS v0057
+  JOIN v0651 AS v0126
+    ON v0126.v0177 = v0057.v0177
+    AND v0126.v0060 IS NULL
+    AND NOT v0126.v0578 IS NULL
+    AND v0126.v0578 >= v0057.v0787
+  GROUP BY
+    v0057.v0177,
+    v0057.v0787
+), v0793 AS (
+  SELECT
+    v0794.v0177,
+    CAST(CAST(MIN(v0126.v0578) AS DATE) - CAST(v0794.v0787 AS DATE) AS INT) AS v0791
+  FROM v0789 AS v0794
+  JOIN v0651 AS v0126
+    ON v0126.v0177 = v0794.v0177
+    AND v0126.v0060 IS NULL
+    AND NOT v0126.v0578 IS NULL
+    AND v0126.v0578 >= v0794.v0787
+  GROUP BY
+    v0794.v0177,
+    v0794.v0787
+), v0795 AS (
+  SELECT
+    COUNT(DISTINCT v0177) AS v0561
+  FROM v0786
+), v0796 AS (
+  SELECT
+    COUNT(DISTINCT v0177) AS v0561
+  FROM v0788
+), v0797 AS (
+  SELECT
+    COUNT(DISTINCT v0177) AS v0561
+  FROM v0789
+), v0798 AS (
+  SELECT
+    SUM(CASE WHEN v0791 <= 1 THEN 1 ELSE 0 END) AS v0799,
+    SUM(CASE WHEN v0791 <= 2 THEN 1 ELSE 0 END) AS v0800,
+    SUM(CASE WHEN v0791 <= 3 THEN 1 ELSE 0 END) AS v0801,
+    SUM(CASE WHEN v0791 <= 4 THEN 1 ELSE 0 END) AS v0802,
+    SUM(CASE WHEN v0791 <= 5 THEN 1 ELSE 0 END) AS v0803,
+    SUM(CASE WHEN v0791 <= 6 THEN 1 ELSE 0 END) AS v0804,
+    SUM(CASE WHEN v0791 <= 7 THEN 1 ELSE 0 END) AS v0805
+  FROM v0790
+), v0806 AS (
+  SELECT
+    SUM(CASE WHEN v0791 <= 1 THEN 1 ELSE 0 END) AS v0799,
+    SUM(CASE WHEN v0791 <= 2 THEN 1 ELSE 0 END) AS v0800,
+    SUM(CASE WHEN v0791 <= 3 THEN 1 ELSE 0 END) AS v0801,
+    SUM(CASE WHEN v0791 <= 4 THEN 1 ELSE 0 END) AS v0802,
+    SUM(CASE WHEN v0791 <= 5 THEN 1 ELSE 0 END) AS v0803,
+    SUM(CASE WHEN v0791 <= 6 THEN 1 ELSE 0 END) AS v0804,
+    SUM(CASE WHEN v0791 <= 7 THEN 1 ELSE 0 END) AS v0805
+  FROM v0792
+), v0807 AS (
+  SELECT
+    SUM(CASE WHEN v0791 <= 1 THEN 1 ELSE 0 END) AS v0799,
+    SUM(CASE WHEN v0791 <= 2 THEN 1 ELSE 0 END) AS v0800,
+    SUM(CASE WHEN v0791 <= 3 THEN 1 ELSE 0 END) AS v0801,
+    SUM(CASE WHEN v0791 <= 4 THEN 1 ELSE 0 END) AS v0802,
+    SUM(CASE WHEN v0791 <= 5 THEN 1 ELSE 0 END) AS v0803,
+    SUM(CASE WHEN v0791 <= 6 THEN 1 ELSE 0 END) AS v0804,
+    SUM(CASE WHEN v0791 <= 7 THEN 1 ELSE 0 END) AS v0805
+  FROM v0793
+)
+SELECT
+  1 AS v0808,
+  CAST(v0798.v0799 AS INT) AS v0809,
+  CAST(v0795.v0561 AS INT) AS v0810,
+  CAST(v0798.v0799 AS DOUBLE) / v0795.v0561 AS v0811,
+  CAST(v0806.v0799 AS INT) AS v0812,
+  CAST(v0796.v0561 AS INT) AS v0813,
+  CAST(v0806.v0799 AS DOUBLE) / v0796.v0561 AS v0814,
+  CAST(v0807.v0799 AS INT) AS v0815,
+  CAST(v0797.v0561 AS INT) AS v0816,
+  CAST(v0807.v0799 AS DOUBLE) / v0797.v0561 AS v0817
+FROM v0798, v0806, v0807, v0795, v0796, v0797
+UNION ALL
+SELECT
+  2,
+  CAST(v0798.v0800 AS INT),
+  CAST(v0795.v0561 AS INT),
+  CAST(v0798.v0800 AS DOUBLE) / v0795.v0561,
+  CAST(v0806.v0800 AS INT),
+  CAST(v0796.v0561 AS INT),
+  CAST(v0806.v0800 AS DOUBLE) / v0796.v0561,
+  CAST(v0807.v0800 AS INT),
+  CAST(v0797.v0561 AS INT),
+  CAST(v0807.v0800 AS DOUBLE) / v0797.v0561
+FROM v0798, v0806, v0807, v0795, v0796, v0797
+UNION ALL
+SELECT
+  3,
+  CAST(v0798.v0801 AS INT),
+  CAST(v0795.v0561 AS INT),
+  CAST(v0798.v0801 AS DOUBLE) / v0795.v0561,
+  CAST(v0806.v0801 AS INT),
+  CAST(v0796.v0561 AS INT),
+  CAST(v0806.v0801 AS DOUBLE) / v0796.v0561,
+  CAST(v0807.v0801 AS INT),
+  CAST(v0797.v0561 AS INT),
+  CAST(v0807.v0801 AS DOUBLE) / v0797.v0561
+FROM v0798, v0806, v0807, v0795, v0796, v0797
+UNION ALL
+SELECT
+  4,
+  CAST(v0798.v0802 AS INT),
+  CAST(v0795.v0561 AS INT),
+  CAST(v0798.v0802 AS DOUBLE) / v0795.v0561,
+  CAST(v0806.v0802 AS INT),
+  CAST(v0796.v0561 AS INT),
+  CAST(v0806.v0802 AS DOUBLE) / v0796.v0561,
+  CAST(v0807.v0802 AS INT),
+  CAST(v0797.v0561 AS INT),
+  CAST(v0807.v0802 AS DOUBLE) / v0797.v0561
+FROM v0798, v0806, v0807, v0795, v0796, v0797
+UNION ALL
+SELECT
+  5,
+  CAST(v0798.v0803 AS INT),
+  CAST(v0795.v0561 AS INT),
+  CAST(v0798.v0803 AS DOUBLE) / v0795.v0561,
+  CAST(v0806.v0803 AS INT),
+  CAST(v0796.v0561 AS INT),
+  CAST(v0806.v0803 AS DOUBLE) / v0796.v0561,
+  CAST(v0807.v0803 AS INT),
+  CAST(v0797.v0561 AS INT),
+  CAST(v0807.v0803 AS DOUBLE) / v0797.v0561
+FROM v0798, v0806, v0807, v0795, v0796, v0797
+UNION ALL
+SELECT
+  6,
+  CAST(v0798.v0804 AS INT),
+  CAST(v0795.v0561 AS INT),
+  CAST(v0798.v0804 AS DOUBLE) / v0795.v0561,
+  CAST(v0806.v0804 AS INT),
+  CAST(v0796.v0561 AS INT),
+  CAST(v0806.v0804 AS DOUBLE) / v0796.v0561,
+  CAST(v0807.v0804 AS INT),
+  CAST(v0797.v0561 AS INT),
+  CAST(v0807.v0804 AS DOUBLE) / v0797.v0561
+FROM v0798, v0806, v0807, v0795, v0796, v0797
+UNION ALL
+SELECT
+  7,
+  CAST(v0798.v0805 AS INT),
+  CAST(v0795.v0561 AS INT),
+  CAST(v0798.v0805 AS DOUBLE) / v0795.v0561,
+  CAST(v0806.v0805 AS INT),
+  CAST(v0796.v0561 AS INT),
+  CAST(v0806.v0805 AS DOUBLE) / v0796.v0561,
+  CAST(v0807.v0805 AS INT),
+  CAST(v0797.v0561 AS INT),
+  CAST(v0807.v0805 AS DOUBLE) / v0797.v0561
+FROM v0798, v0806, v0807, v0795, v0796, v0797
+ORDER BY
+  v0808
+
+-- query 165
+WITH v0818 AS (
+  SELECT
+    v0177,
+    v0367
+  FROM v0215
+  WHERE
+    v0060 IS NULL
+    AND v0031 = 'value0110'
+    AND v0629 = 'value0192'
+    AND CAST(v0367 AS DATE) >= CAST('2026-04-06' AS DATE)
+    AND CAST(v0367 AS DATE) <= CAST('2026-07-27' AS DATE)
+), v0819 AS (
+  SELECT
+    v0177,
+    COUNT(*) AS v0820,
+    MIN(v0367) AS v0821
+  FROM v0818
+  GROUP BY
+    v0177
+), v0822 AS (
+  SELECT
+    v0072.v0177,
+    v0072.v0820,
+    MAX(
+      CASE
+        WHEN NOT v0126.v0578 IS NULL AND v0126.v0578 >= v0072.v0821
+        THEN 1
+        ELSE 0
+      END
+    ) AS v0823
+  FROM v0819 AS v0072
+  LEFT JOIN v0651 AS v0126
+    ON v0126.v0177 = v0072.v0177 AND v0126.v0060 IS NULL
+  GROUP BY
+    v0072.v0177,
+    v0072.v0820
+)
+SELECT
+  v0820,
+  COUNT(*) AS v0824,
+  SUM(v0823) AS v0825,
+  CAST(SUM(v0823) AS DOUBLE) / COUNT(*) AS v0826
+FROM v0822
+GROUP BY
+  v0820
+ORDER BY
+  v0820
+
+-- query 166
+WITH v0818 AS (
+  SELECT
+    v0177,
+    v0367
+  FROM v0215
+  WHERE
+    v0060 IS NULL
+    AND v0031 = 'value0110'
+    AND v0629 = 'value0192'
+    AND CAST(v0367 AS DATE) >= CAST('2026-04-06' AS DATE)
+    AND CAST(v0367 AS DATE) <= CAST('2026-07-27' AS DATE)
+), v0819 AS (
+  SELECT
+    v0177,
+    COUNT(*) AS v0820,
+    MIN(v0367) AS v0821
+  FROM v0818
+  GROUP BY
+    v0177
+), v0822 AS (
+  SELECT
+    v0072.v0177,
+    v0072.v0820,
+    MAX(
+      CASE
+        WHEN NOT v0126.v0578 IS NULL AND v0126.v0578 >= v0072.v0821
+        THEN 1
+        ELSE 0
+      END
+    ) AS v0823
+  FROM v0819 AS v0072
+  LEFT JOIN v0651 AS v0126
+    ON v0126.v0177 = v0072.v0177 AND v0126.v0060 IS NULL
+  GROUP BY
+    v0072.v0177,
+    v0072.v0820
+), v0827 AS (
+  SELECT
+    v0820,
+    SUM(v0823) AS v0825
+  FROM v0822
+  GROUP BY
+    v0820
+), v0828 AS (
+  SELECT
+    SUM(v0825) AS v0829
+  FROM v0827
+)
+SELECT
+  v0593.v0820,
+  v0593.v0825,
+  SUM(v0593.v0825) OVER (ORDER BY v0593.v0820) AS v0830,
+  CAST(SUM(v0593.v0825) OVER (ORDER BY v0593.v0820) AS DOUBLE) / v0000.v0829 AS v0599
+FROM v0827 AS v0593
+CROSS JOIN v0828 AS v0000
+ORDER BY
+  v0593.v0820
+
+-- query 167
+WITH RECURSIVE v0818 AS (
+  SELECT v0177, v0367
+  FROM v0215
+  WHERE v0060 IS NULL
+    AND v0031 = 'value0110'
+    AND v0629 = 'value0192'
+    AND CAST(v0367 AS DATE) >= CAST('2026-04-06' AS DATE)
+    AND CAST(v0367 AS DATE) <= CAST('2026-07-27' AS DATE)
+), v0831 AS (
+  SELECT v0177, MIN(v0367) AS v0821
+  FROM v0818
+  GROUP BY v0177
+), v0822 AS (
+  SELECT v0072.v0177,
+         v0072.v0821,
+         MIN(v0126.v0578) AS v0578
+  FROM v0831 AS v0072
+  JOIN v0651 AS v0126
+    ON v0126.v0177 = v0072.v0177
+    AND v0126.v0060 IS NULL
+    AND v0126.v0578 IS NOT NULL
+    AND v0126.v0578 >= v0072.v0821
+  GROUP BY v0072.v0177, v0072.v0821
+), v0832 AS (
+  SELECT
+    CAST((to_unixtime(v0578) - to_unixtime(v0821)) / 86400 AS BIGINT) AS v0791,
+    COUNT(*) AS v0825
+  FROM v0822
+  GROUP BY 1
+), v0828 AS (
+  SELECT SUM(v0825) AS v0829 FROM v0832
+), v0833 AS (
+  SELECT MAX(v0791) AS v0291 FROM v0832
+), v0834 AS (
+  SELECT CAST(0 AS BIGINT) AS v0561
+  UNION ALL
+  SELECT v0561 + 1 FROM v0834 WHERE v0561 < (SELECT v0291 FROM v0833)
+), v0835 AS (
+  SELECT v0057.v0561 AS v0791,
+         COALESCE(v0593.v0825, 0) AS v0825
+  FROM v0834 v0057
+  LEFT JOIN v0832 v0593 ON v0057.v0561 = v0593.v0791
+)
+, v0657 AS (
+  SELECT v0032.v0791,
+         v0032.v0825,
+         SUM(v0032.v0825) OVER (ORDER BY v0032.v0791) AS v0830,
+         CAST(SUM(v0032.v0825) OVER (ORDER BY v0032.v0791) AS DOUBLE) / v0000.v0829 AS v0599
+  FROM v0835 AS v0032
+  CROSS JOIN v0828 AS v0000
+)
+SELECT v0791,
+       v0825,
+       v0830,
+       v0599
+FROM v0657
+ORDER BY v0791
+
+-- query 168
+WITH v0786 AS (
+  SELECT
+    v0177,
+    MAX(v0367) AS v0787
+  FROM v0215
+  WHERE
+    v0060 IS NULL
+    AND v0031 = 'value0110'
+    AND v0629 = 'value0192'
+    AND CAST(v0367 AS DATE) >= CAST('2026-04-06' AS DATE)
+    AND CAST(v0367 AS DATE) <= CAST('2026-07-27' AS DATE)
+  GROUP BY
+    v0177
+), v0788 AS (
+  SELECT
+    v0177,
+    MAX(v0367) AS v0787
+  FROM v0215
+  WHERE
+    v0060 IS NULL
+    AND v0031 = 'value0073'
+    AND LOWER(v0565) LIKE '%value0230%'
+    AND CAST(v0367 AS DATE) >= CAST('2026-04-06' AS DATE)
+    AND CAST(v0367 AS DATE) <= CAST('2026-07-27' AS DATE)
+    AND NOT v0177 IN (
+      SELECT
+        v0177
+      FROM v0786
+    )
+  GROUP BY
+    v0177
+), v0789 AS (
+  SELECT
+    v0155.v0177,
+    MIN(v0057.v0090) AS v0787
+  FROM v0056 AS v0057
+  JOIN v0212 AS v0155
+    ON v0155.id = v0057.v0175
+  WHERE
+    v0057.v0060 IS NULL
+    AND v0057.v0201 > 0
+    AND CAST(v0057.v0090 AS DATE) >= CAST('2025-04-01' AS DATE)
+    AND CAST(v0057.v0090 AS DATE) <= CAST('2025-07-31' AS DATE)
+  GROUP BY
+    v0155.v0177
+), v0836 AS (
+  SELECT
+    v0075.id AS v0177,
+    MIN(v0032.v0837) AS v0838
+  FROM v0426 AS v0032
+  JOIN v0176 AS v0075
+    ON v0075.v0058 = v0032.v0171
+  WHERE
+    v0032.type = 'value0016'
+    AND v0032.v0031 = 'value0231'
+    AND (
+      v0032.v0839 LIKE '%(value0092)%'
+      OR v0032.v0839 LIKE '%(value0093)%'
+      OR v0032.v0839 LIKE '%(value0094)%'
+      OR v0032.v0839 LIKE '%(value0095)%'
+    )
+  GROUP BY
+    v0075.id
+), v0790 AS (
+  SELECT
+    v0113.v0177,
+    CAST(CAST(MIN(v0094.v0838) AS DATE) - CAST(v0113.v0787 AS DATE) AS INT) AS v0840
+  FROM v0786 AS v0113
+  JOIN v0836 AS v0094
+    ON v0094.v0177 = v0113.v0177 AND v0094.v0838 >= v0113.v0787
+  GROUP BY
+    v0113.v0177,
+    v0113.v0787
+), v0792 AS (
+  SELECT
+    v0057.v0177,
+    CAST(CAST(MIN(v0094.v0838) AS DATE) - CAST(v0057.v0787 AS DATE) AS INT) AS v0840
+  FROM v0788 AS v0057
+  JOIN v0836 AS v0094
+    ON v0094.v0177 = v0057.v0177 AND v0094.v0838 >= v0057.v0787
+  GROUP BY
+    v0057.v0177,
+    v0057.v0787
+), v0793 AS (
+  SELECT
+    v0794.v0177,
+    CAST(CAST(MIN(v0094.v0838) AS DATE) - CAST(v0794.v0787 AS DATE) AS INT) AS v0840
+  FROM v0789 AS v0794
+  JOIN v0836 AS v0094
+    ON v0094.v0177 = v0794.v0177 AND v0094.v0838 >= v0794.v0787
+  GROUP BY
+    v0794.v0177,
+    v0794.v0787
+), days AS (
+  SELECT
+    1 AS v0113
+  UNION ALL
+  SELECT
+    2
+  UNION ALL
+  SELECT
+    3
+  UNION ALL
+  SELECT
+    4
+  UNION ALL
+  SELECT
+    5
+  UNION ALL
+  SELECT
+    6
+  UNION ALL
+  SELECT
+    7
+), v0795 AS (
+  SELECT
+    COUNT(DISTINCT v0177) AS v0561
+  FROM v0786
+), v0796 AS (
+  SELECT
+    COUNT(DISTINCT v0177) AS v0561
+  FROM v0788
+), v0797 AS (
+  SELECT
+    COUNT(DISTINCT v0177) AS v0561
+  FROM v0789
+), v0841 AS (
+  SELECT
+    days.v0113,
+    COUNT(v0383.v0177) AS v0075
+  FROM days
+  LEFT JOIN v0790 AS v0383
+    ON v0383.v0840 <= days.v0113
+  GROUP BY
+    days.v0113
+), v0842 AS (
+  SELECT
+    days.v0113,
+    COUNT(v0185.v0177) AS v0075
+  FROM days
+  LEFT JOIN v0792 AS v0185
+    ON v0185.v0840 <= days.v0113
+  GROUP BY
+    days.v0113
+), v0843 AS (
+  SELECT
+    days.v0113,
+    COUNT(v0844.v0177) AS v0075
+  FROM days
+  LEFT JOIN v0793 AS v0844
+    ON v0844.v0840 <= days.v0113
+  GROUP BY
+    days.v0113
+)
+SELECT
+  v0841.v0113 AS v0808,
+  CAST(v0841.v0075 AS INT) AS v0845,
+  CAST(v0795.v0561 AS INT) AS v0810,
+  CAST(v0841.v0075 AS DOUBLE) / v0795.v0561 AS v0811,
+  CAST(v0842.v0075 AS INT) AS v0846,
+  CAST(v0796.v0561 AS INT) AS v0813,
+  CAST(v0842.v0075 AS DOUBLE) / v0796.v0561 AS v0814,
+  CAST(v0843.v0075 AS INT) AS v0847,
+  CAST(v0797.v0561 AS INT) AS v0816,
+  CAST(v0843.v0075 AS DOUBLE) / v0797.v0561 AS v0817
+FROM v0841
+JOIN v0842
+  ON v0842.v0113 = v0841.v0113
+JOIN v0843
+  ON v0843.v0113 = v0841.v0113
+CROSS JOIN v0795
+CROSS JOIN v0796
+CROSS JOIN v0797
+ORDER BY
+  v0841.v0113
+
+-- query 169
+WITH v0786 AS (
+  SELECT v0177, MAX(v0367) AS v0787
+  FROM v0215
+  WHERE v0060 IS NULL
+    AND v0031 = 'value0110'
+    AND v0629 = 'value0192'
+    AND CAST(v0367 AS DATE) >= CAST('2026-04-06' AS DATE)
+    AND CAST(v0367 AS DATE) <= CAST('2026-07-27' AS DATE)
+  GROUP BY v0177
+), v0788 AS (
+  SELECT v0177, MAX(v0367) AS v0787
+  FROM v0215
+  WHERE v0060 IS NULL
+    AND v0031 = 'value0073'
+    AND LOWER(v0565) LIKE '%value0230%'
+    AND CAST(v0367 AS DATE) >= CAST('2026-04-06' AS DATE)
+    AND CAST(v0367 AS DATE) <= CAST('2026-07-27' AS DATE)
+    AND NOT v0177 IN (SELECT v0177 FROM v0786)
+  GROUP BY v0177
+), v0789 AS (
+  SELECT v0155.v0177, MIN(v0057.v0090) AS v0787
+  FROM v0056 AS v0057
+  JOIN v0212 AS v0155 ON v0155.id = v0057.v0175
+  WHERE v0057.v0060 IS NULL
+    AND v0057.v0201 > 0
+    AND CAST(v0057.v0090 AS DATE) >= CAST('2025-04-01' AS DATE)
+    AND CAST(v0057.v0090 AS DATE) <= CAST('2025-07-31' AS DATE)
+  GROUP BY v0155.v0177
+), v0848 AS (
+  SELECT v0177, MIN(v0323) AS v0838
+  FROM v0326
+  WHERE v0060 IS NULL
+  GROUP BY v0177
+), v0790 AS (
+  SELECT v0113.v0177,
+    CAST(CAST(MIN(v0094.v0838) AS DATE) - CAST(v0113.v0787 AS DATE) AS INT) AS v0840
+  FROM v0786 AS v0113
+  JOIN v0848 AS v0094 ON v0094.v0177 = v0113.v0177 AND v0094.v0838 >= v0113.v0787
+  GROUP BY v0113.v0177, v0113.v0787
+), v0792 AS (
+  SELECT v0057.v0177,
+    CAST(CAST(MIN(v0094.v0838) AS DATE) - CAST(v0057.v0787 AS DATE) AS INT) AS v0840
+  FROM v0788 AS v0057
+  JOIN v0848 AS v0094 ON v0094.v0177 = v0057.v0177 AND v0094.v0838 >= v0057.v0787
+  GROUP BY v0057.v0177, v0057.v0787
+), v0793 AS (
+  SELECT v0794.v0177,
+    CAST(CAST(MIN(v0094.v0838) AS DATE) - CAST(v0794.v0787 AS DATE) AS INT) AS v0840
+  FROM v0789 AS v0794
+  JOIN v0848 AS v0094 ON v0094.v0177 = v0794.v0177 AND v0094.v0838 >= v0794.v0787
+  GROUP BY v0794.v0177, v0794.v0787
+), days AS (
+  SELECT 1 AS v0113 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4
+  UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7
+), v0795 AS (SELECT COUNT(DISTINCT v0177) AS v0561 FROM v0786),
+v0796 AS (SELECT COUNT(DISTINCT v0177) AS v0561 FROM v0788),
+v0797 AS (SELECT COUNT(DISTINCT v0177) AS v0561 FROM v0789),
+v0841 AS (
+  SELECT days.v0113, COUNT(v0383.v0177) AS v0075
+  FROM days LEFT JOIN v0790 AS v0383 ON v0383.v0840 <= days.v0113
+  GROUP BY days.v0113
+), v0842 AS (
+  SELECT days.v0113, COUNT(v0185.v0177) AS v0075
+  FROM days LEFT JOIN v0792 AS v0185 ON v0185.v0840 <= days.v0113
+  GROUP BY days.v0113
+), v0843 AS (
+  SELECT days.v0113, COUNT(v0844.v0177) AS v0075
+  FROM days LEFT JOIN v0793 AS v0844 ON v0844.v0840 <= days.v0113
+  GROUP BY days.v0113
+)
+SELECT
+  v0841.v0113 AS v0808,
+  CAST(v0841.v0075 AS INT) AS v0849,
+  CAST(v0795.v0561 AS INT) AS v0810,
+  CAST(v0841.v0075 AS DOUBLE) / v0795.v0561 AS v0811,
+  CAST(v0842.v0075 AS INT) AS v0850,
+  CAST(v0796.v0561 AS INT) AS v0813,
+  CAST(v0842.v0075 AS DOUBLE) / v0796.v0561 AS v0814,
+  CAST(v0843.v0075 AS INT) AS v0851,
+  CAST(v0797.v0561 AS INT) AS v0816,
+  CAST(v0843.v0075 AS DOUBLE) / v0797.v0561 AS v0817
+FROM v0841
+JOIN v0842 ON v0842.v0113 = v0841.v0113
+JOIN v0843 ON v0843.v0113 = v0841.v0113
+CROSS JOIN v0795 CROSS JOIN v0796 CROSS JOIN v0797
+ORDER BY v0841.v0113
+
+-- query 170
+WITH v0852 AS (
+SELECT '1305' AS tag, 'value0232 value0233 value0234' AS v0853, 0 AS v0731
+  UNION ALL SELECT '1011' AS tag, 'value0235 - value0140 value0236' AS v0853, 1 AS v0731
+  UNION ALL SELECT '1011b' AS tag, 'value0237 value0100 - value0039 value0238' AS v0853, 2 AS v0731
+  UNION ALL SELECT '1013a' AS tag, 'value0239 value0145 value0240' AS v0853, 3 AS v0731
+  UNION ALL SELECT '1013h' AS tag, 'value0241 value0242 value0240' AS v0853, 4 AS v0731
+  UNION ALL SELECT '1013r' AS tag, 'value0243 value0244 - value0233 value0245' AS v0853, 5 AS v0731
+  UNION ALL SELECT '1013c' AS tag, 'value0246 value0247 value0248' AS v0853, 6 AS v0731
+  UNION ALL SELECT '1022' AS tag, 'value0249 value0250 value0251 value0252' AS v0853, 7 AS v0731
+  UNION ALL SELECT '1022f' AS tag, 'value0253 value0141 value0254 value0250?' AS v0853, 8 AS v0731
+  UNION ALL SELECT '1028' AS tag, 'value0255 value0256 value0257 value0034' AS v0853, 9 AS v0731
+  UNION ALL SELECT '1028a' AS tag, 'value0258 value0233 value0234 value0252' AS v0853, 10 AS v0731
+  UNION ALL SELECT '1028b' AS tag, 'value0259 value0260 value0261' AS v0853, 11 AS v0731
+  UNION ALL SELECT '1028s' AS tag, 'value0262 value0263 value0264 value0265' AS v0853, 12 AS v0731
+  UNION ALL SELECT '1028value0266' AS tag, 'value0267 value0264 value0268 value0145' AS v0853, 13 AS v0731
+  UNION ALL SELECT '1017' AS tag, 'value0249 value0053 - value0238 value0170' AS v0853, 14 AS v0731
+  UNION ALL SELECT '1008' AS tag, 'value0128 value0269 - value0140 value0236' AS v0853, 15 AS v0731
+  UNION ALL SELECT '1008a' AS tag, 'value0270 value0271 value0272 value0257 value0273' AS v0853, 16 AS v0731
+  UNION ALL SELECT '1041' AS tag, 'value0274 value0233 (value0275)' AS v0853, 17 AS v0731
+  UNION ALL SELECT '1016' AS tag, 'value0276 value0277' AS v0853, 18 AS v0731
+  UNION ALL SELECT '1016d' AS tag, 'value0249 value0278 value0279 value0209' AS v0853, 19 AS v0731
+  UNION ALL SELECT '1016f' AS tag, 'value0280 value0281 value0141 value0282' AS v0853, 20 AS v0731
+  UNION ALL SELECT '1018' AS tag, 'value0249 value0053 - value0283 value0284' AS v0853, 21 AS v0731
+  UNION ALL SELECT '1310' AS tag, 'value0285 value0268 value0284' AS v0853, 22 AS v0731
+  UNION ALL SELECT '1310z' AS tag, 'value0285 value0286 - value0100 value0287' AS v0853, 23 AS v0731
+  UNION ALL SELECT '1310b' AS tag, 'value0285 value0286 - value0288 value0289' AS v0853, 24 AS v0731
+  UNION ALL SELECT '1310value0290' AS tag, 'value0285 value0286 - value0100 value0291' AS v0853, 25 AS v0731
+  UNION ALL SELECT '1012' AS tag, 'value0274 value0233 (value0292 value0293)' AS v0853, 26 AS v0731
+  UNION ALL SELECT '1004' AS tag, 'value0294 value0295 value0296' AS v0853, 27 AS v0731
+  UNION ALL SELECT '1003' AS tag, 'value0249 value0251 - value0282 value0250' AS v0853, 28 AS v0731
+  UNION ALL SELECT '1003a' AS tag, 'value0249 value0297 value0298' AS v0853, 29 AS v0731
+  UNION ALL SELECT '1003f' AS tag, 'value0299 value0250 value0300 value0301' AS v0853, 30 AS v0731
+  UNION ALL SELECT 'value0302-value0303' AS tag, 'value0270 value0304 - value0305 value0306' AS v0853, 31 AS v0731
+  UNION ALL SELECT '1035' AS tag, 'value0307 value0256 value0153' AS v0853, 32 AS v0731
+  UNION ALL SELECT '1035w' AS tag, 'value0308 value0153 value0252' AS v0853, 33 AS v0731
+  UNION ALL SELECT 'value0309' AS tag, 'value0310 value0311' AS v0853, 34 AS v0731
+  UNION ALL SELECT 'value0302-value0312' AS tag, 'value0310 value0311 (value0305)' AS v0853, 35 AS v0731
+  UNION ALL SELECT '1606a' AS tag, 'value0313 value0314 value0315 value0233' AS v0853, 36 AS v0731
+  UNION ALL SELECT '1023w' AS tag, 'value0249 value0316 value0152 value0100' AS v0853, 37 AS v0731
+  UNION ALL SELECT '72value0317' AS tag, 'value0318 value0319 72 hours' AS v0853, 38 AS v0731
+  UNION ALL SELECT '48value0317' AS tag, 'value0318 value0319 48 hours' AS v0853, 39 AS v0731
+  UNION ALL SELECT '60value0317' AS tag, 'value0318 value0319 60 hours' AS v0853, 40 AS v0731
+  UNION ALL SELECT '36value0317' AS tag, 'value0318 value0319 36 hours' AS v0853, 41 AS v0731
+  UNION ALL SELECT '24value0317' AS tag, 'value0318 value0319 24 hours' AS v0853, 42 AS v0731
+  UNION ALL SELECT '24value0320' AS tag, 'value0318 value0319 ~24 hours' AS v0853, 43 AS v0731
+  UNION ALL SELECT '12value0317' AS tag, 'value0318 value0319 12 hours' AS v0853, 44 AS v0731
+  UNION ALL SELECT '21value0320' AS tag, 'value0318 value0319 ~21 hours' AS v0853, 45 AS v0731
+  UNION ALL SELECT '19value0320' AS tag, 'value0318 value0319 ~19 hours' AS v0853, 46 AS v0731
+  UNION ALL SELECT '18value0320' AS tag, 'value0318 value0319 ~18 hours' AS v0853, 47 AS v0731
+  UNION ALL SELECT '05value0320' AS tag, 'value0318 value0319 ~5 hours' AS v0853, 48 AS v0731
+  UNION ALL SELECT '04value0320' AS tag, 'value0318 value0319 ~4 hours' AS v0853, 49 AS v0731
+  UNION ALL SELECT '02value0320' AS tag, 'value0318 value0319 ~2 hours' AS v0853, 50 AS v0731
+  UNION ALL SELECT '01value0320' AS tag, 'value0318 value0319 ~1 hour' AS v0853, 51 AS v0731
+  UNION ALL SELECT '00value0320' AS tag, 'value0318 value0319 ~0 hours' AS v0853, 52 AS v0731
+  UNION ALL SELECT '1043' AS tag, 'value0249 value0321 value0322 value0269' AS v0853, 53 AS v0731
+  UNION ALL SELECT '1043b' AS tag, 'value0249 value0321 value0322 value0323' AS v0853, 54 AS v0731
+  UNION ALL SELECT 'value0302-value0324' AS tag, 'value0325 value0322 value0261 (value0305)' AS v0853, 55 AS v0731
+  UNION ALL SELECT '1021' AS tag, 'value0253 value0256 value0153' AS v0853, 56 AS v0731
+  UNION ALL SELECT '1033' AS tag, 'value0326’t value0327 value0279 value0051' AS v0853, 57 AS v0731
+  UNION ALL SELECT '1046' AS tag, 'value0328 value0329 value0252' AS v0853, 58 AS v0731
+  UNION ALL SELECT '1046a' AS tag, '$10 value0264 value0329 value0252' AS v0853, 59 AS v0731
+  UNION ALL SELECT '1046s' AS tag, '$25 value0329 value0252' AS v0853, 60 AS v0731
+  UNION ALL SELECT '1046c' AS tag, 'value0294 value0145 value0329 value0252' AS v0853, 61 AS v0731
+  UNION ALL SELECT '1046r' AS tag, 'value0330 value0145 value0329 value0252' AS v0853, 62 AS v0731
+  UNION ALL SELECT '1052' AS tag, 'value0262 value0331 value0332 value0252' AS v0853, 63 AS v0731
+  UNION ALL SELECT '1052b' AS tag, 'value0262 $10 value0332 value0252' AS v0853, 64 AS v0731
+  UNION ALL SELECT '1052c' AS tag, 'value0333 value0334 value0247' AS v0853, 65 AS v0731
+  UNION ALL SELECT '1034' AS tag, 'value0246 value0335 value0252' AS v0853, 66 AS v0731
+  UNION ALL SELECT '1215' AS tag, 'value0336 value0062 value0247' AS v0853, 67 AS v0731
+  UNION ALL SELECT '1025' AS tag, 'value0125 value0236 value0252' AS v0853, 68 AS v0731
+  UNION ALL SELECT '1030' AS tag, 'value0262 value0263 value0265 value0337' AS v0853, 69 AS v0731
+  UNION ALL SELECT '1014value0338' AS tag, 'value0339-value0340' AS v0853, 70 AS v0731
+  UNION ALL SELECT 'value0302-value0341' AS tag, 'value0342 value0261 (value0305)' AS v0853, 71 AS v0731
+  UNION ALL SELECT 'value0302-value0343' AS tag, 'value0344 value0345 value0261 (value0305)' AS v0853, 72 AS v0731
+  UNION ALL SELECT 'value0302-value0346' AS tag, 'value0255 value0341 value0261 (value0305)' AS v0853, 73 AS v0731
+  UNION ALL SELECT 'value0346' AS tag, 'value0255 value0341' AS v0853, 74 AS v0731
+  UNION ALL SELECT '1601' AS tag, 'value0328 value0268 value0345' AS v0853, 75 AS v0731
+  UNION ALL SELECT '1213' AS tag, 'value0347 value0348 value0349' AS v0853, 76 AS v0731
+  UNION ALL SELECT '1211' AS tag, 'value0350 value0100 value0351' AS v0853, 77 AS v0731
+  UNION ALL SELECT '1211d' AS tag, 'value0193 value0352 value0298' AS v0853, 78 AS v0731
+  UNION ALL SELECT '1211a' AS tag, 'value0353 value0286 - value0354 value0289' AS v0853, 79 AS v0731
+  UNION ALL SELECT '1211s' AS tag, 'value0353 value0286 - value0354 value0289' AS v0853, 80 AS v0731
+  UNION ALL SELECT '1211o' AS tag, 'value0355 value0291 value0100 (value0356)' AS v0853, 81 AS v0731
+  UNION ALL SELECT '1211p' AS tag, 'value0353 value0186+ value0357 value0100' AS v0853, 82 AS v0731
+  UNION ALL SELECT '1211value0290' AS tag, 'value0353 value0286 - value0354 value0289' AS v0853, 83 AS v0731
+  UNION ALL SELECT '1206' AS tag, 'value0358 value0261' AS v0853, 84 AS v0731
+  UNION ALL SELECT '1206c' AS tag, 'value0328 value0359 value0340' AS v0853, 85 AS v0731
+  UNION ALL SELECT '1212' AS tag, 'value0360 value0209 value0361 value0261' AS v0853, 86 AS v0731
+  UNION ALL SELECT '1048' AS tag, 'value0249 value0288 value0252' AS v0853, 87 AS v0731
+  UNION ALL SELECT '1501' AS tag, 'value0362 value0363 value0051 value0364' AS v0853, 88 AS v0731
+  UNION ALL SELECT '1005' AS tag, 'value0358 value0100 value0365 value0341' AS v0853, 89 AS v0731
+  UNION ALL SELECT 'value0302-value0247' AS tag, 'value0366 value0261 (value0305)' AS v0853, 90 AS v0731
+  UNION ALL SELECT 'value0367' AS tag, 'value0358' AS v0853, 91 AS v0731
+  UNION ALL SELECT 'value0368' AS tag, 'value0193 value0369 value0248' AS v0853, 92 AS v0731
+  UNION ALL SELECT '1001b' AS tag, 'value0370 value0132 value0371 value0288' AS v0853, 93 AS v0731
+  UNION ALL SELECT '1429' AS tag, 'value0372 value0373 - value0374' AS v0853, 94 AS v0731
+  UNION ALL SELECT '1056' AS tag, 'value0255 + value0138 value0375 value0376' AS v0853, 95 AS v0731
+  UNION ALL SELECT '1056p' AS tag, 'value0377 value0255 + value0138 value0375' AS v0853, 96 AS v0731
+  UNION ALL SELECT '1056a' AS tag, 'value0255 value0376 value0378' AS v0853, 97 AS v0731
+  UNION ALL SELECT '1056value0379' AS tag, 'value0255 value0376 value0380' AS v0853, 98 AS v0731
+  UNION ALL SELECT '1056value0381' AS tag, 'value0382 value0375 value0376 value0380' AS v0853, 99 AS v0731
+  UNION ALL SELECT '1056c' AS tag, 'value0382 value0375 value0376 value0378' AS v0853, 100 AS v0731
+  UNION ALL SELECT '1056m' AS tag, 'value0255 value0134 value0383 value0384' AS v0853, 101 AS v0731
+  UNION ALL SELECT '1056b' AS tag, 'value0385 value0386' AS v0853, 102 AS v0731
+  UNION ALL SELECT 'value0302-value0387' AS tag, 'value0255 value0376 (value0305)' AS v0853, 103 AS v0731
+  UNION ALL SELECT 'value0302-value0388' AS tag, 'value0385 + value0255 value0376 (value0305)' AS v0853, 104 AS v0731
+  UNION ALL SELECT '1015' AS tag, 'value0389 value0390 value0233 value0240' AS v0853, 105 AS v0731
+  UNION ALL SELECT '1408' AS tag, 'value0391 value0140 value0392 value0233' AS v0853, 106 AS v0731
+  UNION ALL SELECT '1432' AS tag, 'value0372 value0373 - value0393 value0394' AS v0853, 107 AS v0731
+  UNION ALL SELECT '1432d' AS tag, 'value0372 value0373 value0395 (value0305)' AS v0853, 108 AS v0731
+  UNION ALL SELECT '1433' AS tag, 'value0372 value0373 - value0288 value0289' AS v0853, 109 AS v0731
+  UNION ALL SELECT '1400' AS tag, 'value0396 value0138 value0375 value0279 value0397' AS v0853, 110 AS v0731
+  UNION ALL SELECT '1404' AS tag, 'value0270 value0398 value0284 - value0399' AS v0853, 111 AS v0731
+  UNION ALL SELECT '1404z' AS tag, 'value0270 value0400 value0401 (value0305)' AS v0853, 112 AS v0731
+  UNION ALL SELECT '1411' AS tag, 'value0402 value0403 value0138 value0375' AS v0853, 113 AS v0731
+  UNION ALL SELECT '1401' AS tag, 'value0382 value0375 - value0140 value0404' AS v0853, 114 AS v0731
+  UNION ALL SELECT '1414' AS tag, 'value0253 value0138 - value0288 value0289' AS v0853, 115 AS v0731
+  UNION ALL SELECT '1414b' AS tag, 'value0253 value0138 - value0256 value0286' AS v0853, 116 AS v0731
+  UNION ALL SELECT '1414f' AS tag, 'value0396 value0138 value0375 value0392 value0280' AS v0853, 117 AS v0731
+  UNION ALL SELECT '1414value0405' AS tag, 'value0382 value0375 value0286 - value0406' AS v0853, 118 AS v0731
+  UNION ALL SELECT '1421' AS tag, 'value0407 value0293 - value0408 value0233' AS v0853, 119 AS v0731
+  UNION ALL SELECT '1430' AS tag, 'value0372 value0373 - value0140 value0304' AS v0853, 120 AS v0731
+  UNION ALL SELECT '1431' AS tag, 'value0372 value0373 - value0238 value0170' AS v0853, 121 AS v0731
+  UNION ALL SELECT '1009' AS tag, 'value0409 value0410 value0411' AS v0853, 122 AS v0731
+  UNION ALL SELECT '1009t' AS tag, 'value0412 value0413 value0257 value0278' AS v0853, 123 AS v0731
+  UNION ALL SELECT '1045' AS tag, 'value0414 value0415 value0416' AS v0853, 124 AS v0731
+  UNION ALL SELECT '1001p' AS tag, 'value0417 value0264 value0367 value0261' AS v0853, 125 AS v0731
+  UNION ALL SELECT '1001' AS tag, 'value0328 value0247 value0298' AS v0853, 126 AS v0731
+  UNION ALL SELECT '1301' AS tag, 'value0258 value0233 - value0288 value0418' AS v0853, 127 AS v0731
+  UNION ALL SELECT '1306' AS tag, 'value0419-value0420: value0238 value0170' AS v0853, 128 AS v0731
+  UNION ALL SELECT '1415b' AS tag, 'value0382 value0375 - value0421 value0100' AS v0853, 129 AS v0731
+  UNION ALL SELECT '1415p' AS tag, 'value0350 value0422 value0421 value0100' AS v0853, 130 AS v0731
+  UNION ALL SELECT '1415c' AS tag, 'value0350 value0421 value0100' AS v0853, 131 AS v0731
+  UNION ALL SELECT '1415v' AS tag, 'value0423 value0421 value0100 value0424' AS v0853, 132 AS v0731
+  UNION ALL SELECT '1415' AS tag, 'value0270 value0100 - value0421 value0425' AS v0853, 133 AS v0731
+  UNION ALL SELECT '1405' AS tag, 'value0270 value0426 value0427' AS v0853, 134 AS v0731
+  UNION ALL SELECT '1604' AS tag, 'value0253 value0415 value0428' AS v0853, 135 AS v0731
+  UNION ALL SELECT '1607' AS tag, 'value0429 value0430' AS v0853, 136 AS v0731
+  UNION ALL SELECT '10' AS tag, 'value0431 value0432' AS v0853, 137 AS v0731
+  UNION ALL SELECT '3001' AS tag, 'value0433 value0247 - value0434 value0288' AS v0853, 138 AS v0731
+  UNION ALL SELECT '3001b' AS tag, 'value0433 value0247 - value0288 value0289' AS v0853, 139 AS v0731
+  UNION ALL SELECT '3002' AS tag, 'value0433 value0435 - value0436 value0233' AS v0853, 140 AS v0731
+  UNION ALL SELECT '3003' AS tag, 'value0433 value0140 value0100 value0406' AS v0853, 141 AS v0731
+  UNION ALL SELECT '3009' AS tag, 'value0433 value0437' AS v0853, 142 AS v0731
+  UNION ALL SELECT '3009f' AS tag, 'value0433 value0145 value0438' AS v0853, 143 AS v0731
+  UNION ALL SELECT '3009t' AS tag, 'value0433 value0439' AS v0853, 144 AS v0731
+  UNION ALL SELECT '3048' AS tag, 'value0433 value0288 value0252' AS v0853, 145 AS v0731
+  UNION ALL SELECT '3110' AS tag, 'value0440 value0141 value0441 value0433' AS v0853, 146 AS v0731
+  UNION ALL SELECT '3504' AS tag, 'value0433 value0145 value0442 value0051' AS v0853, 147 AS v0731
+  UNION ALL SELECT '3502' AS tag, 'value0035 value0433 value0443' AS v0853, 148 AS v0731
+  UNION ALL SELECT '2053s' AS tag, 'value0444 value0257 value0445 - value0446' AS v0853, 149 AS v0731
+  UNION ALL SELECT '2053value0447' AS tag, 'value0446 value0448 value0257 value0278' AS v0853, 150 AS v0731
+  UNION ALL SELECT '1309' AS tag, 'value0193 value0449 - value0450' AS v0853, 151 AS v0731
+  UNION ALL SELECT '1606' AS tag, 'value0451 value0430' AS v0853, 152 AS v0731
+  UNION ALL SELECT '1304' AS tag, 'value0258 value0233 - value0269' AS v0853, 153 AS v0731
+  UNION ALL SELECT 'value0302-value0452' AS tag, 'value0125 value0453 (value0305)' AS v0853, 154 AS v0731
+  UNION ALL SELECT '1420n' AS tag, 'value0196 value0454 value0209 value0455' AS v0853, 155 AS v0731
+  UNION ALL SELECT '1420s' AS tag, 'value0456 value0454 value0209 value0399' AS v0853, 156 AS v0731
+  UNION ALL SELECT '2102a' AS tag, 'value0253 value0457 value0261' AS v0853, 157 AS v0731
+  UNION ALL SELECT '1060' AS tag, 'value0402 value0458 value0457' AS v0853, 158 AS v0731
+  UNION ALL SELECT '1605' AS tag, 'value0253 value0459 value0457' AS v0853, 159 AS v0731
+  UNION ALL SELECT 'value0460' AS tag, 'value0461 value0462' AS v0853, 160 AS v0731
+  UNION ALL SELECT '1049' AS tag, 'value0463' AS v0853, 161 AS v0731
+  UNION ALL SELECT '1049b' AS tag, 'value0342 value0464 value0265' AS v0853, 162 AS v0731
+  UNION ALL SELECT '1023' AS tag, 'value0249 value0465 value0252' AS v0853, 163 AS v0731
+  UNION ALL SELECT 'value0302-value0466' AS tag, 'value0467 value0306 (value0305)' AS v0853, 164 AS v0731
+  UNION ALL SELECT '1418n' AS tag, 'value0235 value0341 - value0148 value0340' AS v0853, 165 AS v0731
+),
+v0854 AS (
+  SELECT
+    CURRENT_DATE() AS v0855,
+    CAST(CURRENT_DATE() - INTERVAL '7' DAY AS DATE) AS v0856,
+    CAST(CURRENT_DATE() - INTERVAL '14' DAY AS DATE) AS v0857,
+    CAST(CURRENT_DATE() - INTERVAL '21' DAY AS DATE) AS v0858,
+    CAST(CURRENT_DATE() - INTERVAL '28' DAY AS DATE) AS v0859
+),
+v0860 AS (
+  SELECT
+    LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') AS v0862,
+    CAST(v0000.v0090 AS DATE) AS v0113
+  FROM v0863 v0000
+  CROSS JOIN v0854 v0154
+  WHERE v0000.v0090 >= CAST(v0154.v0859 AS TIMESTAMP)
+    AND v0000.v0090 <  CAST(v0154.v0855 + INTERVAL '1' DAY AS TIMESTAMP)
+    AND CAST(v0000.v0090 AS DATE) IN (v0154.v0855, v0154.v0856, v0154.v0857, v0154.v0858, v0154.v0859)
+    AND NOT (
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 16, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 6003, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 6006, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 6009, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 6018, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 6019, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 6903value0468, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 6903value0469, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 6905, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, value0470, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, value0471, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, value0472, %'
+    )
+),
+v0864 AS (
+  SELECT v0862, v0113
+  FROM v0860
+  WHERE EXISTS (SELECT 1 FROM v0852 v0865 WHERE v0860.v0862 LIKE '%, ' || v0865.tag || ', %')
+),
+v0866 AS (
+  SELECT
+    SUM(CASE WHEN v0864.v0113 = v0154.v0855 THEN 1 ELSE 0 END) AS v0867,
+    SUM(CASE WHEN v0864.v0113 <> v0154.v0855 THEN 1 ELSE 0 END) AS v0868
+  FROM v0864
+  CROSS JOIN v0854 v0154
+),
+v0869 AS (
+  SELECT
+    v0865.tag,
+    v0865.v0853,
+    v0865.v0731,
+    SUM(CASE WHEN v0057.v0113 = v0154.v0855 THEN 1 ELSE 0 END) AS v0870,
+    SUM(CASE WHEN v0057.v0113 IS NOT NULL AND v0057.v0113 <> v0154.v0855 THEN 1 ELSE 0 END) AS v0871
+  FROM v0852 v0865
+  CROSS JOIN v0854 v0154
+  LEFT JOIN v0864 v0057 ON v0057.v0862 LIKE '%, ' || v0865.tag || ', %'
+  GROUP BY v0865.tag, v0865.v0853, v0865.v0731
+)
+SELECT
+  v0872.tag AS tag,
+  v0872.v0853 AS v0853,
+  v0872.v0870 AS v0873,
+  v0872.v0871 AS v0874,
+  100.0 * v0872.v0870 / NULLIF(v0113.v0867, 0) AS v0875,
+  100.0 * v0872.v0871 / NULLIF(v0113.v0868, 0) AS v0876,
+  (100.0 * v0872.v0870 / NULLIF(v0113.v0867, 0)) - (100.0 * v0872.v0871 / NULLIF(v0113.v0868, 0)) AS v0877
+FROM v0869 v0872
+CROSS JOIN v0866 v0113
+WHERE v0872.v0870 > 0
+  AND v0872.tag <> '00value0320'
+  AND ((100.0 * v0872.v0870 / NULLIF(v0113.v0867, 0)) - (100.0 * v0872.v0871 / NULLIF(v0113.v0868, 0))) > 0.5
+ORDER BY (100.0 * v0872.v0870 / NULLIF(v0113.v0867, 0)) - (100.0 * v0872.v0871 / NULLIF(v0113.v0868, 0)) DESC
+
+-- query 171
+WITH v0852 AS (
+SELECT '1305' AS tag, 'value0232 value0233 value0234' AS v0853, 0 AS v0731
+  UNION ALL SELECT '1011' AS tag, 'value0235 - value0140 value0236' AS v0853, 1 AS v0731
+  UNION ALL SELECT '1011b' AS tag, 'value0237 value0100 - value0039 value0238' AS v0853, 2 AS v0731
+  UNION ALL SELECT '1013a' AS tag, 'value0239 value0145 value0240' AS v0853, 3 AS v0731
+  UNION ALL SELECT '1013h' AS tag, 'value0241 value0242 value0240' AS v0853, 4 AS v0731
+  UNION ALL SELECT '1013r' AS tag, 'value0243 value0244 - value0233 value0245' AS v0853, 5 AS v0731
+  UNION ALL SELECT '1013c' AS tag, 'value0246 value0247 value0248' AS v0853, 6 AS v0731
+  UNION ALL SELECT '1022' AS tag, 'value0249 value0250 value0251 value0252' AS v0853, 7 AS v0731
+  UNION ALL SELECT '1022f' AS tag, 'value0253 value0141 value0254 value0250?' AS v0853, 8 AS v0731
+  UNION ALL SELECT '1028' AS tag, 'value0255 value0256 value0257 value0034' AS v0853, 9 AS v0731
+  UNION ALL SELECT '1028a' AS tag, 'value0258 value0233 value0234 value0252' AS v0853, 10 AS v0731
+  UNION ALL SELECT '1028b' AS tag, 'value0259 value0260 value0261' AS v0853, 11 AS v0731
+  UNION ALL SELECT '1028s' AS tag, 'value0262 value0263 value0264 value0265' AS v0853, 12 AS v0731
+  UNION ALL SELECT '1028value0266' AS tag, 'value0267 value0264 value0268 value0145' AS v0853, 13 AS v0731
+  UNION ALL SELECT '1017' AS tag, 'value0249 value0053 - value0238 value0170' AS v0853, 14 AS v0731
+  UNION ALL SELECT '1008' AS tag, 'value0128 value0269 - value0140 value0236' AS v0853, 15 AS v0731
+  UNION ALL SELECT '1008a' AS tag, 'value0270 value0271 value0272 value0257 value0273' AS v0853, 16 AS v0731
+  UNION ALL SELECT '1041' AS tag, 'value0274 value0233 (value0275)' AS v0853, 17 AS v0731
+  UNION ALL SELECT '1016' AS tag, 'value0276 value0277' AS v0853, 18 AS v0731
+  UNION ALL SELECT '1016d' AS tag, 'value0249 value0278 value0279 value0209' AS v0853, 19 AS v0731
+  UNION ALL SELECT '1016f' AS tag, 'value0280 value0281 value0141 value0282' AS v0853, 20 AS v0731
+  UNION ALL SELECT '1018' AS tag, 'value0249 value0053 - value0283 value0284' AS v0853, 21 AS v0731
+  UNION ALL SELECT '1310' AS tag, 'value0285 value0268 value0284' AS v0853, 22 AS v0731
+  UNION ALL SELECT '1310z' AS tag, 'value0285 value0286 - value0100 value0287' AS v0853, 23 AS v0731
+  UNION ALL SELECT '1310b' AS tag, 'value0285 value0286 - value0288 value0289' AS v0853, 24 AS v0731
+  UNION ALL SELECT '1310value0290' AS tag, 'value0285 value0286 - value0100 value0291' AS v0853, 25 AS v0731
+  UNION ALL SELECT '1012' AS tag, 'value0274 value0233 (value0292 value0293)' AS v0853, 26 AS v0731
+  UNION ALL SELECT '1004' AS tag, 'value0294 value0295 value0296' AS v0853, 27 AS v0731
+  UNION ALL SELECT '1003' AS tag, 'value0249 value0251 - value0282 value0250' AS v0853, 28 AS v0731
+  UNION ALL SELECT '1003a' AS tag, 'value0249 value0297 value0298' AS v0853, 29 AS v0731
+  UNION ALL SELECT '1003f' AS tag, 'value0299 value0250 value0300 value0301' AS v0853, 30 AS v0731
+  UNION ALL SELECT 'value0302-value0303' AS tag, 'value0270 value0304 - value0305 value0306' AS v0853, 31 AS v0731
+  UNION ALL SELECT '1035' AS tag, 'value0307 value0256 value0153' AS v0853, 32 AS v0731
+  UNION ALL SELECT '1035w' AS tag, 'value0308 value0153 value0252' AS v0853, 33 AS v0731
+  UNION ALL SELECT 'value0309' AS tag, 'value0310 value0311' AS v0853, 34 AS v0731
+  UNION ALL SELECT 'value0302-value0312' AS tag, 'value0310 value0311 (value0305)' AS v0853, 35 AS v0731
+  UNION ALL SELECT '1606a' AS tag, 'value0313 value0314 value0315 value0233' AS v0853, 36 AS v0731
+  UNION ALL SELECT '1023w' AS tag, 'value0249 value0316 value0152 value0100' AS v0853, 37 AS v0731
+  UNION ALL SELECT '72value0317' AS tag, 'value0318 value0319 72 hours' AS v0853, 38 AS v0731
+  UNION ALL SELECT '48value0317' AS tag, 'value0318 value0319 48 hours' AS v0853, 39 AS v0731
+  UNION ALL SELECT '60value0317' AS tag, 'value0318 value0319 60 hours' AS v0853, 40 AS v0731
+  UNION ALL SELECT '36value0317' AS tag, 'value0318 value0319 36 hours' AS v0853, 41 AS v0731
+  UNION ALL SELECT '24value0317' AS tag, 'value0318 value0319 24 hours' AS v0853, 42 AS v0731
+  UNION ALL SELECT '24value0320' AS tag, 'value0318 value0319 ~24 hours' AS v0853, 43 AS v0731
+  UNION ALL SELECT '12value0317' AS tag, 'value0318 value0319 12 hours' AS v0853, 44 AS v0731
+  UNION ALL SELECT '21value0320' AS tag, 'value0318 value0319 ~21 hours' AS v0853, 45 AS v0731
+  UNION ALL SELECT '19value0320' AS tag, 'value0318 value0319 ~19 hours' AS v0853, 46 AS v0731
+  UNION ALL SELECT '18value0320' AS tag, 'value0318 value0319 ~18 hours' AS v0853, 47 AS v0731
+  UNION ALL SELECT '05value0320' AS tag, 'value0318 value0319 ~5 hours' AS v0853, 48 AS v0731
+  UNION ALL SELECT '04value0320' AS tag, 'value0318 value0319 ~4 hours' AS v0853, 49 AS v0731
+  UNION ALL SELECT '02value0320' AS tag, 'value0318 value0319 ~2 hours' AS v0853, 50 AS v0731
+  UNION ALL SELECT '01value0320' AS tag, 'value0318 value0319 ~1 hour' AS v0853, 51 AS v0731
+  UNION ALL SELECT '00value0320' AS tag, 'value0318 value0319 ~0 hours' AS v0853, 52 AS v0731
+  UNION ALL SELECT '1043' AS tag, 'value0249 value0321 value0322 value0269' AS v0853, 53 AS v0731
+  UNION ALL SELECT '1043b' AS tag, 'value0249 value0321 value0322 value0323' AS v0853, 54 AS v0731
+  UNION ALL SELECT 'value0302-value0324' AS tag, 'value0325 value0322 value0261 (value0305)' AS v0853, 55 AS v0731
+  UNION ALL SELECT '1021' AS tag, 'value0253 value0256 value0153' AS v0853, 56 AS v0731
+  UNION ALL SELECT '1033' AS tag, 'value0326’t value0327 value0279 value0051' AS v0853, 57 AS v0731
+  UNION ALL SELECT '1046' AS tag, 'value0328 value0329 value0252' AS v0853, 58 AS v0731
+  UNION ALL SELECT '1046a' AS tag, '$10 value0264 value0329 value0252' AS v0853, 59 AS v0731
+  UNION ALL SELECT '1046s' AS tag, '$25 value0329 value0252' AS v0853, 60 AS v0731
+  UNION ALL SELECT '1046c' AS tag, 'value0294 value0145 value0329 value0252' AS v0853, 61 AS v0731
+  UNION ALL SELECT '1046r' AS tag, 'value0330 value0145 value0329 value0252' AS v0853, 62 AS v0731
+  UNION ALL SELECT '1052' AS tag, 'value0262 value0331 value0332 value0252' AS v0853, 63 AS v0731
+  UNION ALL SELECT '1052b' AS tag, 'value0262 $10 value0332 value0252' AS v0853, 64 AS v0731
+  UNION ALL SELECT '1052c' AS tag, 'value0333 value0334 value0247' AS v0853, 65 AS v0731
+  UNION ALL SELECT '1034' AS tag, 'value0246 value0335 value0252' AS v0853, 66 AS v0731
+  UNION ALL SELECT '1215' AS tag, 'value0336 value0062 value0247' AS v0853, 67 AS v0731
+  UNION ALL SELECT '1025' AS tag, 'value0125 value0236 value0252' AS v0853, 68 AS v0731
+  UNION ALL SELECT '1030' AS tag, 'value0262 value0263 value0265 value0337' AS v0853, 69 AS v0731
+  UNION ALL SELECT '1014value0338' AS tag, 'value0339-value0340' AS v0853, 70 AS v0731
+  UNION ALL SELECT 'value0302-value0341' AS tag, 'value0342 value0261 (value0305)' AS v0853, 71 AS v0731
+  UNION ALL SELECT 'value0302-value0343' AS tag, 'value0344 value0345 value0261 (value0305)' AS v0853, 72 AS v0731
+  UNION ALL SELECT 'value0302-value0346' AS tag, 'value0255 value0341 value0261 (value0305)' AS v0853, 73 AS v0731
+  UNION ALL SELECT 'value0346' AS tag, 'value0255 value0341' AS v0853, 74 AS v0731
+  UNION ALL SELECT '1601' AS tag, 'value0328 value0268 value0345' AS v0853, 75 AS v0731
+  UNION ALL SELECT '1213' AS tag, 'value0347 value0348 value0349' AS v0853, 76 AS v0731
+  UNION ALL SELECT '1211' AS tag, 'value0350 value0100 value0351' AS v0853, 77 AS v0731
+  UNION ALL SELECT '1211d' AS tag, 'value0193 value0352 value0298' AS v0853, 78 AS v0731
+  UNION ALL SELECT '1211a' AS tag, 'value0353 value0286 - value0354 value0289' AS v0853, 79 AS v0731
+  UNION ALL SELECT '1211s' AS tag, 'value0353 value0286 - value0354 value0289' AS v0853, 80 AS v0731
+  UNION ALL SELECT '1211o' AS tag, 'value0355 value0291 value0100 (value0356)' AS v0853, 81 AS v0731
+  UNION ALL SELECT '1211p' AS tag, 'value0353 value0186+ value0357 value0100' AS v0853, 82 AS v0731
+  UNION ALL SELECT '1211value0290' AS tag, 'value0353 value0286 - value0354 value0289' AS v0853, 83 AS v0731
+  UNION ALL SELECT '1206' AS tag, 'value0358 value0261' AS v0853, 84 AS v0731
+  UNION ALL SELECT '1206c' AS tag, 'value0328 value0359 value0340' AS v0853, 85 AS v0731
+  UNION ALL SELECT '1212' AS tag, 'value0360 value0209 value0361 value0261' AS v0853, 86 AS v0731
+  UNION ALL SELECT '1048' AS tag, 'value0249 value0288 value0252' AS v0853, 87 AS v0731
+  UNION ALL SELECT '1501' AS tag, 'value0362 value0363 value0051 value0364' AS v0853, 88 AS v0731
+  UNION ALL SELECT '1005' AS tag, 'value0358 value0100 value0365 value0341' AS v0853, 89 AS v0731
+  UNION ALL SELECT 'value0302-value0247' AS tag, 'value0366 value0261 (value0305)' AS v0853, 90 AS v0731
+  UNION ALL SELECT 'value0367' AS tag, 'value0358' AS v0853, 91 AS v0731
+  UNION ALL SELECT 'value0368' AS tag, 'value0193 value0369 value0248' AS v0853, 92 AS v0731
+  UNION ALL SELECT '1001b' AS tag, 'value0370 value0132 value0371 value0288' AS v0853, 93 AS v0731
+  UNION ALL SELECT '1429' AS tag, 'value0372 value0373 - value0374' AS v0853, 94 AS v0731
+  UNION ALL SELECT '1056' AS tag, 'value0255 + value0138 value0375 value0376' AS v0853, 95 AS v0731
+  UNION ALL SELECT '1056p' AS tag, 'value0377 value0255 + value0138 value0375' AS v0853, 96 AS v0731
+  UNION ALL SELECT '1056a' AS tag, 'value0255 value0376 value0378' AS v0853, 97 AS v0731
+  UNION ALL SELECT '1056value0379' AS tag, 'value0255 value0376 value0380' AS v0853, 98 AS v0731
+  UNION ALL SELECT '1056value0381' AS tag, 'value0382 value0375 value0376 value0380' AS v0853, 99 AS v0731
+  UNION ALL SELECT '1056c' AS tag, 'value0382 value0375 value0376 value0378' AS v0853, 100 AS v0731
+  UNION ALL SELECT '1056m' AS tag, 'value0255 value0134 value0383 value0384' AS v0853, 101 AS v0731
+  UNION ALL SELECT '1056b' AS tag, 'value0385 value0386' AS v0853, 102 AS v0731
+  UNION ALL SELECT 'value0302-value0387' AS tag, 'value0255 value0376 (value0305)' AS v0853, 103 AS v0731
+  UNION ALL SELECT 'value0302-value0388' AS tag, 'value0385 + value0255 value0376 (value0305)' AS v0853, 104 AS v0731
+  UNION ALL SELECT '1015' AS tag, 'value0389 value0390 value0233 value0240' AS v0853, 105 AS v0731
+  UNION ALL SELECT '1408' AS tag, 'value0391 value0140 value0392 value0233' AS v0853, 106 AS v0731
+  UNION ALL SELECT '1432' AS tag, 'value0372 value0373 - value0393 value0394' AS v0853, 107 AS v0731
+  UNION ALL SELECT '1432d' AS tag, 'value0372 value0373 value0395 (value0305)' AS v0853, 108 AS v0731
+  UNION ALL SELECT '1433' AS tag, 'value0372 value0373 - value0288 value0289' AS v0853, 109 AS v0731
+  UNION ALL SELECT '1400' AS tag, 'value0396 value0138 value0375 value0279 value0397' AS v0853, 110 AS v0731
+  UNION ALL SELECT '1404' AS tag, 'value0270 value0398 value0284 - value0399' AS v0853, 111 AS v0731
+  UNION ALL SELECT '1404z' AS tag, 'value0270 value0400 value0401 (value0305)' AS v0853, 112 AS v0731
+  UNION ALL SELECT '1411' AS tag, 'value0402 value0403 value0138 value0375' AS v0853, 113 AS v0731
+  UNION ALL SELECT '1401' AS tag, 'value0382 value0375 - value0140 value0404' AS v0853, 114 AS v0731
+  UNION ALL SELECT '1414' AS tag, 'value0253 value0138 - value0288 value0289' AS v0853, 115 AS v0731
+  UNION ALL SELECT '1414b' AS tag, 'value0253 value0138 - value0256 value0286' AS v0853, 116 AS v0731
+  UNION ALL SELECT '1414f' AS tag, 'value0396 value0138 value0375 value0392 value0280' AS v0853, 117 AS v0731
+  UNION ALL SELECT '1414value0405' AS tag, 'value0382 value0375 value0286 - value0406' AS v0853, 118 AS v0731
+  UNION ALL SELECT '1421' AS tag, 'value0407 value0293 - value0408 value0233' AS v0853, 119 AS v0731
+  UNION ALL SELECT '1430' AS tag, 'value0372 value0373 - value0140 value0304' AS v0853, 120 AS v0731
+  UNION ALL SELECT '1431' AS tag, 'value0372 value0373 - value0238 value0170' AS v0853, 121 AS v0731
+  UNION ALL SELECT '1009' AS tag, 'value0409 value0410 value0411' AS v0853, 122 AS v0731
+  UNION ALL SELECT '1009t' AS tag, 'value0412 value0413 value0257 value0278' AS v0853, 123 AS v0731
+  UNION ALL SELECT '1045' AS tag, 'value0414 value0415 value0416' AS v0853, 124 AS v0731
+  UNION ALL SELECT '1001p' AS tag, 'value0417 value0264 value0367 value0261' AS v0853, 125 AS v0731
+  UNION ALL SELECT '1001' AS tag, 'value0328 value0247 value0298' AS v0853, 126 AS v0731
+  UNION ALL SELECT '1301' AS tag, 'value0258 value0233 - value0288 value0418' AS v0853, 127 AS v0731
+  UNION ALL SELECT '1306' AS tag, 'value0419-value0420: value0238 value0170' AS v0853, 128 AS v0731
+  UNION ALL SELECT '1415b' AS tag, 'value0382 value0375 - value0421 value0100' AS v0853, 129 AS v0731
+  UNION ALL SELECT '1415p' AS tag, 'value0350 value0422 value0421 value0100' AS v0853, 130 AS v0731
+  UNION ALL SELECT '1415c' AS tag, 'value0350 value0421 value0100' AS v0853, 131 AS v0731
+  UNION ALL SELECT '1415v' AS tag, 'value0423 value0421 value0100 value0424' AS v0853, 132 AS v0731
+  UNION ALL SELECT '1415' AS tag, 'value0270 value0100 - value0421 value0425' AS v0853, 133 AS v0731
+  UNION ALL SELECT '1405' AS tag, 'value0270 value0426 value0427' AS v0853, 134 AS v0731
+  UNION ALL SELECT '1604' AS tag, 'value0253 value0415 value0428' AS v0853, 135 AS v0731
+  UNION ALL SELECT '1607' AS tag, 'value0429 value0430' AS v0853, 136 AS v0731
+  UNION ALL SELECT '10' AS tag, 'value0431 value0432' AS v0853, 137 AS v0731
+  UNION ALL SELECT '3001' AS tag, 'value0433 value0247 - value0434 value0288' AS v0853, 138 AS v0731
+  UNION ALL SELECT '3001b' AS tag, 'value0433 value0247 - value0288 value0289' AS v0853, 139 AS v0731
+  UNION ALL SELECT '3002' AS tag, 'value0433 value0435 - value0436 value0233' AS v0853, 140 AS v0731
+  UNION ALL SELECT '3003' AS tag, 'value0433 value0140 value0100 value0406' AS v0853, 141 AS v0731
+  UNION ALL SELECT '3009' AS tag, 'value0433 value0437' AS v0853, 142 AS v0731
+  UNION ALL SELECT '3009f' AS tag, 'value0433 value0145 value0438' AS v0853, 143 AS v0731
+  UNION ALL SELECT '3009t' AS tag, 'value0433 value0439' AS v0853, 144 AS v0731
+  UNION ALL SELECT '3048' AS tag, 'value0433 value0288 value0252' AS v0853, 145 AS v0731
+  UNION ALL SELECT '3110' AS tag, 'value0440 value0141 value0441 value0433' AS v0853, 146 AS v0731
+  UNION ALL SELECT '3504' AS tag, 'value0433 value0145 value0442 value0051' AS v0853, 147 AS v0731
+  UNION ALL SELECT '3502' AS tag, 'value0035 value0433 value0443' AS v0853, 148 AS v0731
+  UNION ALL SELECT '2053s' AS tag, 'value0444 value0257 value0445 - value0446' AS v0853, 149 AS v0731
+  UNION ALL SELECT '2053value0447' AS tag, 'value0446 value0448 value0257 value0278' AS v0853, 150 AS v0731
+  UNION ALL SELECT '1309' AS tag, 'value0193 value0449 - value0450' AS v0853, 151 AS v0731
+  UNION ALL SELECT '1606' AS tag, 'value0451 value0430' AS v0853, 152 AS v0731
+  UNION ALL SELECT '1304' AS tag, 'value0258 value0233 - value0269' AS v0853, 153 AS v0731
+  UNION ALL SELECT 'value0302-value0452' AS tag, 'value0125 value0453 (value0305)' AS v0853, 154 AS v0731
+  UNION ALL SELECT '1420n' AS tag, 'value0196 value0454 value0209 value0455' AS v0853, 155 AS v0731
+  UNION ALL SELECT '1420s' AS tag, 'value0456 value0454 value0209 value0399' AS v0853, 156 AS v0731
+  UNION ALL SELECT '2102a' AS tag, 'value0253 value0457 value0261' AS v0853, 157 AS v0731
+  UNION ALL SELECT '1060' AS tag, 'value0402 value0458 value0457' AS v0853, 158 AS v0731
+  UNION ALL SELECT '1605' AS tag, 'value0253 value0459 value0457' AS v0853, 159 AS v0731
+  UNION ALL SELECT 'value0460' AS tag, 'value0461 value0462' AS v0853, 160 AS v0731
+  UNION ALL SELECT '1049' AS tag, 'value0463' AS v0853, 161 AS v0731
+  UNION ALL SELECT '1049b' AS tag, 'value0342 value0464 value0265' AS v0853, 162 AS v0731
+  UNION ALL SELECT '1023' AS tag, 'value0249 value0465 value0252' AS v0853, 163 AS v0731
+  UNION ALL SELECT 'value0302-value0466' AS tag, 'value0467 value0306 (value0305)' AS v0853, 164 AS v0731
+  UNION ALL SELECT '1418n' AS tag, 'value0235 value0341 - value0148 value0340' AS v0853, 165 AS v0731
+),
+v0854 AS (
+  SELECT
+    CAST(CURRENT_DATE() AS DATE) AS v0878,
+    CAST(CURRENT_DATE() - INTERVAL '6' DAY AS DATE) AS v0879,
+    CAST(CURRENT_DATE() - INTERVAL '7' DAY AS DATE) AS v0880,
+    CAST(CURRENT_DATE() - INTERVAL '13' DAY AS DATE) AS v0881
+),
+v0860 AS (
+  SELECT
+    LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') AS v0862,
+    CAST(v0000.v0090 AS DATE) AS v0113
+  FROM v0863 v0000
+  CROSS JOIN v0854 v0154
+  WHERE v0000.v0090 >= CAST(v0154.v0881 AS TIMESTAMP)
+    AND v0000.v0090 <  CAST(v0154.v0878 + INTERVAL '1' DAY AS TIMESTAMP)
+    AND NOT (
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 16, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 6003, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 6006, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 6009, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 6018, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 6019, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 6903value0468, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 6903value0469, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, 6905, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, value0470, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, value0471, %' OR
+      LOWER(', ' || COALESCE(v0000.v0861,'') || ', ') LIKE '%, value0472, %'
+    )
+),
+v0864 AS (
+  SELECT v0862, v0113
+  FROM v0860
+  WHERE EXISTS (SELECT 1 FROM v0852 v0865 WHERE v0860.v0862 LIKE '%, ' || v0865.tag || ', %')
+),
+v0866 AS (
+  SELECT
+    SUM(CASE WHEN v0864.v0113 >= v0154.v0879 THEN 1 ELSE 0 END) AS v0867,
+    SUM(CASE WHEN v0864.v0113 <  v0154.v0879 THEN 1 ELSE 0 END) AS v0882
+  FROM v0864
+  CROSS JOIN v0854 v0154
+),
+v0869 AS (
+  SELECT
+    v0865.tag,
+    v0865.v0853,
+    v0865.v0731,
+    SUM(CASE WHEN v0057.v0113 IS NOT NULL AND v0057.v0113 >= v0154.v0879 THEN 1 ELSE 0 END) AS v0870,
+    SUM(CASE WHEN v0057.v0113 IS NOT NULL AND v0057.v0113 <  v0154.v0879 THEN 1 ELSE 0 END) AS v0883
+  FROM v0852 v0865
+  CROSS JOIN v0854 v0154
+  LEFT JOIN v0864 v0057 ON v0057.v0862 LIKE '%, ' || v0865.tag || ', %'
+  GROUP BY v0865.tag, v0865.v0853, v0865.v0731
+)
+SELECT
+  v0872.tag AS tag,
+  v0872.v0853 AS v0853,
+  v0872.v0870 AS v0884,
+  v0872.v0883 AS v0885,
+  100.0 * v0872.v0870 / NULLIF(v0113.v0867, 0) AS v0886,
+  100.0 * v0872.v0883 / NULLIF(v0113.v0882, 0) AS v0887,
+  (100.0 * v0872.v0870 / NULLIF(v0113.v0867, 0)) - (100.0 * v0872.v0883 / NULLIF(v0113.v0882, 0)) AS v0877
+FROM v0869 v0872
+CROSS JOIN v0866 v0113
+WHERE v0872.v0870 > 0
+  AND v0872.tag <> '00value0320'
+  AND ((100.0 * v0872.v0870 / NULLIF(v0113.v0867, 0)) - (100.0 * v0872.v0883 / NULLIF(v0113.v0882, 0))) > 0.5
+ORDER BY (100.0 * v0872.v0870 / NULLIF(v0113.v0867, 0)) - (100.0 * v0872.v0883 / NULLIF(v0113.v0882, 0)) DESC
+
+-- query 172
+WITH v0854 AS (
+  SELECT
+    CAST(CURRENT_DATE AS DATE) AS v0855,
+    CAST(CURRENT_DATE - INTERVAL '7' DAY AS DATE) AS v0856,
+    CAST(CURRENT_DATE - INTERVAL '14' DAY AS DATE) AS v0857,
+    CAST(CURRENT_DATE - INTERVAL '21' DAY AS DATE) AS v0858,
+    CAST(CURRENT_DATE - INTERVAL '28' DAY AS DATE) AS v0859
+), days AS (
+  SELECT DISTINCT
+    CAST(v0000.v0090 AS DATE) AS v0113
+  FROM v0863 AS v0000
+  CROSS JOIN v0854 AS v0154
+  WHERE
+    v0000.v0090 >= CAST(v0154.v0859 AS TIMESTAMP)
+    AND v0000.v0090 < CAST(CAST(v0154.v0855 + INTERVAL '1' DAY AS DATE) AS TIMESTAMP)
+    AND CAST(v0000.v0090 AS DATE) IN (v0154.v0855, v0154.v0856, v0154.v0857, v0154.v0858, v0154.v0859)
+), v0888 AS (
+  SELECT
+    v0113.v0113,
+    v0094.v0177,
+    v0094.v0031,
+    v0094.v0629,
+    ROW_NUMBER() OVER (PARTITION BY v0113.v0113, v0094.v0177 ORDER BY v0094.v0367 DESC) AS v0330
+  FROM days AS v0113
+  JOIN v0369 AS v0094
+    ON v0094.v0367 <= CAST(v0113.v0113 + INTERVAL '1' DAY AS TIMESTAMP)
+    AND v0094.v0367 > CAST(v0113.v0113 - INTERVAL '30' DAY AS TIMESTAMP)
+), v0889 AS (
+  SELECT
+    v0113,
+    v0177,
+    CASE
+      WHEN v0031 = 'value0073'
+      THEN 'value0473'
+      WHEN v0031 = 'value0110'
+      AND v0629 = 'value0192'
+      THEN 'value0206 - value0474 value0204'
+      WHEN v0031 = 'value0110'
+      AND v0629 = 'value0208'
+      THEN 'value0206 - value0209 value0210 value0211'
+      WHEN v0031 = 'value0110'
+      AND v0629 = 'value0212'
+      THEN 'value0206 - value0209 value0475 value0213'
+      WHEN v0031 = 'value0110'
+      THEN 'value0206 - value0476'
+      ELSE NULL
+    END AS bucket
+  FROM v0888
+  WHERE
+    v0330 = 1
+), v0890 AS (
+  SELECT DISTINCT
+    CAST(v0000.v0090 AS DATE) AS v0113,
+    v0075.id AS v0177
+  FROM v0863 AS v0000
+  JOIN v0891 AS v0072
+    ON v0000.v0892 = v0072.id
+  JOIN v0176 AS v0075
+    ON v0072.v0893 = v0075.v0894
+  CROSS JOIN v0854 AS v0154
+  WHERE
+    v0000.v0090 >= CAST(v0154.v0859 AS TIMESTAMP)
+    AND v0000.v0090 < CAST(CAST(v0154.v0855 + INTERVAL '1' DAY AS DATE) AS TIMESTAMP)
+    AND CAST(v0000.v0090 AS DATE) IN (v0154.v0855, v0154.v0856, v0154.v0857, v0154.v0858, v0154.v0859)
+), v0758 AS (
+  SELECT
+    v0895.v0113,
+    v0895.bucket,
+    COUNT(DISTINCT v0895.v0177) AS v0896,
+    COUNT(DISTINCT CASE WHEN NOT v0073.v0177 IS NULL THEN v0895.v0177 END) AS v0897
+  FROM v0889 AS v0895
+  LEFT JOIN v0890 AS v0073
+    ON v0073.v0113 = v0895.v0113 AND v0073.v0177 = v0895.v0177
+  WHERE
+    NOT v0895.bucket IS NULL
+  GROUP BY
+    v0895.v0113,
+    v0895.bucket
+), buckets AS (
+  SELECT
+    'value0473' AS bucket,
+    0 AS v0731
+  UNION ALL
+  SELECT
+    'value0206 - value0476',
+    1
+  UNION ALL
+  SELECT
+    'value0206 - value0474 value0204',
+    2
+  UNION ALL
+  SELECT
+    'value0206 - value0209 value0210 value0211',
+    3
+  UNION ALL
+  SELECT
+    'value0206 - value0209 value0475 value0213',
+    4
+), v0241 AS (
+  SELECT
+    v0593.bucket,
+    v0593.v0731,
+    SUM(CASE WHEN v0032.v0113 = v0154.v0855 THEN v0032.v0897 ELSE 0 END) AS v0870,
+    SUM(CASE WHEN v0032.v0113 IN (v0154.v0856, v0154.v0857, v0154.v0858, v0154.v0859) THEN v0032.v0897 ELSE 0 END) AS v0871,
+    SUM(CASE WHEN v0032.v0113 = v0154.v0855 THEN v0032.v0896 ELSE 0 END) AS v0867,
+    SUM(CASE WHEN v0032.v0113 IN (v0154.v0856, v0154.v0857, v0154.v0858, v0154.v0859) THEN v0032.v0896 ELSE 0 END) AS v0868
+  FROM buckets AS v0593
+  CROSS JOIN v0854 AS v0154
+  LEFT JOIN v0758 AS v0032
+    ON v0032.bucket = v0593.bucket
+  GROUP BY
+    v0593.bucket,
+    v0593.v0731
+)
+SELECT
+  bucket AS v0898,
+  v0870 AS v0899,
+  v0871 AS v0900,
+  v0867 AS v0901,
+  v0868 AS v0902,
+  100.0 * v0870 / NULLIF(v0867, 0) AS v0875,
+  100.0 * v0871 / NULLIF(v0868, 0) AS v0876,
+  (
+    100.0 * v0870 / NULLIF(v0867, 0)
+  ) - (
+    100.0 * v0871 / NULLIF(v0868, 0)
+  ) AS v0877
+FROM v0241
+ORDER BY
+  v0731
+
+-- query 173
+WITH v0854 AS (
+  SELECT
+    CAST(CURRENT_DATE AS DATE) AS v0878,
+    CAST(CURRENT_DATE - INTERVAL '6' DAY AS DATE) AS v0879,
+    CAST(CURRENT_DATE - INTERVAL '7' DAY AS DATE) AS v0880,
+    CAST(CURRENT_DATE - INTERVAL '13' DAY AS DATE) AS v0881
+), days AS (
+  SELECT DISTINCT
+    CAST(v0000.v0090 AS DATE) AS v0113
+  FROM v0863 AS v0000
+  CROSS JOIN v0854 AS v0154
+  WHERE
+    v0000.v0090 >= CAST(v0154.v0881 AS TIMESTAMP)
+    AND v0000.v0090 < CAST(CAST(v0154.v0878 + INTERVAL '1' DAY AS DATE) AS TIMESTAMP)
+), v0888 AS (
+  SELECT
+    v0113.v0113,
+    v0094.v0177,
+    v0094.v0031,
+    v0094.v0629,
+    ROW_NUMBER() OVER (PARTITION BY v0113.v0113, v0094.v0177 ORDER BY v0094.v0367 DESC) AS v0330
+  FROM days AS v0113
+  JOIN v0369 AS v0094
+    ON v0094.v0367 <= CAST(v0113.v0113 + INTERVAL '1' DAY AS TIMESTAMP)
+    AND v0094.v0367 > CAST(v0113.v0113 - INTERVAL '30' DAY AS TIMESTAMP)
+), v0889 AS (
+  SELECT
+    v0113,
+    v0177,
+    CASE
+      WHEN v0031 = 'value0073'
+      THEN 'value0473'
+      WHEN v0031 = 'value0110'
+      AND v0629 = 'value0192'
+      THEN 'value0206 - value0474 value0204'
+      WHEN v0031 = 'value0110'
+      AND v0629 = 'value0208'
+      THEN 'value0206 - value0209 value0210 value0211'
+      WHEN v0031 = 'value0110'
+      AND v0629 = 'value0212'
+      THEN 'value0206 - value0209 value0475 value0213'
+      WHEN v0031 = 'value0110'
+      THEN 'value0206 - value0476'
+      ELSE NULL
+    END AS bucket
+  FROM v0888
+  WHERE
+    v0330 = 1
+), v0890 AS (
+  SELECT DISTINCT
+    CAST(v0000.v0090 AS DATE) AS v0113,
+    v0075.id AS v0177
+  FROM v0863 AS v0000
+  JOIN v0891 AS v0072
+    ON v0000.v0892 = v0072.id
+  JOIN v0176 AS v0075
+    ON v0072.v0893 = v0075.v0894
+  CROSS JOIN v0854 AS v0154
+  WHERE
+    v0000.v0090 >= CAST(v0154.v0881 AS TIMESTAMP)
+    AND v0000.v0090 < CAST(CAST(v0154.v0878 + INTERVAL '1' DAY AS DATE) AS TIMESTAMP)
+), v0758 AS (
+  SELECT
+    v0895.v0113,
+    v0895.bucket,
+    COUNT(DISTINCT v0895.v0177) AS v0896,
+    COUNT(DISTINCT CASE WHEN NOT v0073.v0177 IS NULL THEN v0895.v0177 END) AS v0897
+  FROM v0889 AS v0895
+  LEFT JOIN v0890 AS v0073
+    ON v0073.v0113 = v0895.v0113 AND v0073.v0177 = v0895.v0177
+  WHERE
+    NOT v0895.bucket IS NULL
+  GROUP BY
+    v0895.v0113,
+    v0895.bucket
+), buckets AS (
+  SELECT
+    'value0473' AS bucket,
+    0 AS v0731
+  UNION ALL
+  SELECT
+    'value0206 - value0476',
+    1
+  UNION ALL
+  SELECT
+    'value0206 - value0474 value0204',
+    2
+  UNION ALL
+  SELECT
+    'value0206 - value0209 value0210 value0211',
+    3
+  UNION ALL
+  SELECT
+    'value0206 - value0209 value0475 value0213',
+    4
+), v0241 AS (
+  SELECT
+    v0593.bucket,
+    v0593.v0731,
+    SUM(CASE WHEN v0032.v0113 >= v0154.v0879 THEN v0032.v0897 ELSE 0 END) AS v0870,
+    SUM(CASE WHEN v0032.v0113 < v0154.v0879 THEN v0032.v0897 ELSE 0 END) AS v0883,
+    SUM(CASE WHEN v0032.v0113 >= v0154.v0879 THEN v0032.v0896 ELSE 0 END) AS v0867,
+    SUM(CASE WHEN v0032.v0113 < v0154.v0879 THEN v0032.v0896 ELSE 0 END) AS v0882
+  FROM buckets AS v0593
+  CROSS JOIN v0854 AS v0154
+  LEFT JOIN v0758 AS v0032
+    ON v0032.bucket = v0593.bucket
+  GROUP BY
+    v0593.bucket,
+    v0593.v0731
+)
+SELECT
+  bucket AS v0898,
+  v0870 AS v0903,
+  v0883 AS v0904,
+  v0867 AS v0905,
+  v0882 AS v0906,
+  100.0 * v0870 / NULLIF(v0867, 0) AS v0886,
+  100.0 * v0883 / NULLIF(v0882, 0) AS v0887,
+  (
+    100.0 * v0870 / NULLIF(v0867, 0)
+  ) - (
+    100.0 * v0883 / NULLIF(v0882, 0)
+  ) AS v0877
+FROM v0241
+ORDER BY
+  v0731
+
+-- query 174
+WITH days AS (
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '0' DAY AS DATE) AS v0113
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '1' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '2' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '3' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '4' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '5' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '6' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '7' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '8' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '9' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '10' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '11' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '12' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '13' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '14' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '15' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '16' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '17' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '18' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '19' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '20' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '21' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '22' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '23' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '24' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '25' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '26' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '27' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '28' DAY AS DATE)
+  UNION ALL
+  SELECT
+    CAST(CURRENT_DATE - INTERVAL '29' DAY AS DATE)
+), v0907 AS (
+  SELECT
+    v0000.id AS v0908,
+    CAST(v0000.v0090 AS DATE) AS v0113,
+    v0075.id AS v0177
+  FROM v0863 AS v0000
+  JOIN v0891 AS v0072
+    ON v0000.v0892 = v0072.id
+  JOIN v0176 AS v0075
+    ON v0072.v0893 = v0075.v0894
+  WHERE
+    CAST(v0000.v0090 AS DATE) >= CAST(CURRENT_DATE - INTERVAL '29' DAY AS DATE)
+    AND CAST(v0000.v0090 AS DATE) <= CURRENT_DATE
+), v0909 AS (
+  SELECT
+    v0910.v0908,
+    v0910.v0113,
+    v0094.v0031,
+    v0094.v0629,
+    v0094.v0367
+  FROM v0907 AS v0910
+  JOIN v0369 AS v0094
+    ON v0094.v0177 = v0910.v0177
+    AND CAST(v0094.v0367 AS TIMESTAMP) <= CAST(v0910.v0113 + INTERVAL '1' DAY AS TIMESTAMP)
+    AND CAST(v0094.v0367 AS TIMESTAMP) > CAST(v0910.v0113 - INTERVAL '30' DAY AS TIMESTAMP)
+), v0911 AS (
+  SELECT
+    v0908,
+    MAX(v0367) AS v0912
+  FROM v0909
+  GROUP BY
+    v0908
+), v0913 AS (
+  SELECT
+    v0914.v0908,
+    v0914.v0113,
+    CASE
+      WHEN v0914.v0031 = 'value0073'
+      THEN 'value0473'
+      WHEN v0914.v0031 = 'value0110'
+      AND v0914.v0629 = 'value0192'
+      THEN 'value0206 - value0474 value0204'
+      WHEN v0914.v0031 = 'value0110'
+      AND v0914.v0629 = 'value0208'
+      THEN 'value0206 - value0209 value0210 value0211'
+      WHEN v0914.v0031 = 'value0110'
+      AND v0914.v0629 = 'value0212'
+      THEN 'value0206 - value0209 value0475 value0213'
+      WHEN v0914.v0031 = 'value0110'
+      THEN 'value0206 - value0476'
+      ELSE NULL
+    END AS bucket
+  FROM v0909 AS v0914
+  JOIN v0911 AS v0865
+    ON v0865.v0908 = v0914.v0908 AND v0865.v0912 = v0914.v0367
+), v0915 AS (
+  SELECT
+    CAST(v0094.v0367 AS DATE) AS v0113,
+    CASE
+      WHEN v0094.v0031 = 'value0073'
+      THEN 'value0473'
+      WHEN v0094.v0031 = 'value0110'
+      AND v0094.v0629 = 'value0192'
+      THEN 'value0206 - value0474 value0204'
+      WHEN v0094.v0031 = 'value0110'
+      AND v0094.v0629 = 'value0208'
+      THEN 'value0206 - value0209 value0210 value0211'
+      WHEN v0094.v0031 = 'value0110'
+      AND v0094.v0629 = 'value0212'
+      THEN 'value0206 - value0209 value0475 value0213'
+      WHEN v0094.v0031 = 'value0110'
+      THEN 'value0206 - value0476'
+      ELSE NULL
+    END AS bucket
+  FROM v0369 AS v0094
+  WHERE
+    CAST(v0094.v0367 AS DATE) >= CAST(CURRENT_DATE - INTERVAL '29' DAY AS DATE)
+    AND CAST(v0094.v0367 AS DATE) <= CURRENT_DATE
+), v0916 AS (
+  SELECT
+    v0113,
+    bucket,
+    COUNT(*) AS v0917
+  FROM v0913
+  WHERE
+    NOT bucket IS NULL
+  GROUP BY
+    v0113,
+    bucket
+), v0918 AS (
+  SELECT
+    v0113,
+    bucket,
+    COUNT(*) AS v0919
+  FROM v0915
+  WHERE
+    NOT bucket IS NULL
+  GROUP BY
+    v0113,
+    bucket
+), v0758 AS (
+  SELECT
+    v0113.v0113,
+    v0593.bucket,
+    100.0 * COALESCE(v0920.v0917, 0) / NULLIF(v0921.v0919, 0) AS v0100
+  FROM days AS v0113
+  CROSS JOIN (
+    SELECT
+      'value0473' AS bucket
+    UNION ALL
+    SELECT
+      'value0206 - value0476'
+    UNION ALL
+    SELECT
+      'value0206 - value0474 value0204'
+    UNION ALL
+    SELECT
+      'value0206 - value0209 value0210 value0211'
+    UNION ALL
+    SELECT
+      'value0206 - value0209 value0475 value0213'
+  ) AS v0593
+  LEFT JOIN v0916 AS v0920
+    ON v0920.v0113 = v0113.v0113 AND v0920.bucket = v0593.bucket
+  LEFT JOIN v0918 AS v0921
+    ON v0921.v0113 = v0113.v0113 AND v0921.bucket = v0593.bucket
+)
+SELECT
+  v0113 AS date,
+  MAX(CASE WHEN bucket = 'value0473' THEN v0100 END) AS v0617,
+  MAX(CASE WHEN bucket = 'value0206 - value0476' THEN v0100 END) AS v0922,
+  MAX(CASE WHEN bucket = 'value0206 - value0474 value0204' THEN v0100 END) AS v0923,
+  MAX(CASE WHEN bucket = 'value0206 - value0209 value0210 value0211' THEN v0100 END) AS v0924,
+  MAX(CASE WHEN bucket = 'value0206 - value0209 value0475 value0213' THEN v0100 END) AS v0925
+FROM v0758
+GROUP BY
+  v0113
+ORDER BY
+  v0113 DESC
+
+-- query 175
+WITH v0926 AS (
+  SELECT '100' AS tag
+  UNION ALL SELECT '101'
+  UNION ALL SELECT '101s'
+  UNION ALL SELECT '112'
+  UNION ALL SELECT '113'
+  UNION ALL SELECT '130'
+  UNION ALL SELECT '131'
+  UNION ALL SELECT '132'
+  UNION ALL SELECT '133'
+  UNION ALL SELECT '134'
+  UNION ALL SELECT '202'
+  UNION ALL SELECT '203'
+  UNION ALL SELECT '211'
+  UNION ALL SELECT '303'
+  UNION ALL SELECT '304'
+  UNION ALL SELECT '304d'
+  UNION ALL SELECT '310'
+  UNION ALL SELECT '400'
+  UNION ALL SELECT '401'
+  UNION ALL SELECT '402'
+  UNION ALL SELECT '403'
+  UNION ALL SELECT '404'
+  UNION ALL SELECT '405'
+  UNION ALL SELECT '406'
+  UNION ALL SELECT '407'
+  UNION ALL SELECT '408'
+  UNION ALL SELECT '409'
+  UNION ALL SELECT '410'
+  UNION ALL SELECT '411'
+  UNION ALL SELECT '801'
+  UNION ALL SELECT '900'
+  UNION ALL SELECT '900b'
+  UNION ALL SELECT '901'
+  UNION ALL SELECT '903'
+  UNION ALL SELECT '904'
+  UNION ALL SELECT '6000'
+  UNION ALL SELECT '6002'
+  UNION ALL SELECT '6003'
+  UNION ALL SELECT '6004'
+  UNION ALL SELECT '6005'
+  UNION ALL SELECT '6006'
+  UNION ALL SELECT '6007'
+  UNION ALL SELECT '6016'
+  UNION ALL SELECT '6016r'
+  UNION ALL SELECT '6016value0477'
+  UNION ALL SELECT '6017'
+  UNION ALL SELECT '6018'
+  UNION ALL SELECT '6019'
+  UNION ALL SELECT '6019b'
+  UNION ALL SELECT '6901'
+  UNION ALL SELECT '6902'
+  UNION ALL SELECT '6903value0468'
+  UNION ALL SELECT '6903value0469'
+  UNION ALL SELECT '6904value0468'
+  UNION ALL SELECT '6904value0469'
+  UNION ALL SELECT '6009'
+), v0927 AS (
+  SELECT
+    CAST(v0000.v0090 AS DATE) AS v0113,
+    COUNT(*) AS v0917
+  FROM v0863 AS v0000
+  WHERE
+    v0000.v0090 >= CAST(CURRENT_DATE - INTERVAL '29' DAY AS TIMESTAMP)
+    AND v0000.v0090 < CAST(CURRENT_DATE + INTERVAL '1' DAY AS TIMESTAMP)
+    AND (
+      v0000.v0861 IS NULL
+      OR v0000.v0861 = ''
+      OR (
+        SELECT COUNT(*) FROM v0926 AS v0928
+        WHERE LOWER(', ' || v0000.v0861 || ', ') LIKE '%, ' || v0928.tag || ', %'
+      ) < ((LENGTH(v0000.v0861) - LENGTH(REPLACE(v0000.v0861, ',', ''))) + 1)
+    )
+  GROUP BY
+    CAST(v0000.v0090 AS DATE)
+), v0929 AS (
+  SELECT
+    CAST(v0094.v0367 AS DATE) AS v0113,
+    COUNT(*) AS v0919,
+    COUNT(DISTINCT v0094.v0177) AS v0930
+  FROM v0215 AS v0094
+  WHERE
+    CAST(v0094.v0367 AS DATE) >= CAST(CURRENT_DATE - INTERVAL '29' DAY AS DATE)
+    AND CAST(v0094.v0367 AS DATE) <= CURRENT_DATE
+  GROUP BY
+    CAST(v0094.v0367 AS DATE)
+)
+SELECT
+  CAST(COALESCE(v0000.v0113, v0094.v0113) AS TEXT) AS date,
+  COALESCE(v0000.v0917, 0) AS v0931,
+  COALESCE(v0094.v0919, 0) AS v0932,
+  COALESCE(v0094.v0930, 0) AS v0933,
+  1.0 * COALESCE(v0000.v0917, 0) / NULLIF(v0094.v0919, 0) AS v0934,
+  1.0 * COALESCE(v0000.v0917, 0) / NULLIF(v0094.v0930, 0) AS v0935
+FROM v0927 AS v0000
+FULL OUTER JOIN v0929 AS v0094
+  ON v0000.v0113 = v0094.v0113
+ORDER BY
+  date ASC
+
+-- query 176
+WITH v0926 AS (
+  SELECT '100' AS tag
+  UNION ALL SELECT '101'
+  UNION ALL SELECT '101s'
+  UNION ALL SELECT '112'
+  UNION ALL SELECT '113'
+  UNION ALL SELECT '130'
+  UNION ALL SELECT '131'
+  UNION ALL SELECT '132'
+  UNION ALL SELECT '133'
+  UNION ALL SELECT '134'
+  UNION ALL SELECT '202'
+  UNION ALL SELECT '203'
+  UNION ALL SELECT '211'
+  UNION ALL SELECT '303'
+  UNION ALL SELECT '304'
+  UNION ALL SELECT '304d'
+  UNION ALL SELECT '310'
+  UNION ALL SELECT '400'
+  UNION ALL SELECT '401'
+  UNION ALL SELECT '402'
+  UNION ALL SELECT '403'
+  UNION ALL SELECT '404'
+  UNION ALL SELECT '405'
+  UNION ALL SELECT '406'
+  UNION ALL SELECT '407'
+  UNION ALL SELECT '408'
+  UNION ALL SELECT '409'
+  UNION ALL SELECT '410'
+  UNION ALL SELECT '411'
+  UNION ALL SELECT '801'
+  UNION ALL SELECT '900'
+  UNION ALL SELECT '900b'
+  UNION ALL SELECT '901'
+  UNION ALL SELECT '903'
+  UNION ALL SELECT '904'
+  UNION ALL SELECT '6000'
+  UNION ALL SELECT '6002'
+  UNION ALL SELECT '6003'
+  UNION ALL SELECT '6004'
+  UNION ALL SELECT '6005'
+  UNION ALL SELECT '6006'
+  UNION ALL SELECT '6007'
+  UNION ALL SELECT '6016'
+  UNION ALL SELECT '6016r'
+  UNION ALL SELECT '6016value0477'
+  UNION ALL SELECT '6017'
+  UNION ALL SELECT '6018'
+  UNION ALL SELECT '6019'
+  UNION ALL SELECT '6019b'
+  UNION ALL SELECT '6901'
+  UNION ALL SELECT '6902'
+  UNION ALL SELECT '6903value0468'
+  UNION ALL SELECT '6903value0469'
+  UNION ALL SELECT '6904value0468'
+  UNION ALL SELECT '6904value0469'
+  UNION ALL SELECT '6009'
+), v0936 AS (
+  SELECT
+    CAST(date_trunc('week', v0000.v0090) AS DATE) AS v0074,
+    COUNT(*) AS v0917
+  FROM v0863 AS v0000
+  WHERE
+    v0000.v0090 >= CAST(CURRENT_DATE - INTERVAL '364' DAY AS TIMESTAMP)
+    AND v0000.v0090 < CAST(CURRENT_DATE + INTERVAL '1' DAY AS TIMESTAMP)
+    AND (
+      v0000.v0861 IS NULL
+      OR v0000.v0861 = ''
+      OR (
+        SELECT COUNT(*) FROM v0926 AS v0928
+        WHERE LOWER(', ' || v0000.v0861 || ', ') LIKE '%, ' || v0928.tag || ', %'
+      ) < ((LENGTH(v0000.v0861) - LENGTH(REPLACE(v0000.v0861, ',', ''))) + 1)
+    )
+  GROUP BY
+    1
+), v0937 AS (
+  SELECT
+    CAST(date_trunc('week', v0094.v0367) AS DATE) AS v0074,
+    COUNT(*) AS v0919,
+    COUNT(DISTINCT v0094.v0177) AS v0938
+  FROM v0215 AS v0094
+  WHERE
+    CAST(v0094.v0367 AS DATE) >= CAST(CURRENT_DATE - INTERVAL '364' DAY AS DATE)
+    AND CAST(v0094.v0367 AS DATE) <= CURRENT_DATE
+  GROUP BY
+    1
+)
+SELECT
+  CAST(COALESCE(v0000.v0074, v0094.v0074) AS TEXT) AS week,
+  COALESCE(v0000.v0917, 0) AS v0931,
+  COALESCE(v0094.v0919, 0) AS v0932,
+  COALESCE(v0094.v0938, 0) AS v0938,
+  1.0 * COALESCE(v0000.v0917, 0) / NULLIF(v0094.v0919, 0) AS v0934,
+  1.0 * COALESCE(v0000.v0917, 0) / NULLIF(v0094.v0938, 0) AS v0939
+FROM v0936 AS v0000
+FULL OUTER JOIN v0937 AS v0094
+  ON v0000.v0074 = v0094.v0074
+ORDER BY
+  week ASC
+
+-- query 177
+SELECT
+  concat(
+    lpad(CAST(date_part('month', DATE_TRUNC('WEEK', v0040.Timestamp)) AS VARCHAR), 2, '0'),
+    '-',
+    lpad(CAST(date_part('day', DATE_TRUNC('WEEK', v0040.Timestamp)) AS VARCHAR), 2, '0'),
+    '-',
+    CAST(date_part('year', DATE_TRUNC('WEEK', v0040.Timestamp)) AS VARCHAR)
+  ) AS week,
+  SUM(
+    CASE
+      WHEN v0040.Account = 'value0068' AND v0940.v0046 = 'value0478'
+      THEN v0040.v0307
+    END
+  ) / 100.0 AS v0941,
+  SUM(
+    CASE
+      WHEN v0040.Account = 'value0068'
+      AND v0940.v0046 IN ('value0479', 'value0480')
+      THEN v0040.v0308
+    END
+  ) / 100.0 AS v0942,
+  SUM(
+    CASE
+      WHEN v0040.Account = 'value0218' AND v0940.v0046 = 'value0481'
+      THEN v0040.v0307
+    END
+  ) / 100.0 AS v0943,
+  SUM(
+    CASE
+      WHEN v0040.Account = 'value0218'
+      AND v0940.v0046 IN ('value0479', 'value0480', 'value0482')
+      THEN v0040.v0308
+    END
+  ) / 100.0 AS v0944,
+  SUM(
+    CASE
+      WHEN v0040.Account = 'value0223' AND v0940.v0046 = 'value0483'
+      THEN v0040.v0307
+    END
+  ) / 100.0 AS v0945,
+  COUNT(
+    CASE
+      WHEN v0040.Account = 'value0484'
+      AND v0940.v0046 IN ('value0485', 'value0486')
+      THEN 1
+    END
+  ) AS v0946
+FROM v0310 AS v0040
+JOIN v0947 AS v0940
+  ON v0040.v0200 = v0940.v0200
+WHERE
+  v0040.Account IN ('value0068', 'value0218', 'value0223', 'value0484')
+GROUP BY
+  1,
+  DATE_TRUNC('WEEK', v0040.Timestamp)
+ORDER BY
+  DATE_TRUNC('WEEK', v0040.Timestamp) DESC
+
+-- query 178
+WITH v0948 AS (
+  SELECT
+    DATE_TRUNC('MONTH', v0040.Timestamp) AS v0267,
+    (SUM(v0040.v0307) - SUM(v0040.v0308)) / 100.0 AS v0948
+  FROM v0310 AS v0040
+  WHERE v0040.Account = 'value0068'
+    AND v0040.v0311 = 'value0084'
+    AND v0040.v0047 IS NULL
+    AND v0040.Timestamp >= CAST('2024-11-01' AS TIMESTAMP)
+  GROUP BY 1
+),
+v0949 AS (
+  SELECT
+    v0040.v0306 AS v0171,
+    SUM(v0040.v0307) - SUM(v0040.v0308) AS v0950
+  FROM v0310 AS v0040
+  WHERE v0040.Account = 'value0068'
+    AND v0040.v0311 = 'value0084'
+    AND v0040.v0047 IS NULL
+    AND v0040.v0306 IS NOT NULL
+  GROUP BY v0040.v0306
+),
+v0951 AS (
+  SELECT
+    DATE_TRUNC(
+      'MONTH',
+      CAST(v0057.v0172 AS TIMESTAMP) + INTERVAL '90 days'
+    ) AS v0267,
+    SUM(
+      CASE
+        WHEN v0952.v0950 > 0 THEN v0952.v0950
+        ELSE 0
+      END
+    ) / 100.0 AS v0951
+  FROM v0246 AS v0057
+  JOIN v0174 AS v0155
+    ON v0155.id = v0057.v0175
+  JOIN v0176 AS v0075
+    ON v0075.id = v0155.v0177
+  JOIN v0949 AS v0952
+    ON v0952.v0171 = v0075.v0058
+  WHERE v0057.v0060 IS NULL
+    AND v0057.v0031 NOT IN ('value0077', 'value0487')
+    AND v0057.v0172 IS NOT NULL
+    AND CAST(v0057.v0172 AS TIMESTAMP) + INTERVAL '90 days' < CAST('2026-08-25' AS TIMESTAMP)
+    AND CAST(v0057.v0172 AS TIMESTAMP) + INTERVAL '90 days' >= CAST('2024-11-01' AS TIMESTAMP)
+  GROUP BY 1
+)
+SELECT
+  CONCAT(
+    CAST(DATE_PART('year', v0561.v0267) AS TEXT),
+    '-',
+    LPAD(CAST(DATE_PART('month', v0561.v0267) AS TEXT), 2, '0')
+  ) AS month,
+  v0561.v0948,
+  COALESCE(v0075.v0951, 0) AS v0951
+FROM v0948 AS v0561
+LEFT JOIN v0951 AS v0075
+  ON v0075.v0267 = v0561.v0267
+ORDER BY v0561.v0267 DESC
+
+-- query 179
+WITH v0953 AS (
+  SELECT
+    v0894,
+    MAX(version) AS v0954
+  FROM v0176
+  GROUP BY
+    v0894
+), v0955 AS (
+  SELECT
+    v0075.id,
+    v0075.v0894
+  FROM v0176 AS v0075
+  JOIN v0953 AS v0956
+    ON v0075.v0894 = v0956.v0894 AND v0075.version = v0956.v0954
+), v0957 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0174
+  GROUP BY
+    v0058
+), v0958 AS (
+  SELECT
+    v0155.id,
+    v0155.v0177
+  FROM v0174 AS v0155
+  JOIN v0957 AS v0959
+    ON v0155.v0058 = v0959.v0058 AND v0155.version = v0959.v0954
+), v0960 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0246
+  GROUP BY
+    v0058
+), v0961 AS (
+  SELECT
+    v0057.v0175,
+    v0057.v0058,
+    v0057.v0172,
+    v0057.v0084
+  FROM v0246 AS v0057
+  JOIN v0960 AS v0962
+    ON v0057.v0058 = v0962.v0058 AND v0057.version = v0962.v0954
+), v0963 AS (
+  SELECT
+    v0032.v0058 AS v0121,
+    v0864.v0084 AS v0964,
+    CAST(v0032.v0025 AS DATE) - v0864.v0172 AS v0965
+  FROM v0426 AS v0032
+  JOIN v0955 AS v0075
+    ON v0032.v0171 = v0075.v0894
+  JOIN v0958 AS v0155
+    ON v0075.id = v0155.v0177
+  JOIN v0961 AS v0864
+    ON v0155.id = v0864.v0175
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2026-06-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0864.v0084 <= v0032.v0025
+    AND v0864.v0172 >= CAST(v0032.v0025 AS DATE) - INTERVAL '120' DAYS
+), v0966 AS (
+  SELECT
+    v0121,
+    MAX(v0964) AS v0967
+  FROM v0963
+  GROUP BY
+    v0121
+), v0968 AS (
+  SELECT
+    v0096.v0121,
+    MIN(v0096.v0965) AS v0965
+  FROM v0963 AS v0096
+  JOIN v0966 AS v0284
+    ON v0096.v0121 = v0284.v0121 AND v0096.v0964 = v0284.v0967
+  GROUP BY
+    v0096.v0121
+), v0969 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0032.type,
+    v0032.v0738,
+    v0032.v0970,
+    v0032.metadata
+  FROM v0426 AS v0032
+  LEFT JOIN v0968 AS v0634
+    ON v0032.v0058 = v0634.v0121
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2026-06-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0032.v0738 IN ('value0087', 'value0156')
+    AND (
+      v0634.v0965 IS NULL OR v0634.v0965 < 14
+    )
+), v0971 AS (
+  SELECT
+    SUBSTR(json_as_text(data, 'value0090'), 9) AS v0121,
+    json_as_text(data, 'value0033') AS status,
+    ROW_NUMBER() OVER (PARTITION BY SUBSTR(json_as_text(data, 'value0090'), 9) ORDER BY v0090 DESC) AS v0330
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_as_text(data, 'value0090') LIKE 'value0052.%'
+), v0093 AS (
+  SELECT v0121, status
+  FROM v0971
+  WHERE v0330 = 1
+), v0707 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    CASE
+      WHEN JSON_GET_STR(v0032.metadata, 'value0042') = 'value0043'
+      THEN 'value0226'
+      WHEN JSON_GET_STR(v0032.metadata, 'value0042') = 'value0044'
+      THEN 'value0227'
+    END AS v0737,
+    CASE
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0488 value0489%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0491'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0495'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0318.v0972)) IN ('value0499', 'value0500')
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0503'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0507'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0509'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE '%value0511 value0512%'
+        OR UPPER(TRIM(v0318.v0972)) LIKE '%value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0515%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      ELSE COALESCE(NULLIF(TRIM(v0318.v0972), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0098.status = 'value0041' THEN 1 ELSE 0 END AS v0974,
+    CASE WHEN v0098.status = 'value0041' THEN v0032.v0026 ELSE NULL END AS v0975
+  FROM v0969 AS v0032
+  LEFT JOIN v0317 AS v0318
+    ON v0318.v0058 = REGEXP_REPLACE(v0032.v0970, '^value0523-', '')
+    AND v0318.v0030 = 1
+  LEFT JOIN v0093 AS v0098
+    ON v0098.v0121 = v0032.v0058
+  WHERE
+    v0032.type = 'value0016'
+    AND (
+      JSON_GET_STR(v0032.metadata, 'value0042') = 'value0043'
+      OR JSON_GET_STR(v0032.metadata, 'value0042') = 'value0044'
+    )
+), v0976 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0977.v0978 AS v0979,
+    ROW_NUMBER() OVER (PARTITION BY v0032.v0058 ORDER BY v0977.v0980) AS v0330
+  FROM v0969 AS v0032
+  JOIN v0981 AS v0982
+    ON v0982.v0058 = v0032.v0970 AND v0982.v0030 = 1
+  JOIN v0983 AS v0977
+    ON v0977.v0980 = v0982.v0980
+  WHERE
+    v0032.v0738 = 'value0087'
+), v0984 AS (
+  SELECT
+    v0058,
+    v0031,
+    v0026,
+    v0033,
+    'value0524' AS v0737,
+    CASE
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0525 value0526%'
+      THEN 'value0527'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0489 value0528 value0529%'
+      THEN 'value0270 value0530 value0531'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0532 value0533%'
+      THEN 'value0534 value0535'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0536 value0537%'
+      THEN 'value0538 value0520 value0539 value0540'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0509 value0489%'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0488 value0541%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0542%'
+      THEN 'value0543 value0544'
+      WHEN UPPER(TRIM(v0979)) LIKE 'U.S. value0489%'
+      THEN 'U.S. value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0545%'
+      THEN 'value0546'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0547 value0489%'
+      THEN 'value0548 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0549%'
+      THEN 'value0550 value0551 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0552 value0489%'
+      THEN 'value0553 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'M&T value0489%'
+      THEN 'M&T value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0554 value0555 value0556%'
+      THEN 'value0557 value0539 value0540 (value0558)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0559 value0560%'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0979)) LIKE '%value0561 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0562 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0563 value0489%'
+      THEN 'value0564 value0409 (value0565)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0566 value0567 value0489%'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0568 value0569%'
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0570%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0507 value0489%'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0571 value0489%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0572 value0499%'
+      THEN 'value0573 value0501'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0574 value0489%'
+      THEN 'value0574 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0575 value0576%'
+      THEN 'value0577 value0578 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0579 value0489%'
+      THEN 'value0580 value0270 & value0581'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0582 value0583%'
+      THEN 'value0584 value0585 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0586 value0489%'
+      THEN 'value0587 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0588%'
+      THEN 'value0589'
+      ELSE COALESCE(NULLIF(TRIM(v0979), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0031 = 'value0017' THEN 1 ELSE 0 END AS v0974,
+    CASE WHEN v0031 = 'value0017' THEN v0033 ELSE NULL END AS v0975
+  FROM v0976
+  WHERE
+    v0330 = 1
+), v0097 AS (
+  SELECT
+    v0973,
+    v0737,
+    v0974,
+    v0026,
+    v0975
+  FROM v0707
+  UNION ALL
+  SELECT
+    v0973,
+    v0737,
+    v0974,
+    v0026,
+    v0975
+  FROM v0984
+), v0985 AS (
+  SELECT
+    v0973,
+    COUNT(*) AS v0986,
+    SUM(v0026) AS v0987,
+    SUM(v0974) AS v0988,
+    SUM(v0975) AS v0975,
+    COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END) AS v0989,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0974 END) AS v0990,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0026 END) AS v0991,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0975 END) AS v0992,
+    COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END) AS v0993,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0974 END) AS v0994,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0026 END) AS v0995,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0975 END) AS v0996,
+    COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END) AS v0997,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0974 END) AS v0998,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0026 END) AS v0999,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0975 END) AS v1000
+  FROM v0097
+  GROUP BY
+    v0973
+)
+SELECT
+  v0973,
+  v0986,
+  v0987,
+  v0988,
+  v0975,
+  CAST(v0988 AS DOUBLE) / NULLIF(v0986, 0) AS v1001,
+  v0989,
+  CAST(v0990 AS DOUBLE) / NULLIF(v0989, 0) AS v1002,
+  v0991,
+  v0992,
+  v0993,
+  CAST(v0994 AS DOUBLE) / NULLIF(v0993, 0) AS v1003,
+  v0995,
+  v0996,
+  v0997,
+  CAST(v0998 AS DOUBLE) / NULLIF(v0997, 0) AS v1004,
+  v0999,
+  v1000
+FROM v0985
+ORDER BY
+  v0986 DESC
+LIMIT 20
+
+-- query 180
+WITH v0953 AS (
+  SELECT
+    v0894,
+    MAX(version) AS v0954
+  FROM v0176
+  GROUP BY
+    v0894
+), v0955 AS (
+  SELECT
+    v0075.id,
+    v0075.v0894
+  FROM v0176 AS v0075
+  JOIN v0953 AS v0956
+    ON v0075.v0894 = v0956.v0894 AND v0075.version = v0956.v0954
+), v0957 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0174
+  GROUP BY
+    v0058
+), v0958 AS (
+  SELECT
+    v0155.id,
+    v0155.v0177
+  FROM v0174 AS v0155
+  JOIN v0957 AS v0959
+    ON v0155.v0058 = v0959.v0058 AND v0155.version = v0959.v0954
+), v0960 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0246
+  GROUP BY
+    v0058
+), v0961 AS (
+  SELECT
+    v0057.v0175,
+    v0057.v0058,
+    v0057.v0172,
+    v0057.v0084
+  FROM v0246 AS v0057
+  JOIN v0960 AS v0962
+    ON v0057.v0058 = v0962.v0058 AND v0057.version = v0962.v0954
+), v0963 AS (
+  SELECT
+    v0032.v0058 AS v0121,
+    v0864.v0084 AS v0964,
+    CAST(v0032.v0025 AS DATE) - v0864.v0172 AS v0965
+  FROM v0426 AS v0032
+  JOIN v0955 AS v0075
+    ON v0032.v0171 = v0075.v0894
+  JOIN v0958 AS v0155
+    ON v0075.id = v0155.v0177
+  JOIN v0961 AS v0864
+    ON v0155.id = v0864.v0175
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2026-06-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0864.v0084 <= v0032.v0025
+    AND v0864.v0172 >= CAST(v0032.v0025 AS DATE) - INTERVAL '120' DAYS
+), v0966 AS (
+  SELECT
+    v0121,
+    MAX(v0964) AS v0967
+  FROM v0963
+  GROUP BY
+    v0121
+), v0968 AS (
+  SELECT
+    v0096.v0121,
+    MIN(v0096.v0965) AS v0965
+  FROM v0963 AS v0096
+  JOIN v0966 AS v0284
+    ON v0096.v0121 = v0284.v0121 AND v0096.v0964 = v0284.v0967
+  GROUP BY
+    v0096.v0121
+), v0969 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0032.v0025,
+    v0032.type,
+    v0032.v0738,
+    v0032.v0970,
+    v0032.metadata
+  FROM v0426 AS v0032
+  LEFT JOIN v0968 AS v0634
+    ON v0032.v0058 = v0634.v0121
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2026-06-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0032.v0738 IN ('value0087', 'value0156')
+    AND (
+      v0634.v0965 IS NULL OR v0634.v0965 < 14
+    )
+), v0971 AS (
+  SELECT
+    SUBSTR(json_as_text(data, 'value0090'), 9) AS v0121,
+    json_as_text(data, 'value0033') AS status,
+    ROW_NUMBER() OVER (PARTITION BY SUBSTR(json_as_text(data, 'value0090'), 9) ORDER BY v0090 DESC) AS v0330
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_as_text(data, 'value0090') LIKE 'value0052.%'
+), v0093 AS (
+  SELECT v0121, status
+  FROM v0971
+  WHERE v0330 = 1
+), v0707 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    CASE
+      WHEN JSON_GET_STR(v0032.metadata, 'value0042') = 'value0043'
+      THEN 'value0226'
+      WHEN JSON_GET_STR(v0032.metadata, 'value0042') = 'value0044'
+      THEN 'value0227'
+    END AS v0737,
+    CASE
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0488 value0489%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0491'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0495'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0318.v0972)) IN ('value0499', 'value0500')
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0503'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0507'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0509'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE '%value0511 value0512%'
+        OR UPPER(TRIM(v0318.v0972)) LIKE '%value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0515%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      ELSE COALESCE(NULLIF(TRIM(v0318.v0972), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0098.status = 'value0041' THEN 1 ELSE 0 END AS v0974,
+    CASE WHEN v0098.status = 'value0041' THEN v0032.v0026 ELSE NULL END AS v0975
+  FROM v0969 AS v0032
+  LEFT JOIN v0317 AS v0318
+    ON v0318.v0058 = REGEXP_REPLACE(v0032.v0970, '^value0523-', '')
+    AND v0318.v0030 = 1
+  LEFT JOIN v0093 AS v0098
+    ON v0098.v0121 = v0032.v0058
+  WHERE
+    v0032.type = 'value0016'
+    AND (
+      JSON_GET_STR(v0032.metadata, 'value0042') = 'value0043'
+      OR JSON_GET_STR(v0032.metadata, 'value0042') = 'value0044'
+    )
+), v0976 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0032.v0025,
+    v0982.v0980,
+    v0977.v0978 AS v0979,
+    ROW_NUMBER() OVER (PARTITION BY v0032.v0058 ORDER BY v0977.v0980) AS v0330
+  FROM v0969 AS v0032
+  JOIN v0981 AS v0982
+    ON v0982.v0058 = v0032.v0970 AND v0982.v0030 = 1
+  JOIN v0983 AS v0977
+    ON v0977.v0980 = v0982.v0980
+  WHERE
+    v0032.v0738 = 'value0087'
+), v1005 AS (
+  SELECT
+    v0058,
+    v0980,
+    CAST(v0025 AS DATE) AS v1006,
+    v0031,
+    v0026,
+    v0033,
+    CASE
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0525 value0526%'
+      THEN 'value0527'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0489 value0528 value0529%'
+      THEN 'value0270 value0530 value0531'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0532 value0533%'
+      THEN 'value0534 value0535'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0536 value0537%'
+      THEN 'value0538 value0520 value0539 value0540'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0509 value0489%'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0488 value0541%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0542%'
+      THEN 'value0543 value0544'
+      WHEN UPPER(TRIM(v0979)) LIKE 'U.S. value0489%'
+      THEN 'U.S. value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0545%'
+      THEN 'value0546'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0547 value0489%'
+      THEN 'value0548 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0549%'
+      THEN 'value0550 value0551 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0552 value0489%'
+      THEN 'value0553 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'M&T value0489%'
+      THEN 'M&T value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0554 value0555 value0556%'
+      THEN 'value0557 value0539 value0540 (value0558)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0559 value0560%'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0979)) LIKE '%value0561 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0562 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0563 value0489%'
+      THEN 'value0564 value0409 (value0565)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0566 value0567 value0489%'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0568 value0569%'
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0570%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0507 value0489%'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0571 value0489%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0572 value0499%'
+      THEN 'value0573 value0501'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0574 value0489%'
+      THEN 'value0574 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0575 value0576%'
+      THEN 'value0577 value0578 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0579 value0489%'
+      THEN 'value0580 value0270 & value0581'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0582 value0583%'
+      THEN 'value0584 value0585 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0586 value0489%'
+      THEN 'value0587 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0588%'
+      THEN 'value0589'
+      ELSE COALESCE(NULLIF(TRIM(v0979), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0031 = 'value0017' THEN 1 ELSE 0 END AS v0974
+  FROM v0976
+  WHERE
+    v0330 = 1
+), v1007 AS (
+  SELECT
+    v0973,
+    'value0524' AS v0737,
+    MAX(v0974) AS v0974,
+    MAX(v0026) AS v0026,
+    CASE WHEN MAX(v0974) = 1 THEN SUM(CASE WHEN v0974 = 1 THEN v0033 END) ELSE NULL END AS v0975
+  FROM v1005
+  GROUP BY
+    v0980, v1006, v0973
+), v0097 AS (
+  SELECT
+    v0973,
+    v0737,
+    v0974,
+    v0026,
+    v0975
+  FROM v0707
+  UNION ALL
+  SELECT
+    v0973,
+    v0737,
+    v0974,
+    v0026,
+    v0975
+  FROM v1007
+), v0985 AS (
+  SELECT
+    v0973,
+    COUNT(*) AS v0986,
+    SUM(v0026) AS v0987,
+    SUM(v0974) AS v0988,
+    SUM(v0975) AS v0975,
+    COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END) AS v0989,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0974 END) AS v0990,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0026 END) AS v0991,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0975 END) AS v0992,
+    COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END) AS v0993,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0974 END) AS v0994,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0026 END) AS v0995,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0975 END) AS v0996,
+    COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END) AS v0997,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0974 END) AS v0998,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0026 END) AS v0999,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0975 END) AS v1000
+  FROM v0097
+  GROUP BY
+    v0973
+)
+SELECT
+  v0973,
+  v0986,
+  v0987,
+  v0988,
+  v0975,
+  CAST(v0988 AS DOUBLE) / NULLIF(v0986, 0) AS v1001,
+  v0989,
+  CAST(v0990 AS DOUBLE) / NULLIF(v0989, 0) AS v1002,
+  v0991,
+  v0992,
+  v0993,
+  CAST(v0994 AS DOUBLE) / NULLIF(v0993, 0) AS v1003,
+  v0995,
+  v0996,
+  v0997,
+  CAST(v0998 AS DOUBLE) / NULLIF(v0997, 0) AS v1004,
+  v0999,
+  v1000
+FROM v0985
+ORDER BY
+  v0986 DESC
+LIMIT 20
+
+-- query 181
+WITH v0953 AS (
+  SELECT
+    v0894,
+    MAX(version) AS v0954
+  FROM v0176
+  GROUP BY
+    v0894
+), v0955 AS (
+  SELECT
+    v0075.id,
+    v0075.v0894
+  FROM v0176 AS v0075
+  JOIN v0953 AS v0956
+    ON v0075.v0894 = v0956.v0894 AND v0075.version = v0956.v0954
+), v0957 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0174
+  GROUP BY
+    v0058
+), v0958 AS (
+  SELECT
+    v0155.id,
+    v0155.v0177
+  FROM v0174 AS v0155
+  JOIN v0957 AS v0959
+    ON v0155.v0058 = v0959.v0058 AND v0155.version = v0959.v0954
+), v0960 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0246
+  GROUP BY
+    v0058
+), v0961 AS (
+  SELECT
+    v0057.v0175,
+    v0057.v0058,
+    v0057.v0172,
+    v0057.v0084
+  FROM v0246 AS v0057
+  JOIN v0960 AS v0962
+    ON v0057.v0058 = v0962.v0058 AND v0057.version = v0962.v0954
+), v0963 AS (
+  SELECT
+    v0032.v0058 AS v0121,
+    v0864.v0084 AS v0964,
+    CAST(v0032.v0025 AS DATE) - v0864.v0172 AS v0965
+  FROM v0426 AS v0032
+  JOIN v0955 AS v0075
+    ON v0032.v0171 = v0075.v0894
+  JOIN v0958 AS v0155
+    ON v0075.id = v0155.v0177
+  JOIN v0961 AS v0864
+    ON v0155.id = v0864.v0175
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2026-06-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0864.v0084 <= v0032.v0025
+    AND v0864.v0172 >= CAST(v0032.v0025 AS DATE) - INTERVAL '120' DAYS
+), v0966 AS (
+  SELECT
+    v0121,
+    MAX(v0964) AS v0967
+  FROM v0963
+  GROUP BY
+    v0121
+), v0968 AS (
+  SELECT
+    v0096.v0121,
+    MIN(v0096.v0965) AS v0965
+  FROM v0963 AS v0096
+  JOIN v0966 AS v0284
+    ON v0096.v0121 = v0284.v0121 AND v0096.v0964 = v0284.v0967
+  GROUP BY
+    v0096.v0121
+), v0969 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0032.v0025,
+    v0032.v0738,
+    v0032.v0970
+  FROM v0426 AS v0032
+  LEFT JOIN v0968 AS v0634
+    ON v0032.v0058 = v0634.v0121
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2026-06-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0032.v0738 = 'value0087'
+    AND (
+      v0634.v0965 IS NULL OR v0634.v0965 < 14
+    )
+), v0976 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0032.v0025,
+    v0982.v0980,
+    v0977.v0978 AS v0979,
+    ROW_NUMBER() OVER (PARTITION BY v0032.v0058 ORDER BY v0977.v0980) AS v0330
+  FROM v0969 AS v0032
+  JOIN v0981 AS v0982
+    ON v0982.v0058 = v0032.v0970 AND v0982.v0030 = 1
+  JOIN v0983 AS v0977
+    ON v0977.v0980 = v0982.v0980
+), v1008 AS (
+  SELECT
+    v0980,
+    CAST(v0025 AS DATE) AS v1006,
+    CASE
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0525 value0526%'
+      THEN 'value0527'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0489 value0528 value0529%'
+      THEN 'value0270 value0530 value0531'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0532 value0533%'
+      THEN 'value0534 value0535'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0536 value0537%'
+      THEN 'value0538 value0520 value0539 value0540'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0509 value0489%'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0488 value0541%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0542%'
+      THEN 'value0543 value0544'
+      WHEN UPPER(TRIM(v0979)) LIKE 'U.S. value0489%'
+      THEN 'U.S. value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0545%'
+      THEN 'value0546'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0547 value0489%'
+      THEN 'value0548 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0549%'
+      THEN 'value0550 value0551 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0552 value0489%'
+      THEN 'value0553 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'M&T value0489%'
+      THEN 'M&T value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0554 value0555 value0556%'
+      THEN 'value0557 value0539 value0540 (value0558)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0559 value0560%'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0979)) LIKE '%value0561 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0562 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0563 value0489%'
+      THEN 'value0564 value0409 (value0565)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0566 value0567 value0489%'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0568 value0569%'
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0570%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0507 value0489%'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0571 value0489%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0572 value0499%'
+      THEN 'value0573 value0501'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0574 value0489%'
+      THEN 'value0574 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0575 value0576%'
+      THEN 'value0577 value0578 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0579 value0489%'
+      THEN 'value0580 value0270 & value0581'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0582 value0583%'
+      THEN 'value0584 value0585 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0586 value0489%'
+      THEN 'value0587 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0588%'
+      THEN 'value0589'
+      ELSE COALESCE(NULLIF(TRIM(v0979), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0031 = 'value0017' THEN 1 ELSE 0 END AS v0974
+  FROM v0976
+  WHERE v0330 = 1
+), v1009 AS (
+  SELECT
+    v0973,
+    COUNT(*) AS v1010,
+    CAST(SUM(v0974) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1011
+  FROM v1008
+  GROUP BY v0973
+), v1012 AS (
+  SELECT
+    v0973,
+    v0980,
+    v1006,
+    MAX(v0974) AS v0974
+  FROM v1008
+  GROUP BY v0973, v0980, v1006
+), v1013 AS (
+  SELECT
+    v0973,
+    COUNT(*) AS v1014,
+    CAST(SUM(v0974) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1015
+  FROM v1012
+  GROUP BY v0973
+)
+SELECT
+  v0057.v0973,
+  v0057.v1010,
+  v0057.v1011,
+  v0094.v1014,
+  v0094.v1015,
+  (v0057.v1010 - v0094.v1014) AS v1016,
+  CAST(v0057.v1010 - v0094.v1014 AS DOUBLE) / NULLIF(v0057.v1010, 0) AS v1017,
+  v0094.v1015 - v0057.v1011 AS v1018
+FROM v1009 AS v0057
+JOIN v1013 AS v0094
+  ON v0057.v0973 = v0094.v0973
+ORDER BY
+  v0057.v1010 DESC
+LIMIT 20
+
+-- query 182
+WITH v0953 AS (
+  SELECT
+    v0894,
+    MAX(version) AS v0954
+  FROM v0176
+  GROUP BY
+    v0894
+), v0955 AS (
+  SELECT
+    v0075.id,
+    v0075.v0894
+  FROM v0176 AS v0075
+  JOIN v0953 AS v0956
+    ON v0075.v0894 = v0956.v0894 AND v0075.version = v0956.v0954
+), v0957 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0174
+  GROUP BY
+    v0058
+), v0958 AS (
+  SELECT
+    v0155.id,
+    v0155.v0177
+  FROM v0174 AS v0155
+  JOIN v0957 AS v0959
+    ON v0155.v0058 = v0959.v0058 AND v0155.version = v0959.v0954
+), v0960 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0246
+  GROUP BY
+    v0058
+), v0961 AS (
+  SELECT
+    v0057.v0175,
+    v0057.v0058,
+    v0057.v0172,
+    v0057.v0084
+  FROM v0246 AS v0057
+  JOIN v0960 AS v0962
+    ON v0057.v0058 = v0962.v0058 AND v0057.version = v0962.v0954
+), v0963 AS (
+  SELECT
+    v0032.v0058 AS v0121,
+    v0864.v0084 AS v0964,
+    CAST(v0032.v0025 AS DATE) - v0864.v0172 AS v0965
+  FROM v0426 AS v0032
+  JOIN v0955 AS v0075
+    ON v0032.v0171 = v0075.v0894
+  JOIN v0958 AS v0155
+    ON v0075.id = v0155.v0177
+  JOIN v0961 AS v0864
+    ON v0155.id = v0864.v0175
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2026-06-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0864.v0084 <= v0032.v0025
+    AND v0864.v0172 >= CAST(v0032.v0025 AS DATE) - INTERVAL '120' DAYS
+), v0966 AS (
+  SELECT
+    v0121,
+    MAX(v0964) AS v0967
+  FROM v0963
+  GROUP BY
+    v0121
+), v0968 AS (
+  SELECT
+    v0096.v0121,
+    MIN(v0096.v0965) AS v0965
+  FROM v0963 AS v0096
+  JOIN v0966 AS v0284
+    ON v0096.v0121 = v0284.v0121 AND v0096.v0964 = v0284.v0967
+  GROUP BY
+    v0096.v0121
+), v0969 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0032.type,
+    v0032.v0738,
+    v0032.v0970,
+    v0032.metadata
+  FROM v0426 AS v0032
+  LEFT JOIN v0968 AS v0634
+    ON v0032.v0058 = v0634.v0121
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2026-06-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0032.v0738 IN ('value0087', 'value0156')
+    AND (
+      v0634.v0965 IS NULL OR v0634.v0965 < 14
+    )
+), v0971 AS (
+  SELECT
+    SUBSTR(json_as_text(data, 'value0090'), 9) AS v0121,
+    json_as_text(data, 'value0033') AS status,
+    ROW_NUMBER() OVER (PARTITION BY SUBSTR(json_as_text(data, 'value0090'), 9) ORDER BY v0090 DESC) AS v0330
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_as_text(data, 'value0090') LIKE 'value0052.%'
+), v0093 AS (
+  SELECT v0121, status
+  FROM v0971
+  WHERE v0330 = 1
+), v0707 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    CASE
+      WHEN JSON_GET_STR(v0032.metadata, 'value0042') = 'value0043'
+      THEN 'value0226'
+      WHEN JSON_GET_STR(v0032.metadata, 'value0042') = 'value0044'
+      THEN 'value0227'
+    END AS v0737,
+    CASE
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0488 value0489%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0491'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0495'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0318.v0972)) IN ('value0499', 'value0500')
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0503'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0507'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0509'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE '%value0511 value0512%'
+        OR UPPER(TRIM(v0318.v0972)) LIKE '%value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0515%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      ELSE COALESCE(NULLIF(TRIM(v0318.v0972), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0098.status = 'value0041' THEN 1 ELSE 0 END AS v0974,
+    CASE WHEN v0098.status = 'value0041' THEN v0032.v0026 ELSE NULL END AS v0975
+  FROM v0969 AS v0032
+  LEFT JOIN v0317 AS v0318
+    ON v0318.v0058 = REGEXP_REPLACE(v0032.v0970, '^value0523-', '')
+    AND v0318.v0030 = 1
+  LEFT JOIN v0093 AS v0098
+    ON v0098.v0121 = v0032.v0058
+  WHERE
+    v0032.type = 'value0016'
+    AND (
+      JSON_GET_STR(v0032.metadata, 'value0042') = 'value0043'
+      OR JSON_GET_STR(v0032.metadata, 'value0042') = 'value0044'
+    )
+), v0976 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0977.v0978 AS v0979,
+    ROW_NUMBER() OVER (PARTITION BY v0032.v0058 ORDER BY v0977.v0980) AS v0330
+  FROM v0969 AS v0032
+  JOIN v0981 AS v0982
+    ON v0982.v0058 = v0032.v0970 AND v0982.v0030 = 1
+  JOIN v0983 AS v0977
+    ON v0977.v0980 = v0982.v0980
+  WHERE
+    v0032.v0738 = 'value0087'
+), v0984 AS (
+  SELECT
+    v0058,
+    v0031,
+    v0026,
+    v0033,
+    'value0524' AS v0737,
+    CASE
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0525 value0526%'
+      THEN 'value0527'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0489 value0528 value0529%'
+      THEN 'value0270 value0530 value0531'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0532 value0533%'
+      THEN 'value0534 value0535'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0536 value0537%'
+      THEN 'value0538 value0520 value0539 value0540'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0509 value0489%'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0488 value0541%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0542%'
+      THEN 'value0543 value0544'
+      WHEN UPPER(TRIM(v0979)) LIKE 'U.S. value0489%'
+      THEN 'U.S. value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0545%'
+      THEN 'value0546'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0547 value0489%'
+      THEN 'value0548 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0549%'
+      THEN 'value0550 value0551 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0552 value0489%'
+      THEN 'value0553 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'M&T value0489%'
+      THEN 'M&T value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0554 value0555 value0556%'
+      THEN 'value0557 value0539 value0540 (value0558)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0559 value0560%'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0979)) LIKE '%value0561 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0562 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0563 value0489%'
+      THEN 'value0564 value0409 (value0565)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0566 value0567 value0489%'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0568 value0569%'
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0570%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0507 value0489%'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0571 value0489%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0572 value0499%'
+      THEN 'value0573 value0501'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0574 value0489%'
+      THEN 'value0574 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0575 value0576%'
+      THEN 'value0577 value0578 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0579 value0489%'
+      THEN 'value0580 value0270 & value0581'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0582 value0583%'
+      THEN 'value0584 value0585 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0586 value0489%'
+      THEN 'value0587 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0588%'
+      THEN 'value0589'
+      ELSE COALESCE(NULLIF(TRIM(v0979), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0031 = 'value0017' THEN 1 ELSE 0 END AS v0974,
+    CASE WHEN v0031 = 'value0017' THEN v0033 ELSE NULL END AS v0975
+  FROM v0976
+  WHERE
+    v0330 = 1
+), v0097 AS (
+  SELECT
+    v0973,
+    v0737,
+    v0974,
+    v0026,
+    v0975
+  FROM v0707
+  UNION ALL
+  SELECT
+    v0973,
+    v0737,
+    v0974,
+    v0026,
+    v0975
+  FROM v0984
+), v0985 AS (
+  SELECT
+    v0973,
+    COUNT(*) AS v0986,
+    COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END) AS v0989,
+    CAST(SUM(CASE WHEN v0737 = 'value0524' THEN v0974 END) AS DOUBLE) / NULLIF(COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END), 0) AS v1002,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0026 END) AS v0991,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0975 END) AS v0992,
+    COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END) AS v0993,
+    CAST(SUM(CASE WHEN v0737 = 'value0226' THEN v0974 END) AS DOUBLE) / NULLIF(COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END), 0) AS v1003,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0026 END) AS v0995,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0975 END) AS v0996,
+    COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END) AS v0997,
+    CAST(SUM(CASE WHEN v0737 = 'value0227' THEN v0974 END) AS DOUBLE) / NULLIF(COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END), 0) AS v1004,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0026 END) AS v0999,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0975 END) AS v1000
+  FROM v0097
+  GROUP BY
+    v0973
+), v1019 AS (
+  SELECT
+    v0973,
+    v0986,
+    CASE
+      WHEN COALESCE(v1002, -1) >= COALESCE(v1003, -1) AND COALESCE(v1002, -1) >= COALESCE(v1004, -1) THEN 'value0590'
+      WHEN COALESCE(v1003, -1) >= COALESCE(v1004, -1) THEN 'value0591'
+      ELSE 'value0592'
+    END AS v1020,
+    v0989, v1002, v0992, v0991,
+    v0993, v1003, v0996, v0995,
+    v0997, v1004, v1000, v0999
+  FROM v0985
+)
+SELECT
+  v0973,
+  CASE v1020
+    WHEN 'value0590' THEN 'value0593'
+    WHEN 'value0591' THEN 'value0594-day value0255'
+    WHEN 'value0592' THEN 'value0258-day value0255'
+  END AS v1021,
+  CASE v1020
+    WHEN 'value0590' THEN v1002
+    WHEN 'value0591' THEN v1003
+    WHEN 'value0592' THEN v1004
+  END AS v1022,
+  CASE v1020
+    WHEN 'value0590' THEN v0992
+    WHEN 'value0591' THEN v0996
+    WHEN 'value0592' THEN v1000
+  END AS v0033,
+  CASE v1020
+    WHEN 'value0590' THEN v0991
+    WHEN 'value0591' THEN v0995
+    WHEN 'value0592' THEN v0999
+  END AS v0026,
+  CASE v1020
+    WHEN 'value0590' THEN v0989
+    WHEN 'value0591' THEN v0993
+    WHEN 'value0592' THEN v0997
+  END AS v1023
+FROM v1019
+ORDER BY
+  v0986 DESC
+LIMIT 20
+
+-- query 183
+WITH v1024 AS (
+  SELECT DISTINCT
+    v1025 AS v0171,
+    CAST(Date AS DATE) AS v1026
+  FROM v1027
+  WHERE v0006 <= -500
+    AND v1028 = false
+    AND CAST(Date AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(Date AS TIMESTAMP) <  CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+), v0953 AS (
+  SELECT
+    v0894,
+    MAX(version) AS v0954
+  FROM v0176
+  GROUP BY
+    v0894
+), v0955 AS (
+  SELECT
+    v0075.id,
+    v0075.v0894
+  FROM v0176 AS v0075
+  JOIN v0953 AS v0956
+    ON v0075.v0894 = v0956.v0894 AND v0075.version = v0956.v0954
+), v0957 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0174
+  GROUP BY
+    v0058
+), v0958 AS (
+  SELECT
+    v0155.id,
+    v0155.v0177
+  FROM v0174 AS v0155
+  JOIN v0957 AS v0959
+    ON v0155.v0058 = v0959.v0058 AND v0155.version = v0959.v0954
+), v0960 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0246
+  GROUP BY
+    v0058
+), v0961 AS (
+  SELECT
+    v0057.v0175,
+    v0057.v0058,
+    v0057.v0172,
+    v0057.v0084
+  FROM v0246 AS v0057
+  JOIN v0960 AS v0962
+    ON v0057.v0058 = v0962.v0058 AND v0057.version = v0962.v0954
+), v0963 AS (
+  SELECT
+    v0032.v0058 AS v0121,
+    v0864.v0084 AS v0964,
+    CAST(v0032.v0025 AS DATE) - v0864.v0172 AS v0965
+  FROM v0426 AS v0032
+  JOIN v0955 AS v0075
+    ON v0032.v0171 = v0075.v0894
+  JOIN v0958 AS v0155
+    ON v0075.id = v0155.v0177
+  JOIN v0961 AS v0864
+    ON v0155.id = v0864.v0175
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0864.v0084 <= v0032.v0025
+    AND v0864.v0172 >= CAST(v0032.v0025 AS DATE) - INTERVAL '120' DAYS
+), v0966 AS (
+  SELECT
+    v0121,
+    MAX(v0964) AS v0967
+  FROM v0963
+  GROUP BY
+    v0121
+), v0968 AS (
+  SELECT
+    v0096.v0121,
+    MIN(v0096.v0965) AS v0965
+  FROM v0963 AS v0096
+  JOIN v0966 AS v0284
+    ON v0096.v0121 = v0284.v0121 AND v0096.v0964 = v0284.v0967
+  GROUP BY
+    v0096.v0121
+), v0969 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0032.type,
+    v0032.v0738,
+    v0032.v0970,
+    v0032.metadata
+  FROM v0426 AS v0032
+  LEFT JOIN v0968 AS v0634
+    ON v0032.v0058 = v0634.v0121
+  JOIN v1024 AS v1029
+    ON v1029.v0171 = v0032.v0171
+    AND v1029.v1026 = CAST(v0032.v0025 AS DATE)
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0032.v0738 IN ('value0087', 'value0156')
+    AND (
+      v0634.v0965 IS NULL OR v0634.v0965 < 14
+    )
+), v0971 AS (
+  SELECT
+    SUBSTR(json_as_text(data, 'value0090'), 9) AS v0121,
+    json_as_text(data, 'value0033') AS status,
+    ROW_NUMBER() OVER (PARTITION BY SUBSTR(json_as_text(data, 'value0090'), 9) ORDER BY v0090 DESC) AS v0330
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_as_text(data, 'value0090') LIKE 'value0052.%'
+), v0093 AS (
+  SELECT v0121, status
+  FROM v0971
+  WHERE v0330 = 1
+), v0707 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    CASE
+      WHEN JSON_GET_STR(v0032.metadata, 'value0042') = 'value0043'
+      THEN 'value0226'
+      WHEN JSON_GET_STR(v0032.metadata, 'value0042') = 'value0044'
+      THEN 'value0227'
+    END AS v0737,
+    CASE
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0488 value0489%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0491'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0495'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0318.v0972)) IN ('value0499', 'value0500')
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0503'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0507'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0509'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE '%value0511 value0512%'
+        OR UPPER(TRIM(v0318.v0972)) LIKE '%value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0515%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      ELSE COALESCE(NULLIF(TRIM(v0318.v0972), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0098.status = 'value0041' THEN 1 ELSE 0 END AS v0974,
+    CASE WHEN v0098.status = 'value0041' THEN v0032.v0026 ELSE NULL END AS v0975
+  FROM v0969 AS v0032
+  LEFT JOIN v0317 AS v0318
+    ON v0318.v0058 = REGEXP_REPLACE(v0032.v0970, '^value0523-', '')
+    AND v0318.v0030 = 1
+  LEFT JOIN v0093 AS v0098
+    ON v0098.v0121 = v0032.v0058
+  WHERE
+    v0032.type = 'value0016'
+    AND (
+      JSON_GET_STR(v0032.metadata, 'value0042') = 'value0043'
+      OR JSON_GET_STR(v0032.metadata, 'value0042') = 'value0044'
+    )
+), v0976 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0977.v0978 AS v0979,
+    ROW_NUMBER() OVER (PARTITION BY v0032.v0058 ORDER BY v0977.v0980) AS v0330
+  FROM v0969 AS v0032
+  JOIN v0981 AS v0982
+    ON v0982.v0058 = v0032.v0970 AND v0982.v0030 = 1
+  JOIN v0983 AS v0977
+    ON v0977.v0980 = v0982.v0980
+  WHERE
+    v0032.v0738 = 'value0087'
+), v0984 AS (
+  SELECT
+    v0058,
+    v0031,
+    v0026,
+    v0033,
+    'value0524' AS v0737,
+    CASE
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0525 value0526%'
+      THEN 'value0527'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0489 value0528 value0529%'
+      THEN 'value0270 value0530 value0531'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0532 value0533%'
+      THEN 'value0534 value0535'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0536 value0537%'
+      THEN 'value0538 value0520 value0539 value0540'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0509 value0489%'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0488 value0541%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0542%'
+      THEN 'value0543 value0544'
+      WHEN UPPER(TRIM(v0979)) LIKE 'U.S. value0489%'
+      THEN 'U.S. value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0545%'
+      THEN 'value0546'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0547 value0489%'
+      THEN 'value0548 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0549%'
+      THEN 'value0550 value0551 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0552 value0489%'
+      THEN 'value0553 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'M&T value0489%'
+      THEN 'M&T value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0554 value0555 value0556%'
+      THEN 'value0557 value0539 value0540 (value0558)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0559 value0560%'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0979)) LIKE '%value0561 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0562 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0563 value0489%'
+      THEN 'value0564 value0409 (value0565)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0566 value0567 value0489%'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0568 value0569%'
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0570%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0507 value0489%'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0571 value0489%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0572 value0499%'
+      THEN 'value0573 value0501'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0574 value0489%'
+      THEN 'value0574 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0575 value0576%'
+      THEN 'value0577 value0578 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0579 value0489%'
+      THEN 'value0580 value0270 & value0581'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0582 value0583%'
+      THEN 'value0584 value0585 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0586 value0489%'
+      THEN 'value0587 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0588%'
+      THEN 'value0589'
+      ELSE COALESCE(NULLIF(TRIM(v0979), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0031 = 'value0017' THEN 1 ELSE 0 END AS v0974,
+    CASE WHEN v0031 = 'value0017' THEN v0033 ELSE NULL END AS v0975
+  FROM v0976
+  WHERE
+    v0330 = 1
+), v0097 AS (
+  SELECT
+    v0973,
+    v0737,
+    v0974,
+    v0026,
+    v0975
+  FROM v0707
+  UNION ALL
+  SELECT
+    v0973,
+    v0737,
+    v0974,
+    v0026,
+    v0975
+  FROM v0984
+), v0985 AS (
+  SELECT
+    v0973,
+    COUNT(*) AS v0986,
+    SUM(v0026) AS v0987,
+    SUM(v0974) AS v0988,
+    SUM(v0975) AS v0975,
+    COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END) AS v0989,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0974 END) AS v0990,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0026 END) AS v0991,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0975 END) AS v0992,
+    COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END) AS v0993,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0974 END) AS v0994,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0026 END) AS v0995,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0975 END) AS v0996,
+    COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END) AS v0997,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0974 END) AS v0998,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0026 END) AS v0999,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0975 END) AS v1000
+  FROM v0097
+  GROUP BY
+    v0973
+), v1030 AS (
+  SELECT
+    'value0595 value0596' AS v0973,
+    COUNT(*) AS v0986,
+    SUM(v0026) AS v0987,
+    SUM(v0974) AS v0988,
+    SUM(v0975) AS v0975,
+    COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END) AS v0989,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0974 END) AS v0990,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0026 END) AS v0991,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0975 END) AS v0992,
+    COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END) AS v0993,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0974 END) AS v0994,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0026 END) AS v0995,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0975 END) AS v0996,
+    COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END) AS v0997,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0974 END) AS v0998,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0026 END) AS v0999,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0975 END) AS v1000
+  FROM v0097
+), v1031 AS (
+  SELECT *
+  FROM v0985
+  ORDER BY v0986 DESC
+  LIMIT 20
+), v1032 AS (
+  SELECT * FROM v1030
+  UNION ALL
+  SELECT * FROM v1031
+)
+SELECT
+  v0973,
+  v0986,
+  v0987 / 100.0 AS v0987,
+  v0988,
+  v0975 / 100.0 AS v0975,
+  CAST(v0988 AS DOUBLE) / NULLIF(v0986, 0) AS v1001,
+  v0989,
+  CAST(v0990 AS DOUBLE) / NULLIF(v0989, 0) AS v1002,
+  v0991 / 100.0 AS v0991,
+  v0992 / 100.0 AS v0992,
+  v0993,
+  CAST(v0994 AS DOUBLE) / NULLIF(v0993, 0) AS v1003,
+  v0995 / 100.0 AS v0995,
+  v0996 / 100.0 AS v0996,
+  v0997,
+  CAST(v0998 AS DOUBLE) / NULLIF(v0997, 0) AS v1004,
+  v0999 / 100.0 AS v0999,
+  v1000 / 100.0 AS v1000
+FROM v1032
+ORDER BY
+  (v0973 = 'value0595 value0596') DESC,
+  v0986 DESC
+
+-- query 184
+WITH v1024 AS (
+  SELECT DISTINCT
+    v1025 AS v0171,
+    CAST(Date AS DATE) AS v1026
+  FROM v1027
+  WHERE v0006 <= -500
+    AND v1028 = false
+    AND CAST(Date AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(Date AS TIMESTAMP) <  CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+), v0953 AS (
+  SELECT
+    v0894,
+    MAX(version) AS v0954
+  FROM v0176
+  GROUP BY
+    v0894
+), v0955 AS (
+  SELECT
+    v0075.id,
+    v0075.v0894
+  FROM v0176 AS v0075
+  JOIN v0953 AS v0956
+    ON v0075.v0894 = v0956.v0894 AND v0075.version = v0956.v0954
+), v0957 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0174
+  GROUP BY
+    v0058
+), v0958 AS (
+  SELECT
+    v0155.id,
+    v0155.v0177
+  FROM v0174 AS v0155
+  JOIN v0957 AS v0959
+    ON v0155.v0058 = v0959.v0058 AND v0155.version = v0959.v0954
+), v0960 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0246
+  GROUP BY
+    v0058
+), v0961 AS (
+  SELECT
+    v0057.v0175,
+    v0057.v0058,
+    v0057.v0172,
+    v0057.v0084
+  FROM v0246 AS v0057
+  JOIN v0960 AS v0962
+    ON v0057.v0058 = v0962.v0058 AND v0057.version = v0962.v0954
+), v0963 AS (
+  SELECT
+    v0032.v0058 AS v0121,
+    v0864.v0084 AS v0964,
+    CAST(v0032.v0025 AS DATE) - v0864.v0172 AS v0965
+  FROM v0426 AS v0032
+  JOIN v0955 AS v0075
+    ON v0032.v0171 = v0075.v0894
+  JOIN v0958 AS v0155
+    ON v0075.id = v0155.v0177
+  JOIN v0961 AS v0864
+    ON v0155.id = v0864.v0175
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0864.v0084 <= v0032.v0025
+    AND v0864.v0172 >= CAST(v0032.v0025 AS DATE) - INTERVAL '120' DAYS
+), v0966 AS (
+  SELECT
+    v0121,
+    MAX(v0964) AS v0967
+  FROM v0963
+  GROUP BY
+    v0121
+), v0968 AS (
+  SELECT
+    v0096.v0121,
+    MIN(v0096.v0965) AS v0965
+  FROM v0963 AS v0096
+  JOIN v0966 AS v0284
+    ON v0096.v0121 = v0284.v0121 AND v0096.v0964 = v0284.v0967
+  GROUP BY
+    v0096.v0121
+), v0969 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0032.type,
+    v0032.v0738,
+    v0032.v0970,
+    v0032.metadata
+  FROM v0426 AS v0032
+  LEFT JOIN v0968 AS v0634
+    ON v0032.v0058 = v0634.v0121
+  JOIN v1024 AS v1029
+    ON v1029.v0171 = v0032.v0171
+    AND v1029.v1026 = CAST(v0032.v0025 AS DATE)
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0032.v0738 IN ('value0087', 'value0156')
+    AND (
+      v0634.v0965 IS NULL OR v0634.v0965 < 14
+    )
+), v0971 AS (
+  SELECT
+    SUBSTR(json_as_text(data, 'value0090'), 9) AS v0121,
+    json_as_text(data, 'value0033') AS status,
+    ROW_NUMBER() OVER (PARTITION BY SUBSTR(json_as_text(data, 'value0090'), 9) ORDER BY v0090 DESC) AS v0330
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_as_text(data, 'value0090') LIKE 'value0052.%'
+), v0093 AS (
+  SELECT v0121, status
+  FROM v0971
+  WHERE v0330 = 1
+), v0707 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    CASE
+      WHEN JSON_GET_STR(v0032.metadata, 'value0042') = 'value0043'
+      THEN 'value0226'
+      WHEN JSON_GET_STR(v0032.metadata, 'value0042') = 'value0044'
+      THEN 'value0227'
+    END AS v0737,
+    CASE
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0488 value0489%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0491'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0495'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0318.v0972)) IN ('value0499', 'value0500')
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0503'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0507'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0509'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE '%value0511 value0512%'
+        OR UPPER(TRIM(v0318.v0972)) LIKE '%value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0515%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      ELSE COALESCE(NULLIF(TRIM(v0318.v0972), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0098.status = 'value0041' THEN 1 ELSE 0 END AS v0974,
+    CASE WHEN v0098.status = 'value0041' THEN v0032.v0026 ELSE NULL END AS v0975
+  FROM v0969 AS v0032
+  LEFT JOIN v0317 AS v0318
+    ON v0318.v0058 = REGEXP_REPLACE(v0032.v0970, '^value0523-', '')
+    AND v0318.v0030 = 1
+  LEFT JOIN v0093 AS v0098
+    ON v0098.v0121 = v0032.v0058
+  WHERE
+    v0032.type = 'value0016'
+    AND (
+      JSON_GET_STR(v0032.metadata, 'value0042') = 'value0043'
+      OR JSON_GET_STR(v0032.metadata, 'value0042') = 'value0044'
+    )
+), v0976 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0977.v0978 AS v0979,
+    ROW_NUMBER() OVER (PARTITION BY v0032.v0058 ORDER BY v0977.v0980) AS v0330
+  FROM v0969 AS v0032
+  JOIN v0981 AS v0982
+    ON v0982.v0058 = v0032.v0970 AND v0982.v0030 = 1
+  JOIN v0983 AS v0977
+    ON v0977.v0980 = v0982.v0980
+  WHERE
+    v0032.v0738 = 'value0087'
+), v0984 AS (
+  SELECT
+    v0058,
+    v0031,
+    v0026,
+    v0033,
+    'value0524' AS v0737,
+    CASE
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0525 value0526%'
+      THEN 'value0527'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0489 value0528 value0529%'
+      THEN 'value0270 value0530 value0531'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0532 value0533%'
+      THEN 'value0534 value0535'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0536 value0537%'
+      THEN 'value0538 value0520 value0539 value0540'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0509 value0489%'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0488 value0541%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0542%'
+      THEN 'value0543 value0544'
+      WHEN UPPER(TRIM(v0979)) LIKE 'U.S. value0489%'
+      THEN 'U.S. value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0545%'
+      THEN 'value0546'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0547 value0489%'
+      THEN 'value0548 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0549%'
+      THEN 'value0550 value0551 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0552 value0489%'
+      THEN 'value0553 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'M&T value0489%'
+      THEN 'M&T value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0554 value0555 value0556%'
+      THEN 'value0557 value0539 value0540 (value0558)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0559 value0560%'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0979)) LIKE '%value0561 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0562 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0563 value0489%'
+      THEN 'value0564 value0409 (value0565)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0566 value0567 value0489%'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0568 value0569%'
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0570%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0507 value0489%'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0571 value0489%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0572 value0499%'
+      THEN 'value0573 value0501'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0574 value0489%'
+      THEN 'value0574 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0575 value0576%'
+      THEN 'value0577 value0578 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0579 value0489%'
+      THEN 'value0580 value0270 & value0581'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0582 value0583%'
+      THEN 'value0584 value0585 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0586 value0489%'
+      THEN 'value0587 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0588%'
+      THEN 'value0589'
+      ELSE COALESCE(NULLIF(TRIM(v0979), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0031 = 'value0017' THEN 1 ELSE 0 END AS v0974,
+    CASE WHEN v0031 = 'value0017' THEN v0033 ELSE NULL END AS v0975
+  FROM v0976
+  WHERE
+    v0330 = 1
+), v0097 AS (
+  SELECT
+    v0973,
+    v0737,
+    v0974,
+    v0026,
+    v0975
+  FROM v0707
+  UNION ALL
+  SELECT
+    v0973,
+    v0737,
+    v0974,
+    v0026,
+    v0975
+  FROM v0984
+), v0985 AS (
+  SELECT
+    v0973,
+    COUNT(*) AS v0986,
+    COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END) AS v0989,
+    CAST(SUM(CASE WHEN v0737 = 'value0524' THEN v0974 END) AS DOUBLE) / NULLIF(COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END), 0) AS v1002,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0026 END) AS v0991,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0975 END) AS v0992,
+    COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END) AS v0993,
+    CAST(SUM(CASE WHEN v0737 = 'value0226' THEN v0974 END) AS DOUBLE) / NULLIF(COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END), 0) AS v1003,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0026 END) AS v0995,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0975 END) AS v0996,
+    COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END) AS v0997,
+    CAST(SUM(CASE WHEN v0737 = 'value0227' THEN v0974 END) AS DOUBLE) / NULLIF(COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END), 0) AS v1004,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0026 END) AS v0999,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0975 END) AS v1000
+  FROM v0097
+  GROUP BY
+    v0973
+), v1030 AS (
+  SELECT
+    'value0595 value0596' AS v0973,
+    COUNT(*) AS v0986,
+    COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END) AS v0989,
+    CAST(SUM(CASE WHEN v0737 = 'value0524' THEN v0974 END) AS DOUBLE) / NULLIF(COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END), 0) AS v1002,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0026 END) AS v0991,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0975 END) AS v0992,
+    COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END) AS v0993,
+    CAST(SUM(CASE WHEN v0737 = 'value0226' THEN v0974 END) AS DOUBLE) / NULLIF(COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END), 0) AS v1003,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0026 END) AS v0995,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0975 END) AS v0996,
+    COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END) AS v0997,
+    CAST(SUM(CASE WHEN v0737 = 'value0227' THEN v0974 END) AS DOUBLE) / NULLIF(COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END), 0) AS v1004,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0026 END) AS v0999,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0975 END) AS v1000
+  FROM v0097
+), v1031 AS (
+  SELECT *
+  FROM v0985
+  ORDER BY v0986 DESC
+  LIMIT 20
+), v1032 AS (
+  SELECT * FROM v1030
+  UNION ALL
+  SELECT * FROM v1031
+), v1019 AS (
+  SELECT
+    v0973,
+    v0986,
+    CASE
+      WHEN COALESCE(v1002, -1) >= COALESCE(v1003, -1) AND COALESCE(v1002, -1) >= COALESCE(v1004, -1) THEN 'value0590'
+      WHEN COALESCE(v1003, -1) >= COALESCE(v1004, -1) THEN 'value0591'
+      ELSE 'value0592'
+    END AS v1020,
+    v0989, v1002, v0992, v0991,
+    v0993, v1003, v0996, v0995,
+    v0997, v1004, v1000, v0999
+  FROM v1032
+)
+SELECT
+  v0973,
+  CASE v1020
+    WHEN 'value0590' THEN 'value0593'
+    WHEN 'value0591' THEN 'value0594-day value0255'
+    WHEN 'value0592' THEN 'value0258-day value0255'
+  END AS v1021,
+  CASE v1020
+    WHEN 'value0590' THEN v1002
+    WHEN 'value0591' THEN v1003
+    WHEN 'value0592' THEN v1004
+  END AS v1022,
+  CASE v1020
+    WHEN 'value0590' THEN v0992
+    WHEN 'value0591' THEN v0996
+    WHEN 'value0592' THEN v1000
+  END / 100.0 AS v0033,
+  CASE v1020
+    WHEN 'value0590' THEN v0991
+    WHEN 'value0591' THEN v0995
+    WHEN 'value0592' THEN v0999
+  END / 100.0 AS v0026,
+  CASE v1020
+    WHEN 'value0590' THEN v0989
+    WHEN 'value0591' THEN v0993
+    WHEN 'value0592' THEN v0997
+  END AS v1023
+FROM v1019
+ORDER BY
+  (v0973 = 'value0595 value0596') DESC,
+  v0986 DESC
+
+-- query 185
+WITH v1024 AS (
+  SELECT DISTINCT
+    v1025 AS v0171,
+    CAST(Date AS DATE) AS v1026
+  FROM v1027
+  WHERE v0006 <= -500
+    AND v1028 = false
+    AND CAST(Date AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(Date AS TIMESTAMP) <  CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+), v0953 AS (
+  SELECT
+    v0894,
+    MAX(version) AS v0954
+  FROM v0176
+  GROUP BY
+    v0894
+), v0955 AS (
+  SELECT
+    v0075.id,
+    v0075.v0894
+  FROM v0176 AS v0075
+  JOIN v0953 AS v0956
+    ON v0075.v0894 = v0956.v0894 AND v0075.version = v0956.v0954
+), v0957 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0174
+  GROUP BY
+    v0058
+), v0958 AS (
+  SELECT
+    v0155.id,
+    v0155.v0177
+  FROM v0174 AS v0155
+  JOIN v0957 AS v0959
+    ON v0155.v0058 = v0959.v0058 AND v0155.version = v0959.v0954
+), v0960 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0246
+  GROUP BY
+    v0058
+), v0961 AS (
+  SELECT
+    v0057.v0175,
+    v0057.v0058,
+    v0057.v0172,
+    v0057.v0084
+  FROM v0246 AS v0057
+  JOIN v0960 AS v0962
+    ON v0057.v0058 = v0962.v0058 AND v0057.version = v0962.v0954
+), v0963 AS (
+  SELECT
+    v0032.v0058 AS v0121,
+    v0864.v0084 AS v0964,
+    CAST(v0032.v0025 AS DATE) - v0864.v0172 AS v0965
+  FROM v0426 AS v0032
+  JOIN v0955 AS v0075
+    ON v0032.v0171 = v0075.v0894
+  JOIN v0958 AS v0155
+    ON v0075.id = v0155.v0177
+  JOIN v0961 AS v0864
+    ON v0155.id = v0864.v0175
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0864.v0084 <= v0032.v0025
+    AND v0864.v0172 >= CAST(v0032.v0025 AS DATE) - INTERVAL '120' DAYS
+), v0966 AS (
+  SELECT
+    v0121,
+    MAX(v0964) AS v0967
+  FROM v0963
+  GROUP BY
+    v0121
+), v0968 AS (
+  SELECT
+    v0096.v0121,
+    MIN(v0096.v0965) AS v0965
+  FROM v0963 AS v0096
+  JOIN v0966 AS v0284
+    ON v0096.v0121 = v0284.v0121 AND v0096.v0964 = v0284.v0967
+  GROUP BY
+    v0096.v0121
+), v0969 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0032.v0025,
+    v0032.type,
+    v0032.v0738,
+    v0032.v0970,
+    v0032.metadata
+  FROM v0426 AS v0032
+  LEFT JOIN v0968 AS v0634
+    ON v0032.v0058 = v0634.v0121
+  JOIN v1024 AS v1029
+    ON v1029.v0171 = v0032.v0171
+    AND v1029.v1026 = CAST(v0032.v0025 AS DATE)
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0032.v0738 IN ('value0087', 'value0156')
+    AND (
+      v0634.v0965 IS NULL OR v0634.v0965 < 14
+    )
+), v0971 AS (
+  SELECT
+    SUBSTR(json_as_text(data, 'value0090'), 9) AS v0121,
+    json_as_text(data, 'value0033') AS status,
+    ROW_NUMBER() OVER (PARTITION BY SUBSTR(json_as_text(data, 'value0090'), 9) ORDER BY v0090 DESC) AS v0330
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_as_text(data, 'value0090') LIKE 'value0052.%'
+), v0093 AS (
+  SELECT v0121, status
+  FROM v0971
+  WHERE v0330 = 1
+), v0707 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    CASE
+      WHEN JSON_GET_STR(v0032.metadata, 'value0042') = 'value0043'
+      THEN 'value0226'
+      WHEN JSON_GET_STR(v0032.metadata, 'value0042') = 'value0044'
+      THEN 'value0227'
+    END AS v0737,
+    CASE
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0488 value0489%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0491'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0495'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0318.v0972)) IN ('value0499', 'value0500')
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0503'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0507'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0509'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE '%value0511 value0512%'
+        OR UPPER(TRIM(v0318.v0972)) LIKE '%value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0515%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      ELSE COALESCE(NULLIF(TRIM(v0318.v0972), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0098.status = 'value0041' THEN 1 ELSE 0 END AS v0974,
+    CASE WHEN v0098.status = 'value0041' THEN v0032.v0026 ELSE NULL END AS v0975
+  FROM v0969 AS v0032
+  LEFT JOIN v0317 AS v0318
+    ON v0318.v0058 = REGEXP_REPLACE(v0032.v0970, '^value0523-', '')
+    AND v0318.v0030 = 1
+  LEFT JOIN v0093 AS v0098
+    ON v0098.v0121 = v0032.v0058
+  WHERE
+    v0032.type = 'value0016'
+    AND (
+      JSON_GET_STR(v0032.metadata, 'value0042') = 'value0043'
+      OR JSON_GET_STR(v0032.metadata, 'value0042') = 'value0044'
+    )
+), v0976 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0032.v0025,
+    v0982.v0980,
+    v0977.v0978 AS v0979,
+    ROW_NUMBER() OVER (PARTITION BY v0032.v0058 ORDER BY v0977.v0980) AS v0330
+  FROM v0969 AS v0032
+  JOIN v0981 AS v0982
+    ON v0982.v0058 = v0032.v0970 AND v0982.v0030 = 1
+  JOIN v0983 AS v0977
+    ON v0977.v0980 = v0982.v0980
+  WHERE
+    v0032.v0738 = 'value0087'
+), v1005 AS (
+  SELECT
+    v0058,
+    v0980,
+    CAST(v0025 AS DATE) AS v1006,
+    v0031,
+    v0026,
+    v0033,
+    CASE
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0525 value0526%'
+      THEN 'value0527'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0489 value0528 value0529%'
+      THEN 'value0270 value0530 value0531'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0532 value0533%'
+      THEN 'value0534 value0535'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0536 value0537%'
+      THEN 'value0538 value0520 value0539 value0540'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0509 value0489%'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0488 value0541%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0542%'
+      THEN 'value0543 value0544'
+      WHEN UPPER(TRIM(v0979)) LIKE 'U.S. value0489%'
+      THEN 'U.S. value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0545%'
+      THEN 'value0546'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0547 value0489%'
+      THEN 'value0548 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0549%'
+      THEN 'value0550 value0551 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0552 value0489%'
+      THEN 'value0553 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'M&T value0489%'
+      THEN 'M&T value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0554 value0555 value0556%'
+      THEN 'value0557 value0539 value0540 (value0558)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0559 value0560%'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0979)) LIKE '%value0561 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0562 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0563 value0489%'
+      THEN 'value0564 value0409 (value0565)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0566 value0567 value0489%'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0568 value0569%'
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0570%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0507 value0489%'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0571 value0489%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0572 value0499%'
+      THEN 'value0573 value0501'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0574 value0489%'
+      THEN 'value0574 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0575 value0576%'
+      THEN 'value0577 value0578 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0579 value0489%'
+      THEN 'value0580 value0270 & value0581'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0582 value0583%'
+      THEN 'value0584 value0585 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0586 value0489%'
+      THEN 'value0587 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0588%'
+      THEN 'value0589'
+      ELSE COALESCE(NULLIF(TRIM(v0979), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0031 = 'value0017' THEN 1 ELSE 0 END AS v0974
+  FROM v0976
+  WHERE
+    v0330 = 1
+), v1007 AS (
+  SELECT
+    v0973,
+    'value0524' AS v0737,
+    MAX(v0974) AS v0974,
+    MAX(v0026) AS v0026,
+    CASE WHEN MAX(v0974) = 1 THEN SUM(CASE WHEN v0974 = 1 THEN v0033 END) ELSE NULL END AS v0975
+  FROM v1005
+  GROUP BY
+    v0980, v1006, v0973
+), v0097 AS (
+  SELECT
+    v0973,
+    v0737,
+    v0974,
+    v0026,
+    v0975
+  FROM v0707
+  UNION ALL
+  SELECT
+    v0973,
+    v0737,
+    v0974,
+    v0026,
+    v0975
+  FROM v1007
+), v0985 AS (
+  SELECT
+    v0973,
+    COUNT(*) AS v0986,
+    SUM(v0026) AS v0987,
+    SUM(v0974) AS v0988,
+    SUM(v0975) AS v0975,
+    COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END) AS v0989,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0974 END) AS v0990,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0026 END) AS v0991,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0975 END) AS v0992,
+    COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END) AS v0993,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0974 END) AS v0994,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0026 END) AS v0995,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0975 END) AS v0996,
+    COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END) AS v0997,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0974 END) AS v0998,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0026 END) AS v0999,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0975 END) AS v1000
+  FROM v0097
+  GROUP BY
+    v0973
+)
+SELECT
+  v0973,
+  v0986,
+  v0987 / 100.0 AS v0987,
+  v0988,
+  v0975 / 100.0 AS v0975,
+  CAST(v0988 AS DOUBLE) / NULLIF(v0986, 0) AS v1001,
+  v0989,
+  CAST(v0990 AS DOUBLE) / NULLIF(v0989, 0) AS v1002,
+  v0991 / 100.0 AS v0991,
+  v0992 / 100.0 AS v0992,
+  v0993,
+  CAST(v0994 AS DOUBLE) / NULLIF(v0993, 0) AS v1003,
+  v0995 / 100.0 AS v0995,
+  v0996 / 100.0 AS v0996,
+  v0997,
+  CAST(v0998 AS DOUBLE) / NULLIF(v0997, 0) AS v1004,
+  v0999 / 100.0 AS v0999,
+  v1000 / 100.0 AS v1000
+FROM v0985
+ORDER BY
+  v0986 DESC
+LIMIT 20
+
+-- query 186
+WITH v1024 AS (
+  SELECT DISTINCT
+    v1025 AS v0171,
+    CAST(Date AS DATE) AS v1026
+  FROM v1027
+  WHERE v0006 <= -500
+    AND v1028 = false
+    AND CAST(Date AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(Date AS TIMESTAMP) <  CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+), v0953 AS (
+  SELECT
+    v0894,
+    MAX(version) AS v0954
+  FROM v0176
+  GROUP BY
+    v0894
+), v0955 AS (
+  SELECT
+    v0075.id,
+    v0075.v0894
+  FROM v0176 AS v0075
+  JOIN v0953 AS v0956
+    ON v0075.v0894 = v0956.v0894 AND v0075.version = v0956.v0954
+), v0957 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0174
+  GROUP BY
+    v0058
+), v0958 AS (
+  SELECT
+    v0155.id,
+    v0155.v0177
+  FROM v0174 AS v0155
+  JOIN v0957 AS v0959
+    ON v0155.v0058 = v0959.v0058 AND v0155.version = v0959.v0954
+), v0960 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0246
+  GROUP BY
+    v0058
+), v0961 AS (
+  SELECT
+    v0057.v0175,
+    v0057.v0058,
+    v0057.v0172,
+    v0057.v0084
+  FROM v0246 AS v0057
+  JOIN v0960 AS v0962
+    ON v0057.v0058 = v0962.v0058 AND v0057.version = v0962.v0954
+), v0963 AS (
+  SELECT
+    v0032.v0058 AS v0121,
+    v0864.v0084 AS v0964,
+    CAST(v0032.v0025 AS DATE) - v0864.v0172 AS v0965
+  FROM v0426 AS v0032
+  JOIN v0955 AS v0075
+    ON v0032.v0171 = v0075.v0894
+  JOIN v0958 AS v0155
+    ON v0075.id = v0155.v0177
+  JOIN v0961 AS v0864
+    ON v0155.id = v0864.v0175
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0864.v0084 <= v0032.v0025
+    AND v0864.v0172 >= CAST(v0032.v0025 AS DATE) - INTERVAL '120' DAYS
+), v0966 AS (
+  SELECT
+    v0121,
+    MAX(v0964) AS v0967
+  FROM v0963
+  GROUP BY
+    v0121
+), v0968 AS (
+  SELECT
+    v0096.v0121,
+    MIN(v0096.v0965) AS v0965
+  FROM v0963 AS v0096
+  JOIN v0966 AS v0284
+    ON v0096.v0121 = v0284.v0121 AND v0096.v0964 = v0284.v0967
+  GROUP BY
+    v0096.v0121
+), v0969 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0032.v0025,
+    v0032.v0738,
+    v0032.v0970
+  FROM v0426 AS v0032
+  LEFT JOIN v0968 AS v0634
+    ON v0032.v0058 = v0634.v0121
+  JOIN v1024 AS v1029
+    ON v1029.v0171 = v0032.v0171
+    AND v1029.v1026 = CAST(v0032.v0025 AS DATE)
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0032.v0738 = 'value0087'
+    AND (
+      v0634.v0965 IS NULL OR v0634.v0965 < 14
+    )
+), v0976 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0032.v0025,
+    v0982.v0980,
+    v0977.v0978 AS v0979,
+    ROW_NUMBER() OVER (PARTITION BY v0032.v0058 ORDER BY v0977.v0980) AS v0330
+  FROM v0969 AS v0032
+  JOIN v0981 AS v0982
+    ON v0982.v0058 = v0032.v0970 AND v0982.v0030 = 1
+  JOIN v0983 AS v0977
+    ON v0977.v0980 = v0982.v0980
+), v1008 AS (
+  SELECT
+    v0980,
+    CAST(v0025 AS DATE) AS v1006,
+    CASE
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0525 value0526%'
+      THEN 'value0527'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0489 value0528 value0529%'
+      THEN 'value0270 value0530 value0531'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0532 value0533%'
+      THEN 'value0534 value0535'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0536 value0537%'
+      THEN 'value0538 value0520 value0539 value0540'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0509 value0489%'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0488 value0541%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0542%'
+      THEN 'value0543 value0544'
+      WHEN UPPER(TRIM(v0979)) LIKE 'U.S. value0489%'
+      THEN 'U.S. value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0545%'
+      THEN 'value0546'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0547 value0489%'
+      THEN 'value0548 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0549%'
+      THEN 'value0550 value0551 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0552 value0489%'
+      THEN 'value0553 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'M&T value0489%'
+      THEN 'M&T value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0554 value0555 value0556%'
+      THEN 'value0557 value0539 value0540 (value0558)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0559 value0560%'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0979)) LIKE '%value0561 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0562 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0563 value0489%'
+      THEN 'value0564 value0409 (value0565)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0566 value0567 value0489%'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0568 value0569%'
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0570%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0507 value0489%'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0571 value0489%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0572 value0499%'
+      THEN 'value0573 value0501'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0574 value0489%'
+      THEN 'value0574 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0575 value0576%'
+      THEN 'value0577 value0578 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0579 value0489%'
+      THEN 'value0580 value0270 & value0581'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0582 value0583%'
+      THEN 'value0584 value0585 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0586 value0489%'
+      THEN 'value0587 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0588%'
+      THEN 'value0589'
+      ELSE COALESCE(NULLIF(TRIM(v0979), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0031 = 'value0017' THEN 1 ELSE 0 END AS v0974
+  FROM v0976
+  WHERE v0330 = 1
+), v1009 AS (
+  SELECT
+    v0973,
+    COUNT(*) AS v1010,
+    CAST(SUM(v0974) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1011
+  FROM v1008
+  GROUP BY v0973
+), v1012 AS (
+  SELECT
+    v0973,
+    v0980,
+    v1006,
+    MAX(v0974) AS v0974
+  FROM v1008
+  GROUP BY v0973, v0980, v1006
+), v1013 AS (
+  SELECT
+    v0973,
+    COUNT(*) AS v1014,
+    CAST(SUM(v0974) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1015
+  FROM v1012
+  GROUP BY v0973
+)
+SELECT
+  v0057.v0973,
+  v0057.v1010,
+  v0057.v1011,
+  v0094.v1014,
+  v0094.v1015,
+  (v0057.v1010 - v0094.v1014) AS v1016,
+  CAST(v0057.v1010 - v0094.v1014 AS DOUBLE) / NULLIF(v0057.v1010, 0) AS v1017,
+  v0094.v1015 - v0057.v1011 AS v1018
+FROM v1009 AS v0057
+JOIN v1013 AS v0094
+  ON v0057.v0973 = v0094.v0973
+ORDER BY
+  v0057.v1010 DESC
+LIMIT 20
+
+-- query 187
+WITH v1024 AS (
+  SELECT DISTINCT
+    v1025 AS v0171,
+    CAST(Date AS DATE) AS v1026
+  FROM v1027
+  WHERE v1033 = 'value0597'
+    AND v1028 = false
+    AND CAST(Date AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(Date AS TIMESTAMP) <  CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+), v0953 AS (
+  SELECT
+    v0894,
+    MAX(version) AS v0954
+  FROM v0176
+  GROUP BY
+    v0894
+), v0955 AS (
+  SELECT
+    v0075.id,
+    v0075.v0894
+  FROM v0176 AS v0075
+  JOIN v0953 AS v0956
+    ON v0075.v0894 = v0956.v0894 AND v0075.version = v0956.v0954
+), v0957 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0174
+  GROUP BY
+    v0058
+), v0958 AS (
+  SELECT
+    v0155.id,
+    v0155.v0177
+  FROM v0174 AS v0155
+  JOIN v0957 AS v0959
+    ON v0155.v0058 = v0959.v0058 AND v0155.version = v0959.v0954
+), v0960 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0246
+  GROUP BY
+    v0058
+), v0961 AS (
+  SELECT
+    v0057.v0175,
+    v0057.v0058,
+    v0057.v0172,
+    v0057.v0084
+  FROM v0246 AS v0057
+  JOIN v0960 AS v0962
+    ON v0057.v0058 = v0962.v0058 AND v0057.version = v0962.v0954
+), v0963 AS (
+  SELECT
+    v0032.v0058 AS v0121,
+    v0864.v0084 AS v0964,
+    CAST(v0032.v0025 AS DATE) - v0864.v0172 AS v0965
+  FROM v0426 AS v0032
+  JOIN v0955 AS v0075
+    ON v0032.v0171 = v0075.v0894
+  JOIN v0958 AS v0155
+    ON v0075.id = v0155.v0177
+  JOIN v0961 AS v0864
+    ON v0155.id = v0864.v0175
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0864.v0084 <= v0032.v0025
+    AND v0864.v0172 >= CAST(v0032.v0025 AS DATE) - INTERVAL '120' DAYS
+), v0966 AS (
+  SELECT
+    v0121,
+    MAX(v0964) AS v0967
+  FROM v0963
+  GROUP BY
+    v0121
+), v0968 AS (
+  SELECT
+    v0096.v0121,
+    MIN(v0096.v0965) AS v0965
+  FROM v0963 AS v0096
+  JOIN v0966 AS v0284
+    ON v0096.v0121 = v0284.v0121 AND v0096.v0964 = v0284.v0967
+  GROUP BY
+    v0096.v0121
+), v0969 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0032.type,
+    v0032.v0738,
+    v0032.v0970,
+    v0032.metadata
+  FROM v0426 AS v0032
+  LEFT JOIN v0968 AS v0634
+    ON v0032.v0058 = v0634.v0121
+  JOIN v1024 AS v1029
+    ON v1029.v0171 = v0032.v0171
+    AND v1029.v1026 = CAST(v0032.v0025 AS DATE)
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0032.v0738 IN ('value0087', 'value0156')
+    AND (
+      v0634.v0965 IS NULL OR v0634.v0965 < 14
+    )
+), v0971 AS (
+  SELECT
+    SUBSTR(json_as_text(data, 'value0090'), 9) AS v0121,
+    json_as_text(data, 'value0033') AS status,
+    ROW_NUMBER() OVER (PARTITION BY SUBSTR(json_as_text(data, 'value0090'), 9) ORDER BY v0090 DESC) AS v0330
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_as_text(data, 'value0090') LIKE 'value0052.%'
+), v0093 AS (
+  SELECT v0121, status
+  FROM v0971
+  WHERE v0330 = 1
+), v0707 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    CASE
+      WHEN JSON_GET_STR(v0032.metadata, 'value0042') = 'value0043'
+      THEN 'value0226'
+      WHEN JSON_GET_STR(v0032.metadata, 'value0042') = 'value0044'
+      THEN 'value0227'
+    END AS v0737,
+    CASE
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0488 value0489%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0491'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0495'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0318.v0972)) IN ('value0499', 'value0500')
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0503'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0507'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0509'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE '%value0511 value0512%'
+        OR UPPER(TRIM(v0318.v0972)) LIKE '%value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0515%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      ELSE COALESCE(NULLIF(TRIM(v0318.v0972), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0098.status = 'value0041' THEN 1 ELSE 0 END AS v0974,
+    CASE WHEN v0098.status = 'value0041' THEN v0032.v0026 ELSE NULL END AS v0975
+  FROM v0969 AS v0032
+  LEFT JOIN v0317 AS v0318
+    ON v0318.v0058 = REGEXP_REPLACE(v0032.v0970, '^value0523-', '')
+    AND v0318.v0030 = 1
+  LEFT JOIN v0093 AS v0098
+    ON v0098.v0121 = v0032.v0058
+  WHERE
+    v0032.type = 'value0016'
+    AND (
+      JSON_GET_STR(v0032.metadata, 'value0042') = 'value0043'
+      OR JSON_GET_STR(v0032.metadata, 'value0042') = 'value0044'
+    )
+), v0976 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0977.v0978 AS v0979,
+    ROW_NUMBER() OVER (PARTITION BY v0032.v0058 ORDER BY v0977.v0980) AS v0330
+  FROM v0969 AS v0032
+  JOIN v0981 AS v0982
+    ON v0982.v0058 = v0032.v0970 AND v0982.v0030 = 1
+  JOIN v0983 AS v0977
+    ON v0977.v0980 = v0982.v0980
+  WHERE
+    v0032.v0738 = 'value0087'
+), v0984 AS (
+  SELECT
+    v0058,
+    v0031,
+    v0026,
+    v0033,
+    'value0524' AS v0737,
+    CASE
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0525 value0526%'
+      THEN 'value0527'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0489 value0528 value0529%'
+      THEN 'value0270 value0530 value0531'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0532 value0533%'
+      THEN 'value0534 value0535'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0536 value0537%'
+      THEN 'value0538 value0520 value0539 value0540'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0509 value0489%'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0488 value0541%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0542%'
+      THEN 'value0543 value0544'
+      WHEN UPPER(TRIM(v0979)) LIKE 'U.S. value0489%'
+      THEN 'U.S. value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0545%'
+      THEN 'value0546'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0547 value0489%'
+      THEN 'value0548 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0549%'
+      THEN 'value0550 value0551 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0552 value0489%'
+      THEN 'value0553 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'M&T value0489%'
+      THEN 'M&T value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0554 value0555 value0556%'
+      THEN 'value0557 value0539 value0540 (value0558)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0559 value0560%'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0979)) LIKE '%value0561 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0562 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0563 value0489%'
+      THEN 'value0564 value0409 (value0565)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0566 value0567 value0489%'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0568 value0569%'
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0570%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0507 value0489%'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0571 value0489%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0572 value0499%'
+      THEN 'value0573 value0501'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0574 value0489%'
+      THEN 'value0574 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0575 value0576%'
+      THEN 'value0577 value0578 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0579 value0489%'
+      THEN 'value0580 value0270 & value0581'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0582 value0583%'
+      THEN 'value0584 value0585 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0586 value0489%'
+      THEN 'value0587 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0588%'
+      THEN 'value0589'
+      ELSE COALESCE(NULLIF(TRIM(v0979), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0031 = 'value0017' THEN 1 ELSE 0 END AS v0974,
+    CASE WHEN v0031 = 'value0017' THEN v0033 ELSE NULL END AS v0975
+  FROM v0976
+  WHERE
+    v0330 = 1
+), v0097 AS (
+  SELECT
+    v0973,
+    v0737,
+    v0974,
+    v0026,
+    v0975
+  FROM v0707
+  UNION ALL
+  SELECT
+    v0973,
+    v0737,
+    v0974,
+    v0026,
+    v0975
+  FROM v0984
+), v0985 AS (
+  SELECT
+    v0973,
+    COUNT(*) AS v0986,
+    SUM(v0026) AS v0987,
+    SUM(v0974) AS v0988,
+    SUM(v0975) AS v0975,
+    COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END) AS v0989,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0974 END) AS v0990,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0026 END) AS v0991,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0975 END) AS v0992,
+    COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END) AS v0993,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0974 END) AS v0994,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0026 END) AS v0995,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0975 END) AS v0996,
+    COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END) AS v0997,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0974 END) AS v0998,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0026 END) AS v0999,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0975 END) AS v1000
+  FROM v0097
+  GROUP BY
+    v0973
+), v1030 AS (
+  SELECT
+    'value0595 value0596' AS v0973,
+    COUNT(*) AS v0986,
+    SUM(v0026) AS v0987,
+    SUM(v0974) AS v0988,
+    SUM(v0975) AS v0975,
+    COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END) AS v0989,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0974 END) AS v0990,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0026 END) AS v0991,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0975 END) AS v0992,
+    COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END) AS v0993,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0974 END) AS v0994,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0026 END) AS v0995,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0975 END) AS v0996,
+    COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END) AS v0997,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0974 END) AS v0998,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0026 END) AS v0999,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0975 END) AS v1000
+  FROM v0097
+), v1031 AS (
+  SELECT *
+  FROM v0985
+  ORDER BY v0986 DESC
+  LIMIT 20
+), v1032 AS (
+  SELECT * FROM v1030
+  UNION ALL
+  SELECT * FROM v1031
+)
+SELECT
+  v0973,
+  v0986,
+  v0987 / 100.0 AS v0987,
+  v0988,
+  v0975 / 100.0 AS v0975,
+  CAST(v0988 AS DOUBLE) / NULLIF(v0986, 0) AS v1001,
+  v0989,
+  CAST(v0990 AS DOUBLE) / NULLIF(v0989, 0) AS v1002,
+  v0991 / 100.0 AS v0991,
+  v0992 / 100.0 AS v0992,
+  v0993,
+  CAST(v0994 AS DOUBLE) / NULLIF(v0993, 0) AS v1003,
+  v0995 / 100.0 AS v0995,
+  v0996 / 100.0 AS v0996,
+  v0997,
+  CAST(v0998 AS DOUBLE) / NULLIF(v0997, 0) AS v1004,
+  v0999 / 100.0 AS v0999,
+  v1000 / 100.0 AS v1000
+FROM v1032
+ORDER BY
+  (v0973 = 'value0595 value0596') DESC,
+  v0986 DESC
+
+-- query 188
+WITH v1024 AS (
+  SELECT DISTINCT
+    v1025 AS v0171,
+    CAST(Date AS DATE) AS v1026
+  FROM v1027
+  WHERE v1033 = 'value0597'
+    AND v1028 = false
+    AND CAST(Date AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(Date AS TIMESTAMP) <  CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+), v0953 AS (
+  SELECT
+    v0894,
+    MAX(version) AS v0954
+  FROM v0176
+  GROUP BY
+    v0894
+), v0955 AS (
+  SELECT
+    v0075.id,
+    v0075.v0894
+  FROM v0176 AS v0075
+  JOIN v0953 AS v0956
+    ON v0075.v0894 = v0956.v0894 AND v0075.version = v0956.v0954
+), v0957 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0174
+  GROUP BY
+    v0058
+), v0958 AS (
+  SELECT
+    v0155.id,
+    v0155.v0177
+  FROM v0174 AS v0155
+  JOIN v0957 AS v0959
+    ON v0155.v0058 = v0959.v0058 AND v0155.version = v0959.v0954
+), v0960 AS (
+  SELECT
+    v0058,
+    MAX(version) AS v0954
+  FROM v0246
+  GROUP BY
+    v0058
+), v0961 AS (
+  SELECT
+    v0057.v0175,
+    v0057.v0058,
+    v0057.v0172,
+    v0057.v0084
+  FROM v0246 AS v0057
+  JOIN v0960 AS v0962
+    ON v0057.v0058 = v0962.v0058 AND v0057.version = v0962.v0954
+), v0963 AS (
+  SELECT
+    v0032.v0058 AS v0121,
+    v0864.v0084 AS v0964,
+    CAST(v0032.v0025 AS DATE) - v0864.v0172 AS v0965
+  FROM v0426 AS v0032
+  JOIN v0955 AS v0075
+    ON v0032.v0171 = v0075.v0894
+  JOIN v0958 AS v0155
+    ON v0075.id = v0155.v0177
+  JOIN v0961 AS v0864
+    ON v0155.id = v0864.v0175
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0864.v0084 <= v0032.v0025
+    AND v0864.v0172 >= CAST(v0032.v0025 AS DATE) - INTERVAL '120' DAYS
+), v0966 AS (
+  SELECT
+    v0121,
+    MAX(v0964) AS v0967
+  FROM v0963
+  GROUP BY
+    v0121
+), v0968 AS (
+  SELECT
+    v0096.v0121,
+    MIN(v0096.v0965) AS v0965
+  FROM v0963 AS v0096
+  JOIN v0966 AS v0284
+    ON v0096.v0121 = v0284.v0121 AND v0096.v0964 = v0284.v0967
+  GROUP BY
+    v0096.v0121
+), v0969 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0032.type,
+    v0032.v0738,
+    v0032.v0970,
+    v0032.metadata
+  FROM v0426 AS v0032
+  LEFT JOIN v0968 AS v0634
+    ON v0032.v0058 = v0634.v0121
+  JOIN v1024 AS v1029
+    ON v1029.v0171 = v0032.v0171
+    AND v1029.v1026 = CAST(v0032.v0025 AS DATE)
+  WHERE
+    CAST(v0032.v0025 AS TIMESTAMP) >= CAST('2025-07-21 00:00:00' AS TIMESTAMP)
+    AND CAST(v0032.v0025 AS TIMESTAMP) < CAST('2026-07-22 00:00:00' AS TIMESTAMP)
+    AND v0032.v0030 = 1
+    AND v0032.v0031 <> 'value0014'
+    AND v0032.v0738 IN ('value0087', 'value0156')
+    AND (
+      v0634.v0965 IS NULL OR v0634.v0965 < 14
+    )
+), v0971 AS (
+  SELECT
+    SUBSTR(json_as_text(data, 'value0090'), 9) AS v0121,
+    json_as_text(data, 'value0033') AS status,
+    ROW_NUMBER() OVER (PARTITION BY SUBSTR(json_as_text(data, 'value0090'), 9) ORDER BY v0090 DESC) AS v0330
+  FROM v0089
+  WHERE type = 'value0035'
+    AND json_as_text(data, 'value0090') LIKE 'value0052.%'
+), v0093 AS (
+  SELECT v0121, status
+  FROM v0971
+  WHERE v0330 = 1
+), v0707 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    CASE
+      WHEN JSON_GET_STR(v0032.metadata, 'value0042') = 'value0043'
+      THEN 'value0226'
+      WHEN JSON_GET_STR(v0032.metadata, 'value0042') = 'value0044'
+      THEN 'value0227'
+    END AS v0737,
+    CASE
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0488 value0489%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0491'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0495'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0318.v0972)) IN ('value0499', 'value0500')
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0503'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0507'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0318.v0972)) = 'value0509'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE '%value0511 value0512%'
+        OR UPPER(TRIM(v0318.v0972)) LIKE '%value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0515%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0318.v0972)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      ELSE COALESCE(NULLIF(TRIM(v0318.v0972), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0098.status = 'value0041' THEN 1 ELSE 0 END AS v0974,
+    CASE WHEN v0098.status = 'value0041' THEN v0032.v0026 ELSE NULL END AS v0975
+  FROM v0969 AS v0032
+  LEFT JOIN v0317 AS v0318
+    ON v0318.v0058 = REGEXP_REPLACE(v0032.v0970, '^value0523-', '')
+    AND v0318.v0030 = 1
+  LEFT JOIN v0093 AS v0098
+    ON v0098.v0121 = v0032.v0058
+  WHERE
+    v0032.type = 'value0016'
+    AND (
+      JSON_GET_STR(v0032.metadata, 'value0042') = 'value0043'
+      OR JSON_GET_STR(v0032.metadata, 'value0042') = 'value0044'
+    )
+), v0976 AS (
+  SELECT
+    v0032.v0058,
+    v0032.v0031,
+    v0032.v0026,
+    v0032.v0033,
+    v0977.v0978 AS v0979,
+    ROW_NUMBER() OVER (PARTITION BY v0032.v0058 ORDER BY v0977.v0980) AS v0330
+  FROM v0969 AS v0032
+  JOIN v0981 AS v0982
+    ON v0982.v0058 = v0032.v0970 AND v0982.v0030 = 1
+  JOIN v0983 AS v0977
+    ON v0977.v0980 = v0982.v0980
+  WHERE
+    v0032.v0738 = 'value0087'
+), v0984 AS (
+  SELECT
+    v0058,
+    v0031,
+    v0026,
+    v0033,
+    'value0524' AS v0737,
+    CASE
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0525 value0526%'
+      THEN 'value0527'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0489 value0528 value0529%'
+      THEN 'value0270 value0530 value0531'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0532 value0533%'
+      THEN 'value0534 value0535'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0536 value0537%'
+      THEN 'value0538 value0520 value0539 value0540'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0509 value0489%'
+      THEN 'value0510'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0488 value0541%'
+      THEN 'value0490 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0542%'
+      THEN 'value0543 value0544'
+      WHEN UPPER(TRIM(v0979)) LIKE 'U.S. value0489%'
+      THEN 'U.S. value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0545%'
+      THEN 'value0546'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0547 value0489%'
+      THEN 'value0548 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0549%'
+      THEN 'value0550 value0551 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0552 value0489%'
+      THEN 'value0553 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'M&T value0489%'
+      THEN 'M&T value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0554 value0555 value0556%'
+      THEN 'value0557 value0539 value0540 (value0558)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0559 value0560%'
+      THEN 'value0492 (value0493 value0494)'
+      WHEN UPPER(TRIM(v0979)) LIKE '%value0561 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0562 value0489%'
+      THEN 'value0496 (value0497/value0498)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0563 value0489%'
+      THEN 'value0564 value0409 (value0565)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0566 value0567 value0489%'
+      THEN 'value0504 (value0505 value0506)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0568 value0569%'
+      THEN 'value0501 (value0502)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0570%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0513%'
+      THEN 'value0514'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0507 value0489%'
+      THEN 'value0508'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0571 value0489%'
+      THEN 'value0516 value0517 (value0518)'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0519%'
+      THEN 'value0519 value0520 value0521 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0572 value0499%'
+      THEN 'value0573 value0501'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0574 value0489%'
+      THEN 'value0574 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0575 value0576%'
+      THEN 'value0577 value0578 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0579 value0489%'
+      THEN 'value0580 value0270 & value0581'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0582 value0583%'
+      THEN 'value0584 value0585 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0586 value0489%'
+      THEN 'value0587 value0270'
+      WHEN UPPER(TRIM(v0979)) LIKE 'value0588%'
+      THEN 'value0589'
+      ELSE COALESCE(NULLIF(TRIM(v0979), ''), '(value0522)')
+    END AS v0973,
+    CASE WHEN v0031 = 'value0017' THEN 1 ELSE 0 END AS v0974,
+    CASE WHEN v0031 = 'value0017' THEN v0033 ELSE NULL END AS v0975
+  FROM v0976
+  WHERE
+    v0330 = 1
+), v0097 AS (
+  SELECT
+    v0973,
+    v0737,
+    v0974,
+    v0026,
+    v0975
+  FROM v0707
+  UNION ALL
+  SELECT
+    v0973,
+    v0737,
+    v0974,
+    v0026,
+    v0975
+  FROM v0984
+), v0985 AS (
+  SELECT
+    v0973,
+    COUNT(*) AS v0986,
+    COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END) AS v0989,
+    CAST(SUM(CASE WHEN v0737 = 'value0524' THEN v0974 END) AS DOUBLE) / NULLIF(COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END), 0) AS v1002,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0026 END) AS v0991,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0975 END) AS v0992,
+    COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END) AS v0993,
+    CAST(SUM(CASE WHEN v0737 = 'value0226' THEN v0974 END) AS DOUBLE) / NULLIF(COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END), 0) AS v1003,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0026 END) AS v0995,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0975 END) AS v0996,
+    COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END) AS v0997,
+    CAST(SUM(CASE WHEN v0737 = 'value0227' THEN v0974 END) AS DOUBLE) / NULLIF(COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END), 0) AS v1004,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0026 END) AS v0999,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0975 END) AS v1000
+  FROM v0097
+  GROUP BY
+    v0973
+), v1030 AS (
+  SELECT
+    'value0595 value0596' AS v0973,
+    COUNT(*) AS v0986,
+    COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END) AS v0989,
+    CAST(SUM(CASE WHEN v0737 = 'value0524' THEN v0974 END) AS DOUBLE) / NULLIF(COUNT(CASE WHEN v0737 = 'value0524' THEN 1 END), 0) AS v1002,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0026 END) AS v0991,
+    SUM(CASE WHEN v0737 = 'value0524' THEN v0975 END) AS v0992,
+    COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END) AS v0993,
+    CAST(SUM(CASE WHEN v0737 = 'value0226' THEN v0974 END) AS DOUBLE) / NULLIF(COUNT(CASE WHEN v0737 = 'value0226' THEN 1 END), 0) AS v1003,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0026 END) AS v0995,
+    SUM(CASE WHEN v0737 = 'value0226' THEN v0975 END) AS v0996,
+    COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END) AS v0997,
+    CAST(SUM(CASE WHEN v0737 = 'value0227' THEN v0974 END) AS DOUBLE) / NULLIF(COUNT(CASE WHEN v0737 = 'value0227' THEN 1 END), 0) AS v1004,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0026 END) AS v0999,
+    SUM(CASE WHEN v0737 = 'value0227' THEN v0975 END) AS v1000
+  FROM v0097
+), v1031 AS (
+  SELECT *
+  FROM v0985
+  ORDER BY v0986 DESC
+  LIMIT 20
+), v1032 AS (
+  SELECT * FROM v1030
+  UNION ALL
+  SELECT * FROM v1031
+), v1019 AS (
+  SELECT
+    v0973,
+    v0986,
+    CASE
+      WHEN COALESCE(v1002, -1) >= COALESCE(v1003, -1) AND COALESCE(v1002, -1) >= COALESCE(v1004, -1) THEN 'value0590'
+      WHEN COALESCE(v1003, -1) >= COALESCE(v1004, -1) THEN 'value0591'
+      ELSE 'value0592'
+    END AS v1020,
+    v0989, v1002, v0992, v0991,
+    v0993, v1003, v0996, v0995,
+    v0997, v1004, v1000, v0999
+  FROM v1032
+)
+SELECT
+  v0973,
+  CASE v1020
+    WHEN 'value0590' THEN 'value0593'
+    WHEN 'value0591' THEN 'value0594-day value0255'
+    WHEN 'value0592' THEN 'value0258-day value0255'
+  END AS v1021,
+  CASE v1020
+    WHEN 'value0590' THEN v1002
+    WHEN 'value0591' THEN v1003
+    WHEN 'value0592' THEN v1004
+  END AS v1022,
+  CASE v1020
+    WHEN 'value0590' THEN v0992
+    WHEN 'value0591' THEN v0996
+    WHEN 'value0592' THEN v1000
+  END / 100.0 AS v0033,
+  CASE v1020
+    WHEN 'value0590' THEN v0991
+    WHEN 'value0591' THEN v0995
+    WHEN 'value0592' THEN v0999
+  END / 100.0 AS v0026,
+  CASE v1020
+    WHEN 'value0590' THEN v0989
+    WHEN 'value0591' THEN v0993
+    WHEN 'value0592' THEN v0997
+  END AS v1023
+FROM v1019
+ORDER BY
+  (v0973 = 'value0595 value0596') DESC,
+  v0986 DESC
+
+-- query 189
+WITH v0705 AS (
+  SELECT v0058, MAX(version) AS v0706
+  FROM v0426
+  WHERE CAST(v0025 AS TIMESTAMP) >= (SELECT CAST(current_date - INTERVAL '30 days' AS TIMESTAMP))
+    AND CAST(v0025 AS TIMESTAMP) < (SELECT CAST(current_date + INTERVAL '1 day' AS TIMESTAMP))
+    AND v0030 = 1
+    AND type = 'value0016'
+  GROUP BY v0058
+),
+v0707 AS (
+  SELECT v0032.v0058, v0032.v0026
+  FROM v0426 v0032
+  INNER JOIN v0705 v0096 ON v0096.v0058 = v0032.v0058 AND v0096.v0706 = v0032.version
+  WHERE v0032.v0030 = 1
+    AND v0032.type = 'value0016'
+    AND v0032.v0031 <> 'value0014'
+),
+v0085 AS (
+  SELECT
+    REPLACE(json_get_str(data, 'value0032'), 'value0052.', '') AS v0058,
+    LOWER(json_get_str(data, 'value0033')) AS v0087,
+    CAST(json_get_str(data, 'value0034') AS TIMESTAMP) AS v0088
+  FROM v0089
+  WHERE type = 'value0035'
+    AND CAST(v0090 AS TIMESTAMP) >= (SELECT CAST(current_date - INTERVAL '30 days' AS TIMESTAMP))
+    AND json_get_str(data, 'value0032') LIKE 'value0052.%'
+),
+v0091 AS (
+  SELECT v0058, MAX(v0088) AS v0092 FROM v0085 GROUP BY v0058
+),
+v0093 AS (
+  SELECT v0094.v0058, v0094.v0087 AS v0095
+  FROM v0085 v0094
+  INNER JOIN v0091 v0096 ON v0096.v0058 = v0094.v0058 AND v0096.v0092 = v0094.v0088
+),
+v1034 AS (
+  SELECT v0058, MIN(v0088) AS v1035
+  FROM v0085
+  WHERE v0087 = 'value0041'
+  GROUP BY v0058
+),
+asof AS (
+  SELECT MAX(v0088) AS v1036, MAX(v0088) - INTERVAL '5 days' AS v1037 FROM v0085
+),
+v1038 AS (
+  SELECT
+    v0032.v0026 / 100.0 AS v0708,
+    v0098.v0095,
+    v0054.v1035,
+    v0057.v1037
+  FROM v0707 v0032
+  INNER JOIN v0093 v0098 ON v0098.v0058 = v0032.v0058
+  LEFT JOIN v1034 v0054 ON v0054.v0058 = v0032.v0058
+  CROSS JOIN asof v0057
+)
+SELECT
+  SUM(v0708) AS v0027,
+  COUNT(*) AS v1039,
+  SUM(CASE WHEN v0095 = 'value0041' AND v1035 IS NOT NULL AND v1035 <= v1037
+           THEN v0708 ELSE 0 END) AS v1040,
+  COUNT(CASE WHEN v0095 = 'value0041' AND v1035 IS NOT NULL AND v1035 <= v1037
+             THEN 1 END) AS v1041,
+  SUM(CASE WHEN v0095 = 'value0039' THEN v0708 ELSE 0 END) AS v1042,
+  COUNT(CASE WHEN v0095 = 'value0039' THEN 1 END) AS v1043,
+  SUM(CASE WHEN v0095 = 'value0053'
+             OR (v0095 = 'value0041' AND (v1035 IS NULL OR v1035 > v1037))
+           THEN v0708 ELSE 0 END) AS v1044,
+  COUNT(CASE WHEN v0095 = 'value0053'
+             OR (v0095 = 'value0041' AND (v1035 IS NULL OR v1035 > v1037))
+             THEN 1 END) AS v1045,
+  100.0 * SUM(CASE WHEN v0095 = 'value0041' AND v1035 IS NOT NULL AND v1035 <= v1037
+           THEN v0708 ELSE 0 END) / NULLIF(SUM(v0708), 0) AS v1046,
+  100.0 * SUM(CASE WHEN v0095 = 'value0039' THEN v0708 ELSE 0 END) / NULLIF(SUM(v0708), 0) AS v1047,
+  100.0 * SUM(CASE WHEN v0095 = 'value0053'
+             OR (v0095 = 'value0041' AND (v1035 IS NULL OR v1035 > v1037))
+           THEN v0708 ELSE 0 END) / NULLIF(SUM(v0708), 0) AS v1048
+FROM v1038
+
+-- query 190
+WITH v0081 AS (
+  SELECT DISTINCT
+    v0082,
+    category
+  FROM v0083
+  WHERE CAST(v0084 AS TIMESTAMP) >= (SELECT CAST(current_date - INTERVAL '30 days' AS TIMESTAMP))
+    AND CAST(v0084 AS TIMESTAMP) < (SELECT CAST(current_date + INTERVAL '1 day' AS TIMESTAMP))
+    AND v0030 = 1
+    AND category IN ('value0030', 'value0031')
+),
+v0085 AS (
+  SELECT
+    json_get_str(data, 'value0032') AS v0086,
+    LOWER(json_get_str(data, 'value0033')) AS v0087,
+    CAST(json_get_str(data, 'value0034') AS TIMESTAMP) AS v0088
+  FROM v0089
+  WHERE type = 'value0035'
+    AND CAST(v0090 AS TIMESTAMP) >= (SELECT CAST(current_date - INTERVAL '30 days' AS TIMESTAMP))
+),
+v0091 AS (
+  SELECT v0086, MAX(v0088) AS v0092
+  FROM v0085
+  GROUP BY v0086
+),
+v0093 AS (
+  SELECT v0094.v0086, v0094.v0087 AS v0095
+  FROM v0085 v0094
+  INNER JOIN v0091 v0096 ON v0096.v0086 = v0094.v0086 AND v0096.v0092 = v0094.v0088
+),
+v0097 AS (
+  SELECT v0000.category, v0098.v0095
+  FROM v0081 v0000
+  LEFT JOIN v0093 v0098 ON v0098.v0086 = v0000.v0082
+)
+SELECT
+  'value0036 value0037 value0038' AS metric,
+  1 AS v0099,
+  100.0 * CAST(COUNT(CASE WHEN v0095 = 'value0039' THEN 1 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v0100,
+  COUNT(CASE WHEN v0095 = 'value0039' THEN 1 END) AS v0101,
+  COUNT(*) AS v0102,
+  15.0 AS v0103
+FROM v0097
+
+-- query 191
+WITH v0705 AS (
+  SELECT v0058, MAX(version) AS v0706
+  FROM v0426
+  WHERE CAST(v0025 AS TIMESTAMP) >= (SELECT CAST(current_date - INTERVAL '30 days' AS TIMESTAMP))
+    AND CAST(v0025 AS TIMESTAMP) < (SELECT CAST(current_date + INTERVAL '1 day' AS TIMESTAMP))
+    AND v0030 = 1
+    AND type = 'value0016'
+  GROUP BY v0058
+),
+v0707 AS (
+  SELECT v0032.v0058, v0032.v0026
+  FROM v0426 v0032
+  INNER JOIN v0705 v0096 ON v0096.v0058 = v0032.v0058 AND v0096.v0706 = v0032.version
+  WHERE v0032.v0030 = 1 AND v0032.type = 'value0016'
+),
+v0085 AS (
+  SELECT
+    REPLACE(json_get_str(data, 'value0032'), 'value0052.', '') AS v0058,
+    LOWER(json_get_str(data, 'value0033')) AS v0087,
+    CAST(json_get_str(data, 'value0034') AS TIMESTAMP) AS v0088
+  FROM v0089
+  WHERE type = 'value0035'
+    AND CAST(v0090 AS TIMESTAMP) >= (SELECT CAST(current_date - INTERVAL '30 days' AS TIMESTAMP))
+    AND json_get_str(data, 'value0032') LIKE 'value0052.%'
+),
+v0091 AS (
+  SELECT v0058, MAX(v0088) AS v0092 FROM v0085 GROUP BY v0058
+),
+v0093 AS (
+  SELECT v0094.v0058, v0094.v0087 AS v0095
+  FROM v0085 v0094
+  INNER JOIN v0091 v0096 ON v0096.v0058 = v0094.v0058 AND v0096.v0092 = v0094.v0088
+),
+v1034 AS (
+  SELECT v0058, MIN(v0088) AS v1035
+  FROM v0085
+  WHERE v0087 = 'value0041'
+  GROUP BY v0058
+),
+asof AS (
+  SELECT MAX(v0088) - INTERVAL '5 days' AS v1037 FROM v0085
+),
+v1038 AS (
+  SELECT
+    v0032.v0026 / 100.0 AS v0708,
+    v0098.v0095,
+    v0054.v1035,
+    v0057.v1037
+  FROM v0707 v0032
+  INNER JOIN v0093 v0098 ON v0098.v0058 = v0032.v0058
+  LEFT JOIN v1034 v0054 ON v0054.v0058 = v0032.v0058
+  CROSS JOIN asof v0057
+),
+v1049 AS (
+  SELECT
+    SUM(CASE WHEN v0095 = 'value0041' AND v1035 IS NOT NULL AND v1035 <= v1037
+             THEN v0708 ELSE 0 END) AS v1040,
+    SUM(CASE WHEN v0095 = 'value0039' THEN v0708 ELSE 0 END) AS v1042,
+    SUM(CASE WHEN v0095 = 'value0053'
+               OR (v0095 = 'value0041' AND (v1035 IS NULL OR v1035 > v1037))
+             THEN v0708 ELSE 0 END) AS v1044
+  FROM v1038
+)
+SELECT 'value0598' AS v1050, v1040 AS v0708 FROM v1049
+UNION ALL
+SELECT 'value0599' AS v1050, v1042 AS v0708 FROM v1049
+UNION ALL
+SELECT 'value0600 value0601' AS v1050, v1044 AS v0708 FROM v1049
+
+-- query 192
+WITH v0736 AS (
+  SELECT DISTINCT
+    v0058,
+    json_get_str(metadata, 'value0042') AS v0123
+  FROM v0426
+  WHERE CAST(v0025 AS TIMESTAMP) >= (SELECT CAST(current_date - INTERVAL '30 days' AS TIMESTAMP))
+    AND CAST(v0025 AS TIMESTAMP) < (SELECT CAST(current_date + INTERVAL '1 day' AS TIMESTAMP))
+    AND v0030 = 1
+    AND type = 'value0016'
+    AND json_get_str(metadata, 'value0042') IN ('value0043', 'value0044')
+),
+v1038 AS (
+  SELECT DISTINCT REPLACE(json_get_str(data, 'value0032'), 'value0052.', '') AS v0058
+  FROM v0089
+  WHERE type = 'value0035'
+    AND CAST(v0090 AS TIMESTAMP) >= (SELECT CAST(current_date - INTERVAL '30 days' AS TIMESTAMP))
+    AND json_get_str(data, 'value0032') LIKE 'value0052.%'
+),
+v1051 AS (
+  SELECT v1052.v0123
+  FROM v0736 v1052
+  INNER JOIN v1038 v1053 ON v1053.v0058 = v1052.v0058
+),
+v1054 AS (
+  SELECT
+    COUNT(CASE WHEN v0123 = 'value0043' THEN 1 END) AS v1055,
+    COUNT(CASE WHEN v0123 = 'value0044' THEN 1 END) AS v1056
+  FROM v1051
+)
+SELECT
+  'value0594-day — ' ||
+    CASE WHEN v1055 >= 1000
+         THEN CAST(ROUND(v1055 / 1000.0, 1) AS VARCHAR) || 'K'
+         ELSE CAST(v1055 AS VARCHAR)
+    END AS v1057,
+  v1055 AS v0561
+FROM v1054
+UNION ALL
+SELECT
+  'value0258-day — ' ||
+    CASE WHEN v1056 >= 1000
+         THEN CAST(ROUND(v1056 / 1000.0, 1) AS VARCHAR) || 'K'
+         ELSE CAST(v1056 AS VARCHAR)
+    END AS v1057,
+  v1056 AS v0561
+FROM v1054
+
+-- query 193
+WITH v0736 AS (
+  SELECT DISTINCT
+    v0058,
+    json_get_str(metadata, 'value0042') AS v0123,
+    CAST(CAST(v0025 AS TIMESTAMP) AS DATE) AS v1058
+  FROM v0426
+  WHERE CAST(v0025 AS TIMESTAMP) >= (SELECT CAST(current_date - INTERVAL '30 days' AS TIMESTAMP))
+    AND CAST(v0025 AS TIMESTAMP) < (SELECT CAST(current_date + INTERVAL '1 day' AS TIMESTAMP))
+    AND v0030 = 1
+    AND type = 'value0016'
+    AND json_get_str(metadata, 'value0042') IN ('value0043', 'value0044')
+),
+v1038 AS (
+  SELECT DISTINCT REPLACE(json_get_str(data, 'value0032'), 'value0052.', '') AS v0058
+  FROM v0089
+  WHERE type = 'value0035'
+    AND CAST(v0090 AS TIMESTAMP) >= (SELECT CAST(current_date - INTERVAL '30 days' AS TIMESTAMP))
+    AND json_get_str(data, 'value0032') LIKE 'value0052.%'
+),
+v1051 AS (
+  SELECT v1052.v0123, v1052.v1058
+  FROM v0736 v1052
+  INNER JOIN v1038 v1053 ON v1053.v0058 = v1052.v0058
+),
+v1059 AS (
+  SELECT MAX(v1058) AS v1060 FROM v1051
+),
+v1054 AS (
+  SELECT
+    (SELECT v1060 FROM v1059) AS v1060,
+    COUNT(CASE WHEN v0123 = 'value0043' AND v1058 = (SELECT v1060 FROM v1059) THEN 1 END) AS v1055,
+    COUNT(CASE WHEN v0123 = 'value0044' AND v1058 = (SELECT v1060 FROM v1059) THEN 1 END) AS v1056
+  FROM v1051
+)
+SELECT
+  'value0594-day — ' ||
+    CASE WHEN v1055 >= 1000
+         THEN CAST(ROUND(v1055 / 1000.0, 1) AS VARCHAR) || 'K'
+         ELSE CAST(v1055 AS VARCHAR)
+    END ||
+    ' (' || CAST(v1060 AS VARCHAR) || ')' AS v1057,
+  v1055 AS v0561
+FROM v1054
+UNION ALL
+SELECT
+  'value0258-day — ' ||
+    CASE WHEN v1056 >= 1000
+         THEN CAST(ROUND(v1056 / 1000.0, 1) AS VARCHAR) || 'K'
+         ELSE CAST(v1056 AS VARCHAR)
+    END ||
+    ' (' || CAST(v1060 AS VARCHAR) || ')' AS v1057,
+  v1056 AS v0561
+FROM v1054
+
+-- query 194
+WITH v0736 AS (
+  SELECT DISTINCT
+    v0058,
+    COALESCE(json_get_str(metadata, 'value0228'), '(value0602)') AS v1061
+  FROM v0426
+  WHERE CAST(v0025 AS TIMESTAMP) >= (SELECT CAST(current_date - INTERVAL '30 days' AS TIMESTAMP))
+    AND CAST(v0025 AS TIMESTAMP) < (SELECT CAST(current_date + INTERVAL '1 day' AS TIMESTAMP))
+    AND v0030 = 1
+    AND type = 'value0016'
+    AND json_get_str(metadata, 'value0042') = 'value0043'
+),
+v0085 AS (
+  SELECT
+    REPLACE(json_get_str(data, 'value0032'), 'value0052.', '') AS v0058,
+    LOWER(json_get_str(data, 'value0033')) AS v0087,
+    json_get_str(data, 'value0089') AS v1062,
+    CAST(json_get_str(data, 'value0034') AS TIMESTAMP) AS v0088
+  FROM v0089
+  WHERE type = 'value0035'
+    AND CAST(v0090 AS TIMESTAMP) >= (SELECT CAST(current_date - INTERVAL '30 days' AS TIMESTAMP))
+    AND json_get_str(data, 'value0032') LIKE 'value0052.%'
+),
+v0091 AS (
+  SELECT v0058, MAX(v0088) AS v0092 FROM v0085 GROUP BY v0058
+),
+v0093 AS (
+  SELECT v0094.v0058, v0094.v0087 AS v0095, v0094.v1062
+  FROM v0085 v0094
+  INNER JOIN v0091 v0096 ON v0096.v0058 = v0094.v0058 AND v0096.v0092 = v0094.v0088
+),
+v0097 AS (
+  SELECT v0000.v0058, v0000.v1061, v0098.v0095, v0098.v1062
+  FROM v0736 v0000
+  INNER JOIN v0093 v0098 ON v0098.v0058 = v0000.v0058
+),
+v0241 AS (
+  SELECT
+    v1061,
+    COUNT(*) AS v1063,
+    COUNT(CASE WHEN v0095 = 'value0039' THEN 1 END) AS v1043,
+    COUNT(CASE WHEN v1062 = 'value0098' THEN 1 END) AS v1064
+  FROM v0097
+  GROUP BY v1061
+)
+SELECT * FROM (
+  SELECT
+    'value0603 value0604 value0037 value0038' AS metric,
+    v1061,
+    1 AS v0099,
+    CAST(v1043 AS DOUBLE) / NULLIF(v1063, 0) AS v0100,
+    v1043 AS v0101,
+    v1063 AS v0102
+  FROM v0241
+  UNION ALL
+  SELECT
+    'value0605 value0448 value0037 value0038',
+    v1061,
+    2,
+    CAST(v1064 AS DOUBLE) / NULLIF(v1063, 0),
+    v1064,
+    v1063
+  FROM v0241
+) v0000
+ORDER BY v0099, v1061
+
+-- query 195
+WITH v0736 AS (
+  SELECT DISTINCT
+    v0058,
+    COALESCE(json_get_str(metadata, 'value0228'), '(value0602)') AS v1061
+  FROM v0426
+  WHERE CAST(v0025 AS TIMESTAMP) >= (SELECT CAST(current_date - INTERVAL '30 days' AS TIMESTAMP))
+    AND CAST(v0025 AS TIMESTAMP) < (SELECT CAST(current_date + INTERVAL '1 day' AS TIMESTAMP))
+    AND v0030 = 1
+    AND type = 'value0016'
+    AND json_get_str(metadata, 'value0042') = 'value0044'
+),
+v0085 AS (
+  SELECT
+    REPLACE(json_get_str(data, 'value0032'), 'value0052.', '') AS v0058,
+    LOWER(json_get_str(data, 'value0033')) AS v0087,
+    json_get_str(data, 'value0089') AS v1062,
+    CAST(json_get_str(data, 'value0034') AS TIMESTAMP) AS v0088
+  FROM v0089
+  WHERE type = 'value0035'
+    AND CAST(v0090 AS TIMESTAMP) >= (SELECT CAST(current_date - INTERVAL '30 days' AS TIMESTAMP))
+    AND json_get_str(data, 'value0032') LIKE 'value0052.%'
+),
+v0091 AS (
+  SELECT v0058, MAX(v0088) AS v0092 FROM v0085 GROUP BY v0058
+),
+v0093 AS (
+  SELECT v0094.v0058, v0094.v0087 AS v0095, v0094.v1062
+  FROM v0085 v0094
+  INNER JOIN v0091 v0096 ON v0096.v0058 = v0094.v0058 AND v0096.v0092 = v0094.v0088
+),
+v0097 AS (
+  SELECT v0000.v0058, v0000.v1061, v0098.v0095, v0098.v1062
+  FROM v0736 v0000
+  INNER JOIN v0093 v0098 ON v0098.v0058 = v0000.v0058
+),
+v0241 AS (
+  SELECT
+    v1061,
+    COUNT(*) AS v1063,
+    COUNT(CASE WHEN v0095 = 'value0039' THEN 1 END) AS v1043,
+    COUNT(CASE WHEN v1062 = 'value0098' THEN 1 END) AS v1064
+  FROM v0097
+  GROUP BY v1061
+)
+SELECT * FROM (
+  SELECT
+    'value0603 value0604 value0037 value0038' AS metric,
+    v1061,
+    1 AS v0099,
+    CAST(v1043 AS DOUBLE) / NULLIF(v1063, 0) AS v0100,
+    v1043 AS v0101,
+    v1063 AS v0102
+  FROM v0241
+  UNION ALL
+  SELECT
+    'value0605 value0448 value0037 value0038',
+    v1061,
+    2,
+    CAST(v1064 AS DOUBLE) / NULLIF(v1063, 0),
+    v1064,
+    v1063
+  FROM v0241
+) v0000
+ORDER BY v0099, v1061
+
+-- query 196
+WITH v0736 AS (
+  SELECT DISTINCT
+    v0032.v0058,
+    json_get_str(v0032.metadata, 'value0042') AS v0123,
+    COALESCE(json_get_str(v0032.metadata, 'value0228'), '(value0602)') AS v1061,
+    REGEXP_REPLACE(v0032.v0970, '^value0523-', '') AS v1065
+  FROM v0426 v0032
+  WHERE CAST(v0032.v0025 AS TIMESTAMP) >= (SELECT CAST(current_date - INTERVAL '30 days' AS TIMESTAMP))
+    AND CAST(v0032.v0025 AS TIMESTAMP) < (SELECT CAST(current_date + INTERVAL '1 day' AS TIMESTAMP))
+    AND v0032.v0030 = 1
+    AND v0032.type = 'value0016'
+    AND (json_get_str(v0032.metadata, 'value0042') = 'value0043'
+         OR json_get_str(v0032.metadata, 'value0042') = 'value0044')
+),
+v1066 AS (
+  SELECT
+    v0000.v0058,
+    v0000.v0123,
+    v0000.v1061,
+    CASE
+      WHEN TRIM(v0318.v0972) = 'value0490 value0270 - value0606 & value0607' THEN 'value0490 value0270'
+      WHEN TRIM(v0318.v0972) = 'value0608' THEN 'value0501'
+      ELSE COALESCE(NULLIF(TRIM(v0318.v0972), ''), '(value0522)')
+    END AS v0972
+  FROM v0736 v0000
+  LEFT JOIN v0317 v0318 ON v0318.v0058 = v0000.v1065 AND v0318.v0030 = 1
+),
+v0085 AS (
+  SELECT
+    REPLACE(json_get_str(data, 'value0032'), 'value0052.', '') AS v0058,
+    LOWER(json_get_str(data, 'value0033')) AS v0087,
+    CAST(json_get_str(data, 'value0034') AS TIMESTAMP) AS v0088
+  FROM v0089
+  WHERE type = 'value0035'
+    AND CAST(v0090 AS TIMESTAMP) >= (SELECT CAST(current_date - INTERVAL '30 days' AS TIMESTAMP))
+    AND json_get_str(data, 'value0032') LIKE 'value0052.%'
+),
+v0091 AS (
+  SELECT v0058, MAX(v0088) AS v0092 FROM v0085 GROUP BY v0058
+),
+v0093 AS (
+  SELECT v0094.v0058, v0094.v0087 AS v0095
+  FROM v0085 v0094
+  INNER JOIN v0091 v0096 ON v0096.v0058 = v0094.v0058 AND v0096.v0092 = v0094.v0088
+),
+v0097 AS (
+  SELECT v0000.v0058, v0000.v0972, v0000.v0123, v0000.v1061, v0098.v0095
+  FROM v1066 v0000
+  INNER JOIN v0093 v0098 ON v0098.v0058 = v0000.v0058
+),
+v1067 AS (
+  SELECT
+    v0972,
+    COUNT(*) AS v0986,
+    COUNT(CASE WHEN v0123 = 'value0043' AND v1061 = 'value0229' THEN 1 END) AS v1068,
+    COUNT(CASE WHEN v0123 = 'value0043' AND v1061 = 'value0229' AND v0095 = 'value0039' THEN 1 END) AS v1069,
+    COUNT(CASE WHEN v0123 = 'value0044' AND v1061 = 'value0609' THEN 1 END) AS v1070,
+    COUNT(CASE WHEN v0123 = 'value0044' AND v1061 = 'value0609' AND v0095 = 'value0039' THEN 1 END) AS v1071,
+    COUNT(CASE WHEN v0123 = 'value0044' AND v1061 = '(value0602)' THEN 1 END) AS v1072,
+    COUNT(CASE WHEN v0123 = 'value0044' AND v1061 = '(value0602)' AND v0095 = 'value0039' THEN 1 END) AS v1073,
+    COUNT(CASE WHEN v0123 = 'value0044' AND v1061 = 'value0229' THEN 1 END) AS v1074,
+    COUNT(CASE WHEN v0123 = 'value0044' AND v1061 = 'value0229' AND v0095 = 'value0039' THEN 1 END) AS v1075
+  FROM v0097
+  GROUP BY v0972
+)
+SELECT
+  v0972,
+  v0986,
+  v1068,
+  CAST(v1069 AS DOUBLE) / NULLIF(v1068, 0) AS v1076,
+  v1070,
+  CAST(v1071 AS DOUBLE) / NULLIF(v1070, 0) AS v1077,
+  v1072,
+  CAST(v1073 AS DOUBLE) / NULLIF(v1072, 0) AS v1078,
+  v1074,
+  CAST(v1075 AS DOUBLE) / NULLIF(v1074, 0) AS v1079
+FROM v1067
+ORDER BY v0986 DESC
+LIMIT 20
+
+-- query 197
+SELECT
+  SUM(
+    CASE
+      WHEN v0025 >= '2026-07-21 16:00:53' AND v0031 = 'value0017'
+      THEN 1
+      ELSE 0
+    END
+  ) AS v1080,
+  SUM(
+    CASE
+      WHEN v0025 >= '2026-07-14 16:00:53'
+      AND v0025 < '2026-07-15 16:00:53'
+      AND v0031 = 'value0017'
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0692
+FROM v0029
+WHERE
+  v0030 = 1
+  AND v0036 = 'value0018'
+  AND type = 'value0015'
+  AND NOT v0025 IS NULL
+  AND (
+    v0025 >= '2026-07-21 16:00:53'
+    OR (
+      v0025 >= '2026-07-14 16:00:53' AND v0025 < '2026-07-15 16:00:53'
+    )
+  )
+
+-- query 198
+SELECT
+  SUM(
+    CASE
+      WHEN v0025 >= '2026-07-21 16:00:53' AND v0031 = 'value0017'
+      THEN v0033
+      ELSE 0
+    END
+  ) / 100 AS v1081,
+  SUM(
+    CASE
+      WHEN v0025 >= '2026-07-14 16:00:53'
+      AND v0025 < '2026-07-15 16:00:53'
+      AND v0031 = 'value0017'
+      THEN v0033
+      ELSE 0
+    END
+  ) / 100 AS v1082
+FROM v0029
+WHERE
+  v0030 = 1
+  AND v0036 = 'value0018'
+  AND type = 'value0015'
+  AND NOT v0025 IS NULL
+  AND (
+    v0025 >= '2026-07-21 16:00:53'
+    OR (
+      v0025 >= '2026-07-14 16:00:53' AND v0025 < '2026-07-15 16:00:53'
+    )
+  )
+
+-- query 199
+SELECT
+  1.0 * SUM(
+    CASE
+      WHEN v0025 >= '2026-07-21 16:00:53' AND v0031 = 'value0017'
+      THEN 1
+      ELSE 0
+    END
+  ) / NULLIF(
+    SUM(CASE WHEN v0025 >= '2026-07-21 16:00:53' THEN 1 ELSE 0 END) - SUM(
+      CASE
+        WHEN v0025 >= '2026-07-21 16:00:53' AND v0031 = 'value0014'
+        THEN 1
+        ELSE 0
+      END
+    ),
+    0
+  ) AS v0079,
+  1.0 * SUM(
+    CASE
+      WHEN v0025 >= '2026-07-14 16:00:53'
+      AND v0025 < '2026-07-15 16:00:53'
+      AND v0031 = 'value0017'
+      THEN 1
+      ELSE 0
+    END
+  ) / NULLIF(
+    SUM(
+      CASE
+        WHEN v0025 >= '2026-07-14 16:00:53' AND v0025 < '2026-07-15 16:00:53'
+        THEN 1
+        ELSE 0
+      END
+    ) - SUM(
+      CASE
+        WHEN v0025 >= '2026-07-14 16:00:53'
+        AND v0025 < '2026-07-15 16:00:53'
+        AND v0031 = 'value0014'
+        THEN 1
+        ELSE 0
+      END
+    ),
+    0
+  ) AS v0080
+FROM v0029
+WHERE
+  v0030 = 1
+  AND v0036 = 'value0018'
+  AND type = 'value0015'
+  AND NOT v0025 IS NULL
+  AND (
+    v0025 >= '2026-07-21 16:00:53'
+    OR (
+      v0025 >= '2026-07-14 16:00:53' AND v0025 < '2026-07-15 16:00:53'
+    )
+  )
+
+-- query 200
+SELECT
+  COUNT(DISTINCT CASE WHEN v0172 = CAST('2026-07-22' AS DATE) THEN v0058 END) AS v0689,
+  COUNT(DISTINCT CASE WHEN v0172 = CAST('2026-07-15' AS DATE) THEN v0058 END) AS v0690
+FROM v0056
+WHERE
+  v0060 IS NULL
+  AND v0172 IN (CAST('2026-07-22' AS DATE), CAST('2026-07-15' AS DATE))
+
+-- query 201
+SELECT
+  CASE
+    WHEN v0025 >= '2026-07-21 16:00:53'
+    THEN 'value0610'
+    WHEN v0025 >= '2026-07-14 16:00:53' AND v0025 < '2026-07-15 16:00:53'
+    THEN 'value0611'
+  END AS bucket,
+  COUNT(*) AS v0183,
+  SUM(v0026) / 100 AS v1083,
+  SUM(CASE WHEN v0031 = 'value0017' THEN 1 ELSE 0 END) AS v0020,
+  SUM(CASE WHEN v0031 = 'value0017' THEN v0033 ELSE 0 END) / 100 AS v0184,
+  SUM(CASE WHEN v0031 = 'value0612' THEN 1 ELSE 0 END) AS v0022,
+  SUM(CASE WHEN v0031 = 'value0014' THEN 1 ELSE 0 END) AS v1084,
+  SUM(CASE WHEN v0031 = 'value0613' THEN 1 ELSE 0 END) AS v1085,
+  1.0 * SUM(CASE WHEN v0031 = 'value0017' THEN 1 ELSE 0 END) / NULLIF(COUNT(*) - SUM(CASE WHEN v0031 = 'value0014' THEN 1 ELSE 0 END), 0) AS v1086
+FROM v0029
+WHERE
+  v0030 = 1
+  AND v0036 = 'value0018'
+  AND type = 'value0015'
+  AND NOT v0025 IS NULL
+  AND (
+    v0025 >= '2026-07-21 16:00:53'
+    OR (
+      v0025 >= '2026-07-14 16:00:53' AND v0025 < '2026-07-15 16:00:53'
+    )
+  )
+GROUP BY
+  CASE
+    WHEN v0025 >= '2026-07-21 16:00:53'
+    THEN 'value0610'
+    WHEN v0025 >= '2026-07-14 16:00:53' AND v0025 < '2026-07-15 16:00:53'
+    THEN 'value0611'
+  END
+ORDER BY
+  1
+
+-- query 202
+SELECT
+  SUBSTRING(CAST(CAST(v0025 AS DATE) AS TEXT), 6, 5) AS day,
+  COUNT(*) AS v0183,
+  SUM(CASE WHEN v0031 = 'value0017' THEN 1 ELSE 0 END) AS v0020,
+  SUM(CASE WHEN v0031 = 'value0017' THEN v0033 ELSE 0 END) / 100 AS v0184
+FROM v0029
+WHERE
+  v0030 = 1
+  AND v0036 = 'value0018'
+  AND type = 'value0015'
+  AND NOT v0025 IS NULL
+  AND v0025 >= '2026-07-08 16:00:53'
+GROUP BY
+  SUBSTRING(CAST(CAST(v0025 AS DATE) AS TEXT), 6, 5)
+ORDER BY
+  day
+
+-- query 203
+SELECT
+  SUBSTRING(CAST(v0172 AS TEXT), 6, 5) AS v0172,
+  SUM(v0006) / 100 AS v0188,
+  SUM(CASE WHEN v0031 = 'value0077' THEN v0006 ELSE 0 END) / 100 AS v1087,
+  100.0 * SUM(CASE WHEN v0031 = 'value0077' THEN v0006 ELSE 0 END) / NULLIF(SUM(v0006), 0) AS v1088
+FROM v0056
+WHERE
+  v0060 IS NULL
+  AND v0172 BETWEEN CAST('2026-07-08' AS DATE) AND CAST('2026-07-22' AS DATE)
+  AND v0172 + INTERVAL '90' DAYS > CAST('2026-07-22' AS DATE)
+GROUP BY
+  v0172
+ORDER BY
+  v0172
+
+-- query 204
+SELECT
+  SUBSTRING(CAST(v0172 AS TEXT), 6, 5) AS v0172,
+  COUNT(DISTINCT v0058) AS v0246,
+  SUM(v0006) / 100 AS v0188,
+  SUM(CASE WHEN v0031 = 'value0077' THEN 1 ELSE 0 END) AS v1089,
+  SUM(
+    CASE
+      WHEN v0031 IN ('value0614', 'value0615')
+      THEN 1
+      ELSE 0
+    END
+  ) AS v1090,
+  SUM(
+    CASE
+      WHEN v0031 IN (
+        'value0075',
+        'value0076',
+        'value0080'
+      )
+      THEN 1
+      ELSE 0
+    END
+  ) AS v1091
+FROM v0056
+WHERE
+  v0060 IS NULL
+  AND v0172 BETWEEN CAST('2026-07-08' AS DATE) AND CAST('2026-07-29' AS DATE)
+GROUP BY
+  v0172
+ORDER BY
+  v0172
+
+-- query 205
+WITH v1092 AS (
+  SELECT DATE '2026-07-06' AS v0172, 'value0616' AS v1093 UNION ALL
+  SELECT DATE '2026-07-07', 'value0617' UNION ALL
+  SELECT DATE '2026-07-08', 'value0618' UNION ALL
+  SELECT DATE '2026-07-09', 'value0619' UNION ALL
+  SELECT DATE '2026-07-10', 'value0620' UNION ALL
+  SELECT DATE '2026-07-11', 'value0621' UNION ALL
+  SELECT DATE '2026-07-12', 'value0622' UNION ALL
+  SELECT DATE '2026-07-13', 'value0616'
+),
+v1094 AS (
+  SELECT
+    v0057.v0172,
+    100.0 * SUM(CASE WHEN v0057.v0031 = 'value0077' THEN v0057.v0006 ELSE 0 END)
+      / NULLIF(CAST(SUM(v0057.v0006) AS DOUBLE), 0) AS v1088
+  FROM v0246 v0057
+  WHERE v0057.v0060 IS NULL
+    AND v0057.v0172 BETWEEN DATE '2026-05-25' AND DATE '2026-07-13'
+  GROUP BY v0057.v0172
+),
+v1095 AS (
+  SELECT
+    v0000.v0172 AS v1096,
+    AVG(v0593.v1088) AS v1097,
+    STDDEV(v0593.v1088) AS v1098,
+    COUNT(*) AS v1099
+  FROM v1092 v0000
+  JOIN v1094 v0593 ON v0593.v0172 IN (
+    v0000.v0172 - INTERVAL '7 days',
+    v0000.v0172 - INTERVAL '14 days',
+    v0000.v0172 - INTERVAL '21 days',
+    v0000.v0172 - INTERVAL '28 days',
+    v0000.v0172 - INTERVAL '35 days',
+    v0000.v0172 - INTERVAL '42 days'
+  )
+  GROUP BY v0000.v0172
+)
+SELECT
+  SUBSTRING(CAST(v0000.v0172 AS VARCHAR) FROM 6 FOR 5) AS date,
+  v0000.v1093,
+  CAST(v0032.v1088 AS DOUBLE) AS v1088,
+  CAST(v0593.v1097 AS DOUBLE) AS v1097,
+  CAST(v0593.v1098 AS DOUBLE) AS v1098,
+  v0593.v1099,
+  CAST((v0032.v1088 - v0593.v1097) / NULLIF(v0593.v1098, 0) AS DOUBLE) AS v1100
+FROM v1092 v0000
+JOIN v1094 v0032 ON v0032.v0172 = v0000.v0172
+LEFT JOIN v1095 v0593 ON v0593.v1096 = v0000.v0172
+ORDER BY v0000.v0172 DESC
+LIMIT 6
+
+-- query 206
+SELECT
+  v0738,
+  SUM(
+    CASE
+      WHEN v0025 >= '2026-07-14 16:00:53' AND v0025 < '2026-07-15 16:00:53'
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0739,
+  SUM(CASE WHEN v0025 >= '2026-07-21 16:00:53' THEN 1 ELSE 0 END) AS v0740,
+  SUM(
+    CASE
+      WHEN v0025 >= '2026-07-14 16:00:53'
+      AND v0025 < '2026-07-15 16:00:53'
+      AND v0031 = 'value0017'
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0741,
+  SUM(
+    CASE
+      WHEN v0025 >= '2026-07-21 16:00:53' AND v0031 = 'value0017'
+      THEN 1
+      ELSE 0
+    END
+  ) AS v0742,
+  SUM(
+    CASE
+      WHEN v0025 >= '2026-07-14 16:00:53'
+      AND v0025 < '2026-07-15 16:00:53'
+      AND v0031 = 'value0017'
+      THEN v0033
+      ELSE 0
+    END
+  ) / 100 AS v0743,
+  SUM(
+    CASE
+      WHEN v0025 >= '2026-07-21 16:00:53' AND v0031 = 'value0017'
+      THEN v0033
+      ELSE 0
+    END
+  ) / 100 AS v0744
+FROM v0029
+WHERE
+  v0030 = 1
+  AND v0036 = 'value0018'
+  AND type = 'value0015'
+  AND NOT v0025 IS NULL
+  AND (
+    v0025 >= '2026-07-21 16:00:53'
+    OR (
+      v0025 >= '2026-07-14 16:00:53' AND v0025 < '2026-07-15 16:00:53'
+    )
+  )
+GROUP BY
+  v0738
+ORDER BY
+  GREATEST(
+    SUM(
+      CASE
+        WHEN v0025 >= '2026-07-14 16:00:53' AND v0025 < '2026-07-15 16:00:53'
+        THEN 1
+        ELSE 0
+      END
+    ),
+    SUM(CASE WHEN v0025 >= '2026-07-21 16:00:53' THEN 1 ELSE 0 END)
+  ) DESC
+
+-- query 207
+SELECT
+  CASE
+    WHEN v0172 + INTERVAL '180' DAYS >= CAST('2026-07-22' AS DATE)
+    THEN '091-180d'
+    WHEN v0172 + INTERVAL '365' DAYS >= CAST('2026-07-22' AS DATE)
+    THEN '181-365d'
+    WHEN v0172 + INTERVAL '730' DAYS >= CAST('2026-07-22' AS DATE)
+    THEN '366-730d'
+    ELSE '731d+'
+  END AS v1101,
+  COUNT(*) AS v1102,
+  SUM(GREATEST(v0006 - COALESCE(v1103, 0), 0)) / 100.0 AS v1104,
+  AVG(GREATEST(v0006 - COALESCE(v1103, 0), 0)) / 100.0 AS v1105
+FROM v0246
+WHERE
+  v0060 IS NULL
+  AND NOT v0031 IN ('value0077', 'value0078', 'value0623')
+  AND v0172 + INTERVAL '90' DAYS < CAST('2026-07-22' AS DATE)
+GROUP BY
+  v1101
+ORDER BY
+  v1101
+
+-- query 208
+SELECT
+  CASE
+    WHEN data LIKE '%value0624%'
+    THEN REGEXP_REPLACE(REGEXP_REPLACE(data, '.*"value0624": "', ''), '".*', '')
+    ELSE 'value0625'
+  END AS v1106,
+  SUM(
+    CASE
+      WHEN v0090 >= '2026-07-14 16:00:53' AND v0090 < '2026-07-15 16:00:53'
+      THEN 1
+      ELSE 0
+    END
+  ) AS v1107,
+  SUM(CASE WHEN v0090 >= '2026-07-21 16:00:53' THEN 1 ELSE 0 END) AS v1108
+FROM v1109
+WHERE
+  v0060 IS NULL
+  AND (
+    v0090 >= '2026-07-21 16:00:53'
+    OR (
+      v0090 >= '2026-07-14 16:00:53' AND v0090 < '2026-07-15 16:00:53'
+    )
+  )
+GROUP BY
+  CASE
+    WHEN data LIKE '%value0624%'
+    THEN REGEXP_REPLACE(REGEXP_REPLACE(data, '.*"value0624": "', ''), '".*', '')
+    ELSE 'value0625'
+  END
+ORDER BY
+  GREATEST(
+    SUM(
+      CASE
+        WHEN v0090 >= '2026-07-14 16:00:53' AND v0090 < '2026-07-15 16:00:53'
+        THEN 1
+        ELSE 0
+      END
+    ),
+    SUM(CASE WHEN v0090 >= '2026-07-21 16:00:53' THEN 1 ELSE 0 END)
+  ) DESC
+
+-- query 209
+SELECT SUM(CASE WHEN v0000.v0012 > 0 THEN 1 ELSE 0 END) AS v0018
+FROM v1110 v0000
+WHERE v0000.v0171 NOT IN (
+    'value0626', 'value0627',
+    'value0628', 'value0629',
+    'value0630', 'value0631',
+    'value0632', 'value0633',
+    'value0634', 'value0635',
+    'value0636', 'value0637'
+  )
+  AND v0000.v1111 = (
+    SELECT MAX(v1112.v1111)
+    FROM v1110 v1112
+    WHERE v1112.v1113 = v0000.v1113
+  )
+
+-- query 210
+SELECT SUM(v0000.v0012) AS v1114
+FROM v1110 v0000
+WHERE v0000.v0171 NOT IN (
+    'value0626', 'value0627',
+    'value0628', 'value0629',
+    'value0630', 'value0631',
+    'value0632', 'value0633',
+    'value0634', 'value0635',
+    'value0636', 'value0637'
+  )
+  AND v0000.v1111 = (
+    SELECT MAX(v1112.v1111)
+    FROM v1110 v1112
+    WHERE v1112.v1113 = v0000.v1113
+  )
+
+-- query 211
+SELECT COUNT(DISTINCT v0057.v1115) AS v1116
+FROM v1117 v0057
+WHERE v0057.v0046 = 'value0638'
+  AND v0057.v1025 NOT IN (
+    'value0626', 'value0627',
+    'value0628', 'value0629',
+    'value0630', 'value0631',
+    'value0632', 'value0633',
+    'value0634', 'value0635',
+    'value0636', 'value0637'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM v1117 v0593
+    WHERE v0593.v1115 = v0057.v1115
+      AND v0593.v0046 = 'value0639'
+      AND v0593.v1118 > v0057.v1118
+  )
+
+-- query 212
+SELECT SUM(v0096.v1119) AS v0014
+FROM v1117 v0057
+INNER JOIN v1120 v0096
+  ON v0096.v1121 = v0057.v1115
+WHERE v0096.v0010 = (
+    SELECT MAX(v0010)
+    FROM v1120
+    WHERE v0010 <= CURRENT_DATE
+  )
+  AND v0057.v0046 = 'value0638'
+  AND v0057.v1025 NOT IN (
+    'value0626', 'value0627',
+    'value0628', 'value0629',
+    'value0630', 'value0631',
+    'value0632', 'value0633',
+    'value0634', 'value0635',
+    'value0636', 'value0637'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM v1117 v0593
+    WHERE v0593.v1115 = v0057.v1115
+      AND v0593.v0046 = 'value0639'
+      AND v0593.v1118 > v0057.v1118
+  )
+
+-- query 213
+SELECT
+  CAST(v0000.v1122 AS DATE) || '' AS date,
+  SUM(CASE WHEN v0000.v0006 > 0
+             AND ((v0000.v0395 IS NOT NULL AND v0000.v0395 != '')
+               OR (v0000.v1123 IS NOT NULL AND v0000.v1123 != '')
+               OR LOWER(v0000.v1124) = 'value0048'
+               OR (v0000.v1125 IS NOT NULL AND v0000.v1125 != '')
+               OR (v0000.v1126 IS NOT NULL AND v0000.v1126 != ''))
+           THEN v0000.v0006 ELSE 0 END) AS v1127,
+  SUM(CASE WHEN v0000.v0006 < 0
+             AND ((v0000.v0395 IS NOT NULL AND v0000.v0395 != '')
+               OR (v0000.v1128 IS NOT NULL AND v0000.v1128 != '')
+               OR LOWER(v0000.v1124) = 'value0048')
+           THEN ABS(v0000.v0006) - CASE WHEN v0000.v1129 = 'value0640' THEN COALESCE(
+             CAST(SUBSTRING(
+               SUBSTRING(v0040.Metadata FROM POSITION('"value0641":"' IN v0040.Metadata) + 19),
+               1,
+               POSITION('"' IN SUBSTRING(v0040.Metadata FROM POSITION('"value0641":"' IN v0040.Metadata) + 19)) - 1
+             ) AS DOUBLE), 0) ELSE 0 END
+           ELSE 0 END) AS v1130
+FROM v1110 v0000
+LEFT JOIN v0332 v0040
+  ON v0040.v0046 = 'value0642'
+ AND POSITION('"value0643":"' IN v0040.Metadata) > 0
+ AND POSITION('"value0641":"' IN v0040.Metadata) > 0
+ AND SUBSTRING(
+       SUBSTRING(v0040.Metadata FROM POSITION('"value0643":"' IN v0040.Metadata) + 17),
+       1,
+       POSITION('"' IN SUBSTRING(v0040.Metadata FROM POSITION('"value0643":"' IN v0040.Metadata) + 17)) - 1
+     ) = v0000.v1131
+WHERE v0000.v1132 IN ('value0644', 'value0645')
+  AND v0000.v0171 NOT IN (
+    'value0626', 'value0627',
+    'value0628', 'value0629',
+    'value0630', 'value0631',
+    'value0632', 'value0633',
+    'value0634', 'value0635',
+    'value0636', 'value0637'
+  )
+GROUP BY CAST(v0000.v1122 AS DATE)
+HAVING SUM(CASE WHEN v0000.v0006 > 0 THEN v0000.v0006 ELSE ABS(v0000.v0006) END) > 0
+ORDER BY CAST(v0000.v1122 AS DATE) ASC
+
+-- query 214
+SELECT
+  CAST(v0000.v1122 AS DATE) || '' AS date,
+  SUM(CASE WHEN (v0000.v0395 IS NULL OR v0000.v0395 = '')
+             AND ((v0000.v1123 IS NOT NULL AND v0000.v1123 != '') OR LOWER(v0000.v1124) = 'value0048')
+             AND v0000.v0006 > 0
+           THEN v0000.v0006 ELSE 0 END) AS v1133,
+  SUM(CASE WHEN v0000.v0395 IS NOT NULL AND v0000.v0395 != ''
+             AND v0000.v0006 > 0
+           THEN v0000.v0006 ELSE 0 END) AS v1134,
+  SUM(CASE WHEN (v0000.v0395 IS NULL OR v0000.v0395 = '')
+             AND (v0000.v1123 IS NULL OR v0000.v1123 = '')
+             AND LOWER(COALESCE(v0000.v1124, '')) != 'value0048'
+             AND ((v0000.v1125 IS NOT NULL AND v0000.v1125 != '') OR (v0000.v1126 IS NOT NULL AND v0000.v1126 != ''))
+             AND v0000.v0006 > 0
+           THEN v0000.v0006 ELSE 0 END) AS v1135,
+  SUM(CASE WHEN v0000.v0006 > 0
+             AND ((v0000.v0395 IS NOT NULL AND v0000.v0395 != '')
+               OR (v0000.v1123 IS NOT NULL AND v0000.v1123 != '')
+               OR LOWER(v0000.v1124) = 'value0048'
+               OR (v0000.v1125 IS NOT NULL AND v0000.v1125 != '')
+               OR (v0000.v1126 IS NOT NULL AND v0000.v1126 != ''))
+           THEN v0000.v0006 ELSE 0 END) AS v1127,
+  SUM(CASE WHEN v0000.v0395 IS NOT NULL AND v0000.v0395 != ''
+             AND v0000.v0006 < 0
+             AND (v0000.v1129 IS NULL OR v0000.v1129 != 'value0640')
+           THEN ABS(v0000.v0006) ELSE 0 END) AS v1136,
+  SUM(CASE WHEN v0000.v0395 IS NOT NULL AND v0000.v0395 != ''
+             AND v0000.v0006 < 0
+             AND v0000.v1129 = 'value0640'
+           THEN ABS(v0000.v0006) - COALESCE(
+             CAST(SUBSTRING(
+               SUBSTRING(v0040.Metadata FROM POSITION('"value0641":"' IN v0040.Metadata) + 19),
+               1,
+               POSITION('"' IN SUBSTRING(v0040.Metadata FROM POSITION('"value0641":"' IN v0040.Metadata) + 19)) - 1
+             ) AS DOUBLE), 0)
+           ELSE 0 END) AS v1137,
+  SUM(CASE WHEN (v0000.v0395 IS NULL OR v0000.v0395 = '')
+             AND ((v0000.v1128 IS NOT NULL AND v0000.v1128 != '') OR LOWER(v0000.v1124) = 'value0048')
+             AND v0000.v0006 < 0
+           THEN ABS(v0000.v0006) ELSE 0 END) AS v0707,
+  SUM(CASE WHEN v0000.v0006 < 0
+             AND ((v0000.v0395 IS NOT NULL AND v0000.v0395 != '')
+               OR (v0000.v1128 IS NOT NULL AND v0000.v1128 != '')
+               OR LOWER(v0000.v1124) = 'value0048')
+           THEN ABS(v0000.v0006) - CASE WHEN v0000.v1129 = 'value0640' THEN COALESCE(
+             CAST(SUBSTRING(
+               SUBSTRING(v0040.Metadata FROM POSITION('"value0641":"' IN v0040.Metadata) + 19),
+               1,
+               POSITION('"' IN SUBSTRING(v0040.Metadata FROM POSITION('"value0641":"' IN v0040.Metadata) + 19)) - 1
+             ) AS DOUBLE), 0) ELSE 0 END
+           ELSE 0 END) AS v1130
+FROM v1110 v0000
+LEFT JOIN v0332 v0040
+  ON v0040.v0046 = 'value0642'
+ AND POSITION('"value0643":"' IN v0040.Metadata) > 0
+ AND POSITION('"value0641":"' IN v0040.Metadata) > 0
+ AND SUBSTRING(
+       SUBSTRING(v0040.Metadata FROM POSITION('"value0643":"' IN v0040.Metadata) + 17),
+       1,
+       POSITION('"' IN SUBSTRING(v0040.Metadata FROM POSITION('"value0643":"' IN v0040.Metadata) + 17)) - 1
+     ) = v0000.v1131
+WHERE v0000.v1132 IN ('value0644', 'value0645')
+  AND CAST(v0000.v1122 AS DATE) >= CURRENT_DATE - INTERVAL '29 days'
+  AND v0000.v0171 NOT IN (
+    'value0626', 'value0627',
+    'value0628', 'value0629',
+    'value0630', 'value0631',
+    'value0632', 'value0633',
+    'value0634', 'value0635',
+    'value0636', 'value0637'
+  )
+GROUP BY CAST(v0000.v1122 AS DATE)
+ORDER BY date DESC
+
+-- query 215
+SELECT
+  CAST(CAST(v1122 AS DATE) AS VARCHAR) AS date,
+  SUM(CASE WHEN UPPER(COALESCE(v0505, '')) LIKE '%value0646%'
+             AND UPPER(COALESCE(v0505, '')) NOT LIKE '%value0647 value0555%'
+             AND v0006 > 0
+           THEN v0006 ELSE 0 END) AS v1138,
+  SUM(CASE WHEN UPPER(COALESCE(v0505, '')) LIKE '%value0648%'
+             AND UPPER(COALESCE(v0505, '')) NOT LIKE '%value0649%'
+             AND UPPER(COALESCE(v0505, '')) NOT LIKE '%value0650%'
+             AND UPPER(COALESCE(v0505, '')) NOT LIKE '%value0651%'
+             AND UPPER(COALESCE(v0505, '')) NOT LIKE '%value0652%'
+           THEN ABS(v0006) ELSE 0 END) AS v1139,
+  SUM(CASE WHEN UPPER(COALESCE(v0505, '')) LIKE '%value0648%'
+             AND (UPPER(COALESCE(v0505, '')) LIKE '%value0649%'
+               OR UPPER(COALESCE(v0505, '')) LIKE '%value0650%'
+               OR UPPER(COALESCE(v0505, '')) LIKE '%value0651%'
+               OR UPPER(COALESCE(v0505, '')) LIKE '%value0652%')
+           THEN ABS(v0006) ELSE 0 END) AS v1140,
+  SUM(CASE WHEN LOWER(COALESCE(v1124, '')) = 'value0048'
+             AND UPPER(COALESCE(v0505, '')) LIKE '%value0255%value0653%'
+           THEN ABS(v0006) ELSE 0 END) AS v1141
+FROM v1110
+WHERE v1132 IN ('value0644', 'value0645')
+  AND v0171 NOT IN (
+    'value0626', 'value0627',
+    'value0628', 'value0629',
+    'value0630', 'value0631',
+    'value0632', 'value0633',
+    'value0634', 'value0635',
+    'value0636', 'value0637'
+  )
+  AND (
+    (UPPER(COALESCE(v0505, '')) LIKE '%value0646%'
+      AND UPPER(COALESCE(v0505, '')) NOT LIKE '%value0647 value0555%'
+      AND v0006 > 0)
+    OR UPPER(COALESCE(v0505, '')) LIKE '%value0648%'
+    OR (LOWER(COALESCE(v1124, '')) = 'value0048'
+        AND UPPER(COALESCE(v0505, '')) LIKE '%value0255%value0653%')
+  )
+GROUP BY 1
+ORDER BY 1 DESC
+
+-- query 216
+SELECT
+  CAST(v0010 AS VARCHAR) AS date,
+  SUM(CASE WHEN v1142 THEN 1 ELSE 0 END) AS v1143,
+  SUM(v0605) AS v1114
+FROM v1120
+WHERE v0010 >= CURRENT_DATE - INTERVAL '29 days'
+  AND v0010 < CURRENT_DATE
+  AND v0171 NOT IN (
+    'value0626', 'value0627',
+    'value0628', 'value0629',
+    'value0630', 'value0631',
+    'value0632', 'value0633',
+    'value0634', 'value0635',
+    'value0636', 'value0637'
+  )
+GROUP BY v0010
+UNION ALL
+SELECT
+  CAST(CURRENT_DATE AS VARCHAR) AS date,
+  SUM(CASE WHEN v0000.v0012 > 0 THEN 1 ELSE 0 END) AS v1143,
+  SUM(v0000.v0012) AS v1114
+FROM v1110 v0000
+WHERE v0000.v0171 NOT IN (
+    'value0626', 'value0627',
+    'value0628', 'value0629',
+    'value0630', 'value0631',
+    'value0632', 'value0633',
+    'value0634', 'value0635',
+    'value0636', 'value0637'
+  )
+  AND v0000.v1111 = (
+    SELECT MAX(v1112.v1111)
+    FROM v1110 v1112
+    WHERE v1112.v1113 = v0000.v1113
+  )
+ORDER BY date DESC
+
+-- query 217
+SELECT
+  CAST(CAST(date_trunc('week', CAST(v0040.v1118 AS TIMESTAMP)) AS DATE) AS VARCHAR) AS week,
+  SUM(CASE
+    WHEN COALESCE(json_get_str(v0073.v1144, 'value0654', 'value0655'), '') != 'value0656'
+    THEN CAST(SUBSTRING(SUBSTRING(v0040.v1145, POSITION('value0392 $' IN v0040.v1145) + 5), 1,
+                       CASE WHEN POSITION(' ' IN SUBSTRING(v0040.v1145, POSITION('value0392 $' IN v0040.v1145) + 5)) > 0
+                         THEN POSITION(' ' IN SUBSTRING(v0040.v1145, POSITION('value0392 $' IN v0040.v1145) + 5)) - 1
+                         ELSE LENGTH(SUBSTRING(v0040.v1145, POSITION('value0392 $' IN v0040.v1145) + 5)) END
+                      ) AS DOUBLE) ELSE 0 END) AS v0510,
+  SUM(CASE
+    WHEN json_get_str(v0073.v1144, 'value0654', 'value0655') = 'value0656'
+    THEN CAST(SUBSTRING(SUBSTRING(v0040.v1145, POSITION('value0392 $' IN v0040.v1145) + 5), 1,
+                       CASE WHEN POSITION(' ' IN SUBSTRING(v0040.v1145, POSITION('value0392 $' IN v0040.v1145) + 5)) > 0
+                         THEN POSITION(' ' IN SUBSTRING(v0040.v1145, POSITION('value0392 $' IN v0040.v1145) + 5)) - 1
+                         ELSE LENGTH(SUBSTRING(v0040.v1145, POSITION('value0392 $' IN v0040.v1145) + 5)) END
+                      ) AS DOUBLE) ELSE 0 END) AS v1146,
+  SUM(CAST(SUBSTRING(SUBSTRING(v0040.v1145, POSITION('value0392 $' IN v0040.v1145) + 5), 1,
+                    CASE WHEN POSITION(' ' IN SUBSTRING(v0040.v1145, POSITION('value0392 $' IN v0040.v1145) + 5)) > 0
+                      THEN POSITION(' ' IN SUBSTRING(v0040.v1145, POSITION('value0392 $' IN v0040.v1145) + 5)) - 1
+                      ELSE LENGTH(SUBSTRING(v0040.v1145, POSITION('value0392 $' IN v0040.v1145) + 5)) END
+                   ) AS DOUBLE)) AS v1147
+FROM v1117 v0040
+LEFT JOIN v1148 v0073
+  ON v0073.v1025 = v0040.v1025
+  AND v0073.v1149 IN (
+    SELECT v1150.v1149 FROM v1148 v1150
+    WHERE v1150.v1144 IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM v1148 v1151
+      WHERE v1151.v1025 = v1150.v1025
+      AND v1151.v1144 IS NOT NULL
+      AND v1151.v1152 > v1150.v1152
+    )
+  )
+WHERE v0040.v0046 = 'value0657'
+  AND v0040.v1025 NOT IN (
+    'value0626', 'value0627',
+    'value0628', 'value0629',
+    'value0630', 'value0631',
+    'value0632', 'value0633',
+    'value0634', 'value0635',
+    'value0636', 'value0637'
+  )
+GROUP BY 1
+ORDER BY 1 DESC
+
+-- query 218
+SELECT
+  CAST(CAST(date_trunc('week', CAST(SUBSTR(v0860.v1153, 1, 19) AS TIMESTAMP)) AS DATE) AS VARCHAR) AS week,
+  COUNT(DISTINCT v0057.v1115) AS v1154,
+  COUNT(DISTINCT v0040.v0200) AS v1155
+FROM v1156 v0860
+LEFT JOIN v1156 v0057
+  ON date_trunc('week', CAST(SUBSTR(v0057.v1153, 1, 19) AS TIMESTAMP)) = date_trunc('week', CAST(SUBSTR(v0860.v1153, 1, 19) AS TIMESTAMP))
+  AND v0057.v1153 IS NOT NULL AND v0057.v1153 != ''
+  AND v0057.v0047 IS NULL
+  AND v0057.v1025 NOT IN (
+    'value0626', 'value0627',
+    'value0628', 'value0629',
+    'value0630', 'value0631',
+    'value0632', 'value0633',
+    'value0634', 'value0635',
+    'value0636', 'value0637'
+  )
+LEFT JOIN v1117 v0040
+  ON date_trunc('week', CAST(v0040.v1118 AS TIMESTAMP)) = date_trunc('week', CAST(SUBSTR(v0860.v1153, 1, 19) AS TIMESTAMP))
+  AND v0040.v0046 = 'value0658'
+  AND v0040.v0047 IS NULL
+WHERE v0860.v1153 IS NOT NULL
+  AND v0860.v1153 != ''
+  AND v0860.v0047 IS NULL
+  AND v0860.v1025 NOT IN (
+    'value0626', 'value0627',
+    'value0628', 'value0629',
+    'value0630', 'value0631',
+    'value0632', 'value0633',
+    'value0634', 'value0635',
+    'value0636', 'value0637'
+  )
+GROUP BY 1
+HAVING COUNT(DISTINCT v0057.v1115) + COUNT(DISTINCT v0040.v0200) > 0
+ORDER BY 1 DESC
+
+-- query 219
+SELECT
+  COUNT(DISTINCT v1121) AS v0007
+FROM v1157
+WHERE
+  v1158 >= CAST(CURRENT_DATE - INTERVAL '31' DAYS AS TIMESTAMP)
+
+-- query 220
+SELECT
+  COUNT(DISTINCT v1121) AS v1159
+FROM v1160
+WHERE
+  COALESCE(v1161, v1162) >= CAST(CURRENT_DATE - INTERVAL '31' DAYS AS TIMESTAMP)
+
+-- query 221
+SELECT
+  COUNT(*) AS v1163
+FROM v1160
+WHERE
+  COALESCE(v1161, v1162) >= CAST(CURRENT_DATE - INTERVAL '31' DAYS AS TIMESTAMP)
+
+-- query 222
+SELECT
+  COUNT(*) AS v1157
+FROM v1157
+WHERE
+  v1158 >= CAST(CURRENT_DATE - INTERVAL '31' DAYS AS TIMESTAMP)
+
+-- query 223
+SELECT
+  SUM(
+    CASE
+      WHEN status = 'value0659' AND COALESCE(v1164, '') <> 'value0300'
+      THEN 1
+      ELSE 0
+    END
+  ) AS v1165
+FROM v1157
+WHERE
+  v1158 >= CAST(CURRENT_DATE - INTERVAL '31' DAYS AS TIMESTAMP)
+
+-- query 224
+SELECT
+  SUM(CASE WHEN v1164 = 'value0300' THEN 1 ELSE 0 END) AS v1166
+FROM v1157
+WHERE
+  v1158 >= CAST(CURRENT_DATE - INTERVAL '31' DAYS AS TIMESTAMP)
+
+-- query 225
+SELECT
+  rule,
+  v1167,
+  CASE
+    WHEN rule = 'value0660' THEN COUNT(DISTINCT regexp_replace(regexp_replace(detail, '^.*value0661 "', ''), '" value0662 value0123.*$', ''))
+    ELSE COUNT(*)
+  END AS v1168
+FROM v1160
+WHERE
+  COALESCE(v1161, v1162) >= CAST(CURRENT_DATE - INTERVAL '31' DAYS AS TIMESTAMP)
+GROUP BY
+  rule,
+  v1167
+ORDER BY
+  v1168 DESC
+
+-- query 226
+SELECT
+  v1169.v1121,
+  MAX(v0057.v1113) AS v1113,
+  MAX(v0057.v1170) AS v1170,
+  MAX(v0057.v1171) AS v1171,
+  MAX(v0057.v0605) AS v0605,
+  MAX(v0057.v1172) AS v1172,
+  MAX(v1173.v1174) AS v1174,
+  MAX(v1173.v1175) AS v1175,
+  MAX(v1173.v1165) AS v1165,
+  MAX(v1173.v1166) AS v1166,
+  MAX(v1173.v1176) AS v1176,
+  MAX(v1173.v1177) AS v1177,
+  COUNT(DISTINCT v1169.rule) AS v1178,
+  STRING_AGG(DISTINCT v1169.rule, ', ' ORDER BY v1169.rule) AS v1179,
+  STRING_AGG(DISTINCT v1169.detail, ' | ') AS v1180
+FROM v1160 v1169
+LEFT JOIN v1181 v0057 ON v0057.v1121 = v1169.v1121
+LEFT JOIN (
+  SELECT
+    v1121,
+    COUNT(*) AS v1174,
+    SUM(CASE WHEN status = 'value0659' THEN 1 ELSE 0 END) AS v1175,
+    SUM(CASE WHEN status = 'value0659' AND COALESCE(v1164, '') <> 'value0300' THEN 1 ELSE 0 END) AS v1165,
+    SUM(CASE WHEN v1164 = 'value0300' THEN 1 ELSE 0 END) AS v1166,
+    (SUM(CASE WHEN status = 'value0659' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0)) AS v1176,
+    MAX(v1182) AS v1177
+  FROM v1157
+  WHERE v1158 >= CAST(CURRENT_DATE - INTERVAL '31' DAYS AS TIMESTAMP)
+  GROUP BY v1121
+) v1173 ON v1173.v1121 = v1169.v1121
+WHERE COALESCE(v1169.v1161, v1169.v1162) >= CAST(CURRENT_DATE - INTERVAL '31' DAYS AS TIMESTAMP)
+GROUP BY v1169.v1121
+ORDER BY v1178 DESC, v1165 DESC, v1177 DESC
+
+-- query 227
+WITH v0586 AS (
+  SELECT *
+  FROM v1160
+  WHERE COALESCE(v1161, v1162) >= CAST(CURRENT_DATE - INTERVAL '31' DAYS AS TIMESTAMP)
+), v1183 AS (
+  SELECT
+    v0171,
+    v1184,
+    v1121,
+    rule,
+    v1167,
+    CASE WHEN v1185 = 'value0663' THEN COALESCE(v1186, 0) ELSE 1 END AS v1187,
+    CASE WHEN v1185 = 'value0663' THEN COALESCE(v1188, 0.0) ELSE COALESCE(v0120, 0.0) END AS v1189,
+    detail
+  FROM v0586
+), v1190 AS (
+  SELECT
+    v0171,
+    v1184,
+    v1121,
+    rule,
+    MAX(v1167) AS v1167,
+    CAST(SUM(v1187) AS BIGINT) AS v1186,
+    CAST(SUM(v1189) AS DOUBLE) AS v1188,
+    MAX(detail) AS detail
+  FROM v1183
+  GROUP BY 1, 2, 3, 4
+)
+SELECT
+  v0171,
+  v1184,
+  v1121,
+  rule,
+  v1167,
+  v1186,
+  v1188,
+  detail
+FROM v1190
+WHERE v0171 IS NOT NULL
+ORDER BY v1186 DESC, rule ASC
+
+-- query 228
+SELECT
+  rule,
+  v1167,
+  v1121,
+  v0395,
+  v1191,
+  v1161,
+  v0120,
+  v1192,
+  v1193,
+  detail
+FROM v1160
+WHERE
+  COALESCE(v1161, v1162) >= CAST(CURRENT_DATE - INTERVAL '31' DAYS AS TIMESTAMP)
+  AND v1185 = 'value0664'
+ORDER BY
+  v1161 DESC
+
+-- query 229
+WITH rows AS (
+  SELECT CAST('value0665 value0666 value0667 — value0668' AS VARCHAR) AS metric, CAST('value0669' AS VARCHAR) AS v1194, CAST(1 AS INTEGER) AS v0731, CAST(24 AS INTEGER) AS v1195, CAST(128 AS INTEGER) AS v1196, CAST(5202 AS INTEGER) AS v1197, CAST(4233 AS INTEGER) AS v1198, CAST('$27,962' AS VARCHAR) AS v1199, CAST('$32,312' AS VARCHAR) AS v1200, CAST('$30,159' AS VARCHAR) AS v1201, CAST('$38,795' AS VARCHAR) AS v1202, CAST('-13.5%' AS VARCHAR) AS v1203
+  UNION ALL SELECT CAST('value0665 value0666 value0667 — value0670' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(2 AS INTEGER), CAST(24 AS INTEGER), CAST(128 AS INTEGER), CAST(5202 AS INTEGER), CAST(4233 AS INTEGER), CAST('$30,271' AS VARCHAR), CAST('$35,742' AS VARCHAR), CAST('$35,985' AS VARCHAR), CAST('$45,595' AS VARCHAR), CAST('-15.3%' AS VARCHAR)
+  UNION ALL SELECT CAST('value0671 value0667 — value0668' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(3 AS INTEGER), CAST(24 AS INTEGER), CAST(128 AS INTEGER), CAST(5202 AS INTEGER), CAST(4233 AS INTEGER), CAST('$12,984' AS VARCHAR), CAST('$18,432' AS VARCHAR), CAST('$25,228' AS VARCHAR), CAST('$4,450' AS VARCHAR), CAST('-29.6%' AS VARCHAR)
+  UNION ALL SELECT CAST('value0671 value0667 — value0670' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(4 AS INTEGER), CAST(24 AS INTEGER), CAST(128 AS INTEGER), CAST(5202 AS INTEGER), CAST(4233 AS INTEGER), CAST('$17,443' AS VARCHAR), CAST('$21,629' AS VARCHAR), CAST('$30,299' AS VARCHAR), CAST('$6,149' AS VARCHAR), CAST('-19.4%' AS VARCHAR)
+  UNION ALL SELECT CAST('value0671 value0672 value0667 value0673 — value0668' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(5 AS INTEGER), CAST(24 AS INTEGER), CAST(128 AS INTEGER), CAST(5202 AS INTEGER), CAST(4233 AS INTEGER), CAST('$962' AS VARCHAR), CAST('$751' AS VARCHAR), CAST('$1,151' AS VARCHAR), CAST('$245' AS VARCHAR), CAST('+28.1%' AS VARCHAR)
+  UNION ALL SELECT CAST('value0671 value0672 value0667 value0673 — value0670' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(6 AS INTEGER), CAST(24 AS INTEGER), CAST(128 AS INTEGER), CAST(5202 AS INTEGER), CAST(4233 AS INTEGER), CAST('$1,540' AS VARCHAR), CAST('$1,654' AS VARCHAR), CAST('$2,318' AS VARCHAR), CAST('$529' AS VARCHAR), CAST('-6.9%' AS VARCHAR)
+  UNION ALL SELECT CAST('value0674 value0038 (value0671 value0674 / value0671 value0667) — value0668' AS VARCHAR), CAST('value0675' AS VARCHAR), CAST(7 AS INTEGER), CAST(24 AS INTEGER), CAST(128 AS INTEGER), CAST(5202 AS INTEGER), CAST(4233 AS INTEGER), CAST('5.51%' AS VARCHAR), CAST('4.90%' AS VARCHAR), CAST('5.56%' AS VARCHAR), CAST('5.56%' AS VARCHAR), CAST('+0.61value0676' AS VARCHAR)
+  UNION ALL SELECT CAST('value0674 value0038 (value0671 value0674 / value0671 value0667) — value0670' AS VARCHAR), CAST('value0675' AS VARCHAR), CAST(8 AS INTEGER), CAST(24 AS INTEGER), CAST(128 AS INTEGER), CAST(5202 AS INTEGER), CAST(4233 AS INTEGER), CAST('5.89%' AS VARCHAR), CAST('6.05%' AS VARCHAR), CAST('5.69%' AS VARCHAR), CAST('6.11%' AS VARCHAR), CAST('-0.16value0676' AS VARCHAR)
+  UNION ALL SELECT CAST('value0677-value0674 value0678' AS VARCHAR), CAST('value0675' AS VARCHAR), CAST(9 AS INTEGER), CAST(24 AS INTEGER), CAST(128 AS INTEGER), CAST(5202 AS INTEGER), CAST(4233 AS INTEGER), CAST('25.0%' AS VARCHAR), CAST('21.1%' AS VARCHAR), CAST('29.3%' AS VARCHAR), CAST('49.0%' AS VARCHAR), CAST('+3.9value0676' AS VARCHAR)
+  UNION ALL SELECT CAST('value0679 value0680 value0678' AS VARCHAR), CAST('value0675' AS VARCHAR), CAST(10 AS INTEGER), CAST(24 AS INTEGER), CAST(128 AS INTEGER), CAST(5202 AS INTEGER), CAST(4233 AS INTEGER), CAST('41.7%' AS VARCHAR), CAST('49.2%' AS VARCHAR), CAST('49.1%' AS VARCHAR), CAST('43.3%' AS VARCHAR), CAST('-7.6value0676' AS VARCHAR)
+)
+SELECT metric, v1194, v0731, v1195, v1196, v1197, v1198, v1199, v1200, v1201, v1202, v1203
+FROM rows
+ORDER BY v0731
+
+-- query 230
+WITH rows AS (
+  SELECT CAST('value0681-value0269 value0678' AS VARCHAR) AS metric, CAST('value0675' AS VARCHAR) AS v1194, CAST(1 AS INTEGER) AS v0731, CAST(24 AS INTEGER) AS v1195, CAST(128 AS INTEGER) AS v1196, CAST(5202 AS INTEGER) AS v1197, CAST(4233 AS INTEGER) AS v1198, CAST('33.3%' AS VARCHAR) AS v1199, CAST('30.5%' AS VARCHAR) AS v1200, CAST('31.8%' AS VARCHAR) AS v1201, CAST('16.2%' AS VARCHAR) AS v1202, CAST('+2.9value0676' AS VARCHAR) AS v1203
+  UNION ALL SELECT CAST('value0682 value0683 — value0668' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(2 AS INTEGER), CAST(8 AS INTEGER), CAST(39 AS INTEGER), CAST(1653 AS INTEGER), CAST(684 AS INTEGER), CAST('$1,957' AS VARCHAR), CAST('$1,508' AS VARCHAR), CAST('$1,072' AS VARCHAR), CAST('$2,117' AS VARCHAR), CAST('+29.8%' AS VARCHAR)
+  UNION ALL SELECT CAST('value0682 value0683 — value0670' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(3 AS INTEGER), CAST(8 AS INTEGER), CAST(39 AS INTEGER), CAST(1653 AS INTEGER), CAST(684 AS INTEGER), CAST('$2,336' AS VARCHAR), CAST('$2,499' AS VARCHAR), CAST('$1,679' AS VARCHAR), CAST('$2,909' AS VARCHAR), CAST('-6.5%' AS VARCHAR)
+  UNION ALL SELECT CAST('value0684 value0683 — value0668' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(4 AS INTEGER), CAST(8 AS INTEGER), CAST(39 AS INTEGER), CAST(1653 AS INTEGER), CAST(684 AS INTEGER), CAST('$174' AS VARCHAR), CAST('$168' AS VARCHAR), CAST('$120' AS VARCHAR), CAST('$180' AS VARCHAR), CAST('+3.5%' AS VARCHAR)
+  UNION ALL SELECT CAST('value0684 value0683 — value0670' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(5 AS INTEGER), CAST(8 AS INTEGER), CAST(39 AS INTEGER), CAST(1653 AS INTEGER), CAST(684 AS INTEGER), CAST('$224' AS VARCHAR), CAST('$273' AS VARCHAR), CAST('$200' AS VARCHAR), CAST('$259' AS VARCHAR), CAST('-17.7%' AS VARCHAR)
+  UNION ALL SELECT CAST('value0681 value0685 value0441 value0686 — value0668' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(6 AS INTEGER), CAST(8 AS INTEGER), CAST(39 AS INTEGER), CAST(1653 AS INTEGER), CAST(684 AS INTEGER), CAST('$67' AS VARCHAR), CAST('$60' AS VARCHAR), CAST('$37' AS VARCHAR), CAST('$62' AS VARCHAR), CAST('+12.2%' AS VARCHAR)
+  UNION ALL SELECT CAST('value0681 value0685 value0441 value0686 — value0670' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(7 AS INTEGER), CAST(8 AS INTEGER), CAST(39 AS INTEGER), CAST(1653 AS INTEGER), CAST(684 AS INTEGER), CAST('$77' AS VARCHAR), CAST('$93' AS VARCHAR), CAST('$63' AS VARCHAR), CAST('$98' AS VARCHAR), CAST('-16.6%' AS VARCHAR)
+  UNION ALL SELECT CAST('value0665 value0673 value0037 — value0668' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(8 AS INTEGER), CAST(24 AS INTEGER), CAST(128 AS INTEGER), CAST(5202 AS INTEGER), CAST(4233 AS INTEGER), CAST('$331' AS VARCHAR), CAST('$408' AS VARCHAR), CAST('$1,770' AS VARCHAR), CAST('$60' AS VARCHAR), CAST('-18.8%' AS VARCHAR)
+  UNION ALL SELECT CAST('value0665 value0673 value0037 — value0670' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(9 AS INTEGER), CAST(24 AS INTEGER), CAST(128 AS INTEGER), CAST(5202 AS INTEGER), CAST(4233 AS INTEGER), CAST('$2,851' AS VARCHAR), CAST('$2,075' AS VARCHAR), CAST('$2,413' AS VARCHAR), CAST('$437' AS VARCHAR), CAST('+37.4%' AS VARCHAR)
+  UNION ALL SELECT CAST('value0687-value0688 value0689 — value0668' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(10 AS INTEGER), CAST(24 AS INTEGER), CAST(128 AS INTEGER), CAST(5202 AS INTEGER), CAST(4233 AS INTEGER), CAST('$4,500' AS VARCHAR), CAST('$1,550' AS VARCHAR), CAST('$2,500' AS VARCHAR), CAST('$2,500' AS VARCHAR), CAST('+190.3%' AS VARCHAR)
+  UNION ALL SELECT CAST('value0687-value0688 value0689 — value0670' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(11 AS INTEGER), CAST(24 AS INTEGER), CAST(128 AS INTEGER), CAST(5202 AS INTEGER), CAST(4233 AS INTEGER), CAST('$4,026' AS VARCHAR), CAST('$2,173' AS VARCHAR), CAST('$2,583' AS VARCHAR), CAST('$2,422' AS VARCHAR), CAST('+85.3%' AS VARCHAR)
+  UNION ALL SELECT CAST('value0690 value0689 — value0668' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(12 AS INTEGER), CAST(24 AS INTEGER), CAST(128 AS INTEGER), CAST(5202 AS INTEGER), CAST(4233 AS INTEGER), CAST('$5,372' AS VARCHAR), CAST('$2,629' AS VARCHAR), CAST('$4,177' AS VARCHAR), CAST('$2,944' AS VARCHAR), CAST('+104.4%' AS VARCHAR)
+  UNION ALL SELECT CAST('value0690 value0689 — value0670' AS VARCHAR), CAST('value0669' AS VARCHAR), CAST(13 AS INTEGER), CAST(24 AS INTEGER), CAST(128 AS INTEGER), CAST(5202 AS INTEGER), CAST(4233 AS INTEGER), CAST('$5,477' AS VARCHAR), CAST('$3,261' AS VARCHAR), CAST('$4,241' AS VARCHAR), CAST('$3,544' AS VARCHAR), CAST('+68.0%' AS VARCHAR)
+)
+SELECT metric, v1194, v0731, v1195, v1196, v1197, v1198, v1199, v1200, v1201, v1202, v1203
+FROM rows
+ORDER BY v0731
+
+-- query 231
+SELECT
+  date_trunc('month', CAST(v1204 AS TIMESTAMP)) AS v1205,
+  CAST(COUNT(CASE WHEN v1206 < 30000  THEN 1 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1207,
+  CAST(COUNT(CASE WHEN v1206 >= 30000  AND v1206 < 60000  THEN 1 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1208,
+  CAST(COUNT(CASE WHEN v1206 >= 60000  AND v1206 < 100000 THEN 1 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1209,
+  CAST(COUNT(CASE WHEN v1206 >= 100000 AND v1206 < 200000 THEN 1 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1210,
+  CAST(COUNT(CASE WHEN v1206 >= 200000 THEN 1 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1211
+FROM v1212
+WHERE v1206 IS NOT NULL
+  AND v1204 IS NOT NULL
+  AND CAST(v1204 AS TIMESTAMP) >= TIMESTAMP '2025-10-01 00:00:00'
+  AND CAST(v1204 AS TIMESTAMP) < TIMESTAMP '2026-09-01 00:00:00'
+GROUP BY 1
+ORDER BY 1
+
+-- query 232
+SELECT
+  date_trunc('month', CAST(v1204 AS TIMESTAMP)) AS v1205,
+  CAST(COUNT(CASE WHEN v1213 IS NULL OR v1213 = 0 THEN 1 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1214,
+  CAST(COUNT(CASE WHEN v1213 > 0     AND v1213 < 500  THEN 1 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1215,
+  CAST(COUNT(CASE WHEN v1213 >= 500  AND v1213 < 1500 THEN 1 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1216,
+  CAST(COUNT(CASE WHEN v1213 >= 1500 AND v1213 < 3000 THEN 1 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1217,
+  CAST(COUNT(CASE WHEN v1213 >= 3000 THEN 1 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1218
+FROM v1212
+WHERE v1204 IS NOT NULL
+  AND CAST(v1204 AS TIMESTAMP) >= TIMESTAMP '2025-10-01 00:00:00'
+  AND CAST(v1204 AS TIMESTAMP) < TIMESTAMP '2026-09-01 00:00:00'
+GROUP BY 1
+ORDER BY 1
+
+-- query 233
+SELECT
+  CASE
+    WHEN v1206 < 30000 THEN '1: <$30k'
+    WHEN v1206 < 60000 THEN '2: $30-60k'
+    WHEN v1206 < 100000 THEN '3: $60-100k'
+    WHEN v1206 < 200000 THEN '4: $100-200k'
+    ELSE '5: >$200k'
+  END AS v1219,
+  COUNT(*) AS v1220,
+  100.0 * CAST(COUNT(*) AS DOUBLE) / NULLIF(SUM(COUNT(*)) OVER (), 0) AS v1221,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-08-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-08-01' THEN 1 END)) OVER (), 0) AS v1222,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-07-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-07-01' THEN 1 END)) OVER (), 0) AS v1223,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-06-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-06-01' THEN 1 END)) OVER (), 0) AS v1224,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-05-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-05-01' THEN 1 END)) OVER (), 0) AS v1225,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-04-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-04-01' THEN 1 END)) OVER (), 0) AS v1226,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-03-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-03-01' THEN 1 END)) OVER (), 0) AS v1227,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-02-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-02-01' THEN 1 END)) OVER (), 0) AS v1228,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-01-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-01-01' THEN 1 END)) OVER (), 0) AS v1229,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-12-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-12-01' THEN 1 END)) OVER (), 0) AS v1230,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-11-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-11-01' THEN 1 END)) OVER (), 0) AS v1231,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-10-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-10-01' THEN 1 END)) OVER (), 0) AS v1232
+FROM v1212
+WHERE v1206 IS NOT NULL AND v1204 IS NOT NULL
+GROUP BY 1
+ORDER BY 1
+
+-- query 234
+SELECT
+  CASE
+    WHEN v1213 IS NULL OR v1213 = 0 THEN '1: $0 / value0602'
+    WHEN v1213 < 500 THEN '2: $1-500'
+    WHEN v1213 < 1500 THEN '3: $500-1.5k'
+    WHEN v1213 < 3000 THEN '4: $1.5-3k'
+    ELSE '5: >$3k'
+  END AS v1233,
+  COUNT(*) AS v1220,
+  100.0 * CAST(COUNT(*) AS DOUBLE) / NULLIF(SUM(COUNT(*)) OVER (), 0) AS v1221,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-08-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-08-01' THEN 1 END)) OVER (), 0) AS v1222,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-07-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-07-01' THEN 1 END)) OVER (), 0) AS v1223,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-06-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-06-01' THEN 1 END)) OVER (), 0) AS v1224,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-05-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-05-01' THEN 1 END)) OVER (), 0) AS v1225,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-04-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-04-01' THEN 1 END)) OVER (), 0) AS v1226,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-03-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-03-01' THEN 1 END)) OVER (), 0) AS v1227,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-02-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-02-01' THEN 1 END)) OVER (), 0) AS v1228,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-01-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-01-01' THEN 1 END)) OVER (), 0) AS v1229,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-12-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-12-01' THEN 1 END)) OVER (), 0) AS v1230
+FROM v1212
+WHERE v1204 IS NOT NULL
+GROUP BY 1
+ORDER BY 1
+
+-- query 235
+SELECT
+  v1234 AS v0519,
+  COUNT(*) AS v1235,
+  COUNT(CASE WHEN CAST(v1204 AS TIMESTAMP) >= date_trunc('week', CAST(current_date AS TIMESTAMP)) THEN 1 END) AS v1236,
+  100.0 * CAST(COUNT(CASE WHEN CAST(v1204 AS TIMESTAMP) >= date_trunc('week', CAST(current_date AS TIMESTAMP)) THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN CAST(v1204 AS TIMESTAMP) >= date_trunc('week', CAST(current_date AS TIMESTAMP)) THEN 1 END)) OVER (), 0) AS v1237,
+  COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-08-01' THEN 1 END) AS v1238,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-08-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-08-01' THEN 1 END)) OVER (), 0) AS v1222,
+  COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-07-01' THEN 1 END) AS v1239,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-07-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-07-01' THEN 1 END)) OVER (), 0) AS v1223,
+  COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-06-01' THEN 1 END) AS v1240,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-06-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-06-01' THEN 1 END)) OVER (), 0) AS v1224,
+  COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-05-01' THEN 1 END) AS v1241,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-05-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-05-01' THEN 1 END)) OVER (), 0) AS v1225,
+  COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-04-01' THEN 1 END) AS v1242,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-04-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-04-01' THEN 1 END)) OVER (), 0) AS v1226,
+  COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-03-01' THEN 1 END) AS v1243,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-03-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-03-01' THEN 1 END)) OVER (), 0) AS v1227,
+  COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-02-01' THEN 1 END) AS v1244,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-02-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-02-01' THEN 1 END)) OVER (), 0) AS v1228,
+  COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-01-01' THEN 1 END) AS v1245,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-01-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2026-01-01' THEN 1 END)) OVER (), 0) AS v1229,
+  COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-12-01' THEN 1 END) AS v1246,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-12-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-12-01' THEN 1 END)) OVER (), 0) AS v1230,
+  COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-11-01' THEN 1 END) AS v1247,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-11-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-11-01' THEN 1 END)) OVER (), 0) AS v1231,
+  COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-10-01' THEN 1 END) AS v1248,
+  100.0 * CAST(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-10-01' THEN 1 END) AS DOUBLE) / NULLIF(SUM(COUNT(CASE WHEN date_trunc('month', CAST(v1204 AS TIMESTAMP)) = TIMESTAMP '2025-10-01' THEN 1 END)) OVER (), 0) AS v1232
+FROM v1212
+WHERE v1204 IS NOT NULL AND v1234 IS NOT NULL AND v1234 <> ''
+GROUP BY v1234
+ORDER BY v1235 DESC
+LIMIT 12
+
+-- query 236
+SELECT
+  COUNT(*) AS v1249,
+  SUM(v0057.v0006) AS v1250,
+  COUNT(DISTINCT CAST(date_trunc('week', CAST(v0057.v0380 AS TIMESTAMP)) AS DATE)) AS v1251,
+  (COUNT(*) FILTER (WHERE v0057.v0031 != 'value0077'
+                         OR CAST(v0057.v0090 AS DATE) > CAST(v0057.v0380 AS DATE) + INTERVAL '14 days'
+                         OR CAST(v0057.v0090 AS DATE) > CURRENT_DATE))::DOUBLE
+    / NULLIF(COUNT(*)::DOUBLE, 0) AS v1252
+FROM v0246 v0057
+JOIN v0369 v0113 ON v0057.v0379 = v0113.id
+WHERE v0057.v0380 >= CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '175 days'
+  AND v0057.v0380 < CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '7 days'
+  AND v0057.v0060 IS NULL
+  AND v0113.v0060 IS NULL
+  AND v0057.v0201 = 0
+  AND v0057.v0031 NOT IN ('value0076', 'value0075')
+
+-- query 237
+WITH v1253 AS (
+    SELECT 2 AS v0356
+    UNION ALL SELECT 3 AS v0356
+    UNION ALL SELECT 4 AS v0356
+    UNION ALL SELECT 5 AS v0356
+    UNION ALL SELECT 6 AS v0356
+    UNION ALL SELECT 7 AS v0356
+    UNION ALL SELECT 8 AS v0356
+    UNION ALL SELECT 9 AS v0356
+    UNION ALL SELECT 10 AS v0356
+    UNION ALL SELECT 11 AS v0356
+    UNION ALL SELECT 12 AS v0356
+    UNION ALL SELECT 13 AS v0356
+    UNION ALL SELECT 14 AS v0356
+    UNION ALL SELECT 15 AS v0356
+    UNION ALL SELECT 16 AS v0356
+    UNION ALL SELECT 17 AS v0356
+    UNION ALL SELECT 18 AS v0356
+    UNION ALL SELECT 19 AS v0356
+    UNION ALL SELECT 20 AS v0356
+    UNION ALL SELECT 21 AS v0356
+    UNION ALL SELECT 22 AS v0356
+    UNION ALL SELECT 23 AS v0356
+    UNION ALL SELECT 24 AS v0356
+),
+v0860 AS (
+  SELECT
+    CAST(date_trunc('week', CAST(v0057.v0380 AS TIMESTAMP)) AS DATE) AS v1254,
+    v1253.v0356 AS v1255,
+    MAX(v0057.v0380) AS v1256,
+    COUNT(*) AS v1235,
+    SUM(CASE WHEN v0057.v0031 != 'value0077'
+              OR (CAST(v0057.v0090 AS DATE) - CAST(v0057.v0380 AS DATE)) > v1253.v0356 * 7
+              OR CAST(v0057.v0090 AS DATE) > CURRENT_DATE
+             THEN 1 ELSE 0 END) AS v1257
+  FROM v0246 v0057
+  JOIN v0369 v0113 ON v0057.v0379 = v0113.id
+  CROSS JOIN v1253
+  WHERE v0057.v0380 >= CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '175 days'
+    AND v0057.v0380 < CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '7 days'
+    AND v0057.v0060 IS NULL
+    AND v0113.v0060 IS NULL
+    AND v0057.v0201 = 0
+    AND v0057.v0031 NOT IN ('value0076', 'value0075')
+  GROUP BY 1, 2
+),
+v1258 AS (
+  SELECT
+    v1254,
+    v1255,
+    CASE WHEN v1254 + v1255 * 7 <= CURRENT_DATE
+         THEN 1.0 * v1257 / v1235
+         ELSE NULL END AS v1259
+  FROM v0860
+)
+SELECT
+  v1255,
+  MEDIAN(v1259) AS v1095,
+  APPROX_PERCENTILE_CONT(v1259, 0.95) AS v1260,
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '175 days' THEN v1259 END) AS "v1261",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '168 days' THEN v1259 END) AS "v1262",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '161 days' THEN v1259 END) AS "v1263",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '154 days' THEN v1259 END) AS "v1264",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '147 days' THEN v1259 END) AS "v1265",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '140 days' THEN v1259 END) AS "v1266",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '133 days' THEN v1259 END) AS "v1267",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '126 days' THEN v1259 END) AS "v1268",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '119 days' THEN v1259 END) AS "v1269",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '112 days' THEN v1259 END) AS "v1270",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '105 days' THEN v1259 END) AS "v1271",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '98 days' THEN v1259 END) AS "v1272",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '91 days' THEN v1259 END) AS "v1273",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '84 days' THEN v1259 END) AS "v1274",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '77 days' THEN v1259 END) AS "v1275",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '70 days' THEN v1259 END) AS "v1276",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '63 days' THEN v1259 END) AS "v1277",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '56 days' THEN v1259 END) AS "v1278",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '49 days' THEN v1259 END) AS "v1279",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '42 days' THEN v1259 END) AS "v1280",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '35 days' THEN v1259 END) AS "v1281",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '28 days' THEN v1259 END) AS "v1282",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '21 days' THEN v1259 END) AS "v1283",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '14 days' THEN v1259 END) AS "v1284"
+FROM v1258
+GROUP BY v1255
+ORDER BY v1255
+
+-- query 238
+WITH v1253 AS (
+    SELECT 2 AS v0356
+    UNION ALL SELECT 3 AS v0356
+    UNION ALL SELECT 4 AS v0356
+    UNION ALL SELECT 5 AS v0356
+    UNION ALL SELECT 6 AS v0356
+    UNION ALL SELECT 7 AS v0356
+    UNION ALL SELECT 8 AS v0356
+    UNION ALL SELECT 9 AS v0356
+    UNION ALL SELECT 10 AS v0356
+    UNION ALL SELECT 11 AS v0356
+    UNION ALL SELECT 12 AS v0356
+    UNION ALL SELECT 13 AS v0356
+    UNION ALL SELECT 14 AS v0356
+    UNION ALL SELECT 15 AS v0356
+    UNION ALL SELECT 16 AS v0356
+    UNION ALL SELECT 17 AS v0356
+    UNION ALL SELECT 18 AS v0356
+    UNION ALL SELECT 19 AS v0356
+    UNION ALL SELECT 20 AS v0356
+    UNION ALL SELECT 21 AS v0356
+    UNION ALL SELECT 22 AS v0356
+    UNION ALL SELECT 23 AS v0356
+    UNION ALL SELECT 24 AS v0356
+),
+v0860 AS (
+  SELECT
+    CAST(date_trunc('week', CAST(v0057.v0380 AS TIMESTAMP)) AS DATE) AS v1254,
+    v1253.v0356 AS v1255,
+    MAX(v0057.v0380) AS v1256,
+    COUNT(*) AS v1235,
+    SUM(CASE WHEN v0057.v0031 != 'value0077'
+              OR (CAST(v0057.v0090 AS DATE) - CAST(v0057.v0380 AS DATE)) > v1253.v0356 * 7
+              OR CAST(v0057.v0090 AS DATE) > CURRENT_DATE
+             THEN 1 ELSE 0 END) AS v1257
+  FROM v0246 v0057
+  JOIN v0369 v0113 ON v0057.v0379 = v0113.id
+  CROSS JOIN v1253
+  WHERE v0057.v0380 >= CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '175 days'
+    AND v0057.v0380 < CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '7 days'
+    AND v0057.v0060 IS NULL
+    AND v0113.v0060 IS NULL
+    AND v0057.v0201 = 0
+    AND v0057.v0031 NOT IN ('value0076', 'value0075')
+    AND (json_get_str(v0113.v0565, 'value0691') IN ('value0692', 'value0693'))
+  GROUP BY 1, 2
+),
+v1258 AS (
+  SELECT
+    v1254,
+    v1255,
+    CASE WHEN v1254 + v1255 * 7 <= CURRENT_DATE
+         THEN 1.0 * v1257 / v1235
+         ELSE NULL END AS v1259
+  FROM v0860
+)
+SELECT
+  v1255,
+  MEDIAN(v1259) AS v1095,
+  APPROX_PERCENTILE_CONT(v1259, 0.95) AS v1260,
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '175 days' THEN v1259 END) AS "v1261",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '168 days' THEN v1259 END) AS "v1262",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '161 days' THEN v1259 END) AS "v1263",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '154 days' THEN v1259 END) AS "v1264",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '147 days' THEN v1259 END) AS "v1265",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '140 days' THEN v1259 END) AS "v1266",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '133 days' THEN v1259 END) AS "v1267",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '126 days' THEN v1259 END) AS "v1268",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '119 days' THEN v1259 END) AS "v1269",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '112 days' THEN v1259 END) AS "v1270",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '105 days' THEN v1259 END) AS "v1271",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '98 days' THEN v1259 END) AS "v1272",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '91 days' THEN v1259 END) AS "v1273",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '84 days' THEN v1259 END) AS "v1274",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '77 days' THEN v1259 END) AS "v1275",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '70 days' THEN v1259 END) AS "v1276",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '63 days' THEN v1259 END) AS "v1277",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '56 days' THEN v1259 END) AS "v1278",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '49 days' THEN v1259 END) AS "v1279",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '42 days' THEN v1259 END) AS "v1280",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '35 days' THEN v1259 END) AS "v1281",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '28 days' THEN v1259 END) AS "v1282",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '21 days' THEN v1259 END) AS "v1283",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '14 days' THEN v1259 END) AS "v1284"
+FROM v1258
+GROUP BY v1255
+ORDER BY v1255
+
+-- query 239
+WITH v1253 AS (
+    SELECT 2 AS v0356
+    UNION ALL SELECT 3 AS v0356
+    UNION ALL SELECT 4 AS v0356
+    UNION ALL SELECT 5 AS v0356
+    UNION ALL SELECT 6 AS v0356
+    UNION ALL SELECT 7 AS v0356
+    UNION ALL SELECT 8 AS v0356
+    UNION ALL SELECT 9 AS v0356
+    UNION ALL SELECT 10 AS v0356
+    UNION ALL SELECT 11 AS v0356
+    UNION ALL SELECT 12 AS v0356
+    UNION ALL SELECT 13 AS v0356
+    UNION ALL SELECT 14 AS v0356
+    UNION ALL SELECT 15 AS v0356
+    UNION ALL SELECT 16 AS v0356
+    UNION ALL SELECT 17 AS v0356
+    UNION ALL SELECT 18 AS v0356
+    UNION ALL SELECT 19 AS v0356
+    UNION ALL SELECT 20 AS v0356
+    UNION ALL SELECT 21 AS v0356
+    UNION ALL SELECT 22 AS v0356
+    UNION ALL SELECT 23 AS v0356
+    UNION ALL SELECT 24 AS v0356
+),
+v0860 AS (
+  SELECT
+    CAST(date_trunc('week', CAST(v0057.v0380 AS TIMESTAMP)) AS DATE) AS v1254,
+    v1253.v0356 AS v1255,
+    MAX(v0057.v0380) AS v1256,
+    COUNT(*) AS v1235,
+    SUM(CASE WHEN v0057.v0031 != 'value0077'
+              OR (CAST(v0057.v0090 AS DATE) - CAST(v0057.v0380 AS DATE)) > v1253.v0356 * 7
+              OR CAST(v0057.v0090 AS DATE) > CURRENT_DATE
+             THEN 1 ELSE 0 END) AS v1257
+  FROM v0246 v0057
+  JOIN v0369 v0113 ON v0057.v0379 = v0113.id
+  CROSS JOIN v1253
+  WHERE v0057.v0380 >= CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '175 days'
+    AND v0057.v0380 < CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '7 days'
+    AND v0057.v0060 IS NULL
+    AND v0113.v0060 IS NULL
+    AND v0057.v0201 = 0
+    AND v0057.v0031 NOT IN ('value0076', 'value0075')
+    AND (json_get_str(v0113.v0565, 'value0691') = 'value0694' AND json_as_text(v0113.v0565, 'value0695') = '0.575')
+  GROUP BY 1, 2
+),
+v1258 AS (
+  SELECT
+    v1254,
+    v1255,
+    CASE WHEN v1254 + v1255 * 7 <= CURRENT_DATE
+         THEN 1.0 * v1257 / v1235
+         ELSE NULL END AS v1259
+  FROM v0860
+)
+SELECT
+  v1255,
+  MEDIAN(v1259) AS v1095,
+  APPROX_PERCENTILE_CONT(v1259, 0.95) AS v1260,
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '175 days' THEN v1259 END) AS "v1261",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '168 days' THEN v1259 END) AS "v1262",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '161 days' THEN v1259 END) AS "v1263",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '154 days' THEN v1259 END) AS "v1264",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '147 days' THEN v1259 END) AS "v1265",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '140 days' THEN v1259 END) AS "v1266",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '133 days' THEN v1259 END) AS "v1267",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '126 days' THEN v1259 END) AS "v1268",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '119 days' THEN v1259 END) AS "v1269",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '112 days' THEN v1259 END) AS "v1270",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '105 days' THEN v1259 END) AS "v1271",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '98 days' THEN v1259 END) AS "v1272",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '91 days' THEN v1259 END) AS "v1273",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '84 days' THEN v1259 END) AS "v1274",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '77 days' THEN v1259 END) AS "v1275",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '70 days' THEN v1259 END) AS "v1276",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '63 days' THEN v1259 END) AS "v1277",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '56 days' THEN v1259 END) AS "v1278",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '49 days' THEN v1259 END) AS "v1279",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '42 days' THEN v1259 END) AS "v1280",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '35 days' THEN v1259 END) AS "v1281",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '28 days' THEN v1259 END) AS "v1282",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '21 days' THEN v1259 END) AS "v1283",
+  MAX(CASE WHEN v1254 = CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '14 days' THEN v1259 END) AS "v1284"
+FROM v1258
+GROUP BY v1255
+HAVING MEDIAN(v1259) IS NOT NULL
+ORDER BY v1255
+
+-- query 240
+SELECT
+  CAST(CAST(date_trunc('week', CAST(v0057.v0380 AS TIMESTAMP)) AS DATE) AS VARCHAR) AS v1254,
+  COUNT(*) AS v1102,
+  SUM(v0057.v0006) AS v1285,
+  (COUNT(*) FILTER (WHERE v0057.v0031 != 'value0077'
+                         OR CAST(v0057.v0090 AS DATE) > CAST(v0057.v0380 AS DATE) + INTERVAL '14 days'
+                         OR CAST(v0057.v0090 AS DATE) > CURRENT_DATE))::DOUBLE / COUNT(*)::DOUBLE AS v1286,
+  CASE WHEN MIN(v0057.v0380) + INTERVAL '28 days' <= CURRENT_DATE
+       THEN (COUNT(*) FILTER (WHERE v0057.v0031 != 'value0077'
+                                   OR CAST(v0057.v0090 AS DATE) > CAST(v0057.v0380 AS DATE) + INTERVAL '28 days'
+                                   OR CAST(v0057.v0090 AS DATE) > CURRENT_DATE))::DOUBLE / COUNT(*)::DOUBLE
+       ELSE NULL END AS v1287,
+  CASE WHEN MIN(v0057.v0380) + INTERVAL '56 days' <= CURRENT_DATE
+       THEN (COUNT(*) FILTER (WHERE v0057.v0031 != 'value0077'
+                                   OR CAST(v0057.v0090 AS DATE) > CAST(v0057.v0380 AS DATE) + INTERVAL '56 days'
+                                   OR CAST(v0057.v0090 AS DATE) > CURRENT_DATE))::DOUBLE / COUNT(*)::DOUBLE
+       ELSE NULL END AS v1288,
+  CASE WHEN MIN(v0057.v0380) + INTERVAL '84 days' <= CURRENT_DATE
+       THEN (COUNT(*) FILTER (WHERE v0057.v0031 != 'value0077'
+                                   OR CAST(v0057.v0090 AS DATE) > CAST(v0057.v0380 AS DATE) + INTERVAL '84 days'
+                                   OR CAST(v0057.v0090 AS DATE) > CURRENT_DATE))::DOUBLE / COUNT(*)::DOUBLE
+       ELSE NULL END AS v1289
+FROM v0246 v0057
+JOIN v0369 v0113 ON v0057.v0379 = v0113.id
+WHERE v0057.v0380 >= CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '175 days'
+  AND v0057.v0380 < CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '7 days'
+  AND v0057.v0060 IS NULL
+  AND v0113.v0060 IS NULL
+  AND v0057.v0201 = 0
+  AND v0057.v0031 NOT IN ('value0076', 'value0075')
+GROUP BY 1
+ORDER BY 1
+
+-- query 241
+WITH v1253 AS (
+    SELECT 2 AS v0356
+    UNION ALL SELECT 3 AS v0356
+    UNION ALL SELECT 4 AS v0356
+    UNION ALL SELECT 5 AS v0356
+    UNION ALL SELECT 6 AS v0356
+    UNION ALL SELECT 7 AS v0356
+    UNION ALL SELECT 8 AS v0356
+    UNION ALL SELECT 9 AS v0356
+    UNION ALL SELECT 10 AS v0356
+    UNION ALL SELECT 11 AS v0356
+    UNION ALL SELECT 12 AS v0356
+    UNION ALL SELECT 13 AS v0356
+    UNION ALL SELECT 14 AS v0356
+    UNION ALL SELECT 15 AS v0356
+    UNION ALL SELECT 16 AS v0356
+    UNION ALL SELECT 17 AS v0356
+    UNION ALL SELECT 18 AS v0356
+    UNION ALL SELECT 19 AS v0356
+    UNION ALL SELECT 20 AS v0356
+    UNION ALL SELECT 21 AS v0356
+    UNION ALL SELECT 22 AS v0356
+    UNION ALL SELECT 23 AS v0356
+    UNION ALL SELECT 24 AS v0356
+),
+v1290 AS (
+  SELECT
+    'value0696' AS v1185,
+    CAST(date_trunc('week', CAST(v0057.v0380 AS TIMESTAMP)) AS DATE) AS v1254,
+    v1253.v0356 AS v1255,
+    COUNT(*) AS v1235,
+    SUM(CASE WHEN v0057.v0031 != 'value0077'
+              OR (CAST(v0057.v0090 AS DATE) - CAST(v0057.v0380 AS DATE)) > v1253.v0356 * 7
+              OR CAST(v0057.v0090 AS DATE) > CURRENT_DATE
+             THEN 1 ELSE 0 END) AS v1257
+  FROM v0246 v0057
+  JOIN v0369 v0113 ON v0057.v0379 = v0113.id
+  CROSS JOIN v1253
+  WHERE v0057.v0380 >= CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '175 days'
+    AND v0057.v0380 < CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '7 days'
+    AND v0057.v0060 IS NULL
+    AND v0113.v0060 IS NULL
+    AND v0057.v0201 = 0
+    AND v0057.v0031 NOT IN ('value0076', 'value0075')
+  GROUP BY 1, 2, 3
+  UNION ALL
+  SELECT
+    'value0697' AS v1185,
+    CAST(date_trunc('week', CAST(v0057.v0380 AS TIMESTAMP)) AS DATE) AS v1254,
+    v1253.v0356 AS v1255,
+    COUNT(*) AS v1235,
+    SUM(CASE WHEN v0057.v0031 != 'value0077'
+              OR (CAST(v0057.v0090 AS DATE) - CAST(v0057.v0380 AS DATE)) > v1253.v0356 * 7
+              OR CAST(v0057.v0090 AS DATE) > CURRENT_DATE
+             THEN 1 ELSE 0 END) AS v1257
+  FROM v0246 v0057
+  JOIN v0369 v0113 ON v0057.v0379 = v0113.id
+  CROSS JOIN v1253
+  WHERE v0057.v0380 >= CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '175 days'
+    AND v0057.v0380 < CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '7 days'
+    AND v0057.v0060 IS NULL
+    AND v0113.v0060 IS NULL
+    AND v0057.v0201 = 0
+    AND v0057.v0031 NOT IN ('value0076', 'value0075')
+    AND json_get_str(v0113.v0565, 'value0691') IN ('value0692', 'value0693')
+  GROUP BY 1, 2, 3
+  UNION ALL
+  SELECT
+    'value0698' AS v1185,
+    CAST(date_trunc('week', CAST(v0057.v0380 AS TIMESTAMP)) AS DATE) AS v1254,
+    v1253.v0356 AS v1255,
+    COUNT(*) AS v1235,
+    SUM(CASE WHEN v0057.v0031 != 'value0077'
+              OR (CAST(v0057.v0090 AS DATE) - CAST(v0057.v0380 AS DATE)) > v1253.v0356 * 7
+              OR CAST(v0057.v0090 AS DATE) > CURRENT_DATE
+             THEN 1 ELSE 0 END) AS v1257
+  FROM v0246 v0057
+  JOIN v0369 v0113 ON v0057.v0379 = v0113.id
+  CROSS JOIN v1253
+  WHERE v0057.v0380 >= CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '175 days'
+    AND v0057.v0380 < CAST(date_trunc('week', CAST(CURRENT_DATE AS TIMESTAMP)) AS DATE) - INTERVAL '7 days'
+    AND v0057.v0060 IS NULL
+    AND v0113.v0060 IS NULL
+    AND v0057.v0201 = 0
+    AND v0057.v0031 NOT IN ('value0076', 'value0075')
+    AND json_get_str(v0113.v0565, 'value0691') = 'value0694'
+    AND json_as_text(v0113.v0565, 'value0695') = '0.575'
+  GROUP BY 1, 2, 3
+),
+v1258 AS (
+  SELECT v1185, v1254, v1255,
+    CASE WHEN v1254 + v1255 * 7 <= CURRENT_DATE
+         THEN 1.0 * v1257 / v1235
+         ELSE NULL END AS v1258
+  FROM v1290
+),
+v1291 AS (
+  SELECT
+    v1185, v1254, v1255, v1258,
+    MEDIAN(v1258) OVER (PARTITION BY v1185, v1255) AS v1292,
+    APPROX_PERCENTILE_CONT(v1258, 0.95) OVER (PARTITION BY v1185, v1255) AS v1260
+  FROM v1258
+  WHERE v1258 IS NOT NULL
+)
+SELECT
+  CAST(v1254 AS VARCHAR) AS v1254,
+  v1255,
+  v1185,
+  v1258,
+  v1292,
+  v1260,
+  v1258 - v1260 AS v1293,
+  CAST(NULL AS DOUBLE) AS v1294,
+  v1258 - v1260 >= 0 AS v1295
+FROM v1291
+ORDER BY v1293 DESC
+LIMIT 15
+
+-- query 242
+SELECT
+  COUNT(*) AS v1235,
+  SUM(CASE WHEN v1206 IS NOT NULL THEN 1 ELSE 0 END) AS v1296,
+  SUM(CASE WHEN v1213 IS NOT NULL AND v1213 > 0 THEN 1 ELSE 0 END) AS v1297,
+  CAST(SUM(CASE WHEN v1298 IS NULL OR v1298 = 0 THEN 1 ELSE 0 END) AS DOUBLE)
+    / NULLIF(COUNT(*), 0) AS v1299,
+  CAST(SUM(CASE WHEN COALESCE(CAST(v1300 AS DOUBLE), 0) > 0 THEN 1 ELSE 0 END) AS DOUBLE)
+    / NULLIF(COUNT(*), 0) AS v1301,
+  CAST(SUM(CASE WHEN COALESCE(v1302, 0) > 30 THEN 1 ELSE 0 END) AS DOUBLE)
+    / NULLIF(SUM(CASE WHEN v1213 IS NOT NULL AND v1213 > 0 THEN 1 ELSE 0 END), 0) AS v1303,
+  SUM(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' THEN 1 ELSE 0 END) AS v1195,
+  SUM(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days'
+           THEN 1 ELSE 0 END) AS v1196
+FROM v1212
+WHERE v1204 IS NOT NULL;
+
+-- query 243
+SELECT
+  'value0665 value0666 value0667 (value0699)' AS metric,
+  SUM(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+              AND v1206 IS NOT NULL THEN 1 ELSE 0 END) AS v1195,
+  AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+           THEN v1206 END) AS v1199,
+  AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days'
+           THEN v1206 END) AS v1200,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2025-10-01 00:00:00' AND v1204 < TIMESTAMP '2026-01-01 00:00:00'
+           THEN v1206 END) AS v1201,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2026-01-01 00:00:00' AND v1204 < TIMESTAMP '2026-04-01 00:00:00'
+           THEN v1206 END) AS v1202,
+  (AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             THEN v1206 END)
+    - AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                 AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days'
+               THEN v1206 END))
+  / NULLIF(AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                      AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days'
+                    THEN v1206 END), 0) AS v1203,
+  1 AS v1304
+FROM v1212
+WHERE v1204 IS NOT NULL
+UNION ALL
+SELECT
+  'value0671 value0667 (value0699)' AS metric,
+  SUM(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+              AND v1305 IS NOT NULL THEN 1 ELSE 0 END) AS v1195,
+  AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+           THEN v1305 END) AS v1199,
+  AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days'
+           THEN v1305 END) AS v1200,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2025-10-01 00:00:00' AND v1204 < TIMESTAMP '2026-01-01 00:00:00'
+           THEN v1305 END) AS v1201,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2026-01-01 00:00:00' AND v1204 < TIMESTAMP '2026-04-01 00:00:00'
+           THEN v1305 END) AS v1202,
+  (AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             THEN v1305 END)
+    - AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                 AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days'
+               THEN v1305 END))
+  / NULLIF(AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                      AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days'
+                    THEN v1305 END), 0) AS v1203,
+  2 AS v1304
+FROM v1212
+WHERE v1204 IS NOT NULL
+UNION ALL
+SELECT
+  'value0671 value0674 (value0699)' AS metric,
+  SUM(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+              AND v1298 IS NOT NULL THEN 1 ELSE 0 END) AS v1195,
+  AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+           THEN v1298 END) AS v1199,
+  AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days'
+           THEN v1298 END) AS v1200,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2025-10-01 00:00:00' AND v1204 < TIMESTAMP '2026-01-01 00:00:00'
+           THEN v1298 END) AS v1201,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2026-01-01 00:00:00' AND v1204 < TIMESTAMP '2026-04-01 00:00:00'
+           THEN v1298 END) AS v1202,
+  (AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             THEN v1298 END)
+    - AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                 AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days'
+               THEN v1298 END))
+  / NULLIF(AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                      AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days'
+                    THEN v1298 END), 0) AS v1203,
+  3 AS v1304
+FROM v1212
+WHERE v1204 IS NOT NULL
+UNION ALL
+SELECT
+  'value0674 value0038 (value0699, value0700 / value0701)' AS metric,
+  SUM(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+              AND v1305 > 0 AND v1298 IS NOT NULL THEN 1 ELSE 0 END) AS v1195,
+  AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+              AND v1305 > 0 AND v1298 IS NOT NULL
+           THEN v1298 / v1305 END) AS v1199,
+  AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days'
+             AND v1305 > 0 AND v1298 IS NOT NULL
+           THEN v1298 / v1305 END) AS v1200,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2025-10-01 00:00:00' AND v1204 < TIMESTAMP '2026-01-01 00:00:00'
+             AND v1305 > 0 AND v1298 IS NOT NULL
+           THEN v1298 / v1305 END) AS v1201,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2026-01-01 00:00:00' AND v1204 < TIMESTAMP '2026-04-01 00:00:00'
+             AND v1305 > 0 AND v1298 IS NOT NULL
+           THEN v1298 / v1305 END) AS v1202,
+  (AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+              AND v1305 > 0 AND v1298 IS NOT NULL
+             THEN v1298 / v1305 END)
+    - AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                 AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days'
+                 AND v1305 > 0 AND v1298 IS NOT NULL
+               THEN v1298 / v1305 END)) AS v1203,
+  4 AS v1304
+FROM v1212
+WHERE v1204 IS NOT NULL
+UNION ALL
+SELECT
+  'value0677-value0674 value0678' AS metric,
+  SUM(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' THEN 1 ELSE 0 END) AS v1195,
+  AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+           THEN CAST(CASE WHEN v1298 IS NULL OR v1298 = 0 THEN 1 ELSE 0 END AS DOUBLE) END) AS v1199,
+  AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days'
+           THEN CAST(CASE WHEN v1298 IS NULL OR v1298 = 0 THEN 1 ELSE 0 END AS DOUBLE) END) AS v1200,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2025-10-01 00:00:00' AND v1204 < TIMESTAMP '2026-01-01 00:00:00'
+           THEN CAST(CASE WHEN v1298 IS NULL OR v1298 = 0 THEN 1 ELSE 0 END AS DOUBLE) END) AS v1201,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2026-01-01 00:00:00' AND v1204 < TIMESTAMP '2026-04-01 00:00:00'
+           THEN CAST(CASE WHEN v1298 IS NULL OR v1298 = 0 THEN 1 ELSE 0 END AS DOUBLE) END) AS v1202,
+  (AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             THEN CAST(CASE WHEN v1298 IS NULL OR v1298 = 0 THEN 1 ELSE 0 END AS DOUBLE) END)
+    - AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                 AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days'
+               THEN CAST(CASE WHEN v1298 IS NULL OR v1298 = 0 THEN 1 ELSE 0 END AS DOUBLE) END)) AS v1203,
+  5 AS v1304
+FROM v1212
+WHERE v1204 IS NOT NULL
+UNION ALL
+SELECT
+  'value0679-value0680 value0678' AS metric,
+  SUM(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' THEN 1 ELSE 0 END) AS v1195,
+  AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+           THEN CAST(CASE WHEN COALESCE(CAST(v1300 AS DOUBLE), 0) > 0 THEN 1 ELSE 0 END AS DOUBLE) END) AS v1199,
+  AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days'
+           THEN CAST(CASE WHEN COALESCE(CAST(v1300 AS DOUBLE), 0) > 0 THEN 1 ELSE 0 END AS DOUBLE) END) AS v1200,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2025-10-01 00:00:00' AND v1204 < TIMESTAMP '2026-01-01 00:00:00'
+           THEN CAST(CASE WHEN COALESCE(CAST(v1300 AS DOUBLE), 0) > 0 THEN 1 ELSE 0 END AS DOUBLE) END) AS v1201,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2026-01-01 00:00:00' AND v1204 < TIMESTAMP '2026-04-01 00:00:00'
+           THEN CAST(CASE WHEN COALESCE(CAST(v1300 AS DOUBLE), 0) > 0 THEN 1 ELSE 0 END AS DOUBLE) END) AS v1202,
+  (AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             THEN CAST(CASE WHEN COALESCE(CAST(v1300 AS DOUBLE), 0) > 0 THEN 1 ELSE 0 END AS DOUBLE) END)
+    - AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                 AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days'
+               THEN CAST(CASE WHEN COALESCE(CAST(v1300 AS DOUBLE), 0) > 0 THEN 1 ELSE 0 END AS DOUBLE) END)) AS v1203,
+  6 AS v1304
+FROM v1212
+WHERE v1204 IS NOT NULL
+ORDER BY v1304;
+
+-- query 244
+SELECT
+  'value0681-value0269 value0678 (value0702 > $30)' AS metric,
+  SUM(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND v1213 > 0 THEN 1 ELSE 0 END) AS v1195,
+  AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND v1213 > 0
+           THEN CAST(CASE WHEN COALESCE(v1302, 0) > 30 THEN 1 ELSE 0 END AS DOUBLE) END) AS v1199,
+  AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND v1213 > 0
+           THEN CAST(CASE WHEN COALESCE(v1302, 0) > 30 THEN 1 ELSE 0 END AS DOUBLE) END) AS v1200,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2025-10-01 00:00:00' AND v1204 < TIMESTAMP '2026-01-01 00:00:00' AND v1213 > 0
+           THEN CAST(CASE WHEN COALESCE(v1302, 0) > 30 THEN 1 ELSE 0 END AS DOUBLE) END) AS v1201,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2026-01-01 00:00:00' AND v1204 < TIMESTAMP '2026-04-01 00:00:00' AND v1213 > 0
+           THEN CAST(CASE WHEN COALESCE(v1302, 0) > 30 THEN 1 ELSE 0 END AS DOUBLE) END) AS v1202,
+  (AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND v1213 > 0
+             THEN CAST(CASE WHEN COALESCE(v1302, 0) > 30 THEN 1 ELSE 0 END AS DOUBLE) END)
+    - AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                 AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND v1213 > 0
+               THEN CAST(CASE WHEN COALESCE(v1302, 0) > 30 THEN 1 ELSE 0 END AS DOUBLE) END)) AS v1203,
+  1 AS v1304
+FROM v1212
+WHERE v1204 IS NOT NULL
+UNION ALL
+SELECT
+  'value0682 value0683 (value0699, value0703-value0683 value0704)' AS metric,
+  SUM(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND COALESCE(v1302, 0) > 30 THEN 1 ELSE 0 END) AS v1195,
+  AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND COALESCE(v1302, 0) > 30 THEN v1213 END) AS v1199,
+  AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND COALESCE(v1302, 0) > 30
+           THEN v1213 END) AS v1200,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2025-10-01 00:00:00' AND v1204 < TIMESTAMP '2026-01-01 00:00:00' AND COALESCE(v1302, 0) > 30 THEN v1213 END) AS v1201,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2026-01-01 00:00:00' AND v1204 < TIMESTAMP '2026-04-01 00:00:00' AND COALESCE(v1302, 0) > 30 THEN v1213 END) AS v1202,
+  (AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND COALESCE(v1302, 0) > 30 THEN v1213 END)
+    - AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                 AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND COALESCE(v1302, 0) > 30
+               THEN v1213 END))
+  / NULLIF(AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                      AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND COALESCE(v1302, 0) > 30
+                    THEN v1213 END), 0) AS v1203,
+  2 AS v1304
+FROM v1212
+WHERE v1204 IS NOT NULL
+UNION ALL
+SELECT
+  'value0684 value0683 (value0699, value0703-value0683 value0704)' AS metric,
+  SUM(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND COALESCE(v1302, 0) > 30 THEN 1 ELSE 0 END) AS v1195,
+  AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND COALESCE(v1302, 0) > 30 THEN v1302 END) AS v1199,
+  AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND COALESCE(v1302, 0) > 30
+           THEN v1302 END) AS v1200,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2025-10-01 00:00:00' AND v1204 < TIMESTAMP '2026-01-01 00:00:00' AND COALESCE(v1302, 0) > 30 THEN v1302 END) AS v1201,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2026-01-01 00:00:00' AND v1204 < TIMESTAMP '2026-04-01 00:00:00' AND COALESCE(v1302, 0) > 30 THEN v1302 END) AS v1202,
+  (AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND COALESCE(v1302, 0) > 30 THEN v1302 END)
+    - AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                 AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND COALESCE(v1302, 0) > 30
+               THEN v1302 END))
+  / NULLIF(AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                      AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND COALESCE(v1302, 0) > 30
+                    THEN v1302 END), 0) AS v1203,
+  3 AS v1304
+FROM v1212
+WHERE v1204 IS NOT NULL
+UNION ALL
+SELECT
+  'value0681 value0685 value0441 value0686 (value0699, value0703-value0683 value0704)' AS metric,
+  SUM(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND COALESCE(v1302, 0) > 30 THEN 1 ELSE 0 END) AS v1195,
+  AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND COALESCE(v1302, 0) > 30 THEN v1306 END) AS v1199,
+  AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND COALESCE(v1302, 0) > 30
+           THEN v1306 END) AS v1200,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2025-10-01 00:00:00' AND v1204 < TIMESTAMP '2026-01-01 00:00:00' AND COALESCE(v1302, 0) > 30 THEN v1306 END) AS v1201,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2026-01-01 00:00:00' AND v1204 < TIMESTAMP '2026-04-01 00:00:00' AND COALESCE(v1302, 0) > 30 THEN v1306 END) AS v1202,
+  (AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND COALESCE(v1302, 0) > 30 THEN v1306 END)
+    - AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                 AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND COALESCE(v1302, 0) > 30
+               THEN v1306 END))
+  / NULLIF(AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                      AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND COALESCE(v1302, 0) > 30
+                    THEN v1306 END), 0) AS v1203,
+  4 AS v1304
+FROM v1212
+WHERE v1204 IS NOT NULL
+UNION ALL
+SELECT
+  'value0665 value0673 value0037 (value0699, value0705 value0706)' AS metric,
+  SUM(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND v1213 > 0 AND v1307 IS NOT NULL THEN 1 ELSE 0 END) AS v1195,
+  AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND v1213 > 0 THEN v1307 END) AS v1199,
+  AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND v1213 > 0
+           THEN v1307 END) AS v1200,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2025-10-01 00:00:00' AND v1204 < TIMESTAMP '2026-01-01 00:00:00' AND v1213 > 0 THEN v1307 END) AS v1201,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2026-01-01 00:00:00' AND v1204 < TIMESTAMP '2026-04-01 00:00:00' AND v1213 > 0 THEN v1307 END) AS v1202,
+  (AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND v1213 > 0 THEN v1307 END)
+    - AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                 AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND v1213 > 0
+               THEN v1307 END))
+  / NULLIF(AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                      AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND v1213 > 0
+                    THEN v1307 END), 0) AS v1203,
+  5 AS v1304
+FROM v1212
+WHERE v1204 IS NOT NULL
+UNION ALL
+SELECT
+  'value0687-value0688 value0689 (value0699, value0705 value0706)' AS metric,
+  SUM(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND v1213 > 0 AND v1308 IS NOT NULL THEN 1 ELSE 0 END) AS v1195,
+  AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND v1213 > 0 THEN v1308 END) AS v1199,
+  AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND v1213 > 0
+           THEN v1308 END) AS v1200,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2025-10-01 00:00:00' AND v1204 < TIMESTAMP '2026-01-01 00:00:00' AND v1213 > 0 THEN v1308 END) AS v1201,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2026-01-01 00:00:00' AND v1204 < TIMESTAMP '2026-04-01 00:00:00' AND v1213 > 0 THEN v1308 END) AS v1202,
+  (AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND v1213 > 0 THEN v1308 END)
+    - AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                 AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND v1213 > 0
+               THEN v1308 END))
+  / NULLIF(AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                      AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND v1213 > 0
+                    THEN v1308 END), 0) AS v1203,
+  6 AS v1304
+FROM v1212
+WHERE v1204 IS NOT NULL
+UNION ALL
+SELECT
+  'value0690 value0689 (value0699, value0705 value0706)' AS metric,
+  SUM(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND v1213 > 0 AND v1309 IS NOT NULL THEN 1 ELSE 0 END) AS v1195,
+  AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND v1213 > 0 THEN v1309 END) AS v1199,
+  AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+             AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND v1213 > 0
+           THEN v1309 END) AS v1200,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2025-10-01 00:00:00' AND v1204 < TIMESTAMP '2026-01-01 00:00:00' AND v1213 > 0 THEN v1309 END) AS v1201,
+  AVG(CASE WHEN v1204 >= TIMESTAMP '2026-01-01 00:00:00' AND v1204 < TIMESTAMP '2026-04-01 00:00:00' AND v1213 > 0 THEN v1309 END) AS v1202,
+  (AVG(CASE WHEN v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours' AND v1213 > 0 THEN v1309 END)
+    - AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                 AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND v1213 > 0
+               THEN v1309 END))
+  / NULLIF(AVG(CASE WHEN v1204 <  (SELECT MAX(v1204) FROM v1212) - INTERVAL '24 hours'
+                      AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '8 days' AND v1213 > 0
+                    THEN v1309 END), 0) AS v1203,
+  7 AS v1304
+FROM v1212
+WHERE v1204 IS NOT NULL
+ORDER BY v1304;
+
+-- query 245
+SELECT
+  v1234 AS v0519,
+  COUNT(*) AS v0986,
+  SUM(CASE WHEN v1204 >= TIMESTAMP '2026-08-01 00:00:00' AND v1204 < TIMESTAMP '2026-09-01 00:00:00' THEN 1 ELSE 0 END) AS v1310,
+  CAST(SUM(CASE WHEN v1204 >= TIMESTAMP '2026-08-01 00:00:00' AND v1204 < TIMESTAMP '2026-09-01 00:00:00' THEN 1 ELSE 0 END) AS DOUBLE)
+    / NULLIF(SUM(SUM(CASE WHEN v1204 >= TIMESTAMP '2026-08-01 00:00:00' AND v1204 < TIMESTAMP '2026-09-01 00:00:00' THEN 1 ELSE 0 END)) OVER (), 0) AS v1311,
+  SUM(CASE WHEN v1204 >= TIMESTAMP '2026-07-01 00:00:00' AND v1204 < TIMESTAMP '2026-08-01 00:00:00' THEN 1 ELSE 0 END) AS v1312,
+  CAST(SUM(CASE WHEN v1204 >= TIMESTAMP '2026-07-01 00:00:00' AND v1204 < TIMESTAMP '2026-08-01 00:00:00' THEN 1 ELSE 0 END) AS DOUBLE)
+    / NULLIF(SUM(SUM(CASE WHEN v1204 >= TIMESTAMP '2026-07-01 00:00:00' AND v1204 < TIMESTAMP '2026-08-01 00:00:00' THEN 1 ELSE 0 END)) OVER (), 0) AS v1313,
+  SUM(CASE WHEN v1204 >= TIMESTAMP '2026-06-01 00:00:00' AND v1204 < TIMESTAMP '2026-07-01 00:00:00' THEN 1 ELSE 0 END) AS v1314,
+  CAST(SUM(CASE WHEN v1204 >= TIMESTAMP '2026-06-01 00:00:00' AND v1204 < TIMESTAMP '2026-07-01 00:00:00' THEN 1 ELSE 0 END) AS DOUBLE)
+    / NULLIF(SUM(SUM(CASE WHEN v1204 >= TIMESTAMP '2026-06-01 00:00:00' AND v1204 < TIMESTAMP '2026-07-01 00:00:00' THEN 1 ELSE 0 END)) OVER (), 0) AS v1315,
+  SUM(CASE WHEN v1204 >= TIMESTAMP '2026-05-01 00:00:00' AND v1204 < TIMESTAMP '2026-06-01 00:00:00' THEN 1 ELSE 0 END) AS v1316,
+  CAST(SUM(CASE WHEN v1204 >= TIMESTAMP '2026-05-01 00:00:00' AND v1204 < TIMESTAMP '2026-06-01 00:00:00' THEN 1 ELSE 0 END) AS DOUBLE)
+    / NULLIF(SUM(SUM(CASE WHEN v1204 >= TIMESTAMP '2026-05-01 00:00:00' AND v1204 < TIMESTAMP '2026-06-01 00:00:00' THEN 1 ELSE 0 END)) OVER (), 0) AS v1317,
+  SUM(CASE WHEN v1204 >= TIMESTAMP '2026-04-01 00:00:00' AND v1204 < TIMESTAMP '2026-05-01 00:00:00' THEN 1 ELSE 0 END) AS v1318,
+  CAST(SUM(CASE WHEN v1204 >= TIMESTAMP '2026-04-01 00:00:00' AND v1204 < TIMESTAMP '2026-05-01 00:00:00' THEN 1 ELSE 0 END) AS DOUBLE)
+    / NULLIF(SUM(SUM(CASE WHEN v1204 >= TIMESTAMP '2026-04-01 00:00:00' AND v1204 < TIMESTAMP '2026-05-01 00:00:00' THEN 1 ELSE 0 END)) OVER (), 0) AS v1319,
+  SUM(CASE WHEN v1204 >= TIMESTAMP '2026-03-01 00:00:00' AND v1204 < TIMESTAMP '2026-04-01 00:00:00' THEN 1 ELSE 0 END) AS v1320,
+  SUM(CASE WHEN v1204 >= TIMESTAMP '2026-02-01 00:00:00' AND v1204 < TIMESTAMP '2026-03-01 00:00:00' THEN 1 ELSE 0 END) AS v1321,
+  SUM(CASE WHEN v1204 >= TIMESTAMP '2026-01-01 00:00:00' AND v1204 < TIMESTAMP '2026-02-01 00:00:00' THEN 1 ELSE 0 END) AS v1322,
+  SUM(CASE WHEN v1204 >= TIMESTAMP '2025-12-01 00:00:00' AND v1204 < TIMESTAMP '2026-01-01 00:00:00' THEN 1 ELSE 0 END) AS v1323
+FROM v1212
+WHERE v1234 IS NOT NULL AND v1234 != ''
+GROUP BY v1234
+ORDER BY v0986 DESC
+LIMIT 12;
+
+-- query 246
+SELECT
+  CAST(date_trunc('month', v1204) AS DATE) || '' AS month,
+  COUNT(*) AS v0561,
+  CAST(SUM(CASE WHEN v1206 < 30000 THEN 1 ELSE 0 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1324,
+  CAST(SUM(CASE WHEN v1206 >= 30000 AND v1206 < 60000 THEN 1 ELSE 0 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1325,
+  CAST(SUM(CASE WHEN v1206 >= 60000 AND v1206 < 100000 THEN 1 ELSE 0 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1326,
+  CAST(SUM(CASE WHEN v1206 >= 100000 AND v1206 < 200000 THEN 1 ELSE 0 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1327,
+  CAST(SUM(CASE WHEN v1206 >= 200000 THEN 1 ELSE 0 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1328
+FROM v1212
+WHERE v1206 IS NOT NULL
+  AND v1204 IS NOT NULL
+  AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '300 days'
+GROUP BY 1
+ORDER BY 1;
+
+-- query 247
+SELECT
+  CAST(date_trunc('month', v1204) AS DATE) || '' AS month,
+  COUNT(*) AS v0561,
+  CAST(SUM(CASE WHEN v1213 IS NULL OR v1213 = 0 THEN 1 ELSE 0 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS none,
+  CAST(SUM(CASE WHEN v1213 > 0 AND v1213 < 500 THEN 1 ELSE 0 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1329,
+  CAST(SUM(CASE WHEN v1213 >= 500 AND v1213 < 1500 THEN 1 ELSE 0 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1330,
+  CAST(SUM(CASE WHEN v1213 >= 1500 AND v1213 < 3000 THEN 1 ELSE 0 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1331,
+  CAST(SUM(CASE WHEN v1213 >= 3000 THEN 1 ELSE 0 END) AS DOUBLE) / NULLIF(COUNT(*), 0) AS v1332
+FROM v1212
+WHERE v1204 IS NOT NULL
+  AND v1204 >= (SELECT MAX(v1204) FROM v1212) - INTERVAL '300 days'
+GROUP BY 1
+ORDER BY 1;
+
+-- query 248
+WITH v1333 AS (
+  SELECT
+    v1025,
+    CAST(v1152 AS DATE) AS period,
+    REPLACE(v1334, 'value0707', '') AS v1335,
+    MAX(CASE WHEN v1336 IS NOT NULL AND Error IS NULL THEN 1 ELSE 0 END) AS v1337
+  FROM v1338
+  WHERE v1334 IN (
+      'value0708',
+      'value0709',
+      'value0710',
+      'value0711',
+      'value0712'
+    )
+    AND CAST(v1152 AS DATE) >= CURRENT_DATE - INTERVAL '14' DAY
+    AND CAST(v1152 AS DATE) <= CURRENT_DATE
+    AND COALESCE(json_get_str(Metadata, 'value0713'), '') != 'value0714'
+  GROUP BY v1025, CAST(v1152 AS DATE), REPLACE(v1334, 'value0707', '')
+),
+v0241 AS (
+  SELECT
+    period,
+    v1335,
+    COUNT(DISTINCT v1025) AS v1339,
+    COUNT(DISTINCT CASE WHEN v1337 = 1 THEN v1025 END) AS v1340,
+    100.0 * COUNT(DISTINCT CASE WHEN v1337 = 1 THEN v1025 END)
+      / NULLIF(COUNT(DISTINCT v1025), 0) AS v1341
+  FROM v1333
+  GROUP BY period, v1335
+)
+SELECT
+  CAST(period AS VARCHAR) AS period,
+  MAX(CASE WHEN v1335 = 'value0715' THEN v1341 END) AS v1342,
+  MAX(CASE WHEN v1335 = 'value0715' THEN v1339 END) AS v1343,
+  MAX(CASE WHEN v1335 = 'value0716' THEN v1341 END) AS v1344,
+  MAX(CASE WHEN v1335 = 'value0716' THEN v1339 END) AS v1345,
+  MAX(CASE WHEN v1335 = 'value0717' THEN v1341 END) AS v1346,
+  MAX(CASE WHEN v1335 = 'value0717' THEN v1339 END) AS v1347,
+  MAX(CASE WHEN v1335 = 'value0718' THEN v1341 END) AS v1348,
+  MAX(CASE WHEN v1335 = 'value0718' THEN v1339 END) AS v1349,
+  MAX(CASE WHEN v1335 = 'value0719' THEN v1341 END) AS v1350,
+  MAX(CASE WHEN v1335 = 'value0719' THEN v1339 END) AS v1351
+FROM v0241
+GROUP BY period
+ORDER BY period DESC
+
+-- query 249
+WITH v1352 AS (
+  SELECT
+    v1025,
+    CAST(v1152 AS DATE) AS v1353,
+    REPLACE(v1334, 'value0707', '') AS v1335,
+    v1354,
+    MAX(CASE WHEN v1355 IS NOT NULL THEN 1 ELSE 0 END) AS v1356
+  FROM v1357
+  WHERE v1354 IN ('value0720','value0721','value0722')
+    AND v1334 IN (
+      'value0708','value0709','value0710',
+      'value0711','value0712')
+    AND CAST(v1152 AS DATE) BETWEEN CURRENT_DATE - INTERVAL '13' DAY AND CURRENT_DATE
+    AND COALESCE(json_get_str(Metadata, 'value0713'), '') != 'value0714'
+  GROUP BY v1025, CAST(v1152 AS DATE), REPLACE(v1334, 'value0707', ''), v1354
+),
+v1358 AS (
+  SELECT
+    v1025, v1353, v1335,
+    SUM(v1356) AS v1359
+  FROM v1352
+  GROUP BY v1025, v1353, v1335
+),
+v0241 AS (
+  SELECT
+    v1353 AS period,
+    v1335,
+    COUNT(DISTINCT v1025) AS v1360,
+    COUNT(DISTINCT CASE WHEN v1359 = 3 THEN v1025 END) AS v1361,
+    100.0 * COUNT(DISTINCT CASE WHEN v1359 = 3 THEN v1025 END)
+      / NULLIF(COUNT(DISTINCT v1025), 0) AS v1362
+  FROM v1358
+  GROUP BY v1353, v1335
+)
+SELECT
+  CAST(period AS VARCHAR) AS period,
+  MAX(CASE WHEN v1335 = 'value0715'       THEN v1362 END) AS v1342,
+  MAX(CASE WHEN v1335 = 'value0715'       THEN v1360  END) AS v1343,
+  MAX(CASE WHEN v1335 = 'value0716'   THEN v1362 END) AS v1344,
+  MAX(CASE WHEN v1335 = 'value0716'   THEN v1360  END) AS v1345,
+  MAX(CASE WHEN v1335 = 'value0717'    THEN v1362 END) AS v1346,
+  MAX(CASE WHEN v1335 = 'value0717'    THEN v1360  END) AS v1347,
+  MAX(CASE WHEN v1335 = 'value0718' THEN v1362 END) AS v1348,
+  MAX(CASE WHEN v1335 = 'value0718' THEN v1360  END) AS v1349,
+  MAX(CASE WHEN v1335 = 'value0719'   THEN v1362 END) AS v1350,
+  MAX(CASE WHEN v1335 = 'value0719'   THEN v1360  END) AS v1351
+FROM v0241
+GROUP BY period
+ORDER BY period DESC
+
+-- query 250
+SELECT
+  period || '' AS period,
+  MAX(CASE WHEN v1334 = 'value0715'       THEN v1363            END) AS v1342,
+  MAX(CASE WHEN v1334 = 'value0715'       THEN v1364 END) AS v1343,
+  MAX(CASE WHEN v1334 = 'value0716'   THEN v1363            END) AS v1344,
+  MAX(CASE WHEN v1334 = 'value0716'   THEN v1364 END) AS v1345,
+  MAX(CASE WHEN v1334 = 'value0717'    THEN v1363            END) AS v1346,
+  MAX(CASE WHEN v1334 = 'value0717'    THEN v1364 END) AS v1347,
+  MAX(CASE WHEN v1334 = 'value0718' THEN v1363            END) AS v1348,
+  MAX(CASE WHEN v1334 = 'value0718' THEN v1364 END) AS v1349,
+  MAX(CASE WHEN v1334 = 'value0719'   THEN v1363            END) AS v1350,
+  MAX(CASE WHEN v1334 = 'value0719'   THEN v1364 END) AS v1351
+FROM v1365
+WHERE v1366 = 'DAY'
+  AND period >= CURRENT_DATE - INTERVAL '13' DAY
+  AND period <= CURRENT_DATE
+GROUP BY period
+ORDER BY period DESC
+
+-- query 251
+SELECT
+  period || '' AS period,
+  MAX(CASE WHEN v1334 = 'value0715'       THEN v1367            END) AS v1342,
+  MAX(CASE WHEN v1334 = 'value0715'       THEN v1368 END) AS v1343,
+  MAX(CASE WHEN v1334 = 'value0716'   THEN v1367            END) AS v1344,
+  MAX(CASE WHEN v1334 = 'value0716'   THEN v1368 END) AS v1345,
+  MAX(CASE WHEN v1334 = 'value0717'    THEN v1367            END) AS v1346,
+  MAX(CASE WHEN v1334 = 'value0717'    THEN v1368 END) AS v1347,
+  MAX(CASE WHEN v1334 = 'value0718' THEN v1367            END) AS v1348,
+  MAX(CASE WHEN v1334 = 'value0718' THEN v1368 END) AS v1349,
+  MAX(CASE WHEN v1334 = 'value0719'   THEN v1367            END) AS v1350,
+  MAX(CASE WHEN v1334 = 'value0719'   THEN v1368 END) AS v1351
+FROM v1365
+WHERE v1366 = 'DAY'
+  AND period >= CURRENT_DATE - INTERVAL '13' DAY
+  AND period <= CURRENT_DATE
+GROUP BY period
+ORDER BY period DESC
+
+-- query 252
+WITH v1369 AS (
+  SELECT
+    json_get_str(v0000.Metadata, 'value0723') AS v1025,
+    CAST(v0040.Timestamp AS DATE) AS v1370
+  FROM v1371 v0000
+  JOIN v0332 v0940 USING (v0045)
+  JOIN v1372 v0040 USING (v0045, v0200)
+  WHERE v0000.v0050 IN (
+    'value0724',
+    'value0725'
+  )
+    AND v0040.Account = 'value0726'
+    AND v0000.v0038 IS NOT NULL
+    AND v0040.v0308 > 100
+    AND CAST(v0040.Timestamp AS DATE) > DATE '2026-05-01'
+    AND json_get_str(v0000.Metadata, 'value0723') NOT IN (
+      'value0626','value0627',
+      'value0628','value0629',
+      'value0630','value0631',
+      'value0632','value0633',
+      'value0634','value0635',
+      'value0636','value0637'
+    )
+), v1373 AS (
+  SELECT
+    v1025,
+    json_get_str(v1374, 'value0727', 'value0728') AS v1375
+  FROM v1376
+  WHERE v1377 = TRUE
+    AND v1374 IS NOT NULL
+), v1378 AS (
+  SELECT
+    v0094.v1025,
+    v0094.v1370,
+    CASE v0132.v1375
+      WHEN 'value0729' THEN 7
+      WHEN 'value0730' THEN 14
+      WHEN 'value0731' THEN 15
+      WHEN 'value0732' THEN 31
+      ELSE NULL
+    END AS v1379
+  FROM v1369 v0094
+  LEFT JOIN v1373 v0132 USING (v1025)
+), v1380 AS (
+  SELECT DISTINCT
+    CAST(date_trunc('week', CAST(v1370 AS TIMESTAMP)) AS DATE) AS v0065
+  FROM v1378
+), v1381 AS (
+  SELECT
+    v0065,
+    CASE
+      WHEN CAST(v0065 + INTERVAL '6 days' AS DATE) > current_date THEN current_date
+      ELSE CAST(v0065 + INTERVAL '6 days' AS DATE)
+    END AS v1382
+  FROM v1380
+), v1383 AS (
+  SELECT
+    v1384.v0065,
+    v1384.v1382,
+    v0113.v1025,
+    v0113.v1379,
+    MAX(v0113.v1370) AS v1385
+  FROM v1381 AS v1384
+  JOIN v1378 v0113
+    ON v0113.v1370 <= v1384.v1382
+  GROUP BY v1384.v0065, v1384.v1382, v0113.v1025, v0113.v1379
+), v1291 AS (
+  SELECT
+    v0065,
+    v1382,
+    v1025,
+    v1379,
+    CAST(
+      CASE v1379
+        WHEN 7  THEN v1385 + INTERVAL '7 days'
+        WHEN 14 THEN v1385 + INTERVAL '14 days'
+        WHEN 15 THEN v1385 + INTERVAL '15 days'
+        WHEN 31 THEN v1385 + INTERVAL '31 days'
+      END AS DATE
+    ) AS v1386,
+    CAST(
+      CASE v1379
+        WHEN 7  THEN v1385 + INTERVAL '14 days'
+        WHEN 14 THEN v1385 + INTERVAL '28 days'
+        WHEN 15 THEN v1385 + INTERVAL '30 days'
+        WHEN 31 THEN v1385 + INTERVAL '62 days'
+      END AS DATE
+    ) AS v1387
+  FROM v1383
+), v1388 AS (
+  SELECT
+    v0065,
+    v1025,
+    CASE
+      WHEN v1379 IS NULL THEN 'value0733'
+      WHEN v1382 >= v1387 THEN 'value0734'
+      WHEN v1382 > v1386 THEN 'value0735'
+      ELSE 'value0736'
+    END AS status
+  FROM v1291
+), v1389 AS (
+  SELECT
+    v0057.v0065,
+    COUNT(DISTINCT v0593.v1025) AS v1390
+  FROM v1380 v0057
+  LEFT JOIN v1388 v0593
+    ON v0593.v0065 <= v0057.v0065
+   AND v0593.status IN ('value0736', 'value0735')
+  GROUP BY v0057.v0065
+), v1391 AS (
+  SELECT
+    v0065,
+    v1390,
+    v1390 - LAG(v1390, 1) OVER (ORDER BY v0065) AS v1392,
+    v1390 - LAG(v1390, 4) OVER (ORDER BY v0065) AS v1393
+  FROM v1389
+)
+SELECT v0731, line
+FROM (
+  SELECT
+    0 AS v0731,
+    CAST(v1390 AS VARCHAR) AS line
+  FROM v1391
+  WHERE v0065 = (SELECT MAX(v0065) FROM v1391)
+  UNION ALL
+  SELECT
+    1 AS v0731,
+    CASE
+      WHEN v1392 IS NULL THEN '—'
+      WHEN v1392 >= 0 THEN '+' || CAST(v1392 AS VARCHAR)
+      ELSE CAST(v1392 AS VARCHAR)
+    END
+    || ' value0737    '
+    ||
+    CASE
+      WHEN v1393 IS NULL THEN '—'
+      WHEN v1393 >= 0 THEN '+' || CAST(v1393 AS VARCHAR)
+      ELSE CAST(v1393 AS VARCHAR)
+    END
+    || ' value0738' AS line
+  FROM v1391
+  WHERE v0065 = (SELECT MAX(v0065) FROM v1391)
+) v1394
+ORDER BY v0731
+
+-- query 253
+WITH v1395 AS (
+  SELECT
+    CAST(v0000.v1122 AS DATE) AS v1370,
+    CASE
+      WHEN (v0000.v0395 IS NULL OR v0000.v0395 = '')
+        AND ((NOT v0000.v1123 IS NULL AND v0000.v1123 <> '')
+             OR LOWER(v0000.v1124) = 'value0048')
+        AND v0000.v0006 > 0
+        THEN v0000.v0006
+      ELSE 0
+    END AS v1396,
+    CASE
+      WHEN NOT v0000.v0395 IS NULL AND v0000.v0395 <> '' AND v0000.v0006 > 0
+        THEN v0000.v0006
+      ELSE 0
+    END AS v1397
+  FROM v1110 v0000
+  WHERE v0000.v1132 = 'value0644'
+    AND CAST(v0000.v1122 AS DATE) > DATE '2026-05-01'
+    AND NOT v0000.v0171 IN (
+      'value0626','value0627',
+      'value0628','value0629',
+      'value0630','value0631',
+      'value0632','value0633',
+      'value0634','value0635',
+      'value0636','value0637'
+    )
+), v1398 AS (
+  SELECT
+    CAST(date_trunc('week', CAST(v1370 AS TIMESTAMP)) AS DATE) AS v0065,
+    SUM(v1396 + v1397) AS v1399
+  FROM v1395
+  GROUP BY 1
+), v1400 AS (
+  SELECT
+    v0057.v0065,
+    SUM(v0593.v1399) AS v1401
+  FROM v1398 v0057
+  LEFT JOIN v1398 v0593
+    ON v0593.v0065 <= v0057.v0065
+  GROUP BY v0057.v0065
+), v1402 AS (
+  SELECT MAX(v0065) AS v1403 FROM v1400
+), v1404 AS (
+  SELECT
+    v0057.v1403,
+    v0348.v1401 AS v1405,
+    v1406.v1401 AS v1407,
+    v1408.v1401 AS v1409
+  FROM v1402 v0057
+  LEFT JOIN v1400 v0348
+    ON v0348.v0065 = v0057.v1403
+  LEFT JOIN v1400 v1406
+    ON v1406.v0065 = CAST(v0057.v1403 - INTERVAL '7 days' AS DATE)
+  LEFT JOIN v1400 v1408
+    ON v1408.v0065 = CAST(v0057.v1403 - INTERVAL '28 days' AS DATE)
+)
+SELECT v0731, line
+FROM (
+  SELECT
+    0 AS v0731,
+    '$' || CAST(TRUNC(v1405 / 1000, 1) AS VARCHAR) || 'K' AS line
+  FROM v1404
+  UNION ALL
+  SELECT
+    1 AS v0731,
+    CASE
+      WHEN (v1405 - v1407) IS NULL THEN '—'
+      WHEN (v1405 - v1407) >= 0
+        THEN '+$' || CAST(TRUNC((v1405 - v1407) / 1000, 1) AS VARCHAR) || 'K'
+      ELSE '-$' || CAST(TRUNC(ABS(v1405 - v1407) / 1000, 1) AS VARCHAR) || 'K'
+    END
+    || ' value0737    '
+    ||
+    CASE
+      WHEN (v1405 - v1409) IS NULL THEN '—'
+      WHEN (v1405 - v1409) >= 0
+        THEN '+$' || CAST(TRUNC((v1405 - v1409) / 1000, 1) AS VARCHAR) || 'K'
+      ELSE '-$' || CAST(TRUNC(ABS(v1405 - v1409) / 1000, 1) AS VARCHAR) || 'K'
+    END
+    || ' value0738' AS line
+  FROM v1404
+) v1394
+ORDER BY v0731
+
+-- query 254
+SELECT SUM(v0006) AS v1410
+FROM v1110
+WHERE v1132 = 'value0644'
+  AND v0006 > 0
+  AND CAST(v1122 AS DATE) = current_date
+  AND NOT v0171 IN (
+    'value0626','value0627',
+    'value0628','value0629',
+    'value0630','value0631',
+    'value0632','value0633',
+    'value0634','value0635',
+    'value0636','value0637'
+  )
+
+-- query 255
+SELECT v0011 AS v1411
+FROM v0009
+WHERE v0010 = (SELECT MAX(v0010) FROM v0009)
+
+-- query 256
+WITH v1412 AS (
+  SELECT DISTINCT
+    v1149,
+    FIRST_VALUE(v1025) OVER v0073 AS v1025,
+    FIRST_VALUE(v1413) OVER v0073 AS v1414,
+    FIRST_VALUE(
+      CASE WHEN NOT v1374 IS NULL
+      THEN CAST(JSON_GET_STR(v1374, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v0073 AS v1415,
+    FIRST_VALUE(JSON_GET_STR(v1416, 'value0741')) OVER v0073 AS v1335,
+    FIRST_VALUE(
+      CASE WHEN NOT v1144 IS NULL
+      THEN CAST(JSON_GET_STR(v1144, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v0073 AS v1417,
+    FIRST_VALUE(
+      CASE WHEN NOT v1418 IS NULL
+      THEN CAST(JSON_GET_STR(v1418, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v0073 AS v1419,
+    FIRST_VALUE(
+      CASE WHEN NOT v1420 IS NULL
+      THEN CAST(JSON_GET_STR(v1420, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v0073 AS v1421,
+    FIRST_VALUE(
+      CASE WHEN NOT v1422 IS NULL
+      THEN CAST(JSON_GET_STR(v1422, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v0073 AS v1423,
+    FIRST_VALUE(
+      CASE WHEN NOT v1424 IS NULL
+      THEN CAST(JSON_GET_STR(v1424, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v0073 AS v1425,
+    FIRST_VALUE(
+      CASE WHEN JSON_GET_STR(v1426, 'value0742', 'value0293') = 'value0743'
+      THEN CAST(JSON_GET_STR(v1426, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v0073 AS v1427,
+    FIRST_VALUE(
+      CASE WHEN NOT v1428 IS NULL
+      THEN CAST(JSON_GET_STR(v1428, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v0073 AS v1429,
+    FIRST_VALUE(
+      CASE WHEN NOT v1430 IS NULL
+      THEN CAST(JSON_GET_STR(v1430, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v0073 AS v1431,
+    FIRST_VALUE(
+      CASE WHEN NOT v1432 IS NULL
+      THEN CAST(JSON_GET_STR(v1432, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v0073 AS v1433,
+    FIRST_VALUE(
+      CASE WHEN NOT v1434 IS NULL
+      THEN CAST(JSON_GET_STR(v1434, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v0073 AS v1435
+  FROM v1436
+  WINDOW v0073 AS (
+    PARTITION BY v1149
+    ORDER BY v1437 DESC, COALESCE(v1377, FALSE) DESC
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  )
+),
+v1438 AS (
+  SELECT DISTINCT CAST(v1439 AS DATE) AS day
+  FROM v1338
+  WHERE NOT v1439 IS NULL
+    AND v1439 >= (CURRENT_DATE - INTERVAL '13' DAYS)::TIMESTAMP
+    AND v1439 < (CURRENT_DATE + INTERVAL '1' DAY)::TIMESTAMP
+),
+v1440 AS (
+  SELECT CAST(v1414 AS DATE) AS day, COUNT(DISTINCT v1025) AS v0551
+  FROM v1412
+  WHERE NOT v1414 IS NULL
+    AND CAST(v1414 AS DATE) >= CURRENT_DATE - INTERVAL '13' DAYS
+    AND CAST(v1414 AS DATE) <= CURRENT_DATE
+  GROUP BY CAST(v1414 AS DATE)
+),
+v1441 AS (
+  SELECT CAST(v1415 AS DATE) AS day, COUNT(DISTINCT v1025) AS v1442
+  FROM v1412
+  WHERE NOT v1415 IS NULL
+    AND CAST(v1415 AS DATE) >= CURRENT_DATE - INTERVAL '13' DAYS
+    AND CAST(v1415 AS DATE) <= CURRENT_DATE
+  GROUP BY CAST(v1415 AS DATE)
+),
+v1443 AS (
+  SELECT CAST(v1439 AS DATE) AS day, COUNT(DISTINCT v1025) AS v1444
+  FROM v1338
+  WHERE NOT v1439 IS NULL
+    AND (JSON_GET_STR(Metadata, 'value0713') != 'value0714'
+         OR JSON_GET_STR(Metadata, 'value0713') IS NULL)
+    AND v1439 >= (CURRENT_DATE - INTERVAL '13' DAYS)::TIMESTAMP
+    AND v1439 < (CURRENT_DATE + INTERVAL '1' DAY)::TIMESTAMP
+  GROUP BY CAST(v1439 AS DATE)
+),
+v1445 AS (
+  SELECT CAST(v1336 AS DATE) AS day, COUNT(DISTINCT v1025) AS v1446
+  FROM v1338
+  WHERE NOT v1336 IS NULL
+    AND Error IS NULL
+    AND (JSON_GET_STR(Metadata, 'value0713') != 'value0714'
+         OR JSON_GET_STR(Metadata, 'value0713') IS NULL)
+    AND v1336 >= (CURRENT_DATE - INTERVAL '13' DAYS)::TIMESTAMP
+    AND v1336 < (CURRENT_DATE + INTERVAL '1' DAY)::TIMESTAMP
+  GROUP BY CAST(v1336 AS DATE)
+),
+v1447 AS (
+  SELECT *
+  FROM v1412
+  WHERE v1335 IN (
+    'value0708',
+    'value0709',
+    'value0710',
+    'value0711',
+    'value0712'
+  )
+),
+v1448 AS (
+  SELECT
+    v1025 AS v0171,
+    MIN(CAST(v1152 AS TIMESTAMP)) AS v1449
+  FROM v1156
+  WHERE NOT v1152 IS NULL
+  GROUP BY v1025
+),
+v1450 AS (
+  SELECT
+    v0075.v1149, v0075.v1025,
+    v0075.v1417 AS v1451,
+    CASE WHEN NOT v0075.v1417 IS NULL AND NOT v0075.v1419 IS NULL AND NOT v0075.v1421 IS NULL
+           AND (v0075.v1335 = 'value0708' OR NOT v0075.v1423 IS NULL)
+      THEN
+        CASE WHEN v0075.v1335 = 'value0708'
+          THEN GREATEST(v0075.v1417, v0075.v1419, v0075.v1421)
+          ELSE GREATEST(v0075.v1417, v0075.v1419, v0075.v1421, v0075.v1423)
+        END
+    END AS v1452,
+    CASE WHEN NOT v0075.v1417 IS NULL AND NOT v0075.v1419 IS NULL AND NOT v0075.v1421 IS NULL
+           AND (v0075.v1335 = 'value0708' OR NOT v0075.v1423 IS NULL)
+           AND NOT v0075.v1425 IS NULL
+      THEN
+        CASE WHEN v0075.v1335 = 'value0708'
+          THEN GREATEST(v0075.v1417, v0075.v1419, v0075.v1421, v0075.v1425)
+          ELSE GREATEST(v0075.v1417, v0075.v1419, v0075.v1421, v0075.v1423, v0075.v1425)
+        END
+    END AS v1453,
+    CASE WHEN NOT v0075.v1417 IS NULL AND NOT v0075.v1419 IS NULL AND NOT v0075.v1421 IS NULL
+           AND (v0075.v1335 = 'value0708' OR NOT v0075.v1423 IS NULL)
+           AND NOT v0075.v1425 IS NULL AND NOT v0075.v1427 IS NULL
+           AND NOT v0075.v1433 IS NULL
+           AND (NOT v0075.v1429 IS NULL OR NOT v0075.v1431 IS NULL)
+           AND (NOT v0075.v1435 IS NULL OR NOT v0920.v0171 IS NULL)
+      THEN
+        CASE WHEN v0075.v1335 = 'value0708'
+          THEN GREATEST(
+                 v0075.v1417, v0075.v1419, v0075.v1421, v0075.v1425, v0075.v1427, v0075.v1433,
+                 CASE
+                   WHEN NOT v0075.v1429 IS NULL AND NOT v0075.v1431 IS NULL THEN LEAST(v0075.v1429, v0075.v1431)
+                   WHEN NOT v0075.v1429 IS NULL THEN v0075.v1429
+                   ELSE v0075.v1431
+                 END,
+                 CASE
+                   WHEN NOT v0075.v1435 IS NULL AND NOT v0920.v1449 IS NULL THEN LEAST(v0075.v1435, v0920.v1449)
+                   WHEN NOT v0075.v1435 IS NULL THEN v0075.v1435
+                   ELSE v0920.v1449
+                 END
+               )
+          ELSE GREATEST(
+                 v0075.v1417, v0075.v1419, v0075.v1421, v0075.v1423, v0075.v1425, v0075.v1427, v0075.v1433,
+                 CASE
+                   WHEN NOT v0075.v1429 IS NULL AND NOT v0075.v1431 IS NULL THEN LEAST(v0075.v1429, v0075.v1431)
+                   WHEN NOT v0075.v1429 IS NULL THEN v0075.v1429
+                   ELSE v0075.v1431
+                 END,
+                 CASE
+                   WHEN NOT v0075.v1435 IS NULL AND NOT v0920.v1449 IS NULL THEN LEAST(v0075.v1435, v0920.v1449)
+                   WHEN NOT v0075.v1435 IS NULL THEN v0075.v1435
+                   ELSE v0920.v1449
+                 END
+               )
+        END
+    END AS v1454
+  FROM v1447 AS v0075
+  LEFT JOIN v1448 AS v0920 ON v0920.v0171 = v0075.v1025
+),
+v1455 AS (
+  SELECT CAST(v1451 AS DATE) AS day, COUNT(DISTINCT v1025) AS v1456
+  FROM v1450
+  WHERE NOT v1451 IS NULL
+    AND CAST(v1451 AS DATE) >= CURRENT_DATE - INTERVAL '13' DAYS
+    AND CAST(v1451 AS DATE) <= CURRENT_DATE
+  GROUP BY CAST(v1451 AS DATE)
+),
+v1457 AS (
+  SELECT CAST(v1452 AS DATE) AS day, COUNT(DISTINCT v1025) AS v0233
+  FROM v1450
+  WHERE NOT v1452 IS NULL
+    AND CAST(v1452 AS DATE) >= CURRENT_DATE - INTERVAL '13' DAYS
+    AND CAST(v1452 AS DATE) <= CURRENT_DATE
+  GROUP BY CAST(v1452 AS DATE)
+),
+v1458 AS (
+  SELECT CAST(v1453 AS DATE) AS day, COUNT(DISTINCT v1025) AS v0234
+  FROM v1450
+  WHERE NOT v1453 IS NULL
+    AND CAST(v1453 AS DATE) >= CURRENT_DATE - INTERVAL '13' DAYS
+    AND CAST(v1453 AS DATE) <= CURRENT_DATE
+  GROUP BY CAST(v1453 AS DATE)
+),
+v1459 AS (
+  SELECT CAST(v1454 AS DATE) AS day, COUNT(DISTINCT v1025) AS v0439
+  FROM v1450
+  WHERE NOT v1454 IS NULL
+    AND CAST(v1454 AS DATE) >= CURRENT_DATE - INTERVAL '13' DAYS
+    AND CAST(v1454 AS DATE) <= CURRENT_DATE
+  GROUP BY CAST(v1454 AS DATE)
+)
+SELECT
+  CAST(v1460.day AS VARCHAR)          AS period,
+  COALESCE(v0087.v0551, 0)          AS v0551,
+  COALESCE(v1461.v1444, 0)     AS v1444,
+  COALESCE(v1462.v1446, 0)    AS v1446,
+  COALESCE(v0593.v1442, 0)        AS v1442,
+  COALESCE(v1463.v1456, 0)         AS v1456,
+  COALESCE(v1464.v0233, 0)   AS v0233,
+  COALESCE(v0077.v0234, 0)   AS v0234,
+  COALESCE(v1465.v0439, 0)        AS v0439
+FROM v1438 v1460
+LEFT JOIN v1440        v0087 ON v0087.day = v1460.day
+LEFT JOIN v1443   v1461 ON v1461.day = v1460.day
+LEFT JOIN v1445  v1462 ON v1462.day = v1460.day
+LEFT JOIN v1441           v0593 ON v0593.day = v1460.day
+LEFT JOIN v1455       v1463 ON v1463.day = v1460.day
+LEFT JOIN v1457 v1464 ON v1464.day = v1460.day
+LEFT JOIN v1458 v0077 ON v0077.day = v1460.day
+LEFT JOIN v1459      v1465 ON v1465.day = v1460.day
+ORDER BY v1460.day DESC
+
+-- query 257
+WITH v1466 AS (
+  SELECT DISTINCT
+    v1149,
+    FIRST_VALUE(v1025) OVER v1467 AS v1025,
+    FIRST_VALUE(v1413) OVER v1467 AS v0090,
+    FIRST_VALUE(CASE WHEN NOT v1374 IS NULL THEN 1 ELSE 0 END) OVER v1467 AS v1468
+  FROM v1436
+  WINDOW v1467 AS (
+    PARTITION BY v1149
+    ORDER BY v1437 DESC
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  )
+),
+v1469 AS (
+  SELECT
+    v1025,
+    MIN(v0090) AS v0084,
+    MAX(v1468) AS v1470
+  FROM v1466
+  GROUP BY v1025
+),
+v1471 AS (
+  SELECT *
+  FROM v1469
+  WHERE CAST(v0084 AS DATE) >= CURRENT_DATE - INTERVAL '13' DAYS
+    AND CAST(v0084 AS DATE) <= CURRENT_DATE
+),
+v1438 AS (
+  SELECT DISTINCT CAST(v0084 AS DATE) AS day
+  FROM v1471
+),
+v1448 AS (
+  SELECT
+    v1025 AS v0171,
+    MIN(CAST(v1152 AS TIMESTAMP)) AS v1449
+  FROM v1156
+  WHERE NOT v1152 IS NULL
+  GROUP BY v1025
+),
+v1440 AS (
+  SELECT CAST(v0084 AS DATE) AS day, COUNT(DISTINCT v1025) AS v0551
+  FROM v1471
+  GROUP BY CAST(v0084 AS DATE)
+),
+v1441 AS (
+  SELECT
+    CAST(v0084 AS DATE) AS day,
+    COUNT(DISTINCT CASE WHEN v1470 = 1 THEN v1025 END) AS v1442
+  FROM v1471
+  GROUP BY CAST(v0084 AS DATE)
+),
+v1472 AS (
+  SELECT
+    v1025,
+    MAX(CASE WHEN NOT v1336 IS NULL AND Error IS NULL THEN 1 ELSE 0 END) AS v1473
+  FROM v1474
+  WHERE NOT v1439 IS NULL
+    AND (JSON_GET_STR(Metadata, 'value0713') != 'value0714'
+         OR JSON_GET_STR(Metadata, 'value0713') IS NULL)
+  GROUP BY v1025
+),
+v1443 AS (
+  SELECT CAST(v0463.v0084 AS DATE) AS day, COUNT(DISTINCT v0463.v1025) AS v1444
+  FROM v1471 v0463
+  JOIN v1472 v1475 ON v1475.v1025 = v0463.v1025
+  GROUP BY CAST(v0463.v0084 AS DATE)
+),
+v1445 AS (
+  SELECT CAST(v0463.v0084 AS DATE) AS day, COUNT(DISTINCT v0463.v1025) AS v1446
+  FROM v1471 v0463
+  JOIN v1472 v1475 ON v1475.v1025 = v0463.v1025 AND v1475.v1473 = 1
+  GROUP BY CAST(v0463.v0084 AS DATE)
+),
+v1476 AS (
+  SELECT
+    v1149, v1025, v1437, v1377,
+    v1416, v1144, v1418,
+    v1420, v1422, v1424,
+    v1426, v1428, v1430,
+    v1432, v1434
+  FROM v1436
+  WHERE JSON_GET_STR(v1416, 'value0741') IN (
+      'value0708',
+      'value0709',
+      'value0710',
+      'value0711',
+      'value0712'
+    )
+),
+v1477 AS (
+  SELECT DISTINCT
+    v1149,
+    FIRST_VALUE(v1025) OVER v1478 AS v1025,
+    FIRST_VALUE(JSON_GET_STR(v1416, 'value0741')) OVER v1478 AS v1335,
+    FIRST_VALUE(
+      CASE WHEN NOT v1144 IS NULL
+      THEN CAST(JSON_GET_STR(v1144, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v1478 AS v1417,
+    FIRST_VALUE(
+      CASE WHEN NOT v1418 IS NULL
+      THEN CAST(JSON_GET_STR(v1418, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v1478 AS v1419,
+    FIRST_VALUE(
+      CASE WHEN NOT v1420 IS NULL
+      THEN CAST(JSON_GET_STR(v1420, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v1478 AS v1421,
+    FIRST_VALUE(
+      CASE WHEN NOT v1422 IS NULL
+      THEN CAST(JSON_GET_STR(v1422, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v1478 AS v1423,
+    FIRST_VALUE(
+      CASE WHEN NOT v1424 IS NULL
+      THEN CAST(JSON_GET_STR(v1424, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v1478 AS v1425,
+    FIRST_VALUE(
+      CASE WHEN JSON_GET_STR(v1426, 'value0742', 'value0293') = 'value0743'
+      THEN CAST(JSON_GET_STR(v1426, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v1478 AS v1427,
+    FIRST_VALUE(
+      CASE WHEN NOT v1428 IS NULL
+      THEN CAST(JSON_GET_STR(v1428, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v1478 AS v1429,
+    FIRST_VALUE(
+      CASE WHEN NOT v1430 IS NULL
+      THEN CAST(JSON_GET_STR(v1430, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v1478 AS v1431,
+    FIRST_VALUE(
+      CASE WHEN NOT v1432 IS NULL
+      THEN CAST(JSON_GET_STR(v1432, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v1478 AS v1433,
+    FIRST_VALUE(
+      CASE WHEN NOT v1434 IS NULL
+      THEN CAST(JSON_GET_STR(v1434, 'value0739', 'value0740') AS TIMESTAMP) END
+    ) OVER v1478 AS v1435
+  FROM v1476
+  WINDOW v1478 AS (
+    PARTITION BY v1149
+    ORDER BY v1437 DESC, COALESCE(v1377, FALSE) DESC
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  )
+),
+v1450 AS (
+  SELECT
+    v0075.v1149, v0075.v1025, v0075.v1335,
+    NOT v0075.v1417 IS NULL AS v1479,
+    (
+      NOT v0075.v1417 IS NULL AND NOT v0075.v1419 IS NULL AND NOT v0075.v1421 IS NULL
+      AND (v0075.v1335 = 'value0708' OR NOT v0075.v1423 IS NULL)
+    ) AS v0233,
+    (
+      NOT v0075.v1417 IS NULL AND NOT v0075.v1419 IS NULL AND NOT v0075.v1421 IS NULL
+      AND (v0075.v1335 = 'value0708' OR NOT v0075.v1423 IS NULL)
+      AND NOT v0075.v1425 IS NULL
+    ) AS v0234,
+    (
+      NOT v0075.v1417 IS NULL AND NOT v0075.v1419 IS NULL AND NOT v0075.v1421 IS NULL
+      AND (v0075.v1335 = 'value0708' OR NOT v0075.v1423 IS NULL)
+      AND NOT v0075.v1425 IS NULL AND NOT v0075.v1427 IS NULL
+      AND NOT v0075.v1433 IS NULL
+      AND (NOT v0075.v1429 IS NULL OR NOT v0075.v1431 IS NULL)
+      AND (NOT v0075.v1435 IS NULL OR NOT v0920.v0171 IS NULL)
+    ) AS v0439
+  FROM v1477 AS v0075
+  LEFT JOIN v1448 AS v0920 ON v0920.v0171 = v0075.v1025
+),
+v1480 AS (
+  SELECT
+    v1025,
+    MAX(CASE WHEN v1479 THEN 1 ELSE 0 END) AS v1481,
+    MAX(CASE WHEN v0233 THEN 1 ELSE 0 END) AS v1482,
+    MAX(CASE WHEN v0234 THEN 1 ELSE 0 END) AS v1483,
+    MAX(CASE WHEN v0439 THEN 1 ELSE 0 END) AS v1484
+  FROM v1450
+  GROUP BY v1025
+),
+v1485 AS (
+  SELECT
+    CAST(v0463.v0084 AS DATE) AS day,
+    COUNT(DISTINCT CASE WHEN v1486.v1481 = 1 THEN v0463.v1025 END) AS v1456,
+    COUNT(DISTINCT CASE WHEN v1486.v1482 = 1 THEN v0463.v1025 END) AS v0233,
+    COUNT(DISTINCT CASE WHEN v1486.v1483 = 1 THEN v0463.v1025 END) AS v0234,
+    COUNT(DISTINCT CASE WHEN v1486.v1484 = 1 THEN v0463.v1025 END) AS v0439
+  FROM v1471 v0463
+  LEFT JOIN v1480 v1486 ON v1486.v1025 = v0463.v1025
+  GROUP BY CAST(v0463.v0084 AS DATE)
+)
+SELECT
+  CAST(v1460.day AS VARCHAR)         AS period,
+  COALESCE(v0087.v0551, 0)         AS v0551,
+  COALESCE(v1461.v1444, 0)    AS v1444,
+  COALESCE(v1462.v1446, 0)   AS v1446,
+  COALESCE(v0593.v1442, 0)       AS v1442,
+  COALESCE(mb.v1456, 0)       AS v1456,
+  COALESCE(mb.v0233, 0)  AS v0233,
+  COALESCE(mb.v0234, 0)  AS v0234,
+  COALESCE(mb.v0439, 0)       AS v0439
+FROM v1438 v1460
+LEFT JOIN v1440       v0087 ON v0087.day = v1460.day
+LEFT JOIN v1443  v1461 ON v1461.day = v1460.day
+LEFT JOIN v1445 v1462 ON v1462.day = v1460.day
+LEFT JOIN v1441          v0593 ON v0593.day = v1460.day
+LEFT JOIN v1485     mb ON mb.day = v1460.day
+ORDER BY v1460.day DESC
+
+-- query 258
+SELECT
+  REPLACE(v0000.v1334, 'value0707', '') AS v1335,
+  COUNT(DISTINCT CASE WHEN v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '24' HOUR) AND v0000.v1439 < (SELECT MAX(v1439) FROM v1338) THEN v0000.v1025 END) AS v1487,
+  COUNT(DISTINCT CASE WHEN v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '24' HOUR) AND v0000.v1439 < (SELECT MAX(v1439) FROM v1338) AND v0000.v1336 IS NOT NULL AND v0000.Error IS NULL THEN v0000.v1025 END) AS v1488,
+  (CAST(COUNT(DISTINCT CASE WHEN v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '24' HOUR) AND v0000.v1439 < (SELECT MAX(v1439) FROM v1338) AND v0000.v1336 IS NOT NULL AND v0000.Error IS NULL THEN v0000.v1025 END) AS DOUBLE) / NULLIF(COUNT(DISTINCT CASE WHEN v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '24' HOUR) AND v0000.v1439 < (SELECT MAX(v1439) FROM v1338) THEN v0000.v1025 END), 0)) AS v1489,
+  COUNT(DISTINCT CASE WHEN v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '8' DAY) AND v0000.v1439 < ((SELECT MAX(v1439) FROM v1338) - INTERVAL '24' HOUR) THEN v0000.v1025 END) AS v1490,
+  COUNT(DISTINCT CASE WHEN v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '8' DAY) AND v0000.v1439 < ((SELECT MAX(v1439) FROM v1338) - INTERVAL '24' HOUR) AND v0000.v1336 IS NOT NULL AND v0000.Error IS NULL THEN v0000.v1025 END) AS v1491,
+  (CAST(COUNT(DISTINCT CASE WHEN v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '8' DAY) AND v0000.v1439 < ((SELECT MAX(v1439) FROM v1338) - INTERVAL '24' HOUR) AND v0000.v1336 IS NOT NULL AND v0000.Error IS NULL THEN v0000.v1025 END) AS DOUBLE) / NULLIF(COUNT(DISTINCT CASE WHEN v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '8' DAY) AND v0000.v1439 < ((SELECT MAX(v1439) FROM v1338) - INTERVAL '24' HOUR) THEN v0000.v1025 END), 0)) AS v1492,
+  ((CAST(COUNT(DISTINCT CASE WHEN v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '24' HOUR) AND v0000.v1439 < (SELECT MAX(v1439) FROM v1338) AND v0000.v1336 IS NOT NULL AND v0000.Error IS NULL THEN v0000.v1025 END) AS DOUBLE) / NULLIF(COUNT(DISTINCT CASE WHEN v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '24' HOUR) AND v0000.v1439 < (SELECT MAX(v1439) FROM v1338) THEN v0000.v1025 END), 0)) - (CAST(COUNT(DISTINCT CASE WHEN v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '8' DAY) AND v0000.v1439 < ((SELECT MAX(v1439) FROM v1338) - INTERVAL '24' HOUR) AND v0000.v1336 IS NOT NULL AND v0000.Error IS NULL THEN v0000.v1025 END) AS DOUBLE) / NULLIF(COUNT(DISTINCT CASE WHEN v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '8' DAY) AND v0000.v1439 < ((SELECT MAX(v1439) FROM v1338) - INTERVAL '24' HOUR) THEN v0000.v1025 END), 0))) AS delta
+FROM v1338 AS v0000
+WHERE
+  v0000.v1334 IN (
+    'value0708',
+    'value0711',
+    'value0709',
+    'value0710',
+    'value0712'
+  )
+  AND v0000.v1439 IS NOT NULL
+  AND v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '10' DAY)
+  AND v0000.v1439 < (SELECT MAX(v1439) FROM v1338)
+  AND (
+    v0000.Metadata IS NULL
+    OR JSON_GET_STR(v0000.Metadata, 'value0713') IS NULL
+    OR JSON_GET_STR(v0000.Metadata, 'value0713') != 'value0714'
+  )
+GROUP BY REPLACE(v0000.v1334, 'value0707', '')
+ORDER BY
+  ((CAST(COUNT(DISTINCT CASE WHEN v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '24' HOUR) AND v0000.v1439 < (SELECT MAX(v1439) FROM v1338) AND v0000.v1336 IS NOT NULL AND v0000.Error IS NULL THEN v0000.v1025 END) AS DOUBLE) / NULLIF(COUNT(DISTINCT CASE WHEN v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '24' HOUR) AND v0000.v1439 < (SELECT MAX(v1439) FROM v1338) THEN v0000.v1025 END), 0)) - (CAST(COUNT(DISTINCT CASE WHEN v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '8' DAY) AND v0000.v1439 < ((SELECT MAX(v1439) FROM v1338) - INTERVAL '24' HOUR) AND v0000.v1336 IS NOT NULL AND v0000.Error IS NULL THEN v0000.v1025 END) AS DOUBLE) / NULLIF(COUNT(DISTINCT CASE WHEN v0000.v1439 >= ((SELECT MAX(v1439) FROM v1338) - INTERVAL '8' DAY) AND v0000.v1439 < ((SELECT MAX(v1439) FROM v1338) - INTERVAL '24' HOUR) THEN v0000.v1025 END), 0))) ASC
+
+-- query 259
+SELECT
+  REPLACE(v0000.v1354, 'value0744', '') AS v1354,
+  COUNT(DISTINCT CASE
+    WHEN v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '24' HOUR)
+      AND v0000.v1152 < (SELECT MAX(v1152) FROM v1357)
+    THEN v0000.v1025 END) AS v1195,
+  (CAST(COUNT(DISTINCT CASE
+    WHEN v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '24' HOUR)
+      AND v0000.v1152 < (SELECT MAX(v1152) FROM v1357)
+      AND v0000.v1355 IS NOT NULL
+    THEN v0000.v1025 END) AS DOUBLE) /
+    NULLIF(COUNT(DISTINCT CASE
+      WHEN v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '24' HOUR)
+        AND v0000.v1152 < (SELECT MAX(v1152) FROM v1357)
+      THEN v0000.v1025 END), 0)) AS v1493,
+  COUNT(DISTINCT CASE
+    WHEN v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '8' DAY)
+      AND v0000.v1152 < ((SELECT MAX(v1152) FROM v1357) - INTERVAL '24' HOUR)
+    THEN v0000.v1025 END) AS v1196,
+  (CAST(COUNT(DISTINCT CASE
+    WHEN v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '8' DAY)
+      AND v0000.v1152 < ((SELECT MAX(v1152) FROM v1357) - INTERVAL '24' HOUR)
+      AND v0000.v1355 IS NOT NULL
+    THEN v0000.v1025 END) AS DOUBLE) /
+    NULLIF(COUNT(DISTINCT CASE
+      WHEN v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '8' DAY)
+        AND v0000.v1152 < ((SELECT MAX(v1152) FROM v1357) - INTERVAL '24' HOUR)
+      THEN v0000.v1025 END), 0)) AS v1494
+FROM v1357 AS v0000
+WHERE
+  v0000.v1354 NOT LIKE '%value0745%'
+  AND v0000.v1354 <> 'value0746'
+  AND v0000.v1334 IN (
+    'value0708',
+    'value0711',
+    'value0709',
+    'value0710',
+    'value0712'
+  )
+  AND v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '8' DAY)
+  AND v0000.v1152 < (SELECT MAX(v1152) FROM v1357)
+  AND (v0000.v1355 IS NOT NULL OR v0000.v1495 IS NOT NULL)
+  AND COALESCE(JSON_GET_STR(v0000.Metadata, 'value0713'), 'value0747') <> 'value0714'
+  AND NOT (
+    v0000.v1334 = 'value0708'
+    AND v0000.v1354 = 'value0748'
+    AND v0000.v1496 = 'value0749'
+    AND LOWER(COALESCE(v0000.Error, '')) LIKE '%value0750 value0751 value0123 value0752 value0753%'
+    AND EXISTS (
+      SELECT 1 FROM v1357 AS v1497
+      WHERE v1497.v1498 = v0000.v1498 AND v1497.v1354 = 'value0754'
+    )
+  )
+GROUP BY REPLACE(v0000.v1354, 'value0744', '')
+ORDER BY v1196 DESC
+
+-- query 260
+SELECT * FROM (
+  SELECT
+    REPLACE(v0000.v1334, 'value0707', '') AS v1335,
+    REPLACE(v0000.v1354, 'value0744', '') AS v1354,
+    COUNT(DISTINCT CASE
+      WHEN v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '24' HOUR)
+        AND v0000.v1152 < (SELECT MAX(v1152) FROM v1357)
+      THEN v0000.v1025 END) AS v1195,
+    COUNT(DISTINCT CASE
+      WHEN v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '8' DAY)
+        AND v0000.v1152 < ((SELECT MAX(v1152) FROM v1357) - INTERVAL '24' HOUR)
+      THEN v0000.v1025 END) AS v1196,
+    (CAST(COUNT(DISTINCT CASE
+      WHEN v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '24' HOUR)
+        AND v0000.v1152 < (SELECT MAX(v1152) FROM v1357)
+        AND v0000.v1355 IS NOT NULL
+      THEN v0000.v1025 END) AS DOUBLE) /
+      NULLIF(COUNT(DISTINCT CASE
+        WHEN v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '24' HOUR)
+          AND v0000.v1152 < (SELECT MAX(v1152) FROM v1357)
+        THEN v0000.v1025 END), 0)) AS v1493,
+    (CAST(COUNT(DISTINCT CASE
+      WHEN v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '8' DAY)
+        AND v0000.v1152 < ((SELECT MAX(v1152) FROM v1357) - INTERVAL '24' HOUR)
+        AND v0000.v1355 IS NOT NULL
+      THEN v0000.v1025 END) AS DOUBLE) /
+      NULLIF(COUNT(DISTINCT CASE
+        WHEN v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '8' DAY)
+          AND v0000.v1152 < ((SELECT MAX(v1152) FROM v1357) - INTERVAL '24' HOUR)
+        THEN v0000.v1025 END), 0)) AS v1494,
+    ((CAST(COUNT(DISTINCT CASE
+      WHEN v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '24' HOUR)
+        AND v0000.v1152 < (SELECT MAX(v1152) FROM v1357)
+        AND v0000.v1355 IS NOT NULL
+      THEN v0000.v1025 END) AS DOUBLE) /
+      NULLIF(COUNT(DISTINCT CASE
+        WHEN v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '24' HOUR)
+          AND v0000.v1152 < (SELECT MAX(v1152) FROM v1357)
+        THEN v0000.v1025 END), 0)) -
+     (CAST(COUNT(DISTINCT CASE
+      WHEN v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '8' DAY)
+        AND v0000.v1152 < ((SELECT MAX(v1152) FROM v1357) - INTERVAL '24' HOUR)
+        AND v0000.v1355 IS NOT NULL
+      THEN v0000.v1025 END) AS DOUBLE) /
+      NULLIF(COUNT(DISTINCT CASE
+        WHEN v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '8' DAY)
+          AND v0000.v1152 < ((SELECT MAX(v1152) FROM v1357) - INTERVAL '24' HOUR)
+        THEN v0000.v1025 END), 0))) AS delta
+  FROM v1357 AS v0000
+  WHERE
+    v0000.v1354 NOT LIKE '%value0745%'
+    AND v0000.v1354 <> 'value0746'
+    AND v0000.v1334 IN (
+      'value0708',
+      'value0711',
+      'value0709',
+      'value0710',
+      'value0712'
+    )
+    AND v0000.v1152 >= ((SELECT MAX(v1152) FROM v1357) - INTERVAL '8' DAY)
+    AND v0000.v1152 < (SELECT MAX(v1152) FROM v1357)
+    AND (v0000.v1355 IS NOT NULL OR v0000.v1495 IS NOT NULL)
+    AND COALESCE(JSON_GET_STR(v0000.Metadata, 'value0713'), 'value0747') <> 'value0714'
+    AND NOT (
+      v0000.v1334 = 'value0708'
+      AND v0000.v1354 = 'value0748'
+      AND v0000.v1496 = 'value0749'
+      AND LOWER(COALESCE(v0000.Error, '')) LIKE '%value0750 value0751 value0123 value0752 value0753%'
+      AND EXISTS (
+        SELECT 1 FROM v1357 AS v1497
+        WHERE v1497.v1498 = v0000.v1498 AND v1497.v1354 = 'value0754'
+      )
+    )
+  GROUP BY
+    REPLACE(v0000.v1334, 'value0707', ''),
+    REPLACE(v0000.v1354, 'value0744', '')
+) AS v1499
+WHERE v1195 >= 4
+  AND v1196 >= 10
+  AND delta <= -0.03
+ORDER BY delta ASC
+
+-- query 261
+WITH source AS (
+  SELECT
+    v1025,
+    JSON_GET_STR(v1416, 'value0741') AS v1335,
+    CASE WHEN NOT v1144 IS NULL
+      THEN CAST(JSON_GET_STR(v1144, 'value0739', 'value0740') AS TIMESTAMP) END AS v1417,
+    CASE WHEN NOT v1418 IS NULL
+      THEN CAST(JSON_GET_STR(v1418, 'value0739', 'value0740') AS TIMESTAMP) END AS v1419,
+    CASE WHEN NOT v1420 IS NULL
+      THEN CAST(JSON_GET_STR(v1420, 'value0739', 'value0740') AS TIMESTAMP) END AS v1421,
+    CASE WHEN NOT v1422 IS NULL
+      THEN CAST(JSON_GET_STR(v1422, 'value0739', 'value0740') AS TIMESTAMP) END AS v1423,
+    CASE WHEN NOT v1424 IS NULL
+      THEN CAST(JSON_GET_STR(v1424, 'value0739', 'value0740') AS TIMESTAMP) END AS v1425,
+    CASE WHEN JSON_GET_STR(v1426, 'value0742', 'value0293') = 'value0743'
+      THEN CAST(JSON_GET_STR(v1426, 'value0739', 'value0740') AS TIMESTAMP) END AS v1427,
+    CASE WHEN NOT v1432 IS NULL
+      THEN CAST(JSON_GET_STR(v1432, 'value0739', 'value0740') AS TIMESTAMP) END AS v1500,
+    CASE WHEN NOT v1428 IS NULL
+      THEN CAST(JSON_GET_STR(v1428, 'value0739', 'value0740') AS TIMESTAMP) END AS v1501,
+    CASE WHEN NOT v1430 IS NULL
+      THEN CAST(JSON_GET_STR(v1430, 'value0739', 'value0740') AS TIMESTAMP) END AS v1502,
+    CASE WHEN NOT v1434 IS NULL
+      THEN CAST(JSON_GET_STR(v1434, 'value0739', 'value0740') AS TIMESTAMP) END AS v1435
+  FROM v1436
+  WHERE
+    JSON_GET_STR(v1416, 'value0741') IN (
+      'value0708',
+      'value0709',
+      'value0710',
+      'value0711',
+      'value0712'
+    )
+),
+v1503 AS (
+  SELECT
+    v1025,
+    v1335,
+    CAST(v1417 AS DATE) AS v1504,
+    CASE WHEN NOT v1417 IS NULL AND NOT v1419 IS NULL
+      THEN CAST(GREATEST(v1417, v1419) AS DATE) END AS v1505,
+    CASE WHEN NOT v1417 IS NULL AND NOT v1419 IS NULL AND NOT v1421 IS NULL
+      AND (v1335 = 'value0708' OR NOT v1423 IS NULL)
+      THEN CAST(
+        CASE WHEN v1335 = 'value0708'
+          THEN GREATEST(v1417, v1419, v1421)
+          ELSE GREATEST(v1417, v1419, v1421, v1423)
+        END AS DATE) END AS v1506,
+    CASE WHEN NOT v1417 IS NULL AND NOT v1419 IS NULL AND NOT v1421 IS NULL
+      AND (v1335 = 'value0708' OR NOT v1423 IS NULL)
+      AND NOT v1425 IS NULL
+      THEN CAST(
+        CASE WHEN v1335 = 'value0708'
+          THEN GREATEST(v1417, v1419, v1421, v1425)
+          ELSE GREATEST(v1417, v1419, v1421, v1423, v1425)
+        END AS DATE) END AS v1507,
+    CASE WHEN NOT v1417 IS NULL AND NOT v1419 IS NULL AND NOT v1421 IS NULL
+      AND (v1335 = 'value0708' OR NOT v1423 IS NULL)
+      AND NOT v1425 IS NULL AND NOT v1427 IS NULL
+      THEN CAST(
+        CASE WHEN v1335 = 'value0708'
+          THEN GREATEST(v1417, v1419, v1421, v1425, v1427)
+          ELSE GREATEST(v1417, v1419, v1421, v1423, v1425, v1427)
+        END AS DATE) END AS v1508,
+    CASE WHEN NOT v1417 IS NULL AND NOT v1419 IS NULL AND NOT v1421 IS NULL
+      AND (v1335 = 'value0708' OR NOT v1423 IS NULL)
+      AND NOT v1425 IS NULL AND NOT v1427 IS NULL
+      AND NOT v1500 IS NULL
+      AND (
+        (v1335 = 'value0708' AND (
+          (NOT v1501 IS NULL AND CAST(v1500 AS DATE) = CAST(v1501 AS DATE))
+          OR (NOT v1502 IS NULL AND CAST(v1500 AS DATE) = CAST(v1502 AS DATE))
+        ))
+        OR (v1335 <> 'value0708' AND NOT v1501 IS NULL
+          AND CAST(v1500 AS DATE) = CAST(v1501 AS DATE))
+      )
+      THEN CAST(v1500 AS DATE) END AS v1509,
+    CASE WHEN NOT v1417 IS NULL AND NOT v1419 IS NULL AND NOT v1421 IS NULL
+      AND (v1335 = 'value0708' OR NOT v1423 IS NULL)
+      AND NOT v1425 IS NULL AND NOT v1427 IS NULL
+      AND NOT v1500 IS NULL
+      AND (
+        (v1335 = 'value0708' AND (
+          (NOT v1501 IS NULL AND CAST(v1500 AS DATE) = CAST(v1501 AS DATE))
+          OR (NOT v1502 IS NULL AND CAST(v1500 AS DATE) = CAST(v1502 AS DATE))
+        ))
+        OR (v1335 <> 'value0708' AND NOT v1501 IS NULL
+          AND CAST(v1500 AS DATE) = CAST(v1501 AS DATE))
+      )
+      AND NOT v1435 IS NULL
+      THEN CAST(v1435 AS DATE) END AS v1510
+  FROM source
+),
+v1511 AS (
+  SELECT v1025, day, MAX(v1512) AS v1513
+  FROM (
+    SELECT v1025, v1504 AS day, 1 AS v1512 FROM v1503 WHERE NOT v1504 IS NULL
+    UNION ALL
+    SELECT v1025, v1505, 2 FROM v1503 WHERE NOT v1505 IS NULL
+    UNION ALL
+    SELECT v1025, v1506, 3 FROM v1503 WHERE NOT v1506 IS NULL
+    UNION ALL
+    SELECT v1025, v1507, 4 FROM v1503 WHERE NOT v1507 IS NULL
+    UNION ALL
+    SELECT v1025, v1508, 5 FROM v1503 WHERE NOT v1508 IS NULL
+    UNION ALL
+    SELECT v1025, v1509, 6 FROM v1503 WHERE NOT v1509 IS NULL
+    UNION ALL
+    SELECT v1025, v1510, 7 FROM v1503 WHERE NOT v1510 IS NULL
+  ) v1514
+  GROUP BY v1025, day
+),
+v1515 AS (
+  SELECT v1025 AS identity, 'value0755' AS stage, day FROM v1511 WHERE v1513 >= 1
+  UNION ALL
+  SELECT v1025, 'value0756', day FROM v1511 WHERE v1513 >= 2
+  UNION ALL
+  SELECT v1025, 'value0757', day FROM v1511 WHERE v1513 >= 3
+  UNION ALL
+  SELECT v1025, 'value0758', day FROM v1511 WHERE v1513 >= 4
+  UNION ALL
+  SELECT v1025, 'value0759', day FROM v1511 WHERE v1513 >= 5
+  UNION ALL
+  SELECT v1025, 'value0760', day FROM v1511 WHERE v1513 >= 6
+  UNION ALL
+  SELECT v1025, 'value0761', day FROM v1511 WHERE v1513 >= 7
+),
+v0332 AS (
+  SELECT identity, stage, day FROM v1515
+  UNION ALL
+  SELECT
+    v0113.v0171 AS identity,
+    'value0762' AS stage,
+    v0113.v1516 AS day
+  FROM (
+    SELECT
+      JSON_GET_STR(v0000.Metadata, 'value0723') AS v0171,
+      MIN(CAST(v0040.Timestamp AS DATE)) AS v1516
+    FROM v1371 AS v0000
+    JOIN v1372 AS v0040
+      ON v0040.v0045 = v0000.v0045
+    WHERE
+      v0000.v0050 IN ('value0724', 'value0725')
+      AND v0040.Account = 'value0726'
+      AND NOT v0000.v0038 IS NULL
+      AND v0040.v0308 > 0
+      AND CAST(v0040.Timestamp AS DATE) > CAST('2026-05-01' AS DATE)
+      AND NOT JSON_GET_STR(v0000.Metadata, 'value0723') IN (
+        'value0626',
+        'value0627',
+        'value0628',
+        'value0629',
+        'value0630',
+        'value0631',
+        'value0632',
+        'value0633',
+        'value0634',
+        'value0635',
+        'value0636',
+        'value0637'
+      )
+    GROUP BY
+      v0171
+  ) AS v0113
+  UNION ALL
+  SELECT
+    v0113.v0171 AS identity,
+    'value0763' AS stage,
+    v0113.v1516 AS day
+  FROM (
+    SELECT
+      JSON_GET_STR(v0000.Metadata, 'value0723') AS v0171,
+      MIN(CAST(v0040.Timestamp AS DATE)) AS v1516
+    FROM v1371 AS v0000
+    JOIN v1372 AS v0040
+      ON v0040.v0045 = v0000.v0045
+    WHERE
+      v0000.v0050 IN ('value0724', 'value0725')
+      AND v0040.Account = 'value0726'
+      AND NOT v0000.v0038 IS NULL
+      AND v0040.v0308 > 0
+      AND CAST(v0040.Timestamp AS DATE) > CAST('2026-05-01' AS DATE)
+      AND NOT JSON_GET_STR(v0000.Metadata, 'value0723') IN (
+        'value0626',
+        'value0627',
+        'value0628',
+        'value0629',
+        'value0630',
+        'value0631',
+        'value0632',
+        'value0633',
+        'value0634',
+        'value0635',
+        'value0636',
+        'value0637'
+      )
+    GROUP BY
+      v0171
+  ) AS v0113
+  LEFT JOIN v1181 AS v0920
+    ON v0920.v0171 = v0113.v0171
+  WHERE
+    NOT v0920.v1171 IS TRUE
+  UNION ALL
+  SELECT
+    v1517.v0171 AS identity,
+    'value0764' AS stage,
+    v1517.v1518 AS day
+  FROM (
+    SELECT
+      v0000.v1519 AS v0171,
+      MIN(CAST(v0040.Timestamp AS DATE)) AS v1518
+    FROM v1371 AS v0000
+    JOIN v1372 AS v0040
+      ON v0040.v0045 = v0000.v0045
+    WHERE
+      v0000.v0050 = 'value0765'
+      AND v0040.Account = 'value0726'
+      AND NOT v0040.v0307 IS NULL
+      AND NOT v0000.v1519 IS NULL
+      AND NOT v0000.v1519 IN (
+        'value0626',
+        'value0627',
+        'value0628',
+        'value0629',
+        'value0630',
+        'value0631',
+        'value0632',
+        'value0633',
+        'value0634',
+        'value0635',
+        'value0636',
+        'value0637'
+      )
+    GROUP BY
+      v0000.v1519
+  ) AS v1517
+)
+SELECT
+  CAST(day AS TEXT) AS period,
+  COUNT(DISTINCT CASE WHEN stage = 'value0755' THEN identity END) AS v1479,
+  COUNT(DISTINCT CASE WHEN stage = 'value0756' THEN identity END) AS v1520,
+  COUNT(DISTINCT CASE WHEN stage = 'value0757' THEN identity END) AS v0233,
+  COUNT(DISTINCT CASE WHEN stage = 'value0758' THEN identity END) AS v0234,
+  COUNT(DISTINCT CASE WHEN stage = 'value0759' THEN identity END) AS v1521,
+  COUNT(DISTINCT CASE WHEN stage = 'value0760' THEN identity END) AS v1522,
+  COUNT(DISTINCT CASE WHEN stage = 'value0761' THEN identity END) AS v1523,
+  0 AS v1524,
+  COUNT(DISTINCT CASE WHEN stage = 'value0762' THEN identity END) AS v1525,
+  COUNT(DISTINCT CASE WHEN stage = 'value0763' THEN identity END) AS v1526,
+  COUNT(DISTINCT CASE WHEN stage = 'value0764' THEN identity END) AS v1527
+FROM v0332
+WHERE
+  day >= CURRENT_DATE - INTERVAL '13' DAYS AND NOT day IS NULL
+GROUP BY
+  day
+ORDER BY
+  day DESC
+
+-- query 262
+WITH canonical AS (
+  SELECT DISTINCT
+    v1025,
+    FIRST_VALUE(
+      CAST(JSON_GET_STR(v1424, 'value0739', 'value0740') AS TIMESTAMP)
+    ) OVER (
+      PARTITION BY v1025
+      ORDER BY v1437 DESC, COALESCE(v1377, FALSE) DESC
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS v0221,
+    FIRST_VALUE(
+      NOT v1432 IS NULL
+        AND (NOT v1428 IS NULL OR NOT v1430 IS NULL)
+    ) OVER (
+      PARTITION BY v1025
+      ORDER BY v1437 DESC, COALESCE(v1377, FALSE) DESC
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS v1528,
+    FIRST_VALUE(
+      NOT v1434 IS NULL
+    ) OVER (
+      PARTITION BY v1025
+      ORDER BY v1437 DESC, COALESCE(v1377, FALSE) DESC
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS v1529
+  FROM v1436
+  WHERE NOT v1424 IS NULL
+    AND JSON_GET_STR(v1416, 'value0741') IN (
+      'value0708',
+      'value0709',
+      'value0710',
+      'value0711',
+      'value0712'
+    )
+),
+v1530 AS (
+  SELECT
+    v1025,
+    v1528,
+    v1529,
+    CAST(date_trunc('week', CAST(v0221 AS TIMESTAMP) + INTERVAL '1' DAY) - INTERVAL '1' DAY AS DATE) AS v0384
+  FROM canonical
+  WHERE NOT v0221 IS NULL
+    AND v0221 >= CAST(CURRENT_DATE - INTERVAL '90' DAY AS TIMESTAMP)
+),
+v1448 AS (
+  SELECT
+    v1025 AS v0171,
+    MIN(CAST(JSON_GET_STR(Data, 'value0766') AS TIMESTAMP)) AS v1449
+  FROM v1156
+  WHERE NOT JSON_GET_STR(Data, 'value0766') IS NULL
+  GROUP BY v1025
+),
+v1531 AS (
+  SELECT
+    v1025 AS v0171,
+    MIN(CASE WHEN v0046 = 'value0767' THEN v1118 END) AS v1532,
+    MAX(CASE WHEN v0046 = 'value0768' THEN 1 ELSE 0 END) AS v1533
+  FROM v1117
+  WHERE JSON_GET_STR(Metadata, 'value0769') = 'value0770'
+    AND v0046 IN ('value0767', 'value0768')
+  GROUP BY v1025
+),
+v1534 AS (
+  SELECT
+    v1025 AS v0171,
+    MIN(CASE WHEN v0046 = 'value0767' THEN v1118 END) AS v1532,
+    MAX(CASE WHEN v0046 = 'value0768' THEN 1 ELSE 0 END) AS v1533
+  FROM v1117
+  WHERE JSON_GET_STR(Metadata, 'value0769') = 'value0771'
+    AND v0046 IN ('value0767', 'value0768')
+  GROUP BY v1025
+),
+v1525 AS (
+  SELECT
+    JSON_GET_STR(v0000.Metadata, 'value0723') AS v0171,
+    MIN(CAST(v0040.Timestamp AS DATE)) AS v1516
+  FROM v1371 AS v0000
+  JOIN v1372 AS v0040 ON v0040.v0045 = v0000.v0045
+  WHERE
+    v0000.v0050 IN ('value0724', 'value0725')
+    AND v0040.Account = 'value0726'
+    AND NOT v0000.v0038 IS NULL
+    AND v0040.v0308 > 100
+    AND NOT JSON_GET_STR(v0000.Metadata, 'value0723') IN (
+      'value0626', 'value0627', 'value0628',
+      'value0629', 'value0630', 'value0631',
+      'value0632', 'value0633', 'value0634',
+      'value0635', 'value0636', 'value0637'
+    )
+  GROUP BY v0171
+),
+v1535 AS (
+  SELECT
+    v0895.v1025,
+    MAX(CASE
+      WHEN v0895.v0519 = 'value0772' AND v0895.v1536 IS NULL
+      THEN 1 ELSE 0
+    END) AS v1537,
+    MAX(CASE
+      WHEN v0895.v0519 = 'value0773'
+        AND v0895.v1536 IS NULL
+        AND v0235.v0171 IS NULL
+      THEN 1 ELSE 0
+    END) AS v1538
+  FROM v1539 AS v0895
+  LEFT JOIN v1525 AS v0235 ON v0235.v0171 = v0895.v1025
+  GROUP BY v0895.v1025
+)
+SELECT
+  CAST(v0075.v0384 AS TEXT) AS v0384,
+  COUNT(DISTINCT v0075.v1025) AS v1540,
+  COUNT(DISTINCT CASE WHEN v0075.v1528 THEN v0075.v1025 END) AS v1528,
+  COUNT(DISTINCT CASE WHEN v0075.v1529 OR NOT v0920.v0171 IS NULL THEN v0075.v1025 END) AS v1541,
+  COUNT(DISTINCT CASE WHEN NOT v1542.v0171 IS NULL THEN v0075.v1025 END) AS v1543,
+  COUNT(DISTINCT CASE WHEN v1542.v1533 = 1 THEN v0075.v1025 END) AS v1544,
+  COUNT(DISTINCT CASE WHEN NOT v0235.v0171 IS NULL THEN v0075.v1025 END) AS v1525,
+  COUNT(DISTINCT CASE WHEN NOT v1545.v0171 IS NULL THEN v0075.v1025 END) AS v1546,
+  COUNT(DISTINCT CASE WHEN v1545.v1533 = 1 THEN v0075.v1025 END) AS v1547,
+  COUNT(DISTINCT CASE WHEN v1548.v1537 = 1 THEN v0075.v1025 END) AS v1549,
+  100.0 * COUNT(DISTINCT CASE WHEN v1548.v1537 = 1 THEN v0075.v1025 END)
+    / NULLIF(COUNT(DISTINCT v0075.v1025), 0) AS v1550,
+  COUNT(DISTINCT CASE WHEN v1548.v1538 = 1 THEN v0075.v1025 END) AS v1551
+FROM v1530 AS v0075
+LEFT JOIN v1448 AS v0920 ON v0920.v0171 = v0075.v1025
+LEFT JOIN v1531 AS v1542 ON v1542.v0171 = v0075.v1025
+LEFT JOIN v1534 AS v1545 ON v1545.v0171 = v0075.v1025
+LEFT JOIN v1525 AS v0235 ON v0235.v0171 = v0075.v1025
+LEFT JOIN v1535 AS v1548 ON v1548.v1025 = v0075.v1025
+GROUP BY v0384
+ORDER BY v0384 DESC
+
+-- query 263
+WITH v1552 AS (
+  SELECT
+    v1149,
+    v1025,
+    CAST(JSON_GET_STR(v1434, 'value0739', 'value0740') AS TIMESTAMP) AS v1553
+  FROM v1436
+  WHERE
+    NOT v1434 IS NULL
+    AND JSON_GET_STR(v1434, 'value0741', 'value0774') = 'value0775'
+    AND NOT v1025 IN (
+      'value0626',
+      'value0627',
+      'value0628',
+      'value0629',
+      'value0630',
+      'value0631',
+      'value0632',
+      'value0633',
+      'value0634',
+      'value0635',
+      'value0636',
+      'value0637'
+    )
+), v1554 AS (
+  SELECT
+    JSON_GET_STR(v0000.Metadata, 'value0723') AS v1025,
+    MIN(v0040.Timestamp) AS v1555
+  FROM v1371 AS v0000
+  JOIN v0332 AS v0940
+    USING (v0045)
+  JOIN v1372 AS v0040
+    USING (v0045, v0200)
+  WHERE
+    v0000.v0050 IN ('value0724', 'value0725')
+    AND v0040.Account = 'value0726'
+    AND NOT v0000.v0038 IS NULL
+    AND v0040.v0308 > 0
+    AND NOT JSON_GET_STR(v0000.Metadata, 'value0723') IN (
+      'value0626',
+      'value0627',
+      'value0628',
+      'value0629',
+      'value0630',
+      'value0631',
+      'value0632',
+      'value0633',
+      'value0634',
+      'value0635',
+      'value0636',
+      'value0637'
+    )
+  GROUP BY
+    JSON_GET_STR(v0000.Metadata, 'value0723')
+), v1556 AS (
+  SELECT
+    v0073.v1149,
+    v0073.v1025,
+    v0073.v1553,
+    v0113.v1555,
+    CAST(to_timestamp(to_unixtime(CAST('2026-01-04T00:00:00' AS TIMESTAMP)) + CAST((to_unixtime(v0073.v1553) - to_unixtime(CAST('2026-01-04T00:00:00' AS TIMESTAMP))) / 604800 AS BIGINT) * 604800) AS DATE) AS v1557
+  FROM v1552 AS v0073
+  LEFT JOIN v1554 AS v0113
+    ON v0113.v1025 = v0073.v1025
+  WHERE
+    v0073.v1553 >= now() - INTERVAL '91' DAY
+    AND v0073.v1553 < now()
+), v1558 AS (
+  SELECT DISTINCT
+    v1557,
+    v1025
+  FROM v1556
+), v1559 AS (
+  SELECT
+    SUBSTRING(v0040.Metadata, STRPOS(v0040.Metadata, '"value0643":"') + 17) AS v1560,
+    SUBSTRING(v0040.Metadata, STRPOS(v0040.Metadata, '"value0641":"') + 19) AS v1561
+  FROM v0332 AS v0040
+  WHERE
+    v0040.v0046 = 'value0642'
+    AND STRPOS(v0040.Metadata, '"value0643":"') > 0
+    AND STRPOS(v0040.Metadata, '"value0641":"') > 0
+), v1562 AS (
+  SELECT
+    SUBSTRING(v1560, 1, STRPOS(v1560, '"') - 1) AS v1131,
+    MAX(CAST(SUBSTRING(v1561, 1, STRPOS(v1561, '"') - 1) AS DOUBLE)) AS v1563
+  FROM v1559
+  GROUP BY
+    1
+), v1564 AS (
+  SELECT
+    v0463.v1557,
+    SUM(
+      CASE
+        WHEN v0000.v0006 > 0
+        AND (
+          (
+            NOT v0000.v0395 IS NULL AND v0000.v0395 <> ''
+          )
+          OR (
+            NOT v0000.v1123 IS NULL AND v0000.v1123 <> ''
+          )
+          OR LOWER(v0000.v1124) = 'value0048'
+          OR (
+            NOT v0000.v1125 IS NULL AND v0000.v1125 <> ''
+          )
+          OR (
+            NOT v0000.v1126 IS NULL AND v0000.v1126 <> ''
+          )
+        )
+        THEN v0000.v0006
+        ELSE 0
+      END
+    ) AS v1565,
+    SUM(
+      CASE
+        WHEN v0000.v0006 < 0
+        AND (
+          (
+            NOT v0000.v0395 IS NULL AND v0000.v0395 <> ''
+          )
+          OR (
+            NOT v0000.v1128 IS NULL AND v0000.v1128 <> ''
+          )
+          OR LOWER(v0000.v1124) = 'value0048'
+        )
+        THEN ABS(v0000.v0006) - CASE
+          WHEN NOT v1566.v1131 IS NULL
+          THEN COALESCE(v1566.v1563, 0)
+          ELSE 0
+        END
+        ELSE 0
+      END
+    ) AS v1567
+  FROM v1558 AS v0463
+  JOIN v1110 AS v0000
+    ON v0000.v0171 = v0463.v1025
+  LEFT JOIN v1562 AS v1566
+    ON v1566.v1131 = v0000.v1131
+  WHERE
+    v0000.v1132 IN ('value0644', 'value0645')
+  GROUP BY
+    v0463.v1557
+), v1568 AS (
+  SELECT
+    v1557,
+    COUNT(DISTINCT v1025) AS v1569,
+    COUNT(
+      DISTINCT CASE
+        WHEN NOT v1555 IS NULL
+        AND v1555 < CAST(v1557 AS TIMESTAMP) + INTERVAL '7' DAY
+        THEN v1025
+      END
+    ) AS v1570,
+    COUNT(
+      DISTINCT CASE
+        WHEN NOT v1555 IS NULL
+        AND v1555 < CAST(v1557 AS TIMESTAMP) + INTERVAL '14' DAY
+        THEN v1025
+      END
+    ) AS v1571,
+    COUNT(
+      DISTINCT CASE
+        WHEN NOT v1555 IS NULL
+        AND v1555 < CAST(v1557 AS TIMESTAMP) + INTERVAL '21' DAY
+        THEN v1025
+      END
+    ) AS v1572,
+    COUNT(
+      DISTINCT CASE
+        WHEN NOT v1555 IS NULL
+        AND v1555 < CAST(v1557 AS TIMESTAMP) + INTERVAL '28' DAY
+        THEN v1025
+      END
+    ) AS v1573,
+    COUNT(
+      DISTINCT CASE
+        WHEN NOT v1555 IS NULL
+        AND v1555 < CAST(v1557 AS TIMESTAMP) + INTERVAL '35' DAY
+        THEN v1025
+      END
+    ) AS v1574,
+    COUNT(
+      DISTINCT CASE
+        WHEN NOT v1555 IS NULL
+        AND v1555 < CAST(v1557 AS TIMESTAMP) + INTERVAL '42' DAY
+        THEN v1025
+      END
+    ) AS v1575,
+    COUNT(
+      DISTINCT CASE
+        WHEN NOT v1555 IS NULL
+        AND v1555 < CAST(v1557 AS TIMESTAMP) + INTERVAL '49' DAY
+        THEN v1025
+      END
+    ) AS v1576,
+    COUNT(
+      DISTINCT CASE
+        WHEN NOT v1555 IS NULL
+        AND v1555 < CAST(v1557 AS TIMESTAMP) + INTERVAL '56' DAY
+        THEN v1025
+      END
+    ) AS v1577,
+    COUNT(
+      DISTINCT CASE
+        WHEN NOT v1555 IS NULL
+        AND v1555 < CAST(v1557 AS TIMESTAMP) + INTERVAL '63' DAY
+        THEN v1025
+      END
+    ) AS v1578
+  FROM v1556
+  GROUP BY
+    v1557
+)
+SELECT
+  CAST(v0126.v1557 AS TEXT) AS v0384,
+  v0126.v1569,
+  COALESCE(v1579.v1565, 0) AS v1565,
+  COALESCE(v1579.v1567, 0) AS v1567,
+  CASE
+    WHEN CAST(v0126.v1557 AS TIMESTAMP) + INTERVAL '7' DAY <= now()
+    THEN CAST(v0126.v1570 AS DOUBLE) / v0126.v1569
+  END AS v1580,
+  CASE
+    WHEN CAST(v0126.v1557 AS TIMESTAMP) + INTERVAL '14' DAY <= now()
+    THEN CAST(v0126.v1571 AS DOUBLE) / v0126.v1569
+  END AS v1581,
+  CASE
+    WHEN CAST(v0126.v1557 AS TIMESTAMP) + INTERVAL '21' DAY <= now()
+    THEN CAST(v0126.v1572 AS DOUBLE) / v0126.v1569
+  END AS v1582,
+  CASE
+    WHEN CAST(v0126.v1557 AS TIMESTAMP) + INTERVAL '28' DAY <= now()
+    THEN CAST(v0126.v1573 AS DOUBLE) / v0126.v1569
+  END AS v1583,
+  CASE
+    WHEN CAST(v0126.v1557 AS TIMESTAMP) + INTERVAL '35' DAY <= now()
+    THEN CAST(v0126.v1574 AS DOUBLE) / v0126.v1569
+  END AS v1584,
+  CASE
+    WHEN CAST(v0126.v1557 AS TIMESTAMP) + INTERVAL '42' DAY <= now()
+    THEN CAST(v0126.v1575 AS DOUBLE) / v0126.v1569
+  END AS v1585,
+  CASE
+    WHEN CAST(v0126.v1557 AS TIMESTAMP) + INTERVAL '49' DAY <= now()
+    THEN CAST(v0126.v1576 AS DOUBLE) / v0126.v1569
+  END AS v1586,
+  CASE
+    WHEN CAST(v0126.v1557 AS TIMESTAMP) + INTERVAL '56' DAY <= now()
+    THEN CAST(v0126.v1577 AS DOUBLE) / v0126.v1569
+  END AS v1587,
+  CASE
+    WHEN CAST(v0126.v1557 AS TIMESTAMP) + INTERVAL '63' DAY <= now()
+    THEN CAST(v0126.v1578 AS DOUBLE) / v0126.v1569
+  END AS v1588
+FROM v1568 AS v0126
+LEFT JOIN v1564 AS v1579
+  ON v1579.v1557 = v0126.v1557
+ORDER BY
+  v0126.v1557 DESC
+
+-- query 264
+WITH v1589 AS (
+  SELECT
+    v1025,
+    MIN(CAST(json_get_str(v1434, 'value0739', 'value0740') AS TIMESTAMP)) AS v1590
+  FROM v1148
+  WHERE json_get_str(v1434, 'value0741', 'value0774') = 'value0775'
+    AND CAST(json_get_str(v1434, 'value0739', 'value0740') AS TIMESTAMP) >= CAST('2026-04-23T00:00:00' AS TIMESTAMP)
+    AND v1025 NOT IN (
+      'value0626',
+      'value0627',
+      'value0628',
+      'value0629',
+      'value0630',
+      'value0631',
+      'value0632',
+      'value0633',
+      'value0634',
+      'value0635',
+      'value0636',
+      'value0637'
+    )
+  GROUP BY v1025
+),
+v1530 AS (
+  SELECT * FROM v1589
+),
+v1369 AS (
+  SELECT
+    json_get_str(v0000.Metadata, 'value0723') AS v1025,
+    CAST(v0040.Timestamp AS TIMESTAMP) AS v1591
+  FROM v1371 v0000
+  JOIN v0332 v0940 USING (v0045)
+  JOIN v1372 v0040 USING (v0045, v0200)
+  WHERE v0000.v0050 IN ('value0724', 'value0725')
+    AND v0040.Account = 'value0726'
+    AND v0000.v0038 IS NOT NULL
+    AND v0040.v0308 > 100
+),
+v1525 AS (
+  SELECT v1025, MIN(v1591) AS v1592
+  FROM v1369
+  GROUP BY v1025
+),
+v1593 AS (
+  SELECT
+    v0126.v1025,
+    v0126.v1590,
+    v0132.v1592,
+    CASE
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '1 day' THEN 0
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '2 day' THEN 1
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '3 day' THEN 2
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '4 day' THEN 3
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '5 day' THEN 4
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '6 day' THEN 5
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '7 day' THEN 6
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '8 day' THEN 7
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '9 day' THEN 8
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '10 day' THEN 9
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '11 day' THEN 10
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '12 day' THEN 11
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '13 day' THEN 12
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '14 day' THEN 13
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '15 day' THEN 14
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '16 day' THEN 15
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '17 day' THEN 16
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '18 day' THEN 17
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '19 day' THEN 18
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '20 day' THEN 19
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '21 day' THEN 20
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '22 day' THEN 21
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '23 day' THEN 22
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '24 day' THEN 23
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '25 day' THEN 24
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '26 day' THEN 25
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '27 day' THEN 26
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '28 day' THEN 27
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '29 day' THEN 28
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '30 day' THEN 29
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '31 day' THEN 30
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '32 day' THEN 31
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '33 day' THEN 32
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '34 day' THEN 33
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '35 day' THEN 34
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '36 day' THEN 35
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '37 day' THEN 36
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '38 day' THEN 37
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '39 day' THEN 38
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '40 day' THEN 39
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '41 day' THEN 40
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '42 day' THEN 41
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '43 day' THEN 42
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '44 day' THEN 43
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '45 day' THEN 44
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '46 day' THEN 45
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '47 day' THEN 46
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '48 day' THEN 47
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '49 day' THEN 48
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '50 day' THEN 49
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '51 day' THEN 50
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '52 day' THEN 51
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '53 day' THEN 52
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '54 day' THEN 53
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '55 day' THEN 54
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '56 day' THEN 55
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '57 day' THEN 56
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '58 day' THEN 57
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '59 day' THEN 58
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '60 day' THEN 59
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '61 day' THEN 60
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '62 day' THEN 61
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '63 day' THEN 62
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '64 day' THEN 63
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '65 day' THEN 64
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '66 day' THEN 65
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '67 day' THEN 66
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '68 day' THEN 67
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '69 day' THEN 68
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '70 day' THEN 69
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '71 day' THEN 70
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '72 day' THEN 71
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '73 day' THEN 72
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '74 day' THEN 73
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '75 day' THEN 74
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '76 day' THEN 75
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '77 day' THEN 76
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '78 day' THEN 77
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '79 day' THEN 78
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '80 day' THEN 79
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '81 day' THEN 80
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '82 day' THEN 81
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '83 day' THEN 82
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '84 day' THEN 83
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '85 day' THEN 84
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '86 day' THEN 85
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '87 day' THEN 86
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '88 day' THEN 87
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '89 day' THEN 88
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '90 day' THEN 89
+    WHEN v0132.v1592 < v0126.v1590 + INTERVAL '91 day' THEN 90
+    ELSE 90
+    END AS v1594
+  FROM v1530 v0126
+  JOIN v1525 v0132 USING (v1025)
+  WHERE v0132.v1592 >= v0126.v1590
+)
+SELECT
+  v1594 AS days,
+  COUNT(*) AS v1595
+FROM v1593
+GROUP BY v1594
+ORDER BY v1594
+
+-- query 265
+WITH raw AS (
+  SELECT
+    json_get_str(v0000.Metadata, 'value0723') AS v1025,
+    CAST(v0040.Timestamp AS DATE) AS v1370,
+    v0000.v0045,
+    v0040.v0308
+  FROM v1371 v0000
+  JOIN v0332 v0940 USING (v0045)
+  JOIN v1372 v0040 USING (v0045, v0200)
+  WHERE v0000.v0050 IN (
+    'value0724',
+    'value0725'
+  )
+    AND v0040.Account = 'value0726'
+    AND v0000.v0038 IS NOT NULL
+    AND v0040.v0308 > 100
+    AND CAST(v0040.Timestamp AS DATE) > DATE '2026-05-01'
+    AND json_get_str(v0000.Metadata, 'value0723') NOT IN (
+      'value0626',
+      'value0627',
+      'value0628',
+      'value0629',
+      'value0630',
+      'value0631',
+      'value0632',
+      'value0633',
+      'value0634',
+      'value0635',
+      'value0636',
+      'value0637'
+    )
+),
+v1373 AS (
+  SELECT
+    v1025,
+    json_get_str(v1374, 'value0727', 'value0728') AS v1375
+  FROM v1436
+  WHERE v1377 = TRUE
+    AND v1374 IS NOT NULL
+),
+v1378 AS (
+  SELECT
+    v0094.v1025,
+    v0094.v1370,
+    v0094.v0045,
+    v0094.v0308,
+    v0132.v1375,
+    CASE v0132.v1375
+      WHEN 'value0729' THEN 7
+      WHEN 'value0730' THEN 14
+      WHEN 'value0731' THEN 15
+      WHEN 'value0732' THEN 31
+      ELSE NULL
+    END AS v1379
+  FROM raw v0094
+  LEFT JOIN v1373 v0132 USING (v1025)
+),
+v1596 AS (
+  SELECT
+    v1025,
+    v1375,
+    v1379,
+    MIN(v1370) AS v1516,
+    MAX(v1370) AS v1385
+  FROM v1378
+  GROUP BY v1025, v1375, v1379
+),
+v1291 AS (
+  SELECT
+    v1025,
+    v1379,
+    v1385,
+    CAST(to_timestamp(to_unixtime(CAST('2026-01-04T00:00:00' AS TIMESTAMP)) + CAST((to_unixtime(CAST(v1516 AS TIMESTAMP)) - to_unixtime(CAST('2026-01-04T00:00:00' AS TIMESTAMP))) / 604800 AS BIGINT) * 604800) AS DATE) AS v0384,
+    CAST(
+      CASE v1375
+        WHEN 'value0729'      THEN v1385 + INTERVAL '7 days'
+        WHEN 'value0730'    THEN v1385 + INTERVAL '14 days'
+        WHEN 'value0731' THEN v1385 + INTERVAL '15 days'
+        WHEN 'value0732'     THEN v1385 + INTERVAL '31 days'
+      END AS DATE
+    ) AS v1597,
+    CAST(
+      CASE v1375
+        WHEN 'value0729'      THEN v1385 + INTERVAL '14 days'
+        WHEN 'value0730'    THEN v1385 + INTERVAL '28 days'
+        WHEN 'value0731' THEN v1385 + INTERVAL '30 days'
+        WHEN 'value0732'     THEN v1385 + INTERVAL '62 days'
+      END AS DATE
+    ) AS v1387
+  FROM v1596
+),
+v1388 AS (
+  SELECT
+    v1025,
+    v0384,
+    v1385,
+    CASE
+      WHEN v1379 IS NULL THEN 'value0733'
+      WHEN current_date >= v1387 THEN 'value0734'
+      WHEN current_date > v1597 THEN 'value0735'
+      ELSE 'value0736'
+    END AS v1598
+  FROM v1291
+)
+SELECT
+  CAST(v0384 AS TEXT) AS v0384,
+  COUNT(DISTINCT v1025) AS v1599,
+  COUNT(DISTINCT CASE WHEN v1598 = 'value0736' THEN v1025 END) AS v1600,
+  COUNT(DISTINCT CASE WHEN v1598 = 'value0736' AND v1385 = current_date THEN v1025 END) AS v1601,
+  COUNT(DISTINCT CASE WHEN v1598 = 'value0735' THEN v1025 END) AS v1602,
+  COUNT(DISTINCT CASE WHEN v1598 = 'value0734' THEN v1025 END) AS v1603,
+  COUNT(DISTINCT CASE WHEN v1598 = 'value0733' THEN v1025 END) AS v1604
+FROM v1388
+GROUP BY v0384
+ORDER BY v0384 DESC
+
+-- query 266
+WITH raw AS (
+  SELECT
+    json_get_str(v0000.Metadata, 'value0723') AS v1025,
+    CAST(v0040.Timestamp AS DATE) AS v1370,
+    v0000.v0045,
+    v0040.v0308
+  FROM v1371 v0000
+  JOIN v0332 v0940 USING (v0045)
+  JOIN v1372 v0040 USING (v0045, v0200)
+  WHERE v0000.v0050 IN (
+    'value0724',
+    'value0725'
+  )
+    AND v0040.Account = 'value0726'
+    AND v0000.v0038 IS NOT NULL
+    AND v0040.v0308 > 0
+    AND CAST(v0040.Timestamp AS DATE) > DATE '2026-05-01'
+    AND json_get_str(v0000.Metadata, 'value0723') NOT IN (
+      'value0626',
+      'value0627',
+      'value0628',
+      'value0629',
+      'value0630',
+      'value0631',
+      'value0632',
+      'value0633',
+      'value0634',
+      'value0635',
+      'value0636',
+      'value0637'
+    )
+),
+v1593 AS (
+  SELECT
+    v1025,
+    MIN(v1370) AS v1516,
+    COUNT(DISTINCT v1370) AS v1605,
+    MAX(CASE WHEN v1370 = CURRENT_DATE THEN 1 ELSE 0 END) AS v1606
+  FROM raw
+  GROUP BY v1025
+),
+v1607 AS (
+  SELECT
+    CAST(DATE_TRUNC('WEEK', CAST(v1516 AS TIMESTAMP) + INTERVAL '1' DAY) - INTERVAL '1' DAY AS DATE) AS v0384,
+    v1025,
+    v1605,
+    v1606
+  FROM v1593
+)
+SELECT
+  CAST(v0384 AS TEXT) AS v0384,
+  COUNT(DISTINCT v1025) AS v1608,
+  COUNT(DISTINCT CASE WHEN v1605 >= 2 THEN v1025 END) AS v1609,
+  COUNT(DISTINCT CASE WHEN v1605 >= 3 THEN v1025 END) AS v1610,
+  COUNT(DISTINCT CASE WHEN v1605 >= 4 THEN v1025 END) AS v1611,
+  COUNT(DISTINCT CASE WHEN v1605 >= 5 THEN v1025 END) AS v1612,
+  COUNT(DISTINCT CASE WHEN v1605 >= 6 THEN v1025 END) AS v1613,
+  NULLIF(COUNT(DISTINCT CASE WHEN v1606 = 1 AND v1605 = 1 THEN v1025 END), 0) AS v1614,
+  NULLIF(COUNT(DISTINCT CASE WHEN v1606 = 1 AND v1605 = 2 THEN v1025 END), 0) AS v1615,
+  NULLIF(COUNT(DISTINCT CASE WHEN v1606 = 1 AND v1605 = 3 THEN v1025 END), 0) AS v1616,
+  NULLIF(COUNT(DISTINCT CASE WHEN v1606 = 1 AND v1605 = 4 THEN v1025 END), 0) AS v1617,
+  NULLIF(COUNT(DISTINCT CASE WHEN v1606 = 1 AND v1605 = 5 THEN v1025 END), 0) AS v1618,
+  NULLIF(COUNT(DISTINCT CASE WHEN v1606 = 1 AND v1605 >= 6 THEN v1025 END), 0) AS v1619
+FROM v1607
+GROUP BY v0384
+ORDER BY v0384 DESC
+
+-- query 267
+WITH v1559 AS (
+  SELECT
+    SUBSTRING(v0040.Metadata, STRPOS(v0040.Metadata, '"value0643":"') + 17) AS v1560,
+    SUBSTRING(v0040.Metadata, STRPOS(v0040.Metadata, '"value0641":"') + 19) AS v1561
+  FROM v0332 AS v0040
+  WHERE
+    v0040.v0046 = 'value0642'
+    AND STRPOS(v0040.Metadata, '"value0643":"') > 0
+    AND STRPOS(v0040.Metadata, '"value0641":"') > 0
+), v1562 AS (
+  SELECT
+    SUBSTRING(v1560, 1, STRPOS(v1560, '"') - 1) AS v1131,
+    MAX(CAST(SUBSTRING(v1561, 1, STRPOS(v1561, '"') - 1) AS DOUBLE)) AS v1563
+  FROM v1559
+  GROUP BY
+    1
+), v1620 AS (
+  SELECT
+    CAST(v0000.v1122 AS DATE) AS v1621,
+    v0000.v0006,
+    v0000.v1124,
+    v0000.v0395,
+    v0000.v1128,
+    v0000.v1123,
+    v0000.v1125,
+    v0000.v1126,
+    CASE WHEN NOT v1566.v1131 IS NULL THEN 1 ELSE 0 END AS v1622,
+    COALESCE(v1566.v1563, 0) AS v1563
+  FROM v1110 AS v0000
+  LEFT JOIN v1562 AS v1566
+    ON v1566.v1131 = v0000.v1131
+  WHERE
+    v0000.v1132 IN ('value0644', 'value0645')
+    AND NOT v0000.v0171 IN (
+      'value0626',
+      'value0627',
+      'value0628',
+      'value0629',
+      'value0630',
+      'value0631',
+      'value0632',
+      'value0633',
+      'value0634',
+      'value0635',
+      'value0636',
+      'value0637'
+    )
+), v1623 AS (
+  SELECT
+    v1621,
+    SUM(
+      CASE
+        WHEN v0006 > 0
+        AND (
+          (
+            NOT v0395 IS NULL AND v0395 <> ''
+          )
+          OR (
+            NOT v1123 IS NULL AND v1123 <> ''
+          )
+          OR LOWER(v1124) = 'value0048'
+          OR (
+            NOT v1125 IS NULL AND v1125 <> ''
+          )
+          OR (
+            NOT v1126 IS NULL AND v1126 <> ''
+          )
+        )
+        THEN v0006
+        ELSE 0
+      END
+    ) AS v1127,
+    SUM(
+      CASE
+        WHEN v0006 < 0
+        AND (
+          (
+            NOT v0395 IS NULL AND v0395 <> ''
+          )
+          OR (
+            NOT v1128 IS NULL AND v1128 <> ''
+          )
+          OR LOWER(v1124) = 'value0048'
+        )
+        THEN ABS(v0006) - CASE WHEN v1622 = 1 THEN v1563 ELSE 0 END
+        ELSE 0
+      END
+    ) AS v1130
+  FROM v1620
+  GROUP BY
+    v1621
+), v1624 AS (
+  SELECT
+    CAST(CURRENT_DATE AS DATE) - 29 AS v1625,
+    CAST(CURRENT_DATE AS DATE) AS v1626
+), v1627 AS (
+  SELECT 0 AS v0113 UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3
+  UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7
+), v1628 AS (
+  SELECT
+    (v0057.v0113 * 64 + v0593.v0113 * 8 + v0075.v0113) AS v0561
+  FROM v1627 AS v0057
+  CROSS JOIN v1627 AS v0593
+  CROSS JOIN v1627 AS v0075
+), v1438 AS (
+  SELECT
+    (v1629.v1625 + v1628.v0561) AS v1621
+  FROM v1624 AS v1629
+  CROSS JOIN v1628
+  WHERE
+    (v1629.v1625 + v1628.v0561) <= v1629.v1626
+)
+SELECT
+  v1460.v1621 || '' AS date,
+  COALESCE(v0921.v1127, 0) AS v1127,
+  COALESCE(v0921.v1130, 0) AS v1130
+FROM v1438 AS v1460
+LEFT JOIN v1623 AS v0921
+  ON v0921.v1621 = v1460.v1621
+ORDER BY
+  v1460.v1621 ASC
+
+-- query 268
+WITH v1559 AS (
+  SELECT
+    SUBSTRING(v0040.Metadata, STRPOS(v0040.Metadata, '"value0643":"') + 17) AS v1560,
+    SUBSTRING(v0040.Metadata, STRPOS(v0040.Metadata, '"value0641":"') + 19) AS v1561
+  FROM v0332 AS v0040
+  WHERE
+    v0040.v0046 = 'value0642'
+    AND CAST(v0040.v0041 AS DATE) >= CURRENT_DATE - INTERVAL '35' DAYS
+    AND STRPOS(v0040.Metadata, '"value0643":"') > 0
+    AND STRPOS(v0040.Metadata, '"value0641":"') > 0
+), v1562 AS (
+  SELECT
+    SUBSTRING(v1560, 1, STRPOS(v1560, '"') - 1) AS v1131,
+    MAX(CAST(SUBSTRING(v1561, 1, STRPOS(v1561, '"') - 1) AS DOUBLE)) AS v1563
+  FROM v1559
+  GROUP BY
+    1
+), v1620 AS (
+  SELECT
+    CAST(v0000.v1122 AS DATE) AS v1621,
+    v0000.v0006,
+    v0000.v1124,
+    v0000.v0395,
+    v0000.v1128,
+    v0000.v1123,
+    v0000.v1125,
+    v0000.v1126,
+    CASE WHEN NOT v1566.v1131 IS NULL THEN 1 ELSE 0 END AS v1622,
+    COALESCE(v1566.v1563, 0) AS v1563
+  FROM v1110 AS v0000
+  LEFT JOIN v1562 AS v1566
+    ON v1566.v1131 = v0000.v1131
+  WHERE
+    v0000.v1132 IN ('value0644', 'value0645')
+    AND CAST(v0000.v1122 AS DATE) >= CURRENT_DATE - INTERVAL '35' DAYS
+    AND NOT v0000.v0171 IN (
+      'value0626',
+      'value0627',
+      'value0628',
+      'value0629',
+      'value0630',
+      'value0631',
+      'value0632',
+      'value0633',
+      'value0634',
+      'value0635',
+      'value0636',
+      'value0637'
+    )
+), v1623 AS (
+  SELECT
+    v1621,
+    SUM(
+      CASE
+        WHEN (
+          v0395 IS NULL OR v0395 = ''
+        )
+        AND (
+          (
+            NOT v1123 IS NULL AND v1123 <> ''
+          )
+          OR LOWER(v1124) = 'value0048'
+        )
+        AND v0006 > 0
+        THEN v0006
+        ELSE 0
+      END
+    ) AS v1133,
+    SUM(
+      CASE
+        WHEN NOT v0395 IS NULL AND v0395 <> '' AND v0006 > 0
+        THEN v0006
+        ELSE 0
+      END
+    ) AS v1134,
+    SUM(
+      CASE
+        WHEN (
+          v0395 IS NULL OR v0395 = ''
+        )
+        AND (
+          v1123 IS NULL OR v1123 = ''
+        )
+        AND LOWER(COALESCE(v1124, '')) <> 'value0048'
+        AND (
+          (
+            NOT v1125 IS NULL AND v1125 <> ''
+          )
+          OR (
+            NOT v1126 IS NULL AND v1126 <> ''
+          )
+        )
+        AND v0006 > 0
+        THEN v0006
+        ELSE 0
+      END
+    ) AS v1135,
+    SUM(
+      CASE
+        WHEN v0006 > 0
+        AND (
+          (
+            NOT v0395 IS NULL AND v0395 <> ''
+          )
+          OR (
+            NOT v1123 IS NULL AND v1123 <> ''
+          )
+          OR LOWER(v1124) = 'value0048'
+          OR (
+            NOT v1125 IS NULL AND v1125 <> ''
+          )
+          OR (
+            NOT v1126 IS NULL AND v1126 <> ''
+          )
+        )
+        THEN v0006
+        ELSE 0
+      END
+    ) AS v1127,
+    SUM(
+      CASE
+        WHEN NOT v0395 IS NULL AND v0395 <> '' AND v0006 < 0 AND v1622 = 0
+        THEN ABS(v0006)
+        ELSE 0
+      END
+    ) AS v1136,
+    SUM(
+      CASE
+        WHEN NOT v0395 IS NULL AND v0395 <> '' AND v0006 < 0 AND v1622 = 1
+        THEN ABS(v0006) - v1563
+        ELSE 0
+      END
+    ) AS v1137,
+    SUM(
+      CASE
+        WHEN (
+          v0395 IS NULL OR v0395 = ''
+        )
+        AND (
+          (
+            NOT v1128 IS NULL AND v1128 <> ''
+          ) OR LOWER(v1124) = 'value0048'
+        )
+        AND v0006 < 0
+        THEN ABS(v0006)
+        ELSE 0
+      END
+    ) AS v0707,
+    SUM(
+      CASE
+        WHEN v0006 < 0
+        AND (
+          (
+            NOT v0395 IS NULL AND v0395 <> ''
+          )
+          OR (
+            NOT v1128 IS NULL AND v1128 <> ''
+          )
+          OR LOWER(v1124) = 'value0048'
+        )
+        THEN ABS(v0006) - CASE WHEN v1622 = 1 THEN v1563 ELSE 0 END
+        ELSE 0
+      END
+    ) AS v1130
+  FROM v1620
+  GROUP BY
+    v1621
+), v1624 AS (
+  SELECT
+    CAST(CURRENT_DATE AS DATE) - 29 AS v1625,
+    CAST(CURRENT_DATE AS DATE) AS v1626
+), v1627       AS (
+  SELECT
+    0 AS v0113
+  UNION ALL
+  SELECT
+    1
+  UNION ALL
+  SELECT
+    2
+  UNION ALL
+  SELECT
+    3
+  UNION ALL
+  SELECT
+    4
+  UNION ALL
+  SELECT
+    5
+  UNION ALL
+  SELECT
+    6
+  UNION ALL
+  SELECT
+    7
+), v1628 AS (
+  SELECT
+    (
+      v0057.v0113 * 64 + v0593.v0113 * 8 + v0075.v0113
+    ) AS v0561
+  FROM v1627 AS v0057
+  CROSS JOIN v1627 AS v0593
+  CROSS JOIN v1627 AS v0075
+), v1438 AS (
+  SELECT
+    (
+      v1629.v1625 + v1628.v0561
+    ) AS v1621
+  FROM v1624 AS v1629
+  CROSS JOIN v1628
+  WHERE
+    (
+      v1629.v1625 + v1628.v0561
+    ) <= v1629.v1626
+)
+SELECT
+  v1460.v1621 || '' AS date,
+  COALESCE(v0921.v1133, 0) AS v1133,
+  COALESCE(v0921.v1134, 0) AS v1134,
+  COALESCE(v0921.v1135, 0) AS v1135,
+  COALESCE(v0921.v1127, 0) AS v1127,
+  COALESCE(v0921.v1136, 0) AS v1136,
+  COALESCE(v0921.v1137, 0) AS v1137,
+  COALESCE(v0921.v0707, 0) AS v0707,
+  COALESCE(v0921.v1130, 0) AS v1130,
+  v1630.v0011 AS v1631
+FROM v1438 AS v1460
+LEFT JOIN v1623 AS v0921
+  ON v0921.v1621 = v1460.v1621
+LEFT JOIN v0009 AS v1630
+  ON v1630.v0010 = v1460.v1621
+ORDER BY
+  v1460.v1621 DESC
+
+-- query 269
+SELECT
+  CAST(v1122 AS DATE) || '' AS date,
+  SUM(
+    CASE
+      WHEN UPPER(COALESCE(v0505, '')) LIKE '%value0646%'
+       AND UPPER(COALESCE(v0505, '')) NOT LIKE '%value0647 value0555%'
+       AND v0006 > 0
+      THEN v0006 ELSE 0
+    END
+  ) AS v1138,
+  SUM(
+    CASE
+      WHEN UPPER(COALESCE(v0505, '')) LIKE '%value0648%'
+       AND NOT (
+         UPPER(COALESCE(v0505, '')) LIKE '%value0649%'
+         OR UPPER(COALESCE(v0505, '')) LIKE '%value0650%'
+         OR UPPER(COALESCE(v0505, '')) LIKE '%value0651%'
+         OR UPPER(COALESCE(v0505, '')) LIKE '%value0652%'
+       )
+      THEN ABS(v0006) ELSE 0
+    END
+  ) AS v1139,
+  SUM(
+    CASE
+      WHEN UPPER(COALESCE(v0505, '')) LIKE '%value0648%'
+       AND (
+         UPPER(COALESCE(v0505, '')) LIKE '%value0649%'
+         OR UPPER(COALESCE(v0505, '')) LIKE '%value0650%'
+         OR UPPER(COALESCE(v0505, '')) LIKE '%value0651%'
+         OR UPPER(COALESCE(v0505, '')) LIKE '%value0652%'
+       )
+      THEN ABS(v0006) ELSE 0
+    END
+  ) AS v1140,
+  SUM(
+    CASE
+      WHEN LOWER(COALESCE(v1124, '')) = 'value0048'
+       AND UPPER(COALESCE(v0505, '')) LIKE '%value0255%value0653%'
+      THEN ABS(v0006) ELSE 0
+    END
+  ) AS v1141
+FROM v1110
+WHERE
+  v1132 IN ('value0644', 'value0645')
+  AND NOT v0171 IN (
+    'value0626','value0627',
+    'value0628','value0629',
+    'value0630','value0631',
+    'value0632','value0633',
+    'value0634','value0635',
+    'value0636','value0637'
+  )
+GROUP BY CAST(v1122 AS DATE) || ''
+HAVING
+  SUM(CASE WHEN UPPER(COALESCE(v0505, '')) LIKE '%value0646%'
+             AND UPPER(COALESCE(v0505, '')) NOT LIKE '%value0647 value0555%'
+             AND v0006 > 0 THEN 1 ELSE 0 END)
+  + SUM(CASE WHEN UPPER(COALESCE(v0505, '')) LIKE '%value0648%' THEN 1 ELSE 0 END)
+  + SUM(CASE WHEN LOWER(COALESCE(v1124, '')) = 'value0048'
+                AND UPPER(COALESCE(v0505, '')) LIKE '%value0255%value0653%'
+              THEN 1 ELSE 0 END) > 0
+ORDER BY 1 DESC
+
+-- query 270
+WITH v1530 AS (
+  SELECT
+    v1025,
+    v1632,
+    CAST(to_timestamp(
+      to_unixtime(CAST('2026-01-04T00:00:00' AS TIMESTAMP))
+      + CAST((to_unixtime(CAST(v1632 AS TIMESTAMP)) - to_unixtime(CAST('2026-01-04T00:00:00' AS TIMESTAMP))) / 604800 AS BIGINT) * 604800
+    ) AS DATE) AS v0384
+  FROM (
+    SELECT
+      v1025,
+      CAST(JSON_GET_STR(v1434, 'value0739', 'value0740') AS DATE) AS v1632
+    FROM v1436
+    WHERE
+      JSON_GET_STR(v1434, 'value0741', 'value0774') = 'value0775'
+      AND NOT v1025 IN (
+        'value0626', 'value0627', 'value0628',
+        'value0629', 'value0630', 'value0631',
+        'value0632', 'value0633', 'value0634',
+        'value0635', 'value0636', 'value0637'
+      )
+    QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY v1025 ORDER BY v1437 DESC, COALESCE(v1377, FALSE) DESC
+    ) = 1
+  )
+),
+v1373 AS (
+  SELECT
+    v1025,
+    JSON_GET_STR(v1374, 'value0727', 'value0728') AS v1375
+  FROM v1436
+  WHERE v1377 = TRUE AND NOT v1374 IS NULL
+    AND NOT v1025 IN (
+      'value0626', 'value0627', 'value0628',
+      'value0629', 'value0630', 'value0631',
+      'value0632', 'value0633', 'value0634',
+      'value0635', 'value0636', 'value0637'
+    )
+),
+v1633 AS (
+  SELECT
+    JSON_GET_STR(v0000.Metadata, 'value0723') AS v1025,
+    MAX(CAST(v0040.Timestamp AS DATE)) AS v1385
+  FROM v1371 AS v0000
+  JOIN v1372 AS v0040 ON v0040.v0045 = v0000.v0045
+  WHERE
+    v0000.v0050 IN ('value0724', 'value0725')
+    AND v0040.Account = 'value0726'
+    AND NOT v0000.v0038 IS NULL
+    AND v0040.v0308 > 0
+    AND NOT JSON_GET_STR(v0000.Metadata, 'value0723') IN (
+      'value0626', 'value0627', 'value0628',
+      'value0629', 'value0630', 'value0631',
+      'value0632', 'value0633', 'value0634',
+      'value0635', 'value0636', 'value0637'
+    )
+  GROUP BY v1025
+),
+v1634 AS (
+  SELECT
+    v0290.v1025,
+    v0132.v1375,
+    v1635.v1385,
+    CASE
+      WHEN v1635.v1385 IS NULL THEN NULL
+      WHEN v0132.v1375 = 'value0729'      THEN v1635.v1385 + INTERVAL '14' DAYS
+      WHEN v0132.v1375 = 'value0730'    THEN v1635.v1385 + INTERVAL '28' DAYS
+      WHEN v0132.v1375 = 'value0731' THEN v1635.v1385 + INTERVAL '30' DAYS
+      WHEN v0132.v1375 = 'value0732'     THEN v1635.v1385 + INTERVAL '62' DAYS
+    END AS v1387
+  FROM v1530 v0290
+  LEFT JOIN v1373 v0132 ON v0132.v1025 = v0290.v1025
+  LEFT JOIN v1633 v1635 ON v1635.v1025 = v0290.v1025
+),
+v1636 AS (
+  SELECT
+    v1025,
+    CAST(MIN(CASE WHEN v1536 IS NULL THEN v1637 END) AS DATE) AS v1638,
+    SUM(CASE WHEN v1355 IS NULL AND v1536 IS NULL THEN 1 ELSE 0 END) AS v1639,
+    SUM(CASE WHEN NOT v1355 IS NULL THEN 1 ELSE 0 END) AS v1640
+  FROM v1539
+  GROUP BY v1025
+),
+v1383 AS (
+  SELECT
+    v0290.v1025,
+    v0290.v0384,
+    v0290.v1632,
+    CASE
+      WHEN v1641.v1385 IS NULL THEN FALSE
+      WHEN v1641.v1387 IS NULL THEN FALSE
+      WHEN CURRENT_DATE >= v1641.v1387 THEN TRUE
+      ELSE FALSE
+    END AS v1642,
+    CASE
+      WHEN v0895.v1639 > 0 THEN 'value0776'
+      WHEN v0895.v1640 > 0 THEN 'value0091'
+      ELSE NULL
+    END AS v1643,
+    v0895.v1638
+  FROM v1530 v0290
+  LEFT JOIN v1634 v1641 ON v1641.v1025 = v0290.v1025
+  LEFT JOIN v1636 v0895 ON v0895.v1025 = v0290.v1025
+)
+SELECT
+  CAST(v0384 AS TEXT) AS v0384,
+  COUNT(DISTINCT v1025) AS v1644,
+  COUNT(DISTINCT CASE WHEN v1643 IN ('value0776', 'value0091') THEN v1025 END) AS v1645,
+  COUNT(DISTINCT CASE WHEN v1643 = 'value0776' THEN v1025 END) AS v1646,
+  COUNT(DISTINCT CASE WHEN v1643 = 'value0091' THEN v1025 END) AS v1647,
+  COUNT(DISTINCT CASE WHEN v1642 THEN v1025 END) AS v1603,
+  COUNT(DISTINCT CASE WHEN v1638 <= v1632 + INTERVAL '7' DAY THEN v1025 END) AS v1648,
+  COUNT(DISTINCT CASE WHEN v1638 <= v1632 + INTERVAL '14' DAY THEN v1025 END) AS v1649,
+  COUNT(DISTINCT CASE WHEN v1638 <= v1632 + INTERVAL '21' DAY THEN v1025 END) AS v1650,
+  COUNT(DISTINCT CASE WHEN v1638 <= v1632 + INTERVAL '28' DAY THEN v1025 END) AS v1651
+FROM v1383
+GROUP BY v0384
+ORDER BY v0384 DESC
+

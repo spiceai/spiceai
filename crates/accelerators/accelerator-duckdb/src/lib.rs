@@ -3917,4 +3917,104 @@ mod tests {
             );
         }
     }
+
+    /// `concat` is rendered as `||` because the `concat` a Spice query
+    /// resolves is `datafusion-spark`'s, which propagates NULL, while
+    /// `DuckDB`'s own `concat` skips a NULL argument. Rendering the function
+    /// name verbatim made an accelerated dataset answer `'z'` where the same
+    /// query answered NULL unaccelerated (issue #13849).
+    ///
+    /// Like the `btrim` case above, a rename or an operator swap is only
+    /// correct if the accelerator answers what `DataFusion` answers, so this
+    /// evaluates the same expression through a real in-memory `DuckDB` and
+    /// through the registered Spark `concat`, and asserts they agree. The
+    /// NULL and empty-argument rows are the ones a plausible-looking
+    /// rendering gets wrong while still producing valid SQL that `DuckDB`
+    /// runs happily.
+    #[test]
+    fn duckdb_concat_rewrite_agrees_with_the_registered_spark_concat() {
+        use arrow::array::Array as _;
+        use datafusion::logical_expr::expr::ScalarFunction;
+        use datafusion::prelude::Expr;
+        use datafusion::scalar::ScalarValue;
+        use datafusion::sql::unparser::Unparser;
+        use runtime_datafusion::dialect::new_duckdb_dialect;
+
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let duck = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let ctx = SessionContext::new();
+
+        let spark_concat = datafusion_spark::all_default_scalar_functions()
+            .into_iter()
+            .find(|udf| udf.name() == "concat")
+            .expect("datafusion-spark provides a concat");
+
+        let null = || Expr::Literal(ScalarValue::Utf8(None), None);
+
+        // Zero arguments, a NULL among non-NULLs, all-NULL, and the empty
+        // string — the differential cases issue #13849 turns on.
+        let cases: Vec<(&str, Vec<Expr>)> = vec![
+            ("zero arguments", vec![]),
+            ("plain", vec![lit("a"), lit("b")]),
+            ("trailing NULL", vec![lit("a"), null()]),
+            ("leading NULL", vec![null(), lit("b")]),
+            ("all NULL", vec![null(), null()]),
+            ("empty string", vec![lit(""), lit("b")]),
+            ("only empty strings", vec![lit(""), lit("")]),
+            ("single NULL", vec![null()]),
+            ("single value", vec![lit("solo")]),
+            ("NULL between values", vec![lit("a"), null(), lit("c")]),
+        ];
+
+        for (label, args) in cases {
+            let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+                Arc::clone(&spark_concat),
+                args.clone(),
+            ));
+
+            let sql = unparser
+                .expr_to_sql(&call)
+                .expect("concat unparses for DuckDB")
+                .to_string();
+            assert!(
+                !sql.contains("concat("),
+                "the dialect must not emit DuckDB's NULL-skipping `concat`, got {sql} ({label})"
+            );
+
+            let from_duckdb: Option<String> = duck
+                .query_row(&format!("SELECT {sql}"), [], |row| row.get(0))
+                .unwrap_or_else(|e| panic!("DuckDB rejected `SELECT {sql}` ({label}): {e}"));
+
+            let batches = tokio_rt
+                .block_on(async {
+                    ctx.read_empty()?
+                        .select(vec![call.alias("v")])?
+                        .collect()
+                        .await
+                })
+                .unwrap_or_else(|e| panic!("DataFusion evaluates concat ({label}): {e}"));
+            let column = batches
+                .first()
+                .expect("one batch")
+                .column_by_name("v")
+                .expect("column v")
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("concat returns Utf8 for Utf8 arguments");
+            let from_datafusion = if column.is_null(0) {
+                None
+            } else {
+                Some(column.value(0).to_string())
+            };
+
+            assert_eq!(
+                from_duckdb, from_datafusion,
+                "DuckDB `{sql}` and the registered Spark concat must agree ({label})"
+            );
+        }
+    }
 }

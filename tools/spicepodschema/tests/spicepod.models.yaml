@@ -76,7 +76,7 @@ models:
   # - name: hf_mistral
   #   from: huggingface:mistralai/Mistral-7B-Instruct-v0.2
   #   params:
-  #     huggingface_token: hf_xxx
+  #     hf_token: hf_xxx
   #     model_type: mistral
 
   # ---------------------------------------------------------------------------

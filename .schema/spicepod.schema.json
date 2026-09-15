@@ -454,7 +454,7 @@
       },
       {
         "name": "huggingface",
-        "prefix": "huggingface",
+        "prefix": "hf",
         "paramsRef": "#/$defs/HuggingfaceModelParams",
         "schemaRef": "#/$defs/HuggingfaceModel"
       },
@@ -10795,8 +10795,8 @@
           "description": "Customizes the transformation of OpenAI chat messages into a character stream for the model.",
           "type": "string"
         },
-        "huggingface_token": {
-          "description": "The Huggingface access token.",
+        "hf_token": {
+          "description": "The Hugging Face access token. `huggingface_token` is accepted as an alias.",
           "type": "string"
         },
         "distributed_backend": {
@@ -10839,73 +10839,73 @@
           "description": "Maximum requests per minute for this model. Overrides provider defaults.",
           "type": "string"
         },
-        "huggingface_frequency_penalty": {
+        "hf_frequency_penalty": {
           "type": "string"
         },
-        "huggingface_logit_bias": {
+        "hf_logit_bias": {
           "type": "string"
         },
-        "huggingface_logprobs": {
+        "hf_logprobs": {
           "type": "string"
         },
-        "huggingface_top_logprobs": {
+        "hf_top_logprobs": {
           "type": "string"
         },
-        "huggingface_max_completion_tokens": {
+        "hf_max_completion_tokens": {
           "type": "string"
         },
-        "huggingface_reasoning_effort": {
+        "hf_reasoning_effort": {
           "type": "string"
         },
-        "huggingface_store": {
+        "hf_store": {
           "type": "string"
         },
-        "huggingface_metadata": {
+        "hf_metadata": {
           "type": "string"
         },
-        "huggingface_n": {
+        "hf_n": {
           "type": "string"
         },
-        "huggingface_presence_penalty": {
+        "hf_presence_penalty": {
           "type": "string"
         },
-        "huggingface_response_format": {
+        "hf_response_format": {
           "type": "string"
         },
-        "huggingface_seed": {
+        "hf_seed": {
           "type": "string"
         },
-        "huggingface_stop": {
+        "hf_stop": {
           "type": "string"
         },
-        "huggingface_stream": {
+        "hf_stream": {
           "type": "string"
         },
-        "huggingface_stream_options": {
+        "hf_stream_options": {
           "type": "string"
         },
-        "huggingface_temperature": {
+        "hf_temperature": {
           "type": "string"
         },
-        "huggingface_top_p": {
+        "hf_top_p": {
           "type": "string"
         },
-        "huggingface_tools": {
+        "hf_tools": {
           "type": "string"
         },
-        "huggingface_tool_choice": {
+        "hf_tool_choice": {
           "type": "string"
         },
-        "huggingface_parallel_tool_calls": {
+        "hf_parallel_tool_calls": {
           "type": "string"
         },
-        "huggingface_prompt_cache_key": {
+        "hf_prompt_cache_key": {
           "type": "string"
         },
-        "huggingface_prompt_cache_retention": {
+        "hf_prompt_cache_retention": {
           "type": "string"
         },
-        "huggingface_user": {
+        "hf_user": {
           "type": "string"
         },
         "openai_frequency_penalty": {

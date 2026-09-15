@@ -71,8 +71,11 @@ use arrow::array::{ArrayRef, BooleanArray, BooleanBufferBuilder};
 use arrow::compute::{max as arrow_col_max, min as arrow_col_min};
 use datafusion::config::ConfigOptions;
 
-use crate::row_converter::RowConverter;
+use crate::row_converter::{RowConverter, Rows};
 use datafusion_execution::SendableRecordBatchStream;
+use datafusion_execution::memory_pool::{
+    MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+};
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
@@ -541,6 +544,10 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
         context: Arc<datafusion_execution::TaskContext>,
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
         let metrics = DeletionFilterMetrics::new(&self.metrics, partition);
+        let row_scratch = RowEncodingScratch::new(
+            context.memory_pool(),
+            context.session_config().target_partitions(),
+        );
         let input_stream = self.input.execute(partition, context)?;
         let tombstones = Arc::clone(&self.tombstones);
         let insert_record_handling = self.insert_record_handling;
@@ -555,6 +562,7 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
             insert_record_handling,
             pk_column_indices,
             row_converter,
+            row_scratch,
             min_delete_seq_to_apply,
             schema,
             metrics,
@@ -566,6 +574,73 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
     }
 }
 
+/// Encoded-row storage carried between the scan batches of one stream, so a
+/// batch re-encodes its primary keys into the previous batch's byte and offset
+/// allocations instead of fresh ones. Retained capacity is charged to the query
+/// pool; the current batch's own allocation stays local to the encoder.
+///
+/// The cache is held across a pending input and released on end-of-stream, on
+/// error, and on drop. The Vortex scan this exec wraps returns `Pending` at its
+/// decode and I/O boundaries, and releasing the cache at each of those would cost
+/// the next batch a fresh encoding, which is the allocation the cache exists to
+/// avoid. Holding the buffers is safe because the reservation charges them to the
+/// pool, and a pool without room declines to keep them.
+struct RowEncodingScratch {
+    rows: Option<Rows>,
+    reservation: MemoryReservation,
+    max_bytes: usize,
+}
+
+impl RowEncodingScratch {
+    /// `target_partitions` is the session's query parallelism. It is only a
+    /// heuristic for how many of these caches run at once, which is why the pool
+    /// reservation, not this cap, bounds their total.
+    fn new(pool: &Arc<dyn MemoryPool>, target_partitions: usize) -> Self {
+        // Cap ONE stream's retained capacity at a MiB so a single large key batch
+        // cannot pin its whole encoding, and divide by the query parallelism so the
+        // cap shrinks, rather than grows, as a small pool is shared by more streams.
+        //
+        // This is a per-stream ceiling, not a share of the pool: a plan holds one
+        // cache per partition of every scan input the deletion filter wraps, and
+        // concurrent queries multiply that again. The pool reservation bounds the
+        // aggregate by refusing admission once the pool is full; this number only
+        // keeps any single stream's share small.
+        let max_bytes = match pool.memory_limit() {
+            MemoryLimit::Finite(limit) => (limit / target_partitions.max(1) / 16).min(1 << 20),
+            MemoryLimit::Infinite | MemoryLimit::Unknown => 1 << 20,
+        };
+        Self {
+            rows: None,
+            reservation: MemoryConsumer::new("Cayenne row encoding scratch").register(pool),
+            max_bytes,
+        }
+    }
+
+    /// Lend the retained allocations to the encoder. The reservation still covers
+    /// them until the matching [`Self::retain`] or [`Self::clear`] resizes it, so
+    /// every path out of a batch must call one of the two.
+    fn take(&mut self) -> Option<Rows> {
+        self.rows.take()
+    }
+
+    /// Keep `rows` for the next batch, or drop them when they exceed the cap or
+    /// the pool declines. Retention is best-effort by design: a full pool costs
+    /// this stream its reuse, never its query.
+    fn retain(&mut self, rows: Rows) {
+        let bytes = rows.allocated_bytes();
+        if bytes <= self.max_bytes && self.reservation.try_resize(bytes).is_ok() {
+            self.rows = Some(rows);
+        } else {
+            self.clear();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.rows = None;
+        self.reservation.free();
+    }
+}
+
 /// Stream that filters out deleted rows based on primary key matching.
 pub struct KeyBasedDeletionFilterStream {
     input: SendableRecordBatchStream,
@@ -573,6 +648,7 @@ pub struct KeyBasedDeletionFilterStream {
     insert_record_handling: InsertRecordHandling,
     pk_column_indices: Vec<usize>,
     row_converter: Arc<RowConverter>,
+    row_scratch: RowEncodingScratch,
     /// See [`Int64PkDeletionFilterStream::min_delete_seq_to_apply`].
     min_delete_seq_to_apply: Option<i64>,
     schema: arrow_schema::SchemaRef,
@@ -633,6 +709,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     }
 
                     if this.pk_column_indices.is_empty() {
+                        this.row_scratch.clear();
                         return std::task::Poll::Ready(Some(Err(
                             datafusion_common::DataFusionError::Internal(
                                 "KeyBasedDeletionFilterExec requires at least one primary key column index".to_string(),
@@ -647,6 +724,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     this.pk_columns_scratch.clear();
                     for &idx in &this.pk_column_indices {
                         let Some(column) = batch.columns().get(idx) else {
+                            this.row_scratch.clear();
                             return std::task::Poll::Ready(Some(Err(
                                 datafusion_common::DataFusionError::Internal(format!(
                                     "KeyBasedDeletionFilterExec primary key column index {idx} is out of bounds for a batch with {} columns",
@@ -658,9 +736,13 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     }
 
                     // Convert PK columns to row bytes (single batched conversion).
-                    let rows = match this.row_converter.convert_columns(&this.pk_columns_scratch) {
+                    let rows = match this
+                        .row_converter
+                        .convert_columns_reusing(&this.pk_columns_scratch, this.row_scratch.take())
+                    {
                         Ok(rows) => rows,
                         Err(e) => {
+                            this.row_scratch.clear();
                             return std::task::Poll::Ready(Some(Err(
                                 datafusion_common::DataFusionError::ArrowError(Box::new(e), None),
                             )));
@@ -705,6 +787,9 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                             }
                         },
                     );
+                    // Retention is optional: an oversized encoding or a full pool
+                    // drops the buffers after probing instead of failing the query.
+                    this.row_scratch.retain(rows);
                     let keep_count = batch_size - this.deleted_scratch.len();
 
                     tracing::trace!(
@@ -742,6 +827,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         match arrow::compute::filter_record_batch(&batch, &filter_array) {
                             Ok(filtered) => filtered,
                             Err(e) => {
+                                this.row_scratch.clear();
                                 return std::task::Poll::Ready(Some(Err(
                                     datafusion_common::DataFusionError::ArrowError(
                                         Box::new(e),
@@ -760,14 +846,17 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     return std::task::Poll::Ready(Some(Ok(filtered_batch)));
                 }
                 std::task::Poll::Ready(Some(Err(e))) => {
+                    self.row_scratch.clear();
                     return std::task::Poll::Ready(Some(Err(e)));
                 }
                 std::task::Poll::Ready(None) => {
+                    self.row_scratch.clear();
                     return std::task::Poll::Ready(None);
                 }
-                std::task::Poll::Pending => {
-                    return std::task::Poll::Pending;
-                }
+                // The retained encoding is deliberately kept across a pending
+                // input: this is the gap between two scan batches, which is
+                // exactly what it exists to bridge.
+                std::task::Poll::Pending => return std::task::Poll::Pending,
             }
         }
     }
@@ -1153,6 +1242,362 @@ mod tests {
     use futures::StreamExt;
     use std::collections::HashMap;
 
+    #[tokio::test]
+    async fn key_based_filter_reuses_rows_and_drops_scratch_under_pressure()
+    -> datafusion_common::Result<()> {
+        use arrow::array::{Array, Int64Array, StringArray};
+        use arrow_schema::{Field, Schema};
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::execution::context::SessionContext;
+        use datafusion_execution::config::SessionConfig;
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+        use std::collections::HashSet;
+
+        const LONG: &str = "a composite primary key that spans multiple encoding blocks";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("key", DataType::Utf8, true),
+        ]));
+        let converter = Arc::new(RowConverter::new(vec![
+            SortField::new(DataType::Int64),
+            SortField::new(DataType::Utf8),
+        ])?);
+        let deleted = HashSet::from([
+            (Some(2_i64), Some("short")),
+            (None, Some(LONG)),
+            (Some(3), Some(LONG)),
+            (Some(5), Some("")),
+        ]);
+        let delete_columns: Vec<ArrayRef> = vec![
+            Arc::new(deleted.iter().map(|(id, _)| *id).collect::<Int64Array>()),
+            Arc::new(deleted.iter().map(|(_, key)| *key).collect::<StringArray>()),
+        ];
+        let delete_rows = converter.convert_columns(&delete_columns)?;
+        let tombstones = Arc::new(KeyDeletionIndex::from_map(
+            delete_rows
+                .iter()
+                .map(|row| (Box::<[u8]>::from(row.as_ref()), 1))
+                .collect(),
+        ));
+        let make_batch = |count: usize| {
+            let ids: ArrayRef = Arc::new(
+                (0..count)
+                    .map(|i| (i % 7 != 0).then(|| i64::try_from(i).expect("small fixture id")))
+                    .collect::<Int64Array>(),
+            );
+            let keys: ArrayRef = Arc::new(
+                (0..count)
+                    .map(|i| match i % 4 {
+                        0 => None,
+                        1 => Some(""),
+                        2 => Some("short"),
+                        _ => Some(LONG),
+                    })
+                    .collect::<StringArray>(),
+            );
+            RecordBatch::try_new(Arc::clone(&schema), vec![ids, keys]).expect("fixture batch")
+        };
+        let batches = vec![
+            make_batch(65),
+            make_batch(257),
+            RecordBatch::try_new(Arc::clone(&schema), delete_columns)?,
+            make_batch(0),
+            make_batch(9),
+            make_batch(32),
+        ];
+        let mut expected = Vec::new();
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("ids");
+            let keys = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("keys");
+            let mask = ids
+                .iter()
+                .zip(keys.iter())
+                .map(|key| !deleted.contains(&key))
+                .collect::<BooleanArray>();
+            let filtered = arrow::compute::filter_record_batch(batch, &mask)?;
+            if filtered.num_rows() > 0 || batch.num_rows() == 0 {
+                expected.push(filtered);
+            }
+        }
+
+        let limit = 8 * 1024 * 1024;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+        let runtime = Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool))
+                .build()?,
+        );
+        let context = SessionContext::new_with_config_rt(
+            SessionConfig::new().with_target_partitions(1),
+            runtime,
+        );
+        let input = MemorySourceConfig::try_new_exec(&[batches], schema, None)?;
+        let exec = KeyBasedDeletionFilterExec::new(
+            input,
+            tombstones,
+            InsertRecordHandling::Apply,
+            vec![0, 1],
+            converter,
+            None,
+        );
+        let mut stream = exec.execute(0, context.task_ctx())?;
+        let first = stream.next().await.expect("first batch")?;
+        assert_eq!(first, expected[0]);
+        let retained = pool.reserved();
+        assert!(retained > 0 && retained <= limit / 16);
+
+        // Leave room for the old cache but not the larger second encoding.
+        // Failed cache admission must still return the correct filtered rows.
+        let pressure = MemoryConsumer::new("test pressure").register(&pool);
+        pressure.try_resize(limit - retained)?;
+        let second = stream.next().await.expect("second batch")?;
+        assert_eq!(second, expected[1]);
+        assert_eq!(pool.reserved(), pressure.size(), "oversized cache released");
+        pressure.free();
+
+        let mut actual = vec![first, second];
+        while let Some(batch) = stream.next().await {
+            actual.push(batch?);
+        }
+        assert_eq!(
+            actual, expected,
+            "nulls, empty keys and padding retain their meaning"
+        );
+        assert_eq!(pool.reserved(), 0, "EOF releases the retained encoding");
+        Ok(())
+    }
+
+    /// An `ExecutionPlan` whose stream returns `Poll::Pending` once before each
+    /// batch, modelling the decode and I/O gaps a Vortex scan puts between the
+    /// batches it hands the deletion filter.
+    ///
+    /// `MemorySourceConfig` never pends, so it cannot stand in for a real scan
+    /// here: a stream that releases its encoding on `Poll::Pending` behaves
+    /// identically to one that keeps it when the input is always ready.
+    #[derive(Debug)]
+    struct PendingBetweenBatchesExec {
+        inner: Arc<dyn ExecutionPlan>,
+        properties: Arc<datafusion_physical_plan::PlanProperties>,
+    }
+
+    impl PendingBetweenBatchesExec {
+        fn new(inner: Arc<dyn ExecutionPlan>) -> Self {
+            let properties = Arc::clone(inner.properties());
+            Self { inner, properties }
+        }
+    }
+
+    impl DisplayAs for PendingBetweenBatchesExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "PendingBetweenBatchesExec")
+        }
+    }
+
+    impl ExecutionPlan for PendingBetweenBatchesExec {
+        fn name(&self) -> &'static str {
+            "PendingBetweenBatchesExec"
+        }
+
+        fn properties(&self) -> &Arc<datafusion_physical_plan::PlanProperties> {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+            let child = children.into_iter().next().ok_or_else(|| {
+                datafusion_common::DataFusionError::Plan(
+                    "PendingBetweenBatchesExec requires exactly 1 child".to_string(),
+                )
+            })?;
+            Ok(Arc::new(Self::new(child)))
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<datafusion_execution::TaskContext>,
+        ) -> datafusion_common::Result<SendableRecordBatchStream> {
+            Ok(Box::pin(PendingBetweenBatches {
+                inner: self.inner.execute(partition, context)?,
+                pend_next: true,
+            }))
+        }
+    }
+
+    struct PendingBetweenBatches {
+        inner: SendableRecordBatchStream,
+        pend_next: bool,
+    }
+
+    impl futures::Stream for PendingBetweenBatches {
+        type Item = datafusion_common::Result<RecordBatch>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if self.pend_next {
+                self.pend_next = false;
+                // Self-wake so the consumer is polled again immediately: the
+                // point is the pending itself, not a delay.
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            let polled = self.inner.as_mut().poll_next(cx);
+            if matches!(polled, std::task::Poll::Ready(Some(Ok(_)))) {
+                self.pend_next = true;
+            }
+            polled
+        }
+    }
+
+    impl datafusion_execution::RecordBatchStream for PendingBetweenBatches {
+        fn schema(&self) -> arrow_schema::SchemaRef {
+            self.inner.schema()
+        }
+    }
+
+    /// A pending input must not cost the stream its retained encoding.
+    ///
+    /// The gap between two scan batches is what the cache exists to bridge. With
+    /// an input that pends before every batch, a stream that released the cache
+    /// on `Poll::Pending` would encode every batch into fresh buffers, exactly as
+    /// if it kept no cache, and an input that never pends would hide that.
+    /// `pool.reserved()` staying charged while the input is pending is the
+    /// observable that separates the two.
+    #[tokio::test]
+    async fn key_based_filter_keeps_its_encoding_across_a_pending_input()
+    -> datafusion_common::Result<()> {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow_schema::{Field, Schema};
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::execution::context::SessionContext;
+        use datafusion_execution::config::SessionConfig;
+        use datafusion_execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        const LONG: &str = "a composite primary key that spans multiple encoding blocks";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("key", DataType::Utf8, false),
+        ]));
+        let converter = Arc::new(RowConverter::new(vec![
+            SortField::new(DataType::Int64),
+            SortField::new(DataType::Utf8),
+        ])?);
+        let batch = |base: i64| {
+            let ids: ArrayRef = Arc::new(Int64Array::from_iter_values(base..base + 96));
+            let keys: ArrayRef = Arc::new(StringArray::from_iter_values(
+                (0..96).map(|i| if i % 2 == 0 { "short" } else { LONG }),
+            ));
+            RecordBatch::try_new(Arc::clone(&schema), vec![ids, keys]).expect("fixture batch")
+        };
+        let batches = vec![batch(0), batch(96), batch(192), batch(288)];
+
+        // One tombstone, matching no scanned key: the probe still runs for every
+        // row, so the filter encodes every batch, and nothing is filtered out.
+        let absent: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![-1_i64])),
+            Arc::new(StringArray::from(vec!["absent"])),
+        ];
+        let tombstones = Arc::new(KeyDeletionIndex::from_map(
+            converter
+                .convert_columns(&absent)?
+                .iter()
+                .map(|row| (Box::<[u8]>::from(row.as_ref()), 1))
+                .collect(),
+        ));
+        assert!(tombstones.has_deletions(), "the probe path must stay live");
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024));
+        let context = SessionContext::new_with_config_rt(
+            SessionConfig::new().with_target_partitions(1),
+            Arc::new(
+                RuntimeEnvBuilder::new()
+                    .with_memory_pool(Arc::clone(&pool))
+                    .build()?,
+            ),
+        );
+        let input = Arc::new(PendingBetweenBatchesExec::new(
+            MemorySourceConfig::try_new_exec(
+                std::slice::from_ref(&batches),
+                Arc::clone(&schema),
+                None,
+            )?,
+        ));
+        let exec = KeyBasedDeletionFilterExec::new(
+            input,
+            tombstones,
+            InsertRecordHandling::Apply,
+            vec![0, 1],
+            converter,
+            None,
+        );
+
+        // Sample the pool from inside the poll cycle, at the moment the filter
+        // reports `Pending`. Sampling after each returned batch instead would
+        // always see a charge, because `retain` runs just before the batch is
+        // handed back — the release happens in the gap, so the gap is where the
+        // assertion has to look.
+        let mut stream = exec.execute(0, context.task_ctx())?;
+        let mut returned: Vec<RecordBatch> = Vec::new();
+        let mut charged_while_pending: Vec<usize> = Vec::new();
+        loop {
+            let mut charged_this_gap: Vec<usize> = Vec::new();
+            let produced_a_batch = !returned.is_empty();
+            let next = std::future::poll_fn(|cx| match stream.as_mut().poll_next(cx) {
+                std::task::Poll::Pending => {
+                    // A pending before the first batch has nothing to retain yet.
+                    if produced_a_batch {
+                        charged_this_gap.push(pool.reserved());
+                    }
+                    std::task::Poll::Pending
+                }
+                ready @ std::task::Poll::Ready(_) => ready,
+            })
+            .await;
+            charged_while_pending.extend(charged_this_gap);
+            match next {
+                Some(batch) => returned.push(batch?),
+                None => break,
+            }
+        }
+
+        assert_eq!(returned, batches, "no scanned key is tombstoned");
+        assert!(
+            !charged_while_pending.is_empty(),
+            "the fixture must make the filter report Pending between batches, \
+             otherwise this test proves nothing"
+        );
+        assert!(
+            charged_while_pending.iter().all(|charged| *charged > 0),
+            "the encoding must stay charged to the pool while the input is pending, \
+             so the next batch can re-encode into it; saw {charged_while_pending:?}"
+        );
+        drop(stream);
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "dropping the stream releases the charge"
+        );
+        Ok(())
+    }
+
     /// Regression for the iter-13 `apply_partial_deletion_filter` fix:
     /// probing the full deletion index with `min_delete_seq_to_apply` set
     /// must return identical visibility decisions to probing a freshly
@@ -1312,6 +1757,10 @@ mod tests {
             insert_record_handling: InsertRecordHandling::Apply,
             pk_column_indices: Vec::new(),
             row_converter,
+            row_scratch: RowEncodingScratch::new(
+                datafusion_execution::TaskContext::default().memory_pool(),
+                1,
+            ),
             min_delete_seq_to_apply: None,
             schema,
             metrics: DeletionFilterMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
@@ -1772,6 +2221,10 @@ mod tests {
             insert_record_handling: handling,
             pk_column_indices: vec![0],
             row_converter,
+            row_scratch: RowEncodingScratch::new(
+                datafusion_execution::TaskContext::default().memory_pool(),
+                1,
+            ),
             min_delete_seq_to_apply: None,
             schema,
             metrics: DeletionFilterMetrics::new(&ExecutionPlanMetricsSet::new(), 0),

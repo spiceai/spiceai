@@ -2033,7 +2033,10 @@ impl TableLayer for AcceleratedTable {
                 let function_support = deny_spice_specific_functions();
                 for (i, filter) in filters.iter().enumerate() {
                     if !matches!(results[i], TableProviderFilterPushDown::Unsupported)
-                        && !function_support.supports(filter)
+                        // No scope: this policy is name-based only
+                        // (`deny_spice_specific_functions` installs no per-call
+                        // check), so nothing here reads an operand's type.
+                        && !function_support.supports(filter, None)
                     {
                         results[i] = TableProviderFilterPushDown::Unsupported;
                     }
@@ -2041,12 +2044,30 @@ impl TableLayer for AcceleratedTable {
                 Ok(results)
             }
             ZeroResultsAction::UseSource => {
-                // In UseSource mode, all filters must still flow into scan() so that
+                // In UseSource mode, row filters must still flow into scan() so that
                 // FallbackOnZeroResultsScanExec receives the full predicate set and can use
                 // its internal filter_plan to evaluate those predicates before making a
                 // correct fallback decision. Unsupported-function filters are therefore kept
                 // out of accelerator SQL pushdown, but still participate in the fallback check.
-                Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+                //
+                // An expression the scan cannot evaluate is the exception: the
+                // federation analyzer runs its filter pushdown over the whole plan as
+                // soon as *any* table in the statement is federated, which is before
+                // decorrelation, so a subquery accepted here is written into this
+                // scan's filters and then fails physical planning. Declining it leaves
+                // it above the scan, which is where decorrelation puts it anyway.
+                // Consequence: such a predicate is absent from the fallback check, so
+                // the zero-results decision is made without it.
+                Ok(filters
+                    .iter()
+                    .map(|filter| {
+                        if util::expr::cannot_be_evaluated_at_scan(filter) {
+                            TableProviderFilterPushDown::Unsupported
+                        } else {
+                            TableProviderFilterPushDown::Inexact
+                        }
+                    })
+                    .collect())
             }
         }
     }
@@ -2333,7 +2354,9 @@ fn filters_for_accelerator_scan(
     let mut accelerator_filters = Vec::with_capacity(filters.len());
 
     for (filter, support) in filters.iter().zip(pushdown_support.iter()) {
-        let function_supported = function_support.supports(filter);
+        // No scope, for the reason given in `supports_filters_pushdown`: this
+        // policy answers by name and never consults an operand's type.
+        let function_supported = function_support.supports(filter, None);
         let can_run_in_accelerator =
             function_supported && !matches!(support, TableProviderFilterPushDown::Unsupported);
         if can_run_in_accelerator {
