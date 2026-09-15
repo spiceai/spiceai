@@ -547,6 +547,7 @@ impl Stream for InlineFlightStream {
                         continue;
                     }
                     let Some(args) = this.encode.as_mut() else {
+                        this.data_stream = None;
                         return Poll::Ready(Some(Err(Status::internal(
                             "Flight encode has no encoder state for an inline batch",
                         ))));
@@ -566,7 +567,13 @@ impl Stream for InlineFlightStream {
                             }
                             this.queue_encoded(batch_data);
                         }
-                        Err(status) => return Poll::Ready(Some(Err(status))),
+                        Err(status) => {
+                            // Drop the source so a later poll cannot encode the
+                            // next batch after this error — the spawned path
+                            // returns from the encode task for the same reason.
+                            this.data_stream = None;
+                            return Poll::Ready(Some(Err(status)));
+                        }
                     }
                 }
                 Poll::Ready(Some(Err(e))) => {
@@ -1442,6 +1449,78 @@ mod tests {
             assert!(!inline.0.is_empty(), "{case}: the schema is always sent");
             assert_eq!(inline, spawned, "{case}");
         }
+    }
+
+    /// Events a Flight stream produced, including one extra poll after the first
+    /// error so a leak of later `FlightData` is visible.
+    async fn events_including_poll_after_error(
+        mut response: BoxStream<'static, Result<FlightData, Status>>,
+    ) -> Vec<String> {
+        let mut events = Vec::new();
+        while let Some(item) = response.next().await {
+            match item {
+                Ok(_) => events.push("Ok(FlightData)".to_string()),
+                Err(status) => {
+                    events.push(format!("Err({:?})", status.code()));
+                    match response.next().await {
+                        Some(Ok(_)) => events.push("Ok(FlightData)".to_string()),
+                        Some(Err(status)) => events.push(format!("Err({:?})", status.code())),
+                        None => {}
+                    }
+                    break;
+                }
+            }
+        }
+        events
+    }
+
+    /// An inline `encode_flight_batch` failure must end the response. Returning
+    /// `Err` without dropping `data_stream` lets a later poll encode the next
+    /// batch; the spawned path already stops after sending the error.
+    #[tokio::test]
+    async fn an_inline_encode_failure_ends_the_response() {
+        let views: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::Utf8View,
+            true,
+        )]));
+        let ints: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("name", DataType::Int64, true)]));
+        let view_batch = || {
+            batch(
+                &views,
+                vec![Arc::new(StringViewArray::from(vec![Some("ok")])) as ArrayRef],
+            )
+        };
+        let int_batch = batch(
+            &ints,
+            vec![Arc::new(Int64Array::from(vec![Some(1)])) as ArrayRef],
+        );
+        // Stream schema is Utf8View so the encoder casts to LargeUtf8. The Int64
+        // batch cannot be cast, so `encode_flight_batch` returns INTERNAL. A
+        // following Utf8View batch is what a later poll would leak.
+        let items = vec![Ok(view_batch()), Ok(int_batch), Ok(view_batch())];
+        let inline = events_including_poll_after_error(respond(&views, items.clone(), true)).await;
+        let spawned = events_including_poll_after_error(respond(&views, items, false)).await;
+
+        assert!(
+            inline.iter().any(|event| event.starts_with("Err(")),
+            "the un-castable batch must fail encoding: {inline:?}"
+        );
+        assert_eq!(
+            inline, spawned,
+            "inline and spawned must both stop after the encode error"
+        );
+        let error_at = inline
+            .iter()
+            .position(|event| event.starts_with("Err("))
+            .expect("the un-castable batch must fail encoding");
+        assert!(
+            inline[error_at + 1..]
+                .iter()
+                .all(|event| event.starts_with("Err(")),
+            "a later poll must not send FlightData after the encode error: {inline:?}"
+        );
     }
 
     /// A small result whose batches are all there is sent without waiting on any
