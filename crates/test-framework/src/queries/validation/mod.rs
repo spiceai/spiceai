@@ -1578,7 +1578,9 @@ pub fn validate_against_keyed_reference(
 /// result filled the `LIMIT` *and* that run has more than one row — then a
 /// leftover tied row past the boundary may exist, so only the sort keys are
 /// required to match. A unique last row, or a result shorter than `LIMIT`,
-/// is compared in full: those groups were not truncated. A numeric sort key
+/// is compared in full: those groups were not truncated. The first run, when
+/// it has more than one row, is a cutoff the same way for a query whose
+/// `OFFSET` skipped rows, since the skipped rows may tie with it. A numeric sort key
 /// compares the way a numeric cell does, so a key two engines round differently
 /// still puts a row in the same tie group.
 fn compare_limit_results_allowing_cutoff_ties(
@@ -1652,6 +1654,9 @@ fn compare_limit_results_allowing_cutoff_ties(
     }
 
     let n = left.num_rows();
+    let limit_filled = sort_order::top_level_limit_count(sql).is_some_and(|limit| n == limit);
+    let offset_skips_rows =
+        sort_order::top_level_offset_count(sql).is_some_and(|offset| offset > 0);
     let mut run_start = 0_usize;
     while run_start < n {
         let run_key = row_sort_key(&left, run_start, &key)?;
@@ -1673,10 +1678,11 @@ fn compare_limit_results_allowing_cutoff_ties(
         // A multi-row last group is not itself proof of LIMIT truncation:
         // `LIMIT 100` of two tied rows still has room for both, and skipping
         // the non-key compare would let a wrong `revenue` pass. Only a result
-        // that filled the literal `LIMIT` can have cut a tie (TPC-DS Q65).
-        let truncated_cutoff = is_last_run
-            && (run_end - run_start) > 1
-            && sort_order::top_level_limit_count(sql).is_some_and(|limit| n == limit);
+        // that filled the literal `LIMIT` can have cut a tie (TPC-DS Q65). The
+        // first group is the other end of the page: an `OFFSET` may have cut
+        // through it (ClickBench Q41 skips 100 rows).
+        let truncated_cutoff = (run_end - run_start) > 1
+            && ((is_last_run && limit_filled) || (run_start == 0 && offset_skips_rows));
         if !truncated_cutoff {
             let left_run = left.slice(run_start, run_end - run_start);
             let right_run = right.slice(run_start, run_end - run_start);
@@ -2445,6 +2451,66 @@ mod test {
         )
         .expect("reference");
         (actual, reference)
+    }
+
+    #[test]
+    fn test_offset_cutoff_ties_at_both_ends_of_the_page_are_free() {
+        // ClickBench Q41 pages with `ORDER BY PageViews DESC LIMIT 10 OFFSET 100`: the
+        // tie group the OFFSET cuts through starts the page and the one the LIMIT cuts
+        // ends it, so two correct engines put different rows at both ends.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("URLHash", DataType::Int64, false),
+            Field::new("PageViews", DataType::Int64, false),
+        ]));
+        let page = |hashes: [i64; 6]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(hashes.to_vec())),
+                    Arc::new(Int64Array::from(vec![27, 27, 26, 26, 24, 24])),
+                ],
+            )
+            .expect("page batch")
+        };
+        let reference = page([1, 2, 3, 4, 5, 6]);
+        let served = page([7, 8, 4, 3, 6, 9]);
+        let offset_query = Query::new(
+            "offset_page".into(),
+            r#"SELECT "URLHash", "PageViews" FROM hits ORDER BY "PageViews" DESC LIMIT 6 OFFSET 100"#
+                .into(),
+            false,
+        );
+        assert_eq!(
+            validate_against_reference_batches(
+                &offset_query,
+                std::slice::from_ref(&served),
+                std::slice::from_ref(&reference)
+            )
+            .expect("compare offset page"),
+            QueryValidationResult::Pass
+        );
+        // The tie groups between the two ends are whole, so their rows must match.
+        assert!(matches!(
+            validate_against_reference_batches(
+                &offset_query,
+                &[page([7, 8, 3, 10, 6, 9])],
+                std::slice::from_ref(&reference)
+            )
+            .expect("compare wrong middle"),
+            QueryValidationResult::Fail(_)
+        ));
+        // Without an OFFSET the page starts at the top of the result, so its first tie
+        // group is whole too.
+        let top_query = Query::new(
+            "top_page".into(),
+            r#"SELECT "URLHash", "PageViews" FROM hits ORDER BY "PageViews" DESC LIMIT 6"#.into(),
+            false,
+        );
+        assert!(matches!(
+            validate_against_reference_batches(&top_query, &[served], &[reference])
+                .expect("compare top page"),
+            QueryValidationResult::Fail(_)
+        ));
     }
 
     #[test]

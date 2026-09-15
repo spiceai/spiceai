@@ -808,6 +808,24 @@ pub fn top_level_limit_count(sql: &str) -> Option<usize> {
     }
 }
 
+/// Top-level `OFFSET m` count, when it is a single integer literal.
+///
+/// `None` if there is no top-level offset, or if it is not a literal.
+#[must_use]
+pub fn top_level_offset_count(sql: &str) -> Option<usize> {
+    let statement = parse_one_statement(sql)?;
+    let Statement::Query(query) = statement else {
+        return None;
+    };
+    match query.limit_clause.as_ref() {
+        Some(LimitClause::LimitOffset {
+            offset: Some(offset),
+            ..
+        }) => expr_as_usize(&offset.value),
+        _ => None,
+    }
+}
+
 /// A top-level `LIMIT` that leaves unspecified which rows it keeps.
 ///
 /// SQL lets a query with a top-level `LIMIT n [OFFSET m]` and no top-level
