@@ -1365,30 +1365,29 @@ impl UnorderedLimitSubsetCheck {
         Ok(())
     }
 
-    /// Whether later full-result batches cannot change [`Self::finish`]'s verdict.
+    /// Whether later full-result batches cannot change [`Self::finish`]'s verdict
+    /// or the row count it reports.
     ///
-    /// Every returned row has been seen in the full result, and either the
-    /// `LIMIT` is already filled so extra full-result rows cannot change the
-    /// expected count, or enough extra rows have arrived that the count already
-    /// fails. A short result whose full-result size is still unknown must keep
-    /// reading, and so must a result whose returned rows have not all been seen.
+    /// A schema mismatch is final at once. Otherwise the answer must hold as many
+    /// rows as the full result has past the `OFFSET`, up to the `LIMIT`, and that
+    /// count is settled only once the full result reaches the `LIMIT` past the
+    /// `OFFSET`: from then an answer of any other size fails against it, and an
+    /// answer of that size passes as soon as every returned row has been seen.
+    /// Until then the stream keeps going, so a failure names the count the full
+    /// result requires rather than the rows read so far.
     #[must_use]
     pub fn observation_complete(&self) -> bool {
-        if self.schema_mismatch || self.returned.len() > self.limit {
+        if self.schema_mismatch {
             return true;
         }
-        let membership_proven = self
-            .copies
-            .values()
-            .all(|(times_returned, times_seen)| *times_seen >= *times_returned);
-        if !membership_proven {
+        if self.full_result_rows.saturating_sub(self.offset) < self.limit {
             return false;
         }
-        let full_rows_past_offset = self.full_result_rows.saturating_sub(self.offset);
-        if self.returned.len() == self.limit {
-            return full_rows_past_offset >= self.limit;
-        }
-        full_rows_past_offset > self.returned.len()
+        self.returned.len() != self.limit
+            || self
+                .copies
+                .values()
+                .all(|(times_returned, times_seen)| times_seen >= times_returned)
     }
 
     /// The verdict, once the full-result stream has ended or
@@ -3087,6 +3086,48 @@ mod test {
             QueryValidationResult::Fail(QueryValidationFailReason::RowCountMismatch {
                 expected: 2,
                 actual: 1
+            })
+        );
+    }
+
+    #[test]
+    fn test_unordered_limit_subset_reports_the_count_the_full_result_requires() {
+        // LIMIT 3 over five groups that arrive one row per batch. A one-row answer is
+        // short from the second full-result row on, but the count it fails against is
+        // three, which only the third row settles.
+        let sql = r#"SELECT "UserID", "SearchPhrase", COUNT(*) FROM hits GROUP BY 1, 2 LIMIT 3"#;
+        let rows = [
+            (1, Some("a"), 3),
+            (2, None, 5),
+            (3, Some("c"), 7),
+            (4, Some("d"), 9),
+            (5, Some("e"), 11),
+        ];
+        let full_result: Vec<RecordBatch> =
+            rows.iter().map(|row| user_phrase_counts(&[*row])).collect();
+        assert_eq!(
+            check_unordered_limit_subset(sql, &user_phrase_counts(&[(2, None, 5)]), &full_result),
+            QueryValidationResult::Fail(QueryValidationFailReason::RowCountMismatch {
+                expected: 3,
+                actual: 1
+            })
+        );
+
+        // An answer longer than its LIMIT fails whatever the full result holds, but
+        // the count it should have had still needs the full result.
+        let unordered = unordered_limit(sql).expect("query should have an unordered LIMIT");
+        let long_answer = user_phrase_counts(&rows[..4]);
+        let check = UnorderedLimitSubsetCheck::new(&unordered, std::slice::from_ref(&long_answer))
+            .expect("subset check should build");
+        assert!(
+            !check.observation_complete(),
+            "before any full-result row, the expected count is unknown"
+        );
+        assert_eq!(
+            check_unordered_limit_subset(sql, &long_answer, &full_result),
+            QueryValidationResult::Fail(QueryValidationFailReason::RowCountMismatch {
+                expected: 3,
+                actual: 4
             })
         );
     }
