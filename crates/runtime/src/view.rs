@@ -46,11 +46,12 @@ use std::{
 /// The binding half of the accelerated-view snapshot consistency check.
 ///
 /// The load-time check in `create_accelerated_view` exists to fail fast with a message an
-/// operator can act on — including a `bootstrap_only` consumer that would otherwise
-/// restore an `accept_skew` archive without opting out — but it cannot be the whole
-/// answer: the compiled plan follows catalog state, statistics and federation pushdown,
-/// so a view that reads once at registration can read twice later without its SQL
-/// changing.
+/// operator can act on — including a `bootstrap_only` consumer whose query is multi-read
+/// today. It cannot speak for an archive already on disk: catalog state and pushdown can
+/// change the compiled plan without changing the SQL, so a view that reads once at
+/// restore may be restoring rows published under `accept_skew` while the plan was
+/// multi-read. Each archive carries a producing-read stamp, and a `consistent_read`
+/// bootstrap refuses an `accept_skew` (or unstamped) entry.
 ///
 /// This gate consumes the read-shape recorded from the plan that *executed* the
 /// refresh that produced the rows now on disk. It does not re-plan at publish time:

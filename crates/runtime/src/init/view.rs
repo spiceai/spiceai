@@ -311,10 +311,13 @@ impl Runtime {
 
             // Engine `init` downloads a snapshot when bootstrap is enabled. Datasets
             // are not registered yet, so the single-read proof cannot run here. A
-            // `bootstrap_only` / `consistent_read` view would otherwise restore an
-            // `accept_skew` archive, checkpoint it, then be refused — leaving those
-            // rows on disk for a later same-schema start. `create_accelerated_view`
-            // inits after that decision.
+            // `bootstrap_only` / `consistent_read` view whose query is multi-read today
+            // would otherwise restore an archive, checkpoint it, then be refused —
+            // leaving those rows on disk for a later same-schema start. The archive's
+            // producing-read stamp additionally refuses `accept_skew` entries, but that
+            // check runs inside `init`; skipping bootstrap here still keeps a currently
+            // multi-read view from restoring a `consistent_read` archive before the
+            // load-time refusal. `create_accelerated_view` inits after that decision.
             if acceleration_settings.snapshot_behavior.bootstrap_enabled() {
                 continue;
             }

@@ -107,7 +107,7 @@ pub mod api {
         pub snapshot_id: u64,
     }
 }
-use spicepod::acceleration::{SnapshotsCompaction, SnapshotsCreationPolicy};
+use spicepod::acceleration::{SnapshotsCompaction, SnapshotsConsistency, SnapshotsCreationPolicy};
 
 const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 const SNAPSHOT_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
@@ -124,6 +124,15 @@ const NETWORK_RETRY_MAX: usize = 3;
 /// definition's results, and serving them under the new definition is a wrong answer,
 /// not a stale one.
 pub const SOURCE_FINGERPRINT_PROPERTY: &str = "spice.source-fingerprint";
+
+fn accept_skew_snapshot_bootstrap_reason() -> String {
+    "the snapshot was published under `snapshots_consistency: accept_skew`, so its rows may span several source positions".to_string()
+}
+
+fn missing_read_consistency_bootstrap_reason() -> String {
+    "the snapshot records no producing-read consistency, so it cannot be shown to have come from a single consistent read"
+        .to_string()
+}
 
 // Shared with the other schema-evolution emit sites. `runtime-acceleration` cannot
 // import the `runtime` crate's counters (it is a dependency of `runtime`), so the
@@ -254,6 +263,19 @@ struct SnapshotEntry {
         rename = "snapshot-source-fingerprint"
     )]
     snapshot_source_fingerprint: Option<String>,
+    /// How the producing materialization was allowed to read its sources.
+    ///
+    /// Recorded per entry so a `consistent_read` bootstrap can refuse an archive
+    /// published under `accept_skew` even when the consumer's current plan happens
+    /// to read once — catalog state and pushdown can change that plan without
+    /// changing the SQL. Absent for an entry written before this was recorded, or
+    /// by a source that is not a query (a dataset always reads once).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "snapshot-read-consistency"
+    )]
+    snapshot_read_consistency: Option<SnapshotsConsistency>,
 }
 
 impl SnapshotMetadata {
@@ -719,6 +741,12 @@ pub struct SnapshotManager {
     /// one, and how to treat an archive that records none. See
     /// [`SOURCE_FINGERPRINT_PROPERTY`].
     source_definition: Option<crate::acceleration_source::SourceDefinition>,
+    /// Producing-read policy this manager stamps on publish and enforces on bootstrap.
+    ///
+    /// `None` for a source that is not a query (a dataset): no stamp, no check. `Some`
+    /// for a view: every published entry records the value, and a `consistent_read`
+    /// bootstrap refuses an `accept_skew` or unstamped entry.
+    snapshots_consistency: Option<SnapshotsConsistency>,
 }
 
 impl std::fmt::Debug for SnapshotManager {
@@ -974,6 +1002,7 @@ impl SnapshotManager {
             network_retry_strategy,
             publish_gate: None,
             source_definition: None,
+            snapshots_consistency: None,
         })
     }
 
@@ -1052,6 +1081,7 @@ impl SnapshotManager {
             network_retry_strategy,
             publish_gate: None,
             source_definition: None,
+            snapshots_consistency: None,
         })
     }
 
@@ -1110,6 +1140,56 @@ impl SnapshotManager {
         self
     }
 
+    /// Records how this series' producing materialization was allowed to read its
+    /// sources, so a `consistent_read` bootstrap can refuse an archive published
+    /// under `accept_skew`.
+    ///
+    /// Call only for a planned-query source (a view). A dataset always reads once
+    /// and does not stamp or check this field.
+    #[must_use]
+    pub fn with_snapshots_consistency(
+        mut self,
+        snapshots_consistency: SnapshotsConsistency,
+    ) -> Self {
+        self.snapshots_consistency = Some(snapshots_consistency);
+        self
+    }
+
+    /// Records definition identity, and for a planned query the producing-read
+    /// consistency a later `consistent_read` bootstrap must enforce.
+    #[must_use]
+    pub fn with_source_identity(
+        self,
+        definition: Option<crate::acceleration_source::SourceDefinition>,
+        snapshots_consistency: SnapshotsConsistency,
+    ) -> Self {
+        let Some(definition) = definition else {
+            return self;
+        };
+        let stamp_read_consistency = matches!(
+            definition.materialization,
+            crate::acceleration_source::MaterializationSource::PlannedQuery
+        );
+        let this = self.with_source_definition(definition);
+        if stamp_read_consistency {
+            this.with_snapshots_consistency(snapshots_consistency)
+        } else {
+            this
+        }
+    }
+
+    /// Apply [`Self::with_source_identity`] from an acceleration source.
+    #[must_use]
+    pub fn with_source(self, source: &dyn crate::acceleration_source::AccelerationSource) -> Self {
+        self.with_source_identity(
+            source.definition_fingerprint(),
+            source
+                .acceleration()
+                .map(|acceleration| acceleration.snapshots_consistency)
+                .unwrap_or_default(),
+        )
+    }
+
     /// The configured definition identity this manager stamps on a publish, if any.
     #[must_use]
     pub fn source_definition_fingerprint(&self) -> Option<&str> {
@@ -1132,6 +1212,26 @@ impl SnapshotManager {
         match entry.snapshot_source_fingerprint.as_deref() {
             Some(stored) => stored == definition.fingerprint,
             None => definition.accept_unstamped,
+        }
+    }
+
+    /// Whether one snapshot entry's producing-read stamp is admissible for this manager.
+    ///
+    /// A manager with no consistency policy (a dataset) accepts anything. An
+    /// `accept_skew` consumer accepts any stamp, including none: it opted out. A
+    /// `consistent_read` consumer accepts only an entry stamped `consistent_read` —
+    /// an `accept_skew` marker means the rows may already be torn, and a missing
+    /// stamp cannot be shown to have come from a single read.
+    fn entry_read_consistency_permits(&self, entry: &SnapshotEntry) -> Result<(), String> {
+        match self.snapshots_consistency {
+            None | Some(SnapshotsConsistency::AcceptSkew) => Ok(()),
+            Some(SnapshotsConsistency::ConsistentRead) => match entry.snapshot_read_consistency {
+                Some(SnapshotsConsistency::ConsistentRead) => Ok(()),
+                Some(SnapshotsConsistency::AcceptSkew) => {
+                    Err(accept_skew_snapshot_bootstrap_reason())
+                }
+                None => Err(missing_read_consistency_bootstrap_reason()),
+            },
         }
     }
 
@@ -1897,6 +1997,15 @@ impl SnapshotManager {
             return Ok(None);
         }
 
+        if let Err(reason) = self.entry_read_consistency_permits(&current_entry) {
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                "Did not bootstrap '{}' from its snapshot, so it starts empty and its first refresh rebuilds it: {reason}",
+                self.dataset_name
+            );
+            return Ok(None);
+        }
+
         self.download_snapshot_entry(&current_entry, &dataset_metadata, checkpointer_factory)
             .await
             .map(Some)
@@ -1953,6 +2062,15 @@ impl SnapshotManager {
             if !self.entry_fingerprint_matches(&snapshot) {
                 tracing::debug!(
                     "Skipping snapshot materialized from a different definition; attempting next available snapshot. dataset={} snapshot={}",
+                    self.dataset_name,
+                    snapshot.snapshot,
+                );
+                continue;
+            }
+
+            if let Err(reason) = self.entry_read_consistency_permits(&snapshot) {
+                tracing::debug!(
+                    "Skipping snapshot that a consistent_read bootstrap cannot restore ({reason}); attempting next available snapshot. dataset={} snapshot={}",
                     self.dataset_name,
                     snapshot.snapshot,
                 );
@@ -2817,6 +2935,7 @@ impl SnapshotManager {
                     .source_definition
                     .as_ref()
                     .map(|definition| definition.fingerprint.clone()),
+                snapshot_read_consistency: self.snapshots_consistency,
             };
 
             dataset_entry.snapshots.push(snapshot_entry);
@@ -3561,6 +3680,7 @@ mod tests {
                 .build(),
             publish_gate: None,
             source_definition: None,
+            snapshots_consistency: None,
         }
     }
 
@@ -3673,6 +3793,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let schema = sample_schema();
@@ -3718,6 +3839,150 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "duckdb")]
+    async fn download_latest_snapshot_refuses_an_accept_skew_archive_under_consistent_read() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 1, 2, 3, 4, 5)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+
+        let contents = Bytes::from_static(b"torn-snapshot-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        let checksum = compute_sha256_hex(contents.as_ref());
+        let snapshot_entry = SnapshotEntry {
+            snapshot_id: 0,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: checksum,
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_read_consistency: Some(SnapshotsConsistency::AcceptSkew),
+        };
+
+        let schema = sample_schema();
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: Utc::now().timestamp_millis(),
+            datasets: HashMap::from([(
+                DATASET_NAME.to_string(),
+                dataset_metadata(&schema, vec![snapshot_entry], Some(0)),
+            )]),
+        };
+
+        let metadata_path = base.join(METADATA_FILE_NAME);
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        )
+        .with_snapshots_consistency(SnapshotsConsistency::ConsistentRead);
+
+        let result = manager
+            .download_latest_snapshot()
+            .await
+            .expect("a refused bootstrap is not a download error");
+        assert!(
+            result.is_none(),
+            "a consistent_read consumer must not restore an accept_skew archive"
+        );
+        assert!(
+            !local_path.exists(),
+            "a refused bootstrap must not write the local acceleration"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn download_latest_snapshot_accepts_a_consistent_read_archive() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 1, 2, 3, 4, 5)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+
+        let contents = Bytes::from_static(b"consistent-snapshot-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        let checksum = compute_sha256_hex(contents.as_ref());
+        let snapshot_entry = SnapshotEntry {
+            snapshot_id: 0,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: checksum.clone(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_read_consistency: Some(SnapshotsConsistency::ConsistentRead),
+        };
+
+        let schema = sample_schema();
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: Utc::now().timestamp_millis(),
+            datasets: HashMap::from([(
+                DATASET_NAME.to_string(),
+                dataset_metadata(&schema, vec![snapshot_entry], Some(0)),
+            )]),
+        };
+
+        let metadata_path = base.join(METADATA_FILE_NAME);
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        )
+        .with_snapshots_consistency(SnapshotsConsistency::ConsistentRead);
+
+        let info = manager
+            .download_latest_snapshot()
+            .await
+            .expect("download should succeed")
+            .expect("a consistent_read archive must bootstrap under consistent_read");
+        assert_eq!(info.checksum, checksum);
+        let downloaded = fs::read(&local_path)
+            .await
+            .expect("read downloaded snapshot");
+        assert_eq!(downloaded.as_slice(), contents.as_ref());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
     async fn download_if_newer_returns_none_when_local_id_matches() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
@@ -3743,6 +4008,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let schema = sample_schema();
         let metadata = SnapshotMetadata {
@@ -3864,6 +4130,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let valid_checksum = compute_sha256_hex(second_contents.as_ref());
@@ -3878,6 +4145,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let schema = sample_schema();
@@ -3952,6 +4220,7 @@ mod tests {
                 .build(),
             publish_gate: None,
             source_definition: None,
+            snapshots_consistency: None,
         }
     }
 
@@ -4199,6 +4468,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn upload_records_the_producing_read_consistency_on_the_entry() {
+        let store = Arc::new(InMemory::new());
+        let (_keep, local_path) = temp_snapshot_file();
+        let schema = sample_schema();
+
+        let manager = manager_for_gate_tests(&store, local_path).with_source_identity(
+            Some(crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:view".to_string(),
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::PlannedQuery,
+            }),
+            SnapshotsConsistency::AcceptSkew,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect("create snapshot")
+            .expect("snapshot created");
+
+        let handle = manager
+            .load_metadata()
+            .await
+            .expect("load metadata")
+            .expect("metadata written");
+        let dataset_entry = handle
+            .metadata
+            .datasets
+            .get(DATASET_NAME)
+            .expect("dataset recorded");
+        let entry = dataset_entry
+            .current_snapshot()
+            .expect("a published archive must be current");
+        assert_eq!(
+            entry.snapshot_read_consistency,
+            Some(SnapshotsConsistency::AcceptSkew),
+            "an accept_skew view must stamp the archive so a consistent_read bootstrap can refuse it"
+        );
+    }
+
     /// The fingerprint decides whether an archive may be *served* under the definition
     /// now in force, so absence has to be refused as firmly as disagreement: an archive
     /// that records nothing cannot be shown to match.
@@ -4277,6 +4589,143 @@ mod tests {
         );
     }
 
+    fn dummy_snapshot_entry(consistency: Option<SnapshotsConsistency>) -> SnapshotEntry {
+        SnapshotEntry {
+            snapshot_id: 0,
+            timestamp_ms: 0,
+            snapshot: "memory://snapshots/x".to_string(),
+            snapshot_checksum: "abc".to_string(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: 1,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_read_consistency: consistency,
+        }
+    }
+
+    /// A `consistent_read` bootstrap cannot trust the consumer's current plan: the
+    /// same SQL can replan from multi-read to single-read. The producing-read stamp
+    /// on the entry is the proof.
+    #[test]
+    fn consistent_read_bootstrap_refuses_an_accept_skew_or_unstamped_archive() {
+        let store = Arc::new(InMemory::new());
+        let consistent = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
+            .with_snapshots_consistency(SnapshotsConsistency::ConsistentRead);
+
+        let refused = consistent
+            .entry_read_consistency_permits(&dummy_snapshot_entry(Some(
+                SnapshotsConsistency::AcceptSkew,
+            )))
+            .expect_err("an accept_skew archive must not bootstrap under consistent_read");
+        assert!(
+            refused.contains("`snapshots_consistency: accept_skew`"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("span several source positions"),
+            "{refused}"
+        );
+
+        let unstamped = consistent
+            .entry_read_consistency_permits(&dummy_snapshot_entry(None))
+            .expect_err("an unstamped archive cannot be shown to have come from a single read");
+        assert!(
+            unstamped.contains("producing-read consistency"),
+            "{unstamped}"
+        );
+
+        consistent
+            .entry_read_consistency_permits(&dummy_snapshot_entry(Some(
+                SnapshotsConsistency::ConsistentRead,
+            )))
+            .expect("a consistent_read stamp must bootstrap under consistent_read");
+    }
+
+    #[test]
+    fn accept_skew_bootstrap_admits_any_producing_read_stamp() {
+        let store = Arc::new(InMemory::new());
+        let accept_skew = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
+            .with_snapshots_consistency(SnapshotsConsistency::AcceptSkew);
+
+        accept_skew
+            .entry_read_consistency_permits(&dummy_snapshot_entry(None))
+            .expect("accept_skew must admit an unstamped archive");
+        accept_skew
+            .entry_read_consistency_permits(&dummy_snapshot_entry(Some(
+                SnapshotsConsistency::AcceptSkew,
+            )))
+            .expect("accept_skew must admit an accept_skew archive");
+        accept_skew
+            .entry_read_consistency_permits(&dummy_snapshot_entry(Some(
+                SnapshotsConsistency::ConsistentRead,
+            )))
+            .expect("accept_skew must admit a consistent_read archive");
+    }
+
+    #[test]
+    fn a_dataset_manager_does_not_enforce_read_consistency() {
+        let store = Arc::new(InMemory::new());
+        let dataset = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"));
+        dataset
+            .entry_read_consistency_permits(&dummy_snapshot_entry(Some(
+                SnapshotsConsistency::AcceptSkew,
+            )))
+            .expect("a dataset has no read-consistency policy");
+        dataset
+            .entry_read_consistency_permits(&dummy_snapshot_entry(None))
+            .expect("a dataset accepts an unstamped archive for read consistency");
+    }
+
+    #[test]
+    fn planned_query_identity_stamps_read_consistency_source_table_does_not() {
+        let store = Arc::new(InMemory::new());
+        let view = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
+            .with_source_identity(
+                Some(crate::acceleration_source::SourceDefinition {
+                    fingerprint: "sha256:view".to_string(),
+                    accept_unstamped: false,
+                    materialization:
+                        crate::acceleration_source::MaterializationSource::PlannedQuery,
+                }),
+                SnapshotsConsistency::AcceptSkew,
+            );
+        assert_eq!(
+            view.snapshots_consistency,
+            Some(SnapshotsConsistency::AcceptSkew),
+            "a view must stamp the producing-read policy it publishes under"
+        );
+
+        let dataset = manager_for_gate_tests(&store, PathBuf::from("/nonexistent/acc.db"))
+            .with_source_identity(
+                Some(crate::acceleration_source::SourceDefinition {
+                    fingerprint: "sha256:dataset".to_string(),
+                    accept_unstamped: false,
+                    materialization: crate::acceleration_source::MaterializationSource::SourceTable,
+                }),
+                SnapshotsConsistency::AcceptSkew,
+            );
+        assert!(
+            dataset.snapshots_consistency.is_none(),
+            "a dataset always reads once and must not carry a view read-consistency stamp"
+        );
+    }
+
+    #[test]
+    fn accept_skew_bootstrap_reason_names_the_setting() {
+        let reason = accept_skew_snapshot_bootstrap_reason();
+        for expected in [
+            "`snapshots_consistency: accept_skew`",
+            "span several source positions",
+        ] {
+            assert!(
+                reason.contains(expected),
+                "the accept_skew bootstrap reason must contain {expected:?}: {reason}"
+            );
+        }
+    }
+
     /// Same-schema `from:` / params change + cold start: the remote series
     /// stamp is the last published identity. Bootstrap must refuse those
     /// rows under a newly loaded Spicepod, which is what
@@ -4319,6 +4768,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: Some("sha256:old-from".to_string()),
+            snapshot_read_consistency: None,
         });
         entry.current_snapshot_id = Some(0);
 
@@ -4726,6 +5176,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -4795,6 +5246,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -4864,6 +5316,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -4938,6 +5391,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -5018,6 +5472,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -5095,6 +5550,7 @@ mod tests {
             snapshot_row_count: Some(100),
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -5183,6 +5639,7 @@ mod tests {
             snapshot_row_count: Some(50),
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let valid_checksum = compute_sha256_hex(second_contents.as_ref());
@@ -5197,6 +5654,7 @@ mod tests {
             snapshot_row_count: Some(100),
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let schema = sample_schema();
@@ -5275,6 +5733,7 @@ mod tests {
             snapshot_row_count: Some(10),
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let schema = sample_schema();
@@ -5366,6 +5825,7 @@ mod tests {
             snapshot_row_count: Some(10),
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let good_checksum = compute_sha256_hex(good_contents.as_ref());
@@ -5380,6 +5840,7 @@ mod tests {
             snapshot_row_count: Some(100),
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let schema = sample_schema();
@@ -5699,6 +6160,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let schema = sample_schema();
@@ -6222,6 +6684,7 @@ mod tests {
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: Some(1_704_153_600_000),
                     snapshot_source_fingerprint: None,
+                    snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
                 properties: HashMap::default(),
@@ -6272,6 +6735,7 @@ mod tests {
                 .build(),
             publish_gate: None,
             source_definition: None,
+            snapshots_consistency: None,
         }
     }
 
@@ -6309,6 +6773,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: Some(1_704_153_600_000),
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let mut datasets = HashMap::new();
@@ -6378,6 +6843,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let missing_entry = SnapshotEntry {
@@ -6391,6 +6857,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let mut datasets = HashMap::new();
@@ -6466,6 +6933,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let mut datasets = HashMap::new();
@@ -6534,6 +7002,7 @@ mod tests {
                 snapshot_row_count: None,
                 snapshot_last_updated_at_ms: None,
                 snapshot_source_fingerprint: None,
+                snapshot_read_consistency: None,
             });
             store
                 .put(&Path::from(filename), Bytes::from_static(b"data").into())
@@ -6595,6 +7064,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let mut datasets = HashMap::new();
@@ -6698,6 +7168,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let snapshot_entry2 = SnapshotEntry {
@@ -6711,6 +7182,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let mut datasets = HashMap::new();
@@ -6801,6 +7273,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
 
         let mut datasets = HashMap::new();
@@ -6928,6 +7401,7 @@ mod tests {
                 .build(),
             publish_gate: None,
             source_definition: None,
+            snapshots_consistency: None,
         }
     }
 
@@ -6992,6 +7466,7 @@ mod tests {
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
                     snapshot_source_fingerprint: None,
+                    snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
                 ..Default::default()
@@ -7044,6 +7519,7 @@ mod tests {
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
                     snapshot_source_fingerprint: None,
+                    snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
                 ..Default::default()
@@ -7103,6 +7579,7 @@ mod tests {
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
                     snapshot_source_fingerprint: None,
+                    snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
                 ..Default::default()
@@ -7126,6 +7603,7 @@ mod tests {
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
                     snapshot_source_fingerprint: None,
+                    snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
                 ..Default::default()
@@ -7193,6 +7671,7 @@ mod tests {
                     snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
                     snapshot_source_fingerprint: None,
+                    snapshot_read_consistency: None,
                 }],
                 current_snapshot_id: Some(0),
                 ..Default::default()
@@ -7250,6 +7729,10 @@ mod tests {
         assert!(
             snapshot.snapshot_row_count.is_none(),
             "snapshot_row_count should default to None"
+        );
+        assert!(
+            snapshot.snapshot_read_consistency.is_none(),
+            "snapshot_read_consistency should default to None"
         );
     }
 
@@ -7318,6 +7801,7 @@ mod tests {
                 snapshot_row_count: Some(100),
                 snapshot_last_updated_at_ms: Some(1_704_240_000_000),
                 snapshot_source_fingerprint: None,
+                snapshot_read_consistency: None,
             });
             dataset.current_snapshot_id = Some(1);
         }
@@ -7542,6 +8026,7 @@ mod tests {
             snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
             snapshot_source_fingerprint: None,
+            snapshot_read_consistency: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),

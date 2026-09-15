@@ -262,7 +262,9 @@ pub enum SnapshotsConsistency {
     /// read-shape attested from the refresh scan that wrote the rows, bound to that
     /// materialization's epoch — not a fresh re-plan after the fact. An ordinary
     /// query does not record, and a later refresh's attestation cannot approve the
-    /// previous generation.
+    /// previous generation. Each published archive records this setting so a later
+    /// `consistent_read` bootstrap can refuse an archive published under `accept_skew`
+    /// even if the consumer's current plan happens to read once.
     #[default]
     ConsistentRead,
     /// Publish or restore regardless, accepting that the stored rows may span several

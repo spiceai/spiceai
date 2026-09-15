@@ -146,10 +146,10 @@ pub async fn download_snapshot(
         }
         // A source whose rows are the result of a definition (a view's SQL) must not
         // bootstrap an archive materialized from a different one: the rows would be
-        // wrong rather than merely old, and no schema check would catch it.
-        if let Some(definition) = source.definition_fingerprint() {
-            manager = manager.with_source_definition(definition);
-        }
+        // wrong rather than merely old, and no schema check would catch it. A view
+        // also stamps producing-read consistency so a `consistent_read` bootstrap
+        // refuses an archive published under `accept_skew`.
+        manager = manager.with_source(source);
         let start_time = Instant::now();
         match manager.download_latest_snapshot().await {
             Ok(Some(info)) => {

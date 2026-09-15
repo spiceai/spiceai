@@ -659,18 +659,20 @@ impl Error {
 
 /// Outcome of the load-time snapshot consistency policy for an accelerated view.
 ///
-/// Applies whenever snapshots are configured — create *or* bootstrap — because a
-/// `bootstrap_only` consumer restores an archive that may have been produced by an
-/// `accept_skew` writer. Archive metadata does not record `snapshots_consistency`,
-/// so the consumer's current SQL and setting are the gate.
+/// Applies whenever snapshots are configured — create *or* bootstrap. The load-time
+/// plan check fails fast when this view's query is multi-read today. It cannot speak
+/// for an archive already on disk: that archive carries a producing-read stamp
+/// (`snapshot-read-consistency`), and a `consistent_read` bootstrap refuses an
+/// `accept_skew` or unstamped entry even if today's plan happens to read once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 enum ViewSnapshotConsistencyDecision {
     /// The operator set `accept_skew`. No single-read gate; a create-enabled view
-    /// publishes unconditionally.
+    /// publishes unconditionally, and each archive is stamped `accept_skew`.
     AcceptSkew,
     /// The compiled plan reads once today. A create-enabled view still installs a
-    /// publish-time re-check because the compiled plan can change.
+    /// publish-time re-check because the compiled plan can change. Archives it
+    /// publishes are stamped `consistent_read`.
     ConsistentSingleRead,
 }
 
@@ -5221,6 +5223,8 @@ impl DataFusion {
         // makes the discrepancy durable and reusable. Load-time refuses a multi-read
         // view; `ViewSnapshotPublishGate` then requires the attestation recorded from
         // the plan that executed the refresh, not a fresh re-plan at publish time.
+        // Each published archive also records producing-read consistency so a
+        // `consistent_read` bootstrap can refuse an `accept_skew` entry.
         if !acceleration.snapshot_behavior.is_disabled() {
             ensure_view_snapshot_identity_params(table, &view.sql, &view.params, &view.app)?;
         }
@@ -6192,14 +6196,11 @@ async fn build_snapshot_creation_config(
         } else {
             sm
         };
-        // Stamped on publish and re-checked on bootstrap. A view's identity is its SQL; a
-        // dataset's is its `from:` plus `refresh_sql`, both of which shape the stored rows
+        // Stamped on publish and re-checked on bootstrap. A view's identity is its SQL
+        // plus producing-read consistency (`accept_skew` vs `consistent_read`); a
+        // dataset's is its `from:` plus `refresh_sql`. Both shape the stored rows
         // while leaving the schema untouched.
-        let sm = if let Some(definition) = source.definition_fingerprint() {
-            sm.with_source_definition(definition)
-        } else {
-            sm
-        };
+        let sm = sm.with_source(source);
         let sm = if let Some(gate) = publish_gate {
             sm.with_publish_gate(gate)
         } else {
@@ -6301,12 +6302,9 @@ async fn build_snapshot_refresh_state(
         });
     // Fingerprinted like every other manager built from a source: `refresh_mode: snapshot`
     // is the path that loads someone else's snapshots, so it is the last place that should
-    // accept an archive materialized from a different definition.
-    let manager = match crate::dataaccelerator::AccelerationSource::definition_fingerprint(dataset)
-    {
-        Some(definition) => manager.with_source_definition(definition),
-        None => manager,
-    };
+    // accept an archive materialized from a different definition. Views also carry the
+    // producing-read stamp so a `consistent_read` consumer cannot restore `accept_skew`.
+    let manager = manager.with_source(dataset);
     let manager = manager
         .with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy)
         .with_checkpointer_factory(checkpoint_factory);
