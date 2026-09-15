@@ -774,7 +774,7 @@ impl SpiceTestQueryWorker {
                             )
                             .await?;
                         let mut keyed_reference = Vec::new();
-                        let mut fetched_rows = 0;
+                        let mut fetched_rows: usize = 0;
                         let mut cutoff_closed = false;
                         while let Some(batch) = futures::StreamExt::next(&mut stream).await {
                             let batch = batch?;

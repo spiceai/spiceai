@@ -1483,7 +1483,7 @@ pub fn decide_from_keyed_reference_batches(
     fetch_rows: usize,
 ) -> Result<(Option<QueryValidationResult>, usize)> {
     let mut keyed_reference = Vec::new();
-    let mut fetched_rows = 0;
+    let mut fetched_rows: usize = 0;
     for batch in batches {
         fetched_rows = fetched_rows.saturating_add(batch.num_rows());
         keyed_reference.push(batch);
@@ -3681,7 +3681,7 @@ mod test {
         assert!(
             keyed_reference_cutoff_closed(&[full.slice(0, needed)], 10, 1)
                 .expect("closed after the first later key"),
-            "row 13's key 10 ends the key-9 group that LIMIT 10 cuts"
+            "row 13's key 10 ends the key-9 group that `LIMIT` 10 cuts"
         );
         assert!(
             !keyed_reference_cutoff_closed(&[full.slice(0, needed - 1)], 10, 1)
