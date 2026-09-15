@@ -330,11 +330,13 @@ struct QueryTimeoutTimerGuard {
 
 /// Cancellation and `runtime.query.timeout` for one query, armed before the
 /// results-cache probe so a stalled lookup is still under the documented
-/// full-query deadline.
+/// full-query deadline. The query is also in `QueryCancelRegistry` from this
+/// point, so `/v1/sql/{id}/cancel` and `cancel_all` can stop the probe.
 struct QueryLifetimeGuards {
     cancel_token: tokio_util::sync::CancellationToken,
     timeout_state: QueryTimeoutState,
     timeout_timer_guard: Option<QueryTimeoutTimerGuard>,
+    active_query_guard: registry::ActiveQueryGuard,
 }
 
 impl Drop for QueryTimeoutTimerGuard {
@@ -394,10 +396,22 @@ impl Query {
             }
             _ => (QueryTimeoutState::default(), None),
         };
+        let sql_preview: Arc<str> = match &self.sql {
+            QueryMethod::Text { sql, .. } => Arc::clone(sql),
+            QueryMethod::Plan(_) => Arc::from("<logical plan>"),
+        };
+        let active_query_guard = self.df.query_cancel_registry().register(
+            self.query_id,
+            sql_preview.as_ref(),
+            request_context.protocol(),
+            Arc::from(request_context.cache_namespace().storage_id()),
+            cancel_token.clone(),
+        );
         QueryLifetimeGuards {
             cancel_token,
             timeout_state,
             timeout_timer_guard,
+            active_query_guard,
         }
     }
 
@@ -1094,24 +1108,15 @@ impl Query {
             cancel_token: query_cancel_token,
             timeout_state,
             timeout_timer_guard,
+            active_query_guard,
         } = guards;
 
-        // Register in the DataFusion-owned active-query registry so administrative
-        // cancel endpoints can locate this query by id. The guard is captured
-        // by the returned stream so the registration is removed on completion,
-        // drop, or cancellation.
-        // Own the SQL preview before moving `self.sql` into the planning match.
+        // Registered in `run` before the results-cache probe. The SQL preview
+        // is owned here before moving `self.sql` into the planning match.
         let sql_preview: Arc<str> = match &self.sql {
             QueryMethod::Text { sql, .. } => Arc::clone(sql),
             QueryMethod::Plan(_) => Arc::from("<logical plan>"),
         };
-        let active_query_guard = self.df.query_cancel_registry().register(
-            self.query_id,
-            sql_preview.as_ref(),
-            request_context.protocol(),
-            Arc::from(request_context.cache_namespace().storage_id()),
-            query_cancel_token.clone(),
-        );
         let query_id_str: Arc<str> = Arc::from(self.query_id.to_string());
 
         let inner_span = span.clone();
@@ -3447,10 +3452,11 @@ mod tests {
         });
 
         // Wait until B is registered in the cancel registry, then cancel it.
-        // `run_internal` registers a query in the cancel registry BEFORE acquiring
-        // the admission permit, so B's presence here means it is genuinely queued
-        // for the permit — making the cancellation deterministic instead of racing
-        // a fixed sleep (which is flaky under slow CI). Bounded fallback (~5s).
+        // `Query::run` registers a query before the results-cache probe and
+        // before acquiring the admission permit, so B's presence here means it
+        // has entered `run` — making the cancellation deterministic instead of
+        // racing a fixed sleep (which is flaky under slow CI). Bounded fallback
+        // (~5s).
         let registry = df.query_cancel_registry();
         for _ in 0..500 {
             if registry
