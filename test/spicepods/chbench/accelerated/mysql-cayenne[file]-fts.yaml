@@ -1,0 +1,202 @@
+version: v1
+kind: Spicepod
+name: mysql-cayenne[file]-fts
+
+# Full-text-search variant of mysql-cayenne[file]: identical Cayenne/CDC baseline,
+# plus a Tantivy full-text index on three columns so the `chbench-fts` query set can
+# exercise `text_search` UDTFs alongside the analytical CH-benCH queries.
+#
+# Indexed columns:
+#   - customer.c_data  — mutated by the OLTP payment transaction (bad-credit customers),
+#     so this is the live path: the FTS index must stay fresh as rows arrive on the CDC
+#     changes stream. Searchable tokens are numeric (customer/district/warehouse ids,
+#     amounts, timestamps) that the payment prefix adds.
+#   - nation.n_name / region.r_name — static real-word columns (GERMANY, EUROPE, ...),
+#     so `text_search` returns semantically meaningful hits.
+#
+# As with mysql-cayenne[file], the only non-defaults are the sql_results / task_history
+# toggles, kept off so the comparison isolates FTS cost, not caching/history overhead.
+
+mysql_connection_params: &mysql_params
+  mysql_host: ${env:CHBENCH_MYSQL_HOST}
+  mysql_tcp_port: 3306
+  mysql_db: chbench
+  mysql_user: bench
+  mysql_pass: bench
+  mysql_sslmode: disabled
+
+runtime:
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+
+datasets:
+  # ---- TPC-C core tables (mutated by OLTP workload) ----
+
+  - from: mysql:warehouse
+    name: warehouse
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+      mysql_replication_server_id: '1001'
+    acceleration: &cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: w_id
+      on_conflict:
+        w_id: upsert
+
+  - from: mysql:district
+    name: district
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+      mysql_replication_server_id: '1002'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (d_w_id, d_id)
+      on_conflict:
+        (d_w_id, d_id): upsert
+
+  - from: mysql:customer
+    name: customer
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+      mysql_replication_server_id: '1003'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (c_w_id, c_d_id, c_id)
+      on_conflict:
+        (c_w_id, c_d_id, c_id): upsert
+    # c_data is rewritten by the payment transaction, so its full-text index is
+    # maintained from the CDC changes stream. The composite row_id matches the
+    # table's primary key.
+    columns:
+      - name: c_data
+        full_text_search:
+          enabled: true
+          row_id:
+            - c_w_id
+            - c_d_id
+            - c_id
+
+  - from: mysql:new_order
+    name: new_order
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+      mysql_replication_server_id: '1004'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (no_w_id, no_d_id, no_o_id)
+      on_conflict:
+        (no_w_id, no_d_id, no_o_id): upsert
+
+  - from: mysql:oorder
+    name: oorder
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+      mysql_replication_server_id: '1005'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (o_w_id, o_d_id, o_id)
+      on_conflict:
+        (o_w_id, o_d_id, o_id): upsert
+
+  - from: mysql:order_line
+    name: order_line
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+      mysql_replication_server_id: '1006'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (ol_w_id, ol_d_id, ol_o_id, ol_number)
+      on_conflict:
+        (ol_w_id, ol_d_id, ol_o_id, ol_number): upsert
+
+  - from: mysql:stock
+    name: stock
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+      mysql_replication_server_id: '1007'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (s_w_id, s_i_id)
+      on_conflict:
+        (s_w_id, s_i_id): upsert
+
+  # ---- Static reference tables (no OLTP mutations, full refresh) ----
+
+  - from: mysql:item
+    name: item
+    params:
+      <<: *mysql_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: i_id
+      on_conflict:
+        i_id: upsert
+
+  - from: mysql:region
+    name: region
+    params:
+      <<: *mysql_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: r_regionkey
+      on_conflict:
+        r_regionkey: upsert
+    # r_name holds real region words (EUROPE, AMERICA, ...) for meaningful text_search hits.
+    columns:
+      - name: r_name
+        full_text_search:
+          enabled: true
+          row_id:
+            - r_regionkey
+
+  - from: mysql:nation
+    name: nation
+    params:
+      <<: *mysql_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: n_nationkey
+      on_conflict:
+        n_nationkey: upsert
+    # n_name holds real nation words (GERMANY, UNITED STATES, ...) for meaningful text_search hits.
+    columns:
+      - name: n_name
+        full_text_search:
+          enabled: true
+          row_id:
+            - n_nationkey
+
+  - from: mysql:supplier
+    name: supplier
+    params:
+      <<: *mysql_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: su_suppkey
+      on_conflict:
+        su_suppkey: upsert
