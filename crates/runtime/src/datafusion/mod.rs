@@ -571,12 +571,16 @@ pub enum Error {
 
     #[snafu(display(
         "{}",
-        found.refusal_message(component, name)
+        crate::view::snapshot_identity_unresolved_param_message(
+            component, name, param, store, key
+        )
     ))]
     SnapshotsIdentityUnresolvedParam {
         component: &'static str,
         name: String,
-        found: crate::view::UnresolvedClosureIdentityParam,
+        param: String,
+        store: String,
+        key: String,
     },
 
     #[snafu(display(
@@ -753,12 +757,9 @@ fn ensure_snapshot_identity_params(
         return SnapshotsIdentityUnresolvedParamSnafu {
             component,
             name: name.to_string(),
-            found: crate::view::UnresolvedClosureIdentityParam {
-                source_component: component.to_string(),
-                source_name: name.to_string(),
-                param_field: "params",
-                unresolved,
-            },
+            param: unresolved.param,
+            store: unresolved.store,
+            key: unresolved.key,
         }
         .fail();
     }
@@ -782,7 +783,9 @@ fn ensure_view_snapshot_identity_params(
         return SnapshotsIdentityUnresolvedParamSnafu {
             component: "view",
             name: name.to_string(),
-            found,
+            param: found.unresolved.param,
+            store: found.unresolved.store,
+            key: found.unresolved.key,
         }
         .fail();
     }
@@ -8027,11 +8030,9 @@ mod tests {
         for expected in [
             "view",
             "'orders_us'",
-            "dataset",
-            "'docs'",
             "`params.json_pointer`",
             "${secrets:pointer}",
-            "`snapshots: disabled` on view 'orders_us'",
+            "`snapshots: disabled`",
         ] {
             assert!(
                 message.contains(expected),
@@ -8056,16 +8057,9 @@ mod tests {
         let message = SnapshotsIdentityUnresolvedParamSnafu {
             component: "view",
             name: "orders_us".to_string(),
-            found: crate::view::UnresolvedClosureIdentityParam {
-                source_component: "view".to_string(),
-                source_name: "orders_us".to_string(),
-                param_field: "params",
-                unresolved: crate::view::UnresolvedSnapshotIdentityParam {
-                    param: "json_pointer".to_string(),
-                    store: "secrets".to_string(),
-                    key: "pointer".to_string(),
-                },
-            },
+            param: "json_pointer".to_string(),
+            store: "secrets".to_string(),
+            key: "pointer".to_string(),
         }
         .build()
         .to_string();
