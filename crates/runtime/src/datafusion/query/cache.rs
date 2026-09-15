@@ -195,6 +195,24 @@ fn stale_policy(
     }
 }
 
+/// Whether TTL / stale-while-revalidate age still allows the entry to be
+/// served. Does not mutate; [`apply_age_eligibility`] records revalidation
+/// when a windowed entry is past `item_ttl` but still inside the window.
+fn age_is_eligible(
+    entry: &ServableEntry,
+    ttl: std::time::Duration,
+    policy: StalePolicy,
+    now: std::time::Instant,
+) -> bool {
+    match policy {
+        StalePolicy::AnyAge => true,
+        StalePolicy::FreshOnly => !entry.cached_result.is_stale(ttl, now),
+        StalePolicy::Window(stale_duration) => !entry
+            .cached_result
+            .is_stale(ttl.saturating_add(stale_duration), now),
+    }
+}
+
 /// Re-evaluate TTL / stale-while-revalidate age. Returns `false` when the
 /// entry must not be served. Not a cache lookup: the caller already holds
 /// the captured result.
@@ -207,18 +225,18 @@ fn apply_age_eligibility(
     match policy {
         StalePolicy::AnyAge => true,
         StalePolicy::FreshOnly => {
-            if entry.cached_result.is_stale(ttl, now) {
+            if age_is_eligible(entry, ttl, policy, now) {
+                true
+            } else {
                 tracing::debug!(
                     "Cache entry is past `item_ttl` with no stale-while-revalidate window, treating as cache miss"
                 );
                 false
-            } else {
-                true
             }
         }
         StalePolicy::Window(stale_duration) => {
-            let max_age = ttl.saturating_add(stale_duration);
-            if entry.cached_result.is_stale(max_age, now) {
+            if !age_is_eligible(entry, ttl, policy, now) {
+                let max_age = ttl.saturating_add(stale_duration);
                 tracing::debug!(
                     "Cache entry is beyond stale-while-revalidate window (max_age: {max_age:?}), treating as cache miss"
                 );
@@ -234,6 +252,31 @@ fn apply_age_eligibility(
             true
         }
     }
+}
+
+/// Serve-time TTL and table-clock checks, without a second counted lookup
+/// and without mutating the entry. Used to decide whether a raw hit can
+/// stay on the request runtime: an ineligible raw hit falls through to
+/// planning, which belongs on the query runtime.
+fn entry_still_servable(
+    entry: &ServableEntry,
+    provider: Option<&QueryResultsCacheProvider>,
+    cache_control: CacheControl,
+) -> bool {
+    let Some(provider) = provider else {
+        return true;
+    };
+    let now = std::time::Instant::now();
+    let policy = stale_policy(cache_control, provider.stale_while_revalidate_ttl());
+    if !age_is_eligible(entry, provider.ttl(), policy, now) {
+        return false;
+    }
+    let validity = provider.entry_validity(
+        &entry.cached_result.input_tables,
+        entry.cached_result.read_started_at,
+        now,
+    );
+    !matches!(validity, EntryValidity::Invalidated)
 }
 
 /// Looks `raw_key` up and decides whether the entry found may be served to a
@@ -347,6 +390,30 @@ impl CacheProbe {
     /// query runtime.
     pub(super) fn is_servable_in_place(&self) -> bool {
         matches!(self, Self::Hit(hit) if !hit.entry.cached_result.is_encoded())
+    }
+
+    /// A raw hit that fails the serve-time TTL / table-clock checks cannot
+    /// be handed out in place. Turn it into a miss so the hop onto the
+    /// query runtime sees planning work, not a hit `run_internal` would
+    /// reject and then plan on the request I/O runtime.
+    ///
+    /// Encoded hits stay hits: they already hop so they can decode, and
+    /// [`Query::serve_probed_hit`] rechecks eligibility after the wait.
+    #[must_use]
+    pub(super) fn into_miss_if_in_place_ineligible(
+        self,
+        cache_control: CacheControl,
+        provider: Option<&QueryResultsCacheProvider>,
+    ) -> Self {
+        match self {
+            Self::Hit(hit)
+                if !hit.entry.cached_result.is_encoded()
+                    && !entry_still_servable(&hit.entry, provider, cache_control) =>
+            {
+                Self::Missed(hit.raw_key())
+            }
+            other => other,
+        }
     }
 }
 
@@ -1409,11 +1476,18 @@ mod tests {
     }
 
     fn dummy_servable_entry_cached_at(cached_at: std::time::Instant) -> ServableEntry {
+        dummy_servable_entry_for_tables(cached_at, HashSet::new())
+    }
+
+    fn dummy_servable_entry_for_tables(
+        cached_at: std::time::Instant,
+        tables: HashSet<TableReference>,
+    ) -> ServableEntry {
         ServableEntry {
             cached_result: cache::result::query::CachedQueryResult::new_raw(
                 vec![],
                 Arc::new(Schema::empty()),
-                Arc::new(HashSet::new()),
+                Arc::new(tables),
                 cached_at,
                 cached_at,
             ),
@@ -1421,6 +1495,31 @@ mod tests {
             cache_status: CacheStatus::CacheHit,
             revalidate: false,
         }
+    }
+
+    fn dummy_encoded_entry_cached_at(cached_at: std::time::Instant) -> ServableEntry {
+        ServableEntry {
+            cached_result: cache::result::query::CachedQueryResult::new(
+                bytes::Bytes::new(),
+                Arc::new(Schema::empty()),
+                Arc::new(HashSet::new()),
+                cached_at,
+                cached_at,
+                None,
+            ),
+            entry_validity: cache::EntryValidity::Valid,
+            cache_status: CacheStatus::CacheHit,
+            revalidate: false,
+        }
+    }
+
+    fn dummy_probe_hit(entry: ServableEntry) -> CacheProbe {
+        CacheProbe::Hit(Box::new(ProbedHit {
+            raw_key: RawCacheKey::new(1),
+            entry,
+            sql: Arc::from("SELECT 1"),
+            revalidation_plan: None,
+        }))
     }
 
     #[test]
@@ -1537,6 +1636,141 @@ mod tests {
         ));
         assert!(entry.revalidate);
         assert_eq!(entry.cache_status, CacheStatus::CacheStaleWhileRevalidate);
+    }
+
+    #[tokio::test]
+    async fn a_raw_hit_past_item_ttl_is_not_servable_in_place() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("1s".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+        let now = std::time::Instant::now();
+        let probe = dummy_probe_hit(dummy_servable_entry_cached_at(
+            now - Duration::from_millis(1_500),
+        ));
+        assert!(
+            probe.is_servable_in_place(),
+            "a raw hit still looks in-place before the serve-time recheck"
+        );
+        let probe = probe.into_miss_if_in_place_ineligible(
+            CacheControl::Cache(CacheKeyType::Default),
+            df.results_cache_provider().as_deref(),
+        );
+        assert!(
+            !probe.is_servable_in_place(),
+            "a raw hit past item_ttl must hop so planning is not on the request runtime"
+        );
+        assert!(
+            matches!(probe, CacheProbe::Missed(_)),
+            "the ineligible raw hit is a miss so already_looked_up skips a second counted lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_raw_hit_inside_item_ttl_is_servable_in_place() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("10s".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+        let now = std::time::Instant::now();
+        let probe = dummy_probe_hit(dummy_servable_entry_cached_at(
+            now - Duration::from_millis(500),
+        ))
+        .into_miss_if_in_place_ineligible(
+            CacheControl::Cache(CacheKeyType::Default),
+            df.results_cache_provider().as_deref(),
+        );
+        assert!(
+            probe.is_servable_in_place(),
+            "a fresh raw hit must still be served where the request arrived"
+        );
+        assert!(matches!(probe, CacheProbe::Hit(_)));
+    }
+
+    #[tokio::test]
+    async fn an_invalidated_raw_hit_is_not_servable_in_place() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+        let provider = df
+            .results_cache_provider()
+            .expect("the test runtime has a results cache");
+        // The entry's read must predate the mark: a change recorded
+        // before `read_started_at` is not a reason to reject it.
+        let probe = dummy_probe_hit(dummy_servable_entry_for_tables(
+            std::time::Instant::now() - Duration::from_secs(1),
+            HashSet::from([TableReference::bare("orders")]),
+        ));
+        provider
+            .invalidate_for_table(TableReference::bare("orders"))
+            .await
+            .expect("the table-change clock should record the invalidation");
+        let probe = probe.into_miss_if_in_place_ineligible(
+            CacheControl::Cache(CacheKeyType::Default),
+            Some(&provider),
+        );
+        assert!(
+            !probe.is_servable_in_place(),
+            "a table-change invalidation after the probe must hop to the query runtime"
+        );
+        assert!(matches!(probe, CacheProbe::Missed(_)));
+    }
+
+    #[tokio::test]
+    async fn a_raw_hit_inside_the_stale_window_stays_servable_in_place() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("1s".to_string()),
+            stale_while_revalidate_ttl: Some("5s".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+        let now = std::time::Instant::now();
+        let probe = dummy_probe_hit(dummy_servable_entry_cached_at(
+            now - Duration::from_millis(1_500),
+        ))
+        .into_miss_if_in_place_ineligible(
+            CacheControl::Cache(CacheKeyType::Default),
+            df.results_cache_provider().as_deref(),
+        );
+        assert!(
+            probe.is_servable_in_place(),
+            "a raw hit past item_ttl but inside the stale window is still served in place"
+        );
+        assert!(matches!(probe, CacheProbe::Hit(_)));
+    }
+
+    #[tokio::test]
+    async fn an_encoded_hit_past_item_ttl_stays_a_hit_and_is_not_servable_in_place() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("1s".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+        let now = std::time::Instant::now();
+        let probe = dummy_probe_hit(dummy_encoded_entry_cached_at(
+            now - Duration::from_millis(1_500),
+        ))
+        .into_miss_if_in_place_ineligible(
+            CacheControl::Cache(CacheKeyType::Default),
+            df.results_cache_provider().as_deref(),
+        );
+        assert!(
+            !probe.is_servable_in_place(),
+            "an encoded hit always hops so it can decode on the query runtime"
+        );
+        assert!(
+            matches!(probe, CacheProbe::Hit(_)),
+            "an encoded hit stays a hit so serve_probed_hit can recheck after the hop"
+        );
     }
 
     async fn prepare_runtime(

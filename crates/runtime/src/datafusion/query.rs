@@ -674,6 +674,14 @@ impl Query {
                 return self.finish_probe_cancellation(&request_context, spans, error);
             }
         };
+        // A raw hit that the serve-time TTL / table-clock checks will
+        // reject is planning work. Reclassify it before the hop so
+        // `run_internal` cannot plan that fallback on the request I/O
+        // runtime after `is_servable_in_place` has already skipped it.
+        let probe = probe.into_miss_if_in_place_ineligible(
+            request_context.cache_control(),
+            self.df.results_cache_provider().as_deref(),
+        );
         if let Some(runtime_handle) = self.df.cpu_runtime().cloned()
             && !probe.is_servable_in_place()
         {
