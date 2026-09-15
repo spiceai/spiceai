@@ -6,19 +6,19 @@ Spice.ai acknowledges the following open source projects for making this project
 
 ## Rust Crates
 
-- accelerator-cayenne 2.3.0,  ../../../LICENSE
+- accelerator-cayenne 2.3.1,  ../../../LICENSE
   <br/>
 
-- accelerator-duckdb 2.3.0,  ../../../LICENSE
+- accelerator-duckdb 2.3.1,  ../../../LICENSE
   <br/>
 
-- accelerator-postgres 2.3.0,  ../../../LICENSE
+- accelerator-postgres 2.3.1,  ../../../LICENSE
   <br/>
 
-- accelerator-sqlite 2.3.0,  ../../../LICENSE
+- accelerator-sqlite 2.3.1,  ../../../LICENSE
   <br/>
 
-- accelerator-turso 2.3.0,  ../../../LICENSE
+- accelerator-turso 2.3.1,  ../../../LICENSE
   <br/>
 
 - adbc_core 0.23.0, Apache-2.0 
@@ -288,7 +288,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - charset 0.1.5, Apache-2.0 OR MIT 
   <br/>https://github.com/hsivonen/charset
 
-- chbench-driver 2.3.0,  ../../LICENSE
+- chbench-driver 2.3.1,  ../../LICENSE
   <br/>
 
 - chdb-rust 1.3.1, Apache-2.0 
@@ -315,7 +315,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - clickhouse-rs 1.1.0-alpha.1, MIT 
   <br/>https://github.com/suharev7/clickhouse-rs
 
-- cloud-connect-crypto 2.3.0, Apache-2.0 
+- cloud-connect-crypto 2.3.1, Apache-2.0 
   <br/>
 
 - cmac 0.7.2, Apache-2.0 OR MIT 
@@ -324,109 +324,109 @@ Spice.ai acknowledges the following open source projects for making this project
 - comfy-table 7.1.4, MIT 
   <br/>https://github.com/nukesor/comfy-table
 
-- connector-abfs 2.3.0,  ../../../LICENSE
+- connector-abfs 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-adbc 2.3.0,  ../../../LICENSE
+- connector-adbc 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-clickhouse 2.3.0,  ../../../LICENSE
+- connector-clickhouse 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-cosmosdb 2.3.0,  ../../../LICENSE
+- connector-cosmosdb 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-databricks 2.3.0,  ../../../LICENSE
+- connector-databricks 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-delta-lake 2.3.0,  ../../../LICENSE
+- connector-delta-lake 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-dremio 2.3.0,  ../../../LICENSE
+- connector-dremio 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-duckdb 2.3.0,  ../../../LICENSE
+- connector-duckdb 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-ducklake 2.3.0,  ../../../LICENSE
+- connector-ducklake 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-dynamodb 2.3.0,  ../../../LICENSE
+- connector-dynamodb 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-elasticsearch 2.3.0,  ../../../LICENSE
+- connector-elasticsearch 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-flightsql 2.3.0,  ../../../LICENSE
+- connector-flightsql 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-ftp 2.3.0,  ../../../LICENSE
+- connector-ftp 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-gcs 2.3.0,  ../../../LICENSE
+- connector-gcs 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-git 2.3.0,  ../../../LICENSE
+- connector-git 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-github 2.3.0,  ../../../LICENSE
+- connector-github 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-glue 2.3.0,  ../../../LICENSE
+- connector-glue 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-graphql 2.3.0,  ../../../LICENSE
+- connector-graphql 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-imap 2.3.0,  ../../../LICENSE
+- connector-imap 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-kafka 2.3.0,  ../../../LICENSE
+- connector-kafka 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-mongodb 2.3.0,  ../../../LICENSE
+- connector-mongodb 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-mssql 2.3.0,  ../../../LICENSE
+- connector-mssql 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-mysql 2.3.0,  ../../../LICENSE
+- connector-mysql 2.3.1,  ../../../LICENSE
   <br/>
 
 - connector-nfs 1.11.0-unstable, Apache-2.0 
   <br/>
 
-- connector-odbc 2.3.0,  ../../../LICENSE
+- connector-odbc 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-oracle 2.3.0,  ../../../LICENSE
+- connector-oracle 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-postgres 2.3.0,  ../../../LICENSE
+- connector-postgres 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-postgres-common 2.3.0,  ../../../LICENSE
+- connector-postgres-common 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-scylladb 2.3.0,  ../../../LICENSE
+- connector-scylladb 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-sftp 2.3.0,  ../../../LICENSE
+- connector-sftp 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-sharepoint 2.3.0,  ../../../LICENSE
+- connector-sharepoint 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-smb 2.3.0,  ../../../LICENSE
+- connector-smb 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-snowflake 2.3.0,  ../../../LICENSE
+- connector-snowflake 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-spark 2.3.0,  ../../../LICENSE
+- connector-spark 2.3.1,  ../../../LICENSE
   <br/>
 
-- connector-spiceai 2.3.0,  ../../../LICENSE
+- connector-spiceai 2.3.1,  ../../../LICENSE
   <br/>
 
 - core_maths 0.1.1, MIT 
@@ -552,13 +552,13 @@ Spice.ai acknowledges the following open source projects for making this project
 - dotenv 0.15.0, MIT 
   <br/>https://github.com/dotenv-rs/dotenv
 
-- dotenv 2.3.0, Apache-2.0 
+- dotenv 2.3.1, Apache-2.0 
   <br/>
 
 - duckdb 1.4.4, MIT 
   <br/>https://github.com/duckdb/duckdb-rs
 
-- duration-parse 2.3.0, Apache-2.0 
+- duration-parse 2.3.1, Apache-2.0 
   <br/>
 
 - dyn-clone 1.0.20, Apache-2.0 OR MIT 
@@ -573,7 +573,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - either 1.16.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rayon-rs/either
 
-- elasticsearch 2.3.0,  ../../LICENSE
+- elasticsearch 2.3.1,  ../../LICENSE
   <br/>
 
 - encoding_rs 0.8.35, (Apache-2.0 OR MIT) AND BSD-3-Clause 
@@ -927,7 +927,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - pdf-inspector 0.1.8, MIT 
   <br/>https://github.com/firecrawl/pdf-inspector
 
-- pdf-parse 2.3.0,  ../../LICENSE
+- pdf-parse 2.3.1,  ../../LICENSE
   <br/>
 
 - pem 3.0.6, MIT 
@@ -1056,19 +1056,19 @@ Spice.ai acknowledges the following open source projects for making this project
 - rstest 0.26.1, Apache-2.0 OR MIT 
   <br/>https://github.com/la10736/rstest
 
-- runtime-checkpoint-duckdb 2.3.0,  ../../LICENSE
+- runtime-checkpoint-duckdb 2.3.1,  ../../LICENSE
   <br/>
 
-- runtime-checkpoint-postgres 2.3.0,  ../../LICENSE
+- runtime-checkpoint-postgres 2.3.1,  ../../LICENSE
   <br/>
 
-- runtime-checkpoint-sqlite 2.3.0,  ../../LICENSE
+- runtime-checkpoint-sqlite 2.3.1,  ../../LICENSE
   <br/>
 
-- runtime-checkpoint-turso 2.3.0,  ../../LICENSE
+- runtime-checkpoint-turso 2.3.1,  ../../LICENSE
   <br/>
 
-- runtime-drasi 2.3.0,  ../../LICENSE
+- runtime-drasi 2.3.1,  ../../LICENSE
   <br/>
 
 - rusqlite 0.40.1, MIT 
@@ -1149,7 +1149,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - spark-connect-rs 0.0.1-beta.4, Apache-2.0 
   <br/>https://github.com/sjrusso8/spark-connect-rs
 
-- spicepod-validator 2.3.0,  ../../LICENSE
+- spicepod-validator 2.3.1,  ../../LICENSE
   <br/>
 
 - ssh2 0.9.5, Apache-2.0 OR MIT 
