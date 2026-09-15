@@ -394,9 +394,11 @@ impl CacheProbe {
     /// runtime.
     ///
     /// Only a hit on an entry held as batches qualifies, since serving it hands
-    /// out batches the cache already holds. Decoding an encoded entry is CPU
-    /// work, and a miss has a query to plan and execute, so both belong on the
-    /// query runtime.
+    /// out batches the cache already holds. That is per-entry, not per-provider:
+    /// `encoding: zstd` still stores results at or under
+    /// [`cache::result::query::RAW_STORE_MAX_BYTES`] as raw batches. Decoding an
+    /// encoded entry is CPU work, and a miss has a query to plan and execute, so
+    /// both belong on the query runtime.
     pub(super) fn is_servable_in_place(&self) -> bool {
         matches!(self, Self::Hit(hit) if !hit.entry.cached_result.is_encoded())
     }

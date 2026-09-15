@@ -93,7 +93,7 @@ impl CacheKey<'_> {
     /// identical regardless of whether a namespace prefix was mixed in.
     fn hash_payload<T: Hasher>(&self, hasher: &mut T) {
         match self {
-            Self::LogicalPlan(logical_plan) => hash_plan(logical_plan, hasher),
+            Self::LogicalPlan(logical_plan) => logical_plan.hash(hasher),
             Self::Search(search_key) => search_key.hash(hasher),
             Self::EmbeddingRequest(embedding_request) => embedding_request.hash(hasher),
             Self::EmbeddingInput(model_name, embedding_input) => {
@@ -165,59 +165,6 @@ impl CacheKey<'_> {
         hasher.write(namespace_id);
         self.hash_payload(&mut hasher);
         RawCacheKey(hasher.finish())
-    }
-}
-
-/// The bytes a value's `Hash` implementation writes, collected so that they reach a
-/// hasher in a single call.
-///
-/// A logical plan hashes as thousands of small writes — one or more for every node,
-/// expression and schema field — and the caches hash through a `Box<dyn Hasher>`, where
-/// each of those is a virtual call into a streaming hasher. A hasher that consumes a
-/// byte stream computes the same value from the collected bytes.
-struct HashBytes(Vec<u8>);
-
-impl Hasher for HashBytes {
-    fn write(&mut self, bytes: &[u8]) {
-        self.0.extend_from_slice(bytes);
-    }
-
-    /// Only collects bytes: the hasher they are handed to computes the value.
-    fn finish(&self) -> u64 {
-        0
-    }
-}
-
-/// The largest plan byte buffer a thread keeps for the next plan it hashes.
-const PLAN_BYTES_RETAINED: usize = 1 << 20;
-
-thread_local! {
-    static PLAN_BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Hashes `plan` into `hasher` as one write of the bytes its `Hash` implementation
-/// produces, reusing this thread's buffer for them.
-fn hash_plan<T: Hasher>(plan: &LogicalPlan, hasher: &mut T) {
-    let mut bytes = HashBytes(
-        PLAN_BYTES
-            .try_with(|buffer| {
-                buffer
-                    .try_borrow_mut()
-                    .map(|mut buffer| std::mem::take(&mut *buffer))
-            })
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default(),
-    );
-    bytes.0.clear();
-    plan.hash(&mut bytes);
-    hasher.write(&bytes.0);
-    if bytes.0.capacity() <= PLAN_BYTES_RETAINED {
-        let _kept = PLAN_BYTES.try_with(|buffer| {
-            if let Ok(mut buffer) = buffer.try_borrow_mut() {
-                *buffer = std::mem::take(&mut bytes.0);
-            }
-        });
     }
 }
 
@@ -392,10 +339,8 @@ mod tests {
         assert_eq!(hash1, hash2);
     }
 
-    /// A plan's key does not depend on whether its bytes reach the hasher write by write
-    /// or in one call, for every configured algorithm that hashes a byte stream. `ahash`
-    /// folds integer writes, so for it the key is checked to be stable and to tell plans
-    /// apart.
+    /// A plan's key is the value of hashing that plan write by write, for every
+    /// configured algorithm — including `ahash`, which folds integer writes.
     #[test]
     fn a_plan_key_is_the_same_however_its_bytes_reach_the_hasher() {
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -425,6 +370,7 @@ mod tests {
         let (wide, narrow) = (plan(200), plan(1));
 
         for algorithm in [
+            HashingAlgorithm::Ahash,
             HashingAlgorithm::Siphash,
             HashingAlgorithm::Blake3,
             HashingAlgorithm::XXH3,
@@ -434,8 +380,7 @@ mod tests {
         ] {
             let builder = crate::get_hash_builder(algorithm).expect("a supported algorithm");
             let mut write_by_write = builder.build_hasher();
-            write_by_write.write_u8(1);
-            write_by_write.write_u64(3);
+            write_by_write.write(&crate::namespace_key::namespace_key_header(1, b"abc"));
             write_by_write.write(b"abc");
             wide.hash(&mut write_by_write);
 

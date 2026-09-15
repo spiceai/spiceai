@@ -38,6 +38,13 @@ use crate::sizing::{BUFFER_OVERHEAD_BYTES, ENTRY_OVERHEAD_BYTES, arc_heap_size};
 
 use super::CacheStatus;
 
+/// Results at or under this many array bytes stay [`CachedData::Raw`] even when
+/// an encoder is configured. Compression on a handful of rows does not pay for
+/// the decode on a later hit, and a `Raw` entry is what the in-place serve path
+/// can hand out without CPU work on the request runtime. Matches the Flight
+/// inline-encode budget.
+pub const RAW_STORE_MAX_BYTES: usize = 16 * 1024;
+
 /// Cached data storage - either raw `RecordBatches` (no encoding) or encoded bytes.
 #[derive(Debug, Clone)]
 pub enum CachedData {
@@ -119,7 +126,10 @@ impl CachedQueryResult {
     }
 
     /// Create a cached query result from record batches.
-    /// Only store encoded data if an encoder is provided.
+    ///
+    /// Encoded only when an encoder is provided *and* the prepared batches
+    /// exceed [`RAW_STORE_MAX_BYTES`]. A small result stays [`CachedData::Raw`]
+    /// so a later hit can be served in place without a decode.
     ///
     /// The `schema` parameter must be provided explicitly to ensure the correct
     /// schema is preserved even when `records` is empty (e.g., 0-row query results).
@@ -135,12 +145,20 @@ impl CachedQueryResult {
         read_started_at: Instant,
         encoder: Option<Arc<dyn Encoder>>,
     ) -> Result<Self, crate::encoding::Error> {
-        // Only store encoded data if an encoder is provided
-        let data = if let Some(encoder) = encoder.as_ref() {
-            let encoded_data = encoder.encode(&records).await?;
-            CachedData::Encoded(Bytes::from(encoded_data))
-        } else {
-            CachedData::Raw(Arc::new(super::prepare_for_storage(records)))
+        let prepared = super::prepare_for_storage(records);
+        let raw_bytes: usize = prepared
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .sum();
+        let (data, encoder) = match encoder {
+            Some(encoder) if raw_bytes > RAW_STORE_MAX_BYTES => {
+                let encoded_data = encoder.encode(&prepared).await?;
+                (
+                    CachedData::Encoded(Bytes::from(encoded_data)),
+                    Some(encoder),
+                )
+            }
+            _ => (CachedData::Raw(Arc::new(prepared)), None),
         };
 
         Ok(Self {
@@ -757,5 +775,79 @@ mod tests {
             3,
             "CachedStream schema must match the original schema"
         );
+    }
+
+    fn encoder() -> Option<Arc<dyn crate::encoding::Encoder>> {
+        crate::encoding::get_encoder(spicepod::component::caching::Encoding::Zstd)
+    }
+
+    /// A result under [`RAW_STORE_MAX_BYTES`] stays raw when zstd is configured,
+    /// so an in-place serve does not decode.
+    #[tokio::test]
+    async fn a_small_result_stays_raw_when_an_encoder_is_configured() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("batch");
+        assert!(
+            batch.get_array_memory_size() <= RAW_STORE_MAX_BYTES,
+            "fixture must be under the raw-store budget"
+        );
+
+        let cached_result = CachedQueryResult::from_batches(
+            vec![batch],
+            schema,
+            Arc::new(HashSet::new()),
+            Instant::now(),
+            Instant::now(),
+            encoder(),
+        )
+        .await
+        .expect("should create cached result");
+
+        assert!(
+            !cached_result.is_encoded(),
+            "a small result must stay raw under zstd so a hit can be served in place"
+        );
+        let records = cached_result.records().await.expect("raw batches");
+        assert_eq!(records[0].num_rows(), 3);
+    }
+
+    /// A result over [`RAW_STORE_MAX_BYTES`] is encoded when zstd is configured.
+    #[tokio::test]
+    async fn a_large_result_is_encoded_when_an_encoder_is_configured() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        // ~20 KiB of zeros: over the raw-store budget, still highly compressible.
+        let values = vec![0i32; 5_000];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(values))],
+        )
+        .expect("batch");
+        assert!(
+            batch.get_array_memory_size() > RAW_STORE_MAX_BYTES,
+            "fixture must exceed the raw-store budget, got {}",
+            batch.get_array_memory_size()
+        );
+
+        let cached_result = CachedQueryResult::from_batches(
+            vec![batch],
+            schema,
+            Arc::new(HashSet::new()),
+            Instant::now(),
+            Instant::now(),
+            encoder(),
+        )
+        .await
+        .expect("should create cached result");
+
+        assert!(
+            cached_result.is_encoded(),
+            "a result over the raw-store budget must still be encoded under zstd"
+        );
+        let records = cached_result.records().await.expect("decoded batches");
+        assert_eq!(records[0].num_rows(), 5_000);
     }
 }

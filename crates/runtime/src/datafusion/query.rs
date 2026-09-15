@@ -341,7 +341,10 @@ struct QueryLifetimeGuards {
 
 /// `runtime.task_history` / Zipkin span for one query, opened before the
 /// results-cache probe so lookup time is in the same duration as planning
-/// and execution.
+/// and execution. That duration is `execution_duration_ms`. For a query
+/// that hops onto the dedicated CPU runtime, it also includes the wait
+/// for a worker — the same wait `query_duration_ms` has always included
+/// (its timer starts in [`QueryBuilder::build`]).
 struct QuerySpans {
     span: Span,
     trace_span: Span,
