@@ -5076,13 +5076,17 @@ impl DataFusion {
             &table.to_string(),
         )?;
 
-        // Refuse a multi-read view before engine `init` restores anything.
+        // Refuse a multi-read view, and a view whose identity `params` are
+        // `${ store:key }` references, before engine `init` restores anything.
         // `initialize_views_accelerators` skips bootstrap-enabled views for this
-        // reason; running the proof after a restore would leave the archive's
+        // reason; running either check after a restore would leave the archive's
         // rows (and a local checkpoint of them) on disk for a later start.
+        // Identity `params` are hashed as declared, so a rotated secret would
+        // otherwise restore the old archive and then abort registration.
         let mut refresh_attestation = None;
         let mut materialization_identity = None;
         if !acceleration.snapshot_behavior.is_disabled() {
+            ensure_view_snapshot_identity_params(table, &view.sql, &view.params, &view.app)?;
             match view_snapshot_consistency_decision(
                 &self.ctx,
                 table,
@@ -5213,9 +5217,8 @@ impl DataFusion {
         // Acceleration snapshots. A view's accelerated rows are the *result* of its
         // query, which brings two obligations a dataset does not have. A bootstrap must
         // only load an archive materialized from this same SQL — carried by
-        // `View::definition_fingerprint`, checked inside the snapshot manager. Identity
-        // `params` are hashed as declared, so a `${ store:key }` reference on this
-        // view or any transitive dataset, view, or catalog is refused here rather
+        // `View::definition_fingerprint`, checked inside the snapshot manager.
+        // Identity `params` were already refused above, before `init`, rather
         // than stamping a definition that cannot see a secret rotation. And a
         // publish must only capture a materialization that came from a single read,
         // because a query that reads its sources twice captures them at two different
@@ -5225,9 +5228,6 @@ impl DataFusion {
         // the plan that executed the refresh, not a fresh re-plan at publish time.
         // Each published archive also records producing-read consistency so a
         // `consistent_read` bootstrap can refuse an `accept_skew` entry.
-        if !acceleration.snapshot_behavior.is_disabled() {
-            ensure_view_snapshot_identity_params(table, &view.sql, &view.params, &view.app)?;
-        }
         match get_acceleration_layout(view, &self.accelerator_engine_registry).await {
             Ok(layout) if layout.is_enabled() => {
                 ensure!(
