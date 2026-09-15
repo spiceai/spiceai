@@ -3897,6 +3897,20 @@ mod test {
         ] {
             assert_eq!(projected_sort_limit(sql, &schema), None, "{sql}");
         }
+
+        // `ORDER BY 1` is a result column, so the keyed read uses it in place
+        // rather than appending a hidden key.
+        let positional = projected_sort_limit("SELECT id, v FROM t ORDER BY 1 LIMIT 2", &schema)
+            .expect("ordinal 1 is the first result column");
+        assert_eq!(
+            (positional.limit, positional.offset, &positional.key),
+            (2, 0, &SortKeyCells::Returned(vec![0]))
+        );
+        assert_eq!(
+            unprojected_sort_limit("SELECT id, v FROM t ORDER BY 1 LIMIT 2", &schema),
+            None,
+            "a positional term is not a hidden sort key"
+        );
     }
 
     #[test]

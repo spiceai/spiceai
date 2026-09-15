@@ -62,6 +62,18 @@ fn next_keyed_reference_fetch_rows(current: usize) -> Option<usize> {
     }
 }
 
+/// Rows the keyed query asks for: `offset` plus the window past it, never more
+/// than [`MAX_KEYED_REFERENCE_ROWS`]. The matcher indexes from the top of the
+/// result, so the rows an `OFFSET` skips have to be in the stream; a query that
+/// kept its `OFFSET` would hide the tie group that cutoff cuts through. Adding
+/// the offset after clamping the window would still request `OFFSET + N` and
+/// defeat the cap (`OFFSET 2_000_000` plus a 20-row window is `2_000_020`).
+fn keyed_reference_requested_rows(offset: usize, fetch_past_offset: usize) -> usize {
+    offset
+        .saturating_add(fetch_past_offset)
+        .min(MAX_KEYED_REFERENCE_ROWS)
+}
+
 pub(crate) struct SpiceTestQueryWorker {
     id: usize,
     query_set: Vec<Query>,
@@ -778,7 +790,15 @@ impl SpiceTestQueryWorker {
                     }
                     let mut fetch_rows = keyed_reference_fetch_rows(sort_limit.limit);
                     loop {
-                        let requested_rows = sort_limit.offset.saturating_add(fetch_rows);
+                        if sort_limit.offset >= MAX_KEYED_REFERENCE_ROWS {
+                            println!(
+                                "Worker {} - Query '{}' - OFFSET {} starts past {MAX_KEYED_REFERENCE_ROWS} reference rows; keeping the row-by-row comparison's result",
+                                self.id, query.name, sort_limit.offset
+                            );
+                            break;
+                        }
+                        let requested_rows =
+                            keyed_reference_requested_rows(sort_limit.offset, fetch_rows);
                         let mut stream = spice_client
                             .sql_with_params(
                                 &sort_limit.keyed_sql(requested_rows),
@@ -811,6 +831,13 @@ impl SpiceTestQueryWorker {
                             !cutoff_closed && fetched_rows < requested_rows,
                         )? {
                             validation_result = result;
+                            break;
+                        }
+                        if requested_rows >= MAX_KEYED_REFERENCE_ROWS {
+                            println!(
+                                "Worker {} - Query '{}' - more than {MAX_KEYED_REFERENCE_ROWS} reference rows tie at the LIMIT; keeping the row-by-row comparison's result",
+                                self.id, query.name
+                            );
                             break;
                         }
                         let Some(next) = next_keyed_reference_fetch_rows(fetch_rows) else {
@@ -1201,6 +1228,38 @@ mod tests {
         assert_eq!(
             next_keyed_reference_fetch_rows(first),
             Some(MAX_KEYED_REFERENCE_ROWS)
+        );
+    }
+
+    /// `OFFSET + 2 * LIMIT` is the first keyed request. That sum is not itself
+    /// clamped by [`keyed_reference_fetch_rows`], so a large `OFFSET` would
+    /// request more than [`MAX_KEYED_REFERENCE_ROWS`] unless the add is clamped.
+    #[test]
+    fn keyed_reference_request_clamps_offset_plus_window_to_the_cap() {
+        let fetch = keyed_reference_fetch_rows(10);
+        assert_eq!(fetch, 20, "first window past OFFSET is 2 * LIMIT");
+        assert_eq!(keyed_reference_requested_rows(100, fetch), 120);
+        let offset = 2_000_000usize;
+        let unclamped = offset.saturating_add(fetch);
+        assert_eq!(
+            unclamped, 2_000_020,
+            "the unclamped request is OFFSET + 2 * LIMIT"
+        );
+        assert!(
+            unclamped > MAX_KEYED_REFERENCE_ROWS,
+            "unclamped {unclamped} must exceed cap {MAX_KEYED_REFERENCE_ROWS}"
+        );
+        assert_eq!(
+            keyed_reference_requested_rows(offset, fetch),
+            MAX_KEYED_REFERENCE_ROWS
+        );
+        assert_eq!(
+            keyed_reference_requested_rows(0, MAX_KEYED_REFERENCE_ROWS),
+            MAX_KEYED_REFERENCE_ROWS
+        );
+        assert_eq!(
+            keyed_reference_requested_rows(MAX_KEYED_REFERENCE_ROWS, fetch),
+            MAX_KEYED_REFERENCE_ROWS
         );
     }
 

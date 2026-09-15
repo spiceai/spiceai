@@ -1307,7 +1307,7 @@ pub fn check_sort_order_parsed(
 
 #[cfg(test)]
 mod tests {
-    use super::top_level_limit_count;
+    use super::{top_level_limit_count, top_level_offset_count};
 
     /// rustdoc immediately above `fn_sig` in this file. A glued pair of comments
     /// lands on the first function and leaves the second undocumented.
@@ -1362,6 +1362,27 @@ mod tests {
         assert_eq!(top_level_limit_count("SELECT v FROM t"), None);
         assert_eq!(
             top_level_limit_count("SELECT v FROM t WHERE id IN (SELECT i FROM u LIMIT 5)"),
+            None
+        );
+    }
+
+    #[test]
+    fn top_level_offset_count_reads_integer_literals() {
+        assert_eq!(
+            top_level_offset_count("SELECT v FROM t LIMIT 10 OFFSET 100"),
+            Some(100)
+        );
+        assert_eq!(top_level_offset_count("SELECT v FROM t OFFSET 3"), Some(3));
+        assert_eq!(top_level_offset_count("SELECT v FROM t LIMIT 10"), None);
+        assert_eq!(top_level_offset_count("SELECT v FROM t"), None);
+        assert_eq!(
+            top_level_offset_count(
+                "SELECT v FROM t WHERE id IN (SELECT i FROM u LIMIT 1 OFFSET 5)"
+            ),
+            None
+        );
+        assert_eq!(
+            top_level_offset_count("SELECT v FROM t LIMIT 10 OFFSET $1"),
             None
         );
     }
