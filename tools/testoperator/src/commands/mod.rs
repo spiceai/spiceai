@@ -943,20 +943,30 @@ mod tests {
         );
     }
 
-    /// TPC-H Q6 returns a wrong answer on these federated arms: both sources type
-    /// `l_discount` as a double, and Spice types the literal `0.06 + 0.01` as a
-    /// `Float64` just below 0.07, so Q6's `BETWEEN` drops every row at 0.07. They
-    /// keep an explicit `validate_results: false` so the scheduled run does not
-    /// fail on that answer. Every other scale factor 1 TPC-H, TPC-DS and
-    /// `ClickBench` dispatch must validate against an oracle.
+    /// Scale factor 1 benchmarks that keep an explicit `validate_results: false`,
+    /// each with its reason in its dispatch file:
+    ///
+    /// - `glue[csv]` and `iceberg[hadoop]`: TPC-H Q6 returns a wrong answer. Both
+    ///   sources type `l_discount` as a double, and Spice types the literal
+    ///   `0.06 + 0.01` as a `Float64` just below 0.07, so Q6's `BETWEEN` drops
+    ///   every row at 0.07.
+    /// - `mssql`, `mssql[catalog]` and `odbc[athena]`: their TPC-H tables hold
+    ///   different text columns than the parquet the TPC-H answer files were
+    ///   computed from, so no answer file is their oracle.
+    ///
+    /// Every other scale factor 1 TPC-H, TPC-DS and `ClickBench` dispatch must
+    /// validate against an oracle.
     const BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION: &[&str] = &[
         "tpch/sf1/federated/glue[csv].yaml",
         "tpch/sf1/federated/iceberg[hadoop].yaml",
+        "tpch/sf1/federated/mssql.yaml",
+        "tpch/sf1/federated/mssql[catalog].yaml",
+        "tpch/sf1/federated/odbc[athena].yaml",
     ];
 
     /// Every scale factor 1 TPC-H, TPC-DS and `ClickBench` benchmark dispatch
-    /// validates its results against an oracle it can actually resolve, except the
-    /// Q6 opt-outs in `BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION`. Benchmarks at
+    /// validates its results against an oracle it can actually resolve, except
+    /// those in `BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION`. Benchmarks at
     /// larger scale factors measure performance and must not validate.
     ///
     /// Each `bench` entry is resolved the way `testoperator_run_bench.yml` runs

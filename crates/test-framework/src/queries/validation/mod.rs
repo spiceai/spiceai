@@ -3446,6 +3446,28 @@ mod test {
     }
 
     #[test]
+    fn test_unprojected_sort_limit_refuses_a_collated_sort_key() {
+        // A collation decides which rows tie, and rendered keys cannot show it: under
+        // `COLLATE NOCASE`, 'a' and 'A' are one tie group but two different strings.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            false,
+        )]));
+        for sql in [
+            "SELECT payload FROM t ORDER BY hidden COLLATE NOCASE LIMIT 1",
+            "SELECT payload FROM t ORDER BY id, lower(hidden COLLATE \"C\") LIMIT 2",
+        ] {
+            assert_eq!(unprojected_sort_limit(sql, &schema), None, "{sql}");
+        }
+        assert!(
+            unprojected_sort_limit("SELECT payload FROM t ORDER BY hidden LIMIT 1", &schema)
+                .is_some(),
+            "without the collation the sort key is read back"
+        );
+    }
+
+    #[test]
     fn test_unprojected_sort_limit_refuses_a_nested_limit() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
         // The inner LIMIT keeps unspecified rows, so no reference run fixes which

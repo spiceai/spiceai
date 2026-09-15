@@ -927,7 +927,9 @@ impl UnprojectedSortLimit {
 /// terms to the projection leaves the rows unchanged. Includes a resolved prefix
 /// with a hidden suffix (`ORDER BY visible, hidden`): ties on `visible` are not
 /// free when `hidden` distinguishes them. `None` otherwise, including for a
-/// positional term such as `ORDER BY 1`.
+/// positional term such as `ORDER BY 1` and for a term that applies a `COLLATE`:
+/// the collation decides which rows tie, and the rendered sort keys the keyed
+/// check compares cannot show it.
 #[must_use]
 pub fn unprojected_sort_limit(sql: &str, schema: &SchemaRef) -> Option<UnprojectedSortLimit> {
     let statement = parse_one_statement(sql)?;
@@ -957,9 +959,11 @@ pub fn unprojected_sort_limit(sql: &str, schema: &SchemaRef) -> Option<Unproject
         return None;
     };
     if terms.is_empty()
-        || terms
-            .iter()
-            .any(|term| term.with_fill.is_some() || expr_as_usize(&term.expr).is_some())
+        || terms.iter().any(|term| {
+            term.with_fill.is_some()
+                || expr_as_usize(&term.expr).is_some()
+                || applies_collation(&term.expr)
+        })
     {
         return None;
     }
@@ -1026,6 +1030,25 @@ fn returns_group_keys(select: &Select) -> bool {
 /// produces for the outer query is only one of the results the query allows. The
 /// checks that read that full result refuse the query rather than judge an answer
 /// against one of them.
+/// Whether `expr` applies a `COLLATE` anywhere inside it. Under `COLLATE NOCASE`,
+/// `'a'` and `'A'` are one tie group but two different rendered strings.
+fn applies_collation(expr: &Expr) -> bool {
+    struct Collation;
+
+    impl Visitor for Collation {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if matches!(expr, Expr::Collate { .. }) {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    expr.visit(&mut Collation).is_break()
+}
+
 fn has_nested_row_limit(statement: &Statement) -> bool {
     struct NestedRowLimit {
         query_depth: usize,
