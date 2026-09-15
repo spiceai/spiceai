@@ -127,18 +127,15 @@ impl SnapshotPublishGate for ViewSnapshotPublishGate {
 /// Last refresh-plan read shape written by the executing refresh scan, read by
 /// [`ViewSnapshotPublishGate`]. `None` means no refresh has attested this process.
 /// Each record is stamped with the [`MaterializationIdentity`] epoch at scan time.
-#[derive(Clone, Debug, Default)]
+/// Production writes go through [`AttestingViewProvider`], which only calls
+/// [`Self::record`] on a refresh session.
+#[derive(Clone, Debug)]
 pub(crate) struct ViewRefreshReadAttestation {
     identity: MaterializationIdentity,
     shape: Arc<parking_lot::RwLock<Option<(u64, ViewReadShape)>>>,
 }
 
 impl ViewRefreshReadAttestation {
-    #[must_use]
-    pub(crate) fn new() -> Self {
-        Self::with_identity(MaterializationIdentity::new())
-    }
-
     #[must_use]
     pub(crate) fn with_identity(identity: MaterializationIdentity) -> Self {
         Self {
@@ -147,19 +144,9 @@ impl ViewRefreshReadAttestation {
         }
     }
 
-    #[must_use]
-    pub(crate) fn identity(&self) -> MaterializationIdentity {
-        self.identity.clone()
-    }
-
     pub(crate) fn record(&self, shape: ViewReadShape) {
         let epoch = self.identity.epoch();
         *self.shape.write() = Some((epoch, shape));
-    }
-
-    #[must_use]
-    pub(crate) fn last(&self) -> Option<ViewReadShape> {
-        self.shape.read().as_ref().map(|(_, shape)| shape.clone())
     }
 
     #[must_use]
@@ -1529,7 +1516,8 @@ mod tests {
 
         #[tokio::test]
         async fn publish_gate_uses_refresh_attestation_not_a_replanned_query() {
-            let attestation = ViewRefreshReadAttestation::new();
+            let attestation =
+                ViewRefreshReadAttestation::with_identity(MaterializationIdentity::new());
             let gate = ViewSnapshotPublishGate::new(
                 TableReference::bare("orders_us"),
                 attestation.clone(),
@@ -1662,7 +1650,8 @@ mod tests {
                 .await
                 .expect("logical plan");
             let view_table = ViewTable::new(logical, Some("join view".to_string()));
-            let attestation = ViewRefreshReadAttestation::new();
+            let attestation =
+                ViewRefreshReadAttestation::with_identity(MaterializationIdentity::new());
             let wrapped = wrap_view_refresh_attestation(Arc::new(view_table), attestation.clone());
 
             let mut state = ctx.state();
@@ -1673,7 +1662,8 @@ mod tests {
                 .expect("view scan");
 
             let shape = attestation
-                .last()
+                .last_stamped()
+                .map(|(_, shape)| shape)
                 .expect("refresh scan records the executing-plan attestation");
             assert!(
                 matches!(shape, ViewReadShape::MultipleReads { .. }),
@@ -1690,7 +1680,8 @@ mod tests {
                 .await
                 .expect("logical plan");
             let view_table = ViewTable::new(logical, Some("join view".to_string()));
-            let attestation = ViewRefreshReadAttestation::new();
+            let attestation =
+                ViewRefreshReadAttestation::with_identity(MaterializationIdentity::new());
             let wrapped = wrap_view_refresh_attestation(Arc::new(view_table), attestation.clone());
 
             let _plan = wrapped
@@ -1699,7 +1690,7 @@ mod tests {
                 .expect("ordinary query scan");
 
             assert!(
-                attestation.last().is_none(),
+                attestation.last_stamped().is_none(),
                 "a non-refresh scan must not write publish-gate attestation"
             );
         }
