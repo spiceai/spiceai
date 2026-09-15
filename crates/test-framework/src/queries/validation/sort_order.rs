@@ -72,14 +72,15 @@ limitations under the License.
 //!   unverified for no reason.
 
 use std::cmp::Ordering;
+use std::ops::ControlFlow;
 
 use anyhow::Result;
 use arrow::array::{Array, ArrayRef, RecordBatch, make_comparator};
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
 use datafusion::sql::sqlparser::ast::{
-    Expr, LimitClause, OrderBy, OrderByKind, Query as SqlQuery, SelectItem, SetExpr, Statement,
-    Value,
+    Expr, GroupByExpr, Ident, LimitClause, OrderBy, OrderByKind, Query as SqlQuery, Select,
+    SelectItem, SetExpr, Statement, Value, Visit, Visitor,
 };
 use datafusion::sql::sqlparser::dialect::{Dialect, GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::parser::Parser;
@@ -114,6 +115,22 @@ pub enum SortKeyResolution {
     },
     /// Not even the first term mapped onto a result column.
     Unresolved { reason: String },
+}
+
+impl SortKeyResolution {
+    /// True when at least one `ORDER BY` term does not appear in the result, so
+    /// the rows cannot show the full sort key.
+    #[must_use]
+    pub fn hides_a_sort_term(&self) -> bool {
+        matches!(
+            self,
+            Self::Unresolved { .. }
+                | Self::Resolved {
+                    unresolved_suffix: Some(_),
+                    ..
+                }
+        )
+    }
 }
 
 /// A row that breaks the query's `ORDER BY`.
@@ -791,6 +808,434 @@ pub fn top_level_limit_count(sql: &str) -> Option<usize> {
     }
 }
 
+/// Top-level `OFFSET m` count, when it is a single integer literal.
+///
+/// `None` if there is no top-level offset, or if it is not a literal.
+#[must_use]
+pub fn top_level_offset_count(sql: &str) -> Option<usize> {
+    let statement = parse_one_statement(sql)?;
+    let Statement::Query(query) = statement else {
+        return None;
+    };
+    match query.limit_clause.as_ref() {
+        Some(LimitClause::LimitOffset {
+            offset: Some(offset),
+            ..
+        }) => expr_as_usize(&offset.value),
+        _ => None,
+    }
+}
+
+/// A top-level `LIMIT` that leaves unspecified which rows it keeps.
+///
+/// SQL lets a query with a top-level `LIMIT n [OFFSET m]` and no top-level
+/// `ORDER BY` return any `n` rows of its full result after skipping any `m`, so
+/// two correct engines — or one engine at two thread counts — can return
+/// different rows. See [`unordered_limit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnorderedLimit {
+    /// The `LIMIT` count.
+    pub limit: usize,
+    /// The `OFFSET` count, `0` when there is none.
+    pub offset: usize,
+    /// The query without its top-level `LIMIT`/`OFFSET`: the full result the
+    /// returned rows are taken from.
+    pub unlimited_sql: String,
+}
+
+impl UnorderedLimit {
+    /// Whether two results of this query can hold different rows and still both
+    /// be correct.
+    ///
+    /// The full result fixes how many rows the `LIMIT` keeps, so both sides must
+    /// agree on the count. Without an `OFFSET`, a result shorter than the `LIMIT`
+    /// is the whole full result, so only one that filled the `LIMIT` can have
+    /// left rows out.
+    #[must_use]
+    pub fn may_keep_different_rows(&self, left_rows: usize, right_rows: usize) -> bool {
+        left_rows == right_rows && (self.offset > 0 || left_rows == self.limit)
+    }
+}
+
+/// The top-level `LIMIT` of `sql`, when it lets the query keep any of its groups
+/// and every row it returns names its group.
+///
+/// `Some` only for a single `SELECT … GROUP BY` — no set operation, parenthesized
+/// query, `DISTINCT` or `TOP` — that returns every `GROUP BY` expression, with a
+/// top-level `LIMIT n [OFFSET m]` of integer literals, no top-level `ORDER BY`, and
+/// no row limit nested inside it. A row such a query returns is either its group's
+/// row of the full result or wrong. Every other query gets `None` and keeps the
+/// comparison it already has: a plain projection can return wrongly computed rows
+/// that still occur in its full result (`SELECT o_orderkey + 1 … LIMIT 10`
+/// evaluated as `o_orderkey + 2`), and a nested row limit leaves the full result
+/// itself unspecified.
+#[must_use]
+pub fn unordered_limit(sql: &str) -> Option<UnorderedLimit> {
+    let statement = parse_one_statement(sql)?;
+    if statement_has_top_level_order_by(&statement) || has_nested_row_limit(&statement) {
+        return None;
+    }
+    let Statement::Query(mut query) = statement else {
+        return None;
+    };
+    if query.fetch.is_some() {
+        return None;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    if select.distinct.is_some() || select.top.is_some() || !returns_group_keys(select) {
+        return None;
+    }
+    let Some(LimitClause::LimitOffset {
+        limit: Some(limit),
+        offset,
+        limit_by,
+    }) = &query.limit_clause
+    else {
+        return None;
+    };
+    if !limit_by.is_empty() {
+        return None;
+    }
+    let limit = expr_as_usize(limit)?;
+    let offset = match offset {
+        Some(offset) => expr_as_usize(&offset.value)?,
+        None => 0,
+    };
+    query.limit_clause = None;
+    Some(UnorderedLimit {
+        limit,
+        offset,
+        unlimited_sql: Statement::Query(query).to_string(),
+    })
+}
+
+/// A top-level `ORDER BY … LIMIT` whose answer is judged against the reference
+/// query's leading rows read back with their sort keys, because comparing it with
+/// the reference's own answer cannot tell a wrong row from another choice among
+/// tied rows. Built by [`unprojected_sort_limit`] and [`projected_sort_limit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyedSortLimit {
+    /// The `LIMIT` count.
+    pub limit: usize,
+    /// The `OFFSET` count, `0` when there is none.
+    pub offset: usize,
+    /// Where each row [`Self::keyed_sql`] returns carries its sort key.
+    pub key: SortKeyCells,
+    keyed_sql_without_limit: String,
+}
+
+/// Where a row of a [`KeyedSortLimit::keyed_sql`] result carries its sort key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SortKeyCells {
+    /// In this many cells appended after the result's own columns.
+    Appended(usize),
+    /// In the result's own columns at these indexes, most significant first.
+    Returned(Vec<usize>),
+}
+
+impl KeyedSortLimit {
+    /// The query's first `rows` rows in `ORDER BY` order, counted from the top of
+    /// its result rather than from its `OFFSET`, each carrying its sort key where
+    /// [`Self::key`] says.
+    #[must_use]
+    pub fn keyed_sql(&self, rows: usize) -> String {
+        format!("{} LIMIT {rows}", self.keyed_sql_without_limit)
+    }
+}
+
+/// The top-level `ORDER BY … LIMIT` of `sql`, when at least one sort term is not
+/// a column of `schema`, the result's.
+///
+/// When the first `ORDER BY` term is not a result column — `ClickBench` Q25
+/// returns `"SearchPhrase"` ordered by `to_timestamp("EventTime")` — the rows
+/// cannot show where one tie group ends and the next begins, so neither the order
+/// of tied rows nor which tied rows the `LIMIT` kept can be judged from them.
+/// [`KeyedSortLimit::keyed_sql`] appends each `ORDER BY` term to the result's
+/// columns, so the reference rows carry [`SortKeyCells::Appended`] keys.
+///
+/// `Some` only for a single `SELECT` — no set operation, `DISTINCT` or `TOP` —
+/// with a top-level `ORDER BY` of expressions, an integer-literal `LIMIT`, and no
+/// `OFFSET`, `FETCH` or `LIMIT … BY`: the shape where appending the `ORDER BY`
+/// terms to the projection leaves the rows unchanged. Includes a resolved prefix
+/// with a hidden suffix (`ORDER BY visible, hidden`): ties on `visible` are not
+/// free when `hidden` distinguishes them. `None` otherwise, including for a
+/// positional term such as `ORDER BY 1` and for a term that applies a `COLLATE`:
+/// the collation decides which rows tie, and the rendered sort keys the keyed
+/// check compares cannot show it. A term that names a select-list alias is
+/// refused too, because the alias is not in scope in the select list the keyed
+/// query appends it to.
+#[must_use]
+pub fn unprojected_sort_limit(sql: &str, schema: &SchemaRef) -> Option<KeyedSortLimit> {
+    let statement = parse_one_statement(sql)?;
+    if has_nested_row_limit(&statement) {
+        return None;
+    }
+    if !resolve_statement_sort_key(&statement, schema).hides_a_sort_term() {
+        return None;
+    }
+    let Statement::Query(mut query) = statement else {
+        return None;
+    };
+    if query.fetch.is_some() {
+        return None;
+    }
+    let limit = match &query.limit_clause {
+        Some(LimitClause::LimitOffset {
+            limit: Some(limit),
+            offset: None,
+            limit_by,
+        }) if limit_by.is_empty() => expr_as_usize(limit)?,
+        _ => return None,
+    };
+    let Some(OrderByKind::Expressions(terms)) =
+        query.order_by.as_ref().map(|order_by| &order_by.kind)
+    else {
+        return None;
+    };
+    if terms.is_empty()
+        || terms.iter().any(|term| {
+            term.with_fill.is_some()
+                || expr_as_usize(&term.expr).is_some()
+                || applies_collation(&term.expr)
+        })
+    {
+        return None;
+    }
+    let sort_keys: Vec<Expr> = terms.iter().map(|term| term.expr.clone()).collect();
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return None;
+    };
+    if select.distinct.is_some() || select.top.is_some() {
+        return None;
+    }
+    let aliases: Vec<String> = select
+        .projection
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+            _ => None,
+        })
+        .collect();
+    if sort_keys
+        .iter()
+        .any(|expr| names_a_select_alias(expr, &aliases))
+    {
+        return None;
+    }
+    let key_columns = sort_keys.len();
+    select
+        .projection
+        .extend(
+            sort_keys
+                .into_iter()
+                .enumerate()
+                .map(|(index, expr)| SelectItem::ExprWithAlias {
+                    expr,
+                    alias: Ident::new(format!("__validation_sort_key_{index}")),
+                }),
+        );
+    query.limit_clause = None;
+    Some(KeyedSortLimit {
+        limit,
+        offset: 0,
+        key: SortKeyCells::Appended(key_columns),
+        keyed_sql_without_limit: Statement::Query(query).to_string(),
+    })
+}
+
+/// The top-level `ORDER BY … LIMIT` of `sql`, when every sort term is a column of
+/// `schema`, the result's.
+///
+/// The rows then show their own sort keys, and so where their tie groups begin
+/// and end, but not which rows past the `LIMIT` or before the `OFFSET` tie with
+/// the rows at either end of the page: `ClickBench` Q31 keeps ten groups by
+/// `c DESC`, and over the full `hits` dataset two groups share the tenth count,
+/// `1058`, so a correct engine may return either one. [`KeyedSortLimit::keyed_sql`]
+/// is the query with its `LIMIT` raised and its `OFFSET` dropped, so its rows are
+/// the query's own, carrying [`SortKeyCells::Returned`] keys.
+///
+/// `Some` only for a query whose top-level `ORDER BY` expressions all resolve onto
+/// result columns — so none applies a `COLLATE` — with an integer-literal `LIMIT`,
+/// an optional integer-literal `OFFSET`, and no `FETCH`, `LIMIT … BY`, `TOP`,
+/// `WITH FILL` or row limit nested inside it: a nested limit leaves the rows past
+/// the page unspecified.
+#[must_use]
+pub fn projected_sort_limit(sql: &str, schema: &SchemaRef) -> Option<KeyedSortLimit> {
+    let statement = parse_one_statement(sql)?;
+    if has_nested_row_limit(&statement) {
+        return None;
+    }
+    let SortKeyResolution::Resolved {
+        key,
+        unresolved_suffix: None,
+    } = resolve_statement_sort_key(&statement, schema)
+    else {
+        return None;
+    };
+    let Statement::Query(mut query) = statement else {
+        return None;
+    };
+    if query.fetch.is_some() {
+        return None;
+    }
+    let (limit, offset) = match &query.limit_clause {
+        Some(LimitClause::LimitOffset {
+            limit: Some(limit),
+            offset,
+            limit_by,
+        }) if limit_by.is_empty() => (
+            expr_as_usize(limit)?,
+            match offset {
+                Some(offset) => expr_as_usize(&offset.value)?,
+                None => 0,
+            },
+        ),
+        _ => return None,
+    };
+    if matches!(query.body.as_ref(), SetExpr::Select(select) if select.top.is_some()) {
+        return None;
+    }
+    let Some(OrderByKind::Expressions(terms)) =
+        query.order_by.as_ref().map(|order_by| &order_by.kind)
+    else {
+        return None;
+    };
+    if terms.iter().any(|term| term.with_fill.is_some()) {
+        return None;
+    }
+    query.limit_clause = None;
+    Some(KeyedSortLimit {
+        limit,
+        offset,
+        key: SortKeyCells::Returned(key.iter().map(|column| column.index).collect()),
+        keyed_sql_without_limit: Statement::Query(query).to_string(),
+    })
+}
+
+/// Whether `select` groups its rows and returns every `GROUP BY` expression — as
+/// the expression itself, its alias, or its 1-based position in the `SELECT` list
+/// — so each row it returns names its group.
+fn returns_group_keys(select: &Select) -> bool {
+    let GroupByExpr::Expressions(keys, modifiers) = &select.group_by else {
+        return false;
+    };
+    !keys.is_empty()
+        && modifiers.is_empty()
+        && keys.iter().all(|key| match expr_as_usize(key) {
+            Some(position) => position
+                .checked_sub(1)
+                .and_then(|index| select.projection.get(index))
+                .is_some_and(|item| {
+                    matches!(
+                        item,
+                        SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. }
+                    )
+                }),
+            None => select.projection.iter().any(|item| match item {
+                SelectItem::UnnamedExpr(expr) => expr == key,
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    expr == key || matches!(key, Expr::Identifier(ident) if ident == alias)
+                }
+                _ => false,
+            }),
+        })
+}
+
+/// Whether `expr` names one of `aliases`, the select list's own output names. An
+/// alias is not in scope inside the select list that defines it, so a sort key
+/// that names one cannot be appended to that select list.
+fn names_a_select_alias(expr: &Expr, aliases: &[String]) -> bool {
+    struct AliasReference<'a> {
+        aliases: &'a [String],
+    }
+
+    impl Visitor for AliasReference<'_> {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if let Expr::Identifier(ident) = expr
+                && self
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(&ident.value))
+            {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    expr.visit(&mut AliasReference { aliases }).is_break()
+}
+
+/// Whether `expr` applies a `COLLATE` anywhere inside it. Under `COLLATE NOCASE`,
+/// `'a'` and `'A'` are one tie group but two different rendered strings.
+fn applies_collation(expr: &Expr) -> bool {
+    struct Collation;
+
+    impl Visitor for Collation {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if matches!(expr, Expr::Collate { .. }) {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    expr.visit(&mut Collation).is_break()
+}
+
+/// Whether a query nested in `statement` — a subquery, derived table or CTE —
+/// limits its rows with `LIMIT`, `OFFSET`, `FETCH` or `TOP`.
+///
+/// Such a limit can keep unspecified rows, so the full result a reference run
+/// produces for the outer query is only one of the results the query allows. The
+/// checks that read that full result refuse the query rather than judge an answer
+/// against one of them.
+fn has_nested_row_limit(statement: &Statement) -> bool {
+    struct NestedRowLimit {
+        query_depth: usize,
+        found: bool,
+    }
+
+    impl Visitor for NestedRowLimit {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &SqlQuery) -> ControlFlow<Self::Break> {
+            self.query_depth += 1;
+            if self.query_depth > 1 && (query.limit_clause.is_some() || query.fetch.is_some()) {
+                self.found = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &SqlQuery) -> ControlFlow<Self::Break> {
+            self.query_depth -= 1;
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<Self::Break> {
+            if self.query_depth > 1 && select.top.is_some() {
+                self.found = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut nested = NestedRowLimit {
+        query_depth: 0,
+        found: false,
+    };
+    let _ = statement.visit(&mut nested);
+    nested.found
+}
+
 fn expr_as_usize(expr: &Expr) -> Option<usize> {
     match expr {
         Expr::Value(value) => match &value.value {
@@ -862,7 +1307,57 @@ pub fn check_sort_order_parsed(
 
 #[cfg(test)]
 mod tests {
-    use super::top_level_limit_count;
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use super::{
+        SortKeyCells, projected_sort_limit, top_level_limit_count, top_level_offset_count,
+        unordered_limit, unprojected_sort_limit,
+    };
+
+    /// rustdoc immediately above `fn_sig` in this file. A glued pair of comments
+    /// lands on the first function and leaves the second undocumented.
+    fn rustdoc_immediately_above<'a>(source: &'a str, fn_sig: &str) -> &'a str {
+        let fn_pos = source
+            .find(fn_sig)
+            .expect("function signature is in this file");
+        let before = &source[..fn_pos];
+        let start = before.rfind("\n\n").map_or(0, |i| i + 2);
+        let block = before[start..].trim();
+        assert!(
+            !block.is_empty()
+                && block
+                    .lines()
+                    .all(|line| line.starts_with("///") || line.is_empty()),
+            "{fn_sig} is not immediately preceded by rustdoc:\n{block}"
+        );
+        block
+    }
+
+    #[test]
+    fn rustdoc_for_nested_row_limit_and_select_alias_sits_on_the_right_fn() {
+        let source = include_str!("sort_order.rs");
+        let alias_doc = rustdoc_immediately_above(source, "fn names_a_select_alias(");
+        let nested_doc = rustdoc_immediately_above(source, "fn has_nested_row_limit(");
+
+        assert!(
+            nested_doc.contains("limits its rows with `LIMIT`, `OFFSET`, `FETCH` or `TOP`"),
+            "has_nested_row_limit must own the nested-limit rustdoc, got:\n{nested_doc}"
+        );
+        assert!(
+            alias_doc.contains("names one of `aliases`"),
+            "names_a_select_alias must own the alias rustdoc, got:\n{alias_doc}"
+        );
+        assert!(
+            !alias_doc.contains("`FETCH`") && !alias_doc.contains("nested in `statement`"),
+            "names_a_select_alias must not carry the nested-limit rustdoc, got:\n{alias_doc}"
+        );
+        assert!(
+            !nested_doc.contains("names one of `aliases`"),
+            "has_nested_row_limit must not carry the alias rustdoc, got:\n{nested_doc}"
+        );
+    }
 
     #[test]
     fn top_level_limit_count_reads_integer_literals() {
@@ -876,5 +1371,99 @@ mod tests {
             top_level_limit_count("SELECT v FROM t WHERE id IN (SELECT i FROM u LIMIT 5)"),
             None
         );
+    }
+
+    #[test]
+    fn top_level_offset_count_reads_integer_literals() {
+        assert_eq!(
+            top_level_offset_count("SELECT v FROM t LIMIT 10 OFFSET 100"),
+            Some(100)
+        );
+        assert_eq!(top_level_offset_count("SELECT v FROM t OFFSET 3"), Some(3));
+        assert_eq!(top_level_offset_count("SELECT v FROM t LIMIT 10"), None);
+        assert_eq!(top_level_offset_count("SELECT v FROM t"), None);
+        assert_eq!(
+            top_level_offset_count(
+                "SELECT v FROM t WHERE id IN (SELECT i FROM u LIMIT 1 OFFSET 5)"
+            ),
+            None
+        );
+        assert_eq!(
+            top_level_offset_count("SELECT v FROM t LIMIT 10 OFFSET $1"),
+            None
+        );
+    }
+
+    #[test]
+    fn sql_shape_detectors_accept_and_reject_representative_queries() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("c", DataType::Int64, false),
+        ]));
+
+        for sql in [
+            "SELECT a AS k, count(*) FROM t GROUP BY k LIMIT 10",
+            "SELECT a, count(*) FROM t GROUP BY 1 LIMIT 10",
+            "SELECT a, count(*) FROM t GROUP BY a LIMIT 10 OFFSET 5",
+        ] {
+            assert!(
+                unordered_limit(sql).is_some(),
+                "grouped LIMIT that returns its keys: {sql}"
+            );
+        }
+        for sql in [
+            "SELECT DISTINCT a FROM t LIMIT 10",
+            "SELECT TOP 10 a, count(*) FROM t GROUP BY a",
+            "SELECT a, count(*) FROM (SELECT a FROM t LIMIT 5) AS s GROUP BY a LIMIT 10",
+            "SELECT count(*) FROM t GROUP BY a LIMIT 10",
+            "SELECT a FROM t LIMIT 10",
+        ] {
+            assert_eq!(unordered_limit(sql), None, "{sql}");
+        }
+
+        let hidden = "SELECT a, c FROM t ORDER BY hidden LIMIT 2";
+        let shown = "SELECT a, c FROM t ORDER BY c LIMIT 2 OFFSET 7";
+        let hidden_limit = unprojected_sort_limit(hidden, &schema)
+            .expect("a hidden sort key is read back beside the result");
+        assert_eq!(
+            (hidden_limit.limit, hidden_limit.offset, &hidden_limit.key),
+            (2, 0, &SortKeyCells::Appended(1))
+        );
+        let shown_limit = projected_sort_limit(shown, &schema)
+            .expect("a returned sort key keeps OFFSET on the struct");
+        assert_eq!(
+            (shown_limit.limit, shown_limit.offset, &shown_limit.key),
+            (2, 7, &SortKeyCells::Returned(vec![1]))
+        );
+        assert_eq!(
+            shown_limit.keyed_sql(4),
+            "SELECT a, c FROM t ORDER BY c LIMIT 4"
+        );
+        assert_eq!(unprojected_sort_limit(shown, &schema), None);
+        assert_eq!(projected_sort_limit(hidden, &schema), None);
+
+        let positional = projected_sort_limit("SELECT a, c FROM t ORDER BY 1 LIMIT 2", &schema)
+            .expect("ordinal 1 is the first result column");
+        assert_eq!(positional.key, SortKeyCells::Returned(vec![0]));
+        assert_eq!(
+            unprojected_sort_limit("SELECT a, c FROM t ORDER BY 1 LIMIT 2", &schema),
+            None
+        );
+
+        let alias_schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        assert_eq!(
+            unprojected_sort_limit(
+                "SELECT a AS x FROM t ORDER BY x, hidden LIMIT 1",
+                &alias_schema
+            ),
+            None
+        );
+        for sql in [
+            "SELECT a FROM t ORDER BY hidden COLLATE NOCASE LIMIT 1",
+            "SELECT a FROM (SELECT a, hidden FROM t LIMIT 5) AS s ORDER BY hidden LIMIT 1",
+            "SELECT TOP 10 a FROM t ORDER BY hidden LIMIT 10",
+        ] {
+            assert_eq!(unprojected_sort_limit(sql, &schema), None, "{sql}");
+        }
     }
 }

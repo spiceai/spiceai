@@ -712,10 +712,16 @@ pub(crate) async fn process_spiced_metrics(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use clap::Parser;
-    use test_framework::spicepod::component::dataset::Dataset;
+    use test_framework::{
+        gh_utils::map_numbers_to_strings, spicepod::component::dataset::Dataset,
+        utils::scan_directory_for_yamls,
+    };
 
     use super::*;
+    use crate::args::dispatch::DispatchTestFile;
 
     fn validation_args(query_set: &str) -> DatasetTestArgs {
         validation_args_at_scale(query_set, "100")
@@ -934,6 +940,197 @@ mod tests {
         assert_eq!(
             validation_reference_schema(&args, &app, &query_set, &queries, false),
             Some("__test_reference".to_string())
+        );
+    }
+
+    /// Scale factor 1 benchmarks that keep an explicit `validate_results: false`,
+    /// each with its reason in its dispatch file:
+    ///
+    /// - `glue[csv]` and `iceberg[hadoop]`: TPC-H Q6 returns a wrong answer. Both
+    ///   sources type `l_discount` as a double, and Spice types the literal
+    ///   `0.06 + 0.01` as a `Float64` just below 0.07, so Q6's `BETWEEN` drops
+    ///   every row at 0.07.
+    /// - `mssql`, `mssql[catalog]` and `odbc[athena]`: their TPC-H tables hold
+    ///   different text columns than the parquet the TPC-H answer files were
+    ///   computed from, so no answer file is their oracle.
+    /// - TPC-DS `mysql-duckdb[file]` and `mysql-duckdb[memory]`: their reference
+    ///   reads the same data through `MySQL` federation, which evaluates the
+    ///   pushed-down SQL with `MySQL` semantics (`||` as logical OR, `/` as decimal
+    ///   division, no `FULL JOIN`), so it is no oracle for the answers the
+    ///   accelerator returns.
+    ///
+    /// Every other scale factor 1 TPC-H, TPC-DS and `ClickBench` dispatch must
+    /// validate against an oracle.
+    const BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION: &[&str] = &[
+        "tpch/sf1/federated/glue[csv].yaml",
+        "tpch/sf1/federated/iceberg[hadoop].yaml",
+        "tpch/sf1/federated/mssql.yaml",
+        "tpch/sf1/federated/mssql[catalog].yaml",
+        "tpch/sf1/federated/odbc[athena].yaml",
+        "tpcds/sf1/accelerated/mysql-duckdb[file].yaml",
+        "tpcds/sf1/accelerated/mysql-duckdb[memory].yaml",
+    ];
+
+    /// rustc `--test` names this module's tests `commands::tests::<fn>`.
+    /// nextest's `test(=…)` matches that string exactly, so the leaf name
+    /// selects nothing and `make nextest` would stay green after a dispatch
+    /// dropped validation.
+    fn oracle_dispatch_guard_rustc_test_name() -> String {
+        format!(
+            "{}::benchmark_dispatches_validate_results_against_an_oracle",
+            module_path!()
+                .strip_prefix(concat!(env!("CARGO_PKG_NAME"), "::"))
+                .expect("unit-test module_path starts with the crate name")
+        )
+    }
+
+    fn makefile_nextest_filter() -> String {
+        let makefile =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Makefile"))
+                .expect("should read the repository Makefile");
+        makefile
+            .lines()
+            .find(|line| line.starts_with("NEXTEST_FILTER :="))
+            .expect("Makefile should define NEXTEST_FILTER")
+            .to_string()
+    }
+
+    #[test]
+    fn nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name() {
+        let rustc_test_name = oracle_dispatch_guard_rustc_test_name();
+        assert_eq!(
+            rustc_test_name,
+            "commands::tests::benchmark_dispatches_validate_results_against_an_oracle",
+            "this function's rustc --test name is what nextest's test(=…) must match"
+        );
+        let filter = makefile_nextest_filter();
+        let needle = format!("test(={rustc_test_name})");
+        assert!(
+            filter.contains(&needle),
+            "NEXTEST_FILTER must select the oracle dispatch guard with `{needle}`; a leaf-only test(=…) matches no test. filter={filter}"
+        );
+    }
+
+    /// Every scale factor 1 TPC-H, TPC-DS and `ClickBench` benchmark dispatch
+    /// validates its results against an oracle it can actually resolve, except
+    /// those in `BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION`. Benchmarks at
+    /// larger scale factors measure performance and leave `validate_results` unset.
+    ///
+    /// Each `bench` entry is resolved the way `testoperator_run_bench.yml` runs
+    /// it — the inputs `testoperator dispatch` sends, the spicepod under
+    /// `test/spicepods/<query set>/sf<scale factor>/`, `spiced` started by
+    /// testoperator — through the same calls a run makes before its first query.
+    /// `--validate` stops a run that has no oracle, so a dispatch that could not
+    /// be validated fails here instead of in the scheduled run.
+    #[tokio::test]
+    async fn benchmark_dispatches_validate_results_against_an_oracle() {
+        nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name();
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let dispatch_root = repo_root.join("tools/testoperator/dispatch");
+        let mut checked = 0;
+        let mut seen_opt_outs = BTreeSet::new();
+        for query_set_directory in ["tpch", "tpcds", "clickbench"] {
+            let dispatch_directory = dispatch_root.join(query_set_directory);
+            for dispatch_path in scan_directory_for_yamls(&dispatch_directory)
+                .expect("should scan the dispatch directory")
+            {
+                let dispatch_file =
+                    std::fs::File::open(&dispatch_path).expect("should open the dispatch file");
+                let dispatch: DispatchTestFile =
+                    yaml::from_reader(dispatch_file).expect("should parse the dispatch file");
+                let relative = dispatch_path
+                    .strip_prefix(&dispatch_root)
+                    .expect("dispatch file is under the dispatch directory")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION.contains(&relative.as_str()) {
+                    seen_opt_outs.insert(relative);
+                    for bench in &dispatch.tests.bench {
+                        let dispatch_name = dispatch_path.display();
+                        assert_eq!(
+                            bench.validate_results,
+                            Some(false),
+                            "{dispatch_name} is opted out of result validation because TPC-H Q6 is known-wrong; keep `validate_results: false`"
+                        );
+                        checked += 1;
+                    }
+                    continue;
+                }
+                for bench in &dispatch.tests.bench {
+                    let dispatch_name = dispatch_path.display();
+
+                    // The workflow inputs, exactly as `testoperator dispatch` sends them.
+                    let inputs = map_numbers_to_strings(
+                        serde_json::to_value(bench).expect("should serialize the bench inputs"),
+                    );
+                    let query_set = inputs["query_set"]
+                        .as_str()
+                        .expect("query_set should serialize as a string");
+                    let scale_factor = inputs["scale_factor"].as_str().unwrap_or("1");
+                    if scale_factor != "1" {
+                        assert_eq!(
+                            bench.validate_results, None,
+                            "{dispatch_name} benchmarks scale factor {scale_factor}, which measures performance; results are validated at scale factor 1, so leave `validate_results` unset"
+                        );
+                        checked += 1;
+                        continue;
+                    }
+                    assert_eq!(
+                        bench.validate_results,
+                        Some(true),
+                        "{dispatch_name} must set `validate_results: true` on its scale factor 1 bench test"
+                    );
+                    let spicepod_path = repo_root
+                        .join("test/spicepods")
+                        .join(query_set.split('[').next().unwrap_or(query_set))
+                        .join(format!("sf{scale_factor}"))
+                        .join(&bench.spicepod_path);
+                    let spicepod_path = spicepod_path.to_string_lossy();
+
+                    let mut command_line = vec![
+                        "testoperator",
+                        "--spicepod-path",
+                        spicepod_path.as_ref(),
+                        "--query-set",
+                        query_set,
+                        "--scale-factor",
+                        scale_factor,
+                        "--validate",
+                    ];
+                    if let Some(query_overrides) = inputs["query_overrides"].as_str() {
+                        command_line.extend(["--query-overrides", query_overrides]);
+                    }
+                    let args = DatasetTestArgs::try_parse_from(command_line).unwrap_or_else(|e| {
+                        panic!("{dispatch_name} should translate to testoperator arguments: {e}")
+                    });
+
+                    let mut app = load_app(&args.common).await.unwrap_or_else(|e| {
+                        panic!("{dispatch_name} should load its spicepod: {e}")
+                    });
+                    add_automatic_reference_datasets(&args, &mut app)
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!("{dispatch_name} should add its reference datasets: {e}")
+                        });
+                    if let Err(e) = build_test_with_validation(&args, &app, NotStarted::new()).await
+                    {
+                        panic!("{dispatch_name} cannot validate its results: {e}");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(
+            seen_opt_outs,
+            BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION
+                .iter()
+                .map(|path| (*path).to_string())
+                .collect::<BTreeSet<_>>(),
+            "every listed result-validation opt-out must exist as a dispatch file"
+        );
+        assert!(
+            checked > 0,
+            "should find TPC-H, TPC-DS and ClickBench benchmark dispatches"
         );
     }
 }

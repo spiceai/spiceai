@@ -1242,12 +1242,17 @@ pub fn get_tpcds_test_queries(
             32, 92, // https://github.com/spiceai/spiceai/issues/8150
             29, 37, 41, 44, 54, 58 // empty results
         ),
-        Some(QueryOverrides::SQLite) => remove_tpcds_query!(
-            queries, 17, 29, 35, 74, // SQLite does not support `stddev`
-            5, 14, 18, 22, 27, 36, 67, 70, 77, 80,
-            86, // SQLite does not support `ROLLUP` and `GROUPING`
-            8, 14, 38, 87 // EXCEPT and INTERSECT aren't supported
-        ),
+        Some(QueryOverrides::SQLite) => {
+            let queries: Vec<Query> = remove_tpcds_query!(
+                queries, 17, 29, 35, 74, // SQLite does not support `stddev`
+                5, 14, 18, 22, 27, 36, 67, 70, 77, 80,
+                86, // SQLite does not support `ROLLUP` and `GROUPING`
+                8, 14, 38, 87, // EXCEPT and INTERSECT aren't supported
+                49, 75,
+                90 // overridden below: SQLite keeps `CAST(… AS DECIMAL)` an integer
+            );
+            add_tpcds_query_overrides!(queries, "sqlite", 49, 75, 90)
+        }
         Some(QueryOverrides::Spark) => remove_tpcds_query!(
             queries, 8, // https://github.com/spiceai/spiceai/issues/5250
             36, 44, 47, 49, 57, 67, 70, 86, // https://github.com/spiceai/spiceai/issues/5249
