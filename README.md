@@ -103,7 +103,7 @@ Connect to any Iceberg catalog (REST, AWS Glue, Hadoop), query tables with full 
 
 ### Petabyte-scale hybrid search
 
-Native **Amazon S3 Vectors** (Day 1 launch partner) for billions of vectors at up to 90% lower cost than traditional vector DBs. Plus DuckDB HNSW and Elasticsearch kNN as `.vectors.engine` backends. Spice manages the full lifecycle — ingestion → embedding (AWS Bedrock, HuggingFace, OpenAI, Model2Vec for 500x faster static embeddings, multi-vector ColBERT-style late interaction with MaxSim) → indexing → query. SQL-integrated via `vector_search`, `text_search`, `rrf` (reciprocal rank fusion), and `rerank` UDTFs.
+Native **Amazon S3 Vectors** (Day 1 launch partner) for billions of vectors at up to 90% lower cost than traditional vector DBs. Plus DuckDB HNSW, Elasticsearch kNN, and Qdrant HNSW as `.vectors.engine` backends. Spice manages the full lifecycle — ingestion → embedding (AWS Bedrock, HuggingFace, OpenAI, Model2Vec for 500x faster static embeddings, multi-vector ColBERT-style late interaction with MaxSim) → indexing → query. SQL-integrated via `vector_search`, `text_search`, `rrf` (reciprocal rank fusion), and `rerank` UDTFs.
 
 ```sql
 SELECT * FROM rerank(
@@ -308,6 +308,7 @@ Configured as `.vectors.engine` on a column-level embedding.
 | `s3_vectors`    | Amazon S3 Vectors for petabyte-scale vector storage and querying     | Alpha  |
 | `duckdb`        | DuckDB with HNSW vector index                                        | Alpha  |
 | `elasticsearch` | Elasticsearch with kNN                                               | Alpha  |
+| `qdrant`        | Qdrant with HNSW vector index                                        | Alpha  |
 
 ## Change Forwarding to Drasi (Alpha)
 

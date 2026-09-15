@@ -6444,6 +6444,7 @@ dependencies = [
  "pgwire-replication",
  "postgres-native-tls",
  "postgres-protocol",
+ "qdrant",
  "rand 0.10.1",
  "rdkafka",
  "regex",
@@ -16024,6 +16025,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "qdrant"
+version = "2.4.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "async-trait",
+ "qdrant-client",
+ "snafu",
+ "tokio",
+ "tracing",
+ "uuid 1.23.2",
+]
+
+[[package]]
+name = "qdrant-client"
+version = "1.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dddc19df129bad7346ebd027288621ab1ac7e52678371f906b9a8622d7aaf87e"
+dependencies = [
+ "anyhow",
+ "derive_builder",
+ "futures",
+ "parking_lot",
+ "prost 0.14.3",
+ "prost-types",
+ "semver",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
 name = "qoi"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17531,6 +17565,7 @@ dependencies = [
  "postcard",
  "prometheus",
  "prost 0.14.3",
+ "qdrant",
  "rand 0.10.1",
  "rayon",
  "rcgen",
@@ -18237,6 +18272,7 @@ dependencies = [
  "linkme",
  "llms",
  "moka",
+ "qdrant",
  "rayon",
  "runtime-acceleration",
  "runtime-datafusion-index",
@@ -19129,6 +19165,7 @@ dependencies = [
  "itertools 0.14.0",
  "llms",
  "parking_lot",
+ "qdrant",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
  "runtime-query-engine",
