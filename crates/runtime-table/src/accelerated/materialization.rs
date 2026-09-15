@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn sample_after_begin_is_never_configured_on_the_new_epoch() {
         let identity = MaterializationIdentity::new();
-        identity.begin_refresh();
+        let _ = identity.begin_refresh();
         identity.set_configured(true);
         let sampled = identity.sample();
         assert!(sampled.configured);
@@ -211,14 +211,14 @@ mod tests {
     #[test]
     fn concurrent_begin_and_sample_never_tears_the_pair() {
         let identity = MaterializationIdentity::new();
-        identity.begin_refresh();
+        let _ = identity.begin_refresh();
         identity.set_configured(true);
 
         let writer = {
             let identity = identity.clone();
             thread::spawn(move || {
                 for _ in 0..8_000 {
-                    identity.begin_refresh();
+                    let _ = identity.begin_refresh();
                     identity.set_configured(true);
                 }
             })

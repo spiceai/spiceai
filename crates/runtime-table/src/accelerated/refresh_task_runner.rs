@@ -484,7 +484,9 @@ impl RefreshTaskRunner {
             let _guard = accelerator_write_mutex.lock().await;
             let r = defaults.read().await.clone();
             let inherited = r.materialization_is_configured();
-            r.begin_materialization();
+            // Retract `configured` and bump the shared epoch; snapshot bind and
+            // view attestation sample that cell later — this site has no consumer.
+            let _ = r.begin_materialization();
             (r, inherited)
         };
         let live_matches_configured = r.live_refresh_sql_matches_configured();
