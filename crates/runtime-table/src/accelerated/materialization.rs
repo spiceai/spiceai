@@ -79,6 +79,7 @@ impl MaterializationIdentity {
     ///
     /// Called when a refresh is dequeued, while holding the accelerator write
     /// mutex. Returns the epoch the new run will attest under.
+    #[must_use]
     pub fn begin_refresh(&self) -> u64 {
         loop {
             let current = self.stamp.load(Ordering::Acquire);

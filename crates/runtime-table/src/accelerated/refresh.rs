@@ -351,6 +351,7 @@ impl Refresh {
     /// mutex. The epoch is what stops a snapshot that already sampled the
     /// previous generation from adopting this run's plan-shape attestation if a
     /// later scan records a new shape after the mutex is released.
+    #[must_use]
     pub fn begin_materialization(&self) -> u64 {
         self.materialization.begin_refresh()
     }
