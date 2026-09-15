@@ -934,9 +934,9 @@ pub struct DataFusion {
     // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
     query_admission_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
-    /// Whether a query's output preview is recorded anywhere: the `captured_output`
-    /// column of `runtime.task_history` is not `none`, or the task spans are exported to
-    /// Zipkin. When nothing records it, queries do not build it.
+    /// Whether a query's output preview is recorded: task history is enabled and the
+    /// `captured_output` column of `runtime.task_history` is not `none`. When nothing
+    /// records it, queries do not build it.
     pub(crate) task_history_captured_output: bool,
     // Dedicated runtime for CPU-bound DataFusion queries
     cpu_runtime: OnceLock<ManagedTokioRuntime>,

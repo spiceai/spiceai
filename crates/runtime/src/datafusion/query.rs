@@ -1932,8 +1932,8 @@ fn attach_query_tracker_to_stream(
     let mut num_records = 0u64;
     let mut num_output_bytes = 0u64;
 
-    // The output preview is read only by the task-history row's `captured_output` and a
-    // Zipkin export of the task span, so it is built only when one of them records it.
+    // The output preview is recorded only in the task-history row's `captured_output`, so
+    // it is built only when task history is enabled and that column records it.
     let capture_task_history = tracker.task_history_enabled && tracker.captured_output_enabled;
     let mut captured_output = Cow::Borrowed("[]"); // default to empty preview
 
