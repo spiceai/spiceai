@@ -1286,8 +1286,10 @@ impl Default for RateLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, DictionaryArray, Int64Array, StringArray, StringViewArray};
-    use arrow::datatypes::{Field, Int32Type, SchemaRef};
+    use arrow::array::{
+        ArrayRef, DictionaryArray, Int64Array, StringArray, StringViewArray, StructArray,
+    };
+    use arrow::datatypes::{Field, Fields, Int32Type, SchemaRef};
     use datafusion::execution::SendableRecordBatchStream;
     use datafusion::execution::memory_pool::UnboundedMemoryPool;
     use datafusion::physical_plan::RecordBatchStream;
@@ -1484,22 +1486,33 @@ mod tests {
             DataType::Utf8View,
             true,
         )]));
-        let ints: SchemaRef =
-            Arc::new(Schema::new(vec![Field::new("name", DataType::Int64, true)]));
+        // A struct cannot be cast to LargeUtf8. Int64 can (Arrow stringifies
+        // it), so that mismatch would encode successfully and never hit the
+        // error arm this test is guarding.
+        let nested_fields = Fields::from(vec![Field::new("x", DataType::Int64, true)]);
+        let nested: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::Struct(nested_fields.clone()),
+            true,
+        )]));
         let view_batch = || {
             batch(
                 &views,
                 vec![Arc::new(StringViewArray::from(vec![Some("ok")])) as ArrayRef],
             )
         };
-        let int_batch = batch(
-            &ints,
-            vec![Arc::new(Int64Array::from(vec![Some(1)])) as ArrayRef],
+        let nested_batch = batch(
+            &nested,
+            vec![Arc::new(StructArray::new(
+                nested_fields,
+                vec![Arc::new(Int64Array::from(vec![Some(1)])) as ArrayRef],
+                None,
+            )) as ArrayRef],
         );
-        // Stream schema is Utf8View so the encoder casts to LargeUtf8. The Int64
-        // batch cannot be cast, so `encode_flight_batch` returns INTERNAL. A
-        // following Utf8View batch is what a later poll would leak.
-        let items = || vec![Ok(view_batch()), Ok(int_batch.clone()), Ok(view_batch())];
+        // Stream schema is Utf8View so the encoder casts to LargeUtf8. The
+        // struct batch cannot be cast, so `encode_flight_batch` returns
+        // INTERNAL. A following Utf8View batch is what a later poll would leak.
+        let items = || vec![Ok(view_batch()), Ok(nested_batch.clone()), Ok(view_batch())];
         let inline = events_including_poll_after_error(respond(&views, items(), true)).await;
         let spawned = events_including_poll_after_error(respond(&views, items(), false)).await;
 
