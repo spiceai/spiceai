@@ -1568,6 +1568,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             Capability::ApplySpicepod
             | Capability::AttachApp
             | Capability::GetStatus
+            | Capability::GetDatasets
             | Capability::ExecuteQuery => true,
             // Only when the log-capture layer was installed at startup;
             // otherwise there is no buffer to read from.
@@ -1584,6 +1585,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             Capability::ApplySpicepod
             | Capability::AttachApp
             | Capability::GetStatus
+            | Capability::GetDatasets
             | Capability::ExecuteQuery => format!(
                 "{} is not supported by this instance",
                 capability.wire_name()
@@ -1636,6 +1638,16 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             "models": models,
             "catalogs": catalogs,
             "views": views,
+        })
+    }
+
+    /// The `/v1/datasets?status=true` document for the app this instance
+    /// serves: the same rows the local HTTP endpoint answers, so `spice cloud
+    /// datasets` shows a self-hosted instance the way it shows a managed one.
+    async fn datasets_json(&self) -> Result<serde_json::Value, CommandError> {
+        let infos = runtime::dataset_infos_with_status(&self.runtime).await;
+        serde_json::to_value(infos).map_err(|source| {
+            CommandError::internal(format!("Failed to encode the dataset list: {source}"))
         })
     }
 

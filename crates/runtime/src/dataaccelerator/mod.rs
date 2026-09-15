@@ -1010,8 +1010,8 @@ mod accelerator_compat_tests {
                         ..Acceleration::default()
                     });
                     // These compat tests exercise DML (insert / overwrite / delete), so
-                    // the dataset is read-write. Marking it so also drives Cayenne's
-                    // access-derived scan freshness to 0 (read-your-writes), which these
+                    // the dataset is read-write. Writable Cayenne tables invalidate
+                    // the scan-view cache on write (`UntilInvalidated`), which these
                     // tests assert (e.g. test_overwrite_operations reads its own writes).
                     dataset.access = crate::component::access::AccessMode::ReadWrite;
 

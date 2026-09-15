@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q45"
+---
++--------+--------------+-------------------------------+
+| ca_zip | ca_city      | sum(web_sales.ws_sales_price) |
++--------+--------------+-------------------------------+
+| 00669  | Edgewood     | 99.43                         |
+| 04111  | Glenwood     | 52.26                         |
+| 08971  | Oak Ridge    | 162.40                        |
+| 09548  | Siloam       | 86.63                         |
+| 09727  | Mount Vernon | 32.40                         |
+| 11749  | Newtown      | 3.69                          |
+| 13683  | Plainview    | 23.28                         |
+| 16098  | Five Points  | 38.07                         |
+| 16971  | Wilson       | 25.96                         |
+| 18059  | Mount Olive  | 85.71                         |
++--------+--------------+-------------------------------+

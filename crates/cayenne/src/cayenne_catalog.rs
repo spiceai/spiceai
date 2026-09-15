@@ -35,6 +35,7 @@ use datafusion_table_providers::util::on_conflict::OnConflict;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use turso_shared::{
     DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, is_retryable_write_conflict_message, retry_backoff_delay,
 };
@@ -104,13 +105,45 @@ fn ensure_reinsert_keys_have_key_based_delete_file(
 
 /// Metastore backend enum to support different implementations.
 #[derive(Debug)]
-pub(crate) enum MetastoreImpl {
+enum MetastoreBackendImpl {
     Sqlite(SqliteMetastore),
     #[cfg(feature = "turso")]
     Turso(TursoMetastore),
 }
 
+/// Pluggable metastore plus a process-local op counter. Query / execute / begin
+/// increment the counter; shutdown / WAL checkpoint / vacuum do not (those are
+/// maintenance, not scan-path catalog I/O).
+#[derive(Debug)]
+struct MetastoreImpl {
+    backend: MetastoreBackendImpl,
+    query_count: AtomicU64,
+}
+
 impl MetastoreImpl {
+    fn sqlite(metastore: SqliteMetastore) -> Self {
+        Self {
+            backend: MetastoreBackendImpl::Sqlite(metastore),
+            query_count: AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(feature = "turso")]
+    fn turso(metastore: TursoMetastore) -> Self {
+        Self {
+            backend: MetastoreBackendImpl::Turso(metastore),
+            query_count: AtomicU64::new(0),
+        }
+    }
+
+    fn note_query(&self) {
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn query_count(&self) -> u64 {
+        self.query_count.load(Ordering::Relaxed)
+    }
+
     /// Helper to query a single row from metastore, working with both `SQLite` and Turso
     pub(crate) async fn query_row_helper<F, T>(
         &self,
@@ -121,28 +154,31 @@ impl MetastoreImpl {
         F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.query_row(params, f).await,
+        self.note_query();
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.query_row(params, f).await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.query_row(params, f).await,
+            MetastoreBackendImpl::Turso(m) => m.query_row(params, f).await,
         }
     }
 
     /// Helper to execute a statement on metastore, working with both `SQLite` and Turso
     pub(crate) async fn execute_helper(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.execute(params).await,
+        self.note_query();
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.execute(params).await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.execute(params).await,
+            MetastoreBackendImpl::Turso(m) => m.execute(params).await,
         }
     }
 
     /// Helper to execute a transactional batch on metastore, working with both `SQLite` and Turso
     pub(crate) async fn execute_transaction_batch_helper(&self, sql: &str) -> CatalogResult<()> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.execute_transaction_batch(sql).await,
+        self.note_query();
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.execute_transaction_batch(sql).await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.execute_transaction_batch(sql).await,
+            MetastoreBackendImpl::Turso(m) => m.execute_transaction_batch(sql).await,
         }
     }
 
@@ -156,36 +192,37 @@ impl MetastoreImpl {
         F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.query(params, f).await,
+        self.note_query();
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.query(params, f).await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.query(params, f).await,
+            MetastoreBackendImpl::Turso(m) => m.query(params, f).await,
         }
     }
 
     /// Shutdown the metastore, performing any necessary cleanup.
     pub(crate) async fn shutdown(&self) -> CatalogResult<()> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.shutdown().await,
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.shutdown().await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.shutdown().await,
+            MetastoreBackendImpl::Turso(m) => m.shutdown().await,
         }
     }
 
     /// Run a non-blocking WAL checkpoint off the hot path (cycle-5 TASK 2b).
     pub(crate) async fn checkpoint_wal(&self) -> CatalogResult<()> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.checkpoint_wal().await,
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.checkpoint_wal().await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.checkpoint_wal().await,
+            MetastoreBackendImpl::Turso(m) => m.checkpoint_wal().await,
         }
     }
 
     pub(crate) async fn incremental_vacuum(&self) -> CatalogResult<u64> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.incremental_vacuum().await,
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.incremental_vacuum().await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.incremental_vacuum().await,
+            MetastoreBackendImpl::Turso(m) => m.incremental_vacuum().await,
         }
     }
 
@@ -197,10 +234,11 @@ impl MetastoreImpl {
     pub(crate) async fn begin_transaction(
         &self,
     ) -> CatalogResult<Box<dyn super::metastore::MetastoreTransaction>> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.begin_transaction().await,
+        self.note_query();
+        match &self.backend {
+            MetastoreBackendImpl::Sqlite(m) => m.begin_transaction().await,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.begin_transaction().await,
+            MetastoreBackendImpl::Turso(m) => m.begin_transaction().await,
         }
     }
 }
@@ -245,20 +283,29 @@ impl CayenneCatalog {
         let metastore = if connection_string.starts_with("libsql://") {
             #[cfg(feature = "turso")]
             {
-                MetastoreImpl::Turso(TursoMetastore::new(&connection_string))
+                MetastoreImpl::turso(TursoMetastore::new(&connection_string))
             }
             #[cfg(not(feature = "turso"))]
             {
                 return Err(CatalogError::TursoNotEnabled);
             }
         } else {
-            MetastoreImpl::Sqlite(SqliteMetastore::new(&connection_string))
+            MetastoreImpl::sqlite(SqliteMetastore::new(&connection_string))
         };
 
         Ok(Self {
             connection_string,
             metastore,
         })
+    }
+
+    /// Number of metastore query / execute / begin operations this catalog has
+    /// issued. Tests and benches use this to prove a scan-view cache hit does
+    /// not round-trip the metastore. WAL checkpoint, vacuum, and shutdown are
+    /// not counted (maintenance, not scan-path I/O).
+    #[must_use]
+    pub fn metastore_query_count(&self) -> u64 {
+        self.metastore.query_count()
     }
 
     /// Get the database file path from the connection string.
@@ -2142,10 +2189,10 @@ impl MetadataCatalog for CayenneCatalog {
         }
 
         // Initialize schema using the appropriate metastore backend
-        match &self.metastore {
-            MetastoreImpl::Sqlite(metastore) => metastore.init_schema().await?,
+        match &self.metastore.backend {
+            MetastoreBackendImpl::Sqlite(metastore) => metastore.init_schema().await?,
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(metastore) => metastore.init_schema().await?,
+            MetastoreBackendImpl::Turso(metastore) => metastore.init_schema().await?,
         }
 
         Ok(())
@@ -5080,12 +5127,12 @@ impl MetadataCatalog for CayenneCatalog {
         dataset_name: &str,
         data_dir_anchor: &std::path::Path,
     ) -> CatalogResult<crate::metastore::snapshot::DatasetMetastoreSlice> {
-        match &self.metastore {
-            MetastoreImpl::Sqlite(m) => {
+        match &self.metastore.backend {
+            MetastoreBackendImpl::Sqlite(m) => {
                 crate::metastore::snapshot::export_dataset(m, dataset_name, data_dir_anchor).await
             }
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => {
+            MetastoreBackendImpl::Turso(m) => {
                 crate::metastore::snapshot::export_dataset(m, dataset_name, data_dir_anchor).await
             }
         }
@@ -5096,12 +5143,12 @@ impl MetadataCatalog for CayenneCatalog {
         slice: &crate::metastore::snapshot::DatasetMetastoreSlice,
         data_dir_anchor: &std::path::Path,
     ) -> CatalogResult<()> {
-        match &self.metastore {
-            MetastoreImpl::Sqlite(m) => {
+        match &self.metastore.backend {
+            MetastoreBackendImpl::Sqlite(m) => {
                 crate::metastore::snapshot::import_dataset(m, slice, data_dir_anchor).await
             }
             #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => {
+            MetastoreBackendImpl::Turso(m) => {
                 crate::metastore::snapshot::import_dataset(m, slice, data_dir_anchor).await
             }
         }

@@ -56,8 +56,15 @@ models:
   - name: hf_local_model
     from: huggingface:huggingface.co/Qwen/Qwen2.5-3B-Instruct
     params:
+      # Bound Metal generation so a long lecture cannot consume the chat expect
+      # budget (https://github.com/spiceai/spiceai/actions/runs/34707044620/job/103597842965).
+      # `hf_*` is the Hugging Face form of the chat-completion overrides; the
+      # runtime applies them as `max_completion_tokens` / `temperature`.
+      hf_max_completion_tokens: 64
+      hf_temperature: 0
       system_prompt: |
         Instructions for Responses:
+          - Answer in one short sentence.
           - Do not include any private metadata provided to the model as context such as \"reference_url_template\" or \"instructions\" in your responses.
 
 embeddings:

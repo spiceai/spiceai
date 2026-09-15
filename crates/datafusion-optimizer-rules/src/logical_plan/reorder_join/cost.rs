@@ -24,11 +24,47 @@ limitations under the License.
     clippy::cast_possible_wrap
 )]
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+
 use datafusion::datasource::DefaultTableSource;
 use datafusion_common::{Column, Result, ScalarValue, plan_err, stats::Precision};
 use datafusion_expr::{Expr, JoinType, LogicalPlan, Operator};
 
 use super::join_graph::Edge;
+
+thread_local! {
+    static CARD_MEMO: RefCell<HashMap<(usize, usize), f64>> = RefCell::new(HashMap::new());
+    static CARD_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct CardMemoScope;
+
+impl CardMemoScope {
+    fn enter() -> Self {
+        CARD_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for CardMemoScope {
+    fn drop(&mut self) {
+        CARD_DEPTH.with(|depth| {
+            let next = depth.get().saturating_sub(1);
+            depth.set(next);
+            if next == 0 {
+                CARD_MEMO.with(|memo| memo.borrow_mut().clear());
+            }
+        });
+    }
+}
+
+fn card_memo_key(plan: &LogicalPlan, column: Option<&Column>) -> (usize, usize) {
+    (
+        std::ptr::from_ref(plan).addr(),
+        column.map_or(0, |col| std::ptr::from_ref(col).addr()),
+    )
+}
 
 /// Fraction of preserved-side rows estimated to survive a semi/anti join
 /// when column NDV statistics are unavailable. Mirrors `DuckDB`'s
@@ -383,7 +419,24 @@ fn ndv_for<E: JoinCostEstimator + ?Sized>(
     }
 }
 
+/// Inner-join estimation walks each child twice (row count, then NDV /
+/// row-bound), so an unflattened `n`-way tree is `O(2^n)` without a memo.
+/// Keys are pointer identity, valid for one top-level call while the borrowed
+/// plan tree is stable.
 pub(super) fn estimate_cardinality(plan: &LogicalPlan, column: Option<&Column>) -> Result<f64> {
+    let _scope = CardMemoScope::enter();
+    let key = card_memo_key(plan, column);
+    if let Some(cached) = CARD_MEMO.with(|memo| memo.borrow().get(&key).copied()) {
+        return Ok(cached);
+    }
+    let computed = estimate_cardinality_uncached(plan, column)?;
+    CARD_MEMO.with(|memo| {
+        memo.borrow_mut().insert(key, computed);
+    });
+    Ok(computed)
+}
+
+fn estimate_cardinality_uncached(plan: &LogicalPlan, column: Option<&Column>) -> Result<f64> {
     match plan {
         LogicalPlan::Filter(filter) => match column {
             None => {
