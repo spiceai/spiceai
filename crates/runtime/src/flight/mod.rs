@@ -46,7 +46,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::sqlparser::parser::ParserError;
 use flight_client::Error as FlightClientError;
 use futures::stream::{self, BoxStream, StreamExt};
-use futures::{FutureExt, Stream, TryStreamExt};
+use futures::{Stream, TryStreamExt};
 use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
 use middleware::{RequestContextLayer, WriteRateLimitLayer};
@@ -54,6 +54,7 @@ use runtime_auth::{AuthRequestContext, FlightBasicAuth, layer::flight::BasicAuth
 use runtime_request_context::{AsyncMarker, RequestContext};
 use runtime_tls::TlsConfig;
 use snafu::prelude::*;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::num::NonZeroU32;
 use std::pin::Pin;
@@ -348,7 +349,7 @@ impl Service {
 
         // Pre-compute schema flight data once
         let mut dict_tracker = DictionaryTracker::new(true); // Set to true to handle dictionaries
-        let mut compression_context = CompressionContext::default();
+        let compression_context = CompressionContext::default();
         let encoder = IpcDataGenerator::default();
         let data = IpcMessage(
             encoder
@@ -365,142 +366,28 @@ impl Service {
             ..Default::default()
         };
 
-        let mut data_stream = query_result.data;
         let cache_status = query_result.cache_status;
 
-        // Take the batches that are already there, up to a small byte and
-        // batch-count budget. A result that ends within it — any small cached
-        // result — is encoded here, on the request's own task, instead of by an
-        // encode task: its few messages need no second task to wait on, no
-        // channel, and no egress reservation. The batch cap exists because empty
-        // batches do not grow the byte budget.
-        let mut taken = Vec::new();
-        let mut taken_bytes = 0;
-        let ended = loop {
-            if inline_encode_budget_exhausted(taken_bytes, taken.len()) {
-                break false;
-            }
-            match data_stream.next().now_or_never() {
-                Some(Some(Ok(batch))) => {
-                    taken_bytes += batch.get_array_memory_size();
-                    taken.push(Ok(batch));
-                }
-                // A failure ends the result, as it ends the encode task below.
-                Some(Some(Err(e))) => {
-                    taken.push(Err(e));
-                    break true;
-                }
-                Some(None) => break true,
-                None => break false,
-            }
-        };
-        if ended {
-            let mut messages = Vec::with_capacity(taken.len() + 1);
-            messages.push(Ok(schema_flight_data));
-            for item in taken {
-                let encoded = item
-                    .map_err(|e| handle_datafusion_error(find_datafusion_root(e)))
-                    .and_then(|batch| {
-                        encode_flight_batch(
-                            batch,
-                            needs_view_cast,
-                            &schema,
-                            &encoder,
-                            &mut dict_tracker,
-                            &options,
-                            &mut compression_context,
-                        )
-                    });
-                match encoded {
-                    Ok((dicts, batch_data)) => {
-                        messages.extend(dicts.into_iter().map(Ok));
-                        messages.push(Ok(batch_data));
-                    }
-                    Err(status) => {
-                        messages.push(Err(status));
-                        break;
-                    }
-                }
-            }
-            return (stream::iter(messages).boxed(), cache_status);
-        }
-        let data_stream = stream::iter(taken).chain(data_stream);
-
-        // Charge the encoded FlightData buffered for send against the query
-        // memory pool so egress memory is visible to `runtime.query.memory_limit`
-        // and applies back-pressure under real pressure.
-        let account = EgressAccount::register(memory_pool, "flight_egress");
-
-        // Encode on the dedicated CPU runtime when one is configured, otherwise on
-        // the current (IO) runtime — the fallback when
-        // `runtime.params.dedicated_thread_pool=disabled`. Either way encoding runs
-        // as a task feeding a small bounded channel: it never blocks the tonic
-        // response writer inline, the channel back-pressures so egress memory stays
-        // bounded (and a slow client stalls execution), and the encode of batch N
-        // overlaps the socket write of batch N-1, reducing transfer time. With a
-        // dedicated CPU runtime that overlap is free; on the shared IO-runtime
-        // fallback the spawn costs one scheduling hop before the first byte.
-        let encode_runtime = cpu_runtime.unwrap_or_else(Handle::current);
-        let (tx, rx) = mpsc::channel::<Result<FlightData, Status>>(FLIGHT_ENCODE_CHANNEL_CAPACITY);
-        let span = Span::current();
-
-        let encode_task = {
-            let account = Arc::clone(&account);
-            async move {
-                // Reserve when a message enters the channel; the consumer
-                // (`FlightEncodeStream`) releases it once handed to tonic.
-                account.reserve(flight_data_size(&schema_flight_data)).await;
-                if tx.send(Ok(schema_flight_data)).await.is_err() {
-                    return;
-                }
-
-                let mut data_stream = data_stream.fuse();
-
-                while let Some(batch_result) = data_stream.next().await {
-                    match batch_result {
-                        Ok(batch) => match encode_flight_batch(
-                            batch,
-                            needs_view_cast,
-                            &schema,
-                            &encoder,
-                            &mut dict_tracker,
-                            &options,
-                            &mut compression_context,
-                        ) {
-                            Ok((dicts, batch_data)) => {
-                                for dict in dicts {
-                                    account.reserve(flight_data_size(&dict)).await;
-                                    if tx.send(Ok(dict)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                                account.reserve(flight_data_size(&batch_data)).await;
-                                if tx.send(Ok(batch_data)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            Err(status) => {
-                                let _ = tx.send(Err(status)).await;
-                                return;
-                            }
-                        },
-                        Err(e) => {
-                            let e = find_datafusion_root(e);
-                            let _ = tx.send(Err(handle_datafusion_error(e))).await;
-                            return;
-                        }
-                    }
-                }
-            }
-        };
-
-        let encode_handle =
-            encode_runtime.spawn(request_context.scope(encode_task).instrument(span));
-
-        let stream = FlightEncodeStream {
-            receiver: ReceiverStream::new(rx),
-            encode_handle: Some(encode_handle),
-            account,
+        // The schema is ready immediately. Batches are encoded as the Flight
+        // response is polled so a ready result is never drained through `None`
+        // at construction — that poll is what finishes query telemetry.
+        let stream = InlineFlightStream {
+            pending: VecDeque::from([Ok(schema_flight_data)]),
+            data_stream: Some(query_result.data),
+            spawned: None,
+            taken_bytes: 0,
+            taken_batches: 0,
+            encode: Some(FlightEncodeArgs {
+                needs_view_cast,
+                schema,
+                encoder,
+                dict_tracker,
+                options,
+                compression_context,
+                memory_pool: Arc::clone(memory_pool),
+                cpu_runtime,
+                request_context,
+            }),
         };
 
         (stream.boxed(), cache_status)
@@ -527,24 +414,240 @@ impl Service {
 /// write of batch N-1.
 const FLIGHT_ENCODE_CHANNEL_CAPACITY: usize = 2;
 
-/// How much Arrow data a Flight response whose batches are all already there is
-/// encoded on the request's own task, instead of by an encode task. Small enough
-/// to encode — even with `zstd` IPC compression — well within the time a task may
-/// run without yielding.
+/// How much Arrow data a Flight response encodes on the request's own task as
+/// the client polls, instead of by an encode task. Small enough to encode —
+/// even with `zstd` IPC compression — well within the time a task may run
+/// without yielding.
 const FLIGHT_INLINE_ENCODE_MAX_BYTES: usize = 16 * 1024;
 
 /// Empty batches (especially with an empty schema) do not grow
 /// [`FLIGHT_INLINE_ENCODE_MAX_BYTES`]. This batch-count cap is what stops an
-/// unbounded ready stream from being encoded on the request runtime.
+/// unbounded ready stream from being encoded on the request runtime as it is
+/// polled.
 const FLIGHT_INLINE_ENCODE_MAX_BATCHES: usize = 16;
 
-/// Whether the ready-batch take loop should stop and fall back to the encode
+/// Whether inline Flight encoding should stop and fall back to the encode
 /// task. Checked before each take so a stream that ends inside the budget is
-/// still encoded inline.
+/// still encoded inline as the response is consumed.
 #[must_use]
 fn inline_encode_budget_exhausted(taken_bytes: usize, taken_batches: usize) -> bool {
     taken_bytes > FLIGHT_INLINE_ENCODE_MAX_BYTES
         || taken_batches >= FLIGHT_INLINE_ENCODE_MAX_BATCHES
+}
+
+/// Encoder state and runtimes needed to continue a Flight response on the
+/// encode task after the inline budget is exhausted.
+struct FlightEncodeArgs {
+    needs_view_cast: bool,
+    schema: Arc<Schema>,
+    encoder: IpcDataGenerator,
+    dict_tracker: DictionaryTracker,
+    options: IpcWriteOptions,
+    compression_context: CompressionContext,
+    memory_pool: Arc<dyn MemoryPool>,
+    cpu_runtime: Option<Handle>,
+    request_context: Arc<RequestContext>,
+}
+
+/// Flight response that encodes ready batches on the request task as the
+/// client polls, then hands any remainder to [`FlightEncodeStream`].
+///
+/// The record-batch stream is never polled through `None` until this stream
+/// itself is polled: that is what keeps `finish_returned_output` on the
+/// consume path.
+struct InlineFlightStream {
+    pending: VecDeque<Result<FlightData, Status>>,
+    data_stream: Option<datafusion::execution::SendableRecordBatchStream>,
+    spawned: Option<FlightEncodeStream>,
+    taken_bytes: usize,
+    taken_batches: usize,
+    encode: Option<FlightEncodeArgs>,
+}
+
+impl InlineFlightStream {
+    fn spawn_remaining(&mut self, prepend: Option<RecordBatch>) -> Result<(), Status> {
+        let Some(data_stream) = self.data_stream.take() else {
+            return Err(Status::internal(
+                "Flight encode has no remaining record-batch stream to spawn",
+            ));
+        };
+        let Some(args) = self.encode.take() else {
+            return Err(Status::internal(
+                "Flight encode has no encoder state to spawn",
+            ));
+        };
+        let remaining = match prepend {
+            Some(batch) => stream::once(std::future::ready(Ok(batch)))
+                .chain(data_stream)
+                .boxed(),
+            None => data_stream.boxed(),
+        };
+        self.spawned = Some(spawn_flight_encode_stream(remaining, args));
+        Ok(())
+    }
+}
+
+impl Stream for InlineFlightStream {
+    type Item = Result<FlightData, Status>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(spawned) = this.spawned.as_mut() {
+                return Pin::new(spawned).poll_next(cx);
+            }
+            if let Some(message) = this.pending.pop_front() {
+                return Poll::Ready(Some(message));
+            }
+            if inline_encode_budget_exhausted(this.taken_bytes, this.taken_batches) {
+                if let Err(status) = this.spawn_remaining(None) {
+                    return Poll::Ready(Some(Err(status)));
+                }
+                continue;
+            }
+            let Some(data_stream) = this.data_stream.as_mut() else {
+                return Poll::Ready(None);
+            };
+            match Pin::new(data_stream).poll_next(cx) {
+                Poll::Ready(Some(Ok(batch))) => {
+                    this.taken_bytes += batch.get_array_memory_size();
+                    this.taken_batches += 1;
+                    if inline_encode_budget_exhausted(this.taken_bytes, this.taken_batches) {
+                        if let Err(status) = this.spawn_remaining(Some(batch)) {
+                            return Poll::Ready(Some(Err(status)));
+                        }
+                        continue;
+                    }
+                    let Some(args) = this.encode.as_mut() else {
+                        return Poll::Ready(Some(Err(Status::internal(
+                            "Flight encode has no encoder state for an inline batch",
+                        ))));
+                    };
+                    match encode_flight_batch(
+                        batch,
+                        args.needs_view_cast,
+                        &args.schema,
+                        &args.encoder,
+                        &mut args.dict_tracker,
+                        &args.options,
+                        &mut args.compression_context,
+                    ) {
+                        Ok((dicts, batch_data)) => {
+                            this.pending.extend(dicts.into_iter().map(Ok));
+                            this.pending.push_back(Ok(batch_data));
+                        }
+                        Err(status) => return Poll::Ready(Some(Err(status))),
+                    }
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    this.data_stream = None;
+                    return Poll::Ready(Some(Err(handle_datafusion_error(find_datafusion_root(
+                        e,
+                    )))));
+                }
+                Poll::Ready(None) => {
+                    this.data_stream = None;
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if let Some(spawned) = &self.spawned {
+            return spawned.size_hint();
+        }
+        (self.pending.len(), None)
+    }
+}
+
+/// Encode on the dedicated CPU runtime when one is configured, otherwise on
+/// the current (IO) runtime — the fallback when
+/// `runtime.params.dedicated_thread_pool=disabled`. Either way encoding runs
+/// as a task feeding a small bounded channel: it never blocks the tonic
+/// response writer inline, the channel back-pressures so egress memory stays
+/// bounded (and a slow client stalls execution), and the encode of batch N
+/// overlaps the socket write of batch N-1, reducing transfer time. With a
+/// dedicated CPU runtime that overlap is free; on the shared IO-runtime
+/// fallback the spawn costs one scheduling hop before the first byte.
+fn spawn_flight_encode_stream<S>(data_stream: S, args: FlightEncodeArgs) -> FlightEncodeStream
+where
+    S: Stream<Item = Result<RecordBatch, DataFusionError>> + Send + 'static,
+{
+    let FlightEncodeArgs {
+        needs_view_cast,
+        schema,
+        encoder,
+        mut dict_tracker,
+        options,
+        mut compression_context,
+        memory_pool,
+        cpu_runtime,
+        request_context,
+    } = args;
+
+    // Charge the encoded FlightData buffered for send against the query
+    // memory pool so egress memory is visible to `runtime.query.memory_limit`
+    // and applies back-pressure under real pressure.
+    let account = EgressAccount::register(&memory_pool, "flight_egress");
+    let encode_runtime = cpu_runtime.unwrap_or_else(Handle::current);
+    let (tx, rx) = mpsc::channel::<Result<FlightData, Status>>(FLIGHT_ENCODE_CHANNEL_CAPACITY);
+    let span = Span::current();
+
+    let encode_task = {
+        let account = Arc::clone(&account);
+        async move {
+            let mut data_stream = data_stream.fuse();
+
+            while let Some(batch_result) = data_stream.next().await {
+                match batch_result {
+                    Ok(batch) => match encode_flight_batch(
+                        batch,
+                        needs_view_cast,
+                        &schema,
+                        &encoder,
+                        &mut dict_tracker,
+                        &options,
+                        &mut compression_context,
+                    ) {
+                        Ok((dicts, batch_data)) => {
+                            for dict in dicts {
+                                account.reserve(flight_data_size(&dict)).await;
+                                if tx.send(Ok(dict)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            account.reserve(flight_data_size(&batch_data)).await;
+                            if tx.send(Ok(batch_data)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(status) => {
+                            let _ = tx.send(Err(status)).await;
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        let e = find_datafusion_root(e);
+                        let _ = tx.send(Err(handle_datafusion_error(e))).await;
+                        return;
+                    }
+                }
+            }
+        }
+    };
+
+    let encode_handle = encode_runtime.spawn(request_context.scope(encode_task).instrument(span));
+
+    FlightEncodeStream {
+        receiver: ReceiverStream::new(rx),
+        encode_handle: Some(encode_handle),
+        account,
+    }
 }
 
 /// Encode one [`RecordBatch`] into its Flight dictionary + record-batch
@@ -1146,7 +1249,9 @@ mod tests {
     use arrow::datatypes::{Field, Int32Type, SchemaRef};
     use datafusion::execution::SendableRecordBatchStream;
     use datafusion::execution::memory_pool::UnboundedMemoryPool;
+    use datafusion::physical_plan::RecordBatchStream;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::FutureExt;
     use runtime_request_context::Protocol;
 
     /// The messages a Flight response sent, and the failure that ended it, if any.
@@ -1337,9 +1442,9 @@ mod tests {
     }
 
     /// Empty batches do not grow the byte budget. The batch-count cap must
-    /// therefore send a long ready stream of them down the encode-task path.
-    /// On this current-thread runtime a spawned encode task cannot have run
-    /// yet, so immediate messages would mean the path still encoded inline.
+    /// therefore stop encoding them on the request task and hand the rest to
+    /// the encode task. Immediate messages are only the schema plus at most
+    /// the batch cap — never the whole ready stream.
     #[tokio::test]
     async fn empty_ready_batches_do_not_encode_inline_without_a_bound() {
         let schema: SchemaRef = Arc::new(Schema::empty());
@@ -1353,10 +1458,112 @@ mod tests {
             messages.push(message.expect("a message"));
         }
         assert!(
-            messages.is_empty(),
-            "a long ready stream of empty batches must fall back to the encode task, so no message is ready on this current-thread runtime; got {}",
+            !messages.is_empty(),
+            "the schema is sent on the first poll without waiting"
+        );
+        assert!(
+            messages.len() <= 1 + FLIGHT_INLINE_ENCODE_MAX_BATCHES,
+            "a long ready stream of empty batches must stop inline encode at the batch cap; got {}",
             messages.len()
         );
+        let (rest, error) = sent(response).await;
+        assert!(
+            error.is_none(),
+            "the remainder must complete on the encode task: {error:?}"
+        );
+        assert_eq!(
+            messages.len() + rest.len(),
+            1 + 1_000,
+            "schema plus every empty batch must still be sent"
+        );
+    }
+
+    /// Construction and a schema-only poll must not drain a ready result
+    /// through `None`. That poll finishes query telemetry.
+    #[tokio::test]
+    async fn inline_encode_does_not_finish_the_result_before_the_response_is_consumed() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batches = vec![
+            batch(
+                &schema,
+                vec![Arc::new(Int64Array::from(vec![Some(1)])) as ArrayRef],
+            ),
+            batch(
+                &schema,
+                vec![Arc::new(Int64Array::from(vec![Some(2)])) as ArrayRef],
+            ),
+        ];
+        let ended = Arc::new(AtomicBool::new(false));
+        let data: SendableRecordBatchStream = Box::pin(EndFlagStream {
+            schema: Arc::clone(&schema),
+            batches: batches.into_iter(),
+            ended: Arc::clone(&ended),
+        });
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let (mut response, _) = Service::query_result_to_flight_stream(
+            QueryResult::new(data, CacheStatus::CacheHit),
+            IpcWriteOptions::default(),
+            None,
+            &pool,
+            Arc::new(RequestContext::builder(Protocol::FlightSQL).build()),
+        );
+
+        assert!(
+            !ended.load(Ordering::SeqCst),
+            "converting the result must not poll the record-batch stream through None"
+        );
+
+        response
+            .next()
+            .now_or_never()
+            .expect("schema is ready")
+            .expect("schema is a message")
+            .expect("schema encodes");
+        assert!(
+            !ended.load(Ordering::SeqCst),
+            "polling only the schema must not finish the record-batch stream"
+        );
+
+        let (messages, error) = sent(response).await;
+        assert!(
+            error.is_none(),
+            "the remaining batches must encode: {error:?}"
+        );
+        assert_eq!(messages.len(), 2, "two batches follow the schema");
+        assert!(
+            ended.load(Ordering::SeqCst),
+            "full Flight consumption finishes the record-batch stream"
+        );
+    }
+
+    struct EndFlagStream {
+        schema: SchemaRef,
+        batches: std::vec::IntoIter<RecordBatch>,
+        ended: Arc<AtomicBool>,
+    }
+
+    impl Stream for EndFlagStream {
+        type Item = Result<RecordBatch, DataFusionError>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            match self.batches.next() {
+                Some(next_batch) => Poll::Ready(Some(Ok(next_batch))),
+                None => {
+                    self.ended.store(true, Ordering::SeqCst);
+                    Poll::Ready(None)
+                }
+            }
+        }
+    }
+
+    impl RecordBatchStream for EndFlagStream {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
     }
 
     /// One million zero-byte ready batches must stop at the batch-count cap.
