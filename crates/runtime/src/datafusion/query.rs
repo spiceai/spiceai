@@ -328,6 +328,15 @@ struct QueryTimeoutTimerGuard {
     handle: tokio::task::JoinHandle<()>,
 }
 
+/// Cancellation and `runtime.query.timeout` for one query, armed before the
+/// results-cache probe so a stalled lookup is still under the documented
+/// full-query deadline.
+struct QueryLifetimeGuards {
+    cancel_token: tokio_util::sync::CancellationToken,
+    timeout_state: QueryTimeoutState,
+    timeout_timer_guard: Option<QueryTimeoutTimerGuard>,
+}
+
 impl Drop for QueryTimeoutTimerGuard {
     fn drop(&mut self) {
         self.handle.abort();
@@ -344,6 +353,52 @@ impl Query {
             return Err(timeout_state.cancellation_error(query_id));
         }
         Ok(())
+    }
+
+    /// Arm `runtime.query.timeout` and resolve the query cancel token before
+    /// the results-cache probe, so the documented full-query lifetime includes
+    /// the lookup.
+    ///
+    /// An explicit token on the `Query` takes precedence; otherwise the query
+    /// inherits the request-scoped token so cancelling the originating request
+    /// cancels this query too. A child token is used so that cancelling the
+    /// query (via admin cancel endpoint) does not propagate upwards to the
+    /// request and abort other in-progress work.
+    fn lifetime_guards(&self, request_context: &RequestContext) -> QueryLifetimeGuards {
+        let cancel_token = match &self.cancellation_token {
+            Some(t) => t.clone(),
+            None => request_context.child_cancellation_token(),
+        };
+        let (timeout_state, timeout_timer_guard) = match request_context.query_timeout() {
+            Some(timeout) => {
+                let state = QueryTimeoutState::armed(timeout);
+                let timer_state = state.clone();
+                let timer_token = cancel_token.clone();
+                let handle = tokio::spawn(async move {
+                    tokio::select! {
+                        // The token fired first (explicit cancel, client
+                        // disconnect): stand down so a cancellation observed
+                        // lazily — after the timeout would have elapsed —
+                        // keeps its `QueryCancelled` classification.
+                        () = timer_token.cancelled() => {}
+                        () = tokio::time::sleep(timeout) => {
+                            // Mark before cancelling so observers of the fired
+                            // token always classify the cancellation as a
+                            // timeout.
+                            timer_state.mark_fired();
+                            timer_token.cancel();
+                        }
+                    }
+                });
+                (state, Some(QueryTimeoutTimerGuard { handle }))
+            }
+            _ => (QueryTimeoutState::default(), None),
+        };
+        QueryLifetimeGuards {
+            cancel_token,
+            timeout_state,
+            timeout_timer_guard,
+        }
     }
 
     fn flight_batch_size_config(request_context: &RequestContext) -> FlightBatchSize {
@@ -543,20 +598,28 @@ impl Query {
     /// Panics when running under test if no cache key is computed for the query.
     pub async fn run(self) -> Result<QueryResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
+        let guards = self.lifetime_guards(&request_context);
 
-        // Looked up before anything else, on the runtime the request arrived on:
-        // a hit held as batches needs no planning or execution, so it is served
-        // from here rather than paying for the hop onto the query runtime.
-        let probe = self.probe_results_cache(&request_context).await;
+        // Looked up on the runtime the request arrived on: a hit held as
+        // batches needs no planning or execution, so it is served from here
+        // rather than paying for the hop onto the query runtime. The probe
+        // is still under `runtime.query.timeout` and the request cancel token.
+        let probe = tokio::select! {
+            biased;
+            () = guards.cancel_token.cancelled() => {
+                return Err(guards.timeout_state.cancellation_error(&self.query_id.to_string()));
+            }
+            probe = self.probe_results_cache(&request_context) => probe,
+        };
         if let Some(runtime_handle) = self.df.cpu_runtime().cloned()
             && !probe.is_servable_in_place()
         {
             return self
-                .run_with_managed_runtime(request_context, runtime_handle, probe)
+                .run_with_managed_runtime(request_context, runtime_handle, probe, guards)
                 .await;
         }
 
-        self.run_internal(request_context, probe).await
+        self.run_internal(request_context, probe, guards).await
     }
 
     /// Submit a query for distributed execution via Ballista and return a handle.
@@ -970,6 +1033,7 @@ impl Query {
         request_context: Arc<RequestContext>,
         runtime_handle: Handle,
         probe: CacheProbe,
+        guards: QueryLifetimeGuards,
     ) -> Result<QueryResult> {
         let span = Span::current();
 
@@ -981,7 +1045,7 @@ impl Query {
             runtime_request_context,
             span,
             async move {
-                self.run_internal(future_request_context, probe)
+                self.run_internal(future_request_context, probe, guards)
                     .await
                     .map(|query_result| (query_result.cache_status, query_result.data))
             },
@@ -1005,6 +1069,7 @@ impl Query {
         self,
         request_context: Arc<RequestContext>,
         probe: CacheProbe,
+        guards: QueryLifetimeGuards,
     ) -> Result<QueryResult> {
         let query_start = std::time::Instant::now();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
@@ -1016,53 +1081,20 @@ impl Query {
         // otherwise leaves a failure with nothing to correlate on.
         let trace_span = correlation::begin_task_trace(&span, &request_context);
 
-        // Resolve the cancellation token for this query. An explicit token on
-        // the `Query` takes precedence; otherwise the query inherits the
-        // request-scoped token so that cancelling the originating request
-        // cancels this query too. A child token is used so that cancelling the
-        // query (via admin cancel endpoint) does not propagate upwards to the
-        // request and abort other in-progress work.
-        let query_cancel_token = match &self.cancellation_token {
-            Some(t) => t.clone(),
-            None => request_context.child_cancellation_token(),
-        };
-
-        // Arm the `runtime.query.timeout` timer: when it elapses it fires the
-        // query's cancellation token and the existing cancellation machinery
-        // tears the query down; the state marker distinguishes the resulting
-        // error as `QueryTimedOut`. The timer covers the query's full
-        // lifetime — planning, admission wait, execution, and result
-        // streaming — and is disarmed (via the guard bundled into the result
-        // stream) when the stream completes, errors, or is dropped. The
-        // timeout is a property of the request context (resolved there from
-        // `runtime.query.timeout` or an explicit per-request override);
-        // internal runtime queries (acceleration refreshes, health checks,
-        // task history) carry no timeout unless explicitly overridden.
-        let (timeout_state, timeout_timer_guard) = match request_context.query_timeout() {
-            Some(timeout) => {
-                let state = QueryTimeoutState::armed(timeout);
-                let timer_state = state.clone();
-                let timer_token = query_cancel_token.clone();
-                let handle = tokio::spawn(async move {
-                    tokio::select! {
-                        // The token fired first (explicit cancel, client
-                        // disconnect): stand down so a cancellation observed
-                        // lazily — after the timeout would have elapsed —
-                        // keeps its `QueryCancelled` classification.
-                        () = timer_token.cancelled() => {}
-                        () = tokio::time::sleep(timeout) => {
-                            // Mark before cancelling so observers of the fired
-                            // token always classify the cancellation as a
-                            // timeout.
-                            timer_state.mark_fired();
-                            timer_token.cancel();
-                        }
-                    }
-                });
-                (state, Some(QueryTimeoutTimerGuard { handle }))
-            }
-            _ => (QueryTimeoutState::default(), None),
-        };
+        // Armed in `run` before the results-cache probe so the timer covers
+        // the query's full lifetime — cache lookup, planning, admission wait,
+        // execution, and result streaming — and is disarmed (via the guard
+        // bundled into the result stream) when the stream completes, errors,
+        // or is dropped. The timeout is a property of the request context
+        // (resolved there from `runtime.query.timeout` or an explicit
+        // per-request override); internal runtime queries (acceleration
+        // refreshes, health checks, task history) carry no timeout unless
+        // explicitly overridden.
+        let QueryLifetimeGuards {
+            cancel_token: query_cancel_token,
+            timeout_state,
+            timeout_timer_guard,
+        } = guards;
 
         // Register in the DataFusion-owned active-query registry so administrative
         // cancel endpoints can locate this query by id. The guard is captured

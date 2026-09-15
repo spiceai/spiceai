@@ -552,7 +552,14 @@ impl Stream for InlineFlightStream {
                     this.data_stream = None;
                     return Poll::Ready(None);
                 }
-                Poll::Pending => return Poll::Pending,
+                // Only batches that are already there stay on the request task.
+                // A pending source is the encode-task path: delayed compression
+                // must not land on the I/O runtime.
+                Poll::Pending => {
+                    if let Err(status) = this.spawn_remaining(None) {
+                        return Poll::Ready(Some(Err(status)));
+                    }
+                }
             }
         }
     }
@@ -1438,6 +1445,32 @@ mod tests {
                 .now_or_never()
                 .is_some_and(|end| end.is_none()),
             "the response must end without waiting"
+        );
+    }
+
+    /// A result whose first batch is not ready must not keep encoding on the
+    /// request task. After the schema, the remainder goes to the encode task,
+    /// which cannot have run yet on this current-thread runtime.
+    #[tokio::test]
+    async fn a_not_ready_result_is_handed_to_the_encode_task() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let items = vec![Ok(batch(
+            &schema,
+            vec![Arc::new(Int64Array::from(vec![Some(1)])) as ArrayRef],
+        ))];
+        let mut response = respond(&schema, items, false);
+
+        let schema_message = response
+            .next()
+            .now_or_never()
+            .expect("schema is ready")
+            .expect("schema is a message")
+            .expect("schema encodes");
+        let _ = schema_message;
+        assert!(
+            response.next().now_or_never().is_none(),
+            "a pending batch must spawn the encode task, so no further message is ready on this current-thread runtime"
         );
     }
 
