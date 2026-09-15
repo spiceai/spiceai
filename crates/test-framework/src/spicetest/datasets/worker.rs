@@ -1025,11 +1025,10 @@ fn zero_row_count_is_failure(
     validate_row_count && !skipped && row_count == 0 && !reference_validation_passed
 }
 
-/// LIMIT fallbacks compare rendered cells as a multiset. They must not replace
-/// an arity [`validation::QueryValidationFailReason::SchemaMismatch`], and they
-/// must not replace a [`validation::QueryValidationFailReason::SortOrderViolation`]:
-/// a visible-prefix inversion is still a broken `ORDER BY` even when the same
-/// rows would pass a keyed membership check.
+/// LIMIT fallbacks match rows by their rendered cells. They must not replace an
+/// arity [`validation::QueryValidationFailReason::SchemaMismatch`], and they must
+/// not replace a [`validation::QueryValidationFailReason::SortOrderViolation`]:
+/// those rows already show that the engine broke its own `ORDER BY`.
 fn live_oracle_row_fallback_applies(result: &QueryValidationResult) -> bool {
     matches!(
         result,

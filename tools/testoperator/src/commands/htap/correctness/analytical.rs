@@ -477,7 +477,8 @@ async fn evaluate_query(
                         }
                         QueryValidationFailReason::SchemaMismatch
                         | QueryValidationFailReason::ColumnLengthMismatch { .. }
-                        | QueryValidationFailReason::RowNotAllowedByLimit { .. } => {}
+                        | QueryValidationFailReason::RowNotAllowedByLimit { .. }
+                        | QueryValidationFailReason::RowOutOfSortOrder { .. } => {}
                     }
                 }
                 (

@@ -116,6 +116,13 @@ pub enum QueryValidationFailReason {
         row_number: usize,
         row: String,
     },
+    /// A query that sorts on a column its result does not return put a row where
+    /// its `ORDER BY` does not allow it: the row belongs to the answer, but the
+    /// reference's sort keys place it in a different tie group.
+    RowOutOfSortOrder {
+        row_number: usize,
+        row: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1182,8 +1189,11 @@ pub fn compare_query_result_batches_with_sort_check(
 /// that violates its own `ORDER BY` still fails.
 ///
 /// An `ORDER BY` the sort check could not fully verify is not a failure here —
-/// the rows were still compared. Callers that need to count that hole should
-/// use [`compare_query_result_batches_with_sort_check`] directly.
+/// the rows were still compared — except an `ORDER BY … LIMIT` on something the
+/// result does not return: that answer must match the reference row by row, and a
+/// mismatch is left for [`validate_against_keyed_reference`], which has the sort
+/// keys. Callers that need to count that hole should use
+/// [`compare_query_result_batches_with_sort_check`] directly.
 ///
 /// # Errors
 /// Returns an error if the batches cannot be concatenated or compared.
@@ -1204,6 +1214,14 @@ pub fn validate_against_reference_batches(
         reference,
         order,
     )?;
+    // Rows cannot show an order decided by a sort key they do not return, so a
+    // match that ignored order proves nothing about it.
+    if comparison.result == QueryValidationResult::Pass
+        && let Some(schema) = actual.first().map(RecordBatch::schema)
+        && unprojected_sort_limit(&query.sql, &schema).is_some()
+    {
+        return compare_query_result_batches(&query.name, actual, reference, RowOrder::Preserved);
+    }
     Ok(comparison.result)
 }
 
@@ -1348,11 +1366,13 @@ fn row_as_strings(batch: &RecordBatch, row: usize) -> Result<Vec<Option<String>>
 /// reference query's rows read back with their sort keys.
 ///
 /// `keyed_reference` holds the reference rows in `ORDER BY` order, each followed
-/// by its `key_columns` sort-key cells. Every row before the tie group the
-/// `LIMIT` cuts through must be in `actual`, and the rest of `actual` must come
-/// from that tie group, the only rows SQL leaves an engine free to choose among.
-/// Cells must match exactly. The order of `actual` goes unchecked: without its
-/// sort keys it cannot be checked.
+/// by its `key_columns` sort-key cells, which split them into tie groups. Every
+/// tie group before the one the `LIMIT` cuts through fills exactly its own
+/// positions of `actual`, in any order within the group, and the rest of `actual`
+/// must come from the cut tie group, the only rows SQL leaves an engine free to
+/// choose among. Cells must match exactly. A row the answer holds but in another
+/// group's positions fails as [`QueryValidationFailReason::RowOutOfSortOrder`]; a
+/// row the answer cannot hold fails as [`QueryValidationFailReason::RowNotAllowedByLimit`].
 ///
 /// Returns `None` while `keyed_reference` ends inside that tie group and
 /// `reached_end` is `false`: a verdict needs the whole group, so the caller reads
@@ -1428,55 +1448,63 @@ pub fn validate_against_keyed_reference(
         )));
     }
 
-    let mut before_cut: HashMap<&[Option<String>], usize> = HashMap::new();
-    for (cells, _) in &reference[..group_start] {
-        *before_cut.entry(cells.as_slice()).or_insert(0) += 1;
-    }
-    let mut cut_group: HashMap<&[Option<String>], usize> = HashMap::new();
-    for (cells, _) in &reference[group_start..group_end] {
-        *cut_group.entry(cells.as_slice()).or_insert(0) += 1;
-    }
-    let mut picks_from_cut_group = expected_rows - group_start;
-
-    let mut row_number = 0;
+    let mut answer = Vec::with_capacity(actual_rows);
     for batch in actual {
         for row in 0..batch.num_rows() {
-            row_number += 1;
-            let cells = row_as_strings(batch, row)?;
-            if let Some(count) = before_cut.get_mut(cells.as_slice())
-                && *count > 0
-            {
-                *count -= 1;
-            } else if picks_from_cut_group > 0
-                && let Some(count) = cut_group.get_mut(cells.as_slice())
-                && *count > 0
-            {
-                *count -= 1;
-                picks_from_cut_group -= 1;
-            } else {
-                return Ok(Some(QueryValidationResult::Fail(
-                    QueryValidationFailReason::RowNotAllowedByLimit {
-                        row_number,
-                        row: format!("{cells:?}"),
-                    },
-                )));
-            }
+            answer.push(row_as_strings(batch, row)?);
         }
     }
-    if picks_from_cut_group > 0 || before_cut.values().any(|count| *count > 0) {
-        let missing = before_cut
+
+    // A correct answer lists each tie group before the cut in exactly that group's
+    // positions, so walk the answer one tie group at a time. The positions from
+    // `group_start` on belong to the tie group the `LIMIT` cuts through.
+    let mut block_start = 0;
+    while block_start < expected_rows {
+        let block_key = &reference[block_start].1;
+        let block_end = if block_start == group_start {
+            group_end
+        } else {
+            reference[block_start..group_start]
+                .iter()
+                .position(|(_, key)| key != block_key)
+                .map_or(group_start, |offset| block_start + offset)
+        };
+        let mut block: HashMap<&[Option<String>], usize> = HashMap::new();
+        for (cells, _) in &reference[block_start..block_end] {
+            *block.entry(cells.as_slice()).or_insert(0) += 1;
+        }
+        for (offset, cells) in answer[block_start..block_end.min(expected_rows)]
             .iter()
-            .find(|(_, count)| **count > 0)
-            .map_or_else(
-                || "a row from the LIMIT cutoff group".to_string(),
-                |(cells, _)| format!("{cells:?}"),
-            );
-        return Ok(Some(QueryValidationResult::Fail(
-            QueryValidationFailReason::RowNotAllowedByLimit {
-                row_number,
-                row: missing,
-            },
-        )));
+            .enumerate()
+        {
+            if let Some(count) = block.get_mut(cells.as_slice())
+                && *count > 0
+            {
+                *count -= 1;
+                continue;
+            }
+            let row_index = block_start + offset;
+            let row_number = row_index + 1; // indexes are 0-based, counts are 1-based
+            let row = format!("{cells:?}");
+            // A row the answer may hold, not yet over its count, is in the wrong tie
+            // group; any other row is one the LIMIT does not keep.
+            let copies_allowed = reference[..group_end]
+                .iter()
+                .filter(|(reference_cells, _)| reference_cells == cells)
+                .count();
+            let copies_returned = answer[..=row_index]
+                .iter()
+                .filter(|answer_cells| *answer_cells == cells)
+                .count();
+            return Ok(Some(QueryValidationResult::Fail(
+                if copies_returned <= copies_allowed {
+                    QueryValidationFailReason::RowOutOfSortOrder { row_number, row }
+                } else {
+                    QueryValidationFailReason::RowNotAllowedByLimit { row_number, row }
+                },
+            )));
+        }
+        block_start = block_end;
     }
     Ok(Some(QueryValidationResult::Pass))
 }
@@ -2954,8 +2982,99 @@ mod test {
         .expect("keyed inversion reference");
         assert_eq!(
             validate_against_keyed_reference(&[inverted], &[keyed], 2, 2, true)
-                .expect("keyed would accept the same rows in any order"),
-            Some(QueryValidationResult::Pass)
+                .expect("keyed check"),
+            Some(QueryValidationResult::Fail(
+                QueryValidationFailReason::RowOutOfSortOrder {
+                    row_number: 1,
+                    row: r#"[Some("2"), Some("b")]"#.to_string(),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn test_hidden_sort_suffix_requires_the_reference_row_order() {
+        // ORDER BY id, hidden LIMIT 2: both rows tie on `id`, and `hidden` puts p1
+        // first. The same two rows in the other order are not the answer.
+        let sql = "SELECT id, payload FROM t ORDER BY id, hidden LIMIT 2";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let rows = |payloads: &[&str]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 1])),
+                    Arc::new(StringArray::from(payloads.to_vec())),
+                ],
+            )
+            .expect("id/payload batch")
+        };
+        let reference = rows(&["p1", "p2"]);
+        let swapped = rows(&["p2", "p1"]);
+        let query = Query::new("hidden_suffix_order".into(), sql.into(), false);
+        assert!(
+            matches!(
+                validate_against_reference_batches(
+                    &query,
+                    std::slice::from_ref(&swapped),
+                    std::slice::from_ref(&reference)
+                )
+                .expect("compare"),
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            ),
+            "without the hidden sort keys, the rows must match the reference row by row"
+        );
+        assert_eq!(
+            validate_against_reference_batches(
+                &query,
+                std::slice::from_ref(&reference),
+                std::slice::from_ref(&reference)
+            )
+            .expect("compare"),
+            QueryValidationResult::Pass
+        );
+
+        let keyed = |hidden: [&str; 2]| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("payload", DataType::Utf8, false),
+                    Field::new("__validation_sort_key_0", DataType::Int64, false),
+                    Field::new("__validation_sort_key_1", DataType::Utf8, false),
+                ])),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 1])),
+                    Arc::new(StringArray::from(vec!["p1", "p2"])),
+                    Arc::new(Int64Array::from(vec![1, 1])),
+                    Arc::new(StringArray::from(hidden.to_vec())),
+                ],
+            )
+            .expect("keyed hidden-suffix reference")
+        };
+        assert_eq!(
+            validate_against_keyed_reference(
+                std::slice::from_ref(&swapped),
+                &[keyed(["a", "b"])],
+                2,
+                2,
+                true
+            )
+            .expect("check distinct hidden keys"),
+            Some(QueryValidationResult::Fail(
+                QueryValidationFailReason::RowOutOfSortOrder {
+                    row_number: 1,
+                    row: r#"[Some("1"), Some("p2")]"#.to_string(),
+                }
+            )),
+            "`hidden` orders p1 before p2"
+        );
+        assert_eq!(
+            validate_against_keyed_reference(&[swapped], &[keyed(["a", "a"])], 2, 2, true)
+                .expect("check tied hidden keys"),
+            Some(QueryValidationResult::Pass),
+            "rows that tie on every sort key may come in either order"
         );
     }
 
@@ -3003,15 +3122,16 @@ mod test {
 
     #[test]
     fn test_keyed_reference_rejects_an_answer_missing_a_row_before_the_cut() {
-        // Both `d` rows sort before the cut, so a third tied row cannot replace one.
+        // Both `d` rows sort before the cut, so row 8 cannot already be an `e` from
+        // the tie group the LIMIT cuts through.
         let answer = search_phrases(&["a", "a", "b", "b", "c", "d", "c", "e", "e", "f"]);
         assert_eq!(
             validate_against_keyed_reference(&[answer], &[q25_keyed_reference()], 10, 1, false)
                 .expect("check"),
             Some(QueryValidationResult::Fail(
-                QueryValidationFailReason::RowNotAllowedByLimit {
-                    row_number: 10,
-                    row: r#"[Some("f")]"#.to_string(),
+                QueryValidationFailReason::RowOutOfSortOrder {
+                    row_number: 8,
+                    row: r#"[Some("e")]"#.to_string(),
                 }
             ))
         );
@@ -3060,8 +3180,8 @@ mod test {
             )
             .expect("check missing Y"),
             Some(QueryValidationResult::Fail(
-                QueryValidationFailReason::RowNotAllowedByLimit {
-                    row_number: 3,
+                QueryValidationFailReason::RowOutOfSortOrder {
+                    row_number: 2,
                     row: r#"[Some("X")]"#.to_string(),
                 }
             ))

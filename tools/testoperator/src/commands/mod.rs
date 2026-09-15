@@ -943,11 +943,12 @@ mod tests {
         );
     }
 
-    /// TPC-H Q6 on these federated arms is known-wrong (Glue CSV typing /
-    /// Hadoop Iceberg Spark schema inference). They keep an explicit
-    /// `validate_results: false` so the scheduled run does not fail on that
-    /// discrepancy. Every other scale factor 1 TPC-H, TPC-DS and `ClickBench`
-    /// dispatch must validate against an oracle.
+    /// TPC-H Q6 returns a wrong answer on these federated arms: both sources type
+    /// `l_discount` as a double, and Spice types the literal `0.06 + 0.01` as a
+    /// `Float64` just below 0.07, so Q6's `BETWEEN` drops every row at 0.07. They
+    /// keep an explicit `validate_results: false` so the scheduled run does not
+    /// fail on that answer. Every other scale factor 1 TPC-H, TPC-DS and
+    /// `ClickBench` dispatch must validate against an oracle.
     const BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION: &[&str] = &[
         "tpch/sf1/federated/glue[csv].yaml",
         "tpch/sf1/federated/iceberg[hadoop].yaml",
