@@ -276,6 +276,65 @@ pub fn validate_sql_query_read_only(plan: &LogicalPlan) -> Result<(), DataFusion
     Ok(())
 }
 
+/// Validates that a view's query is safe to refresh with `refresh_mode: append`.
+///
+/// `refresh_mode: append` incrementally selects rows with `time_column > watermark`
+/// and inserts them into the accelerator — it never revises a row it already wrote.
+/// That is only correct for row-preserving queries (plain projections/filters/unions
+/// over an append-only base): a later-arriving row must not be able to change the
+/// value of any row already appended.
+///
+/// This is a default-deny allow-list, not a deny-list: only [`LogicalPlan`] variants
+/// explicitly known to be row-preserving continue the walk. Any variant not
+/// recognized here — including future `LogicalPlan` additions this function hasn't
+/// been updated for — is rejected, so an unrecognized query shape fails closed
+/// instead of silently producing wrong results.
+///
+/// # Returns
+/// * `Ok(())` if the plan is append-safe.
+/// * `Err(DataFusionError)` naming the disallowed construct otherwise.
+pub fn validate_view_append_refresh_plan(plan: &LogicalPlan) -> Result<(), DataFusionError> {
+    plan.apply_with_subqueries(|node| match node {
+        LogicalPlan::Projection(_)
+        | LogicalPlan::Filter(_)
+        | LogicalPlan::TableScan(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::Union(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::EmptyRelation(_) => Ok(TreeNodeRecursion::Continue),
+        LogicalPlan::Aggregate(_) => plan_err!(
+            "'refresh_mode: append' is not supported for views containing GROUP BY or aggregate \
+            functions: a later-arriving row can change an already-appended group's value, which \
+            append mode cannot revise. Use 'refresh_mode: full' instead."
+        ),
+        LogicalPlan::Window(_) => plan_err!(
+            "'refresh_mode: append' is not supported for views containing window functions \
+            (e.g. ROW_NUMBER, RANK, LAG/LEAD, running aggregates): values for already-appended \
+            rows can change as more rows arrive. Use 'refresh_mode: full' instead."
+        ),
+        LogicalPlan::Distinct(_) => plan_err!(
+            "'refresh_mode: append' is not supported for views containing DISTINCT (or UNION / \
+            INTERSECT / EXCEPT without ALL): a newly appended row cannot be de-duplicated \
+            against rows already written. Use 'refresh_mode: full' instead."
+        ),
+        LogicalPlan::Limit(_) => plan_err!(
+            "'refresh_mode: append' is not supported for views containing LIMIT/OFFSET: which \
+            rows fall within the limit changes as more data arrives. Use 'refresh_mode: full' \
+            instead."
+        ),
+        LogicalPlan::Join(_) => plan_err!(
+            "'refresh_mode: append' is not supported for views containing JOIN: a new row on \
+            one side may match rows already appended on the other side without reproducing that \
+            match. Use 'refresh_mode: full' instead."
+        ),
+        _ => plan_err!(
+            "'refresh_mode: append' is not supported for this view's query shape. Use \
+            'refresh_mode: full' instead."
+        ),
+    })?;
+    Ok(())
+}
+
 fn validate_no_code_executing_functions(plan: &LogicalPlan) -> Result<(), DataFusionError> {
     for expr in plan.expressions() {
         expr.apply(|expr| {
@@ -1248,5 +1307,149 @@ mod tests {
 
         validate_sql_query_read_only(&plan)
             .expect_err("INSERT via Spice planner must be rejected in read-only context");
+    }
+
+    #[tokio::test]
+    async fn test_append_refresh_plan_allows_projection_and_filter() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("SELECT id, name FROM tbl_read_only WHERE value > 0.0")
+            .await
+            .expect("plan should be created");
+
+        validate_view_append_refresh_plan(&plan)
+            .expect("plain projection/filter view should be append-safe");
+    }
+
+    #[tokio::test]
+    async fn test_append_refresh_plan_allows_union_all() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(
+                "SELECT id FROM tbl_read_only UNION ALL SELECT id FROM tbl_writable",
+            )
+            .await
+            .expect("plan should be created");
+
+        validate_view_append_refresh_plan(&plan).expect("UNION ALL view should be append-safe");
+    }
+
+    #[tokio::test]
+    async fn test_append_refresh_plan_allows_sort_without_limit() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("SELECT id FROM tbl_read_only ORDER BY id")
+            .await
+            .expect("plan should be created");
+
+        validate_view_append_refresh_plan(&plan)
+            .expect("ORDER BY without LIMIT should be append-safe");
+    }
+
+    #[tokio::test]
+    async fn test_append_refresh_plan_rejects_aggregate() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(
+                "SELECT name, SUM(value) AS total FROM tbl_read_only GROUP BY name",
+            )
+            .await
+            .expect("plan should be created");
+
+        let err = validate_view_append_refresh_plan(&plan)
+            .expect_err("GROUP BY / aggregate view must be rejected");
+        assert!(
+            err.to_string().contains("GROUP BY"),
+            "error should cite GROUP BY/aggregate, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_append_refresh_plan_rejects_window_function() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM tbl_read_only")
+            .await
+            .expect("plan should be created");
+
+        let err = validate_view_append_refresh_plan(&plan)
+            .expect_err("window function view must be rejected");
+        assert!(
+            err.to_string().contains("window function"),
+            "error should cite window functions, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_append_refresh_plan_rejects_distinct() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("SELECT DISTINCT name FROM tbl_read_only")
+            .await
+            .expect("plan should be created");
+
+        let err =
+            validate_view_append_refresh_plan(&plan).expect_err("DISTINCT view must be rejected");
+        assert!(
+            err.to_string().contains("DISTINCT"),
+            "error should cite DISTINCT, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_append_refresh_plan_rejects_limit() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("SELECT id FROM tbl_read_only LIMIT 10")
+            .await
+            .expect("plan should be created");
+
+        let err =
+            validate_view_append_refresh_plan(&plan).expect_err("LIMIT view must be rejected");
+        assert!(
+            err.to_string().contains("LIMIT"),
+            "error should cite LIMIT, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_append_refresh_plan_rejects_join() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(
+                "SELECT a.id FROM tbl_read_only a JOIN tbl_writable b ON a.id = b.id",
+            )
+            .await
+            .expect("plan should be created");
+
+        let err = validate_view_append_refresh_plan(&plan).expect_err("JOIN view must be rejected");
+        assert!(
+            err.to_string().contains("JOIN"),
+            "error should cite JOIN, got: {err}"
+        );
     }
 }
