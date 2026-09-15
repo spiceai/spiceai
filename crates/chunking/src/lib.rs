@@ -749,11 +749,11 @@ mod tests {
         let sizer = TokenizerWrapper::from(Arc::clone(&tokenizer));
 
         let text = "an apple a day";
-        let sized = sizer.size(text);
+        let measured = sizer.size(text);
         let received = tokens_the_model_receives(&tokenizer, text);
         assert_eq!(
-            sized, received,
-            "the sizer measured {sized} tokens for {text:?} but the model is handed {received}: \
+            measured, received,
+            "the sizer measured {measured} tokens for {text:?} but the model is handed {received}: \
              sizing that skips the tokenizer's special tokens puts every chunk over its budget"
         );
     }
