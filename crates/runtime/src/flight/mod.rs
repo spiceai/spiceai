@@ -574,10 +574,10 @@ impl Stream for InlineFlightStream {
 /// overlaps the socket write of batch N-1, reducing transfer time. With a
 /// dedicated CPU runtime that overlap is free; on the shared IO-runtime
 /// fallback the spawn costs one scheduling hop before the first byte.
-fn spawn_flight_encode_stream<S>(data_stream: S, args: FlightEncodeArgs) -> FlightEncodeStream
-where
-    S: Stream<Item = Result<RecordBatch, DataFusionError>> + Send + 'static,
-{
+fn spawn_flight_encode_stream(
+    data_stream: BoxStream<'static, Result<RecordBatch, DataFusionError>>,
+    args: FlightEncodeArgs,
+) -> FlightEncodeStream {
     let FlightEncodeArgs {
         needs_view_cast,
         schema,
