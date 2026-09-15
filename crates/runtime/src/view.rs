@@ -39,6 +39,7 @@ use snafu::ResultExt;
 use spice_table::TableLayer;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
@@ -159,7 +160,11 @@ impl ViewRefreshReadAttestation {
 /// Records the read shape of the [`ExecutionPlan`] a refresh will run.
 ///
 /// Stacked as a [`spice_table::TableLayer`] so layer walks see through to the
-/// federated view instead of stopping on a wrapping `TableProvider`.
+/// federated view instead of stopping on a wrapping `TableProvider`. Hides the
+/// inner [`ViewTable`]'s logical plan: `LogicalPlanBuilder::scan` (the refresh
+/// `get_data` path) inlines that plan when present and never calls `scan`, so
+/// the wrapper would otherwise record nothing and a `consistent_read` view
+/// would never publish.
 pub(crate) fn wrap_view_refresh_attestation(
     inner: Arc<dyn TableProvider>,
     attestation: ViewRefreshReadAttestation,
@@ -192,6 +197,16 @@ impl AttestingViewProvider {
 
 #[async_trait]
 impl TableLayer for AttestingViewProvider {
+    /// A [`ViewTable`] returns its logical plan so DataFusion can inline the
+    /// view SQL. Refresh `get_data` builds that scan; inlining skips this
+    /// layer's `scan_with_args` and the producing-read stamp is never written.
+    fn get_logical_plan<'a>(
+        &'a self,
+        _below: &'a Arc<dyn TableProvider>,
+    ) -> Option<Cow<'a, LogicalPlan>> {
+        None
+    }
+
     async fn scan_with_args<'a>(
         &self,
         below: &Arc<dyn TableProvider>,
@@ -1966,6 +1981,48 @@ mod tests {
             assert!(
                 message.contains("single consistent read"),
                 "must state the impact, got {message}"
+            );
+        }
+
+        #[tokio::test]
+        async fn attesting_provider_records_when_refresh_builds_a_table_scan() {
+            // Refresh `get_data` uses `LogicalPlanBuilder::scan`, which inlines a
+            // `ViewTable`'s logical plan unless this wrapper hides it. Direct
+            // `wrapped.scan()` (the test below) cannot catch that skip.
+            let ctx = ctx_with_tables(&["orders", "customers"]);
+            let logical = ctx
+                .state()
+                .create_logical_plan("SELECT o.id FROM orders o JOIN customers c ON o.id = c.id")
+                .await
+                .expect("logical plan");
+            let view_table = ViewTable::new(logical, Some("join view".to_string()));
+            let attestation =
+                ViewRefreshReadAttestation::with_identity(MaterializationIdentity::new());
+            let wrapped = wrap_view_refresh_attestation(Arc::new(view_table), attestation.clone());
+
+            let mut state = ctx.state();
+            runtime_datafusion::refresh_scan::mark_refresh_scan(&mut state);
+            let table_source = Arc::new(datafusion::datasource::DefaultTableSource::new(wrapped));
+            let plan = datafusion::logical_expr::LogicalPlanBuilder::scan(
+                "orders_join",
+                table_source,
+                None,
+            )
+            .expect("refresh-shaped table scan")
+            .build()
+            .expect("logical plan");
+            datafusion::dataframe::DataFrame::new(state, plan)
+                .create_physical_plan()
+                .await
+                .expect("physical plan of a refresh-shaped view scan");
+
+            let shape = attestation
+                .last_stamped()
+                .map(|(_, shape)| shape)
+                .expect("refresh TableScan must record the executing-plan attestation");
+            assert!(
+                matches!(shape, ViewReadShape::MultipleReads { .. }),
+                "inlining the view plan would skip the wrapper and leave no stamp: {shape:?}"
             );
         }
 
