@@ -974,7 +974,7 @@ fn push_acceleration_row_policies(
 ///
 /// A marker is recorded rather than the field dropped: dropping it would silently widen
 /// what the identity accepts, which is the direction that restores a wrong archive.
-fn identity_value<T: serde::Serialize>(value: &T) -> String {
+fn identity_value<T: serde::Serialize + ?Sized>(value: &T) -> String {
     match serde_json::to_value(value) {
         Ok(value) => serde_json::to_string(&canonicalize_json_object_keys(value))
             .unwrap_or_else(|e| format!("-- unserializable: {e}")),
