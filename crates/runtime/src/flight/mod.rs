@@ -1499,9 +1499,9 @@ mod tests {
         // Stream schema is Utf8View so the encoder casts to LargeUtf8. The Int64
         // batch cannot be cast, so `encode_flight_batch` returns INTERNAL. A
         // following Utf8View batch is what a later poll would leak.
-        let items = vec![Ok(view_batch()), Ok(int_batch), Ok(view_batch())];
-        let inline = events_including_poll_after_error(respond(&views, items.clone(), true)).await;
-        let spawned = events_including_poll_after_error(respond(&views, items, false)).await;
+        let items = || vec![Ok(view_batch()), Ok(int_batch.clone()), Ok(view_batch())];
+        let inline = events_including_poll_after_error(respond(&views, items(), true)).await;
+        let spawned = events_including_poll_after_error(respond(&views, items(), false)).await;
 
         assert!(
             inline.iter().any(|event| event.starts_with("Err(")),
