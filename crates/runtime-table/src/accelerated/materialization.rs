@@ -17,10 +17,10 @@ limitations under the License.
 //! Dequeue begins a new generation under the accelerator write mutex — the same
 //! lock the snapshot path samples — so a snapshot already in
 //! `create_checkpoint_and_snapshot` finishes against the previous identity
-//! before a new refresh can retract. The epoch is the second lock: attestation
-//! is stamped at scan time (after that mutex is released), and the publish gate
-//! binds the epoch sampled with the rows. A later scan's plan cannot approve
-//! the previous generation.
+//! before a new refresh can retract. The epoch is the second lock: a refresh
+//! scan stamps attestation after that mutex is released, and the publish gate
+//! binds the epoch sampled with the rows. A later refresh generation's plan
+//! cannot approve the previous one. Ordinary queries do not record attestation.
 //!
 //! `(epoch, configured)` is one packed `AtomicU64` so a sample cannot observe a
 //! torn pair (`configured = true` for epoch `N` with the epoch word already at

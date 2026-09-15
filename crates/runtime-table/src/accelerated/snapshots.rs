@@ -506,8 +506,10 @@ pub async fn create_checkpoint_and_snapshot(
     // serialises this against the refresh that writes the rows *and* against the
     // dequeue retract that begins a new generation. Inside the lock the rows and the
     // sampled `(epoch, configured)` pair are consistent. Binding that epoch on the
-    // publish gate is what stops a later scan's attestation (recorded after the mutex
-    // is released) from approving these rows.
+    // publish gate stops a later refresh generation's attestation from approving
+    // these rows. Attestation itself is recorded only from a refresh session, so
+    // an ordinary query (including `on_zero_results: use_source`) cannot replace
+    // the plan shape that produced these rows at the same epoch.
     let (publishable, sampled_epoch) = match provenance {
         Some(refresh) => {
             let sample = refresh.read().await.sample_materialization();

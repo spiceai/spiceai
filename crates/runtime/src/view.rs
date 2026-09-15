@@ -31,6 +31,7 @@ use datafusion::{
 };
 use datafusion_federation::{FederatedPlanNode, FederatedTableProviderAdaptor};
 use runtime_acceleration::snapshot::SnapshotPublishGate;
+use runtime_datafusion::refresh_scan::session_is_refresh_scan;
 use runtime_search::embeddings::{table::EmbeddingTable, warm_index_on_zero_results};
 use runtime_table::accelerated::materialization::MaterializationIdentity;
 use sha2::{Digest, Sha256};
@@ -58,12 +59,15 @@ use std::{
 /// single-read refresh whose sources have since grown a second scan.
 ///
 /// [`AttestingViewProvider`] writes that attestation when the federated view is
-/// scanned, stamped with the materialization epoch the refresh began. No
-/// attestation means no refresh in this process has proven the current rows came
-/// from a single read, so publication is refused. An attestation from a later
-/// epoch than the rows being archived is refused the same way: a refresh can
-/// record a new plan shape before it takes the write mutex, and that shape must
-/// not approve the previous generation's rows.
+/// scanned from a refresh session, stamped with the materialization epoch the
+/// refresh began. An ordinary query — including `on_zero_results: use_source`
+/// fallback — does not record, so it cannot replace a multi-read refresh with a
+/// later single-read scan at the same epoch. No attestation means no refresh in
+/// this process has proven the current rows came from a single read, so
+/// publication is refused. An attestation from a later epoch than the rows being
+/// archived is refused the same way: a refresh can record a new plan shape
+/// before it takes the write mutex, and that shape must not approve the
+/// previous generation's rows.
 ///
 /// Refusing skips one publish; it does not fail the view or the refresh. The accelerated
 /// table stays correct and keeps serving — it just does not add a snapshot this cycle,
@@ -120,7 +124,7 @@ impl SnapshotPublishGate for ViewSnapshotPublishGate {
     }
 }
 
-/// Last refresh-plan read shape written by the executing scan, read by
+/// Last refresh-plan read shape written by the executing refresh scan, read by
 /// [`ViewSnapshotPublishGate`]. `None` means no refresh has attested this process.
 /// Each record is stamped with the [`MaterializationIdentity`] epoch at scan time.
 #[derive(Clone, Debug, Default)]
@@ -164,8 +168,7 @@ impl ViewRefreshReadAttestation {
     }
 }
 
-/// Records the read shape of the [`ExecutionPlan`] that will run this scan, which
-/// is the plan the refresh actually executes.
+/// Records the read shape of the [`ExecutionPlan`] a refresh will run.
 ///
 /// Stacked as a [`spice_table::TableLayer`] so layer walks see through to the
 /// federated view instead of stopping on a wrapping `TableProvider`.
@@ -177,9 +180,10 @@ pub(crate) fn wrap_view_refresh_attestation(
 }
 
 /// Federated-side layer for an accelerated view. `scan_with_args` classifies the
-/// plan returned by the table beneath — that is the executing refresh plan — and
-/// stores it for the publish gate. Every other [`TableLayer`] method keeps its
-/// default and forwards to `below`.
+/// plan returned by the table beneath and stores it for the publish gate only
+/// when the session is a refresh execution. An ordinary query, including
+/// `on_zero_results: use_source` fallback, does not record. Every other
+/// [`TableLayer`] method keeps its default and forwards to `below`.
 struct AttestingViewProvider {
     attestation: ViewRefreshReadAttestation,
 }
@@ -208,7 +212,9 @@ impl TableLayer for AttestingViewProvider {
     ) -> Result<ScanResult> {
         let result = below.scan_with_args(state, args).await?;
         let plan = result.into_inner();
-        self.record_executed(plan.as_ref());
+        if session_is_refresh_scan(state) {
+            self.record_executed(plan.as_ref());
+        }
         Ok(ScanResult::new(plan))
     }
 }
@@ -1322,6 +1328,7 @@ mod tests {
         use datafusion::logical_expr::Extension;
         use datafusion::physical_plan::ExecutionPlan;
         use datafusion_federation::FederationPlanner;
+        use runtime_table::accelerated::materialization::MaterializationSample;
         use std::sync::Arc;
 
         fn ctx_with_tables(names: &[&str]) -> SessionContext {
@@ -1658,18 +1665,147 @@ mod tests {
             let attestation = ViewRefreshReadAttestation::new();
             let wrapped = wrap_view_refresh_attestation(Arc::new(view_table), attestation.clone());
 
+            let mut state = ctx.state();
+            runtime_datafusion::refresh_scan::mark_refresh_scan(&mut state);
             let _plan = wrapped
-                .scan(&ctx.state(), None, &[], None)
+                .scan(&state, None, &[], None)
                 .await
                 .expect("view scan");
 
             let shape = attestation
                 .last()
-                .expect("scan records the executing-plan attestation");
+                .expect("refresh scan records the executing-plan attestation");
             assert!(
                 matches!(shape, ViewReadShape::MultipleReads { .. }),
                 "the wrapper must attest the executed join as a multi-read: {shape:?}"
             );
+        }
+
+        #[tokio::test]
+        async fn attesting_provider_ignores_scans_outside_refresh() {
+            let ctx = ctx_with_tables(&["orders", "customers"]);
+            let logical = ctx
+                .state()
+                .create_logical_plan("SELECT o.id FROM orders o JOIN customers c ON o.id = c.id")
+                .await
+                .expect("logical plan");
+            let view_table = ViewTable::new(logical, Some("join view".to_string()));
+            let attestation = ViewRefreshReadAttestation::new();
+            let wrapped = wrap_view_refresh_attestation(Arc::new(view_table), attestation.clone());
+
+            let _plan = wrapped
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("ordinary query scan");
+
+            assert!(
+                attestation.last().is_none(),
+                "a non-refresh scan must not write publish-gate attestation"
+            );
+        }
+
+        /// Sequential model of Copilot discussion_r4011722534.
+        ///
+        /// A refresh at epoch N produced a multi-read materialization and the
+        /// snapshot path sampled `(configured=true, epoch=N)`. An ordinary
+        /// query with `on_zero_results: use_source` then scans the wrapped
+        /// federated view without advancing the epoch. That scan's plan can
+        /// be a single read; it must not replace `MultipleReads` with
+        /// `SingleScan`. The publish gate must still refuse.
+        #[tokio::test]
+        async fn fallback_scan_cannot_replace_refresh_attestation_at_the_same_epoch() {
+            let identity = MaterializationIdentity::new();
+            let attestation = ViewRefreshReadAttestation::with_identity(identity.clone());
+
+            let epoch = identity.begin_refresh();
+            attestation.record(ViewReadShape::MultipleReads {
+                reads: 2,
+                tables: vec![
+                    TableReference::bare("orders"),
+                    TableReference::bare("customers"),
+                ],
+            });
+            identity.set_configured(true);
+
+            let sampled = identity.sample();
+            assert!(sampled.configured, "precondition: rows are configured");
+            assert_eq!(sampled.epoch, epoch);
+
+            let gate = ViewSnapshotPublishGate::new(
+                TableReference::bare("orders_us"),
+                attestation.clone(),
+            );
+            gate.bind_materialization_epoch(sampled.epoch);
+
+            let before = publish_gate_harness_state(&gate, &sampled).await;
+            eprintln!("before_fallback={before}");
+            assert_eq!(
+                before, "refused: multiple reads",
+                "precondition: multi-read refresh must refuse"
+            );
+
+            // Ordinary query / `on_zero_results: use_source`: scan the same
+            // attestation through a single-table plan with no refresh marker.
+            // Ungated, `classify_executed_read` would record `SingleScan` at
+            // epoch N and the gate would publish.
+            let ctx = ctx_with_tables(&["orders"]);
+            let logical = ctx
+                .state()
+                .create_logical_plan("SELECT id FROM orders")
+                .await
+                .expect("logical plan");
+            let view_table = ViewTable::new(logical, Some("fallback scan".to_string()));
+            let wrapped = wrap_view_refresh_attestation(Arc::new(view_table), attestation.clone());
+            let _plan = wrapped
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("fallback scan");
+
+            let after = publish_gate_harness_state(&gate, &sampled).await;
+            eprintln!("after_fallback={after}");
+            assert_eq!(
+                after, "refused: multiple reads",
+                "fallback must not flip MultipleReads→SingleScan at epoch {epoch}"
+            );
+            assert_eq!(
+                attestation.last_stamped().map(|(stamped_epoch, shape)| {
+                    (
+                        stamped_epoch,
+                        matches!(shape, ViewReadShape::MultipleReads { reads: 2, .. }),
+                    )
+                }),
+                Some((epoch, true)),
+                "refresh attestation must survive the fallback scan"
+            );
+            assert_eq!(
+                identity.sample(),
+                sampled,
+                "epoch+configured publish gating must stay intact"
+            );
+        }
+
+        async fn publish_gate_harness_state(
+            gate: &ViewSnapshotPublishGate,
+            sample: &MaterializationSample,
+        ) -> String {
+            match gate.check_publish().await {
+                Ok(()) => format!(
+                    "allowed configured={} epoch={}",
+                    sample.configured, sample.epoch
+                ),
+                Err(reason) => {
+                    let kind = if reason.contains("reads its sources") {
+                        "multiple reads"
+                    } else if reason.contains("no refresh-plan attestation") {
+                        "missing attestation"
+                    } else if reason.contains("later materialization") {
+                        "epoch mismatch"
+                    } else {
+                        "other"
+                    };
+                    format!("refused: {kind}")
+                }
+            }
         }
 
         /// Build an app holding one view and one dataset, to exercise the closure.

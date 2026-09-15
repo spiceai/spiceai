@@ -129,9 +129,10 @@ pub struct Refresh {
     /// state this cell cannot vouch for declines a publish instead of authorising
     /// one: a fresh process, a refresh in flight, and a refresh that failed or
     /// panicked. The epoch advances when a refresh is dequeued (under the same
-    /// write mutex the snapshot path samples). Attestation is stamped with that
-    /// epoch at scan time, so a later plan cannot approve an earlier
-    /// generation's rows. See [`super::materialization::MaterializationIdentity`].
+    /// write mutex the snapshot path samples). A refresh scan stamps
+    /// attestation with that epoch, so a later generation's plan cannot
+    /// approve an earlier one. Ordinary queries do not record. See
+    /// [`super::materialization::MaterializationIdentity`].
     ///
     /// Shared with every clone of this `Refresh`, which is what lets the refresh
     /// runner record provenance where the rows are written and the snapshot path

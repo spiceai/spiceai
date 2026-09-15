@@ -73,7 +73,7 @@ use runtime_datafusion::extension::bytes_processed::BytesProcessedPhysicalOptimi
 use runtime_datafusion::is_spice_internal_dataset;
 use runtime_datafusion::managed_runtime::{self, ManagedRuntimeError};
 use runtime_datafusion::optimizer_rule::avoid_vector_columns_on_index::AvoidDerivedVectorColumnOnIndexRule;
-use runtime_datafusion::refresh_scan::get_data;
+use runtime_datafusion::refresh_scan::{get_data, mark_refresh_scan};
 use runtime_datafusion::refresh_sql;
 use runtime_datafusion::schema_provider::ensure_schema_exists;
 use runtime_datafusion::session_config::get_df_default_config;
@@ -1871,6 +1871,10 @@ impl RefreshTask {
         state
             .config_mut()
             .set_extension(RequestContext::current(AsyncMarker::new().await));
+        // View snapshot attestation records only on a refresh session, so a
+        // later `on_zero_results: use_source` scan of the same provider cannot
+        // overwrite the plan that produced the rows.
+        mark_refresh_scan(&mut state);
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             tracing::error!("Unable to register JSON functions: {e}");
