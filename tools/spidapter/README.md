@@ -174,7 +174,7 @@ Run standard benchmarks using the `spidapter run bench [OPTIONS]` command. In ad
 - `--scenario-query-file <FILE_PATH>`: Path to a YAML file containing custom scenario queries. Required when `--query-set scenario` is specified.
 - `--query-overrides <QUERY_OVERRIDES>`: Optional query overrides. Possible values: `sqlite`, `postgresql`, `mysql`, `dremio`, `spark`, `odbcathena`, `duckdb`.
 - `--scale-factor <SCALE_FACTOR>`: The expected scale factor for the test, used in metrics calculation.
-- `--validate`: A boolean flag to specify whether results should be validated against their expected results. Supported for `tpch`, `tpch[parameterized]` (scale factor 1 only), and `scenario` query sets (when expected results are defined in the scenario file).
+- `--validate`: Compare query results against an oracle. TPC-H / `tpch[parameterized]` at scale factor 1 use the spec answer files. TPC-DS (any scale) and TPC-H at other scale factors compare each query to the same SQL run against unaccelerated clones under a reference schema: when testoperator starts `spiced`, it injects `__test_reference.*` datasets automatically; against an already-running instance, add those clones to the spicepod (`scripts/add_test_reference_datasets.py`) and pass `--reference-schema __test_reference`. Scenario query sets validate when expected results are defined in the scenario file. ClickBench still has no result oracle.
 - `--metrics`: Whether to upload metrics to the Spice OSS benchmarks dashboards. By default, submits to the Production metrics endpoint using the API key specified in the `SPICEAI_BENCHMARK_METRICS_KEY` environment variable. If specified, the metrics delivery endpoint can be overridden with the `SPICEAI_TELEMETRY_ENDPOINT` environment variable.
 - `--disable-caching`: Whether to disable results cache by supplying a `Cache-Control: no-cache` header over the Flight request. Allows disabling results cache separately from spicepod configuration.
 
@@ -312,7 +312,7 @@ spidapter run load -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced 
 
 ### Running Data Consistency tests
 
-Data consistency tests support specifying two spicepods, and validating that the outputs of queries between the two match. This has been partially superseded by the functionality of `--validate`, but is still useful for testing between query sets that do not yet support the `--validate` option (like `tpcds` and `clickbench`).
+Data consistency tests support specifying two spicepods, and validating that the outputs of queries between the two match. This has been partially superseded by `--validate` (TPC-H gold files, TPC-DS / non-SF-1 TPC-H via a reference schema). It remains useful for ClickBench, and for comparing two spicepods rather than an accelerator against its unaccelerated source.
 
 A data consistency test supports the same options as a benchmark test, with the additional options:
 

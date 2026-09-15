@@ -64,13 +64,21 @@ params:
     }
 
     /// Test that spiced can connect to a Streamable HTTP MCP server, as well as be an MCP server.
+    ///
+    /// The upstream Spice MCP endpoint requires `runtime.auth`, so the client
+    /// sends `mcp_auth_token`. This also exercises the dual-era client path
+    /// (`server/discover` first, legacy `initialize` fallback).
     #[tokio::test]
     async fn test_mcp_streamable_http() -> Result<(), anyhow::Error> {
-        let http_server_url = start_spiced_with_tools(vec![])
-            .await
-            .expect("Failed to start spiced with tools");
+        let http_server_url = start_spiced_with_mcp_config(McpConfig {
+            allowed_hosts: Some(vec!["*".to_string()]),
+        })
+        .await
+        .expect("Failed to start auth-enabled spiced MCP server");
 
-        let tool_yaml = format!("name: mcp_from_spiced\nfrom: mcp:{http_server_url}/v1/mcp");
+        let tool_yaml = format!(
+            "name: mcp_from_spiced\nfrom: mcp:{http_server_url}/v1/mcp\nparams:\n  mcp_auth_token: {TEST_API_KEY}"
+        );
         let http_client_url = start_spiced_with_tools(vec![
             yaml::from_str(tool_yaml.as_str())
                 .expect("Tool spicepod component is not in expected format"),
@@ -148,15 +156,62 @@ params:
         Ok(())
     }
 
+    const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
+
+    fn modern_request_meta() -> Value {
+        serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "spice-integration-test",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "io.modelcontextprotocol/clientCapabilities": {},
+        })
+    }
+
+    fn parse_jsonrpc_body(body: &str) -> anyhow::Result<Value> {
+        // rmcp may prefix the stream with an empty priming `data:` event
+        // (`id` / `retry`). Skip empty payloads so initialize / tools/list
+        // parse the JSON-RPC frame.
+        let json_str = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .find(|payload| !payload.is_empty())
+            .unwrap_or(body);
+        serde_json::from_str(json_str)
+            .map_err(|e| anyhow::anyhow!("Failed to parse JSON-RPC body '{body}': {e}"))
+    }
+
+    async fn post_mcp(
+        client: &reqwest::Client,
+        http_server_url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> anyhow::Result<reqwest::Response> {
+        let mut req = client
+            .post(format!("{http_server_url}/v1/mcp"))
+            .header(ACCEPT, "application/json, text/event-stream")
+            .header(CONTENT_TYPE, "application/json")
+            .header("X-API-Key", TEST_API_KEY);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        Ok(req.json(body).send().await?)
+    }
+
     /// Test the MCP Streamable HTTP server endpoint directly via JSON-RPC,
     /// without going through the rmcp client. This verifies the wire format
     /// (`POST /v1/mcp` with `Accept: application/json, text/event-stream`)
-    /// and the `initialize` handshake.
+    /// and the full legacy `initialize` session (dual-era): mint
+    /// `Mcp-Session-Id`, send `notifications/initialized`, then
+    /// `tools/list` on that session.
     #[tokio::test]
     async fn test_mcp_streamable_http_initialize() -> Result<(), anyhow::Error> {
-        let http_server_url = start_spiced_with_tools(vec![])
-            .await
-            .expect("Failed to start spiced with tools");
+        let http_server_url = start_spiced_with_mcp_config(McpConfig {
+            allowed_hosts: Some(vec!["*".to_string()]),
+        })
+        .await
+        .expect("Failed to start spiced MCP server");
 
         let client = reqwest::Client::new();
         // Use a concrete known protocol version rather than `LATEST` so this test
@@ -184,6 +239,7 @@ params:
             .post(format!("{http_server_url}/v1/mcp"))
             .header(ACCEPT, "application/json, text/event-stream")
             .header(CONTENT_TYPE, "application/json")
+            .header("X-API-Key", TEST_API_KEY)
             .json(&init_body)
             .send()
             .await?;
@@ -193,19 +249,14 @@ params:
             "initialize returned non-success status: {}",
             resp.status()
         );
-        assert!(
-            resp.headers().get("mcp-session-id").is_some(),
-            "initialize response missing Mcp-Session-Id header"
-        );
+        let session_id = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+            .expect("initialize response missing Mcp-Session-Id header");
 
-        // Response may be SSE-framed or plain JSON depending on server policy.
-        let body = resp.text().await?;
-        let json_str = body
-            .lines()
-            .find_map(|line| line.strip_prefix("data: "))
-            .unwrap_or(body.as_str());
-        let v: Value = serde_json::from_str(json_str)
-            .map_err(|e| anyhow::anyhow!("Failed to parse initialize response '{body}': {e}"))?;
+        let v = parse_jsonrpc_body(&resp.text().await?)?;
         assert_eq!(v.get("jsonrpc"), Some(&Value::String("2.0".to_string())));
         assert_eq!(v.get("id"), Some(&Value::Number(1.into())));
         let result = v
@@ -221,6 +272,353 @@ params:
                 .and_then(|c| c.get("tools"))
                 .is_some(),
             "initialize result missing tools capability: {result}"
+        );
+
+        let initialized_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        });
+        let initialized_resp = post_mcp(
+            &client,
+            &http_server_url,
+            &[
+                ("MCP-Protocol-Version", protocol_version.as_str()),
+                ("mcp-session-id", session_id.as_str()),
+            ],
+            &initialized_body,
+        )
+        .await?;
+        assert_eq!(
+            initialized_resp.status(),
+            reqwest::StatusCode::ACCEPTED,
+            "notifications/initialized should be HTTP 202, got {}",
+            initialized_resp.status()
+        );
+
+        let list_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {},
+        });
+        let list_resp = post_mcp(
+            &client,
+            &http_server_url,
+            &[
+                ("MCP-Protocol-Version", protocol_version.as_str()),
+                ("mcp-session-id", session_id.as_str()),
+            ],
+            &list_body,
+        )
+        .await?;
+        let list_status = list_resp.status();
+        let list_text = list_resp.text().await?;
+        assert!(
+            list_status.is_success(),
+            "legacy tools/list with Mcp-Session-Id failed: {list_status} body={list_text}"
+        );
+        let list_json = parse_jsonrpc_body(&list_text)?;
+        assert!(
+            list_json.get("error").is_none(),
+            "session-bound tools/list returned an error: {list_json}"
+        );
+        let tools = list_json
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .expect("session-bound tools/list missing result.tools");
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.get("name").and_then(Value::as_str) == Some("get_readiness")),
+            "session-bound tools/list should include get_readiness: {tools:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Modern (`2026-07-28`) `server/discover` — no `initialize`, no session.
+    #[tokio::test]
+    async fn test_mcp_streamable_http_discover() -> Result<(), anyhow::Error> {
+        let http_server_url = start_spiced_with_mcp_config(McpConfig {
+            allowed_hosts: Some(vec!["*".to_string()]),
+        })
+        .await
+        .expect("Failed to start spiced MCP server");
+
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": {
+                "_meta": modern_request_meta(),
+            },
+        });
+
+        let resp = post_mcp(
+            &client,
+            &http_server_url,
+            &[
+                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                ("Mcp-Method", "server/discover"),
+            ],
+            &body,
+        )
+        .await?;
+
+        let status = resp.status();
+        let minted_session = resp.headers().get("mcp-session-id").cloned();
+        let body = resp.text().await?;
+        assert!(
+            status.is_success(),
+            "server/discover returned non-success status: {status} body={body}"
+        );
+        assert!(
+            minted_session.is_none(),
+            "2026-07-28 discover must not mint Mcp-Session-Id"
+        );
+
+        let v = parse_jsonrpc_body(&body)?;
+        let result = v
+            .get("result")
+            .expect("server/discover response missing 'result'");
+        let versions = result
+            .get("supportedVersions")
+            .and_then(Value::as_array)
+            .expect("discover result missing supportedVersions");
+        assert!(
+            versions
+                .iter()
+                .any(|v| v.as_str() == Some(MODERN_PROTOCOL_VERSION)),
+            "discover must list 2026-07-28: {result}"
+        );
+        assert!(
+            result
+                .get("capabilities")
+                .and_then(|c| c.get("tools"))
+                .is_some(),
+            "discover result missing tools capability: {result}"
+        );
+
+        Ok(())
+    }
+
+    /// `tools/list` and `tools/call` succeed without a prior `initialize`.
+    #[tokio::test]
+    async fn test_mcp_streamable_http_tools_without_initialize() -> Result<(), anyhow::Error> {
+        let http_server_url = start_spiced_with_mcp_config(McpConfig {
+            allowed_hosts: Some(vec!["*".to_string()]),
+        })
+        .await
+        .expect("Failed to start spiced MCP server");
+
+        let client = reqwest::Client::new();
+        let list_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {
+                "_meta": modern_request_meta(),
+            },
+        });
+
+        let list_resp = post_mcp(
+            &client,
+            &http_server_url,
+            &[
+                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                ("Mcp-Method", "tools/list"),
+            ],
+            &list_body,
+        )
+        .await?;
+        assert!(
+            list_resp.status().is_success(),
+            "tools/list without initialize failed: {}",
+            list_resp.status()
+        );
+        let list_json = parse_jsonrpc_body(&list_resp.text().await?)?;
+        let tools = list_json
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .expect("tools/list missing result.tools");
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.get("name").and_then(Value::as_str) == Some("get_readiness")),
+            "tools/list should include get_readiness: {tools:?}"
+        );
+
+        let call_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "get_readiness",
+                "arguments": {},
+                "_meta": modern_request_meta(),
+            },
+        });
+        let call_resp = post_mcp(
+            &client,
+            &http_server_url,
+            &[
+                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                ("Mcp-Method", "tools/call"),
+                ("Mcp-Name", "get_readiness"),
+            ],
+            &call_body,
+        )
+        .await?;
+        assert!(
+            call_resp.status().is_success(),
+            "tools/call without initialize failed: {}",
+            call_resp.status()
+        );
+        let call_json = parse_jsonrpc_body(&call_resp.text().await?)?;
+        assert!(
+            call_json.get("result").is_some(),
+            "tools/call missing result: {call_json}"
+        );
+
+        Ok(())
+    }
+
+    /// Header/body mismatches on modern Streamable HTTP must be rejected.
+    #[tokio::test]
+    async fn test_mcp_streamable_http_header_mismatch() -> Result<(), anyhow::Error> {
+        let http_server_url = start_spiced_with_mcp_config(McpConfig {
+            allowed_hosts: Some(vec!["*".to_string()]),
+        })
+        .await
+        .expect("Failed to start spiced MCP server");
+
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {
+                "_meta": modern_request_meta(),
+            },
+        });
+
+        let resp = post_mcp(
+            &client,
+            &http_server_url,
+            &[
+                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                ("Mcp-Method", "tools/call"),
+            ],
+            &body,
+        )
+        .await?;
+
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "header/body method mismatch should be HTTP 400, got {}",
+            resp.status()
+        );
+        let v = parse_jsonrpc_body(&resp.text().await?)?;
+        let code = v.pointer("/error/code").and_then(Value::as_i64);
+        assert_eq!(
+            code,
+            Some(-32020),
+            "expected HeaderMismatch (-32020), got {v}"
+        );
+
+        Ok(())
+    }
+
+    /// An unknown protocol version must return `UnsupportedProtocolVersionError` (-32022)
+    /// listing the versions Spice supports.
+    #[tokio::test]
+    async fn test_mcp_unsupported_protocol_version() -> Result<(), anyhow::Error> {
+        let http_server_url = start_spiced_with_mcp_config(McpConfig {
+            allowed_hosts: Some(vec!["*".to_string()]),
+        })
+        .await
+        .expect("Failed to start spiced MCP server");
+
+        let client = reqwest::Client::new();
+        let mut meta = modern_request_meta();
+        meta["io.modelcontextprotocol/protocolVersion"] = Value::String("1900-01-01".to_string());
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": { "_meta": meta },
+        });
+
+        let resp = post_mcp(
+            &client,
+            &http_server_url,
+            &[
+                ("MCP-Protocol-Version", "1900-01-01"),
+                ("Mcp-Method", "server/discover"),
+            ],
+            &body,
+        )
+        .await?;
+
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "unsupported protocol version should be HTTP 400, got {}",
+            resp.status()
+        );
+        let v = parse_jsonrpc_body(&resp.text().await?)?;
+        let error = v.get("error").expect("missing JSON-RPC error");
+        assert_eq!(error.get("code").and_then(Value::as_i64), Some(-32022));
+        let supported = error
+            .pointer("/data/supported")
+            .and_then(Value::as_array)
+            .expect("UnsupportedProtocolVersionError must list supported versions");
+        assert!(
+            supported
+                .iter()
+                .any(|v| v.as_str() == Some(MODERN_PROTOCOL_VERSION)),
+            "supported versions should include 2026-07-28: {error}"
+        );
+
+        Ok(())
+    }
+
+    /// `/v1/mcp` requires `runtime.auth`. A modern request without credentials is 401.
+    #[tokio::test]
+    async fn test_mcp_streamable_http_requires_auth() -> Result<(), anyhow::Error> {
+        let http_server_url = start_spiced_with_mcp_config(McpConfig {
+            allowed_hosts: Some(vec!["*".to_string()]),
+        })
+        .await
+        .expect("Failed to start spiced MCP server");
+
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": {
+                "_meta": modern_request_meta(),
+            },
+        });
+
+        let resp = client
+            .post(format!("{http_server_url}/v1/mcp"))
+            .header(ACCEPT, "application/json, text/event-stream")
+            .header(CONTENT_TYPE, "application/json")
+            .header("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION)
+            .header("Mcp-Method", "server/discover")
+            .json(&body)
+            .send()
+            .await?;
+
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "modern request without credentials should be 401, got {}",
+            resp.status()
         );
 
         Ok(())
@@ -417,8 +815,23 @@ params:
     }
 
     /// Returns the runtime (with all components ready) and the base URL of the HTTP server.
+    ///
+    /// Auth is enabled with [`TEST_API_KEY`] so `/v1/tools` is reachable (the
+    /// `require_auth_configured` guard requires auth to be set up).
     async fn start_spiced_with_tools(tools: Vec<Tool>) -> anyhow::Result<String> {
-        let mut app_builder = AppBuilder::new("mcp-stdio");
+        use spicepod::component::runtime::Runtime as SpicepodRuntime;
+
+        let mut app_builder = AppBuilder::new("mcp-stdio").with_runtime(SpicepodRuntime {
+            auth: Some(Auth {
+                api_key: Some(ApiKeyAuth {
+                    enabled: true,
+                    keys: vec![ApiKey::ReadWrite {
+                        key: TEST_API_KEY.to_string(),
+                    }],
+                }),
+            }),
+            ..Default::default()
+        });
 
         for tool in tools {
             app_builder = app_builder.with_tool(tool);
@@ -432,9 +845,15 @@ params:
 
         let _tracing = init_tracing_with_task_history(Some("integration=debug,info"), &rt);
 
+        let app_arc = rt
+            .read_app()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("App not loaded"))?;
+        let endpoint_auth = EndpointAuth::new(rt.secrets(), &app_arc).await;
+
         let rt_ref_copy = Arc::clone(&rt);
         tokio::spawn(async move {
-            Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            Box::pin(rt_ref_copy.start_servers(api_config, None, endpoint_auth)).await
         });
 
         tokio::select! {
@@ -453,6 +872,7 @@ params:
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert("x-api-key", HeaderValue::from_static(TEST_API_KEY));
         let Ok(mut values) = http_get(format!("{base_url}/v1/tools").as_str(), headers).await
         else {
             return Err(anyhow::anyhow!("Failed to get tools list"));

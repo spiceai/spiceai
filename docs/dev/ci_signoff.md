@@ -639,6 +639,51 @@ reclaiming space is then the remedy that fixes both. Unlike disk there is no
 after-the-fact backstop: the endpoint may well be answering again by the time the
 run ends, so the only evidence is what the build said while it was failing.
 
+### "Compiler subprocess crashed — checks did not complete"
+
+The compiler driver can lose a subprocess to a signal — a crash in `ld` itself,
+the kernel killing it for memory, or the driver's own frontend going down the
+same way — and reports it in its own words, with a crash snapshot beside them;
+cargo then stops the build at that crate:
+
+```
+clang: error: unable to execute command: Segmentation fault: 11
+clang: error: linker command failed due to signal (use -v to see invocation)
+clang: note: diagnostic msg: /var/folders/…/T/linker-crash-122a1e
+error: could not compile `cayenne` (test "result_correctness_vs_sqlite_test") due to 1 previous error
+```
+
+The driver words a crash in its own frontend the same way, so the status names
+the class rather than the tool:
+
+```
+clang: error: unable to execute command: Segmentation fault: 11
+clang: error: clang frontend command failed due to signal (use -v to see invocation)
+error: could not compile `spiced` (lib) due to 1 previous error
+```
+
+**Re-dispatch it.** The artifact being produced never appeared, so the sign-off
+stopped there: whatever passed before it stands (the run above had already cleared
+lint), and nothing after it ran. None of that is a statement about your branch.
+The hedge is the same as for an unloadable test binary: if it recurs on this
+branch alone, or names a crate whose build this branch changes — a new build
+script, a dependency whose objects the linker cannot digest — the diff is worth
+suspecting.
+
+The same watcher reads this signature, and both halves are required: the
+compiler driver reporting a signal under its own `<driver>: error:` prefix at the
+start of the line (`clang`, `cc`, `gcc`, `g++`, `collect2` and their C++ spellings;
+`collect2` says `fatal error:`),
+*and* cargo's `could not compile` line. This repo's own suites assert on error
+strings, so a test that quotes the driver's wording and then fails stays a
+verdict about the branch; a `compile_error!` or build script whose text reads
+like a crash — prefix included — lands behind rustc's own `error:` rather than at
+the start of the line, and stays one too; and cargo's line alone is every
+ordinary compile error. Disk,
+cache, and an unloadable artifact all outrank it when they appear alongside,
+because each of those names a cause with its own remedy where this one only
+names the symptom.
+
 ### External contributors (forks)
 
 Posting a commit status requires write access to this repository, so
