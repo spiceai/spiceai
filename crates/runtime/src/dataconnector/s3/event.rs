@@ -140,15 +140,15 @@ fn parse_s3_record(record: &Value) -> Result<S3ObjectEvent, ParseError> {
 }
 
 fn parse_eventbridge_detail(value: &Value) -> Result<S3ObjectEvent, ParseError> {
-    let detail_type = value
+    let event_name = value
         .get("detail-type")
         .and_then(Value::as_str)
-        .unwrap_or("");
-    let event_name = if detail_type.is_empty() {
-        "ObjectCreated:Put".to_string()
-    } else {
-        detail_type.to_string()
-    };
+        .map(str::trim)
+        .filter(|detail_type| !detail_type.is_empty())
+        .ok_or_else(|| ParseError::Unrecognized {
+            detail: "EventBridge event is missing `detail-type`".to_string(),
+        })?
+        .to_string();
     let bucket = value
         .pointer("/detail/bucket/name")
         .and_then(Value::as_str)
@@ -156,18 +156,21 @@ fn parse_eventbridge_detail(value: &Value) -> Result<S3ObjectEvent, ParseError> 
             detail: "EventBridge detail is missing `detail.bucket.name`".to_string(),
         })?
         .to_string();
-    let encoded_key = value
+    // EventBridge delivers `detail.object.key` unencoded. Do not run it through
+    // `decode_s3_key` (`+` → space, `%xx` decode) or the object path is wrong.
+    let key = value
         .pointer("/detail/object/key")
         .and_then(Value::as_str)
         .ok_or_else(|| ParseError::Unrecognized {
             detail: "EventBridge detail is missing `detail.object.key`".to_string(),
-        })?;
+        })?
+        .to_string();
 
     Ok(S3ObjectEvent {
         kind: event_kind(&event_name),
         event_name,
         bucket,
-        key: decode_s3_key(encoded_key),
+        key,
     })
 }
 
@@ -216,7 +219,7 @@ pub fn matches_dataset(event: &S3ObjectEvent, bucket: &str, key_prefix: &str) ->
     if key_prefix.is_empty() {
         return true;
     }
-    event.key == key_prefix.trim_end_matches('/') || event.key.starts_with(key_prefix)
+    event.key.starts_with(key_prefix)
 }
 
 #[cfg(test)]
@@ -323,16 +326,54 @@ mod tests {
         assert!(!matches_dataset(&event, "other-bucket", "events/"));
         assert!(!matches_dataset(&event, "my-bucket", "other/"));
         assert!(matches_dataset(&event, "my-bucket", ""));
-        assert!(matches_dataset(
-            &S3ObjectEvent {
-                event_name: "ObjectCreated:Put".into(),
-                kind: ObjectEventKind::Created,
-                bucket: "my-bucket".into(),
-                key: "events".into(),
-            },
-            "my-bucket",
-            "events/"
-        ));
+        assert!(
+            !matches_dataset(
+                &S3ObjectEvent {
+                    event_name: "ObjectCreated:Put".into(),
+                    kind: ObjectEventKind::Created,
+                    bucket: "my-bucket".into(),
+                    key: "events".into(),
+                },
+                "my-bucket",
+                "events/"
+            ),
+            "object key `events` is not under prefix `events/`"
+        );
+    }
+
+    #[test]
+    fn parse_eventbridge_rejects_missing_detail_type() {
+        let err = parse_notification_body(
+            r#"{
+                "source": "aws.s3",
+                "detail": {
+                    "bucket": {"name": "my-bucket"},
+                    "object": {"key": "events/x.parquet"}
+                }
+            }"#,
+        )
+        .expect_err("missing detail-type must fail closed");
+        assert!(matches!(err, ParseError::Unrecognized { .. }));
+        assert!(
+            err.to_string().contains("detail-type"),
+            "error must name the missing field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_eventbridge_preserves_literal_plus_in_key() {
+        let events = parse_notification_body(
+            r#"{
+                "source": "aws.s3",
+                "detail-type": "Object Created",
+                "detail": {
+                    "bucket": {"name": "my-bucket"},
+                    "object": {"key": "events/data+file.parquet"}
+                }
+            }"#,
+        )
+        .expect("valid EventBridge notification");
+        assert_eq!(events[0].key, "events/data+file.parquet");
     }
 
     #[test]

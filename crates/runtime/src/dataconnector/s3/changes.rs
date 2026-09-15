@@ -29,8 +29,8 @@ use crate::dataconnector::federated::FederatedTableProvider;
 use crate::dataconnector::listing::ListingTableConnector;
 use crate::dataconnector::parameters::ConnectorContext;
 use crate::dataconnector::{ConnectorComponent, DataConnectorError, DataConnectorResult};
-use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
+use arrow::array::{ArrayRef, RecordBatch, StringArray, new_null_array};
+use arrow::datatypes::{DataType, SchemaRef};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use data_components::cdc::{
@@ -42,8 +42,8 @@ use datafusion::datasource::TableProvider;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
-use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
+use object_store::path::Path as ObjectPath;
 use runtime_component::dataset::DatasetSpec;
 use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_parameters::Parameters;
@@ -170,14 +170,12 @@ pub struct QueueMessage {
 
 #[derive(Debug, Snafu)]
 pub enum QueueError {
-    #[snafu(display("Failed to receive messages from SQS queue '{queue_url}': {source}"))]
+    #[snafu(display("Failed to receive messages from the configured SQS queue: {source}"))]
     Receive {
-        queue_url: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    #[snafu(display("Failed to delete an SQS message from queue '{queue_url}': {source}"))]
+    #[snafu(display("Failed to delete an SQS message from the configured SQS queue: {source}"))]
     Delete {
-        queue_url: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
@@ -231,7 +229,6 @@ impl MessageQueue for SqsQueue {
             .send()
             .await
             .map_err(|source| QueueError::Receive {
-                queue_url: self.queue_url.clone(),
                 source: Box::new(source),
             })?;
 
@@ -256,7 +253,6 @@ impl MessageQueue for SqsQueue {
             .send()
             .await
             .map_err(|source| QueueError::Delete {
-                queue_url: self.queue_url.clone(),
                 source: Box::new(source),
             })?;
         Ok(())
@@ -317,6 +313,96 @@ impl ObjectReader for ListingObjectReader {
             .await
             .map_err(|e| StreamError::Arrow(e.to_string()))
     }
+}
+
+/// `create_listing_table` infers Hive partition columns only when the path is a
+/// collection. An exact-object URL is not, so the file scan omits `key=value`
+/// columns that the federated dataset schema still has. Reconstruct those
+/// Utf8 constants from the object key so `wrap_data_as_change_batch` can apply.
+fn align_object_batch(
+    table_schema: &SchemaRef,
+    object_key: &str,
+    batch: &RecordBatch,
+) -> std::result::Result<RecordBatch, StreamError> {
+    if batch.schema().as_ref() == table_schema.as_ref() {
+        return Ok(batch.clone());
+    }
+
+    let hive = hive_partition_values(object_key);
+    let num_rows = batch.num_rows();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(table_schema.fields().len());
+    for field in table_schema.fields() {
+        if let Ok(index) = batch.schema().index_of(field.name()) {
+            let column = batch.column(index);
+            if column.data_type() != field.data_type() {
+                return Err(StreamError::External(format!(
+                    "S3 changes cannot apply object '{object_key}': column '{}' has type {} but the dataset schema is {}. See: {S3_DOCS}",
+                    field.name(),
+                    column.data_type(),
+                    field.data_type()
+                )));
+            }
+            columns.push(Arc::clone(column));
+            continue;
+        }
+        if let Some(value) = hive.get(field.name()) {
+            columns.push(constant_partition_array(field, value, num_rows)?);
+            continue;
+        }
+        if field.is_nullable() {
+            columns.push(new_null_array(field.data_type(), num_rows));
+            continue;
+        }
+        return Err(StreamError::External(format!(
+            "S3 changes cannot apply object '{object_key}': required column '{}' is missing from the object and is not a Hive `key=value` path segment. See: {S3_DOCS}",
+            field.name()
+        )));
+    }
+    RecordBatch::try_new(Arc::clone(table_schema), columns)
+        .map_err(|error| StreamError::Arrow(error.to_string()))
+}
+
+fn hive_partition_values(object_key: &str) -> std::collections::HashMap<String, String> {
+    object_key
+        .split('/')
+        .filter_map(|segment| {
+            let (name, value) = segment.split_once('=')?;
+            if name.is_empty() || value.is_empty() {
+                None
+            } else {
+                Some((name.to_string(), value.to_string()))
+            }
+        })
+        .collect()
+}
+
+fn constant_partition_array(
+    field: &arrow::datatypes::Field,
+    value: &str,
+    num_rows: usize,
+) -> std::result::Result<ArrayRef, StreamError> {
+    match field.data_type() {
+        DataType::Utf8 => Ok(Arc::new(StringArray::from(vec![
+            value.to_string();
+            num_rows
+        ]))),
+        other => Err(StreamError::External(format!(
+            "S3 changes cannot reconstruct Hive partition column '{}' as {other} from object key '{value}'. Listing Hive partitions are Utf8. See: {S3_DOCS}",
+            field.name()
+        ))),
+    }
+}
+
+fn align_object_batches(
+    table_schema: &SchemaRef,
+    object_key: &str,
+    batches: Vec<RecordBatch>,
+) -> std::result::Result<Vec<RecordBatch>, StreamError> {
+    batches
+        .into_iter()
+        .filter(|batch| batch.num_rows() > 0)
+        .map(|batch| align_object_batch(table_schema, object_key, &batch))
+        .collect()
 }
 
 struct ListingPrefixScanner {
@@ -437,9 +523,8 @@ impl S3ChangesConfig {
 
                 let backfill_interval = parse_backfill_interval(params, &dataset_name)?;
 
-                let region = resolve_region(params, url).context(MissingRegionSnafu {
-                    dataset_name,
-                })?;
+                let region =
+                    resolve_region(params, url).context(MissingRegionSnafu { dataset_name })?;
 
                 Ok(Some(Self {
                     queue_url: url.to_string(),
@@ -458,7 +543,9 @@ fn parse_backfill_interval(params: &Parameters, dataset_name: &str) -> Result<Du
     let Some(raw) = params.get("changes_backfill_interval").expose().ok() else {
         return Ok(DEFAULT_BACKFILL_INTERVAL);
     };
-    let parsed = fundu::parse_duration(raw).ok().filter(|d| *d > Duration::ZERO);
+    let parsed = fundu::parse_duration(raw)
+        .ok()
+        .filter(|d| *d > Duration::ZERO);
     parsed.context(InvalidBackfillIntervalSnafu {
         dataset_name,
         value: raw.to_string(),
@@ -521,6 +608,10 @@ pub fn region_from_queue_url(queue_url: &str) -> Option<String> {
     }
 }
 
+fn replace_applied_keys(applied_keys: &mut HashSet<String>, listed: Vec<String>) {
+    *applied_keys = listed.into_iter().collect();
+}
+
 fn prefix_display(bucket: &str, key_prefix: &str) -> String {
     if key_prefix.is_empty() {
         format!("s3://{bucket}")
@@ -529,59 +620,135 @@ fn prefix_display(bucket: &str, key_prefix: &str) -> String {
     }
 }
 
+/// How SQS credentials are selected — the same rules as the S3 object store
+/// (`determine_s3_credential_config`): explicit `s3_key`/`s3_secret` win even
+/// without `s3_auth: key`; `s3_iam_role_source: metadata|env` restricts the chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SqsAuth {
+    ExplicitKeys,
+    RestrictedIam { source: String },
+    DefaultChain,
+}
+
+fn sqs_auth_from_params(params: &Parameters, dataset_name: &str) -> Result<SqsAuth> {
+    let key = params.get("key").expose().ok();
+    let secret = params.get("secret").expose().ok();
+    let auth = params.get("auth").expose().ok();
+    let iam_role_source = params.get("iam_role_source").expose().ok();
+    let cred_config = aws_sdk_credential_bridge::determine_s3_credential_config(
+        key,
+        secret,
+        auth,
+        iam_role_source,
+    )
+    .map_err(|message| Error::SqsClient {
+        dataset_name: dataset_name.to_string(),
+        source: message.into(),
+    })?;
+
+    if cred_config.skip_signature {
+        return PublicAuthCannotConsumeSqsSnafu {
+            dataset_name: dataset_name.to_string(),
+        }
+        .fail();
+    }
+
+    if matches!(auth, Some("key")) && (key.is_none() || secret.is_none()) {
+        let missing = if key.is_none() { "s3_key" } else { "s3_secret" };
+        return Err(Error::SqsClient {
+            dataset_name: dataset_name.to_string(),
+            source: format!("s3_auth is `key` but `{missing}` is not set").into(),
+        });
+    }
+
+    if key.is_some() && secret.is_some() {
+        return Ok(SqsAuth::ExplicitKeys);
+    }
+
+    match cred_config.iam_role_source.as_deref() {
+        Some(source @ ("metadata" | "env")) => Ok(SqsAuth::RestrictedIam {
+            source: source.to_string(),
+        }),
+        _ => Ok(SqsAuth::DefaultChain),
+    }
+}
+
 async fn build_sqs_client(
     params: &Parameters,
     region: &str,
     dataset_name: &str,
 ) -> Result<aws_sdk_sqs::Client> {
-    let auth = params.get("auth").expose().ok();
-    if matches!(auth, Some("key")) {
-        let access_key = params.get("key").expose().ok().ok_or_else(|| Error::SqsClient {
-            dataset_name: dataset_name.to_string(),
-            source: "s3_auth is `key` but `s3_key` is not set".into(),
-        })?;
-        let secret_key = params
-            .get("secret")
-            .expose()
-            .ok()
-            .ok_or_else(|| Error::SqsClient {
+    match sqs_auth_from_params(params, dataset_name)? {
+        SqsAuth::ExplicitKeys => {
+            let access_key = params
+                .get("key")
+                .expose()
+                .ok()
+                .ok_or_else(|| Error::SqsClient {
+                    dataset_name: dataset_name.to_string(),
+                    source: "explicit S3 key credentials were selected but `s3_key` is not set"
+                        .into(),
+                })?;
+            let secret_key =
+                params
+                    .get("secret")
+                    .expose()
+                    .ok()
+                    .ok_or_else(|| Error::SqsClient {
+                        dataset_name: dataset_name.to_string(),
+                        source:
+                            "explicit S3 key credentials were selected but `s3_secret` is not set"
+                                .into(),
+                    })?;
+            let session_token = params
+                .get("session_token")
+                .expose()
+                .ok()
+                .map(ToString::to_string);
+            let credentials = aws_credential_types::Credentials::new(
+                access_key,
+                secret_key,
+                session_token,
+                None,
+                "spice-s3-changes",
+            );
+            let sdk_config = aws_sdk_credential_bridge::default_aws_config()
+                .region(aws_config::Region::new(region.to_string()))
+                .credentials_provider(credentials)
+                .load()
+                .await;
+            Ok(aws_sdk_sqs::Client::new(&sdk_config))
+        }
+        SqsAuth::RestrictedIam { source } => {
+            let sdk_config = aws_sdk_credential_bridge::build_restricted_sdk_config(
+                &source,
+                Some(region.to_string()),
+            )
+            .await
+            .map_err(|error| Error::SqsClient {
                 dataset_name: dataset_name.to_string(),
-                source: "s3_auth is `key` but `s3_secret` is not set".into(),
+                source: Box::new(error),
             })?;
-        let session_token = params
-            .get("session_token")
-            .expose()
-            .ok()
-            .map(ToString::to_string);
-        let credentials = aws_credential_types::Credentials::new(
-            access_key,
-            secret_key,
-            session_token,
-            None,
-            "spice-s3-changes",
-        );
-        let sdk_config = aws_sdk_credential_bridge::default_aws_config()
-            .region(aws_config::Region::new(region.to_string()))
-            .credentials_provider(credentials)
-            .load()
-            .await;
-        return Ok(aws_sdk_sqs::Client::new(&sdk_config));
+            Ok(aws_sdk_sqs::Client::new(&sdk_config))
+        }
+        SqsAuth::DefaultChain => {
+            let sdk_config =
+                aws_sdk_credential_bridge::get_or_init_sdk_config_with_region(Some(region))
+                    .await
+                    .map_err(|source| Error::SqsClient {
+                        dataset_name: dataset_name.to_string(),
+                        source: Box::new(source),
+                    })?
+                    .ok_or_else(|| Error::SqsClient {
+                        dataset_name: dataset_name.to_string(),
+                        source: "no AWS credentials were resolved for SQS".into(),
+                    })?;
+            let sqs_config = aws_sdk_sqs::config::Builder::from(sdk_config.as_ref())
+                .region(aws_config::Region::new(region.to_string()))
+                .build();
+            Ok(aws_sdk_sqs::Client::from_conf(sqs_config))
+        }
     }
-
-    let sdk_config = aws_sdk_credential_bridge::get_or_init_sdk_config_with_region(Some(region))
-        .await
-        .map_err(|source| Error::SqsClient {
-            dataset_name: dataset_name.to_string(),
-            source: Box::new(source),
-        })?
-        .ok_or_else(|| Error::SqsClient {
-            dataset_name: dataset_name.to_string(),
-            source: "no AWS credentials were resolved for SQS".into(),
-        })?;
-    let sqs_config = aws_sdk_sqs::config::Builder::from(sdk_config.as_ref())
-        .region(aws_config::Region::new(region.to_string()))
-        .build();
-    Ok(aws_sdk_sqs::Client::from_conf(sqs_config))
 }
 
 fn error_stream(error: Error) -> ChangesStream {
@@ -605,11 +772,16 @@ pub async fn s3_changes_stream(
         Ok(None) => return None,
         Err(error) => return Some(error_stream(error)),
     };
-    let client =
-        match build_sqs_client(&connector.params, &config.region, &dataset.name.to_string()).await {
-            Ok(client) => client,
-            Err(error) => return Some(error_stream(error)),
-        };
+    let client = match build_sqs_client(
+        &connector.params,
+        &config.region,
+        &dataset.name.to_string(),
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(error) => return Some(error_stream(error)),
+    };
     let queue = Arc::new(SqsQueue {
         client,
         queue_url: config.queue_url.clone(),
@@ -666,6 +838,7 @@ enum ProcessOutcome {
 async fn process_message(
     dataset: &DatasetSpec,
     config: &S3ChangesConfig,
+    table_schema: &SchemaRef,
     object_reader: &dyn ObjectReader,
     message: &QueueMessage,
 ) -> ProcessOutcome {
@@ -690,10 +863,13 @@ async fn process_message(
         .filter(|event| matches_dataset(event, &config.bucket, &config.key_prefix))
         .collect();
 
-    if matching.is_empty() {
-        let sample = &events[0];
+    if matching.len() != events.len() {
+        let sample = events
+            .iter()
+            .find(|event| !matches_dataset(event, &config.bucket, &config.key_prefix))
+            .unwrap_or(&events[0]);
         tracing::error!(
-            "Dataset '{}' received an S3 notification for s3://{}/{} that is outside this dataset's prefix {}, so the SQS message was left on the queue (not deleted) and will retry until visibility timeout. The queue must be exclusive to this dataset — fan out with SNS to a per-dataset queue, or set a bucket notification prefix filter. Sharing one queue across datasets is not supported. See: {S3_DOCS}",
+            "Dataset '{}' received an S3 notification for s3://{}/{} that is outside this dataset's prefix {}, so the entire SQS message was left on the queue (not deleted) and will retry until visibility timeout. The queue must be exclusive to this dataset — fan out with SNS to a per-dataset queue, or set a bucket notification prefix filter. Sharing one queue across datasets is not supported. See: {S3_DOCS}",
             dataset.name,
             sample.bucket,
             sample.key,
@@ -738,12 +914,21 @@ async fn process_message(
     for event in created {
         match object_reader.read_object(&event.bucket, &event.key).await {
             Ok(object_batches) => {
-                keys.push(event.key.clone());
-                batches.extend(
-                    object_batches
-                        .into_iter()
-                        .filter(|batch| batch.num_rows() > 0),
-                );
+                match align_object_batches(table_schema, &event.key, object_batches) {
+                    Ok(aligned) => {
+                        keys.push(event.key.clone());
+                        batches.extend(aligned);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "Dataset '{}' failed to align s3://{}/{} to the dataset schema after an ObjectCreated notification, so the SQS message will retry. Cause: {error}. See: {S3_DOCS}",
+                            dataset.name,
+                            event.bucket,
+                            event.key
+                        );
+                        return ProcessOutcome::Retry;
+                    }
+                }
             }
             Err(error) => {
                 tracing::warn!(
@@ -776,6 +961,7 @@ struct BackfillCreates {
 async fn backfill_unapplied(
     dataset: &DatasetSpec,
     config: &S3ChangesConfig,
+    table_schema: &SchemaRef,
     object_lister: &dyn ObjectLister,
     object_reader: &dyn ObjectReader,
     applied_keys: &HashSet<String>,
@@ -797,18 +983,24 @@ async fn backfill_unapplied(
             continue;
         }
         match object_reader.read_object(&config.bucket, &key).await {
-            Ok(object_batches) => {
-                let nonempty: Vec<RecordBatch> = object_batches
-                    .into_iter()
-                    .filter(|batch| batch.num_rows() > 0)
-                    .collect();
-                if nonempty.is_empty() {
+            Ok(object_batches) => match align_object_batches(table_schema, &key, object_batches) {
+                Ok(aligned) => {
+                    if aligned.is_empty() {
+                        keys.push(key);
+                        continue;
+                    }
+                    batches.extend(aligned);
                     keys.push(key);
-                    continue;
                 }
-                batches.extend(nonempty);
-                keys.push(key);
-            }
+                Err(error) => {
+                    tracing::warn!(
+                        "Dataset '{}' failed to align s3://{}/{} to the dataset schema during a listing backfill, so that object will be retried on the next `s3_changes_backfill_interval`. Cause: {error}. See: {S3_DOCS}",
+                        dataset.name,
+                        config.bucket,
+                        key
+                    );
+                }
+            },
             Err(error) => {
                 tracing::warn!(
                     "Dataset '{}' failed to read s3://{}/{} during a listing backfill, so that object will be retried on the next `s3_changes_backfill_interval`. Cause: {error}. See: {S3_DOCS}",
@@ -839,7 +1031,8 @@ fn rebuild_envelope(
     queue: &Arc<dyn MessageQueue>,
     receipt_handle: String,
 ) -> std::result::Result<ChangeEnvelope, StreamError> {
-    let (_, batch, is_dataset_ready, _) = build_history_unavailable_envelope(schema)?.into_parts()?;
+    let (_, batch, is_dataset_ready, _) =
+        build_history_unavailable_envelope(schema)?.into_parts()?;
     Ok(ChangeEnvelope::from_parts(
         Box::new(SqsDeleteCommitter {
             queue: Arc::clone(queue),
@@ -940,22 +1133,19 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
             }
         } else {
             tracing::info!(
-                "Dataset '{}' is starting S3 event capture with a non-empty accelerator, so objects under {} that are not yet in this process's applied set will be listed and applied before the dataset is marked ready. See: {S3_DOCS}",
+                "Dataset '{}' is starting S3 event capture with a non-empty accelerator, so the accelerator will be replaced from the listing prefix {} before SQS events are applied. An in-memory applied-key set cannot prove which objects are already present after a restart. See: {S3_DOCS}",
                 dataset.name,
                 prefix_display(&config.bucket, &config.key_prefix)
             );
-            let backfill = backfill_unapplied(
-                &dataset,
-                &config,
-                object_lister.as_ref(),
-                object_reader.as_ref(),
-                &applied_keys,
-            )
-            .await?;
-            let envelopes = backfill_envelopes(&schema, backfill.batches, false)?;
-            applied_keys.extend(backfill.keys);
-            for envelope in envelopes {
-                yield envelope;
+            yield build_history_unavailable_envelope(&schema)?;
+            match object_lister.list_keys().await {
+                Ok(keys) => applied_keys.extend(keys),
+                Err(error) => {
+                    tracing::warn!(
+                        "Dataset '{}' will replace the accelerator from the listing prefix but could not record object keys for backfill skip, so the next listing backfill may re-apply those objects. Cause: {error}. See: {S3_DOCS}",
+                        dataset.name
+                    );
+                }
             }
         }
 
@@ -988,7 +1178,7 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                 if shutdown_epoch() != epoch {
                     break;
                 }
-                match process_message(&dataset, &config, object_reader.as_ref(), &message).await {
+                match process_message(&dataset, &config, &schema, object_reader.as_ref(), &message).await {
                     ProcessOutcome::Creates { batches, keys, receipt_handle } => {
                         match create_envelopes(&schema, batches, &queue, receipt_handle) {
                             Ok(envelopes) => {
@@ -1006,7 +1196,17 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                         }
                     }
                     ProcessOutcome::Rebuild { receipt_handle } => {
-                        applied_keys.clear();
+                        match object_lister.list_keys().await {
+                            Ok(keys) => {
+                                replace_applied_keys(&mut applied_keys, keys);
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    "Dataset '{}' will rebuild the accelerator from the listing prefix but could not refresh the applied-object set, so the next listing backfill may re-apply current objects. Cause: {error}. See: {S3_DOCS}",
+                                    dataset.name
+                                );
+                            }
+                        }
                         yield rebuild_envelope(&schema, &queue, receipt_handle)?;
                     }
                     ProcessOutcome::Ack { receipt_handle } => {
@@ -1025,6 +1225,7 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                 match backfill_unapplied(
                     &dataset,
                     &config,
+                    &schema,
                     object_lister.as_ref(),
                     object_reader.as_ref(),
                     &applied_keys,
@@ -1066,8 +1267,8 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
 mod tests {
     use super::*;
     use crate::dataconnector::s3::{PARAMETERS, PREFIX};
-    use arrow::array::{Int32Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{Array, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use data_components::cdc::ChangeOperation;
     use datafusion::datasource::memory::MemTable;
     use runtime_component::dataset::acceleration::Acceleration;
@@ -1176,13 +1377,17 @@ mod tests {
         Arc::new(StaticFederated(Arc::new(table)))
     }
 
-    fn id_name_batch(ids: &[i32], names: &[&str]) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
+    fn id_name_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, false),
-        ]));
+        ]))
+    }
+
+    fn id_name_batch(ids: &[i32], names: &[&str]) -> RecordBatch {
+        let schema = id_name_schema();
         RecordBatch::try_new(
-            Arc::clone(&schema),
+            schema,
             vec![
                 Arc::new(Int32Array::from(ids.to_vec())),
                 Arc::new(StringArray::from(names.to_vec())),
@@ -1449,6 +1654,7 @@ mod tests {
         let outcome = process_message(
             &events_dataset(),
             &default_config(),
+            &id_name_schema(),
             &reader,
             &QueueMessage {
                 body: created_put_body("events/a.parquet"),
@@ -1480,6 +1686,7 @@ mod tests {
         let outcome = process_message(
             &events_dataset(),
             &default_config(),
+            &id_name_schema(),
             &reader,
             &QueueMessage {
                 body: removed_body("events/a.parquet"),
@@ -1494,6 +1701,7 @@ mod tests {
         let outcome = process_message(
             &events_dataset(),
             &config,
+            &id_name_schema(),
             &reader,
             &QueueMessage {
                 body: removed_body("events/a.parquet"),
@@ -1513,6 +1721,7 @@ mod tests {
         let unmatched = process_message(
             &events_dataset(),
             &default_config(),
+            &id_name_schema(),
             &reader,
             &QueueMessage {
                 body: created_put_body("other/a.parquet"),
@@ -1528,6 +1737,7 @@ mod tests {
         let other_bucket = process_message(
             &events_dataset(),
             &default_config(),
+            &id_name_schema(),
             &reader,
             &QueueMessage {
                 body: r#"{"Records":[{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"other-bucket"},"object":{"key":"events/a.parquet"}}}]}"#.into(),
@@ -1543,6 +1753,7 @@ mod tests {
         let poison = process_message(
             &events_dataset(),
             &default_config(),
+            &id_name_schema(),
             &reader,
             &QueueMessage {
                 body: "not-json".into(),
@@ -1562,6 +1773,7 @@ mod tests {
         let outcome = process_message(
             &events_dataset(),
             &default_config(),
+            &id_name_schema(),
             &reader,
             &QueueMessage {
                 body: created_put_body("events/a.parquet"),
@@ -1598,6 +1810,7 @@ mod tests {
         let result = backfill_unapplied(
             &events_dataset(),
             &default_config(),
+            &id_name_schema(),
             &lister,
             &reader,
             &applied,
@@ -1630,16 +1843,17 @@ mod tests {
             default_config(),
             id_name_batch(&[1], &["snap"]),
         );
-        let mut envelopes = collect_until_idle(stream, 2).await;
+        let mut envelopes = collect_until_idle(stream, 3).await;
         assert!(
-            envelopes.len() >= 2,
-            "expected ready + create, got {}",
+            envelopes.len() >= 3,
+            "expected rebuild + ready + create, got {}",
             envelopes.len()
         );
-        assert!(envelopes[0].is_dataset_ready());
-        assert!(envelopes[0].is_empty());
+        assert!(envelopes[0].history_unavailable());
+        assert!(envelopes[1].is_dataset_ready());
+        assert!(envelopes[1].is_empty());
 
-        let create = envelopes.remove(1);
+        let create = envelopes.remove(2);
         assert!(!create.is_empty());
         assert!(matches!(
             create.change_batch().expect("create batch").op(0),
@@ -1670,14 +1884,15 @@ mod tests {
             default_config(),
             id_name_batch(&[1], &["snap"]),
         );
-        let envelopes = collect_until_idle(stream, 2).await;
+        let envelopes = collect_until_idle(stream, 3).await;
         assert_eq!(
             envelopes.len(),
-            1,
+            2,
             "unmatched SQS must not yield a create, got {}",
             envelopes.len()
         );
-        assert!(envelopes[0].is_dataset_ready());
+        assert!(envelopes[0].history_unavailable());
+        assert!(envelopes[1].is_dataset_ready());
         assert!(
             queue.deleted.lock().await.is_empty(),
             "unmatched SQS messages must stay on the queue"
@@ -1704,13 +1919,15 @@ mod tests {
             config,
             id_name_batch(&[1], &["snap"]),
         );
-        let mut envelopes = collect_until_idle(stream, 2).await;
+        let mut envelopes = collect_until_idle(stream, 3).await;
         assert!(
-            envelopes.len() >= 2,
-            "expected ready + rebuild, got {}",
+            envelopes.len() >= 3,
+            "expected startup rebuild + ready + ObjectRemoved rebuild, got {}",
             envelopes.len()
         );
-        let rebuild = envelopes.remove(1);
+        assert!(envelopes[0].history_unavailable());
+        assert!(envelopes[1].is_dataset_ready());
+        let rebuild = envelopes.remove(2);
         assert!(rebuild.history_unavailable());
         rebuild
             .commit()
@@ -1751,7 +1968,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_nonempty_lists_unapplied_objects_before_ready() {
+    async fn stream_nonempty_rebuilds_from_listing_before_ready() {
         let queue = Arc::new(MockQueue::with_messages(vec![]));
         let reader = Arc::new(MapObjectReader {
             objects: HashMap::from([(
@@ -1771,21 +1988,165 @@ mod tests {
             default_config(),
             id_name_batch(&[1], &["snap"]),
         );
-        let envelopes = collect_until_idle(stream, 2).await;
+        let envelopes = collect_until_idle(stream, 3).await;
         assert_eq!(
             envelopes.len(),
             2,
-            "expected backfill create + ready, got {}",
+            "expected history_unavailable + ready, not an append of listed objects, got {}",
             envelopes.len()
         );
+        assert!(envelopes[0].history_unavailable());
         assert!(!envelopes[0].is_dataset_ready());
-        assert!(matches!(
-            envelopes[0]
-                .change_batch()
-                .expect("backfill batch")
-                .op(0),
-            ChangeOperation::Create
-        ));
         assert!(envelopes[1].is_dataset_ready());
+        assert!(envelopes[1].is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_mixed_notification_is_left_on_queue() {
+        let reader = MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/a.parquet".to_string(),
+                vec![id_name_batch(&[1], &["a"])],
+            )]),
+            fail_keys: vec![],
+        };
+        let mixed = process_message(
+            &events_dataset(),
+            &default_config(),
+            &id_name_schema(),
+            &reader,
+            &QueueMessage {
+                body: r#"{"Records":[{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/a.parquet"}}},{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"other/b.parquet"}}}]}"#.into(),
+                receipt_handle: "rh-mixed".into(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(mixed, ProcessOutcome::Leave),
+            "a mixed notification must leave the entire message, got {mixed:?}"
+        );
+    }
+
+    #[test]
+    fn queue_errors_do_not_include_the_secret_queue_url() {
+        let receive = QueueError::Receive {
+            source: "access denied".into(),
+        };
+        let delete = QueueError::Delete {
+            source: "access denied".into(),
+        };
+        for message in [receive.to_string(), delete.to_string()] {
+            assert!(
+                !message.contains("amazonaws")
+                    && !message.contains("123456789012")
+                    && !message.contains(QUEUE_URL),
+                "SQS errors must not interpolate the queue URL, got: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sqs_auth_uses_explicit_keys_without_auth_key_and_restricts_iam_source() {
+        let explicit = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_key", "AKIAEXAMPLE"),
+            ("s3_secret", "secret"),
+        ])
+        .await;
+        assert_eq!(
+            sqs_auth_from_params(&explicit, "events").expect("explicit keys"),
+            SqsAuth::ExplicitKeys
+        );
+
+        let metadata = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_auth", "iam_role"),
+            ("s3_iam_role_source", "metadata"),
+        ])
+        .await;
+        assert_eq!(
+            sqs_auth_from_params(&metadata, "events").expect("metadata"),
+            SqsAuth::RestrictedIam {
+                source: "metadata".into(),
+            }
+        );
+
+        let env = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_auth", "iam_role"),
+            ("s3_iam_role_source", "env"),
+        ])
+        .await;
+        assert_eq!(
+            sqs_auth_from_params(&env, "events").expect("env"),
+            SqsAuth::RestrictedIam {
+                source: "env".into(),
+            }
+        );
+
+        let default_chain = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_auth", "iam_role"),
+        ])
+        .await;
+        assert_eq!(
+            sqs_auth_from_params(&default_chain, "events").expect("default chain"),
+            SqsAuth::DefaultChain
+        );
+    }
+
+    #[test]
+    fn align_object_batch_adds_hive_partition_columns_from_key() {
+        let table_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("year", DataType::Utf8, true),
+            Field::new("month", DataType::Utf8, true),
+        ]));
+        let aligned = align_object_batch(
+            &table_schema,
+            "events/year=2026/month=09/a.parquet",
+            &id_name_batch(&[1], &["a"]),
+        )
+        .expect("hive columns should be reconstructed from the object key");
+        assert_eq!(aligned.schema().as_ref(), table_schema.as_ref());
+        let year = aligned
+            .column_by_name("year")
+            .expect("year")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("year is Utf8");
+        let month = aligned
+            .column_by_name("month")
+            .expect("month")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("month is Utf8");
+        assert_eq!(year.value(0), "2026");
+        assert_eq!(month.value(0), "09");
+    }
+
+    #[test]
+    fn align_object_batch_is_noop_when_schemas_match() {
+        let batch = id_name_batch(&[1], &["a"]);
+        let aligned = align_object_batch(&id_name_schema(), "events/a.parquet", &batch)
+            .expect("matching schema is a no-op");
+        assert_eq!(aligned.schema().as_ref(), batch.schema().as_ref());
+        assert_eq!(aligned.num_rows(), 1);
+    }
+
+    #[test]
+    fn replace_applied_keys_uses_current_listing_not_clear() {
+        let mut applied = HashSet::from(["events/gone.parquet".to_string()]);
+        replace_applied_keys(
+            &mut applied,
+            vec![
+                "events/a.parquet".to_string(),
+                "events/b.parquet".to_string(),
+            ],
+        );
+        assert!(!applied.contains("events/gone.parquet"));
+        assert!(applied.contains("events/a.parquet"));
+        assert!(applied.contains("events/b.parquet"));
     }
 }
