@@ -1257,9 +1257,7 @@ impl Query {
                 cached_at,
                 revalidation_started_at,
                 encoder,
-                cache::result::query::CachedQueryResult::raw_store_budget(
-                    cache_provider.max_size(),
-                ),
+                cache_provider.max_size(),
             )
             .await
             {

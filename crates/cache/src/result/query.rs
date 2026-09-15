@@ -126,10 +126,10 @@ impl CachedQueryResult {
     }
 
     /// Stay [`CachedData::Raw`] only when the prepared size is at or under this
-    /// many bytes. [`Self::from_batches`] uses [`RAW_STORE_MAX_BYTES`]. A store
-    /// path whose cache `max_size` is smaller should pass
-    /// [`raw_store_budget`] so a compressible result that would not fit raw is
-    /// still encoded (see <https://github.com/spiceai/spiceai/issues/8508>).
+    /// many bytes. [`Self::from_batches`] uses [`RAW_STORE_MAX_BYTES`].
+    /// [`Self::from_batches_bounded`] uses this against the cache `max_size`
+    /// so a compressible result that would not fit raw is still encoded
+    /// (see <https://github.com/spiceai/spiceai/issues/8508>).
     #[must_use]
     pub fn raw_store_budget(cache_max_size: u64) -> usize {
         let max = usize::try_from(cache_max_size.min(u64::from(u32::MAX))).unwrap_or(usize::MAX);
@@ -143,9 +143,9 @@ impl CachedQueryResult {
     /// so a later hit can be served in place without a decode.
     ///
     /// Store paths that know the cache `max_size` should call
-    /// [`Self::from_batches_bounded`] with [`raw_store_budget`] instead: a
-    /// result under the in-place budget that still exceeds `max_size` must be
-    /// encoded or it cannot be stored (see <https://github.com/spiceai/spiceai/issues/8508>).
+    /// [`Self::from_batches_bounded`] with that limit: a result under the
+    /// in-place budget that the weigher still rejects must be encoded or it
+    /// cannot be stored (see <https://github.com/spiceai/spiceai/issues/8508>).
     ///
     /// The `schema` parameter must be provided explicitly to ensure the correct
     /// schema is preserved even when `records` is empty (e.g., 0-row query results).
@@ -168,12 +168,17 @@ impl CachedQueryResult {
             cached_at,
             read_started_at,
             encoder,
-            RAW_STORE_MAX_BYTES,
+            u64::MAX,
         )
         .await
     }
 
-    /// [`Self::from_batches`] with an explicit raw-store budget.
+    /// [`Self::from_batches`] that also admits against `cache_max_size`.
+    ///
+    /// Stays [`CachedData::Raw`] when the prepared size is at or under
+    /// [`raw_store_budget`] *and* [`Self::memory_size`] fits `cache_max_size`.
+    /// Otherwise an encoder compresses the entry so a result that cannot fit
+    /// raw can still be stored (see <https://github.com/spiceai/spiceai/issues/8508>).
     ///
     /// # Errors
     ///
@@ -185,31 +190,48 @@ impl CachedQueryResult {
         cached_at: Instant,
         read_started_at: Instant,
         encoder: Option<Arc<dyn Encoder>>,
-        raw_store_budget: usize,
+        cache_max_size: u64,
     ) -> Result<Self, crate::encoding::Error> {
         let prepared = super::prepare_for_storage(records);
         let raw_bytes: usize = prepared
             .iter()
             .map(RecordBatch::get_array_memory_size)
             .sum();
-        let (data, encoder) = match encoder {
-            Some(encoder) if raw_bytes > raw_store_budget => {
-                let encoded_data = encoder.encode(&prepared).await?;
-                (
-                    CachedData::Encoded(Bytes::from(encoded_data)),
-                    Some(encoder),
-                )
-            }
-            _ => (CachedData::Raw(Arc::new(prepared)), None),
-        };
+        let raw_store_budget = Self::raw_store_budget(cache_max_size);
 
-        Ok(Self {
-            data,
+        let raw = Self {
+            data: CachedData::Raw(Arc::new(prepared)),
             schema: crate::intern::schema::intern(schema),
             input_tables: crate::intern::table_set::intern(input_tables),
             cached_at,
             read_started_at,
-            encoder,
+            encoder: None,
+        };
+
+        let Some(encoder) = encoder else {
+            return Ok(raw);
+        };
+
+        // Stay raw under the in-place budget only when the weigher would also
+        // admit the entry. Admission uses `memory_size()`, which adds entry and
+        // buffer overhead on top of array bytes. A compressible result whose
+        // arrays fit `max_size` but whose weight does not must still encode, or
+        // the store path skips it (see #8508).
+        if raw_bytes <= raw_store_budget && raw.memory_size() <= cache_max_size {
+            return Ok(raw);
+        }
+
+        let CachedData::Raw(batches) = raw.data else {
+            unreachable!("just constructed as Raw");
+        };
+        let encoded_data = encoder.encode(batches.as_slice()).await?;
+        Ok(Self {
+            data: CachedData::Encoded(Bytes::from(encoded_data)),
+            schema: raw.schema,
+            input_tables: raw.input_tables,
+            cached_at,
+            read_started_at,
+            encoder: Some(encoder),
         })
     }
 
@@ -920,8 +942,11 @@ mod tests {
             "fixture must stay under the in-place budget, got {raw_bytes}"
         );
 
-        let budget = CachedQueryResult::raw_store_budget(u64::try_from(cache_max).expect("2 KiB"));
-        assert_eq!(budget, cache_max);
+        let cache_max_u64 = u64::try_from(cache_max).expect("2 KiB");
+        assert_eq!(
+            CachedQueryResult::raw_store_budget(cache_max_u64),
+            cache_max
+        );
 
         let cached_result = CachedQueryResult::from_batches_bounded(
             vec![batch],
@@ -930,7 +955,7 @@ mod tests {
             Instant::now(),
             Instant::now(),
             encoder(),
-            budget,
+            cache_max_u64,
         )
         .await
         .expect("should create cached result");
@@ -938,6 +963,68 @@ mod tests {
         assert!(
             cached_result.is_encoded(),
             "a result that cannot fit raw in the cache must still be encoded under zstd"
+        );
+        let records = cached_result.records().await.expect("decoded batches");
+        assert_eq!(records[0].num_rows(), n);
+    }
+
+    /// Array bytes under `max_size` can still weigh more than `max_size` once
+    /// the weigher adds entry and buffer overhead. Those must encode under
+    /// zstd or the store path skips them (the #8508 weigher boundary).
+    #[tokio::test]
+    async fn a_result_under_max_size_in_array_bytes_is_encoded_when_the_weigher_does_not_fit() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let n = 200;
+        let col = Arc::new(Int32Array::from(vec![0i32; n]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::clone(&col) as _, Arc::clone(&col) as _],
+        )
+        .expect("batch");
+        let cache_max = 2 * 1024;
+        let raw_bytes = batch.get_array_memory_size();
+        assert!(
+            raw_bytes <= cache_max,
+            "fixture must sit under max_size in array bytes, got {raw_bytes}"
+        );
+
+        let now = Instant::now();
+        let raw = CachedQueryResult::new_raw(
+            vec![batch.clone()],
+            Arc::clone(&schema),
+            Arc::new(HashSet::new()),
+            now,
+            now,
+        );
+        assert!(
+            raw.memory_size() > u64::try_from(cache_max).expect("2 KiB"),
+            "fixture must exceed max_size once weighed, got {} vs {cache_max}",
+            raw.memory_size()
+        );
+
+        let cached_result = CachedQueryResult::from_batches_bounded(
+            vec![batch],
+            schema,
+            Arc::new(HashSet::new()),
+            now,
+            now,
+            encoder(),
+            u64::try_from(cache_max).expect("2 KiB"),
+        )
+        .await
+        .expect("should create cached result");
+
+        assert!(
+            cached_result.is_encoded(),
+            "a result whose weigher exceeds max_size must still be encoded under zstd"
+        );
+        assert!(
+            cached_result.memory_size() <= u64::try_from(cache_max).expect("2 KiB"),
+            "encoded entry must fit the cache, got {}",
+            cached_result.memory_size()
         );
         let records = cached_result.records().await.expect("decoded batches");
         assert_eq!(records[0].num_rows(), n);
