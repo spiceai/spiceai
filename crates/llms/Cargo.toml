@@ -80,6 +80,10 @@ rstest = "0.26.1"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 
+[[test]]
+name = "model2vec_hf_cache"
+path = "tests/model2vec_hf_cache.rs"
+
 [features]
 cuda = [
     "tei_backend/cuda",
