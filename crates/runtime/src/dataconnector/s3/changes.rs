@@ -39,8 +39,6 @@ use data_components::cdc::{
     wrap_data_as_change_batch,
 };
 use datafusion::datasource::TableProvider;
-use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
@@ -803,7 +801,6 @@ pub async fn s3_changes_stream(
         object_reader,
         object_lister,
         config,
-        session: connector.get_session_context(),
     }))
 }
 
@@ -815,7 +812,6 @@ struct S3ChangesStreamParts {
     object_reader: Arc<dyn ObjectReader>,
     object_lister: Arc<dyn ObjectLister>,
     config: S3ChangesConfig,
-    session: SessionContext,
 }
 
 #[derive(Debug)]
@@ -958,20 +954,21 @@ struct BackfillCreates {
     keys: Vec<String>,
 }
 
-async fn backfill_unapplied(
+async fn apply_unapplied_objects(
     dataset: &DatasetSpec,
     config: &S3ChangesConfig,
     table_schema: &SchemaRef,
     object_lister: &dyn ObjectLister,
     object_reader: &dyn ObjectReader,
     applied_keys: &HashSet<String>,
+    pass: &'static str,
 ) -> std::result::Result<BackfillCreates, StreamError> {
     let listed = object_lister.list_keys().await?;
     let mut batches = Vec::new();
     let mut keys = Vec::new();
     for key in listed {
         let event = S3ObjectEvent {
-            event_name: "listing-backfill".into(),
+            event_name: pass.to_string(),
             kind: ObjectEventKind::Created,
             bucket: config.bucket.clone(),
             key: key.clone(),
@@ -994,7 +991,7 @@ async fn backfill_unapplied(
                 }
                 Err(error) => {
                     tracing::warn!(
-                        "Dataset '{}' failed to align s3://{}/{} to the dataset schema during a listing backfill, so that object will be retried on the next `s3_changes_backfill_interval`. Cause: {error}. See: {S3_DOCS}",
+                        "Dataset '{}' failed to align s3://{}/{} to the dataset schema during {pass}, so that object will be retried on the next `s3_changes_backfill_interval`. Cause: {error}. See: {S3_DOCS}",
                         dataset.name,
                         config.bucket,
                         key
@@ -1003,7 +1000,7 @@ async fn backfill_unapplied(
             },
             Err(error) => {
                 tracing::warn!(
-                    "Dataset '{}' failed to read s3://{}/{} during a listing backfill, so that object will be retried on the next `s3_changes_backfill_interval`. Cause: {error}. See: {S3_DOCS}",
+                    "Dataset '{}' failed to read s3://{}/{} during {pass}, so that object will be retried on the next `s3_changes_backfill_interval`. Cause: {error}. See: {S3_DOCS}",
                     dataset.name,
                     config.bucket,
                     key
@@ -1012,18 +1009,6 @@ async fn backfill_unapplied(
         }
     }
     Ok(BackfillCreates { batches, keys })
-}
-
-async fn snapshot_stream(
-    session: &SessionContext,
-    table_provider: Arc<dyn TableProvider>,
-) -> std::result::Result<SendableRecordBatchStream, StreamError> {
-    let df = session
-        .read_table(table_provider)
-        .map_err(|error| StreamError::Arrow(error.to_string()))?;
-    df.execute_stream()
-        .await
-        .map_err(|error| StreamError::Arrow(error.to_string()))
 }
 
 fn rebuild_envelope(
@@ -1100,11 +1085,9 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
             object_reader,
             object_lister,
             config,
-            session,
         } = parts;
         let epoch = shutdown_epoch();
-        let table_provider = federated_table.table_provider().await;
-        let schema = table_provider.schema();
+        let schema = federated_table.table_provider().await.schema();
         let mut applied_keys: HashSet<String> = HashSet::new();
 
         if acceleration.is_provably_empty() {
@@ -1113,23 +1096,23 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                 dataset.name,
                 prefix_display(&config.bucket, &config.key_prefix)
             );
-            let mut snapshot = snapshot_stream(&session, Arc::clone(&table_provider)).await?;
-            while let Some(batch) = snapshot.next().await {
-                let batch = batch.map_err(|error| StreamError::Arrow(error.to_string()))?;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let change_batch = wrap_data_as_change_batch(&schema, &batch)?;
-                yield ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch, false);
-            }
-            match object_lister.list_keys().await {
-                Ok(keys) => applied_keys.extend(keys),
-                Err(error) => {
-                    tracing::warn!(
-                        "Dataset '{}' snapshotted the listing prefix but could not record object keys for backfill skip, so the next listing backfill may re-apply those objects. Cause: {error}. See: {S3_DOCS}",
-                        dataset.name
-                    );
-                }
+            // One listing is both the snapshot and the applied-key manifest.
+            // A later listing can include objects that were never read here; those
+            // must stay eligible for the completeness backfill.
+            let snapshot = apply_unapplied_objects(
+                &dataset,
+                &config,
+                &schema,
+                object_lister.as_ref(),
+                object_reader.as_ref(),
+                &applied_keys,
+                "the empty-accelerator snapshot",
+            )
+            .await?;
+            let envelopes = backfill_envelopes(&schema, snapshot.batches, false)?;
+            applied_keys.extend(snapshot.keys);
+            for envelope in envelopes {
+                yield envelope;
             }
         } else {
             tracing::info!(
@@ -1137,9 +1120,11 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                 dataset.name,
                 prefix_display(&config.bucket, &config.key_prefix)
             );
-            yield build_history_unavailable_envelope(&schema)?;
+            // Seed before `history_unavailable`. A listing taken afterwards can
+            // include objects the replace scan never saw; those must stay
+            // eligible for the completeness backfill.
             match object_lister.list_keys().await {
-                Ok(keys) => applied_keys.extend(keys),
+                Ok(keys) => replace_applied_keys(&mut applied_keys, keys),
                 Err(error) => {
                     tracing::warn!(
                         "Dataset '{}' will replace the accelerator from the listing prefix but could not record object keys for backfill skip, so the next listing backfill may re-apply those objects. Cause: {error}. See: {S3_DOCS}",
@@ -1147,6 +1132,7 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                     );
                 }
             }
+            yield build_history_unavailable_envelope(&schema)?;
         }
 
         yield build_ready_signal_envelope(&schema)?;
@@ -1222,13 +1208,14 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
             }
 
             if last_backfill.elapsed() >= config.backfill_interval {
-                match backfill_unapplied(
+                match apply_unapplied_objects(
                     &dataset,
                     &config,
                     &schema,
                     object_lister.as_ref(),
                     object_reader.as_ref(),
                     &applied_keys,
+                    "a listing backfill",
                 )
                 .await
                 {
@@ -1493,7 +1480,6 @@ mod tests {
             object_reader: reader,
             object_lister: lister,
             config,
-            session: SessionContext::new(),
         })
     }
 
@@ -1845,13 +1831,14 @@ mod tests {
             ],
         };
         let applied = HashSet::from(["events/old.parquet".to_string()]);
-        let result = backfill_unapplied(
+        let result = apply_unapplied_objects(
             &events_dataset(),
             &default_config(),
             &id_name_schema(),
             &lister,
             &reader,
             &applied,
+            "a listing backfill",
         )
         .await
         .expect("backfill should succeed");
@@ -1974,20 +1961,39 @@ mod tests {
         assert_eq!(*queue.deleted.lock().await, vec!["rh-gone".to_string()]);
     }
 
+    fn names_in(envelope: &ChangeEnvelope) -> Vec<String> {
+        let batch = envelope.change_batch().expect("change batch").data_batch();
+        let names = batch
+            .column_by_name("name")
+            .expect("name")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name is Utf8");
+        (0..names.len())
+            .map(|i| names.value(i).to_string())
+            .collect()
+    }
+
     #[tokio::test]
     async fn stream_empty_accelerator_snapshots_then_ready() {
         let queue = Arc::new(MockQueue::with_messages(vec![]));
         let reader = Arc::new(MapObjectReader {
-            objects: HashMap::new(),
+            objects: HashMap::from([(
+                "my-bucket/events/snap.parquet".to_string(),
+                vec![id_name_batch(&[1], &["snap"])],
+            )]),
             fail_keys: vec![],
+        });
+        let lister = Arc::new(MockLister {
+            keys: vec!["events/snap.parquet".into()],
         });
         let stream = start_stream(
             AccelerationContents::Empty,
             queue,
             reader,
-            empty_lister(),
+            lister,
             default_config(),
-            id_name_batch(&[1], &["snap"]),
+            id_name_batch(&[99], &["stale-federated"]),
         );
         let envelopes = collect_until_idle(stream, 2).await;
         assert_eq!(
@@ -2001,8 +2007,169 @@ mod tests {
             envelopes[0].change_batch().expect("snapshot batch").op(0),
             ChangeOperation::Create
         ));
+        assert_eq!(names_in(&envelopes[0]), vec!["snap".to_string()]);
         assert!(envelopes[1].is_dataset_ready());
         assert!(envelopes[1].is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_empty_snapshot_applies_every_key_from_the_listing_manifest() {
+        let queue: Arc<dyn MessageQueue> = Arc::new(FailingQueue {
+            remaining_failures: Mutex::new(2),
+        });
+        let reader = Arc::new(MapObjectReader {
+            objects: HashMap::from([
+                (
+                    "my-bucket/events/existing.parquet".to_string(),
+                    vec![id_name_batch(&[1], &["existing"])],
+                ),
+                (
+                    "my-bucket/events/arrived_during_snapshot.parquet".to_string(),
+                    vec![id_name_batch(&[2], &["arrived"])],
+                ),
+            ]),
+            fail_keys: vec![],
+        });
+        let lister: Arc<dyn ObjectLister> = Arc::new(SequenceLister {
+            listings: Mutex::new(vec![
+                vec![
+                    "events/existing.parquet".into(),
+                    "events/arrived_during_snapshot.parquet".into(),
+                ],
+                vec![
+                    "events/existing.parquet".into(),
+                    "events/arrived_during_snapshot.parquet".into(),
+                ],
+            ]),
+        });
+        let mut config = default_config();
+        config.backfill_interval = Duration::from_millis(1);
+        let stream = stream_s3_changes(S3ChangesStreamParts {
+            dataset: events_dataset(),
+            federated_table: federated_table(id_name_batch(&[99], &["stale-federated"])),
+            acceleration: AccelerationContents::Empty,
+            queue,
+            object_reader: reader,
+            object_lister: lister,
+            config,
+        });
+        let envelopes = collect_until_idle(stream, 3).await;
+        let snapshot_names: Vec<String> = envelopes
+            .iter()
+            .filter(|envelope| !envelope.is_empty() && !envelope.is_dataset_ready())
+            .flat_map(names_in)
+            .collect();
+        assert!(
+            snapshot_names.contains(&"existing".to_string())
+                && snapshot_names.contains(&"arrived".to_string()),
+            "snapshot must apply the listing manifest, not a later federated-table scan, got {snapshot_names:?} from {} envelopes",
+            envelopes.len()
+        );
+        assert!(
+            !snapshot_names.contains(&"stale-federated".to_string()),
+            "federated-table rows must not substitute for the listing manifest, got {snapshot_names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_empty_snapshot_backfills_keys_absent_from_the_snapshot_listing() {
+        let queue: Arc<dyn MessageQueue> = Arc::new(FailingQueue {
+            remaining_failures: Mutex::new(2),
+        });
+        let reader = Arc::new(MapObjectReader {
+            objects: HashMap::from([
+                (
+                    "my-bucket/events/existing.parquet".to_string(),
+                    vec![id_name_batch(&[1], &["existing"])],
+                ),
+                (
+                    "my-bucket/events/arrived_during_snapshot.parquet".to_string(),
+                    vec![id_name_batch(&[2], &["arrived"])],
+                ),
+            ]),
+            fail_keys: vec![],
+        });
+        let lister: Arc<dyn ObjectLister> = Arc::new(SequenceLister {
+            listings: Mutex::new(vec![
+                vec!["events/existing.parquet".into()],
+                vec![
+                    "events/existing.parquet".into(),
+                    "events/arrived_during_snapshot.parquet".into(),
+                ],
+            ]),
+        });
+        let mut config = default_config();
+        config.backfill_interval = Duration::from_millis(1);
+        let stream = stream_s3_changes(S3ChangesStreamParts {
+            dataset: events_dataset(),
+            federated_table: federated_table(id_name_batch(&[99], &["stale-federated"])),
+            acceleration: AccelerationContents::Empty,
+            queue,
+            object_reader: reader,
+            object_lister: lister,
+            config,
+        });
+        let envelopes = collect_until_idle(stream, 3).await;
+        assert!(
+            envelopes.len() >= 3,
+            "objects absent from the snapshot listing must be backfilled, got {}",
+            envelopes.len()
+        );
+        assert_eq!(names_in(&envelopes[0]), vec!["existing".to_string()]);
+        assert!(!envelopes[0].is_dataset_ready());
+        assert!(envelopes[1].is_dataset_ready());
+        assert!(envelopes[1].is_empty());
+        assert_eq!(names_in(&envelopes[2]), vec!["arrived".to_string()]);
+        assert!(envelopes[2].is_dataset_ready());
+    }
+
+    #[tokio::test]
+    async fn stream_nonempty_rebuild_backfills_keys_absent_from_the_pre_rebuild_listing() {
+        let queue: Arc<dyn MessageQueue> = Arc::new(FailingQueue {
+            remaining_failures: Mutex::new(2),
+        });
+        let reader = Arc::new(MapObjectReader {
+            objects: HashMap::from([
+                (
+                    "my-bucket/events/existing.parquet".to_string(),
+                    vec![id_name_batch(&[1], &["existing"])],
+                ),
+                (
+                    "my-bucket/events/arrived_during_rebuild.parquet".to_string(),
+                    vec![id_name_batch(&[2], &["arrived"])],
+                ),
+            ]),
+            fail_keys: vec![],
+        });
+        let lister: Arc<dyn ObjectLister> = Arc::new(SequenceLister {
+            listings: Mutex::new(vec![
+                vec!["events/existing.parquet".into()],
+                vec![
+                    "events/existing.parquet".into(),
+                    "events/arrived_during_rebuild.parquet".into(),
+                ],
+            ]),
+        });
+        let mut config = default_config();
+        config.backfill_interval = Duration::from_millis(1);
+        let stream = stream_s3_changes(S3ChangesStreamParts {
+            dataset: events_dataset(),
+            federated_table: federated_table(id_name_batch(&[99], &["stale-federated"])),
+            acceleration: AccelerationContents::NonEmpty,
+            queue,
+            object_reader: reader,
+            object_lister: lister,
+            config,
+        });
+        let envelopes = collect_until_idle(stream, 3).await;
+        assert!(
+            envelopes.len() >= 3,
+            "objects absent from the pre-rebuild listing must be backfilled, got {}",
+            envelopes.len()
+        );
+        assert!(envelopes[0].history_unavailable());
+        assert!(envelopes[1].is_dataset_ready());
+        assert_eq!(names_in(&envelopes[2]), vec!["arrived".to_string()]);
     }
 
     #[tokio::test]
@@ -2213,7 +2380,6 @@ mod tests {
             object_reader: reader,
             object_lister: lister,
             config,
-            session: SessionContext::new(),
         });
         let envelopes = collect_until_idle(stream, 3).await;
         assert!(
