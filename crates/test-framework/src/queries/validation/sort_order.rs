@@ -1057,13 +1057,6 @@ fn returns_group_keys(select: &Select) -> bool {
         })
 }
 
-/// Whether a query nested in `statement` — a subquery, derived table or CTE —
-/// limits its rows with `LIMIT`, `OFFSET`, `FETCH` or `TOP`.
-///
-/// Such a limit can keep unspecified rows, so the full result a reference run
-/// produces for the outer query is only one of the results the query allows. The
-/// checks that read that full result refuse the query rather than judge an answer
-/// against one of them.
 /// Whether `expr` names one of `aliases`, the select list's own output names. An
 /// alias is not in scope inside the select list that defines it, so a sort key
 /// that names one cannot be appended to that select list.
@@ -1110,6 +1103,13 @@ fn applies_collation(expr: &Expr) -> bool {
     expr.visit(&mut Collation).is_break()
 }
 
+/// Whether a query nested in `statement` — a subquery, derived table or CTE —
+/// limits its rows with `LIMIT`, `OFFSET`, `FETCH` or `TOP`.
+///
+/// Such a limit can keep unspecified rows, so the full result a reference run
+/// produces for the outer query is only one of the results the query allows. The
+/// checks that read that full result refuse the query rather than judge an answer
+/// against one of them.
 fn has_nested_row_limit(statement: &Statement) -> bool {
     struct NestedRowLimit {
         query_depth: usize,
@@ -1222,6 +1222,49 @@ pub fn check_sort_order_parsed(
 #[cfg(test)]
 mod tests {
     use super::top_level_limit_count;
+
+    /// rustdoc immediately above `fn_sig` in this file. A glued pair of comments
+    /// lands on the first function and leaves the second undocumented.
+    fn rustdoc_immediately_above<'a>(source: &'a str, fn_sig: &str) -> &'a str {
+        let fn_pos = source
+            .find(fn_sig)
+            .expect("function signature is in this file");
+        let before = &source[..fn_pos];
+        let start = before.rfind("\n\n").map_or(0, |i| i + 2);
+        let block = before[start..].trim();
+        assert!(
+            !block.is_empty()
+                && block
+                    .lines()
+                    .all(|line| line.starts_with("///") || line.is_empty()),
+            "{fn_sig} is not immediately preceded by rustdoc:\n{block}"
+        );
+        block
+    }
+
+    #[test]
+    fn rustdoc_for_nested_row_limit_and_select_alias_sits_on_the_right_fn() {
+        let source = include_str!("sort_order.rs");
+        let alias_doc = rustdoc_immediately_above(source, "fn names_a_select_alias(");
+        let nested_doc = rustdoc_immediately_above(source, "fn has_nested_row_limit(");
+
+        assert!(
+            nested_doc.contains("limits its rows with `LIMIT`, `OFFSET`, `FETCH` or `TOP`"),
+            "has_nested_row_limit must own the nested-limit rustdoc, got:\n{nested_doc}"
+        );
+        assert!(
+            alias_doc.contains("names one of `aliases`"),
+            "names_a_select_alias must own the alias rustdoc, got:\n{alias_doc}"
+        );
+        assert!(
+            !alias_doc.contains("`FETCH`") && !alias_doc.contains("nested in `statement`"),
+            "names_a_select_alias must not carry the nested-limit rustdoc, got:\n{alias_doc}"
+        );
+        assert!(
+            !nested_doc.contains("names one of `aliases`"),
+            "has_nested_row_limit must not carry the alias rustdoc, got:\n{nested_doc}"
+        );
+    }
 
     #[test]
     fn top_level_limit_count_reads_integer_literals() {
