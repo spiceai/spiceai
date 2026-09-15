@@ -576,10 +576,54 @@ fn bytes_to_string(bytes: &[u8]) -> String {
 /// The largest relative difference at which two numeric cells still compare equal.
 ///
 /// Engines legitimately disagree in the last digits of the same answer — a float
-/// `avg()` summed in a different partition order, a decimal rounded to a different
-/// scale — so the comparison cannot be exact. 0.1% absorbs that while failing an
-/// answer that is wrong by more.
+/// `avg()` summed in a different partition order — so the comparison cannot be
+/// exact. 0.1% absorbs that while failing an answer that is wrong by more. A
+/// decimal rounded by one engine and truncated by another also gets one unit of
+/// slack in its last place; see `numeric_strings_match`.
 pub const NUMERIC_RELATIVE_TOLERANCE: f64 = 0.001;
+
+/// Whether two rendered numeric cells hold the same answer.
+///
+/// They do when they differ by at most [`NUMERIC_RELATIVE_TOLERANCE`] of the first,
+/// or when both are written to the same number of decimal places and differ by one
+/// unit in the last of them. That is where an engine that rounds a decimal result
+/// and one that truncates it part ways — TPC-DS Q53's `224.796667` against
+/// `224.796666` — and for a value as small as Q98's `revenueratio` of `0.000812`,
+/// one unit is more than 0.1%. An integer has no rounded place, so it gets only the
+/// relative tolerance.
+fn numeric_strings_match(expected: &str, actual: &str) -> bool {
+    let (Ok(expected_num), Ok(actual_num)) = (expected.parse::<f64>(), actual.parse::<f64>())
+    else {
+        return false;
+    };
+    let diff = (expected_num - actual_num).abs();
+    if diff <= (expected_num.abs() * NUMERIC_RELATIVE_TOLERANCE).max(1e-12) {
+        return true;
+    }
+    match (decimal_places(expected), decimal_places(actual)) {
+        (Some(places), Some(actual_places)) if places == actual_places && places > 0 => {
+            let Ok(exponent) = i32::try_from(places) else {
+                return false;
+            };
+            // `f64` leaves `0.000813 - 0.000812` a hair over one unit.
+            diff <= 10_f64.powi(-exponent) * (1.0 + 1e-9)
+        }
+        _ => false,
+    }
+}
+
+/// The digits after the decimal point of a plainly written number, or `None` for
+/// one in exponent notation, whose last written digit marks no decimal place.
+fn decimal_places(value: &str) -> Option<usize> {
+    if value.contains(['e', 'E']) {
+        return None;
+    }
+    Some(
+        value
+            .split_once('.')
+            .map_or(0, |(_, fraction)| fraction.len()),
+    )
+}
 
 pub fn validate_batches_as_strings(
     expected: &RecordBatch,
@@ -635,15 +679,9 @@ pub fn validate_batches_as_strings(
                 (Some(expected_val), Some(actual_val)) => {
                     if expected_val != actual_val {
                         if data_type.is_numeric()
-                            && let (Ok(expected_num), Ok(actual_num)) =
-                                (expected_val.parse::<f64>(), actual_val.parse::<f64>())
+                            && numeric_strings_match(&expected_val, &actual_val)
                         {
-                            let diff = (expected_num - actual_num).abs();
-                            let tolerance =
-                                (expected_num.abs() * NUMERIC_RELATIVE_TOLERANCE).max(1e-12); // avoid zero-multiplied tolerance
-                            if diff <= tolerance {
-                                continue; // numeric match within tolerance
-                            }
+                            continue;
                         }
 
                         // Timestamp strings may differ only in fractional-second
@@ -1521,7 +1559,9 @@ pub fn validate_against_keyed_reference(
 /// result filled the `LIMIT` *and* that run has more than one row — then a
 /// leftover tied row past the boundary may exist, so only the sort keys are
 /// required to match. A unique last row, or a result shorter than `LIMIT`,
-/// is compared in full: those groups were not truncated.
+/// is compared in full: those groups were not truncated. A numeric sort key
+/// compares the way a numeric cell does, so a key two engines round differently
+/// still puts a row in the same tie group.
 fn compare_limit_results_allowing_cutoff_ties(
     query_name: &str,
     sql: &str,
@@ -1596,47 +1636,17 @@ fn compare_limit_results_allowing_cutoff_ties(
     let mut run_start = 0_usize;
     while run_start < n {
         let run_key = row_sort_key(&left, run_start, &key)?;
-        if row_sort_key(&right, run_start, &key)? != run_key {
+        if let Some(mismatch) = sort_key_mismatch(&left, &right, run_start, &key, &run_key)? {
             println!(
                 "Query '{query_name}' ORDER BY key mismatch at row {} (left vs right cutoff)",
                 run_start + 1
             );
-            return Ok(QueryValidationResult::Fail(
-                QueryValidationFailReason::DataMismatch {
-                    column: key[0].name.clone(),
-                    row_number: run_start + 1,
-                    expected: run_key
-                        .first()
-                        .and_then(Option::as_deref)
-                        .unwrap_or("")
-                        .to_string(),
-                    actual: row_sort_key(&right, run_start, &key)?
-                        .first()
-                        .and_then(Option::as_deref)
-                        .unwrap_or("")
-                        .to_string(),
-                },
-            ));
+            return Ok(QueryValidationResult::Fail(mismatch));
         }
         let mut run_end = run_start + 1;
         while run_end < n && row_sort_key(&left, run_end, &key)? == run_key {
-            if row_sort_key(&right, run_end, &key)? != run_key {
-                return Ok(QueryValidationResult::Fail(
-                    QueryValidationFailReason::DataMismatch {
-                        column: key[0].name.clone(),
-                        row_number: run_end + 1,
-                        expected: run_key
-                            .first()
-                            .and_then(Option::as_deref)
-                            .unwrap_or("")
-                            .to_string(),
-                        actual: row_sort_key(&right, run_end, &key)?
-                            .first()
-                            .and_then(Option::as_deref)
-                            .unwrap_or("")
-                            .to_string(),
-                    },
-                ));
+            if let Some(mismatch) = sort_key_mismatch(&left, &right, run_end, &key, &run_key)? {
+                return Ok(QueryValidationResult::Fail(mismatch));
             }
             run_end += 1;
         }
@@ -1664,6 +1674,41 @@ fn compare_limit_results_allowing_cutoff_ties(
         run_start = run_end;
     }
     Ok(QueryValidationResult::Pass)
+}
+
+/// Compares `right`'s sort key at `row` with `run_key`, the key of the tie group
+/// `left` has there, and names the first key column that differs. A numeric key
+/// column compares with [`numeric_strings_match`].
+fn sort_key_mismatch(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    row: usize,
+    key: &[SortKeyColumn],
+    run_key: &[Option<String>],
+) -> Result<Option<QueryValidationFailReason>> {
+    let right_key = row_sort_key(right, row, key)?;
+    let position = key.iter().zip(run_key.iter().zip(&right_key)).position(
+        |(column, (left_value, right_value))| match (left_value, right_value) {
+            (Some(left_value), Some(right_value)) => {
+                left_value != right_value
+                    && !(left
+                        .schema_ref()
+                        .field(column.index)
+                        .data_type()
+                        .is_numeric()
+                        && numeric_strings_match(left_value, right_value))
+            }
+            (left_value, right_value) => left_value != right_value,
+        },
+    );
+    Ok(
+        position.map(|position| QueryValidationFailReason::DataMismatch {
+            column: key[position].name.clone(),
+            row_number: row + 1, // indexes are 0-based, counts are 1-based
+            expected: run_key[position].as_deref().unwrap_or("").to_string(),
+            actual: right_key[position].as_deref().unwrap_or("").to_string(),
+        }),
+    )
 }
 
 fn row_sort_key(
@@ -3075,6 +3120,120 @@ mod test {
                 .expect("check tied hidden keys"),
             Some(QueryValidationResult::Pass),
             "rows that tie on every sort key may come in either order"
+        );
+    }
+
+    #[test]
+    fn test_numeric_cells_rounded_one_unit_apart_in_the_last_place_match() {
+        // TPC-DS Q98's `revenueratio` for one item: the reference returned 0.000812
+        // and DuckDB 0.000813, the same ratio written to six places and rounded two
+        // ways. One unit in the sixth place is 0.12% of so small a value.
+        let decimals = |scale: i8, values: &[i128]| {
+            let mut builder = Decimal128Builder::new()
+                .with_precision_and_scale(20, scale)
+                .expect("decimal type");
+            for value in values {
+                builder.append_value(*value);
+            }
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "revenueratio",
+                    DataType::Decimal128(20, scale),
+                    false,
+                )])),
+                vec![Arc::new(builder.finish())],
+            )
+            .expect("decimal batch")
+        };
+        let integers = |values: &[i64]| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "count",
+                    DataType::Int64,
+                    false,
+                )])),
+                vec![Arc::new(Int64Array::from(values.to_vec()))],
+            )
+            .expect("integer batch")
+        };
+        let matches = |expected: &RecordBatch, actual: &RecordBatch| {
+            validate_batches_as_strings(expected, actual).expect("compare")
+                == QueryValidationResult::Pass
+        };
+        assert!(
+            matches(&decimals(6, &[812]), &decimals(6, &[813])),
+            "one unit apart in the sixth place"
+        );
+        assert!(
+            !matches(&decimals(6, &[812]), &decimals(6, &[814])),
+            "two units apart is a different value"
+        );
+        assert!(
+            !matches(&decimals(6, &[812]), &decimals(7, &[8135])),
+            "a value written to more places does not widen the coarser one"
+        );
+        assert!(
+            !matches(&integers(&[5]), &integers(&[6])),
+            "an integer has no rounded place"
+        );
+    }
+
+    #[test]
+    fn test_sort_keys_rounded_one_unit_apart_share_a_position() {
+        // TPC-DS Q63 sorts on `avg_monthly_sales`, which the reference returned as
+        // 1677.624166 and DuckDB as 1677.624167.
+        let sql = "SELECT i_manager_id, sum_sales, avg_monthly_sales FROM t \
+                   ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 2";
+        let rows = |averages: [i128; 2]| {
+            let mut sums = Decimal128Builder::new()
+                .with_precision_and_scale(15, 2)
+                .expect("sum type");
+            sums.append_value(55_653);
+            sums.append_value(72_200);
+            let mut monthly = Decimal128Builder::new()
+                .with_precision_and_scale(15, 6)
+                .expect("average type");
+            for average in averages {
+                monthly.append_value(average);
+            }
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("i_manager_id", DataType::Int64, false),
+                    Field::new("sum_sales", DataType::Decimal128(15, 2), false),
+                    Field::new("avg_monthly_sales", DataType::Decimal128(15, 6), false),
+                ])),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 1])),
+                    Arc::new(sums.finish()),
+                    Arc::new(monthly.finish()),
+                ],
+            )
+            .expect("q63 batch")
+        };
+        let query = Query::new("tpcds_q63".into(), sql.into(), false);
+        let reference = rows([1_677_624_166, 1_677_624_166]);
+        assert_eq!(
+            validate_against_reference_batches(
+                &query,
+                &[rows([1_677_624_167, 1_677_624_167])],
+                std::slice::from_ref(&reference)
+            )
+            .expect("compare rounded keys"),
+            QueryValidationResult::Pass
+        );
+        assert_eq!(
+            validate_against_reference_batches(
+                &query,
+                &[rows([1_680_000_000, 1_680_000_000])],
+                &[reference]
+            )
+            .expect("compare different keys"),
+            QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch {
+                column: "avg_monthly_sales".to_string(),
+                row_number: 1,
+                expected: "1680.000000".to_string(),
+                actual: "1677.624166".to_string(),
+            })
         );
     }
 
