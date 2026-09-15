@@ -3482,6 +3482,39 @@ mod test {
     }
 
     #[test]
+    fn test_sqlite_tpcds_queries_divide_float_casts() {
+        // SQLite keeps `CAST(7 AS DECIMAL(15,4))` an integer, so a ratio of two such
+        // casts divides as integers and returns 0 (#3238). The SQLite TPC-DS set runs
+        // its FLOAT-cast Q49, Q75 and Q90 in their place.
+        let queries = crate::queries::get_tpcds_test_queries(
+            Some(crate::queries::QueryOverrides::SQLite),
+            None,
+        );
+        for (name, float_cast) in [
+            (
+                "tpcds_q49",
+                "cast(sum(coalesce(wr.wr_return_quantity,0)) as float)",
+            ),
+            (
+                "tpcds_q75",
+                "cast(curr_yr.sales_cnt as float)/cast(prev_yr.sales_cnt as float)",
+            ),
+            ("tpcds_q90", "cast(amc as float)/cast(pmc as float)"),
+        ] {
+            let matching: Vec<&Query> = queries
+                .iter()
+                .filter(|query| &*query.name == name)
+                .collect();
+            assert_eq!(matching.len(), 1, "{name} runs exactly once");
+            assert!(
+                matching[0].sql.to_lowercase().contains(float_cast),
+                "{name} divides FLOAT casts: {}",
+                matching[0].sql
+            );
+        }
+    }
+
+    #[test]
     fn test_only_clickbench_q18_takes_the_unordered_limit_subset_check() {
         use crate::queries::{
             QueryOverrides, get_clickbench_test_queries, get_tpcds_test_queries,
