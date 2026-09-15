@@ -1307,7 +1307,14 @@ pub fn check_sort_order_parsed(
 
 #[cfg(test)]
 mod tests {
-    use super::{top_level_limit_count, top_level_offset_count};
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use super::{
+        SortKeyCells, projected_sort_limit, top_level_limit_count, top_level_offset_count,
+        unordered_limit, unprojected_sort_limit,
+    };
 
     /// rustdoc immediately above `fn_sig` in this file. A glued pair of comments
     /// lands on the first function and leaves the second undocumented.
@@ -1385,5 +1392,78 @@ mod tests {
             top_level_offset_count("SELECT v FROM t LIMIT 10 OFFSET $1"),
             None
         );
+    }
+
+    #[test]
+    fn sql_shape_detectors_accept_and_reject_representative_queries() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("c", DataType::Int64, false),
+        ]));
+
+        for sql in [
+            "SELECT a AS k, count(*) FROM t GROUP BY k LIMIT 10",
+            "SELECT a, count(*) FROM t GROUP BY 1 LIMIT 10",
+            "SELECT a, count(*) FROM t GROUP BY a LIMIT 10 OFFSET 5",
+        ] {
+            assert!(
+                unordered_limit(sql).is_some(),
+                "grouped LIMIT that returns its keys: {sql}"
+            );
+        }
+        for sql in [
+            "SELECT DISTINCT a FROM t LIMIT 10",
+            "SELECT TOP 10 a, count(*) FROM t GROUP BY a",
+            "SELECT a, count(*) FROM (SELECT a FROM t LIMIT 5) AS s GROUP BY a LIMIT 10",
+            "SELECT count(*) FROM t GROUP BY a LIMIT 10",
+            "SELECT a FROM t LIMIT 10",
+        ] {
+            assert_eq!(unordered_limit(sql), None, "{sql}");
+        }
+
+        let hidden = "SELECT a, c FROM t ORDER BY hidden LIMIT 2";
+        let shown = "SELECT a, c FROM t ORDER BY c LIMIT 2 OFFSET 7";
+        let hidden_limit = unprojected_sort_limit(hidden, &schema)
+            .expect("a hidden sort key is read back beside the result");
+        assert_eq!(
+            (hidden_limit.limit, hidden_limit.offset, &hidden_limit.key),
+            (2, 0, &SortKeyCells::Appended(1))
+        );
+        let shown_limit = projected_sort_limit(shown, &schema)
+            .expect("a returned sort key keeps OFFSET on the struct");
+        assert_eq!(
+            (shown_limit.limit, shown_limit.offset, &shown_limit.key),
+            (2, 7, &SortKeyCells::Returned(vec![1]))
+        );
+        assert_eq!(
+            shown_limit.keyed_sql(4),
+            "SELECT a, c FROM t ORDER BY c LIMIT 4"
+        );
+        assert_eq!(unprojected_sort_limit(shown, &schema), None);
+        assert_eq!(projected_sort_limit(hidden, &schema), None);
+
+        let positional = projected_sort_limit("SELECT a, c FROM t ORDER BY 1 LIMIT 2", &schema)
+            .expect("ordinal 1 is the first result column");
+        assert_eq!(positional.key, SortKeyCells::Returned(vec![0]));
+        assert_eq!(
+            unprojected_sort_limit("SELECT a, c FROM t ORDER BY 1 LIMIT 2", &schema),
+            None
+        );
+
+        let alias_schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        assert_eq!(
+            unprojected_sort_limit(
+                "SELECT a AS x FROM t ORDER BY x, hidden LIMIT 1",
+                &alias_schema
+            ),
+            None
+        );
+        for sql in [
+            "SELECT a FROM t ORDER BY hidden COLLATE NOCASE LIMIT 1",
+            "SELECT a FROM (SELECT a, hidden FROM t LIMIT 5) AS s ORDER BY hidden LIMIT 1",
+            "SELECT TOP 10 a FROM t ORDER BY hidden LIMIT 10",
+        ] {
+            assert_eq!(unprojected_sort_limit(sql, &schema), None, "{sql}");
+        }
     }
 }

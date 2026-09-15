@@ -1365,7 +1365,34 @@ impl UnorderedLimitSubsetCheck {
         Ok(())
     }
 
-    /// The verdict, once every batch of the full result has been observed.
+    /// Whether later full-result batches cannot change [`Self::finish`]'s verdict.
+    ///
+    /// Every returned row has been seen in the full result, and either the
+    /// `LIMIT` is already filled so extra full-result rows cannot change the
+    /// expected count, or enough extra rows have arrived that the count already
+    /// fails. A short result whose full-result size is still unknown must keep
+    /// reading, and so must a result whose returned rows have not all been seen.
+    #[must_use]
+    pub fn observation_complete(&self) -> bool {
+        if self.schema_mismatch || self.returned.len() > self.limit {
+            return true;
+        }
+        let membership_proven = self
+            .copies
+            .values()
+            .all(|(times_returned, times_seen)| *times_seen >= *times_returned);
+        if !membership_proven {
+            return false;
+        }
+        let full_rows_past_offset = self.full_result_rows.saturating_sub(self.offset);
+        if self.returned.len() == self.limit {
+            return full_rows_past_offset >= self.limit;
+        }
+        full_rows_past_offset > self.returned.len()
+    }
+
+    /// The verdict, once the full-result stream has ended or
+    /// [`Self::observation_complete`] is true.
     #[must_use]
     pub fn finish(mut self) -> QueryValidationResult {
         if self.schema_mismatch {
@@ -2817,6 +2844,9 @@ mod test {
             check
                 .observe(batch)
                 .expect("full result batch should be observed");
+            if check.observation_complete() {
+                break;
+            }
         }
         check.finish()
     }
@@ -2856,6 +2886,7 @@ mod test {
             // full result (TPC-H simple_q6).
             "SELECT * FROM (SELECT o_orderkey + 1 FROM orders) AS c(key) LIMIT 10",
             "SELECT DISTINCT a FROM t LIMIT 10",
+            "SELECT TOP 10 a, count(*) FROM t GROUP BY a",
             // The groups are not returned, so a wrong count can match another group.
             "SELECT count(*) FROM t GROUP BY a LIMIT 10",
             // A nested LIMIT leaves the full result itself unspecified (TPC-H simple_q7).
@@ -2978,6 +3009,84 @@ mod test {
             QueryValidationResult::Fail(QueryValidationFailReason::RowCountMismatch {
                 expected: 1,
                 actual: 2
+            })
+        );
+    }
+
+    #[test]
+    fn test_unordered_limit_subset_stops_once_membership_and_count_are_proven() {
+        let sql = UNORDERED_GROUP_LIMIT;
+        let returned = user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5)]);
+        let first = user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5)]);
+        let unordered = unordered_limit(sql).expect("query should have an unordered LIMIT");
+        let mut check = UnorderedLimitSubsetCheck::new(&unordered, std::slice::from_ref(&returned))
+            .expect("subset check should build");
+        assert!(
+            !check.observation_complete(),
+            "no full-result row has been seen"
+        );
+        check
+            .observe(&first)
+            .expect("first full-result batch should be observed");
+        assert!(
+            check.observation_complete(),
+            "both returned rows fill the LIMIT and are in the first batch"
+        );
+        assert_eq!(check.finish(), QueryValidationResult::Pass);
+    }
+
+    #[test]
+    fn test_unordered_limit_subset_keeps_reading_when_offset_leaves_the_count_open() {
+        let sql =
+            r#"SELECT "UserID", "SearchPhrase", COUNT(*) FROM hits GROUP BY 1, 2 LIMIT 1 OFFSET 1"#;
+        let returned = user_phrase_counts(&[(1, Some("a"), 3)]);
+        let first = user_phrase_counts(&[(1, Some("a"), 3)]);
+        let second = user_phrase_counts(&[(2, None, 5)]);
+        let unordered = unordered_limit(sql).expect("query should have an unordered LIMIT");
+        let mut check = UnorderedLimitSubsetCheck::new(&unordered, std::slice::from_ref(&returned))
+            .expect("subset check should build");
+        check
+            .observe(&first)
+            .expect("first full-result batch should be observed");
+        assert!(
+            !check.observation_complete(),
+            "OFFSET 1 plus LIMIT 1 still needs a second full-result row"
+        );
+        check
+            .observe(&second)
+            .expect("second full-result batch should be observed");
+        assert!(check.observation_complete());
+        assert_eq!(check.finish(), QueryValidationResult::Pass);
+    }
+
+    #[test]
+    fn test_unordered_limit_subset_stops_a_short_result_once_the_full_result_is_too_long() {
+        let returned = user_phrase_counts(&[(2, None, 5)]);
+        let first = user_phrase_counts(&[(2, None, 5)]);
+        let extra = user_phrase_counts(&[(1, Some("a"), 3)]);
+        let unordered =
+            unordered_limit(UNORDERED_GROUP_LIMIT).expect("query should have an unordered LIMIT");
+        let mut check = UnorderedLimitSubsetCheck::new(&unordered, std::slice::from_ref(&returned))
+            .expect("subset check should build");
+        check
+            .observe(&first)
+            .expect("first full-result batch should be observed");
+        assert!(
+            !check.observation_complete(),
+            "a one-row answer to LIMIT 2 is only a count failure after a second full-result row"
+        );
+        check
+            .observe(&extra)
+            .expect("extra full-result batch should be observed");
+        assert!(
+            check.observation_complete(),
+            "two full-result rows already exceed a one-row LIMIT 2 answer"
+        );
+        assert_eq!(
+            check.finish(),
+            QueryValidationResult::Fail(QueryValidationFailReason::RowCountMismatch {
+                expected: 2,
+                actual: 1
             })
         );
     }

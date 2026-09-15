@@ -752,14 +752,19 @@ impl SpiceTestQueryWorker {
                     );
                     let mut subset_check =
                         validation::UnorderedLimitSubsetCheck::new(&unordered_limit, batches)?;
-                    let mut stream = spice_client
-                        .sql_with_params(
-                            &unordered_limit.unlimited_sql,
-                            reference_query.get_parameters_batch().transpose()?,
-                        )
-                        .await?;
-                    while let Some(batch) = futures::StreamExt::next(&mut stream).await {
-                        subset_check.observe(&batch?)?;
+                    if !subset_check.observation_complete() {
+                        let mut stream = spice_client
+                            .sql_with_params(
+                                &unordered_limit.unlimited_sql,
+                                reference_query.get_parameters_batch().transpose()?,
+                            )
+                            .await?;
+                        while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                            subset_check.observe(&batch?)?;
+                            if subset_check.observation_complete() {
+                                break;
+                            }
+                        }
                     }
                     validation_result = subset_check.finish();
                 }
