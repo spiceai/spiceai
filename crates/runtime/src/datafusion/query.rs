@@ -429,10 +429,11 @@ impl Query {
         QuerySpans { span, trace_span }
     }
 
-    /// Record a timeout or cancellation that fired during the results-cache
-    /// probe, matching `run_internal`'s tracked error path: the query span
-    /// exists, the tracker is finished, and `runtime.task_history` gets the
-    /// error.
+    /// Record a timeout or cancellation that fired before planning moved the
+    /// tracker, matching the tracked error path: the query span exists, the
+    /// tracker is finished, and `runtime.task_history` gets the error. Used
+    /// when the cancel fires during the results-cache probe, or while waiting
+    /// to run on the query runtime after the probe.
     fn finish_probe_cancellation(
         self,
         request_context: &RequestContext,
@@ -1175,12 +1176,25 @@ impl Query {
         };
         let query_id_str: Arc<str> = Arc::from(self.query_id.to_string());
 
+        // Cancellation can fire after the probe, while this query is waiting
+        // to run on the dedicated runtime. Check before moving `self` into the
+        // planning block: `ensure_not_cancelled` after that move used to
+        // return through the outer `Err` arm, which only logs and drops the
+        // tracker without `query_count` / duration / task-history completion.
+        if let Err(error) =
+            Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)
+        {
+            return self.finish_probe_cancellation(
+                &request_context,
+                QuerySpans { span, trace_span },
+                error,
+            );
+        }
+
         let inner_span = span.clone();
 
         let query_result =
             async {
-                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
-
                 // A hit found before planning is served here, ahead of the
                 // session state every planned query clones. An entry that fails
                 // to decode leaves the query to plan and run like a miss, without
@@ -3532,6 +3546,90 @@ mod tests {
             .expect("query B task should not panic")
             .expect_err("query B should fail with cancellation");
         match b_err {
+            Error::QueryCancelled {
+                query_id: cancelled,
+            } => assert_eq!(cancelled, query_id.to_string()),
+            other => panic!("expected QueryCancelled, got: {other:?}"),
+        }
+    }
+
+    /// A miss hops onto the query runtime after the probe. A cancel that fires
+    /// while that hop is waiting must still return `QueryCancelled` and finish
+    /// the tracker — `run_internal`'s first cancel check used to `?` before
+    /// `self` moved, and the outer `Err` arm only logged.
+    #[tokio::test]
+    async fn a_cancel_while_waiting_on_the_query_runtime_returns_cancelled() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+        let query_runtime =
+            runtime_async::ManagedTokioRuntime::try_new().expect("the query runtime should start");
+        let query_runtime_handle = query_runtime.handle().clone();
+        df.set_cpu_runtime(query_runtime);
+
+        let workers = query_runtime_handle.metrics().num_workers();
+        let release = Arc::new(std::sync::Barrier::new(workers + 1));
+        let held = Arc::new(AtomicUsize::new(0));
+        for _ in 0..workers {
+            let release = Arc::clone(&release);
+            let held = Arc::clone(&held);
+            query_runtime_handle.spawn(async move {
+                held.fetch_add(1, Ordering::SeqCst);
+                release.wait();
+            });
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while held.load(Ordering::SeqCst) < workers {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "only {} of {workers} query runtime workers were held",
+                held.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let query_id = uuid::Uuid::new_v4();
+        let cancel_token = CancellationToken::new();
+        let df_q = Arc::clone(&df);
+        let token_q = cancel_token.clone();
+        let handle = tokio::spawn(async move {
+            QueryBuilder::new("SELECT 43 AS value", df_q)
+                .query_id(query_id)
+                .cancellation_token(token_q)
+                .build()
+                .run()
+                .await
+                .map(|_q| ())
+        });
+
+        let registry = df.query_cancel_registry();
+        for _ in 0..500 {
+            if registry
+                .list_all()
+                .iter()
+                .any(|info| info.query_id == query_id)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cancel_token.cancel();
+        release.wait();
+
+        let err = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("cancelled query should return once the query runtime can run it")
+            .expect("query task should not panic")
+            .expect_err("query should fail with cancellation");
+        match err {
             Error::QueryCancelled {
                 query_id: cancelled,
             } => assert_eq!(cancelled, query_id.to_string()),
