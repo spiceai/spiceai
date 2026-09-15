@@ -1210,23 +1210,22 @@ pub fn validate_against_reference_batches(
 /// over the same file. [`unordered_limit`] only accepts a grouped query that returns
 /// its group keys, so every row names its group, and an answer is correct when it
 /// has as many rows as the full result leaves after the `OFFSET`, up to the `LIMIT`,
-/// and every row it returned is a row of the full result after `OFFSET`, counted as
-/// a multiset. Rows before `OFFSET` in the reference stream are not eligible:
-/// `LIMIT 1 OFFSET 2` over `[a, b, c]` may return only `c`.
+/// and every row it returned is a row of the full result, counted as a multiset.
+/// `OFFSET` is applied to each engine's own unspecified order, so a row the
+/// reference stream would skip is still eligible.
 ///
 /// Cells render through [`array_value_to_string`] like every comparison here but
 /// must match exactly, with no numeric tolerance, so a returned row passes only if
-/// the full result holds that exact row after `OFFSET`. The full result arrives one
-/// batch at a time through [`Self::observe`] and only the returned rows are kept, so
-/// memory stays bounded by the `LIMIT` however large the full result is.
+/// the full result holds that exact row. The full result arrives one batch at a
+/// time through [`Self::observe`] and only the returned rows are kept, so memory
+/// stays bounded by the `LIMIT` however large the full result is.
 pub struct UnorderedLimitSubsetCheck {
     limit: usize,
     offset: usize,
     /// The returned rows, in the order they were returned.
     returned: Vec<Vec<Option<String>>>,
     /// Per distinct returned row: how many times it was returned, and how many
-    /// copies of it the full result has shown after `OFFSET` so far, capped at
-    /// the former.
+    /// copies of it the full result has shown so far, capped at the former.
     copies: HashMap<Vec<Option<String>>, (usize, usize)>,
     /// First-column values of the returned rows, so a full-result row that cannot
     /// match is skipped without rendering the rest of it.
@@ -1263,13 +1262,15 @@ impl UnorderedLimitSubsetCheck {
 
     /// Matches one batch of the full result against the returned rows.
     ///
-    /// The first `offset` rows of the reference stream are skipped before
-    /// `copies` is updated: they are not eligible to satisfy the limited query.
+    /// Every full-result row may update `copies`. `OFFSET` is applied to each
+    /// engine's own unspecified stream, so a row this reference stream would skip
+    /// can still be returned (for example `LIMIT 1 OFFSET 1` over `[a, b, c]`
+    /// may return `a` from stream `[c, a, b]`). [`Self::finish`] still sizes the
+    /// answer from `offset` and `limit`.
     ///
     /// # Errors
     /// Returns an error if a cell of `batch` cannot be rendered.
     pub fn observe(&mut self, batch: &RecordBatch) -> Result<()> {
-        let stream_start = self.full_result_rows;
         self.full_result_rows += batch.num_rows();
         let Some(width) = self.returned.first().map(Vec::len) else {
             return Ok(());
@@ -1278,12 +1279,8 @@ impl UnorderedLimitSubsetCheck {
             self.schema_mismatch = true;
             return Ok(());
         }
-        let skip = self.offset.saturating_sub(stream_start);
         let first_column = batch.column(0).as_ref();
         for row in 0..batch.num_rows() {
-            if row < skip {
-                continue;
-            }
             if !self
                 .first_column_values
                 .contains(&array_value_to_string(first_column, row)?)
@@ -2576,30 +2573,22 @@ mod test {
     }
 
     #[test]
-    fn test_unordered_limit_subset_skips_rows_before_offset() {
-        // regression test for #14119: LIMIT 1 OFFSET 2 over [a, b, c] may return
-        // only `c`. Rows before OFFSET in the reference stream are not eligible.
+    fn test_unordered_limit_subset_offset_changes_how_many_rows_not_which() {
+        // OFFSET is applied to each engine's own unspecified order. LIMIT 1
+        // OFFSET 1 over [a, b, c] may return a (stream [c, a, b]), b, or c.
         let sql =
-            r#"SELECT "UserID", "SearchPhrase", COUNT(*) FROM hits GROUP BY 1, 2 LIMIT 1 OFFSET 2"#;
+            r#"SELECT "UserID", "SearchPhrase", COUNT(*) FROM hits GROUP BY 1, 2 LIMIT 1 OFFSET 1"#;
         let full_result = [
             user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5)]),
             user_phrase_counts(&[(3, Some("c"), 7)]),
         ];
-        assert_eq!(
-            check_unordered_limit_subset(
-                sql,
-                &user_phrase_counts(&[(3, Some("c"), 7)]),
-                &full_result
-            ),
-            QueryValidationResult::Pass
-        );
-        assert_eq!(
-            check_unordered_limit_subset(sql, &user_phrase_counts(&[(2, None, 5)]), &full_result),
-            QueryValidationResult::Fail(QueryValidationFailReason::RowNotAllowedByLimit {
-                row_number: 1,
-                row: r#"[Some("2"), None, Some("5")]"#.to_string(),
-            })
-        );
+        for row in [(1, Some("a"), 3), (2, None, 5), (3, Some("c"), 7)] {
+            assert_eq!(
+                check_unordered_limit_subset(sql, &user_phrase_counts(&[row]), &full_result),
+                QueryValidationResult::Pass,
+                "{row:?}"
+            );
+        }
         assert_eq!(
             check_unordered_limit_subset(
                 sql,
