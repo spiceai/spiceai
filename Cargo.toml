@@ -217,6 +217,7 @@ aws-sdk-ec2 = { version = "1.113.0", default-features = false, features = ["defa
 aws-sdk-dynamodbstreams = { version = "1.101.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-glue = { version = "1.149.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-s3 = { version = "1.134.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+aws-sdk-sqs = { version = "1.102.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-s3vectors = { version = "1.26.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-secretsmanager = { version = "1.106.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-sts = { version = "1.105.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }

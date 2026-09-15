@@ -108,6 +108,10 @@ datasets:
       file_format: parquet
       hive_partitioning_enabled: "true"
       refresh_skip: enabled
+      s3_cdc_queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/s3-events
+      s3_cdc_region: us-east-1
+      s3_cdc_events: object_created
+      s3_cdc_key_prefix: data/
 
   - name: test_s3_csv
     from: s3://my-bucket/csv-data/

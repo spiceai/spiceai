@@ -17,6 +17,7 @@ limitations under the License.
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, ParameterSpec, Parameters,
+    federated::FederatedTableProvider,
     listing::{self, ListingTableConnector},
     parameters::{
         self, Validator,
@@ -25,23 +26,26 @@ use super::{
 };
 use crate::dataconnector::ConnectorContext;
 
+mod cdc;
+mod event;
+
 use app::App;
 
 use crate::{
     component::dataset::DatasetSpec,
     dataconnector::listing::{LISTING_TABLE_PARAMETERS, ObjectVersionType},
 };
+use data_components::cdc::{AccelerationContents, ChangesStream};
 
 use snafu::prelude::*;
 use std::any::Any;
-use std::clone::Clone;
 use std::future::Future;
 use std::pin::Pin;
 use std::string::String;
 use std::sync::{Arc, LazyLock};
 use url::Url;
 
-static PREFIX: &str = "s3";
+pub(crate) static PREFIX: &str = "s3";
 
 static VALIDATORS: LazyLock<
     Vec<Box<dyn Validator<Error = parameters::aws::Error> + Send + Sync + 'static>>,
@@ -103,6 +107,7 @@ pub enum Error {
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }
 
+#[derive(Clone)]
 pub struct S3 {
     pub(crate) params: Parameters,
     pub(crate) app: Option<Arc<App>>,
@@ -190,6 +195,24 @@ pub static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             ParameterSpec::component("versioning")
                 .description("Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.")
                 .default("enabled")
+                .help_link(S3_DOCS),
+            ParameterSpec::component("cdc_queue_url")
+                .description("SQS queue URL subscribed to S3 event notifications for `refresh_mode: changes`. Must be a queue URL, not an ARN.")
+                .examples(&["https://sqs.us-east-1.amazonaws.com/123456789012/s3-events"])
+                .help_link(S3_DOCS)
+                .secret(),
+            ParameterSpec::component("cdc_region")
+                .description("AWS region of the SQS queue. Defaults to the region in `s3_cdc_queue_url`, then `s3_region`.")
+                .examples(&["us-east-1"])
+                .help_link(S3_DOCS),
+            ParameterSpec::component("cdc_events")
+                .description("S3 event types to apply. `object_created` appends new objects; `object_created_and_removed` rebuilds the accelerator from the listing prefix when an object is deleted.")
+                .one_of(&["object_created", "object_created_and_removed"])
+                .default("object_created")
+                .help_link(S3_DOCS),
+            ParameterSpec::component("cdc_key_prefix")
+                .description("Object-key prefix to apply from the SQS queue. Defaults to the dataset `from` prefix. Must be equal to or nested under the dataset path.")
+                .examples(&["events/year=2026/"])
                 .help_link(S3_DOCS),
             ParameterSpec::runtime("client_timeout")
                 .description("The timeout setting for S3 client.")
@@ -330,6 +353,27 @@ impl ListingTableConnector for S3 {
 
     fn get_params(&self) -> &Parameters {
         &self.params
+    }
+
+    fn supports_changes_stream(&self) -> bool {
+        // Always true so `refresh_mode: changes` without `s3_cdc_queue_url`
+        // fails in `validate_dataset` with an S3-specific message instead of
+        // the generic "does not support changes" error.
+        true
+    }
+
+    fn validate_dataset(&self, dataset: &DatasetSpec) -> DataConnectorResult<()> {
+        cdc::validate_s3_cdc_config(&self.params, dataset)
+    }
+
+    async fn changes_stream(
+        &self,
+        context: &dyn ConnectorContext,
+        federated_table: Arc<dyn FederatedTableProvider>,
+        dataset: &DatasetSpec,
+        acceleration: AccelerationContents,
+    ) -> Option<ChangesStream> {
+        cdc::s3_changes_stream(self, context, federated_table, dataset, acceleration).await
     }
 
     fn get_tokio_io_runtime(&self) -> tokio::runtime::Handle {

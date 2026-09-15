@@ -623,6 +623,10 @@ datasets:
       json_format: jsonl # json, jsonl
       flatten_json: 'true'
       refresh_skip: enabled # enabled, disabled
+      s3_cdc_queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/s3-events
+      s3_cdc_region: us-east-1
+      s3_cdc_events: object_created # object_created, object_created_and_removed
+      s3_cdc_key_prefix: data/
       # CSV params
       csv_has_header: 'true'
       csv_quote: '"'

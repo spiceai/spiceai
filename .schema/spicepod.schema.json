@@ -8047,6 +8047,37 @@
           "type": "string",
           "default": "enabled"
         },
+        "s3_cdc_queue_url": {
+          "description": "SQS queue URL subscribed to S3 event notifications for `refresh_mode: changes`. Must be a queue URL, not an ARN.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "examples": [
+            "https://sqs.us-east-1.amazonaws.com/123456789012/s3-events"
+          ],
+          "x-secret": true
+        },
+        "s3_cdc_region": {
+          "description": "AWS region of the SQS queue. Defaults to the region in `s3_cdc_queue_url`, then `s3_region`.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "examples": [
+            "us-east-1"
+          ]
+        },
+        "s3_cdc_events": {
+          "description": "S3 event types to apply. `object_created` appends new objects; `object_created_and_removed` rebuilds the accelerator from the listing prefix when an object is deleted.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "default": "object_created",
+          "enum": [
+            "object_created",
+            "object_created_and_removed"
+          ]
+        },
+        "s3_cdc_key_prefix": {
+          "description": "Object-key prefix to apply from the SQS queue. Defaults to the dataset `from` prefix. Must be equal to or nested under the dataset path.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "examples": [
+            "events/year=2026/"
+          ]
+        },
         "client_timeout": {
           "description": "The timeout setting for S3 client.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
