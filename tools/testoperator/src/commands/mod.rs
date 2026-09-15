@@ -715,7 +715,10 @@ mod tests {
     use std::path::Path;
 
     use clap::Parser;
-    use test_framework::{spicepod::component::dataset::Dataset, utils::scan_directory_for_yamls};
+    use test_framework::{
+        gh_utils::map_numbers_to_strings, spicepod::component::dataset::Dataset,
+        utils::scan_directory_for_yamls,
+    };
 
     use super::*;
     use crate::args::dispatch::DispatchTestFile;
@@ -972,14 +975,14 @@ mod tests {
                         "{dispatch_name} must set `validate_results: true` on its bench test"
                     );
 
-                    let inputs =
-                        serde_json::to_value(bench).expect("should serialize the bench inputs");
+                    // The workflow inputs, exactly as `testoperator dispatch` sends them.
+                    let inputs = map_numbers_to_strings(
+                        serde_json::to_value(bench).expect("should serialize the bench inputs"),
+                    );
                     let query_set = inputs["query_set"]
                         .as_str()
                         .expect("query_set should serialize as a string");
-                    let scale_factor = inputs
-                        .get("scale_factor")
-                        .map_or_else(|| "1".to_string(), ToString::to_string);
+                    let scale_factor = inputs["scale_factor"].as_str().unwrap_or("1");
                     let spicepod_path = repo_root
                         .join("test/spicepods")
                         .join(query_set.split('[').next().unwrap_or(query_set))
@@ -994,7 +997,7 @@ mod tests {
                         "--query-set",
                         query_set,
                         "--scale-factor",
-                        scale_factor.as_str(),
+                        scale_factor,
                         "--validate",
                     ];
                     if let Some(query_overrides) = inputs["query_overrides"].as_str() {

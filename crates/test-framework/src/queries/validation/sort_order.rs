@@ -72,14 +72,15 @@ limitations under the License.
 //!   unverified for no reason.
 
 use std::cmp::Ordering;
+use std::ops::ControlFlow;
 
 use anyhow::Result;
 use arrow::array::{Array, ArrayRef, RecordBatch, make_comparator};
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
 use datafusion::sql::sqlparser::ast::{
-    Expr, Ident, LimitClause, OrderBy, OrderByKind, Query as SqlQuery, SelectItem, SetExpr,
-    Statement, Value,
+    Expr, GroupByExpr, Ident, LimitClause, OrderBy, OrderByKind, Query as SqlQuery, Select,
+    SelectItem, SetExpr, Statement, Value, Visit, Visitor,
 };
 use datafusion::sql::sqlparser::dialect::{Dialect, GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::parser::Parser;
@@ -822,22 +823,34 @@ impl UnorderedLimit {
     }
 }
 
-/// The top-level `LIMIT` of `sql`, when it leaves unspecified which rows it keeps.
+/// The top-level `LIMIT` of `sql`, when it lets the query keep any of its groups
+/// and every row it returns names its group.
 ///
-/// `Some` only for a top-level `LIMIT n [OFFSET m]` with integer literals and no
-/// top-level `ORDER BY`. `None` for everything else — an `ORDER BY`, a `LIMIT`
-/// only inside a subquery, `FETCH`, `LIMIT … BY`, the `LIMIT m, n` form, or a
-/// count that is not a literal — so a caller keeps the comparison it already has.
+/// `Some` only for a single `SELECT … GROUP BY` — no set operation, parenthesized
+/// query, `DISTINCT` or `TOP` — that returns every `GROUP BY` expression, with a
+/// top-level `LIMIT n [OFFSET m]` of integer literals, no top-level `ORDER BY`, and
+/// no row limit nested inside it. A row such a query returns is either its group's
+/// row of the full result or wrong. Every other query gets `None` and keeps the
+/// comparison it already has: a plain projection can return wrongly computed rows
+/// that still occur in its full result (`SELECT o_orderkey + 1 … LIMIT 10`
+/// evaluated as `o_orderkey + 2`), and a nested row limit leaves the full result
+/// itself unspecified.
 #[must_use]
 pub fn unordered_limit(sql: &str) -> Option<UnorderedLimit> {
     let statement = parse_one_statement(sql)?;
-    if statement_has_top_level_order_by(&statement) {
+    if statement_has_top_level_order_by(&statement) || has_nested_row_limit(&statement) {
         return None;
     }
     let Statement::Query(mut query) = statement else {
         return None;
     };
     if query.fetch.is_some() {
+        return None;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    if select.distinct.is_some() || select.top.is_some() || !returns_group_keys(select) {
         return None;
     }
     let Some(LimitClause::LimitOffset {
@@ -900,6 +913,9 @@ impl UnprojectedSortLimit {
 #[must_use]
 pub fn unprojected_sort_limit(sql: &str, schema: &SchemaRef) -> Option<UnprojectedSortLimit> {
     let statement = parse_one_statement(sql)?;
+    if has_nested_row_limit(&statement) {
+        return None;
+    }
     if !matches!(
         resolve_statement_sort_key(&statement, schema),
         SortKeyResolution::Unresolved { .. }
@@ -957,6 +973,82 @@ pub fn unprojected_sort_limit(sql: &str, schema: &SchemaRef) -> Option<Unproject
         key_columns,
         keyed_sql_without_limit: Statement::Query(query).to_string(),
     })
+}
+
+/// Whether `select` groups its rows and returns every `GROUP BY` expression — as
+/// the expression itself, its alias, or its 1-based position in the `SELECT` list
+/// — so each row it returns names its group.
+fn returns_group_keys(select: &Select) -> bool {
+    let GroupByExpr::Expressions(keys, modifiers) = &select.group_by else {
+        return false;
+    };
+    !keys.is_empty()
+        && modifiers.is_empty()
+        && keys.iter().all(|key| match expr_as_usize(key) {
+            Some(position) => position
+                .checked_sub(1)
+                .and_then(|index| select.projection.get(index))
+                .is_some_and(|item| {
+                    matches!(
+                        item,
+                        SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. }
+                    )
+                }),
+            None => select.projection.iter().any(|item| match item {
+                SelectItem::UnnamedExpr(expr) => expr == key,
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    expr == key || matches!(key, Expr::Identifier(ident) if ident == alias)
+                }
+                _ => false,
+            }),
+        })
+}
+
+/// Whether a query nested in `statement` — a subquery, derived table or CTE —
+/// limits its rows with `LIMIT`, `OFFSET`, `FETCH` or `TOP`.
+///
+/// Such a limit can keep unspecified rows, so the full result a reference run
+/// produces for the outer query is only one of the results the query allows. The
+/// checks that read that full result refuse the query rather than judge an answer
+/// against one of them.
+fn has_nested_row_limit(statement: &Statement) -> bool {
+    struct NestedRowLimit {
+        query_depth: usize,
+        found: bool,
+    }
+
+    impl Visitor for NestedRowLimit {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &SqlQuery) -> ControlFlow<Self::Break> {
+            self.query_depth += 1;
+            if self.query_depth > 1 && (query.limit_clause.is_some() || query.fetch.is_some()) {
+                self.found = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &SqlQuery) -> ControlFlow<Self::Break> {
+            self.query_depth -= 1;
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<Self::Break> {
+            if self.query_depth > 1 && select.top.is_some() {
+                self.found = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut nested = NestedRowLimit {
+        query_depth: 0,
+        found: false,
+    };
+    let _ = statement.visit(&mut nested);
+    nested.found
 }
 
 fn expr_as_usize(expr: &Expr) -> Option<usize> {

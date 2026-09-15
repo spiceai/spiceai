@@ -354,9 +354,27 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
         DataType::UInt8 => downcast_and_stringify!(array, index, UInt8Array),
         DataType::Float32 => downcast_and_stringify!(array, index, Float32Array),
         DataType::Float64 => downcast_and_stringify!(array, index, Float64Array),
-        DataType::Utf8 => downcast_and_stringify!(array, index, StringArray),
-        DataType::LargeUtf8 => downcast_and_stringify!(array, index, LargeStringArray),
-        DataType::Utf8View => downcast_and_stringify!(array, index, StringViewArray),
+        DataType::Utf8 => Ok(Some(text_to_string(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("Failed to downcast Utf8 array"))?
+                .value(index),
+        ))),
+        DataType::LargeUtf8 => Ok(Some(text_to_string(
+            array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| anyhow!("Failed to downcast LargeUtf8 array"))?
+                .value(index),
+        ))),
+        DataType::Utf8View => Ok(Some(text_to_string(
+            array
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| anyhow!("Failed to downcast Utf8View array"))?
+                .value(index),
+        ))),
         DataType::Binary => Ok(Some(bytes_to_string(
             array
                 .as_any()
@@ -521,14 +539,23 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
     }
 }
 
-/// Renders a binary cell as the text its bytes spell, so a column read as bytes
-/// compares equal to the same values read as a string: `ClickBench` stores its
-/// text columns as parquet `BINARY`. Bytes that are not valid UTF-8 render as
-/// `\x` followed by their hex digits instead.
+/// Renders a text cell with every backslash doubled.
+///
+/// The doubling keeps text and bytes apart: a binary cell that is not valid UTF-8
+/// renders as `\x` and hex digits, a form no rendered text can take once each of
+/// its backslashes is doubled, so the text `\xff` never equals the byte `0xff`.
+fn text_to_string(text: &str) -> String {
+    text.replace('\\', "\\\\")
+}
+
+/// Renders a binary cell as the text its bytes spell, rendered by [`text_to_string`],
+/// so a column read as bytes compares equal to the same values read as a string:
+/// `ClickBench` stores its text columns as parquet `BINARY`. Bytes that are not valid
+/// UTF-8 render as `\x` followed by their hex digits instead.
 fn bytes_to_string(bytes: &[u8]) -> String {
     const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
     if let Ok(text) = std::str::from_utf8(bytes) {
-        return text.to_string();
+        return text_to_string(text);
     }
     let mut hex = String::with_capacity(2 + 2 * bytes.len());
     hex.push_str("\\x");
@@ -1180,9 +1207,10 @@ pub fn validate_against_reference_batches(
 /// Two engines' answers to such a query cannot be compared directly, because SQL
 /// lets each keep different rows: `ClickBench` Q18 (`GROUP BY … LIMIT 10` with no
 /// `ORDER BY`) returns different groups from `DuckDB` at 1, 2, 8 and 16 threads
-/// over the same file. An answer is correct when it has as many rows as the full
-/// result leaves after the `OFFSET`, up to the `LIMIT`, and every row it returned
-/// is a row of the full result, counted as a multiset.
+/// over the same file. [`unordered_limit`] only accepts a grouped query that returns
+/// its group keys, so every row names its group, and an answer is correct when it
+/// has as many rows as the full result leaves after the `OFFSET`, up to the `LIMIT`,
+/// and every row it returned is a row of the full result, counted as a multiset.
 ///
 /// Cells render through [`array_value_to_string`] like every comparison here but
 /// must match exactly, with no numeric tolerance, so a returned row passes only if
@@ -2406,24 +2434,48 @@ mod test {
     }
 
     #[test]
-    fn test_unordered_limit_is_only_a_top_level_limit_without_order_by() {
+    fn test_unordered_limit_is_only_a_grouped_limit_that_returns_its_group_keys() {
         let limit = unordered_limit(UNORDERED_GROUP_LIMIT).expect("LIMIT without ORDER BY");
         assert_eq!((limit.limit, limit.offset), (2, 0));
         assert_eq!(
             limit.unlimited_sql,
             r#"SELECT "UserID", "SearchPhrase", COUNT(*) FROM hits GROUP BY "UserID", "SearchPhrase""#
         );
-        assert_eq!(
-            unordered_limit("SELECT a FROM t LIMIT 10 OFFSET 5")
-                .map(|limit| (limit.limit, limit.offset)),
-            Some((10, 5))
-        );
+        for (sql, limit_and_offset) in [
+            (
+                "SELECT a, count(*) FROM t GROUP BY a LIMIT 10 OFFSET 5",
+                (10, 5),
+            ),
+            (
+                "SELECT a AS k, count(*) FROM t GROUP BY k LIMIT 10",
+                (10, 0),
+            ),
+            ("SELECT a, count(*) FROM t GROUP BY 1 LIMIT 10", (10, 0)),
+        ] {
+            assert_eq!(
+                unordered_limit(sql).map(|limit| (limit.limit, limit.offset)),
+                Some(limit_and_offset),
+                "{sql}"
+            );
+        }
         for sql in [
             "SELECT a FROM t ORDER BY a LIMIT 10",
             "SELECT a FROM (SELECT a FROM t LIMIT 10) AS s",
             "SELECT a FROM t LIMIT $1",
             "SELECT a FROM t FETCH FIRST 10 ROWS ONLY",
             "SELECT a FROM t",
+            // A plain projection: rows computed wrongly can still be rows of the
+            // full result (TPC-H simple_q6).
+            "SELECT * FROM (SELECT o_orderkey + 1 FROM orders) AS c(key) LIMIT 10",
+            "SELECT DISTINCT a FROM t LIMIT 10",
+            // The groups are not returned, so a wrong count can match another group.
+            "SELECT count(*) FROM t GROUP BY a LIMIT 10",
+            // A nested LIMIT leaves the full result itself unspecified (TPC-H simple_q7).
+            "SELECT * FROM (SELECT o_orderkey FROM orders LIMIT 10) AS c(key) LIMIT 10",
+            "SELECT a, count(*) FROM (SELECT a FROM t LIMIT 5) AS s GROUP BY a LIMIT 10",
+            // The LIMIT applies to a parenthesized query that orders its own rows.
+            "(SELECT a FROM t ORDER BY a) LIMIT 10",
+            "(SELECT a, count(*) FROM t GROUP BY a ORDER BY a) LIMIT 10",
         ] {
             assert_eq!(unordered_limit(sql), None, "{sql}");
         }
@@ -2441,8 +2493,8 @@ mod test {
             !limit.may_keep_different_rows(2, 1),
             "the full result fixes how many rows are kept"
         );
-        let with_offset =
-            unordered_limit("SELECT a FROM t LIMIT 2 OFFSET 1").expect("LIMIT without ORDER BY");
+        let with_offset = unordered_limit("SELECT a, count(*) FROM t GROUP BY a LIMIT 2 OFFSET 1")
+            .expect("LIMIT without ORDER BY");
         assert!(
             with_offset.may_keep_different_rows(1, 1),
             "an OFFSET skips rows the query does not specify"
@@ -2746,6 +2798,125 @@ mod test {
         assert_eq!(
             validate_against_keyed_reference(&[answer], &[keyed], 10, 1, true).expect("check"),
             Some(QueryValidationResult::Pass)
+        );
+    }
+
+    #[test]
+    fn test_unprojected_sort_limit_refuses_a_nested_limit() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        // The inner LIMIT keeps unspecified rows, so no reference run fixes which
+        // rows sort first.
+        assert_eq!(
+            unprojected_sort_limit(
+                "SELECT x FROM (SELECT x, t FROM s LIMIT 5) AS d ORDER BY t LIMIT 2",
+                &schema
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_only_clickbench_q18_takes_the_unordered_limit_subset_check() {
+        use crate::queries::{
+            QueryOverrides, get_clickbench_test_queries, get_tpcds_test_queries,
+            get_tpch_test_queries,
+        };
+        use std::collections::BTreeSet;
+
+        // The subset check only proves a row a query returns when the row carries
+        // its group key. A query that newly qualifies has to be added here on
+        // purpose; every other query keeps the direct comparison.
+        let overrides = [
+            None,
+            Some(QueryOverrides::SQLite),
+            Some(QueryOverrides::PostgreSQL),
+            Some(QueryOverrides::MySQL),
+            Some(QueryOverrides::Dremio),
+            Some(QueryOverrides::Spark),
+            Some(QueryOverrides::ODBCAthena),
+            Some(QueryOverrides::ODBCDatabricks),
+            Some(QueryOverrides::DuckDB),
+            Some(QueryOverrides::DuckDBOnZeroResults),
+            Some(QueryOverrides::Snowflake),
+            Some(QueryOverrides::Oracle),
+            Some(QueryOverrides::IcebergSF1),
+            Some(QueryOverrides::IcebergHadoop),
+            Some(QueryOverrides::SpicecloudCatalog),
+            Some(QueryOverrides::GlueCatalog),
+            Some(QueryOverrides::PostgresCatalog),
+            Some(QueryOverrides::MysqlCatalog),
+            Some(QueryOverrides::MSSqlCatalog),
+            Some(QueryOverrides::OracleCatalog),
+            Some(QueryOverrides::DucklakeCatalog),
+            Some(QueryOverrides::SnowflakeCatalog),
+            Some(QueryOverrides::Spicecloud),
+            Some(QueryOverrides::DynamoDB),
+            Some(QueryOverrides::Arrow),
+            Some(QueryOverrides::Cayenne),
+            Some(QueryOverrides::Turso),
+            Some(QueryOverrides::BigQuery),
+            Some(QueryOverrides::ScyllaDB),
+            Some(QueryOverrides::ChbenchSkipSlow),
+        ];
+        let mut subset_checked = BTreeSet::new();
+        for query_overrides in overrides {
+            for query in get_tpch_test_queries(query_overrides)
+                .into_iter()
+                .chain(get_tpcds_test_queries(query_overrides, None))
+                .chain(get_clickbench_test_queries(query_overrides))
+            {
+                if unordered_limit(&query.sql).is_some() {
+                    subset_checked.insert(query.name.to_string());
+                }
+            }
+        }
+        assert_eq!(
+            subset_checked,
+            BTreeSet::from(["clickbench_q18".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_text_and_binary_cells_compare_equal_only_when_they_hold_the_same_text() {
+        let column = |data_type: DataType, array: ArrayRef| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("c", data_type, false)])),
+                vec![array],
+            )
+            .expect("single column batch")
+        };
+        let compare = |left: &RecordBatch, right: &RecordBatch| {
+            compare_query_result_batches(
+                "q",
+                std::slice::from_ref(left),
+                std::slice::from_ref(right),
+                RowOrder::Multiset,
+            )
+            .expect("compare")
+        };
+
+        let escape_spelled_as_text =
+            column(DataType::Utf8, Arc::new(StringArray::from(vec![r"\xff"])));
+        let invalid_utf8 = column(
+            DataType::LargeBinary,
+            Arc::new(LargeBinaryArray::from_iter_values([[0xff_u8].as_slice()])),
+        );
+        assert!(
+            matches!(
+                compare(&escape_spelled_as_text, &invalid_utf8),
+                QueryValidationResult::Fail(_)
+            ),
+            r"the four characters `\xff` are not the byte 0xff"
+        );
+
+        let text_with_backslash = column(DataType::Utf8, Arc::new(StringArray::from(vec![r"a\b"])));
+        let bytes_with_backslash = column(
+            DataType::LargeBinary,
+            Arc::new(LargeBinaryArray::from_iter_values([br"a\b".as_slice()])),
+        );
+        assert_eq!(
+            compare(&text_with_backslash, &bytes_with_backslash),
+            QueryValidationResult::Pass
         );
     }
 
