@@ -32,6 +32,7 @@ use datafusion::{
 use datafusion_federation::{FederatedPlanNode, FederatedTableProviderAdaptor};
 use runtime_acceleration::snapshot::SnapshotPublishGate;
 use runtime_search::embeddings::{table::EmbeddingTable, warm_index_on_zero_results};
+use runtime_table::accelerated::materialization::MaterializationIdentity;
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use spice_table::TableLayer;
@@ -57,8 +58,12 @@ use std::{
 /// single-read refresh whose sources have since grown a second scan.
 ///
 /// [`AttestingViewProvider`] writes that attestation when the federated view is
-/// scanned. No attestation means no refresh in this process has proven the current
-/// rows came from a single read, so publication is refused.
+/// scanned, stamped with the materialization epoch the refresh began. No
+/// attestation means no refresh in this process has proven the current rows came
+/// from a single read, so publication is refused. An attestation from a later
+/// epoch than the rows being archived is refused the same way: a refresh can
+/// record a new plan shape before it takes the write mutex, and that shape must
+/// not approve the previous generation's rows.
 ///
 /// Refusing skips one publish; it does not fail the view or the refresh. The accelerated
 /// table stays correct and keeps serving — it just does not add a snapshot this cycle,
@@ -66,6 +71,10 @@ use std::{
 pub(crate) struct ViewSnapshotPublishGate {
     view_name: TableReference,
     attestation: ViewRefreshReadAttestation,
+    /// Epoch sampled with the rows under the write mutex. `None` until
+    /// [`SnapshotPublishGate::bind_materialization_epoch`] — tests that only
+    /// exercise shape still work; the live snapshot path always binds.
+    expected_epoch: parking_lot::Mutex<Option<u64>>,
 }
 
 impl ViewSnapshotPublishGate {
@@ -73,44 +82,84 @@ impl ViewSnapshotPublishGate {
         Self {
             view_name,
             attestation,
+            expected_epoch: parking_lot::Mutex::new(None),
         }
     }
+}
+
+fn missing_refresh_attestation_reason(view_name: &TableReference) -> String {
+    format!(
+        "view '{view_name}' has no refresh-plan attestation, so Spice cannot confirm these rows came from a single consistent read of its sources"
+    )
+}
+
+fn attestation_epoch_mismatch_reason(view_name: &TableReference) -> String {
+    format!(
+        "view '{view_name}' has a refresh-plan attestation from a later materialization than the rows being archived, so Spice cannot confirm these rows came from a single consistent read of its sources"
+    )
 }
 
 #[async_trait]
 impl SnapshotPublishGate for ViewSnapshotPublishGate {
     async fn check_publish(&self) -> Result<(), String> {
-        match self.attestation.last() {
-            None => Err(format!(
-                "view '{}' has no refresh-plan attestation, so Spice cannot confirm these rows came from a single consistent read of its sources",
-                self.view_name
-            )),
-            Some(shape) => shape.refusal_reason().map_or(Ok(()), Err),
+        match self.attestation.last_stamped() {
+            None => Err(missing_refresh_attestation_reason(&self.view_name)),
+            Some((epoch, shape)) => {
+                if let Some(expected) = *self.expected_epoch.lock()
+                    && epoch != expected
+                {
+                    return Err(attestation_epoch_mismatch_reason(&self.view_name));
+                }
+                shape.refusal_reason().map_or(Ok(()), Err)
+            }
         }
+    }
+
+    fn bind_materialization_epoch(&self, epoch: u64) {
+        *self.expected_epoch.lock() = Some(epoch);
     }
 }
 
 /// Last refresh-plan read shape written by the executing scan, read by
 /// [`ViewSnapshotPublishGate`]. `None` means no refresh has attested this process.
+/// Each record is stamped with the [`MaterializationIdentity`] epoch at scan time.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ViewRefreshReadAttestation {
-    shape: Arc<parking_lot::RwLock<Option<ViewReadShape>>>,
+    identity: MaterializationIdentity,
+    shape: Arc<parking_lot::RwLock<Option<(u64, ViewReadShape)>>>,
 }
 
 impl ViewRefreshReadAttestation {
     #[must_use]
     pub(crate) fn new() -> Self {
+        Self::with_identity(MaterializationIdentity::new())
+    }
+
+    #[must_use]
+    pub(crate) fn with_identity(identity: MaterializationIdentity) -> Self {
         Self {
+            identity,
             shape: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
+    #[must_use]
+    pub(crate) fn identity(&self) -> MaterializationIdentity {
+        self.identity.clone()
+    }
+
     pub(crate) fn record(&self, shape: ViewReadShape) {
-        *self.shape.write() = Some(shape);
+        let epoch = self.identity.epoch();
+        *self.shape.write() = Some((epoch, shape));
     }
 
     #[must_use]
     pub(crate) fn last(&self) -> Option<ViewReadShape> {
+        self.shape.read().as_ref().map(|(_, shape)| shape.clone())
+    }
+
+    #[must_use]
+    pub(crate) fn last_stamped(&self) -> Option<(u64, ViewReadShape)> {
         self.shape.read().clone()
     }
 }
@@ -1501,6 +1550,100 @@ mod tests {
             gate.check_publish()
                 .await
                 .expect("a single-read executing-plan attestation may publish");
+        }
+
+        /// Sequential model of Copilot discussion_r4010927556.
+        ///
+        /// A snapshot holds the write mutex and samples `configured = true` at
+        /// epoch N. A new refresh then begins (retracts provenance, epoch N+1)
+        /// and records a single-read attestation while blocked from writing.
+        /// The gate must refuse: that plan is not the plan that produced these
+        /// rows. Without the epoch, `check_publish` would approve the old
+        /// multi-read rows under the new single-read shape.
+        #[tokio::test]
+        async fn publish_gate_refuses_a_newer_attestation_than_the_sampled_rows() {
+            let identity = MaterializationIdentity::new();
+            let attestation = ViewRefreshReadAttestation::with_identity(identity.clone());
+
+            let epoch_n = identity.begin_refresh();
+            attestation.record(ViewReadShape::MultipleReads {
+                reads: 2,
+                tables: vec![TableReference::bare("orders")],
+            });
+            identity.set_configured(true);
+
+            let sampled = identity.sample();
+            assert!(sampled.configured, "precondition: rows are configured");
+            assert_eq!(sampled.epoch, epoch_n);
+
+            let gate = ViewSnapshotPublishGate::new(
+                TableReference::bare("orders_us"),
+                attestation.clone(),
+            );
+            gate.bind_materialization_epoch(sampled.epoch);
+
+            let epoch_next = identity.begin_refresh();
+            assert_eq!(epoch_next, epoch_n + 1);
+            assert!(
+                !identity.is_configured(),
+                "dequeue must retract configured on the new epoch"
+            );
+            attestation.record(ViewReadShape::SingleScan {
+                tables: vec![TableReference::bare("orders")],
+            });
+            assert_eq!(
+                attestation.last_stamped().map(|(epoch, _)| epoch),
+                Some(epoch_next),
+                "the in-flight refresh stamps the new epoch"
+            );
+
+            let refused = gate
+                .check_publish()
+                .await
+                .expect_err("old rows must not publish under a later refresh's attestation");
+            assert!(
+                refused.contains("later materialization"),
+                "refusal must name the epoch mismatch, got {refused}"
+            );
+            assert!(
+                refused.contains("orders_us"),
+                "refusal must name the view, got {refused}"
+            );
+        }
+
+        #[tokio::test]
+        async fn publish_gate_accepts_attestation_from_the_sampled_epoch() {
+            let identity = MaterializationIdentity::new();
+            let attestation = ViewRefreshReadAttestation::with_identity(identity.clone());
+            let epoch = identity.begin_refresh();
+            attestation.record(ViewReadShape::SingleScan {
+                tables: vec![TableReference::bare("orders")],
+            });
+            identity.set_configured(true);
+
+            let gate = ViewSnapshotPublishGate::new(TableReference::bare("orders_us"), attestation);
+            gate.bind_materialization_epoch(epoch);
+            gate.check_publish()
+                .await
+                .expect("matching epoch and a single-read plan must publish");
+        }
+
+        #[test]
+        fn attestation_epoch_mismatch_names_the_view() {
+            let name = TableReference::bare("orders_us");
+            let message = attestation_epoch_mismatch_reason(&name);
+            assert!(
+                message.contains("view 'orders_us'"),
+                "must name the view, got {message}"
+            );
+            assert!(
+                message.contains("later materialization"),
+                "must state the epoch mismatch, got {message}"
+            );
+            assert!(
+                message.contains("single consistent read"),
+                "must state the impact, got {message}"
+            );
         }
 
         #[tokio::test]

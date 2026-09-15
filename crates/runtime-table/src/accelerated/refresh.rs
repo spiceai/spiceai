@@ -122,28 +122,21 @@ pub struct Refresh {
     /// Currently populated only for Arrow and `PartitionedArrow` accelerators;
     /// `DuckDB` and Cayenne apply retention in their own write paths.
     pub write_retention_sql_delete_expr: Option<Expr>,
-    /// Whether the most recent refresh ran with request-scoped overrides.
+    /// Generation of the rows currently in the accelerator, and whether they are
+    /// the configured definition's result.
     ///
-    /// Shared rather than copied: a per-run [`Refresh`] is a *clone* of the configured one
-    /// with overrides applied to the clone, so the configured value never learns what
-    /// actually ran. Everything downstream that reads the configured `Refresh` — including
-    /// the snapshot path — would otherwise describe rows it did not produce. The `Arc`
-    /// makes the clone and its original point at one cell, so setting it on either is
-    /// visible to both.
-    /// Whether the rows currently in the accelerator are known to be the CONFIGURED
-    /// definition's result.
+    /// Stated positively, and defaulting to `configured = false`, so that every
+    /// state this cell cannot vouch for declines a publish instead of authorising
+    /// one: a fresh process, a refresh in flight, and a refresh that failed or
+    /// panicked. The epoch advances when a refresh is dequeued (under the same
+    /// write mutex the snapshot path samples). Attestation is stamped with that
+    /// epoch at scan time, so a later plan cannot approve an earlier
+    /// generation's rows. See [`super::materialization::MaterializationIdentity`].
     ///
-    /// Stated positively, and defaulting to `false`, so that every state this cell cannot
-    /// vouch for declines a publish instead of authorising one. The cases that matters for:
-    /// a fresh process (the rows on disk came from before the restart and nothing in memory
-    /// knows what produced them), a refresh in flight (the rows are mid-replacement), and a
-    /// refresh that failed or panicked (the rows are whatever survived). Under the opposite
-    /// polarity each of those reads as "not overridden" and publishes.
-    ///
-    /// Shared with every clone of this `Refresh`, which is what lets the refresh runner
-    /// record provenance where the rows are written and the snapshot path read it where the
-    /// rows are archived.
-    pub(crate) materialization_is_configured: Arc<AtomicBool>,
+    /// Shared with every clone of this `Refresh`, which is what lets the refresh
+    /// runner record provenance where the rows are written and the snapshot path
+    /// sample it where the rows are archived.
+    materialization: super::materialization::MaterializationIdentity,
 }
 
 /// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
@@ -268,6 +261,10 @@ impl Refresh {
     /// accelerator were produced by the previous one. A later plain refresh
     /// re-establishes provenance only if the live SQL again matches
     /// [`Self::live_refresh_sql_matches_configured`].
+    ///
+    /// Does not advance the materialization epoch: no new run has started, so a
+    /// snapshot that already sampled this generation still pairs with the
+    /// attestation that produced these rows.
     pub fn apply_runtime_refresh_sql(&mut self, sql: RefreshSQL) {
         self.sql = Some(sql);
         self.set_materialization_is_configured(false);
@@ -336,21 +333,26 @@ impl Refresh {
     }
 
     /// Records whether the rows now in the accelerator are the configured definition's
-    /// result.
+    /// result, without advancing the materialization epoch.
     ///
-    /// `RefreshTaskRunner` calls this twice per run: `false` when the refresh is dequeued,
-    /// because from that moment the rows are being replaced and no longer describe anything
-    /// definite, and then the run's actual provenance once it has succeeded. Both writes
-    /// take the accelerator write mutex first — the same lock
-    /// `create_checkpoint_and_snapshot` holds when it samples the mark — so a snapshot
-    /// cannot read the previous materialization as configured after a new refresh has
-    /// retracted, and cannot run the publish gate against a newer attestation while
-    /// still publishing the previous rows. Both writes move the cell in the safe
-    /// direction first, so a snapshot landing anywhere in between declines rather than
-    /// publishing rows it cannot account for.
+    /// `RefreshTaskRunner` re-asserts this on successful completion of the epoch
+    /// [`Self::begin_materialization`] started, while holding the accelerator write
+    /// mutex — the same lock `create_checkpoint_and_snapshot` samples under. A
+    /// snapshot that sampled that epoch then requires an attestation stamped with
+    /// the same generation; see [`super::materialization::MaterializationIdentity`].
     pub fn set_materialization_is_configured(&self, configured: bool) {
-        self.materialization_is_configured
-            .store(configured, std::sync::atomic::Ordering::Release);
+        self.materialization.set_configured(configured);
+    }
+
+    /// Start a new materialization generation: increment the epoch and retract
+    /// `configured`.
+    ///
+    /// Called when a refresh is dequeued, while holding the accelerator write
+    /// mutex. The epoch is what stops a snapshot that already sampled the
+    /// previous generation from adopting this run's plan-shape attestation if a
+    /// later scan records a new shape after the mutex is released.
+    pub fn begin_materialization(&self) -> u64 {
+        self.materialization.begin_refresh()
     }
 
     /// Whether the rows currently in the accelerator are known to be the configured
@@ -361,8 +363,30 @@ impl Refresh {
     /// answer can go stale between the check and the archive.
     #[must_use]
     pub fn materialization_is_configured(&self) -> bool {
-        self.materialization_is_configured
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.materialization.is_configured()
+    }
+
+    /// Epoch and configured bit as one consistent pair. Sample under the
+    /// accelerator write mutex with the rows being archived.
+    #[must_use]
+    pub fn sample_materialization(&self) -> super::materialization::MaterializationSample {
+        self.materialization.sample()
+    }
+
+    /// Share this `Refresh`'s materialization identity with a view attestation
+    /// so the publish gate can match plan shape to the same generation.
+    #[must_use]
+    pub fn with_materialization_identity(
+        mut self,
+        identity: super::materialization::MaterializationIdentity,
+    ) -> Self {
+        self.materialization = identity;
+        self
+    }
+
+    #[must_use]
+    pub fn materialization_identity(&self) -> super::materialization::MaterializationIdentity {
+        self.materialization.clone()
     }
 
     /// Checks that the dataset's `time_column` exists in `schema` and that its
@@ -639,7 +663,7 @@ impl Default for Refresh {
             retry_max_attempts: None,
             caching_ttl: None,
             write_retention_sql_delete_expr: None,
-            materialization_is_configured: Arc::new(AtomicBool::new(false)),
+            materialization: super::materialization::MaterializationIdentity::new(),
         }
     }
 }

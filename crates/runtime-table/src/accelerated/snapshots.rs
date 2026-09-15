@@ -502,19 +502,24 @@ pub async fn create_checkpoint_and_snapshot(
 ) {
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
 
-    // Asked HERE, under the write mutex, rather than by the caller before it: the mutex is
-    // what serialises this against the refresh that writes the rows *and* against the
-    // retract/restore that move the mark (and, after retract returns, the refresh scan
-    // that records a new view attestation). Inside the lock the rows, their provenance,
-    // and the attestation the publish gate will consume are one consistent pair. A caller
-    // that sampled the mark first could be overtaken by an overridden refresh and archive
-    // its rows under the configured definition's identity.
-    let publishable = match provenance {
-        Some(refresh) => refresh.read().await.materialization_is_configured(),
+    // Asked HERE, under the write mutex, rather than by the caller before it: the mutex
+    // serialises this against the refresh that writes the rows *and* against the
+    // dequeue retract that begins a new generation. Inside the lock the rows and the
+    // sampled `(epoch, configured)` pair are consistent. Binding that epoch on the
+    // publish gate is what stops a later scan's attestation (recorded after the mutex
+    // is released) from approving these rows.
+    let (publishable, sampled_epoch) = match provenance {
+        Some(refresh) => {
+            let sample = refresh.read().await.sample_materialization();
+            (sample.configured, Some(sample.epoch))
+        }
         // No provenance to consult (a path with no refresher, e.g. a CDC-fed accelerator
         // whose rows are never produced by a request-scoped refresh).
-        None => true,
+        None => (true, None),
     };
+    if let (Some(manager), Some(epoch)) = (snapshot_manager, sampled_epoch) {
+        manager.bind_publish_epoch(epoch);
+    }
     // Asked under the same write mutex as the rows: the stamp written into the
     // local checkpoint is the identity of *these* rows. A withheld override
     // retracts the previous stamp (`None`) so a later pre-recreation cannot

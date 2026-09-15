@@ -5019,6 +5019,7 @@ impl DataFusion {
         // reason; running the proof after a restore would leave the archive's
         // rows (and a local checkpoint of them) on disk for a later start.
         let mut refresh_attestation = None;
+        let mut materialization_identity = None;
         if !acceleration.snapshot_behavior.is_disabled() {
             match view_snapshot_consistency_decision(
                 &self.ctx,
@@ -5031,12 +5032,16 @@ impl DataFusion {
                 ViewSnapshotConsistencyDecision::AcceptSkew => {}
                 ViewSnapshotConsistencyDecision::ConsistentSingleRead => {
                     if acceleration.snapshot_behavior.create_enabled() {
-                        let attestation = crate::view::ViewRefreshReadAttestation::new();
+                        let identity = crate::accelerated::MaterializationIdentity::new();
+                        let attestation = crate::view::ViewRefreshReadAttestation::with_identity(
+                            identity.clone(),
+                        );
                         view_table = crate::view::wrap_view_refresh_attestation(
                             view_table,
                             attestation.clone(),
                         );
                         refresh_attestation = Some(attestation);
+                        materialization_identity = Some(identity);
                     }
                 }
             }
@@ -5097,6 +5102,9 @@ impl DataFusion {
             view.refresh_retry_enabled(),
             view.refresh_retry_max_attempts(),
         );
+        if let Some(identity) = materialization_identity {
+            refresh = refresh.with_materialization_identity(identity);
+        }
         if let Some(refresh_check_interval) = acceleration.refresh_check_interval {
             refresh = refresh.check_interval(refresh_check_interval);
         }

@@ -685,6 +685,16 @@ enum SnapshotFileStatus {
 pub trait SnapshotPublishGate: Send + Sync {
     /// `Err(reason)` skips this publish; `reason` is a cause clause worded for an operator log.
     async fn check_publish(&self) -> Result<(), String>;
+
+    /// Bind the materialization epoch sampled with the rows under the accelerator
+    /// write mutex.
+    ///
+    /// A refresh can retract provenance and record a new plan-shape attestation
+    /// before it takes that mutex. Publication must refuse unless the attestation
+    /// is from this epoch — otherwise the gate can approve old rows using a later
+    /// plan. No default: every impl must say what it does with the bound epoch
+    /// (view gates match it; test fixtures that ignore plan shape no-op).
+    fn bind_materialization_epoch(&self, epoch: u64);
 }
 
 /// Manages snapshots for a specific accelerated dataset.
@@ -1076,6 +1086,16 @@ impl SnapshotManager {
     pub fn with_publish_gate(mut self, gate: Arc<dyn SnapshotPublishGate>) -> Self {
         self.publish_gate = Some(gate);
         self
+    }
+
+    /// Bind the materialization epoch sampled with the rows being archived.
+    ///
+    /// No-op when this manager has no publish gate (datasets). View gates use
+    /// the epoch to refuse a later refresh's attestation.
+    pub fn bind_publish_epoch(&self, epoch: u64) {
+        if let Some(gate) = self.publish_gate.as_ref() {
+            gate.bind_materialization_epoch(epoch);
+        }
     }
 
     /// Records the identity of the definition this series materializes, so a bootstrap
@@ -4065,6 +4085,8 @@ mod tests {
                 None => Ok(()),
             }
         }
+
+        fn bind_materialization_epoch(&self, _epoch: u64) {}
     }
 
     fn manager_for_gate_tests(store: &Arc<InMemory>, local_path: PathBuf) -> SnapshotManager {

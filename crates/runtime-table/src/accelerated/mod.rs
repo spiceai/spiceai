@@ -68,6 +68,7 @@ use tokio::task::JoinHandle;
 pub mod caching;
 pub mod caching_eviction;
 pub mod federation;
+pub mod materialization;
 pub mod refresh;
 pub mod refresh_completion;
 pub mod refresh_task;
@@ -82,6 +83,7 @@ pub mod write_back_worker;
 
 pub(crate) use write::WriteMode;
 
+pub use materialization::{MaterializationIdentity, MaterializationSample};
 pub use refresh_completion::{
     RefreshCompletion, RefreshCompletionOutcome, RefreshCompletionWaiter, RefreshRequestId,
 };

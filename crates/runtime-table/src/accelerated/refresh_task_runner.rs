@@ -442,11 +442,15 @@ impl RefreshTaskRunner {
     /// Create a new [`Refresh`] based on defaults and overrides, and report what this run
     /// would let us say about the accelerator's provenance if it succeeds.
     ///
-    /// Also retracts the provenance mark, because from here the accelerator's rows are being
-    /// replaced and describe nothing definite until the run finishes. Retracting up front is
-    /// what makes every window safe: a snapshot that lands mid-refresh, or after a refresh
-    /// that failed, finds "not known configured" and declines. The caller re-asserts the mark
-    /// only once the run has actually succeeded.
+    /// Also begins a new materialization generation (new epoch, `configured = false`),
+    /// because from here the accelerator's rows are being replaced and describe
+    /// nothing definite until the run finishes. Retracting up front is what makes
+    /// every window safe for the configured bit: a snapshot that lands mid-refresh,
+    /// or after a refresh that failed, finds "not known configured" and declines.
+    /// The epoch is what makes the window safe for attestation: a snapshot that
+    /// already sampled the previous generation under the write mutex cannot adopt
+    /// this run's plan shape. The caller re-asserts the mark only once the run has
+    /// actually succeeded.
     ///
     /// Retract waits for `accelerator_write_mutex` first. A snapshot already in
     /// `create_checkpoint_and_snapshot` holds that lock through its provenance sample
@@ -479,7 +483,7 @@ impl RefreshTaskRunner {
             let _guard = accelerator_write_mutex.lock().await;
             let r = defaults.read().await.clone();
             let inherited = r.materialization_is_configured();
-            r.set_materialization_is_configured(false);
+            r.begin_materialization();
             (r, inherited)
         };
         let live_matches_configured = r.live_refresh_sql_matches_configured();
@@ -757,6 +761,36 @@ mod tests {
         assert!(
             defaults.read().await.materialization_is_configured(),
             "restore must be visible once the snapshot releases the write mutex"
+        );
+    }
+
+    #[tokio::test]
+    async fn dequeue_advances_the_materialization_epoch() {
+        let refresh = Refresh::new(RefreshMode::Full);
+        let first = refresh.begin_materialization();
+        refresh.set_materialization_is_configured(true);
+        let defaults = Arc::new(RwLock::new(refresh));
+
+        let before = defaults.read().await.sample_materialization();
+        assert!(before.configured);
+        assert_eq!(before.epoch, first);
+
+        let (_request, _configured) = RefreshTaskRunner::create_refresh_from_overrides(
+            Arc::clone(&defaults),
+            None,
+            &write_mutex(),
+        )
+        .await;
+
+        let after = defaults.read().await.sample_materialization();
+        assert!(
+            !after.configured,
+            "dequeue must retract configured with the new epoch"
+        );
+        assert_eq!(
+            after.epoch,
+            first + 1,
+            "dequeue must advance the epoch so a snapshot of the previous rows cannot adopt this run's attestation"
         );
     }
 }
