@@ -1165,12 +1165,12 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                 }
                 Err(error) => {
                     tracing::warn!(
-                        "Dataset '{}' failed to long-poll SQS for S3 event notifications, so new objects will not be applied until the next successful poll. Cause: {error}. Check `s3_changes_queue_url` and SQS permissions. See: {S3_DOCS}",
+                        "Dataset '{}' failed to long-poll SQS for S3 event notifications, so those notifications will not be applied until the next successful poll. The listing backfill still runs on `s3_changes_backfill_interval`. Cause: {error}. Check `s3_changes_queue_url` and SQS permissions. See: {S3_DOCS}",
                         dataset.name
                     );
                     sleep(receive_backoff).await;
                     receive_backoff = (receive_backoff * 2).min(RECEIVE_ERROR_BACKOFF_CAP);
-                    continue;
+                    Vec::new()
                 }
             };
 
@@ -1358,6 +1358,44 @@ mod tests {
     impl ObjectLister for MockLister {
         async fn list_keys(&self) -> std::result::Result<Vec<String>, StreamError> {
             Ok(self.keys.clone())
+        }
+    }
+
+    struct SequenceLister {
+        listings: Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ObjectLister for SequenceLister {
+        async fn list_keys(&self) -> std::result::Result<Vec<String>, StreamError> {
+            let mut listings = self.listings.lock().await;
+            if listings.is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(listings.remove(0))
+        }
+    }
+
+    struct FailingQueue {
+        remaining_failures: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl MessageQueue for FailingQueue {
+        async fn receive(&self) -> std::result::Result<Vec<QueueMessage>, QueueError> {
+            let mut remaining = self.remaining_failures.lock().await;
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(QueueError::Receive {
+                    source: "simulated SQS receive failure".into(),
+                });
+            }
+            std::future::pending::<()>().await;
+            Ok(Vec::new())
+        }
+
+        async fn delete(&self, _receipt_handle: &str) -> std::result::Result<(), QueueError> {
+            Ok(())
         }
     }
 
@@ -2148,5 +2186,49 @@ mod tests {
         assert!(!applied.contains("events/gone.parquet"));
         assert!(applied.contains("events/a.parquet"));
         assert!(applied.contains("events/b.parquet"));
+    }
+
+    #[tokio::test]
+    async fn stream_lists_backfill_after_sqs_receive_failures() {
+        let queue: Arc<dyn MessageQueue> = Arc::new(FailingQueue {
+            remaining_failures: Mutex::new(2),
+        });
+        let reader = Arc::new(MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/missed.parquet".to_string(),
+                vec![id_name_batch(&[3], &["missed"])],
+            )]),
+            fail_keys: vec![],
+        });
+        let lister: Arc<dyn ObjectLister> = Arc::new(SequenceLister {
+            listings: Mutex::new(vec![Vec::new(), vec!["events/missed.parquet".into()]]),
+        });
+        let mut config = default_config();
+        config.backfill_interval = Duration::from_millis(1);
+        let stream = stream_s3_changes(S3ChangesStreamParts {
+            dataset: events_dataset(),
+            federated_table: federated_table(id_name_batch(&[1], &["snap"])),
+            acceleration: AccelerationContents::NonEmpty,
+            queue,
+            object_reader: reader,
+            object_lister: lister,
+            config,
+            session: SessionContext::new(),
+        });
+        let envelopes = collect_until_idle(stream, 3).await;
+        assert!(
+            envelopes.len() >= 3,
+            "SQS receive failures must not skip listing backfill, got {}",
+            envelopes.len()
+        );
+        assert!(envelopes[0].history_unavailable());
+        assert!(envelopes[1].is_dataset_ready());
+        assert!(matches!(
+            envelopes[2]
+                .change_batch()
+                .expect("backfill after SQS failure")
+                .op(0),
+            ChangeOperation::Create
+        ));
     }
 }
