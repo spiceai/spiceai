@@ -1217,10 +1217,12 @@ impl Query {
                                     tracker,
                                     Arc::clone(&request_context),
                                     inner_span.clone(),
-                                    query_cancel_token.clone(),
-                                    Arc::clone(&query_id_str),
-                                    timeout_state.clone(),
-                                    (active_query_guard, timeout_timer_guard),
+                                    CachedHitCancel {
+                                        token: query_cancel_token.clone(),
+                                        query_id: Arc::clone(&query_id_str),
+                                        timeout_state: timeout_state.clone(),
+                                        guard: (active_query_guard, timeout_timer_guard),
+                                    },
                                 ));
                             }
                             None => Some(raw_key),
@@ -1360,10 +1362,12 @@ impl Query {
                                     tracker,
                                     Arc::clone(&request_context),
                                     inner_span.clone(),
-                                    query_cancel_token.clone(),
-                                    Arc::clone(&query_id_str),
-                                    timeout_state.clone(),
-                                    (active_query_guard, timeout_timer_guard),
+                                    CachedHitCancel {
+                                        token: query_cancel_token.clone(),
+                                        query_id: Arc::clone(&query_id_str),
+                                        timeout_state: timeout_state.clone(),
+                                        guard: (active_query_guard, timeout_timer_guard),
+                                    },
                                 ));
                             }
                         }
@@ -2243,6 +2247,16 @@ where
     )
 }
 
+/// Cancellation attachment for a served cache hit. Kept together so
+/// `assemble_cached_query_result` stays under the argument limit while
+/// still wrapping source → cancellation → tracker in one place.
+struct CachedHitCancel<G> {
+    token: tokio_util::sync::CancellationToken,
+    query_id: Arc<str>,
+    timeout_state: QueryTimeoutState,
+    guard: G,
+}
+
 /// A served cache hit: source → cancellation → tracker, matching the
 /// planned path. A cancel after the batches are ready is then an error
 /// the tracker finishes, instead of dropping an unpolled tracked stream.
@@ -2251,20 +2265,17 @@ fn assemble_cached_query_result<G>(
     tracker: Option<QueryTracker>,
     request_context: Arc<RequestContext>,
     span: Span,
-    cancellation_token: tokio_util::sync::CancellationToken,
-    query_id: Arc<str>,
-    timeout_state: QueryTimeoutState,
-    guard: G,
+    cancel: CachedHitCancel<G>,
 ) -> QueryResult
 where
     G: Send + 'static,
 {
     let QueryResult { data, cache_status } = attach_cancellation_to_query_result(
         query_result,
-        cancellation_token,
-        query_id,
-        timeout_state,
-        guard,
+        cancel.token,
+        cancel.query_id,
+        cancel.timeout_state,
+        cancel.guard,
     );
     QueryResult::new(
         attach_query_tracker_to_stream(span, request_context, tracker, data),
@@ -4851,10 +4862,12 @@ mod tests {
             Some(tracker),
             request_context,
             tracing::Span::current(),
-            cancel_token,
-            Arc::clone(&query_id),
-            QueryTimeoutState::default(),
-            (),
+            CachedHitCancel {
+                token: cancel_token,
+                query_id: Arc::clone(&query_id),
+                timeout_state: QueryTimeoutState::default(),
+                guard: (),
+            },
         );
         let cancellation = result
             .data
