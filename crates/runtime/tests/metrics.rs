@@ -1237,17 +1237,34 @@ fn cache_hit_query_durations(registry: &prometheus::Registry) -> (u64, f64) {
 /// How long a slow caller waits before reading a cache hit it has been served.
 const SLOW_READER_DELAY: Duration = Duration::from_millis(250);
 
-/// A cache hit is recorded when it is served, not when its caller has read it.
+/// The number of observations and the sum of a histogram family.
+fn histogram_count_and_sum(registry: &prometheus::Registry, name: &str) -> (u64, f64) {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == name)
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .fold((0, 0.0), |(count, sum), metric| {
+            let histogram = metric.get_histogram();
+            (
+                count + histogram.get_sample_count(),
+                sum + histogram.get_sample_sum(),
+            )
+        })
+}
+
+/// A cache hit's duration and returned-output counters are recorded when the
+/// result stream is consumed, matching a miss.
 ///
-/// A hit's result is whole in memory once found, so nothing is left to execute: a
-/// caller that reads slowly, or a response that is expensive to serialize, must not
-/// lengthen the query it records. Getting this wrong changes no rows, and shows
-/// only in `query_duration_ms` and the task-history row.
+/// Finalizing at serve time would change `query_duration_ms` and the
+/// task-history duration, and would add every cached batch to
+/// `query_returned_rows` / `query_returned_bytes` before HTTP or Flight read
+/// them. Both are user-facing contracts; neither changes without an Enhancement.
 ///
 /// Counts compare before/after deltas, which only `cargo nextest` isolates by giving
 /// the test its own process.
 #[tokio::test]
-async fn a_cache_hit_is_recorded_when_served_not_when_read() {
+async fn a_cache_hit_is_recorded_when_the_stream_is_consumed() {
     let registry = &*PROMETHEUS;
 
     let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
@@ -1265,13 +1282,26 @@ async fn a_cache_hit_is_recorded_when_served_not_when_read() {
     }
 
     let (hits_before, ms_before) = cache_hit_query_durations(registry);
+    let (rows_before, rows_sum_before) = histogram_count_and_sum(registry, "query_returned_rows");
+    let bytes_before = counter_total(registry, "query_returned_bytes");
     let mut hit = run().await.expect("query to run");
     assert_eq!(hit.cache_status, CacheStatus::CacheHit);
     let (hits_served, _) = cache_hit_query_durations(registry);
+    let (rows_served, _) = histogram_count_and_sum(registry, "query_returned_rows");
+    let bytes_served = counter_total(registry, "query_returned_bytes");
     assert_eq!(
         hits_served - hits_before,
-        1,
-        "a cache hit must be recorded once it is served, before anything reads it"
+        0,
+        "a cache hit must not record query_duration_ms until its stream is consumed"
+    );
+    assert_eq!(
+        rows_served - rows_before,
+        0,
+        "a cache hit must not record query_returned_rows until its stream is consumed"
+    );
+    assert!(
+        (bytes_served - bytes_before).abs() < f64::EPSILON,
+        "a cache hit must not record query_returned_bytes until its stream is consumed"
     );
 
     // The caller's delay is the behavior under test, so it is a fixed sleep.
@@ -1283,14 +1313,30 @@ async fn a_cache_hit_is_recorded_when_served_not_when_read() {
     assert!(rows > 0, "the hit must return the fixture's rows");
 
     let (hits_read, ms_read) = cache_hit_query_durations(registry);
+    let (rows_read, rows_sum_read) = histogram_count_and_sum(registry, "query_returned_rows");
+    let bytes_read = counter_total(registry, "query_returned_bytes");
     assert_eq!(
         hits_read - hits_before,
         1,
-        "reading a served hit must not record it again"
+        "consuming a cache hit must record query_duration_ms once"
+    );
+    assert_eq!(
+        rows_read - rows_before,
+        1,
+        "consuming a cache hit must record query_returned_rows once"
+    );
+    assert!(
+        (rows_sum_read - rows_sum_before - rows as f64).abs() < f64::EPSILON,
+        "query_returned_rows recorded {} rows, expected the {rows} the caller read",
+        rows_sum_read - rows_sum_before
+    );
+    assert!(
+        bytes_read - bytes_before > 0.0,
+        "consuming a cache hit must record query_returned_bytes"
     );
     let recorded_ms = ms_read - ms_before;
     assert!(
-        recorded_ms < SLOW_READER_DELAY.as_secs_f64() * 1000.0,
-        "the hit recorded {recorded_ms}ms, counting the {SLOW_READER_DELAY:?} its caller took to read it"
+        recorded_ms >= SLOW_READER_DELAY.as_secs_f64() * 1000.0,
+        "the hit recorded {recorded_ms}ms, missing the {SLOW_READER_DELAY:?} its caller took to read it"
     );
 }

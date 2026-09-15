@@ -74,7 +74,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::ResultExt;
 
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 
 use runtime_auth::AuthPrincipalRef;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
@@ -315,31 +315,9 @@ async fn query_stream_to_http_response(
         None => None,
     };
 
-    // Serialize the batches that are already there, up to one chunk. A result that
-    // ends within it — any small cached result — is sent whole, as one body with a
-    // `Content-Length`, with no body stream or egress reservation to send it.
-    let mut writer = json_array_writer();
-    let mut written = match first {
-        Some(batch) => write_ready_batches(&mut writer, batch, &mut data_stream),
-        None => Ok(ReadyBatches::Ended),
-    };
-    if matches!(written, Ok(ReadyBatches::Ended)) {
-        // Closes the array (`]`), or emits `[]` for an empty result.
-        written = writer.finish().map(|()| ReadyBatches::Ended);
-    }
-
     let headers = response_headers(format, cache_status).await;
-    if matches!(written, Ok(ReadyBatches::Ended)) {
-        return (StatusCode::OK, headers, Body::from(writer.into_inner())).into_response();
-    }
-
     let account = EgressAccount::register(&memory_pool, "http_egress");
-    let body = Body::from_stream(json_array_body_stream(
-        writer,
-        written,
-        data_stream,
-        account,
-    ));
+    let body = Body::from_stream(json_array_body_stream(first, data_stream, account));
     (StatusCode::OK, headers, body).into_response()
 }
 
@@ -477,88 +455,34 @@ async fn buffered_sql_response(
         .into_response()
 }
 
-/// How many bytes of serialized rows a JSON response holds before sending them,
-/// even when more batches are ready. Bounds how much sending ready batches
-/// together can buffer ahead of the client, and how large a response is sent
-/// whole.
-const JSON_CHUNK_COALESCE_BYTES: usize = 64 * 1024;
-
-/// The writer a `/v1/sql` JSON response is serialized with.
-type JsonArrayWriter = arrow_json::Writer<Vec<u8>, arrow_json::writer::JsonArray>;
-
-/// Where [`write_ready_batches`] stopped writing.
-enum ReadyBatches {
-    /// The result ended: every row is written.
-    Ended,
-    /// The writer holds a chunk of rows, or the next batch is not there yet.
-    Pending,
-    /// The result failed after the rows written.
-    Failed(datafusion::error::DataFusionError),
-}
-
-/// Writes `batch`, then each batch `batches` already has, until the writer holds
-/// [`JSON_CHUNK_COALESCE_BYTES`] of rows, the next batch is not there yet, or the
-/// result ends.
-fn write_ready_batches(
-    writer: &mut JsonArrayWriter,
-    mut batch: RecordBatch,
-    batches: &mut SendableRecordBatchStream,
-) -> Result<ReadyBatches, arrow::error::ArrowError> {
-    loop {
-        writer.write(&batch)?;
-        if writer.get_ref().len() >= JSON_CHUNK_COALESCE_BYTES {
-            return Ok(ReadyBatches::Pending);
-        }
-        match batches.next().now_or_never() {
-            Some(Some(Ok(next))) => batch = next,
-            Some(Some(Err(e))) => return Ok(ReadyBatches::Failed(e)),
-            Some(None) => return Ok(ReadyBatches::Ended),
-            None => return Ok(ReadyBatches::Pending),
-        }
-    }
-}
-
-/// Streams the rest of a query result into the JSON array `writer` has begun,
-/// `written` being where [`write_ready_batches`] left it. Batches that are ready
-/// together leave as one chunk, and each chunk is charged against the query
-/// memory pool via `account`. With the rows `writer` already held, the bytes
-/// emitted are identical to the non-streamed `arrow_to_json` output.
+/// Streams the query result as a single JSON array, one input batch at a time,
+/// charging each serialized chunk against the query memory pool via `account`.
+/// The bytes emitted are identical to the non-streamed `arrow_to_json` output.
 fn json_array_body_stream(
-    mut writer: JsonArrayWriter,
-    written: Result<ReadyBatches, arrow::error::ArrowError>,
-    mut batches: SendableRecordBatchStream,
+    first: Option<RecordBatch>,
+    rest: SendableRecordBatchStream,
     account: Arc<EgressAccount>,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    let mut batches =
+        futures::stream::iter(first.map(Ok::<_, datafusion::error::DataFusionError>)).chain(rest);
     try_stream! {
         // One JSON-array writer drives the whole response: it emits the opening
         // `[`, the inter-row/inter-batch commas, and the closing `]`, so the
-        // streamed bytes match `arrow_to_json` exactly. Drain its buffer to yield
-        // a chunk (zero-copy — `mem::take` moves the `Vec`).
-        let mut written = written;
-        loop {
-            let ready = written.map_err(|e| std::io::Error::other(e.to_string()))?;
-            // Rows already written go out before waiting for the next batch, and
-            // before an error ends the body; at the end of the result they travel
-            // with the closing `]` instead.
-            if !matches!(ready, ReadyBatches::Ended) {
-                let chunk = std::mem::take(writer.get_mut());
-                if !chunk.is_empty() {
-                    let size = chunk.len();
-                    account.reserve(size).await;
-                    yield Bytes::from(chunk);
-                    account.release(size);
-                }
+        // streamed bytes match `arrow_to_json` exactly. Drain its buffer after
+        // each write to yield a chunk (zero-copy — `mem::take` moves the `Vec`).
+        let mut writer = json_array_writer();
+        while let Some(item) = batches.next().await {
+            let batch = item.map_err(|e| std::io::Error::other(e.to_string()))?;
+            writer
+                .write(&batch)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let chunk = std::mem::take(writer.get_mut());
+            if !chunk.is_empty() {
+                let size = chunk.len();
+                account.reserve(size).await;
+                yield Bytes::from(chunk);
+                account.release(size);
             }
-            let next = match ready {
-                ReadyBatches::Ended => break,
-                ReadyBatches::Failed(e) => Err(e),
-                ReadyBatches::Pending => match batches.next().await {
-                    Some(next) => next,
-                    None => break,
-                },
-            };
-            let batch = next.map_err(|e| std::io::Error::other(e.to_string()))?;
-            written = write_ready_batches(&mut writer, batch, &mut batches);
         }
         // Closes the array (`]`), or emits `[]` for an empty result.
         writer
@@ -1105,18 +1029,15 @@ mod tests {
         );
     }
 
-    /// A `/v1/sql` JSON body must be byte-identical to the buffered `arrow_to_json`
-    /// output whether it is sent whole or streamed — across multi-batch, empty,
-    /// NULL, and larger-than-a-chunk results — and only a small result that is
-    /// complete when its first batch arrives is sent whole.
+    /// The chunked `/v1/sql` JSON body must be byte-identical to the buffered
+    /// `arrow_to_json` output across multi-batch, empty, and NULL cases.
     #[tokio::test]
-    async fn json_responses_match_the_buffered_output_sent_whole_or_streamed() {
+    async fn json_array_body_stream_matches_buffered_output() {
         use arrow::array::ArrayRef;
         use datafusion::error::DataFusionError;
         use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
         use http_body::Body as _;
-        use http_body_util::BodyExt;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, true),
@@ -1132,94 +1053,67 @@ mod tests {
             )
             .expect("record batch")
         };
-        let ids: Vec<Option<i64>> = (0..5_000).map(Some).collect();
-        let names = vec![Some("a name long enough to spread the rows over chunks"); ids.len()];
-        let large = make(ids, names);
 
-        let cases: Vec<(&str, Vec<RecordBatch>)> = vec![
-            (
-                "several batches, one empty, with NULLs",
-                vec![
-                    make(vec![Some(1), None], vec![Some("a"), Some("b")]),
-                    make(vec![], vec![]),
-                    make(vec![Some(3)], vec![None]),
-                ],
-            ),
-            ("an empty result", vec![]),
-            ("a single empty batch", vec![make(vec![], vec![])]),
-            (
-                "a result larger than one chunk",
-                vec![make(vec![Some(1)], vec![Some("a")]), large.clone(), large],
-            ),
+        let cases: Vec<Vec<RecordBatch>> = vec![
+            // Multiple batches, an empty batch mid-stream, and NULL values.
+            vec![
+                make(vec![Some(1), None], vec![Some("a"), Some("b")]),
+                make(vec![], vec![]),
+                make(vec![Some(3)], vec![None]),
+            ],
+            // Empty result.
+            vec![],
+            // Single empty batch.
+            vec![make(vec![], vec![])],
         ];
 
-        let respond = |items: Vec<Result<RecordBatch, DataFusionError>>, ready: bool| {
-            let items = futures::stream::iter(items);
-            let data: SendableRecordBatchStream = if ready {
-                Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), items))
-            } else {
-                Box::pin(RecordBatchStreamAdapter::new(
-                    Arc::clone(&schema),
-                    items.then(|item| async move {
-                        tokio::task::yield_now().await;
-                        item
-                    }),
-                ))
-            };
-            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
-            query_stream_to_http_response(
-                data,
-                CacheStatus::CacheMiss,
-                ResponseMimeType::Json,
-                pool,
-            )
-        };
-
-        for (case, batches) in cases {
+        for batches in cases {
             let expected = write_to_json_string(&batches).expect("buffered json");
-            let small = expected.len() < JSON_CHUNK_COALESCE_BYTES;
-            // Ready: every batch is there when asked for. Not ready: each one has to
-            // be waited for.
-            for ready in [true, false] {
-                let response = respond(batches.iter().cloned().map(Ok).collect(), ready).await;
-                assert_eq!(response.status(), StatusCode::OK, "{case}, ready: {ready}");
 
-                // A body sent whole has an exact size, so it carries a `Content-Length`.
-                let sent_whole = response.body().size_hint().exact().is_some();
-                let complete_at_first_batch = ready || batches.len() <= 1;
-                assert_eq!(
-                    sent_whole,
-                    small && complete_at_first_batch,
-                    "{case}, ready: {ready}"
-                );
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let account = EgressAccount::register(&pool, "test_egress");
 
-                let body = response
-                    .into_body()
-                    .collect()
-                    .await
-                    .expect("the body to be read")
-                    .to_bytes();
-                assert_eq!(
-                    String::from_utf8(body.to_vec()).expect("utf8"),
-                    expected,
-                    "{case}, ready: {ready}"
-                );
+            let mut batches = batches.into_iter();
+            let first = batches.next();
+            let rest: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter(batches.map(Ok::<_, DataFusionError>)),
+            ));
+
+            let mut body = std::pin::pin!(json_array_body_stream(first, rest, account));
+            let mut streamed = Vec::new();
+            while let Some(chunk) = body.next().await {
+                streamed.extend_from_slice(&chunk.expect("chunk"));
             }
+
+            assert_eq!(
+                String::from_utf8(streamed).expect("utf8"),
+                expected,
+                "streamed JSON must match buffered arrow_to_json output"
+            );
         }
 
-        // A failure after rows have been taken still ends a 200 body with an error.
-        let response = respond(
-            vec![
-                Ok(make(vec![Some(1)], vec![Some("a")])),
-                Err(DataFusionError::Execution("the source failed".to_string())),
-            ],
-            true,
+        // A complete small result is still a chunked body. Sending it whole with
+        // `Content-Length` is an HTTP framing change and needs an Enhancement.
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let data: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(std::iter::once(Ok::<_, DataFusionError>(make(
+                vec![Some(1)],
+                vec![Some("a")],
+            )))),
+        ));
+        let response = query_stream_to_http_response(
+            data,
+            CacheStatus::CacheMiss,
+            ResponseMimeType::Json,
+            pool,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert!(
-            response.into_body().collect().await.is_err(),
-            "a result that fails partway must not end its body as if it were complete"
+            response.body().size_hint().exact().is_none(),
+            "JSON responses must stream; an exact size hint is a Content-Length body"
         );
     }
 }

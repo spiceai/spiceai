@@ -1992,8 +1992,8 @@ fn output_preview(batch: &RecordBatch) -> Cow<'static, str> {
     Cow::Owned(write_to_json_string(&[batch.slice(0, batch.num_rows().min(3))]).unwrap_or_default())
 }
 
-/// Records the rows and bytes a query returned and finishes its tracker: the end
-/// of every tracked result, streamed or served whole.
+/// Records the rows and bytes a query returned and finishes its tracker after
+/// the result stream has been consumed.
 fn finish_returned_output(
     request_context: &RequestContext,
     tracker: QueryTracker,
@@ -2010,47 +2010,6 @@ fn finish_returned_output(
         .schema(schema)
         .rows_produced(num_records)
         .finish_with_dimensions(request_context, captured_output, dims);
-}
-
-/// Finishes `tracker` for a result that is already whole in memory — a results
-/// cache hit — at the moment it is served.
-///
-/// Nothing is left to execute once such a result is found, so the query ends here
-/// rather than when its caller has read it: a client that reads slowly, or a
-/// response that is expensive to serialize, does not lengthen the recorded query.
-/// What is recorded is what [`attach_query_tracker_to_stream`] records once the
-/// same batches have been read.
-fn finish_served_records(
-    request_context: &RequestContext,
-    tracker: QueryTracker,
-    schema: arrow::datatypes::SchemaRef,
-    records: &[RecordBatch],
-) {
-    // The preview the streamed path captures: from the first batch, or from the
-    // first one holding any rows.
-    let mut captured_output = Cow::Borrowed("[]");
-    if tracker.task_history_enabled && tracker.captured_output_enabled {
-        for batch in records {
-            captured_output = output_preview(batch);
-            if batch.num_rows() > 0 {
-                break;
-            }
-        }
-    }
-    let num_records = records.iter().map(|batch| batch.num_rows() as u64).sum();
-    let num_output_bytes = records
-        .iter()
-        .map(|batch| batch.get_array_memory_size() as u64)
-        .sum();
-
-    finish_returned_output(
-        request_context,
-        tracker,
-        schema,
-        num_records,
-        num_output_bytes,
-        &captured_output,
-    );
 }
 
 /// This guard guarantees:

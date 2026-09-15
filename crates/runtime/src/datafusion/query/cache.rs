@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::{
     BindingParametersSnafu, Query, QueryMethod, QueryResult, QueryTracker, ResultsCacheMode,
-    finish_served_records,
+    attach_query_tracker_to_stream,
 };
 use crate::datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode};
 use cache::{
@@ -798,21 +798,21 @@ impl Query {
             cache::metrics::sql_results::INVALIDATION_STALE_HITS.add(1, &[]);
         }
 
-        // The whole result is in memory, so the query is finished as it is served.
-        let schema = cached_result.schema.arc();
-        if let Some(tracker) = tracker {
-            finish_served_records(
-                request_context,
-                tracker
-                    .datasets(cached_result.input_tables.arc())
-                    .results_cache_hit(true),
-                Arc::clone(&schema),
-                &records,
-            );
-        }
+        // Duration and returned-output counters finish when this stream is
+        // consumed, matching a miss. The batches are already in memory; the
+        // client may still disconnect before HTTP or Flight reads them.
+        let tracker = tracker.map(|t| {
+            t.datasets(cached_result.input_tables.arc())
+                .results_cache_hit(true)
+        });
 
         Served::Hit(QueryResult::new(
-            Box::pin(CachedStream::new(records, schema)),
+            attach_query_tracker_to_stream(
+                tracing::Span::current(),
+                Arc::clone(request_context),
+                tracker,
+                Box::pin(CachedStream::new(records, cached_result.schema.arc())),
+            ),
             cache_status,
         ))
     }
@@ -3072,12 +3072,11 @@ mod tests {
         }
     }
 
-    /// A cached result served over HTTP is sent whole — one body of known length —
-    /// since all of it is in memory. The response is only built whole when the
-    /// stream around the cached batches reports its end as soon as they are read;
-    /// a wrapper that answers "not ready" there sends every hit chunked instead.
+    /// A cached result served over HTTP keeps the streamed JSON framing. Sending
+    /// a small complete hit as a `Content-Length` body is an HTTP contract
+    /// change and needs an Enhancement.
     #[tokio::test]
-    async fn a_served_hit_is_sent_over_http_with_a_known_length() {
+    async fn a_served_hit_is_streamed_over_http() {
         use http_body::Body as _;
         use http_body_util::BodyExt;
 
@@ -3111,10 +3110,9 @@ mod tests {
 
         let hit = respond().await;
         assert_eq!(cache_status(&hit).as_deref(), Some("HIT"));
-        assert_eq!(
-            hit.body().size_hint().exact(),
-            Some(28),
-            "a cache hit held in memory must be sent whole, with its length known"
+        assert!(
+            hit.body().size_hint().exact().is_none(),
+            "a cache hit must keep the streamed JSON framing, not a Content-Length body"
         );
         let body = hit
             .into_body()
