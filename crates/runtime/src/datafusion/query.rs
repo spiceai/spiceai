@@ -56,6 +56,7 @@ pub(crate) use tracker::QueryTracker;
 pub mod builder;
 pub use builder::QueryBuilder;
 mod cache;
+pub(crate) mod coalescing;
 pub mod transaction;
 pub use transaction::{
     TransactionError, TransactionOutcome, run_transaction, schema_statement, transaction_statements,
@@ -1334,6 +1335,7 @@ impl Query {
                     }
                     _ => true,
                 };
+                let mut coalesced = None;
                 let admission_permit: Option<tokio::sync::OwnedSemaphorePermit> =
                     match ctx.df.query_admission_semaphore() {
                         Some(semaphore) if plan_executes_query => {
@@ -1342,18 +1344,65 @@ impl Query {
                                 &query_id_str,
                                 &timeout_state,
                             )?;
-                            // Race permit acquisition against cancellation so a query
-                            // cancelled WHILE QUEUED for a permit (client disconnect or
-                            // `/cancel` under load) aborts promptly instead of blocking
-                            // until a permit frees and then still executing. `biased`
-                            // polls cancellation first. A closed semaphore (shutdown
-                            // only) proceeds ungated rather than failing the query.
-                            tokio::select! {
-                                biased;
-                                () = query_cancel_token.cancelled() => {
-                                    return Err(timeout_state.cancellation_error(&query_id_str));
+                            // Coalescing accepts anonymous synchronous HTTP requests
+                            // without a client-selected session.
+                            let coalescing_eligible = ctx.df.query_coalescer.enabled()
+                                && is_accelerated
+                                && request_context.protocol() == Protocol::Http
+                                && request_context.auth_principal().is_none()
+                                && coalescing::outside_transaction(&request_context)
+                                && request_context
+                                    .extension::<super::flight_session_extension::FlightSessionExtension>()
+                                    .is_none();
+                            let admission = if coalescing_eligible {
+                                coalescing::recognize(
+                                    &plan,
+                                    &session,
+                                    request_context.cache_namespace(),
+                                )
+                                .filter(|lookup| lookup.supported_table)
+                                .map(|lookup| {
+                                    ctx.df.query_coalescer.admit(lookup, &session, Arc::clone(&semaphore))
+                                })
+                            } else {
+                                None
+                            };
+                            if let Some(coalescing::Admission::Coalesced(ticket)) = admission {
+                                let response = tokio::select! {
+                                    biased;
+                                    () = query_cancel_token.cancelled() => {
+                                        return Err(timeout_state.cancellation_error(&query_id_str));
+                                    }
+                                    response = ticket => response.unwrap_or_else(|_| {
+                                        Err(DataFusionError::Execution("Coalesced query producer stopped".into()))
+                                    }),
+                                };
+                                match response {
+                                    Ok((batch, physical)) => {
+                                        coalesced = Some((coalescing::response_stream(batch), physical));
+                                    }
+                                    Err(e) => {
+                                        let error_code = ErrorCode::from(&e);
+                                        handle_error!(tracker, &request_context, error_code, e, UnableToExecuteQuery)
+                                    }
                                 }
-                                permit = semaphore.acquire_owned() => permit.ok(),
+                                None
+                            } else if let Some(coalescing::Admission::Individual(permit)) = admission {
+                                Some(permit)
+                            } else {
+                                // Race permit acquisition against cancellation so a query
+                                // cancelled WHILE QUEUED for a permit (client disconnect or
+                                // `/cancel` under load) aborts promptly instead of blocking
+                                // until a permit frees and then still executing. `biased`
+                                // polls cancellation first. A closed semaphore (shutdown
+                                // only) proceeds ungated rather than failing the query.
+                                tokio::select! {
+                                    biased;
+                                    () = query_cancel_token.cancelled() => {
+                                        return Err(timeout_state.cancellation_error(&query_id_str));
+                                    }
+                                    permit = semaphore.acquire_owned() => permit.ok(),
+                                }
                             }
                         }
                         _ => None,
@@ -1362,7 +1411,9 @@ impl Query {
                 let (res_stream, physical_plan): (
                     SendableRecordBatchStream,
                     Arc<dyn ExecutionPlan>,
-                ) = if matches!(&*plan, LogicalPlan::Statement(_)) {
+                ) = if let Some(result) = coalesced {
+                    result
+                } else if matches!(&*plan, LogicalPlan::Statement(_)) {
                     // For Statement plans, use SessionContext::execute_logical_plan()
                     // which handles PREPARE/EXECUTE/DEALLOCATE by modifying session state.
                     // Use the session-specific context if available to ensure prepared statements

@@ -32,6 +32,7 @@ pub mod http;
 pub mod llms;
 pub mod models;
 pub mod query;
+pub mod query_coalescing;
 pub mod rerankers;
 pub mod secrets;
 pub mod spiced_runtime;
