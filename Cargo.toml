@@ -22,6 +22,7 @@ members = [
     "crates/data-http-rate-control",
     "crates/data_components",
     "crates/dataformat-json",
+    "crates/dataformat-orc",
     "crates/document_parse",
     "crates/dotenv",
     "crates/duration-parse",
@@ -333,6 +334,9 @@ object_store = { version = "0.13.1", features = [
 ] }
 odbc-api = { version = "20" }
 opendal = { version = "0.55", default-features = false, features = ["services-s3", "services-fs", "services-gcs", "services-memory"] }
+# orc-rust 0.8.0 is the first release on Arrow ^58.0, matching the workspace Arrow 58 pin.
+# Do not use datafusion-orc; the FileFormat lives in crates/dataformat-orc.
+orc-rust = { version = "0.8.0", default-features = false, features = ["async"] }
 opentelemetry = { version = "0.32", default-features = false, features = [
     "metrics",
     "trace",

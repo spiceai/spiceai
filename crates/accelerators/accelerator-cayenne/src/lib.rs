@@ -52,7 +52,7 @@ use util::concat_arrays;
 
 use crate::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
 use data_accelerator_api::FilePathError;
-use data_accelerator_api::snapshots::download_snapshot_if_needed;
+use data_accelerator_api::snapshots::{download_snapshot, should_download_snapshot};
 use data_accelerator_api::spice_data_base_path;
 use data_accelerator_api::{
     AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
@@ -3765,6 +3765,20 @@ impl DataAccelerator for CayenneAccelerator {
                 metadata_dir.clone(),
                 path_buf.clone(),
             );
+            let refresh_mode = resolved_refresh_mode(source, acceleration);
+
+            // Config, refresh-mode, and layout checks first — before
+            // `get_or_create_catalog` below opens the local metastore. That call
+            // creates `metadata_dir` as a side effect (a fresh SQLite connection),
+            // but the decision uses `has_existing_acceleration` (data-dir
+            // contents), not metadata-dir existence, so opening the catalog does
+            // not flip the answer. Deciding first still avoids opening the
+            // catalog when snapshots are disabled or the data dir already holds
+            // rows.
+            if !should_download_snapshot(acceleration, source, &snapshot_adapter, refresh_mode) {
+                return Ok(BootstrapStatus::none());
+            }
+
             // Build a CayenneSnapshotEngine so the snapshot tar uses the
             // per-dataset metastore-slice format (no raw cayenne.db file)
             // and so `download_latest_snapshot` imports the slice into the
@@ -3827,16 +3841,14 @@ impl DataAccelerator for CayenneAccelerator {
                     catalog,
                     source.name().to_string(),
                     path_buf.clone(),
-                ))
-                    as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>,
+                )) as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>,
             );
-            Ok(download_snapshot_if_needed(
+            Ok(download_snapshot(
                 acceleration,
                 source,
                 snapshot_adapter,
                 AccelerationEngine::Cayenne,
                 snapshot_engine,
-                resolved_refresh_mode(source, acceleration),
             )
             .await)
         } else {

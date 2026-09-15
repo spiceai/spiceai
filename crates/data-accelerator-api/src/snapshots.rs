@@ -57,16 +57,26 @@ fn mode_allows_snapshot_bootstrap(acceleration: &Acceleration, refresh_mode: Ref
     !matches!(refresh_mode, RefreshMode::Full | RefreshMode::Caching)
 }
 
-pub async fn download_snapshot_if_needed(
+/// Decides whether a snapshot should be downloaded to bootstrap `layout`, with no side
+/// effects: it only reads configuration and asks [`AccelerationLayout::has_existing_acceleration`].
+///
+/// Split out of [`download_snapshot_if_needed`] so a caller whose own startup would
+/// otherwise change layout state before the check runs (e.g. Cayenne opening its
+/// metastore, which creates the metadata directory) can decide first, against the
+/// true pre-startup state, and only then do side-effecting setup.
+///
+/// For a directory layout the gate is the *data* directory's contents, not
+/// [`AccelerationLayout::primary_path`]: that path is Cayenne's shared metastore
+/// directory and is created by the catalog open itself, so an existence test on
+/// it would skip every bootstrap.
+pub fn should_download_snapshot(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
-    layout: AccelerationLayout,
-    engine: AccelerationEngine,
-    engine_override: Option<Arc<dyn SnapshotEngine>>,
+    layout: &AccelerationLayout,
     refresh_mode: RefreshMode,
-) -> BootstrapStatus {
+) -> bool {
     if !acceleration.snapshot_behavior.bootstrap_enabled() {
-        return BootstrapStatus::none();
+        return false;
     }
 
     if !mode_allows_snapshot_bootstrap(acceleration, refresh_mode) {
@@ -74,12 +84,12 @@ pub async fn download_snapshot_if_needed(
             "Acceleration mode is 'file_create' for dataset {}, skipping snapshot bootstrap so the next refresh rebuilds the acceleration from the source",
             source.name()
         );
-        return BootstrapStatus::none();
+        return false;
     }
 
     if !layout.is_enabled() {
         tracing::debug!("No storage paths for the acceleration layout, skipping download");
-        return BootstrapStatus::none();
+        return false;
     }
 
     // Asks the layout whether an acceleration is already present, rather than testing one
@@ -97,9 +107,25 @@ pub async fn download_snapshot_if_needed(
                 |p| p.display().to_string()
             )
         );
-        return BootstrapStatus::none();
+        return false;
     }
 
+    true
+}
+
+/// Downloads the latest snapshot for `layout` unconditionally.
+///
+/// Callers should first confirm a download is appropriate with
+/// [`should_download_snapshot`]; this function performs no checks of its own before
+/// downloading — it exists so the decision and the (potentially side-effecting) act of
+/// downloading can happen at different points in a caller's startup sequence.
+pub async fn download_snapshot(
+    acceleration: &Acceleration,
+    source: &dyn AccelerationSource,
+    layout: AccelerationLayout,
+    engine: AccelerationEngine,
+    engine_override: Option<Arc<dyn SnapshotEngine>>,
+) -> BootstrapStatus {
     let dataset_name = source.name().to_string();
     // The source opens its own checkpoint: each engine's checkpointer carries that
     // engine's sidecar SQL and lives in its own `runtime-checkpoint-*` crate, so it
@@ -145,6 +171,28 @@ pub async fn download_snapshot_if_needed(
     } else {
         BootstrapStatus::none()
     }
+}
+
+/// Checks whether a snapshot should be downloaded to bootstrap `layout` and, if so,
+/// downloads it.
+///
+/// Thin composition of [`should_download_snapshot`] and [`download_snapshot`], kept for
+/// callers (`DuckDB`, `SQLite`, Turso) that make the decision and perform the download at
+/// the same point in their startup, with no side-effecting setup of their own in
+/// between.
+pub async fn download_snapshot_if_needed(
+    acceleration: &Acceleration,
+    source: &dyn AccelerationSource,
+    layout: AccelerationLayout,
+    engine: AccelerationEngine,
+    engine_override: Option<Arc<dyn SnapshotEngine>>,
+    refresh_mode: RefreshMode,
+) -> BootstrapStatus {
+    if !should_download_snapshot(acceleration, source, &layout, refresh_mode) {
+        return BootstrapStatus::none();
+    }
+
+    download_snapshot(acceleration, source, layout, engine, engine_override).await
 }
 
 /// Creates a snapshot of the existing acceleration file before it is deleted or recreated.
