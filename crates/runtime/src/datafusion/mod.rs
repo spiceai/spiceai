@@ -569,18 +569,11 @@ pub enum Error {
         name: String,
     },
 
-    #[snafu(display(
-        "{}",
-        crate::view::snapshot_identity_unresolved_param_message(
-            component, name, param, store, key
-        )
-    ))]
+    #[snafu(display("{message}"))]
     SnapshotsIdentityUnresolvedParam {
         component: &'static str,
         name: String,
-        param: String,
-        store: String,
-        key: String,
+        message: String,
     },
 
     #[snafu(display(
@@ -754,12 +747,16 @@ fn ensure_snapshot_identity_params(
     params: &HashMap<String, String>,
 ) -> Result<()> {
     if let Some(unresolved) = crate::view::first_unresolved_snapshot_identity_param(params) {
+        let found = crate::view::UnresolvedClosureIdentityParam {
+            source_component: component.to_string(),
+            source_name: name.to_string(),
+            param_field: "params",
+            unresolved,
+        };
         return SnapshotsIdentityUnresolvedParamSnafu {
             component,
             name: name.to_string(),
-            param: unresolved.param,
-            store: unresolved.store,
-            key: unresolved.key,
+            message: found.refusal_message(component, name),
         }
         .fail();
     }
@@ -780,12 +777,11 @@ fn ensure_view_snapshot_identity_params(
     if let Some(found) = crate::view::first_unresolved_snapshot_identity_param_in_view_closure(
         name, sql, params, app,
     ) {
+        let view_name = name.to_string();
         return SnapshotsIdentityUnresolvedParamSnafu {
             component: "view",
-            name: name.to_string(),
-            param: found.unresolved.param,
-            store: found.unresolved.store,
-            key: found.unresolved.key,
+            message: found.refusal_message("view", &view_name),
+            name: view_name,
         }
         .fail();
     }
@@ -8030,9 +8026,11 @@ mod tests {
         for expected in [
             "view",
             "'orders_us'",
+            "dataset",
+            "'docs'",
             "`params.json_pointer`",
             "${secrets:pointer}",
-            "`snapshots: disabled`",
+            "`snapshots: disabled` on view 'orders_us'",
         ] {
             assert!(
                 message.contains(expected),
@@ -8054,12 +8052,20 @@ mod tests {
 
     #[test]
     fn snapshot_identity_unresolved_param_refusal_names_the_view_and_a_way_out() {
+        let found = crate::view::UnresolvedClosureIdentityParam {
+            source_component: "view".to_string(),
+            source_name: "orders_us".to_string(),
+            param_field: "params",
+            unresolved: crate::view::UnresolvedSnapshotIdentityParam {
+                param: "json_pointer".to_string(),
+                store: "secrets".to_string(),
+                key: "pointer".to_string(),
+            },
+        };
         let message = SnapshotsIdentityUnresolvedParamSnafu {
             component: "view",
             name: "orders_us".to_string(),
-            param: "json_pointer".to_string(),
-            store: "secrets".to_string(),
-            key: "pointer".to_string(),
+            message: found.refusal_message("view", "orders_us"),
         }
         .build()
         .to_string();

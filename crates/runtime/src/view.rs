@@ -2414,7 +2414,7 @@ mod tests {
             view
         }
 
-        fn dataset_with_params(
+        fn named_dataset_with_params(
             from: &str,
             name: &str,
             params: &[(&str, &str)],
@@ -2451,7 +2451,7 @@ mod tests {
             let outer = TableReference::bare("orders_us");
             let app = app_from(
                 vec![],
-                vec![dataset_with_params(
+                vec![named_dataset_with_params(
                     "s3://docs",
                     "docs",
                     &[("json_pointer", "${secrets:pointer}")],
@@ -2542,7 +2542,7 @@ mod tests {
                     "SELECT 1",
                     &[("file_format", "parquet")],
                 )],
-                vec![dataset_with_params(
+                vec![named_dataset_with_params(
                     "s3://docs",
                     "docs",
                     &[("json_pointer", "/us")],
@@ -2566,7 +2566,7 @@ mod tests {
             let outer = TableReference::bare("orders_us");
             let app = app_from(
                 vec![],
-                vec![dataset_with_params(
+                vec![named_dataset_with_params(
                     "s3://docs",
                     "docs",
                     &[("json_pointer", "${secrets:docs_pointer}")],
