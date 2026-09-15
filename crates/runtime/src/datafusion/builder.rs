@@ -87,7 +87,7 @@ use datafusion_optimizer_rules::{
         cache_invalidation::CacheInvalidationOptimizerRule,
     },
     physical_plan::{
-        EmptyHashJoinExecPhysicalOptimization, HttpParamsPushdown,
+        EmptyHashJoinExecPhysicalOptimization, HttpParamsPushdown, PartitionOnlyScanRewrite,
         flightsql::aggregate_pushdown::FlightSQLPartialAggregatePushdown,
         flightsql::broadcast_join::{ExecutorAddressProvider, FlightSQLBroadcastJoinPushdown},
     },
@@ -1004,7 +1004,11 @@ impl DataFusionBuilder {
 
         state = state
             .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
-            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}));
+            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
+            // Answer a `GROUP BY`/`DISTINCT` over only partition columns from the
+            // directory listing instead of scanning every file. Registered before
+            // `BytesProcessedPhysicalOptimizer` so it rewrites the bare scan.
+            .with_physical_optimizer_rule(Arc::new(PartitionOnlyScanRewrite::new()));
 
         if self.cte_materialization.is_auto() {
             tracing::info!("Applied runtime.query.cte_materialization=auto");
