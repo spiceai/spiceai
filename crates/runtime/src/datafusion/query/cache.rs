@@ -717,10 +717,28 @@ impl Query {
             None => Some(plan),
         }
     }
+}
 
+/// Re-read the table-change clock immediately before serving a probed hit.
+/// Returns `false` when the entry must not be served.
+fn apply_serve_time_table_clock(entry: &mut ServableEntry, validity: EntryValidity) -> bool {
+    match validity {
+        EntryValidity::Invalidated => false,
+        EntryValidity::StaleWhileRevalidate => {
+            entry.entry_validity = EntryValidity::StaleWhileRevalidate;
+            entry.revalidate = true;
+            entry.cache_status = CacheStatus::CacheStaleWhileRevalidate;
+            true
+        }
+        EntryValidity::Valid => true,
+    }
+}
+
+impl Query {
     /// Serves a hit [`Self::probe_results_cache`] found.
     ///
-    /// `None` when the entry cannot be decoded, with the query's tracker left in
+    /// `None` when the entry cannot be decoded, or when the table-change clock
+    /// has invalidated it since the probe, with the query's tracker left in
     /// place so it can still be planned, executed and tracked like a miss.
     pub(super) async fn serve_probed_hit(
         &mut self,
@@ -729,10 +747,26 @@ impl Query {
     ) -> Option<QueryResult> {
         let ProbedHit {
             raw_key,
-            entry,
+            mut entry,
             sql,
             revalidation_plan,
         } = hit;
+
+        // Encoded hits hop onto the query runtime after the probe. Recheck
+        // the table-change clock at serve time so a refresh or DML that
+        // landed while it waited cannot be served as fresh. In-place hits
+        // are sequential on this task; the check is the same and cheap.
+        if let Some(provider) = self.df.results_cache_provider() {
+            let validity = provider.entry_validity(
+                &entry.cached_result.input_tables,
+                entry.cached_result.read_started_at,
+                std::time::Instant::now(),
+            );
+            if !apply_serve_time_table_clock(&mut entry, validity) {
+                return None;
+            }
+        }
+
         match Self::serve_entry(
             &self.df,
             request_context,
@@ -1193,9 +1227,10 @@ impl Query {
 mod tests {
     use super::*;
 
-    use std::{sync::Arc, time::Duration};
+    use std::{collections::HashSet, sync::Arc, time::Duration};
 
     use arrow::array::Int64Array;
+    use arrow::datatypes::Schema;
     use datafusion::scalar::ScalarValue;
 
     use futures::TryStreamExt;
@@ -1244,6 +1279,42 @@ mod tests {
                 .with_cache_namespace(namespace)
                 .build(),
         )
+    }
+
+    fn dummy_servable_entry() -> ServableEntry {
+        let now = std::time::Instant::now();
+        ServableEntry {
+            cached_result: cache::result::query::CachedQueryResult::new_raw(
+                vec![],
+                Arc::new(Schema::empty()),
+                Arc::new(HashSet::new()),
+                now,
+                now,
+            ),
+            entry_validity: cache::EntryValidity::Valid,
+            cache_status: CacheStatus::CacheHit,
+            revalidate: false,
+        }
+    }
+
+    #[test]
+    fn an_invalidated_probed_entry_is_not_served() {
+        let mut entry = dummy_servable_entry();
+        assert!(
+            !apply_serve_time_table_clock(&mut entry, cache::EntryValidity::Invalidated),
+            "a table-change invalidation after the probe must not be served"
+        );
+    }
+
+    #[test]
+    fn a_stale_probed_entry_is_marked_for_revalidation() {
+        let mut entry = dummy_servable_entry();
+        assert!(apply_serve_time_table_clock(
+            &mut entry,
+            cache::EntryValidity::StaleWhileRevalidate
+        ));
+        assert!(entry.revalidate);
+        assert_eq!(entry.cache_status, CacheStatus::CacheStaleWhileRevalidate);
     }
 
     async fn prepare_runtime(
