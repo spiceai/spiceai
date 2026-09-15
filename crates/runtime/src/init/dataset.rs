@@ -45,7 +45,9 @@ use crate::{
         acceleration::{Acceleration, DurableWriteBackKey, Mode, RefreshMode},
         builder::DatasetBuilder,
     },
-    component::{AcceleratedComponent, disabled_acceleration_warning},
+    component::{
+        AcceleratedComponent, deprecated_ready_state_warning, disabled_acceleration_warning,
+    },
     dataaccelerator::{AccelerationSource, validate_snapshot_consistency, validate_snapshot_paths},
     dataconnector::{
         self, ConnectorComponent, DataConnector, ODBC_DATACONNECTOR, SCYLLADB_DATACONNECTOR,
@@ -86,17 +88,20 @@ use util::{error_spaced, warn_spaced};
 /// bound once per dataset.
 const HOT_RELOAD_INITIAL_REFRESH_TIMEOUT: Duration = Duration::from_mins(5);
 
-/// Warn an operator whose dataset or view sets `acceleration.enabled: false` and leaves
-/// settings in the block that the runtime will not apply (#13514).
+/// Warn an operator about what their dataset's or view's acceleration block asks for and
+/// the runtime will not do as written: settings that `enabled: false` discards (#13514), and
+/// the deprecated `acceleration.ready_state`, honoured but superseded by the component's own
+/// `ready_state` (#13749).
 ///
-/// Deliberately **not** in `DatasetBuilder`/`ViewBuilder`'s `TryFrom`, where this started.
-/// Those conversions are not the load path: `datasets_iter` runs them on every call to
-/// `get_valid_datasets`, and `GET /v1/datasets` is one of those callers — so a warning
-/// emitted there fires once per misconfigured dataset **per HTTP request**, in a caller
-/// that passes `LogErrors(false)` precisely to say "do not log from here". Emitting it
-/// here instead puts it behind the same `log_errors` gate as the load errors beside it,
-/// so it is tied to a load rather than to a read.
-pub(crate) fn warn_about_discarded_acceleration_settings(
+/// Deliberately **not** in `DatasetBuilder`/`ViewBuilder`'s `TryFrom`, where both started.
+/// Those conversions are not the load path: `datasets_iter` and `get_valid_views` run them on
+/// every call to `get_valid_datasets`/`get_valid_views`, and `GET /v1/datasets`, every
+/// accelerated component's `initialized_sources()` and the hot-reload comparison are among
+/// those callers — each passing `LogErrors(false)` precisely to say "do not log from here".
+/// A warning emitted inside the conversion therefore printed once per *call*, not once per
+/// component. Emitting here puts both behind the same `log_errors` gate as the load errors
+/// beside them, so they are tied to a load rather than to a read.
+pub(crate) fn warn_about_acceleration_block(
     component: AcceleratedComponent,
     name: &str,
     acceleration: Option<&spicepod::acceleration::Acceleration>,
@@ -108,16 +113,23 @@ pub(crate) fn warn_about_discarded_acceleration_settings(
     let Some(acceleration) = acceleration else {
         return;
     };
+
+    // Both formatters escape the name: a *quoted* Spicepod identifier passes validation
+    // carrying a newline, and would otherwise forge a second log line.
     let ignored = acceleration.fields_ignored_when_disabled();
-    if ignored.is_empty() {
-        return;
+    if !ignored.is_empty() {
+        tracing::warn!(
+            "{}",
+            disabled_acceleration_warning(component, name, &ignored)
+        );
     }
-    // The name is escaped inside the formatter: a *quoted* Spicepod identifier passes
-    // validation carrying a newline, and would otherwise forge a second log line.
-    tracing::warn!(
-        "{}",
-        disabled_acceleration_warning(component, name, &ignored)
-    );
+
+    // Reading the deprecated key is the point.
+    #[expect(deprecated)]
+    let sets_deprecated_ready_state = acceleration.ready_state.is_some();
+    if sets_deprecated_ready_state {
+        tracing::warn!("{}", deprecated_ready_state_warning(component, name));
+    }
 }
 
 impl Runtime {
@@ -346,7 +358,7 @@ impl Runtime {
             .zip(&app.datasets)
             .filter_map(|(ds, spicepod_ds)| match ds {
                 Ok(ds) => {
-                    warn_about_discarded_acceleration_settings(
+                    warn_about_acceleration_block(
                         AcceleratedComponent::Dataset,
                         &spicepod_ds.name,
                         spicepod_ds.acceleration.as_ref(),
@@ -3813,6 +3825,95 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         assert!(
             (counted - 1.0).abs() < f64::EPSILON,
             "teardown counted one load error before this change; counted {counted}"
+        );
+    }
+
+    /// Every `acceleration.ready_state` deprecation line emitted while `f` runs. Synchronous
+    /// callers only — `get_valid_datasets` and `get_valid_views` log on the caller's thread.
+    fn ready_state_deprecation_lines(f: impl FnOnce()) -> Vec<String> {
+        crate::tracing_util::warn_lines_emitted_by(f)
+            .into_iter()
+            .filter(|line| line.contains("sets `acceleration.ready_state`"))
+            .collect()
+    }
+
+    /// One dataset and one view, both setting the deprecated key, plus a dataset that does not.
+    fn app_with_deprecated_ready_state() -> Arc<app::App> {
+        #[expect(deprecated)]
+        let acceleration = spicepod::acceleration::Acceleration {
+            ready_state: Some(spicepod::component::dataset::ReadyState::OnRegistration),
+            ..spicepod::acceleration::Acceleration::default()
+        };
+
+        let mut trips = spicepod::component::dataset::Dataset::new("test:source", "trips");
+        trips.acceleration = Some(acceleration.clone());
+
+        let mut trips_vw = spicepod::component::view::View::new("trips_vw".to_string());
+        trips_vw.sql = Some("SELECT 1".to_string());
+        trips_vw.acceleration = Some(acceleration);
+
+        let mut current = spicepod::component::dataset::Dataset::new("test:source", "current");
+        current.acceleration = Some(spicepod::acceleration::Acceleration::default());
+
+        Arc::new(
+            app::AppBuilder::new("deprecated_ready_state")
+                .with_dataset(trips)
+                .with_dataset(current)
+                .with_view(trips_vw)
+                .build(),
+        )
+    }
+
+    /// Regression test for #13749: the deprecation notice prints exactly once per component,
+    /// from the load path, and never from a read — not once per `get_valid_*` call.
+    #[tokio::test]
+    async fn the_ready_state_deprecation_is_reported_once_per_component_and_only_on_load() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let app = app_with_deprecated_ready_state();
+
+        let on_dataset_load = ready_state_deprecation_lines(|| {
+            let loaded = Arc::clone(&runtime).get_valid_datasets(&app, LogErrors(true));
+            assert_eq!(loaded.len(), 2, "both datasets must build");
+        });
+        assert_eq!(
+            on_dataset_load.len(),
+            1,
+            "one dataset sets the key, so one line — not one per conversion, and none for the \
+             dataset that does not set it: {on_dataset_load:?}"
+        );
+        assert!(
+            on_dataset_load[0].contains("Dataset 'trips'"),
+            "the line names the component that set the key: {on_dataset_load:?}"
+        );
+
+        // `get_valid_views` also rebuilds every dataset (with `LogErrors(false)`) to check for
+        // name collisions, so this is where the dataset's line used to reappear.
+        let on_view_load = ready_state_deprecation_lines(|| {
+            let loaded = Arc::clone(&runtime).get_valid_views(&app, LogErrors(true));
+            assert_eq!(loaded.len(), 1, "the view must build");
+        });
+        assert_eq!(
+            on_view_load.len(),
+            1,
+            "loading the views reports the view's key once and the datasets' not at all: \
+             {on_view_load:?}"
+        );
+        assert!(
+            on_view_load[0].contains("View 'trips_vw'"),
+            "the line names the view: {on_view_load:?}"
+        );
+
+        // A read — `GET /v1/datasets`, `initialized_sources()`, the hot-reload comparison —
+        // says so with `LogErrors(false)`, and must not warn: these are the callers that
+        // multiplied the line.
+        let on_read = ready_state_deprecation_lines(|| {
+            let datasets = Arc::clone(&runtime).get_valid_datasets(&app, LogErrors(false));
+            let views = Arc::clone(&runtime).get_valid_views(&app, LogErrors(false));
+            assert_eq!((datasets.len(), views.len()), (2, 1));
+        });
+        assert!(
+            on_read.is_empty(),
+            "a read must not emit the deprecation notice: {on_read:?}"
         );
     }
 }
