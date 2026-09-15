@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q80"
+---
++-----------------+------------------------------+------------+----------+------------+
+| channel         | id                           | sales      | returns  | profit     |
++-----------------+------------------------------+------------+----------+------------+
+| catalog channel | catalog_pageAAAAAAAAAAGDAAAA | 1081366.35 | 70284.65 | -248647.20 |
+| catalog channel | catalog_pageAAAAAAAAAAHDAAAA | 671893.14  | 17552.83 | -54617.69  |
+| catalog channel | catalog_pageAAAAAAAAAAKDAAAA | 6412.25    | 0.00     | -3868.58   |
+| catalog channel | catalog_pageAAAAAAAAABGDAAAA | 1042660.87 | 43495.65 | -207498.89 |
+| catalog channel | catalog_pageAAAAAAAAABHDAAAA | 566577.98  | 34817.82 | -82320.66  |
+| catalog channel | catalog_pageAAAAAAAAABKDAAAA | 520834.90  | 21441.07 | -48982.33  |
+| catalog channel | catalog_pageAAAAAAAAACGDAAAA | 1237862.40 | 51667.73 | -204196.99 |
+| catalog channel | catalog_pageAAAAAAAAACKDAAAA | 629736.64  | 35432.45 | -74311.63  |
+| catalog channel | catalog_pageAAAAAAAAADGDAAAA | 1129660.19 | 69453.62 | -199679.53 |
+| catalog channel | catalog_pageAAAAAAAAADKDAAAA | 539523.67  | 18579.76 | -55276.17  |
++-----------------+------------------------------+------------+----------+------------+

@@ -10,12 +10,12 @@
 # credentials: a stub `df` on PATH reports whatever free space a case needs, and a
 # stub `make` prints whatever a case needs the watcher to read.
 #
-# `failure_kind` names three further causes with the same consequence — a run that
+# `failure_kind` names four further causes with the same consequence — a run that
 # was signalled and so judged nothing at all, a branch whose Makefile has no rule
-# for a target the gate invokes, so nothing was compiled, and a test binary the
-# runner's loader will not execute, so nothing was run — so their cases live here
-# too, alongside `describe_check_failure`, which turns any of them into what the
-# run publishes. The make-target preflight is here for the same reason
+# for a target the gate invokes, so nothing was compiled, a test binary the
+# runner's loader will not execute, so nothing was run, and a linker that died of
+# a signal, so nothing was built — so their cases live here too, alongside
+# `describe_check_failure`, which turns any of them into what the run publishes. The make-target preflight is here for the same reason
 # the disk one is: it decides whether a run gets to start, and getting it wrong
 # either way is the bug.
 #
@@ -906,6 +906,9 @@ assert_recorder() {
   # ...and the same for the unloadable-artifact signature, which the disk and
   # cache cases above must not trip either.
   local want_artifact_marked="${7:-no}"
+  # ...and for the crashed-toolchain signature, so every earlier case also proves
+  # an ordinary compile failure is not read as a linker crash.
+  local want_toolchain_marked="${8:-no}"
   tests_run=$((tests_run + 1))
 
   local fake_make="$stub_dir/make"
@@ -921,6 +924,7 @@ assert_recorder() {
       echo "VERDICT=${SIGNOFF_DISK_HIT:+yes}"
       echo "CACHEHIT=${SIGNOFF_CACHE_HIT:+yes}"
       echo "ARTIFACTHIT=${SIGNOFF_ARTIFACT_HIT:+yes}"
+      echo "TOOLCHAINHIT=${SIGNOFF_TOOLCHAIN_HIT:+yes}"
       exit "$step_rc"' _ "$subject" 2>&1)"
   rc=$?
 
@@ -970,6 +974,19 @@ assert_recorder() {
   fi
   if [[ "$artifact_marked" != "$want_artifact_marked" ]]; then
     fail_test "$name: expected artifact_marked=${want_artifact_marked}, got ${artifact_marked} (output: '${output}')"
+    rm -f "$fake_make"
+    return
+  fi
+
+  local toolchain_marked="no"
+  [[ "$output" == *"TOOLCHAINHIT=yes"* ]] && toolchain_marked="yes"
+  if [[ "$output" != *"TOOLCHAINHIT="* ]]; then
+    fail_test "$name: the step never reported a toolchain verdict — output: '${output}'"
+    rm -f "$fake_make"
+    return
+  fi
+  if [[ "$toolchain_marked" != "$want_toolchain_marked" ]]; then
+    fail_test "$name: expected toolchain_marked=${want_toolchain_marked}, got ${toolchain_marked} (output: '${output}')"
     rm -f "$fake_make"
     return
   fi
@@ -1090,6 +1107,86 @@ assert_recorder "reports disk, not the artifact, when the volume filled first" \
    echo "  Malformed Mach-o file (os error 88)"
    exit 104' \
   104 yes "errno=28" no no
+
+# Verbatim from run 33041791988, where the linker took SIGSEGV linking a cayenne
+# test binary on a branch that never touched the crate, and the run published
+# "Sign-off checks failed" (#13614). cargo stopped at the crate, so no test ran.
+assert_recorder "records a linker that died of a signal" \
+  'echo "          clang: error: unable to execute command: Segmentation fault: 11"
+   echo "          clang: error: linker command failed due to signal (use -v to see invocation)"
+   echo "          clang: note: diagnostic msg: /var/folders/mk/T/linker-crash-122a1e"
+   echo "error: could not compile \`cayenne\` (test \"result_correctness_vs_sqlite_test\") due to 1 previous error"
+   echo "make: *** [nextest] Error 101"
+   exit 101' \
+  101 no "Segmentation fault" no no yes
+# The driver words a crash in its own frontend identically — `unable to execute
+# command: <signal>` names the subprocess only by its signal — so this signature
+# is the same no-verdict class one step earlier, with no linker involved at all.
+# Recorded rather than excluded: narrowing to the linker would send a frontend
+# crash back to the generic "checks failed" this kind exists to replace, and the
+# published wording therefore names the class and not the tool.
+assert_recorder "records the driver's own frontend dying of a signal, not just the linker" \
+  'echo "clang: error: unable to execute command: Segmentation fault: 11"
+   echo "clang: error: clang frontend command failed due to signal (use -v to see invocation)"
+   echo "error: could not compile \`spiced\` (lib) due to 1 previous error"
+   exit 101' \
+  101 no "Segmentation fault" no no yes
+# The same pool has killed a linker for memory, which the driver reports in the
+# same channel with the kernel's wording.
+assert_recorder "records a linker the kernel killed" \
+  'echo "clang: error: unable to execute command: Killed: 9"
+   echo "error: could not compile \`runtime\` (lib) due to 1 previous error"
+   exit 101' \
+  101 no "Killed: 9" no no yes
+# Both halves are required. This repo's own suites assert on error strings, so a
+# test that quotes the driver's wording and then fails must stay a verdict about
+# the branch — and cargo never prints "could not compile" for a test that ran.
+assert_recorder "leaves a failure unmarked when the crash wording is only quoted" \
+  'echo "assertion failed: expected \"linker command failed due to signal\""
+   echo "test result: FAILED. 1 passed; 1 failed"
+   exit 100' \
+  100 no "assertion failed" no no no
+# ...and cargo's line alone is every ordinary compile error, which is the branch.
+assert_recorder "leaves an ordinary compile failure unmarked despite cargo's summary line" \
+  'echo "error[E0308]: mismatched types"
+   echo "error: could not compile \`runtime\` (lib) due to 1 previous error"
+   exit 101' \
+  101 no "E0308" no no no
+# The words alone, under rustc's own `error:` rather than the driver's, are a
+# defect the branch wrote — a `compile_error!` or a build script quoting them —
+# and cargo's summary follows a defect just as it follows a crash. Only the
+# driver's prefix tells the two apart.
+assert_recorder "leaves a compile error worded like a crash unmarked" \
+  'echo "error: linker command failed due to signal"
+   echo "  --> crates/runtime/build.rs:1:1"
+   echo "error: could not compile \`runtime\` (build script) due to 1 previous error"
+   exit 101' \
+  101 no "build.rs" no no no
+# The complete driver diagnostic, prefix included, quoted under rustc's own
+# `error:` — a `compile_error!` that copied the wording, or a build script that
+# echoed it and then failed for its own reasons. The driver itself never prints
+# behind another prefix, so only a line-start anchor tells this from the real one.
+assert_recorder "leaves a quoted driver diagnostic under rustc's error prefix unmarked" \
+  'echo "error: clang: error: linker command failed due to signal (use -v to see invocation)"
+   echo "  --> crates/runtime/build.rs:3:5"
+   echo "error: could not compile \`runtime\` (build script) due to 1 previous error"
+   exit 101' \
+  101 no "build.rs" no no no
+# GNU's driver reports the same death through collect2, whose signal path is a
+# `fatal error:` — the plain `error:` spelling alone would miss every GCC crash.
+assert_recorder "records the GNU driver's spelling of a linker killed by a signal" \
+  'echo "collect2: fatal error: ld terminated with signal 11 [Segmentation fault]"
+   echo "error: could not compile \`cayenne\` (lib) due to 1 previous error"
+   exit 101' \
+  101 no "collect2" no no yes
+# Disk wins over a crash, as it wins over the other two: a volume at zero can
+# take the linker down too, and reclaiming space is the remedy that fixes both.
+assert_recorder "reports disk, not the crash, when the volume filled as well" \
+  'echo "ld: write() failed, errno=28 (No space left on device)"
+   echo "clang: error: linker command failed due to signal (use -v to see invocation)"
+   echo "error: could not compile \`cayenne\` (lib) due to 1 previous error"
+   exit 101' \
+  101 yes "errno=28" no no no
 
 # Stickiness: a step that merely mentions running out of disk and then succeeds
 # must not leave the verdict blaming the volume for a later, genuine failure.
@@ -1319,6 +1416,27 @@ assert_failure_kind "a signalled run stays signalled, not an unloadable artifact
 assert_failure_kind "ignores an artifact flag when nothing watched the build" 104 "checks" \
   SIGNOFF_ARTIFACT_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 
+# The crashed-toolchain kind: the watch was armed, the linker reported a signal
+# and cargo stopped there, and none of the three causes above went past. Distinct
+# from "checks" for the same reason as every kind above — nothing about the
+# branch was judged (#13614).
+assert_failure_kind "calls a compiler subprocess that died of a signal its own kind, not a check failure" 101 "toolchain-crash" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# The three named causes outrank the symptom, because each carries its own remedy.
+assert_failure_kind "reports disk when the volume filled and the linker died" 101 "disk" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_DISK_HIT=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind "reports cache when the cache was unreachable and the linker died" 101 "cache" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind "reports the unloadable artifact over the crash when both were recorded" 104 "corrupt-artifact" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_ARTIFACT_HIT=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# ...and a signalled run still outranks it: it reached no verdict at all.
+assert_failure_kind "a signalled run stays signalled, not a crashed toolchain" 143 "signalled" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# A crash flag inherited from the environment with nothing watching is not a
+# reading anyone took, exactly as for the artifact flag above.
+assert_failure_kind "ignores a crash flag when nothing watched the build" 101 "checks" \
+  SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+
 # The cache verdict, same shape as the disk one: authoritative when the watch was
 # armed, and worth nothing without it.
 assert_failure_kind "calls an unreachable compiler cache an infrastructure failure" 101 "cache" \
@@ -1539,6 +1657,76 @@ assert_describe "tells the author to re-dispatch rather than to read the log" 10
   "Sign-off could not complete after 21195s — a test binary on the runner would not load; re-dispatch (triggered by someone)" \
   "re-dispatch" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_ARTIFACT_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# A compiler subprocess that died of a signal has to say so in the commit status
+# too, and name the remedy: run 33041791988 published "Sign-off checks failed
+# after 5975s" for a crash on a crate the branch never touched (#13614). The
+# status names the class, not the tool, because the driver's signature does not
+# distinguish its frontend from the linker.
+assert_describe "says a crashed compiler subprocess could not complete, not that checks failed" 101 \
+  "Compiler subprocess crashed after 21195s — checks did not complete, re-dispatch (triggered by someone)" \
+  "the checks did not complete" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_lacks "does not call a crashed compiler subprocess a check failure" 101 \
+  "checks failed" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# What a verdict must still say once GitHub is done with the line.
+#
+# post_commit_status cuts the description at STATUS_DESC_MAX_CHARS and the
+# attribution suffix is last, so an over-long verdict does not lose the detail
+# — it loses the name of whoever triggered it, mid-word. Asserted as a
+# property rather than against a copy of the text, so rewording an arm cannot
+# pass this by accident, and driven through describe_check_failure so it
+# measures what the run will publish.
+#
+# The cap comes from the subject rather than a literal here: a second copy of
+# the number is a guard that can agree with itself while the real cut still
+# truncates. The length likewise comes from the subject, which is the shell
+# that performs the cut — with no locale set that counts bytes, two or three
+# more than the characters GitHub counts, so this errs strict and never lax.
+assert_describe_fits() {
+  local name="$1" check_status="$2"
+  shift 2
+  tests_run=$((tests_run + 1))
+
+  # The longest login GitHub issues. The bug only appears at this boundary:
+  # every login that signs off today is a third of it, which is why four arms
+  # carried it unnoticed (spiceai/spiceai#14076).
+  local login
+  login="$(printf "%0${LONGEST_LOGIN_LEN}d" 0 | tr 0 a)"
+
+  local result rc output length cap
+  result="$(call_subject \
+    "describe_check_failure ${check_status} 999999 ${login}
+     printf 'LEN[%s]\nCAP[%s]\nDESC[%s]\n' \"\${#SIGNOFF_FAILURE_STATUS_DESC}\" \"\$STATUS_DESC_MAX_CHARS\" \"\$SIGNOFF_FAILURE_STATUS_DESC\"" \
+    "$@")"
+  rc="${result%%|*}"
+  output="${result#*|}"
+
+  if [[ "$rc" -ne 0 ]]; then
+    fail_test "$name: expected exit 0, got ${rc} (output: ${output})"
+    return
+  fi
+  length="${output#*LEN[}"; length="${length%%]*}"
+  cap="${output#*CAP[}"; cap="${cap%%]*}"
+  if [[ ! "$length" =~ ^[0-9]+$ || ! "$cap" =~ ^[0-9]+$ ]]; then
+    fail_test "$name: the verdict's length or the cap did not parse: '${output}'"
+    return
+  fi
+  if (( length > cap )); then
+    fail_test "$name: the verdict is ${length} long against a cap of ${cap}; GitHub cuts it there and the attribution is what is lost: '${output}'"
+    return
+  fi
+  if [[ "$output" != *"(triggered by ${login})"* ]]; then
+    fail_test "$name: the verdict must carry the whole login: '${output}'"
+    return
+  fi
+  echo "  ok: $name"
+}
+readonly LONGEST_LOGIN_LEN=39
+
+assert_describe_fits "the crash verdict fits a commit status with the longest login GitHub issues" 101 \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+
 assert_describe "still publishes a genuine check failure" 101 \
   "Sign-off checks failed after 21195s (triggered by someone)" \
   "sign-off checks failed" STUB_FREE_KB="$(gib_to_kb 200)"
