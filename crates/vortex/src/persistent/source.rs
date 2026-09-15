@@ -68,6 +68,7 @@ pub struct VortexSource {
     layout_readers: Arc<DashMap<Path, Weak<dyn LayoutReader>>>,
     /// Shared full-file natural split ranges keyed by path.
     natural_split_ranges: Arc<DashMap<Path, Arc<[Range<u64>]>>>,
+    file_prune_verdicts: Arc<DashMap<Path, bool>>,
     expression_convertor: Arc<dyn ExpressionConvertor>,
     pub(crate) vortex_reader_factory: Option<Arc<dyn VortexReaderFactory>>,
     vx_metrics_registry: Arc<dyn MetricsRegistry>,
@@ -105,6 +106,7 @@ impl VortexSource {
             df_metrics: ExecutionPlanMetricsSet::default(),
             layout_readers: Arc::new(DashMap::default()),
             natural_split_ranges: Arc::new(DashMap::default()),
+            file_prune_verdicts: Arc::new(DashMap::default()),
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             vortex_reader_factory: None,
             vx_metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
@@ -281,6 +283,7 @@ impl FileSource for VortexSource {
             metrics_registry: Arc::clone(&self.vx_metrics_registry),
             layout_readers: Arc::clone(&self.layout_readers),
             natural_split_ranges: Arc::clone(&self.natural_split_ranges),
+            file_prune_verdicts: Arc::clone(&self.file_prune_verdicts),
             has_output_ordering: !base_config.output_ordering.is_empty(),
             expression_convertor: Arc::clone(&self.expression_convertor),
             file_metadata_cache: self.file_metadata_cache.as_ref().map(Arc::clone),

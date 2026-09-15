@@ -99,6 +99,9 @@ pub(crate) struct VortexOpener {
     pub layout_readers: Arc<DashMap<Path, Weak<dyn LayoutReader>>>,
     /// Shared full-file natural split ranges keyed by file path.
     pub natural_split_ranges: Arc<DashMap<Path, Arc<[Range<u64>]>>>,
+    /// Shared file-level pruning verdicts, keyed by file path. Only populated for a
+    /// static pruning predicate, whose verdict is a property of the file alone.
+    pub file_prune_verdicts: Arc<DashMap<Path, bool>>,
     /// Whether the query has output ordering specified
     pub has_output_ordering: bool,
 
@@ -149,6 +152,13 @@ impl FileOpener for VortexOpener {
 
         let expr_convertor = Arc::clone(&self.expression_convertor);
         let projection_pushdown = self.projection_pushdown;
+        let file_prune_verdicts = Arc::clone(&self.file_prune_verdicts);
+        // A dynamic predicate answers differently as build sides publish; a static one
+        // cannot, which is what lets its verdict be cached and its re-check dropped.
+        let pruning_predicate_is_dynamic = self
+            .file_pruning_predicate
+            .as_ref()
+            .is_some_and(is_dynamic_physical_expr);
 
         // Replace column access for partition columns with literals
         let literal_value_cols: std::collections::HashMap<String, ScalarValue> = self
@@ -192,10 +202,40 @@ impl FileOpener for VortexOpener {
 
             // Check if this file should be pruned based on statistics/partition values.
             // Returns empty stream if file can be skipped entirely.
-            if let Some(file_pruner) = file_pruner.as_mut()
-                && file_pruner.should_prune()?
-            {
-                return Ok(stream::empty().boxed());
+            //
+            // A static predicate prunes on the file's statistics and partition values,
+            // both fixed when the plan was built, so the verdict belongs to the file and
+            // not to the split: decide it once and let every other split of the file read
+            // it. `FilePruner::should_prune` rebuilds a `PruningPredicate` from the
+            // expression on its first call and only then consults the statistics, and
+            // `FilePruner` is constructed per split, so its own memo - which is per
+            // instance - never gets a second call to serve.
+            //
+            // Nothing can change that verdict once the scan is running either, so the
+            // pruner is dropped rather than handed to `PrunableStream`, which would
+            // otherwise re-ask it on every poll for an answer fixed at plan time. A
+            // dynamic predicate keeps both: its generation rises when a build side
+            // publishes, and the stream ends early when it does.
+            if let Some(pruner) = file_pruner.as_mut() {
+                if pruning_predicate_is_dynamic {
+                    if pruner.should_prune()? {
+                        return Ok(stream::empty().boxed());
+                    }
+                } else {
+                    let pruned = match file_prune_verdicts.entry(file.object_meta.location.clone())
+                    {
+                        Entry::Occupied(entry) => *entry.get(),
+                        Entry::Vacant(entry) => {
+                            let pruned = pruner.should_prune()?;
+                            entry.insert(pruned);
+                            pruned
+                        }
+                    };
+                    if pruned {
+                        return Ok(stream::empty().boxed());
+                    }
+                    file_pruner = None;
+                }
             }
 
             let mut open_opts = session
@@ -904,6 +944,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            file_prune_verdicts: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
@@ -1173,6 +1214,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            file_prune_verdicts: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
@@ -1262,6 +1304,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            file_prune_verdicts: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
@@ -1419,6 +1462,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            file_prune_verdicts: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
@@ -1481,6 +1525,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            file_prune_verdicts: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
@@ -1690,6 +1735,7 @@ mod tests {
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             layout_readers: Default::default(),
             natural_split_ranges: Default::default(),
+            file_prune_verdicts: Default::default(),
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
