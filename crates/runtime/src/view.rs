@@ -715,13 +715,14 @@ fn push_len_prefixed(out: &mut String, value: &str) {
 /// source.
 ///
 /// These are the Spicepod parameters, so a `${secrets:...}` value is hashed as the
-/// *reference*. That cuts both ways and the second half is a real limit, not a benefit:
-/// rotating a credential leaves the identity alone (good — the rows did not change), but a
-/// row-shaping parameter read from a secret, `json_pointer: ${secrets:pointer}`, can move
-/// from `/us` to `/eu` with the reference and therefore the identity unchanged, and a cold
-/// start would accept the old rows. Closing that needs an identity built from the RESOLVED
-/// values, which are only available where the connector is constructed
-/// (`get_params_with_secrets`) — not from this sync, secret-less context.
+/// *reference*. Rotating a credential would leave the identity alone (the rows did not
+/// change), but a row-shaping parameter read from a secret, `json_pointer:
+/// ${secrets:pointer}`, can move from `/us` to `/eu` with the reference — and therefore
+/// the identity — unchanged. This sync, secret-less path cannot see the resolved value
+/// (`get_params_with_secrets` runs where the connector is constructed), so a
+/// snapshot-enabled source whose identity `params` contain a `${ store:key }` reference
+/// is refused at load rather than accepting a stamp that cannot see that change. See
+/// [`first_unresolved_snapshot_identity_param`].
 ///
 /// The cost of including params in full falls on SHARING a snapshot series between
 /// deployments, and it is significant: two spiced instances that materialize identical rows
@@ -1065,6 +1066,59 @@ pub(crate) fn definition_fingerprint(definition: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(definition.as_bytes());
     format!("sha256:{:x}", hasher.finalize())
+}
+
+/// A Spicepod `params` value that is a `${ store:key }` reference.
+///
+/// Snapshot identity hashes the reference, not the resolved value, so a row-shaping
+/// parameter such as `json_pointer: ${secrets:pointer}` can move from `/us` to `/eu`
+/// without changing the stamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnresolvedSnapshotIdentityParam {
+    pub param: String,
+    pub store: String,
+    pub key: String,
+}
+
+/// The first identity `params` entry that is a secret or env reference, if any.
+///
+/// Uses the same `${ store:key }` grammar as `Spicepod` secret expansion
+/// ([`runtime_secrets::iter_secret_references`]), including whitespace variants such as
+/// `${ secrets:pointer }` and `${env:POINTER}`. Any matching store is refused — `secrets`,
+/// `env`, and a user-defined store have the same hole. Keys are considered in sorted
+/// order so the named parameter does not depend on `HashMap` iteration.
+#[must_use]
+pub(crate) fn first_unresolved_snapshot_identity_param(
+    params: &HashMap<String, String>,
+) -> Option<UnresolvedSnapshotIdentityParam> {
+    params
+        .iter()
+        .filter_map(|(param, value)| {
+            runtime_secrets::iter_secret_references(value)
+                .next()
+                .map(|reference| UnresolvedSnapshotIdentityParam {
+                    param: param.clone(),
+                    store: reference.store,
+                    key: reference.key,
+                })
+        })
+        .min_by(|left, right| left.param.cmp(&right.param))
+}
+
+/// User-facing refusal when snapshots are enabled and an identity param is a secret or
+/// env reference. Built as a pure function so a reword cannot drop the resource, the
+/// consequence, or the docs link.
+#[must_use]
+pub(crate) fn snapshot_identity_unresolved_param_message(
+    component: &str,
+    name: &str,
+    param: &str,
+    store: &str,
+    key: &str,
+) -> String {
+    format!(
+        "Failed to enable acceleration snapshots for {component} '{name}': its snapshot identity hashes Spicepod `params.{param}` as the `${{{store}:{key}}}` reference, so a change to the resolved value would not change the stamp and a cold start could restore rows that no longer match. Set a literal value for `params.{param}`, or set `snapshots: disabled`. See: https://spiceai.org/docs/components/data-accelerators/snapshots"
+    )
 }
 
 pub(crate) fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReference> {
@@ -2261,6 +2315,100 @@ mod tests {
                 "column metadata that can change stored values is part of the definition"
             );
         }
+    }
+
+    #[test]
+    fn literal_identity_params_are_not_unresolved_snapshot_refs() {
+        let params = HashMap::from([
+            ("json_pointer".to_string(), "/us".to_string()),
+            ("file_format".to_string(), "parquet".to_string()),
+        ]);
+        assert!(
+            first_unresolved_snapshot_identity_param(&params).is_none(),
+            "a literal row-shaping param is visible to the stamp and must not refuse snapshots"
+        );
+    }
+
+    /// Conservative refuse for Copilot `discussion_r4012511570`: identity hashes
+    /// the Spicepod reference, so a row-shaping secret can change without the stamp.
+    #[test]
+    fn secret_ref_in_a_row_shaping_param_is_an_unresolved_snapshot_ref() {
+        let params =
+            HashMap::from([("json_pointer".to_string(), "${secrets:pointer}".to_string())]);
+        let unresolved = first_unresolved_snapshot_identity_param(&params)
+            .expect("a ${secrets:...} row-shaping param must be detected");
+        assert_eq!(unresolved.param, "json_pointer");
+        assert_eq!(unresolved.store, "secrets");
+        assert_eq!(unresolved.key, "pointer");
+    }
+
+    #[test]
+    fn env_ref_in_a_row_shaping_param_is_an_unresolved_snapshot_ref() {
+        let params = HashMap::from([("json_pointer".to_string(), "${env:POINTER}".to_string())]);
+        let unresolved = first_unresolved_snapshot_identity_param(&params)
+            .expect("a ${env:...} row-shaping param must be detected");
+        assert_eq!(unresolved.param, "json_pointer");
+        assert_eq!(unresolved.store, "env");
+        assert_eq!(unresolved.key, "POINTER");
+    }
+
+    #[test]
+    fn spaced_secret_ref_matches_the_spicepod_grammar() {
+        let params = HashMap::from([(
+            "json_pointer".to_string(),
+            "${ secrets:pointer }".to_string(),
+        )]);
+        let unresolved = first_unresolved_snapshot_identity_param(&params)
+            .expect("whitespace inside ${ store:key } is still a secret reference");
+        assert_eq!(unresolved.store, "secrets");
+        assert_eq!(unresolved.key, "pointer");
+    }
+
+    #[test]
+    fn snapshot_identity_unresolved_param_refusal_names_the_view_and_a_way_out() {
+        let message = snapshot_identity_unresolved_param_message(
+            "view",
+            "orders_us",
+            "json_pointer",
+            "secrets",
+            "pointer",
+        );
+        for expected in [
+            "view",
+            "'orders_us'",
+            "`params.json_pointer`",
+            "${secrets:pointer}",
+            "would not change the stamp",
+            "cold start could restore rows",
+            "`snapshots: disabled`",
+            "https://spiceai.org/docs/components/data-accelerators/snapshots",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal must contain {expected:?}: {message}"
+            );
+        }
+        assert!(
+            !message.contains('\n'),
+            "a user-facing refusal must stay on one line: {message:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_identity_unresolved_param_refusal_names_the_dataset() {
+        let message = snapshot_identity_unresolved_param_message(
+            "dataset",
+            "docs",
+            "json_pointer",
+            "env",
+            "POINTER",
+        );
+        assert!(
+            message.contains("dataset")
+                && message.contains("'docs'")
+                && message.contains("${env:POINTER}"),
+            "the dataset refusal must name the component and the env reference: {message}"
+        );
     }
 
     #[tokio::test]

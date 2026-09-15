@@ -570,6 +570,20 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "{}",
+        crate::view::snapshot_identity_unresolved_param_message(
+            component, name, param, store, key
+        )
+    ))]
+    SnapshotsIdentityUnresolvedParam {
+        component: &'static str,
+        name: String,
+        param: String,
+        store: String,
+        key: String,
+    },
+
+    #[snafu(display(
         "Failed to enable acceleration snapshots for view '{view_name}': {reason}. \
          Set `snapshots: disabled` on the view, reduce its query to a single table scan, \
          or set `snapshots_consistency: accept_skew` to use the snapshots anyway and accept \
@@ -641,6 +655,7 @@ impl Error {
                 | Self::SnapshotsRequireFileAcceleration { .. }
                 | Self::SnapshotsUnsupportedForPartitionedCayenne { .. }
                 | Self::SnapshotsCayenneMetastoreUnavailable { .. }
+                | Self::SnapshotsIdentityUnresolvedParam { .. }
                 // Unparseable `snapshots_trigger_threshold` value.
                 | Self::InvalidSnapshotCreationInterval { .. }
                 | Self::InvalidSnapshotCreationBatches { .. }
@@ -723,6 +738,28 @@ fn validate_distributed_engine(
         return UnsupportedDistributedAccelerationEngineSnafu {
             dataset_name: dataset_name.to_string(),
             engine: engine.to_string(),
+        }
+        .fail();
+    }
+    Ok(())
+}
+
+/// Refuses snapshot enablement when an identity `params` value is a
+/// `${ store:key }` reference this sync path cannot resolve.
+///
+/// See [`crate::view::first_unresolved_snapshot_identity_param`].
+fn ensure_snapshot_identity_params(
+    component: &'static str,
+    name: &str,
+    params: &HashMap<String, String>,
+) -> Result<()> {
+    if let Some(unresolved) = crate::view::first_unresolved_snapshot_identity_param(params) {
+        return SnapshotsIdentityUnresolvedParamSnafu {
+            component,
+            name: name.to_string(),
+            param: unresolved.param,
+            store: unresolved.store,
+            key: unresolved.key,
         }
         .fail();
     }
@@ -3482,6 +3519,7 @@ impl DataFusion {
         // and finds out otherwise at the one moment it matters. Applies to bootstrap-only
         // too — an acceleration with nothing on disk has nothing to restore into either.
         if !acceleration_settings.snapshot_behavior.is_disabled() {
+            ensure_snapshot_identity_params("dataset", &dataset.name.to_string(), &dataset.params)?;
             ensure!(
                 acceleration_layout
                     .as_ref()
@@ -5158,6 +5196,9 @@ impl DataFusion {
         // makes the discrepancy durable and reusable. Load-time refuses a multi-read
         // view; `ViewSnapshotPublishGate` then requires the attestation recorded from
         // the plan that executed the refresh, not a fresh re-plan at publish time.
+        if !acceleration.snapshot_behavior.is_disabled() {
+            ensure_snapshot_identity_params("view", &table.to_string(), &view.params)?;
+        }
         match get_acceleration_layout(view, &self.accelerator_engine_registry).await {
             Ok(layout) if layout.is_enabled() => {
                 ensure!(
@@ -7898,6 +7939,75 @@ mod tests {
                 outcome,
                 DeferredRefreshOutcome::Abandoned,
                 "no refresh was ever recorded, and none can be now the table is gone"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_view_params_do_not_refuse_snapshots() {
+        let params = HashMap::from([("json_pointer".to_string(), "/us".to_string())]);
+        super::ensure_snapshot_identity_params("view", "orders_us", &params)
+            .expect("a literal row-shaping param must accept snapshots");
+    }
+
+    #[test]
+    fn secret_ref_view_params_refuse_snapshots() {
+        let params =
+            HashMap::from([("json_pointer".to_string(), "${secrets:pointer}".to_string())]);
+        let err = super::ensure_snapshot_identity_params("view", "orders_us", &params)
+            .expect_err("a secret-referenced row-shaping param must refuse snapshots");
+        let message = err.to_string();
+        assert!(
+            matches!(err, Error::SnapshotsIdentityUnresolvedParam { .. }),
+            "expected an unresolved-param refusal, got: {err}"
+        );
+        for expected in [
+            "view",
+            "'orders_us'",
+            "`params.json_pointer`",
+            "${secrets:pointer}",
+            "`snapshots: disabled`",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal must contain {expected:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_ref_view_params_refuse_snapshots() {
+        let params = HashMap::from([("json_pointer".to_string(), "${env:POINTER}".to_string())]);
+        let err = super::ensure_snapshot_identity_params("view", "orders_us", &params)
+            .expect_err("an env-referenced row-shaping param must refuse snapshots");
+        assert!(
+            err.to_string().contains("${env:POINTER}"),
+            "the refusal must name the env reference: {err}"
+        );
+    }
+
+    #[test]
+    fn snapshot_identity_unresolved_param_refusal_names_the_view_and_a_way_out() {
+        let message = SnapshotsIdentityUnresolvedParamSnafu {
+            component: "view",
+            name: "orders_us".to_string(),
+            param: "json_pointer".to_string(),
+            store: "secrets".to_string(),
+            key: "pointer".to_string(),
+        }
+        .build()
+        .to_string();
+        for expected in [
+            "view",
+            "'orders_us'",
+            "`params.json_pointer`",
+            "${secrets:pointer}",
+            "`snapshots: disabled`",
+            "https://spiceai.org/docs/components/data-accelerators/snapshots",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal must contain {expected:?}: {message}"
             );
         }
     }

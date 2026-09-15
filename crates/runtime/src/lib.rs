@@ -393,6 +393,23 @@ pub enum Error {
         connector: String,
     },
 
+    #[snafu(display(
+        "{}",
+        crate::view::snapshot_identity_unresolved_param_message(
+            "dataset",
+            dataset_name,
+            param,
+            store,
+            key
+        )
+    ))]
+    SnapshotsIdentityUnresolvedParam {
+        dataset_name: String,
+        param: String,
+        store: String,
+        key: String,
+    },
+
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
