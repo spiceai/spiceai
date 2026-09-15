@@ -93,7 +93,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | Fork | Pinned revision | Branch |
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `34a465e97fb529075f953adf40bc2e02de755bec` | `spiceai` |
-| [arrow-rs](#arrow-rs) | `a8dc5914fe55ce1c0eec1b2cd7409b973abcfd0b` | `phillip/260915-thrift-0.23` (TEMPORARY: spiceai/arrow-rs#27) |
+| [arrow-rs](#arrow-rs) | `22ff09c419766c9e3b1ecb8d911fb3a9abf723b3` | `spiceai-58` |
 | [async-openai](#async-openai) | `6bda5533dd118afcf80aa6f5ef59ad35277627a7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `efbb9a72e92789eafed0806c3e16f14640c504f6` | `lukim/spiceai-0.11.0` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
@@ -109,14 +109,14 @@ own section below — a count here would be one more thing to keep true by hand.
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `9d7be742f060d70066fc041319af787772716e0d` | `spiceai-1.4.4` |
-| [graph-rs-sdk](#graph-rs-sdk) | `2c3de8623edae59a9a540676587de262c5df5751` | `phillip/260915-jsonwebtoken-10` (TEMPORARY: spiceai/graph-rs-sdk#8) |
+| [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `351d1bc7b6ac9a835397e248e9c687f305e947d1` | `spiceai-0.10.1-df-54` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
 | [sea-query](#sea-query) | `ae75baef819513fb8d19af014972dcfa324e201a` | `spiceai` |
-| [snowflake-rs](#snowflake-rs) | `31d458d2fae2581af8d35792bab52975c41a82c0` | `phillip/260915-jsonwebtoken-10` (TEMPORARY: spiceai/snowflake-rs#11) |
+| [snowflake-rs](#snowflake-rs) | `e1542cc4320cd08b0e50b3d2270f38ba3f0ccd68` | `spiceai-58` |
 | [spark-connect-rs](#spark-connect-rs) | `5f7c2452d4202d7496abac0a6f2eaa4bef46a5ad` | `spiceai` |
 | [text-embeddings-inference](#mistralrs-and-text-embeddings-inference) | `ac4e457936bc11c9b4fee453f2be33133d3146d8` | `spiceai` |
 | [text-splitter](#text-splitter) | `58f9c21006e01e5e968c5de80a0398b3f5ec439a` | `spiceai` |
