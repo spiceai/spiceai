@@ -41,6 +41,7 @@ use data_components::cdc::{
 use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
+use parking_lot::Mutex;
 use runtime_component::dataset::DatasetSpec;
 use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_parameters::Parameters;
@@ -195,6 +196,58 @@ pub trait ObjectLister: Send + Sync {
     async fn list_keys(&self) -> std::result::Result<Vec<String>, StreamError>;
 }
 
+/// Object keys that have been applied, or yielded and not yet committed.
+///
+/// Keys are marked in-flight when their envelopes are yielded so a prefetch
+/// cannot append the same object twice. They move to `committed` only from a
+/// post-apply committer. An in-flight SQS notification is left on the queue
+/// (not deleted) so a failed apply can still retry.
+#[derive(Debug, Default, Clone)]
+struct AppliedKeySet {
+    committed: HashSet<String>,
+    in_flight: HashSet<String>,
+}
+
+impl AppliedKeySet {
+    fn is_committed(&self, key: &str) -> bool {
+        self.committed.contains(key)
+    }
+
+    fn is_in_flight(&self, key: &str) -> bool {
+        self.in_flight.contains(key)
+    }
+
+    fn is_known(&self, key: &str) -> bool {
+        self.is_committed(key) || self.is_in_flight(key)
+    }
+
+    fn mark_in_flight(&mut self, keys: impl IntoIterator<Item = String>) {
+        for key in keys {
+            if !self.committed.contains(&key) {
+                self.in_flight.insert(key);
+            }
+        }
+    }
+
+    fn commit(&mut self, keys: &[String]) {
+        for key in keys {
+            self.in_flight.remove(key);
+            self.committed.insert(key.clone());
+        }
+    }
+
+    fn abort_in_flight(&mut self, keys: &[String]) {
+        for key in keys {
+            self.in_flight.remove(key);
+        }
+    }
+
+    fn replace_in_flight(&mut self, listed: Vec<String>) {
+        self.committed.clear();
+        self.in_flight = listed.into_iter().collect();
+    }
+}
+
 struct SqsDeleteCommitter {
     queue: Arc<dyn MessageQueue>,
     receipt_handle: String,
@@ -209,6 +262,29 @@ impl CommitChange for SqsDeleteCommitter {
             .map_err(|source| CommitError::UnableToCommitChange {
                 source: Box::new(source),
             })
+    }
+}
+
+/// Advances [`AppliedKeySet`] after the consumer applies the envelope. Drop
+/// without `commit` releases in-flight keys so a retry or backfill can apply
+/// them again.
+struct AppliedKeysCommitter {
+    applied: Arc<Mutex<AppliedKeySet>>,
+    keys: Vec<String>,
+    inner: Box<dyn CommitChange + Send + Sync>,
+}
+
+#[async_trait]
+impl CommitChange for AppliedKeysCommitter {
+    async fn commit(&self) -> std::result::Result<(), CommitError> {
+        self.applied.lock().commit(&self.keys);
+        self.inner.commit().await
+    }
+}
+
+impl Drop for AppliedKeysCommitter {
+    fn drop(&mut self) {
+        self.applied.lock().abort_in_flight(&self.keys);
     }
 }
 
@@ -610,8 +686,16 @@ pub fn region_from_queue_url(queue_url: &str) -> Option<String> {
     }
 }
 
-fn replace_applied_keys(applied_keys: &mut HashSet<String>, listed: Vec<String>) {
-    *applied_keys = listed.into_iter().collect();
+fn applied_keys_committer(
+    applied: &Arc<Mutex<AppliedKeySet>>,
+    keys: Vec<String>,
+    inner: Box<dyn CommitChange + Send + Sync>,
+) -> Box<dyn CommitChange + Send + Sync> {
+    Box::new(AppliedKeysCommitter {
+        applied: Arc::clone(applied),
+        keys,
+        inner,
+    })
 }
 
 fn prefix_display(bucket: &str, key_prefix: &str) -> String {
@@ -840,7 +924,7 @@ async fn process_message(
     config: &S3ChangesConfig,
     table_schema: &SchemaRef,
     object_reader: &dyn ObjectReader,
-    applied_keys: &HashSet<String>,
+    applied_keys: &Mutex<AppliedKeySet>,
     message: &QueueMessage,
 ) -> ProcessOutcome {
     let receipt_handle = message.receipt_handle.clone();
@@ -870,7 +954,7 @@ async fn process_message(
             .find(|event| !matches_dataset(event, &config.bucket, &config.key_prefix))
             .unwrap_or(&events[0]);
         tracing::error!(
-            "Dataset '{}' received an S3 notification for s3://{}/{} that is outside this dataset's prefix {}, so the entire SQS message was left on the queue (not deleted) and will retry until visibility timeout. The queue must be exclusive to this dataset — fan out with SNS to a per-dataset queue, or set a bucket notification prefix filter. Sharing one queue across datasets is not supported. See: {S3_DOCS}",
+            "Dataset '{}' received an S3 notification for s3://{}/{} that is outside this dataset's prefix {}, so the entire SQS message was left on the queue (not deleted) and will become visible again after each visibility timeout until it is deleted or the queue retention period expires. The queue must be exclusive to this dataset — fan out with SNS to a per-dataset queue, or set a bucket notification prefix filter. Sharing one queue across datasets is not supported. See: {S3_DOCS}",
             dataset.name,
             sample.bucket,
             sample.key,
@@ -905,10 +989,17 @@ async fn process_message(
         .iter()
         .copied()
         .filter(|event| {
-            event.kind == ObjectEventKind::Created && !applied_keys.contains(&event.key)
+            event.kind == ObjectEventKind::Created && !applied_keys.lock().is_known(&event.key)
         })
         .collect();
     if created.is_empty() {
+        let in_flight = matching.iter().any(|event| {
+            event.kind == ObjectEventKind::Created && applied_keys.lock().is_in_flight(&event.key)
+        });
+        if in_flight {
+            // Apply is still pending. Do not delete — a failed apply must retry.
+            return ProcessOutcome::Leave;
+        }
         return ProcessOutcome::Ack { receipt_handle };
     }
 
@@ -971,7 +1062,7 @@ async fn apply_unapplied_objects(
     table_schema: &SchemaRef,
     object_lister: &dyn ObjectLister,
     object_reader: &dyn ObjectReader,
-    applied_keys: &HashSet<String>,
+    applied_keys: &Mutex<AppliedKeySet>,
     scope_prefix: &str,
     pass: &'static str,
 ) -> std::result::Result<BackfillCreates, StreamError> {
@@ -988,7 +1079,7 @@ async fn apply_unapplied_objects(
         if !matches_dataset(&event, &config.bucket, scope_prefix) {
             continue;
         }
-        if applied_keys.contains(&key) {
+        if applied_keys.lock().is_known(&key) {
             continue;
         }
         match object_reader.read_object(&config.bucket, &key).await {
@@ -1027,14 +1118,36 @@ fn rebuild_envelope(
     schema: &SchemaRef,
     queue: &Arc<dyn MessageQueue>,
     receipt_handle: String,
+    applied: &Arc<Mutex<AppliedKeySet>>,
+    keys: Option<Vec<String>>,
+) -> std::result::Result<ChangeEnvelope, StreamError> {
+    let (_, batch, is_dataset_ready, _) =
+        build_history_unavailable_envelope(schema)?.into_parts()?;
+    let sqs: Box<dyn CommitChange + Send + Sync> = Box::new(SqsDeleteCommitter {
+        queue: Arc::clone(queue),
+        receipt_handle,
+    });
+    let committer = match keys {
+        Some(keys) => applied_keys_committer(applied, keys, sqs),
+        None => sqs,
+    };
+    Ok(ChangeEnvelope::from_parts(
+        committer,
+        batch,
+        is_dataset_ready,
+        true,
+    ))
+}
+
+fn history_unavailable_envelope(
+    schema: &SchemaRef,
+    applied: &Arc<Mutex<AppliedKeySet>>,
+    keys: Vec<String>,
 ) -> std::result::Result<ChangeEnvelope, StreamError> {
     let (_, batch, is_dataset_ready, _) =
         build_history_unavailable_envelope(schema)?.into_parts()?;
     Ok(ChangeEnvelope::from_parts(
-        Box::new(SqsDeleteCommitter {
-            queue: Arc::clone(queue),
-            receipt_handle,
-        }),
+        applied_keys_committer(applied, keys, Box::new(NoOpCommitter)),
         batch,
         is_dataset_ready,
         true,
@@ -1044,16 +1157,18 @@ fn rebuild_envelope(
 fn create_envelopes(
     schema: &SchemaRef,
     batches: Vec<RecordBatch>,
+    applied: &Arc<Mutex<AppliedKeySet>>,
+    keys: Vec<String>,
     queue: &Arc<dyn MessageQueue>,
     receipt_handle: String,
 ) -> std::result::Result<Vec<ChangeEnvelope>, StreamError> {
     let last = batches.len().saturating_sub(1);
-    batches
+    let envelopes = batches
         .into_iter()
         .enumerate()
         .map(|(i, batch)| {
             let change_batch = wrap_data_as_change_batch(schema, &batch)?;
-            let committer: Box<dyn CommitChange + Send + Sync> = if i == last {
+            let inner: Box<dyn CommitChange + Send + Sync> = if i == last {
                 Box::new(SqsDeleteCommitter {
                     queue: Arc::clone(queue),
                     receipt_handle: receipt_handle.clone(),
@@ -1061,27 +1176,49 @@ fn create_envelopes(
             } else {
                 Box::new(NoOpCommitter)
             };
-            Ok(ChangeEnvelope::new(committer, change_batch, true))
+            let committer = if i == last {
+                applied_keys_committer(applied, keys.clone(), inner)
+            } else {
+                inner
+            };
+            Ok::<_, StreamError>(ChangeEnvelope::new(committer, change_batch, true))
         })
-        .collect()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    applied.lock().mark_in_flight(keys);
+    Ok(envelopes)
 }
 
 fn backfill_envelopes(
     schema: &SchemaRef,
     batches: Vec<RecordBatch>,
     is_dataset_ready: bool,
+    applied: &Arc<Mutex<AppliedKeySet>>,
+    keys: Vec<String>,
 ) -> std::result::Result<Vec<ChangeEnvelope>, StreamError> {
-    batches
+    if batches.is_empty() {
+        applied.lock().commit(&keys);
+        return Ok(Vec::new());
+    }
+    let last = batches.len().saturating_sub(1);
+    let envelopes = batches
         .into_iter()
-        .map(|batch| {
+        .enumerate()
+        .map(|(i, batch)| {
             let change_batch = wrap_data_as_change_batch(schema, &batch)?;
-            Ok(ChangeEnvelope::new(
-                Box::new(NoOpCommitter),
+            let committer: Box<dyn CommitChange + Send + Sync> = if i == last {
+                applied_keys_committer(applied, keys.clone(), Box::new(NoOpCommitter))
+            } else {
+                Box::new(NoOpCommitter)
+            };
+            Ok::<_, StreamError>(ChangeEnvelope::new(
+                committer,
                 change_batch,
                 is_dataset_ready,
             ))
         })
-        .collect()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    applied.lock().mark_in_flight(keys);
+    Ok(envelopes)
 }
 
 /// SQS long-poll change stream for one S3 listing dataset, with a periodic
@@ -1100,7 +1237,7 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
         } = parts;
         let epoch = shutdown_epoch();
         let schema = federated_table.table_provider().await.schema();
-        let mut applied_keys: HashSet<String> = HashSet::new();
+        let applied_keys = Arc::new(Mutex::new(AppliedKeySet::default()));
 
         if acceleration.is_provably_empty() {
             tracing::info!(
@@ -1117,13 +1254,18 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                 &schema,
                 object_lister.as_ref(),
                 object_reader.as_ref(),
-                &applied_keys,
+                applied_keys.as_ref(),
                 &config.dataset_prefix,
                 "the empty-accelerator snapshot",
             )
             .await?;
-            let envelopes = backfill_envelopes(&schema, snapshot.batches, false)?;
-            applied_keys.extend(snapshot.keys);
+            let envelopes = backfill_envelopes(
+                &schema,
+                snapshot.batches,
+                false,
+                &applied_keys,
+                snapshot.keys,
+            )?;
             for envelope in envelopes {
                 yield envelope;
             }
@@ -1135,17 +1277,21 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
             );
             // Seed before `history_unavailable`. A listing taken afterwards can
             // include objects the replace scan never saw; those must stay
-            // eligible for the completeness backfill.
+            // eligible for the completeness backfill. Keys stay in-flight until
+            // the replace envelope commits.
             match object_lister.list_keys().await {
-                Ok(keys) => replace_applied_keys(&mut applied_keys, keys),
+                Ok(keys) => {
+                    applied_keys.lock().replace_in_flight(keys.clone());
+                    yield history_unavailable_envelope(&schema, &applied_keys, keys)?;
+                }
                 Err(error) => {
                     tracing::warn!(
                         "Dataset '{}' will replace the accelerator from the listing prefix but could not record object keys for backfill skip, so the next listing backfill may re-apply those objects. Cause: {error}. See: {S3_DOCS}",
                         dataset.name
                     );
+                    yield build_history_unavailable_envelope(&schema)?;
                 }
             }
-            yield build_history_unavailable_envelope(&schema)?;
         }
 
         yield build_ready_signal_envelope(&schema)?;
@@ -1177,11 +1323,10 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                 if shutdown_epoch() != epoch {
                     break;
                 }
-                match process_message(&dataset, &config, &schema, object_reader.as_ref(), &applied_keys, &message).await {
+                match process_message(&dataset, &config, &schema, object_reader.as_ref(), applied_keys.as_ref(), &message).await {
                     ProcessOutcome::Creates { batches, keys, receipt_handle } => {
-                        match create_envelopes(&schema, batches, &queue, receipt_handle) {
+                        match create_envelopes(&schema, batches, &applied_keys, keys, &queue, receipt_handle) {
                             Ok(envelopes) => {
-                                applied_keys.extend(keys);
                                 for envelope in envelopes {
                                     yield envelope;
                                 }
@@ -1195,18 +1340,20 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                         }
                     }
                     ProcessOutcome::Rebuild { receipt_handle } => {
-                        match object_lister.list_keys().await {
+                        let listing_keys = match object_lister.list_keys().await {
                             Ok(keys) => {
-                                replace_applied_keys(&mut applied_keys, keys);
+                                applied_keys.lock().replace_in_flight(keys.clone());
+                                Some(keys)
                             }
                             Err(error) => {
                                 tracing::warn!(
                                     "Dataset '{}' will rebuild the accelerator from the listing prefix but could not refresh the applied-object set, so the next listing backfill may re-apply current objects. Cause: {error}. See: {S3_DOCS}",
                                     dataset.name
                                 );
+                                None
                             }
-                        }
-                        yield rebuild_envelope(&schema, &queue, receipt_handle)?;
+                        };
+                        yield rebuild_envelope(&schema, &queue, receipt_handle, &applied_keys, listing_keys)?;
                     }
                     ProcessOutcome::Ack { receipt_handle } => {
                         if let Err(error) = queue.delete(&receipt_handle).await {
@@ -1227,16 +1374,21 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                     &schema,
                     object_lister.as_ref(),
                     object_reader.as_ref(),
-                    &applied_keys,
+                    applied_keys.as_ref(),
                     &config.key_prefix,
                     "a listing backfill",
                 )
                 .await
                 {
                     Ok(backfill) => {
-                        match backfill_envelopes(&schema, backfill.batches, true) {
+                        match backfill_envelopes(
+                            &schema,
+                            backfill.batches,
+                            true,
+                            &applied_keys,
+                            backfill.keys,
+                        ) {
                             Ok(envelopes) => {
-                                applied_keys.extend(backfill.keys);
                                 for envelope in envelopes {
                                     yield envelope;
                                 }
@@ -1480,6 +1632,15 @@ mod tests {
         Arc::new(MockLister { keys: vec![] })
     }
 
+    fn applied_mutex(
+        committed: impl IntoIterator<Item = String>,
+    ) -> parking_lot::Mutex<AppliedKeySet> {
+        let mut set = AppliedKeySet::default();
+        let keys: Vec<String> = committed.into_iter().collect();
+        set.commit(&keys);
+        parking_lot::Mutex::new(set)
+    }
+
     fn start_stream(
         acceleration: AccelerationContents,
         queue: Arc<MockQueue>,
@@ -1698,7 +1859,7 @@ mod tests {
             &default_config(),
             &id_name_schema(),
             &reader,
-            &HashSet::new(),
+            &applied_mutex([]),
             &QueueMessage {
                 body: created_put_body("events/a.parquet"),
                 receipt_handle: "rh-1".into(),
@@ -1729,7 +1890,7 @@ mod tests {
             )]),
             fail_keys: vec![],
         };
-        let applied = HashSet::from(["events/a.parquet".to_string()]);
+        let applied = applied_mutex(["events/a.parquet".to_string()]);
         let outcome = process_message(
             &events_dataset(),
             &default_config(),
@@ -1744,7 +1905,38 @@ mod tests {
         .await;
         assert!(
             matches!(outcome, ProcessOutcome::Ack { .. }),
-            "a queued ObjectCreated for a snapshotted key must not append again, got {outcome:?}"
+            "a queued ObjectCreated for a committed key must not append again, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_created_leaves_in_flight_key() {
+        let reader = MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/a.parquet".to_string(),
+                vec![id_name_batch(&[1], &["a"])],
+            )]),
+            fail_keys: vec![],
+        };
+        let applied = parking_lot::Mutex::new(AppliedKeySet::default());
+        applied
+            .lock()
+            .mark_in_flight(["events/a.parquet".to_string()]);
+        let outcome = process_message(
+            &events_dataset(),
+            &default_config(),
+            &id_name_schema(),
+            &reader,
+            &applied,
+            &QueueMessage {
+                body: created_put_body("events/a.parquet"),
+                receipt_handle: "rh-inflight".into(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(outcome, ProcessOutcome::Leave),
+            "an in-flight ObjectCreated must stay on the queue until apply commits, got {outcome:?}"
         );
     }
 
@@ -1759,7 +1951,7 @@ mod tests {
             &default_config(),
             &id_name_schema(),
             &reader,
-            &HashSet::new(),
+            &applied_mutex([]),
             &QueueMessage {
                 body: removed_body("events/a.parquet"),
                 receipt_handle: "rh-del".into(),
@@ -1775,7 +1967,7 @@ mod tests {
             &config,
             &id_name_schema(),
             &reader,
-            &HashSet::new(),
+            &applied_mutex([]),
             &QueueMessage {
                 body: removed_body("events/a.parquet"),
                 receipt_handle: "rh-del".into(),
@@ -1796,7 +1988,7 @@ mod tests {
             &default_config(),
             &id_name_schema(),
             &reader,
-            &HashSet::new(),
+            &applied_mutex([]),
             &QueueMessage {
                 body: created_put_body("other/a.parquet"),
                 receipt_handle: "rh-other".into(),
@@ -1813,7 +2005,7 @@ mod tests {
             &default_config(),
             &id_name_schema(),
             &reader,
-            &HashSet::new(),
+            &applied_mutex([]),
             &QueueMessage {
                 body: r#"{"Records":[{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"other-bucket"},"object":{"key":"events/a.parquet"}}}]}"#.into(),
                 receipt_handle: "rh-bucket".into(),
@@ -1830,7 +2022,7 @@ mod tests {
             &default_config(),
             &id_name_schema(),
             &reader,
-            &HashSet::new(),
+            &applied_mutex([]),
             &QueueMessage {
                 body: "not-json".into(),
                 receipt_handle: "rh-poison".into(),
@@ -1851,7 +2043,7 @@ mod tests {
             &default_config(),
             &id_name_schema(),
             &reader,
-            &HashSet::new(),
+            &applied_mutex([]),
             &QueueMessage {
                 body: created_put_body("events/a.parquet"),
                 receipt_handle: "rh-fail".into(),
@@ -1883,7 +2075,7 @@ mod tests {
                 "other/skip.parquet".into(),
             ],
         };
-        let applied = HashSet::from(["events/old.parquet".to_string()]);
+        let applied = applied_mutex(["events/old.parquet".to_string()]);
         let result = apply_unapplied_objects(
             &events_dataset(),
             &default_config(),
@@ -2274,7 +2466,7 @@ mod tests {
             &default_config(),
             &id_name_schema(),
             &reader,
-            &HashSet::new(),
+            &applied_mutex([]),
             &QueueMessage {
                 body: r#"{"Records":[{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/a.parquet"}}},{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"other/b.parquet"}}}]}"#.into(),
                 receipt_handle: "rh-mixed".into(),
@@ -2397,17 +2589,55 @@ mod tests {
 
     #[test]
     fn replace_applied_keys_uses_current_listing_not_clear() {
-        let mut applied = HashSet::from(["events/gone.parquet".to_string()]);
-        replace_applied_keys(
-            &mut applied,
-            vec![
-                "events/a.parquet".to_string(),
-                "events/b.parquet".to_string(),
-            ],
+        let mut applied = AppliedKeySet::default();
+        applied.commit(&["events/gone.parquet".to_string()]);
+        applied.replace_in_flight(vec![
+            "events/a.parquet".to_string(),
+            "events/b.parquet".to_string(),
+        ]);
+        assert!(!applied.is_known("events/gone.parquet"));
+        assert!(applied.is_in_flight("events/a.parquet"));
+        assert!(applied.is_in_flight("events/b.parquet"));
+    }
+
+    #[tokio::test]
+    async fn applied_keys_committer_advances_only_after_commit() {
+        let applied = Arc::new(parking_lot::Mutex::new(AppliedKeySet::default()));
+        applied
+            .lock()
+            .mark_in_flight(["events/a.parquet".to_string()]);
+        let committer = AppliedKeysCommitter {
+            applied: Arc::clone(&applied),
+            keys: vec!["events/a.parquet".to_string()],
+            inner: Box::new(NoOpCommitter),
+        };
+        assert!(applied.lock().is_in_flight("events/a.parquet"));
+        assert!(!applied.lock().is_committed("events/a.parquet"));
+        committer
+            .commit()
+            .await
+            .expect("noop commit should succeed");
+        assert!(applied.lock().is_committed("events/a.parquet"));
+        assert!(!applied.lock().is_in_flight("events/a.parquet"));
+    }
+
+    #[test]
+    fn dropping_uncommitted_envelope_releases_in_flight_keys() {
+        let applied = Arc::new(parking_lot::Mutex::new(AppliedKeySet::default()));
+        applied
+            .lock()
+            .mark_in_flight(["events/a.parquet".to_string()]);
+        {
+            let _committer = AppliedKeysCommitter {
+                applied: Arc::clone(&applied),
+                keys: vec!["events/a.parquet".to_string()],
+                inner: Box::new(NoOpCommitter),
+            };
+        }
+        assert!(
+            !applied.lock().is_known("events/a.parquet"),
+            "drop without commit must release in-flight keys so apply can retry"
         );
-        assert!(!applied.contains("events/gone.parquet"));
-        assert!(applied.contains("events/a.parquet"));
-        assert!(applied.contains("events/b.parquet"));
     }
 
     #[tokio::test]
@@ -2486,7 +2716,21 @@ mod tests {
         );
         assert_eq!(names_in(&envelopes[0]), vec!["snap".to_string()]);
         assert!(envelopes[1].is_dataset_ready());
-        assert_eq!(*queue.deleted.lock().await, vec!["rh-snap".to_string()]);
+        assert!(
+            queue.deleted.lock().await.is_empty(),
+            "queued ObjectCreated for an in-flight snapshot key must stay on the queue until apply commits"
+        );
+        envelopes
+            .into_iter()
+            .next()
+            .expect("snapshot envelope")
+            .commit()
+            .await
+            .expect("snapshot commit should succeed");
+        assert!(
+            queue.deleted.lock().await.is_empty(),
+            "the overlapping SQS notification is left, not acked, while apply is pending; it is not deleted by snapshot commit"
+        );
     }
 
     #[tokio::test]
