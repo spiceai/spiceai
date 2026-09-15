@@ -579,34 +579,53 @@ fn bytes_to_string(bytes: &[u8]) -> String {
 /// `avg()` summed in a different partition order — so the comparison cannot be
 /// exact. 0.1% absorbs that while failing an answer that is wrong by more. A
 /// decimal rounded by one engine and truncated by another also gets one unit of
-/// slack in its last place; see `numeric_strings_match`.
+/// slack in a fine last place; see `numeric_strings_match`.
 pub const NUMERIC_RELATIVE_TOLERANCE: f64 = 0.001;
+
+/// The fewest decimal places at which one unit in the last place can be rounding.
+/// A decimal average or ratio carries several places; an amount written to two is
+/// a stored value, and one unit there is a different value.
+const ROUNDED_PLACES_MIN: usize = 4;
+
+/// The largest relative difference that one unit of last-place rounding may make.
+const ROUNDED_RELATIVE_TOLERANCE: f64 = 0.01;
 
 /// Whether two rendered numeric cells hold the same answer.
 ///
 /// They do when they differ by at most [`NUMERIC_RELATIVE_TOLERANCE`] of the first,
-/// or when both are written to the same number of decimal places and differ by one
-/// unit in the last of them. That is where an engine that rounds a decimal result
-/// and one that truncates it part ways — TPC-DS Q53's `224.796667` against
-/// `224.796666` — and for a value as small as Q98's `revenueratio` of `0.000812`,
-/// one unit is more than 0.1%. An integer has no rounded place, so it gets only the
-/// relative tolerance.
+/// or when they differ only in how their last decimal place was rounded: both are
+/// written to the same number of places, at least [`ROUNDED_PLACES_MIN`], one unit
+/// apart in the last, and within [`ROUNDED_RELATIVE_TOLERANCE`] of each other. That
+/// is where an engine that rounds a decimal result and one that truncates it part
+/// ways — TPC-DS Q53's `224.796667` against `224.796666` — and for a value as small
+/// as Q98's `revenueratio` of `0.000812`, one unit is more than 0.1%. A coarser last
+/// place is a different value (`0.1` against `0.0`), and so is a unit that is most
+/// of a tiny value. An infinity or NaN matches only the same infinity or NaN.
 fn numeric_strings_match(expected: &str, actual: &str) -> bool {
     let (Ok(expected_num), Ok(actual_num)) = (expected.parse::<f64>(), actual.parse::<f64>())
     else {
         return false;
     };
+    if !expected_num.is_finite() || !actual_num.is_finite() {
+        return (expected_num.is_nan() && actual_num.is_nan())
+            || (expected_num.is_infinite()
+                && actual_num.is_infinite()
+                && expected_num.is_sign_positive() == actual_num.is_sign_positive());
+    }
     let diff = (expected_num - actual_num).abs();
     if diff <= (expected_num.abs() * NUMERIC_RELATIVE_TOLERANCE).max(1e-12) {
         return true;
     }
     match (decimal_places(expected), decimal_places(actual)) {
-        (Some(places), Some(actual_places)) if places == actual_places && places > 0 => {
+        (Some(places), Some(actual_places))
+            if places == actual_places && places >= ROUNDED_PLACES_MIN =>
+        {
             let Ok(exponent) = i32::try_from(places) else {
                 return false;
             };
             // `f64` leaves `0.000813 - 0.000812` a hair over one unit.
             diff <= 10_f64.powi(-exponent) * (1.0 + 1e-9)
+                && diff <= expected_num.abs().max(actual_num.abs()) * ROUNDED_RELATIVE_TOLERANCE
         }
         _ => false,
     }
@@ -3176,6 +3195,35 @@ mod test {
             !matches(&integers(&[5]), &integers(&[6])),
             "an integer has no rounded place"
         );
+    }
+
+    #[test]
+    fn test_numeric_strings_match_only_rounding_of_the_same_value() {
+        // Rounding one way or the other moves only the last of several decimal places.
+        assert!(numeric_strings_match("0.000812", "0.000813"));
+        assert!(numeric_strings_match("224.796666", "224.796667"));
+        // A coarse last place is not rounding noise: 0.1 against 0.0 is a different
+        // answer, and so is a unit that is most of the value.
+        for (expected, actual) in [
+            ("0.0", "0.1"),
+            ("1.0", "1.1"),
+            ("0.05", "0.06"),
+            ("0.0000", "0.0001"),
+        ] {
+            assert!(
+                !numeric_strings_match(expected, actual),
+                "{expected} against {actual}"
+            );
+        }
+        // Infinities and NaN match only themselves, however they are written.
+        assert!(numeric_strings_match("inf", "Infinity"));
+        assert!(numeric_strings_match("NaN", "nan"));
+        for (expected, actual) in [("inf", "1"), ("inf", "-inf"), ("NaN", "1"), ("1", "inf")] {
+            assert!(
+                !numeric_strings_match(expected, actual),
+                "{expected} against {actual}"
+            );
+        }
     }
 
     #[test]
