@@ -77,8 +77,8 @@ impl MaterializationIdentity {
 
     /// Start a new materialization: increment the epoch and retract `configured`.
     ///
-    /// Called when a refresh is dequeued, before it takes the write mutex.
-    /// Returns the epoch the new run will attest under.
+    /// Called when a refresh is dequeued, while holding the accelerator write
+    /// mutex. Returns the epoch the new run will attest under.
     pub fn begin_refresh(&self) -> u64 {
         loop {
             let current = self.stamp.load(Ordering::Acquire);

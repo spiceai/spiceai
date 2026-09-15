@@ -188,6 +188,7 @@ impl RefreshTaskRunnerBuilder {
 
     #[must_use]
     pub fn build(self) -> RefreshTaskRunner {
+        let accelerator_write_mutex = Arc::clone(&self.accelerator_write_mutex);
         let mut refresh_task_builder = RefreshTask::builder(
             self.runtime_status,
             self.dataset_name.clone(),
@@ -195,7 +196,7 @@ impl RefreshTaskRunnerBuilder {
             self.federated_source,
             self.accelerator,
             self.io_runtime,
-            self.accelerator_write_mutex,
+            accelerator_write_mutex,
         )
         .with_disable_federation(self.disable_federation)
         .with_last_updated_at(Arc::clone(&self.last_updated_at))
