@@ -290,6 +290,16 @@ mod tests {
     }
 
     #[test]
+    fn eligible_keeps_a_slow_lookup_when_exec_is_below_the_threshold() {
+        // 120ms cache lookup + 1ms exec at min_sql_duration_ms=100: measuring
+        // from after the probe would drop the Explain Analyze plan row
+        // (1 < 100); measuring from query start keeps it (121 >= 100).
+        let config = cfg(TaskHistoryCapturedPlan::ExplainAnalyze, None, Some(100.0));
+        assert!(!plan_capture_eligible(1.0, &config));
+        assert!(plan_capture_eligible(121.0, &config));
+    }
+
+    #[test]
     fn should_capture_explain_plan_matches_exporter_predicate() {
         assert!(should_capture_explain_plan(
             "sql_query",

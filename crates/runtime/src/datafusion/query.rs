@@ -648,6 +648,11 @@ impl Query {
     ///
     /// Panics when running under test if no cache key is computed for the query.
     pub async fn run(self) -> Result<QueryResult> {
+        // Taken before the results-cache probe so Explain Analyze plan
+        // capture (`min_sql_duration_ms` / `min_plan_duration_ms`) and the
+        // cache-write `read_started_at` still include lookup time — the
+        // same clock `run_internal` used when the probe lived inside it.
+        let query_start = std::time::Instant::now();
         let request_context = RequestContext::current(AsyncMarker::new().await);
         let guards = self.lifetime_guards(&request_context);
         let spans = self.query_spans(&request_context);
@@ -687,11 +692,18 @@ impl Query {
             && !probe.is_servable_in_place()
         {
             return self
-                .run_with_managed_runtime(request_context, runtime_handle, probe, guards, spans)
+                .run_with_managed_runtime(
+                    request_context,
+                    runtime_handle,
+                    probe,
+                    guards,
+                    spans,
+                    query_start,
+                )
                 .await;
         }
 
-        self.run_internal(request_context, probe, guards, spans)
+        self.run_internal(request_context, probe, guards, spans, query_start)
             .await
     }
 
@@ -1108,6 +1120,7 @@ impl Query {
         probe: CacheProbe,
         guards: QueryLifetimeGuards,
         spans: QuerySpans,
+        query_start: std::time::Instant,
     ) -> Result<QueryResult> {
         let span = spans.span.clone();
 
@@ -1119,7 +1132,7 @@ impl Query {
             runtime_request_context,
             span,
             async move {
-                self.run_internal(future_request_context, probe, guards, spans)
+                self.run_internal(future_request_context, probe, guards, spans, query_start)
                     .await
                     .map(|query_result| (query_result.cache_status, query_result.data))
             },
@@ -1145,8 +1158,8 @@ impl Query {
         probe: CacheProbe,
         guards: QueryLifetimeGuards,
         spans: QuerySpans,
+        query_start: std::time::Instant,
     ) -> Result<QueryResult> {
-        let query_start = std::time::Instant::now();
         // Opened in `run` before the results-cache probe so lookup time is
         // in `runtime.task_history` / Zipkin durations, and a timeout or
         // cancel during the lookup still finishes the tracker.
