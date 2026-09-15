@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! S3 event-driven CDC: SQS long-poll → object read → `ChangesStream`.
+//! S3 event notifications → SQS → listing backfill → `ChangesStream`.
 //!
-//! `try_stream!` keeps the snapshot, long-poll, and per-message apply path in
-//! one backpressured generator (the same shape as MongoDB / Kafka CDC). A
-//! manual `Stream` impl would split that state machine across poll/yield
-//! points without changing behavior.
+//! `try_stream!` keeps the snapshot, long-poll, backfill, and per-message apply
+//! path in one backpressured generator (the same shape as MongoDB / Kafka
+//! change streams). A manual `Stream` impl would split that state machine
+//! across poll/yield points without changing behavior.
 
 use super::event::{
     ObjectEventKind, S3ObjectEvent, matches_dataset, parse_notification_body, s3_object_from,
@@ -42,48 +42,52 @@ use datafusion::datasource::TableProvider;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
+use object_store::path::Path as ObjectPath;
+use object_store::ObjectStore;
 use runtime_component::dataset::DatasetSpec;
 use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_parameters::Parameters;
 use snafu::prelude::*;
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 const SQS_LONG_POLL_SECONDS: i32 = 20;
 const SQS_MAX_MESSAGES: i32 = 10;
 const SQS_VISIBILITY_TIMEOUT_SECONDS: i32 = 300;
 const RECEIVE_ERROR_BACKOFF_CAP: Duration = Duration::from_secs(30);
+const DEFAULT_BACKFILL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to register dataset {dataset_name} (s3): `refresh_mode: changes` requires `s3_cdc_queue_url` set to an SQS queue subscribed to S3 event notifications. Set `s3_cdc_queue_url` to the queue URL (not ARN). See: {S3_DOCS}"
+        "Failed to register dataset {dataset_name} (s3): `refresh_mode: changes` requires `s3_changes_queue_url` set to an SQS queue subscribed to S3 event notifications. Set `s3_changes_queue_url` to the queue URL (https://sqs.<region>.amazonaws.com/...), not an ARN. See: {S3_DOCS}"
     ))]
     MissingQueueUrl { dataset_name: String },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} (s3): `s3_cdc_queue_url` is set, but `acceleration.refresh_mode` is not `changes`, so the queue would never be consumed. Set `refresh_mode: changes` or remove `s3_cdc_queue_url`. See: {S3_DOCS}"
+        "Failed to register dataset {dataset_name} (s3): `s3_changes_queue_url` is set, but `acceleration.refresh_mode` is not `changes`, so the queue would never be consumed. Set `refresh_mode: changes` or remove `s3_changes_queue_url`. See: {S3_DOCS}"
     ))]
     QueueWithoutChanges { dataset_name: String },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} (s3): `s3_cdc_queue_url` must be an SQS queue URL (https://sqs.<region>.amazonaws.com/...), not an ARN. See: {S3_DOCS}"
+        "Failed to register dataset {dataset_name} (s3): `s3_changes_queue_url` must be an SQS queue URL (https://sqs.<region>.amazonaws.com/...), not an ARN. See: {S3_DOCS}"
     ))]
     QueueUrlIsArn { dataset_name: String },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} (s3): `s3_cdc_queue_url` is empty. Set it to the SQS queue URL that receives S3 event notifications. See: {S3_DOCS}"
+        "Failed to register dataset {dataset_name} (s3): `s3_changes_queue_url` is empty. Set it to the SQS queue URL that receives S3 event notifications. See: {S3_DOCS}"
     ))]
     EmptyQueueUrl { dataset_name: String },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} (s3): `s3_cdc_events` value '{value}' is not supported. Use `object_created` or `object_created_and_removed`. See: {S3_DOCS}"
+        "Failed to register dataset {dataset_name} (s3): `s3_on_object_removed` value '{value}' is not supported. Use `ignore` (leave deleted objects in the accelerator) or `rebuild` (replace the accelerator from the listing prefix; this is not a row-level delete). See: {S3_DOCS}"
     ))]
-    InvalidEvents { dataset_name: String, value: String },
+    InvalidOnObjectRemoved { dataset_name: String, value: String },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} (s3): `s3_cdc_key_prefix` '{configured}' is not under the dataset path prefix '{dataset_prefix}'. Use a prefix equal to or nested under the `from` path. See: {S3_DOCS}"
+        "Failed to register dataset {dataset_name} (s3): `s3_changes_key_prefix` '{configured}' is not under the dataset path prefix '{dataset_prefix}'. Use a prefix equal to or nested under the `from` path. See: {S3_DOCS}"
     ))]
     KeyPrefixOutsideDataset {
         dataset_name: String,
@@ -97,7 +101,7 @@ pub enum Error {
     PublicAuthCannotConsumeSqs { dataset_name: String },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} (s3): no AWS region for the SQS queue. Set `s3_cdc_region` or `s3_region`, or use a queue URL that includes the region (https://sqs.<region>.amazonaws.com/...). See: {S3_DOCS}"
+        "Failed to register dataset {dataset_name} (s3): no AWS region for the SQS queue. Set `s3_changes_region` or `s3_region`, or use a queue URL that includes the region (https://sqs.<region>.amazonaws.com/...). See: {S3_DOCS}"
     ))]
     MissingRegion { dataset_name: String },
 
@@ -107,7 +111,12 @@ pub enum Error {
     MissingBucket { dataset_name: String, from: String },
 
     #[snafu(display(
-        "Failed to create an SQS client for dataset {dataset_name} (s3): {source}. Check AWS credentials and `s3_cdc_region`. See: {S3_DOCS}"
+        "Failed to register dataset {dataset_name} (s3): `s3_changes_backfill_interval` value '{value}' is not a duration greater than 0. Use a value like `1h` or `30m`. See: {S3_DOCS}"
+    ))]
+    InvalidBackfillInterval { dataset_name: String, value: String },
+
+    #[snafu(display(
+        "Failed to create an SQS client for dataset {dataset_name} (s3): {source}. Check AWS credentials and `s3_changes_region`. See: {S3_DOCS}"
     ))]
     SqsClient {
         dataset_name: String,
@@ -117,33 +126,34 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// What to do with `s3:ObjectRemoved:*` notifications.
+///
+/// `Rebuild` is a full listing-prefix replacement (`history_unavailable`), not a
+/// row-level CDC delete of the object's contents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CdcEvents {
-    ObjectCreated,
-    ObjectCreatedAndRemoved,
+pub enum OnObjectRemoved {
+    Ignore,
+    Rebuild,
 }
 
-impl CdcEvents {
+impl OnObjectRemoved {
     fn parse(value: &str) -> Option<Self> {
         match value {
-            "object_created" => Some(Self::ObjectCreated),
-            "object_created_and_removed" => Some(Self::ObjectCreatedAndRemoved),
+            "ignore" => Some(Self::Ignore),
+            "rebuild" => Some(Self::Rebuild),
             _ => None,
         }
-    }
-
-    fn includes_removed(self) -> bool {
-        matches!(self, Self::ObjectCreatedAndRemoved)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct S3CdcConfig {
+pub struct S3ChangesConfig {
     pub queue_url: String,
     pub region: String,
-    pub events: CdcEvents,
+    pub on_object_removed: OnObjectRemoved,
     pub bucket: String,
     pub key_prefix: String,
+    pub backfill_interval: Duration,
 }
 
 #[async_trait]
@@ -179,6 +189,11 @@ pub trait ObjectReader: Send + Sync {
         bucket: &str,
         key: &str,
     ) -> std::result::Result<Vec<RecordBatch>, StreamError>;
+}
+
+#[async_trait]
+pub trait ObjectLister: Send + Sync {
+    async fn list_keys(&self) -> std::result::Result<Vec<String>, StreamError>;
 }
 
 struct SqsDeleteCommitter {
@@ -262,7 +277,7 @@ impl ObjectReader for ListingObjectReader {
     ) -> std::result::Result<Vec<RecordBatch>, StreamError> {
         let object_from = s3_object_from(bucket, key).map_err(|error| {
             StreamError::External(format!(
-                "S3 CDC cannot build an object URL for s3://{bucket}/{key}: {error}"
+                "S3 changes cannot build an object URL for s3://{bucket}/{key}: {error}"
             ))
         })?;
         let url = self
@@ -282,7 +297,7 @@ impl ObjectReader for ListingObjectReader {
             })?;
         let file_format = format_opt.ok_or_else(|| {
             StreamError::External(format!(
-                "S3 CDC cannot read unstructured text object s3://{bucket}/{key} for dataset '{}'. Set `file_format` to parquet, csv, or json. See: {S3_DOCS}",
+                "S3 changes cannot read unstructured text object s3://{bucket}/{key} for dataset '{}'. Set `file_format` to parquet, csv, or json. See: {S3_DOCS}",
                 self.dataset.name
             ))
         })?;
@@ -304,20 +319,56 @@ impl ObjectReader for ListingObjectReader {
     }
 }
 
-/// Fail closed on S3 CDC misconfiguration before the listing table is built.
+struct ListingPrefixScanner {
+    connector: S3,
+    dataset: DatasetSpec,
+    key_prefix: String,
+}
+
+#[async_trait]
+impl ObjectLister for ListingPrefixScanner {
+    async fn list_keys(&self) -> std::result::Result<Vec<String>, StreamError> {
+        let store = self
+            .connector
+            .get_object_store(&self.dataset)
+            .map_err(|e| StreamError::Connector {
+                connector: "S3",
+                source: Box::new(e),
+            })?;
+        let prefix = if self.key_prefix.is_empty() {
+            None
+        } else {
+            Some(ObjectPath::from(self.key_prefix.as_str()))
+        };
+        let mut listing = store.list(prefix.as_ref());
+        let mut keys = Vec::new();
+        while let Some(meta) = listing.next().await {
+            let meta = meta.map_err(|error| StreamError::External(error.to_string()))?;
+            let key = meta.location.as_ref().trim_start_matches('/').to_string();
+            if key.is_empty() || key.ends_with('/') {
+                continue;
+            }
+            keys.push(key);
+        }
+        Ok(keys)
+    }
+}
+
+/// Fail closed on S3 changes misconfiguration before the listing table is built.
 ///
 /// # Errors
 ///
 /// Returns [`DataConnectorError::InvalidConfigurationNoSource`] when
-/// `refresh_mode: changes` is missing `s3_cdc_queue_url` (or the reverse), the
-/// queue value is an ARN, `s3_auth` is `public`, `s3_cdc_events` is unknown,
-/// `s3_cdc_key_prefix` is outside the dataset path, or no SQS region can be
-/// resolved.
-pub fn validate_s3_cdc_config(
+/// `refresh_mode: changes` is missing `s3_changes_queue_url` (or the reverse),
+/// the queue value is an ARN, `s3_auth` is `public`, `s3_on_object_removed` is
+/// unknown, `s3_changes_key_prefix` is outside the dataset path,
+/// `s3_changes_backfill_interval` is not a positive duration, or no SQS region
+/// can be resolved.
+pub fn validate_s3_changes_config(
     params: &Parameters,
     dataset: &DatasetSpec,
 ) -> DataConnectorResult<()> {
-    match S3CdcConfig::try_from_params(params, dataset) {
+    match S3ChangesConfig::try_from_params(params, dataset) {
         Ok(_) => Ok(()),
         Err(error) => Err(DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: "s3".to_string(),
@@ -327,11 +378,11 @@ pub fn validate_s3_cdc_config(
     }
 }
 
-impl S3CdcConfig {
-    /// `Ok(None)` when CDC is not configured (no queue, not `changes`).
+impl S3ChangesConfig {
+    /// `Ok(None)` when changes-mode SQS is not configured (no queue, not `changes`).
     fn try_from_params(params: &Parameters, dataset: &DatasetSpec) -> Result<Option<Self>> {
         let dataset_name = dataset.name.to_string();
-        let queue_raw = params.get("cdc_queue_url").expose().ok();
+        let queue_raw = params.get("changes_queue_url").expose().ok();
         let empty_queue = queue_raw.is_some_and(|url| url.trim().is_empty());
         let queue_url = queue_raw
             .map(str::trim)
@@ -357,16 +408,18 @@ impl S3CdcConfig {
                     return PublicAuthCannotConsumeSqsSnafu { dataset_name }.fail();
                 }
 
-                let events = match params.get("cdc_events").expose().ok() {
-                    None => CdcEvents::ObjectCreated,
-                    Some(value) => CdcEvents::parse(value).context(InvalidEventsSnafu {
-                        dataset_name: dataset_name.clone(),
-                        value,
-                    })?,
+                let on_object_removed = match params.get("on_object_removed").expose().ok() {
+                    None => OnObjectRemoved::Ignore,
+                    Some(value) => {
+                        OnObjectRemoved::parse(value).context(InvalidOnObjectRemovedSnafu {
+                            dataset_name: dataset_name.clone(),
+                            value,
+                        })?
+                    }
                 };
 
                 let (bucket, dataset_prefix) = bucket_and_key_prefix(dataset)?;
-                let key_prefix = match params.get("cdc_key_prefix").expose().ok() {
+                let key_prefix = match params.get("changes_key_prefix").expose().ok() {
                     None => dataset_prefix,
                     Some(configured) => {
                         let normalized = normalize_prefix(configured);
@@ -382,19 +435,34 @@ impl S3CdcConfig {
                     }
                 };
 
-                let region =
-                    resolve_region(params, url).context(MissingRegionSnafu { dataset_name })?;
+                let backfill_interval = parse_backfill_interval(params, &dataset_name)?;
+
+                let region = resolve_region(params, url).context(MissingRegionSnafu {
+                    dataset_name,
+                })?;
 
                 Ok(Some(Self {
                     queue_url: url.to_string(),
                     region,
-                    events,
+                    on_object_removed,
                     bucket,
                     key_prefix,
+                    backfill_interval,
                 }))
             }
         }
     }
+}
+
+fn parse_backfill_interval(params: &Parameters, dataset_name: &str) -> Result<Duration> {
+    let Some(raw) = params.get("changes_backfill_interval").expose().ok() else {
+        return Ok(DEFAULT_BACKFILL_INTERVAL);
+    };
+    let parsed = fundu::parse_duration(raw).ok().filter(|d| *d > Duration::ZERO);
+    parsed.context(InvalidBackfillIntervalSnafu {
+        dataset_name,
+        value: raw.to_string(),
+    })
 }
 
 fn bucket_and_key_prefix(dataset: &DatasetSpec) -> Result<(String, String)> {
@@ -430,7 +498,7 @@ fn prefix_is_nested_under(child: &str, parent: &str) -> bool {
 
 fn resolve_region(params: &Parameters, queue_url: &str) -> Option<String> {
     params
-        .get("cdc_region")
+        .get("changes_region")
         .expose()
         .ok()
         .map(ToString::to_string)
@@ -453,6 +521,14 @@ pub fn region_from_queue_url(queue_url: &str) -> Option<String> {
     }
 }
 
+fn prefix_display(bucket: &str, key_prefix: &str) -> String {
+    if key_prefix.is_empty() {
+        format!("s3://{bucket}")
+    } else {
+        format!("s3://{bucket}/{}", key_prefix.trim_end_matches('/'))
+    }
+}
+
 async fn build_sqs_client(
     params: &Parameters,
     region: &str,
@@ -460,14 +536,10 @@ async fn build_sqs_client(
 ) -> Result<aws_sdk_sqs::Client> {
     let auth = params.get("auth").expose().ok();
     if matches!(auth, Some("key")) {
-        let access_key = params
-            .get("key")
-            .expose()
-            .ok()
-            .ok_or_else(|| Error::SqsClient {
-                dataset_name: dataset_name.to_string(),
-                source: "s3_auth is `key` but `s3_key` is not set".into(),
-            })?;
+        let access_key = params.get("key").expose().ok().ok_or_else(|| Error::SqsClient {
+            dataset_name: dataset_name.to_string(),
+            source: "s3_auth is `key` but `s3_key` is not set".into(),
+        })?;
         let secret_key = params
             .get("secret")
             .expose()
@@ -486,7 +558,7 @@ async fn build_sqs_client(
             secret_key,
             session_token,
             None,
-            "spice-s3-cdc",
+            "spice-s3-changes",
         );
         let sdk_config = aws_sdk_credential_bridge::default_aws_config()
             .region(aws_config::Region::new(region.to_string()))
@@ -528,21 +600,16 @@ pub async fn s3_changes_stream(
     dataset: &DatasetSpec,
     acceleration: AccelerationContents,
 ) -> Option<ChangesStream> {
-    let config = match S3CdcConfig::try_from_params(&connector.params, dataset) {
+    let config = match S3ChangesConfig::try_from_params(&connector.params, dataset) {
         Ok(Some(config)) => config,
         Ok(None) => return None,
         Err(error) => return Some(error_stream(error)),
     };
-    let client = match build_sqs_client(
-        &connector.params,
-        &config.region,
-        &dataset.name.to_string(),
-    )
-    .await
-    {
-        Ok(client) => client,
-        Err(error) => return Some(error_stream(error)),
-    };
+    let client =
+        match build_sqs_client(&connector.params, &config.region, &dataset.name.to_string()).await {
+            Ok(client) => client,
+            Err(error) => return Some(error_stream(error)),
+        };
     let queue = Arc::new(SqsQueue {
         client,
         queue_url: config.queue_url.clone(),
@@ -551,21 +618,39 @@ pub async fn s3_changes_stream(
         connector: connector.clone(),
         dataset: dataset.clone(),
     });
-    Some(stream_s3_changes(
-        dataset.clone(),
+    let object_lister = Arc::new(ListingPrefixScanner {
+        connector: connector.clone(),
+        dataset: dataset.clone(),
+        key_prefix: config.key_prefix.clone(),
+    });
+    Some(stream_s3_changes(S3ChangesStreamParts {
+        dataset: dataset.clone(),
         federated_table,
         acceleration,
         queue,
         object_reader,
+        object_lister,
         config,
-        connector.get_session_context(),
-    ))
+        session: connector.get_session_context(),
+    }))
+}
+
+struct S3ChangesStreamParts {
+    dataset: DatasetSpec,
+    federated_table: Arc<dyn FederatedTableProvider>,
+    acceleration: AccelerationContents,
+    queue: Arc<dyn MessageQueue>,
+    object_reader: Arc<dyn ObjectReader>,
+    object_lister: Arc<dyn ObjectLister>,
+    config: S3ChangesConfig,
+    session: SessionContext,
 }
 
 #[derive(Debug)]
 enum ProcessOutcome {
     Creates {
         batches: Vec<RecordBatch>,
+        keys: Vec<String>,
         receipt_handle: String,
     },
     Rebuild {
@@ -574,12 +659,13 @@ enum ProcessOutcome {
     Ack {
         receipt_handle: String,
     },
+    Leave,
     Retry,
 }
 
 async fn process_message(
     dataset: &DatasetSpec,
-    config: &S3CdcConfig,
+    config: &S3ChangesConfig,
     object_reader: &dyn ObjectReader,
     message: &QueueMessage,
 ) -> ProcessOutcome {
@@ -605,26 +691,24 @@ async fn process_message(
         .collect();
 
     if matching.is_empty() {
-        tracing::debug!(
-            "Dataset '{}' skipped SQS S3 notifications that are outside s3://{}{}, so those messages were deleted without applying rows. Use a dedicated queue per dataset; sharing a queue across datasets is not supported. See: {S3_DOCS}",
+        let sample = &events[0];
+        tracing::error!(
+            "Dataset '{}' received an S3 notification for s3://{}/{} that is outside this dataset's prefix {}, so the SQS message was left on the queue (not deleted) and will retry until visibility timeout. The queue must be exclusive to this dataset — fan out with SNS to a per-dataset queue, or set a bucket notification prefix filter. Sharing one queue across datasets is not supported. See: {S3_DOCS}",
             dataset.name,
-            config.bucket,
-            if config.key_prefix.is_empty() {
-                String::new()
-            } else {
-                format!("/{}", config.key_prefix.trim_end_matches('/'))
-            }
+            sample.bucket,
+            sample.key,
+            prefix_display(&config.bucket, &config.key_prefix)
         );
-        return ProcessOutcome::Ack { receipt_handle };
+        return ProcessOutcome::Leave;
     }
 
     let removed: Vec<&&S3ObjectEvent> = matching
         .iter()
         .filter(|event| event.kind == ObjectEventKind::Removed)
         .collect();
-    if !removed.is_empty() && config.events.includes_removed() {
+    if !removed.is_empty() && config.on_object_removed == OnObjectRemoved::Rebuild {
         tracing::info!(
-            "Dataset '{}' received S3 ObjectRemoved for s3://{}/{}, so the accelerator will be rebuilt from the listing prefix. See: {S3_DOCS}",
+            "Dataset '{}' received S3 ObjectRemoved for s3://{}/{}, so the accelerator will be rebuilt from the listing prefix (`s3_on_object_removed: rebuild` is not a row-level delete). See: {S3_DOCS}",
             dataset.name,
             removed[0].bucket,
             removed[0].key
@@ -633,7 +717,7 @@ async fn process_message(
     }
     for event in &removed {
         tracing::warn!(
-            "Dataset '{}' ignored an S3 ObjectRemoved notification for s3://{}/{}, so queries will still return rows from that object. Set `s3_cdc_events: object_created_and_removed` to rebuild the accelerator from the listing prefix after deletes. See: {S3_DOCS}",
+            "Dataset '{}' ignored an S3 ObjectRemoved notification for s3://{}/{}, so queries will still return rows from that object. Set `s3_on_object_removed: rebuild` to replace the accelerator from the listing prefix (not a row-level delete). See: {S3_DOCS}",
             dataset.name,
             event.bucket,
             event.key
@@ -650,13 +734,17 @@ async fn process_message(
     }
 
     let mut batches = Vec::new();
+    let mut keys = Vec::new();
     for event in created {
         match object_reader.read_object(&event.bucket, &event.key).await {
-            Ok(object_batches) => batches.extend(
-                object_batches
-                    .into_iter()
-                    .filter(|batch| batch.num_rows() > 0),
-            ),
+            Ok(object_batches) => {
+                keys.push(event.key.clone());
+                batches.extend(
+                    object_batches
+                        .into_iter()
+                        .filter(|batch| batch.num_rows() > 0),
+                );
+            }
             Err(error) => {
                 tracing::warn!(
                     "Dataset '{}' failed to read s3://{}/{} after an ObjectCreated notification, so the SQS message will retry. Cause: {error}. See: {S3_DOCS}",
@@ -675,8 +763,63 @@ async fn process_message(
 
     ProcessOutcome::Creates {
         batches,
+        keys,
         receipt_handle,
     }
+}
+
+struct BackfillCreates {
+    batches: Vec<RecordBatch>,
+    keys: Vec<String>,
+}
+
+async fn backfill_unapplied(
+    dataset: &DatasetSpec,
+    config: &S3ChangesConfig,
+    object_lister: &dyn ObjectLister,
+    object_reader: &dyn ObjectReader,
+    applied_keys: &HashSet<String>,
+) -> std::result::Result<BackfillCreates, StreamError> {
+    let listed = object_lister.list_keys().await?;
+    let mut batches = Vec::new();
+    let mut keys = Vec::new();
+    for key in listed {
+        let event = S3ObjectEvent {
+            event_name: "listing-backfill".into(),
+            kind: ObjectEventKind::Created,
+            bucket: config.bucket.clone(),
+            key: key.clone(),
+        };
+        if !matches_dataset(&event, &config.bucket, &config.key_prefix) {
+            continue;
+        }
+        if applied_keys.contains(&key) {
+            continue;
+        }
+        match object_reader.read_object(&config.bucket, &key).await {
+            Ok(object_batches) => {
+                let nonempty: Vec<RecordBatch> = object_batches
+                    .into_iter()
+                    .filter(|batch| batch.num_rows() > 0)
+                    .collect();
+                if nonempty.is_empty() {
+                    keys.push(key);
+                    continue;
+                }
+                batches.extend(nonempty);
+                keys.push(key);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Dataset '{}' failed to read s3://{}/{} during a listing backfill, so that object will be retried on the next `s3_changes_backfill_interval`. Cause: {error}. See: {S3_DOCS}",
+                    dataset.name,
+                    config.bucket,
+                    key
+                );
+            }
+        }
+    }
+    Ok(BackfillCreates { batches, keys })
 }
 
 async fn snapshot_stream(
@@ -696,8 +839,7 @@ fn rebuild_envelope(
     queue: &Arc<dyn MessageQueue>,
     receipt_handle: String,
 ) -> std::result::Result<ChangeEnvelope, StreamError> {
-    let (_, batch, is_dataset_ready, _) =
-        build_history_unavailable_envelope(schema)?.into_parts()?;
+    let (_, batch, is_dataset_ready, _) = build_history_unavailable_envelope(schema)?.into_parts()?;
     Ok(ChangeEnvelope::from_parts(
         Box::new(SqsDeleteCommitter {
             queue: Arc::clone(queue),
@@ -734,32 +876,49 @@ fn create_envelopes(
         .collect()
 }
 
-/// SQS long-poll change stream for one S3 listing dataset.
-///
-/// `try_stream!` keeps snapshot, SQS long-poll, and per-message apply in one
-/// backpressured generator. A channel would buffer SQS deletes ahead of
-/// accelerator commits.
+fn backfill_envelopes(
+    schema: &SchemaRef,
+    batches: Vec<RecordBatch>,
+    is_dataset_ready: bool,
+) -> std::result::Result<Vec<ChangeEnvelope>, StreamError> {
+    batches
+        .into_iter()
+        .map(|batch| {
+            let change_batch = wrap_data_as_change_batch(schema, &batch)?;
+            Ok(ChangeEnvelope::new(
+                Box::new(NoOpCommitter),
+                change_batch,
+                is_dataset_ready,
+            ))
+        })
+        .collect()
+}
+
+/// SQS long-poll change stream for one S3 listing dataset, with a periodic
+/// listing backfill so objects missed while the runtime was down still apply.
 #[must_use]
-pub fn stream_s3_changes(
-    dataset: DatasetSpec,
-    federated_table: Arc<dyn FederatedTableProvider>,
-    acceleration: AccelerationContents,
-    queue: Arc<dyn MessageQueue>,
-    object_reader: Arc<dyn ObjectReader>,
-    config: S3CdcConfig,
-    session: SessionContext,
-) -> ChangesStream {
+fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
     Box::pin(try_stream! {
+        let S3ChangesStreamParts {
+            dataset,
+            federated_table,
+            acceleration,
+            queue,
+            object_reader,
+            object_lister,
+            config,
+            session,
+        } = parts;
         let epoch = shutdown_epoch();
         let table_provider = federated_table.table_provider().await;
         let schema = table_provider.schema();
+        let mut applied_keys: HashSet<String> = HashSet::new();
 
         if acceleration.is_provably_empty() {
             tracing::info!(
-                "Dataset '{}' is starting S3 change capture from an empty accelerator, so existing objects under s3://{}/{} will be snapshotted before SQS events are applied. See: {S3_DOCS}",
+                "Dataset '{}' is starting S3 event capture from an empty accelerator, so existing objects under {} will be snapshotted before SQS events are applied. See: {S3_DOCS}",
                 dataset.name,
-                config.bucket,
-                config.key_prefix
+                prefix_display(&config.bucket, &config.key_prefix)
             );
             let mut snapshot = snapshot_stream(&session, Arc::clone(&table_provider)).await?;
             while let Some(batch) = snapshot.next().await {
@@ -770,11 +929,40 @@ pub fn stream_s3_changes(
                 let change_batch = wrap_data_as_change_batch(&schema, &batch)?;
                 yield ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch, false);
             }
+            match object_lister.list_keys().await {
+                Ok(keys) => applied_keys.extend(keys),
+                Err(error) => {
+                    tracing::warn!(
+                        "Dataset '{}' snapshotted the listing prefix but could not record object keys for backfill skip, so the next listing backfill may re-apply those objects. Cause: {error}. See: {S3_DOCS}",
+                        dataset.name
+                    );
+                }
+            }
+        } else {
+            tracing::info!(
+                "Dataset '{}' is starting S3 event capture with a non-empty accelerator, so objects under {} that are not yet in this process's applied set will be listed and applied before the dataset is marked ready. See: {S3_DOCS}",
+                dataset.name,
+                prefix_display(&config.bucket, &config.key_prefix)
+            );
+            let backfill = backfill_unapplied(
+                &dataset,
+                &config,
+                object_lister.as_ref(),
+                object_reader.as_ref(),
+                &applied_keys,
+            )
+            .await?;
+            let envelopes = backfill_envelopes(&schema, backfill.batches, false)?;
+            applied_keys.extend(backfill.keys);
+            for envelope in envelopes {
+                yield envelope;
+            }
         }
 
         yield build_ready_signal_envelope(&schema)?;
 
         let mut receive_backoff = Duration::from_secs(1);
+        let mut last_backfill = Instant::now();
         loop {
             if shutdown_epoch() != epoch {
                 break;
@@ -787,7 +975,7 @@ pub fn stream_s3_changes(
                 }
                 Err(error) => {
                     tracing::warn!(
-                        "Dataset '{}' failed to long-poll SQS for S3 change notifications, so new objects will not be applied until the next successful poll. Cause: {error}. Check `s3_cdc_queue_url` and SQS permissions. See: {S3_DOCS}",
+                        "Dataset '{}' failed to long-poll SQS for S3 event notifications, so new objects will not be applied until the next successful poll. Cause: {error}. Check `s3_changes_queue_url` and SQS permissions. See: {S3_DOCS}",
                         dataset.name
                     );
                     sleep(receive_backoff).await;
@@ -801,22 +989,24 @@ pub fn stream_s3_changes(
                     break;
                 }
                 match process_message(&dataset, &config, object_reader.as_ref(), &message).await {
-                    ProcessOutcome::Creates { batches, receipt_handle } => {
+                    ProcessOutcome::Creates { batches, keys, receipt_handle } => {
                         match create_envelopes(&schema, batches, &queue, receipt_handle) {
                             Ok(envelopes) => {
+                                applied_keys.extend(keys);
                                 for envelope in envelopes {
                                     yield envelope;
                                 }
                             }
                             Err(error) => {
                                 tracing::warn!(
-                                    "Dataset '{}' failed to wrap S3 object rows as CDC creates, so the SQS message will retry. Cause: {error}. See: {S3_DOCS}",
+                                    "Dataset '{}' failed to wrap S3 object rows as change-stream creates, so the SQS message will retry. Cause: {error}. See: {S3_DOCS}",
                                     dataset.name
                                 );
                             }
                         }
                     }
                     ProcessOutcome::Rebuild { receipt_handle } => {
+                        applied_keys.clear();
                         yield rebuild_envelope(&schema, &queue, receipt_handle)?;
                     }
                     ProcessOutcome::Ack { receipt_handle } => {
@@ -827,8 +1017,46 @@ pub fn stream_s3_changes(
                             );
                         }
                     }
-                    ProcessOutcome::Retry => {}
+                    ProcessOutcome::Leave | ProcessOutcome::Retry => {}
                 }
+            }
+
+            if last_backfill.elapsed() >= config.backfill_interval {
+                match backfill_unapplied(
+                    &dataset,
+                    &config,
+                    object_lister.as_ref(),
+                    object_reader.as_ref(),
+                    &applied_keys,
+                )
+                .await
+                {
+                    Ok(backfill) => {
+                        match backfill_envelopes(&schema, backfill.batches, true) {
+                            Ok(envelopes) => {
+                                applied_keys.extend(backfill.keys);
+                                for envelope in envelopes {
+                                    yield envelope;
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    "Dataset '{}' failed to wrap listing-backfill rows as change-stream creates, so those objects will be retried on the next `s3_changes_backfill_interval`. Cause: {error}. See: {S3_DOCS}",
+                                    dataset.name
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "Dataset '{}' failed to list s3://{}/{} for the completeness backfill, so objects missed by SQS will not be applied until the next `s3_changes_backfill_interval`. Cause: {error}. See: {S3_DOCS}",
+                            dataset.name,
+                            config.bucket,
+                            config.key_prefix
+                        );
+                    }
+                }
+                last_backfill = Instant::now();
             }
         }
     })
@@ -919,6 +1147,17 @@ mod tests {
         }
     }
 
+    struct MockLister {
+        keys: Vec<String>,
+    }
+
+    #[async_trait]
+    impl ObjectLister for MockLister {
+        async fn list_keys(&self) -> std::result::Result<Vec<String>, StreamError> {
+            Ok(self.keys.clone())
+        }
+    }
+
     fn events_dataset() -> DatasetSpec {
         let mut spec = DatasetSpec::new("s3://my-bucket/events/", "events".into());
         spec.acceleration = Some(Acceleration {
@@ -968,24 +1207,49 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string().into()))
             .collect();
         Parameters::try_new(
-            "s3_cdc_test",
+            "s3_changes_test",
             params,
             PREFIX,
             Arc::new(RwLock::new(Secrets::new())),
             PARAMETERS.as_ref(),
         )
         .await
-        .expect("valid S3 CDC test parameters")
+        .expect("valid S3 changes test parameters")
     }
 
-    fn default_config() -> S3CdcConfig {
-        S3CdcConfig {
+    fn default_config() -> S3ChangesConfig {
+        S3ChangesConfig {
             queue_url: QUEUE_URL.to_string(),
             region: "us-east-1".to_string(),
-            events: CdcEvents::ObjectCreated,
+            on_object_removed: OnObjectRemoved::Ignore,
             bucket: "my-bucket".to_string(),
             key_prefix: "events/".to_string(),
+            backfill_interval: Duration::from_secs(60 * 60),
         }
+    }
+
+    fn empty_lister() -> Arc<dyn ObjectLister> {
+        Arc::new(MockLister { keys: vec![] })
+    }
+
+    fn start_stream(
+        acceleration: AccelerationContents,
+        queue: Arc<MockQueue>,
+        reader: Arc<MapObjectReader>,
+        lister: Arc<dyn ObjectLister>,
+        config: S3ChangesConfig,
+        snapshot: RecordBatch,
+    ) -> ChangesStream {
+        stream_s3_changes(S3ChangesStreamParts {
+            dataset: events_dataset(),
+            federated_table: federated_table(snapshot),
+            acceleration,
+            queue: queue as Arc<dyn MessageQueue>,
+            object_reader: reader,
+            object_lister: lister,
+            config,
+            session: SessionContext::new(),
+        })
     }
 
     async fn collect_until_idle(stream: ChangesStream, expected: usize) -> Vec<ChangeEnvelope> {
@@ -1021,26 +1285,27 @@ mod tests {
     #[tokio::test]
     async fn validate_accepts_queue_url_with_changes() {
         let params = test_params(vec![
-            ("s3_cdc_queue_url", QUEUE_URL),
+            ("s3_changes_queue_url", QUEUE_URL),
             ("s3_auth", "iam_role"),
         ])
         .await;
-        let config = S3CdcConfig::try_from_params(&params, &events_dataset())
-            .expect("valid CDC config")
-            .expect("CDC should be enabled");
+        let config = S3ChangesConfig::try_from_params(&params, &events_dataset())
+            .expect("valid changes config")
+            .expect("changes should be enabled");
         assert_eq!(config.bucket, "my-bucket");
         assert_eq!(config.key_prefix, "events/");
         assert_eq!(config.region, "us-east-1");
-        assert_eq!(config.events, CdcEvents::ObjectCreated);
+        assert_eq!(config.on_object_removed, OnObjectRemoved::Ignore);
+        assert_eq!(config.backfill_interval, Duration::from_secs(60 * 60));
     }
 
     #[tokio::test]
-    async fn validate_skips_when_cdc_is_not_configured() {
+    async fn validate_skips_when_changes_is_not_configured() {
         let params = test_params(vec![]).await;
         let mut dataset = DatasetSpec::new("s3://my-bucket/events/", "events".into());
         dataset.acceleration = Some(Acceleration::default());
         assert_eq!(
-            S3CdcConfig::try_from_params(&params, &dataset).expect("no CDC"),
+            S3ChangesConfig::try_from_params(&params, &dataset).expect("no changes"),
             None
         );
     }
@@ -1048,75 +1313,128 @@ mod tests {
     #[tokio::test]
     async fn validate_fails_closed_without_queue_on_changes() {
         let params = test_params(vec![]).await;
-        let error = S3CdcConfig::try_from_params(&params, &events_dataset())
+        let error = S3ChangesConfig::try_from_params(&params, &events_dataset())
             .expect_err("changes requires a queue URL");
-        assert!(error.to_string().contains("s3_cdc_queue_url"));
+        let message = error.to_string();
+        assert!(
+            message.contains("s3_changes_queue_url"),
+            "S3-specific error must name the param, got: {message}"
+        );
+        assert!(
+            message.contains("not an ARN"),
+            "S3-specific error must say queue URL not ARN, got: {message}"
+        );
+        assert!(
+            message.contains(S3_DOCS),
+            "S3-specific error must include the docs pointer, got: {message}"
+        );
     }
 
     #[tokio::test]
     async fn validate_fails_closed_on_queue_without_changes() {
-        let params = test_params(vec![("s3_cdc_queue_url", QUEUE_URL)]).await;
+        let params = test_params(vec![("s3_changes_queue_url", QUEUE_URL)]).await;
         let dataset = DatasetSpec::new("s3://my-bucket/events/", "events".into());
-        let error = S3CdcConfig::try_from_params(&params, &dataset)
+        let error = S3ChangesConfig::try_from_params(&params, &dataset)
             .expect_err("queue without changes is refused");
         assert!(error.to_string().contains("refresh_mode"));
+        assert!(error.to_string().contains("s3_changes_queue_url"));
     }
 
     #[tokio::test]
     async fn validate_rejects_queue_arn() {
         let params = test_params(vec![(
-            "s3_cdc_queue_url",
+            "s3_changes_queue_url",
             "arn:aws:sqs:us-east-1:123456789012:s3-events",
         )])
         .await;
-        let error = S3CdcConfig::try_from_params(&params, &events_dataset())
+        let error = S3ChangesConfig::try_from_params(&params, &events_dataset())
             .expect_err("ARN must be refused");
         assert!(error.to_string().contains("not an ARN"));
+        assert!(error.to_string().contains("s3_changes_queue_url"));
     }
 
     #[tokio::test]
     async fn validate_rejects_public_auth() {
-        let params =
-            test_params(vec![("s3_cdc_queue_url", QUEUE_URL), ("s3_auth", "public")]).await;
-        let error = S3CdcConfig::try_from_params(&params, &events_dataset())
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_auth", "public"),
+        ])
+        .await;
+        let error = S3ChangesConfig::try_from_params(&params, &events_dataset())
             .expect_err("public auth cannot consume SQS");
         assert!(error.to_string().contains("public"));
     }
 
     #[tokio::test]
-    async fn validate_rejects_invalid_events_and_outside_prefix() {
-        let params = test_params(vec![
-            ("s3_cdc_queue_url", QUEUE_URL),
-            ("s3_cdc_events", "everything"),
-        ])
-        .await;
-        let error = S3CdcConfig::try_from_params(&params, &events_dataset())
-            .expect_err("invalid events value");
-        assert!(error.to_string().contains("object_created"));
-
-        let params = test_params(vec![
-            ("s3_cdc_queue_url", QUEUE_URL),
-            ("s3_cdc_key_prefix", "other/"),
-        ])
-        .await;
-        let error = S3CdcConfig::try_from_params(&params, &events_dataset())
-            .expect_err("prefix outside dataset");
-        assert!(error.to_string().contains("s3_cdc_key_prefix"));
+    async fn validate_rejects_invalid_removed_action_at_param_parse() {
+        let error = Parameters::try_new(
+            "s3_changes_test",
+            vec![
+                (
+                    "s3_changes_queue_url".to_string(),
+                    QUEUE_URL.to_string().into(),
+                ),
+                (
+                    "s3_on_object_removed".to_string(),
+                    "delete".to_string().into(),
+                ),
+            ],
+            PREFIX,
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS.as_ref(),
+        )
+        .await
+        .expect_err("`delete` is not a valid `s3_on_object_removed` value");
+        let message = error.to_string();
+        assert!(
+            message.contains("s3_on_object_removed"),
+            "invalid ObjectRemoved action must name the param, got: {message}"
+        );
+        assert!(
+            message.contains("ignore") && message.contains("rebuild"),
+            "invalid ObjectRemoved action must list ignore|rebuild, got: {message}"
+        );
     }
 
     #[tokio::test]
-    async fn validate_nested_prefix_and_events_enum() {
+    async fn validate_rejects_prefix_outside_dataset() {
         let params = test_params(vec![
-            ("s3_cdc_queue_url", QUEUE_URL),
-            ("s3_cdc_key_prefix", "events/year=2026"),
-            ("s3_cdc_events", "object_created_and_removed"),
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_changes_key_prefix", "other/"),
         ])
         .await;
-        let config = S3CdcConfig::try_from_params(&params, &events_dataset())
+        let error = S3ChangesConfig::try_from_params(&params, &events_dataset())
+            .expect_err("prefix outside dataset");
+        assert!(error.to_string().contains("s3_changes_key_prefix"));
+    }
+
+    #[tokio::test]
+    async fn validate_nested_prefix_rebuild_and_backfill_interval() {
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_changes_key_prefix", "events/year=2026"),
+            ("s3_on_object_removed", "rebuild"),
+            ("s3_changes_backfill_interval", "30m"),
+        ])
+        .await;
+        let config = S3ChangesConfig::try_from_params(&params, &events_dataset())
             .expect("nested prefix is valid")
-            .expect("CDC enabled");
+            .expect("changes enabled");
         assert_eq!(config.key_prefix, "events/year=2026/");
-        assert_eq!(config.events, CdcEvents::ObjectCreatedAndRemoved);
+        assert_eq!(config.on_object_removed, OnObjectRemoved::Rebuild);
+        assert_eq!(config.backfill_interval, Duration::from_secs(30 * 60));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_zero_backfill_interval() {
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_changes_backfill_interval", "0s"),
+        ])
+        .await;
+        let error = S3ChangesConfig::try_from_params(&params, &events_dataset())
+            .expect_err("zero interval is refused");
+        assert!(error.to_string().contains("s3_changes_backfill_interval"));
     }
 
     #[tokio::test]
@@ -1139,10 +1457,12 @@ mod tests {
         match outcome {
             ProcessOutcome::Creates {
                 batches,
+                keys,
                 receipt_handle,
             } => {
                 assert_eq!(batches.len(), 1);
                 assert_eq!(batches[0].num_rows(), 1);
+                assert_eq!(keys, vec!["events/a.parquet".to_string()]);
                 assert_eq!(receipt_handle, "rh-1");
             }
             other => panic!("expected Creates, got {other:?}"),
@@ -1150,7 +1470,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_removed_is_acked_by_default_and_rebuilds_when_enabled() {
+    async fn process_removed_is_acked_by_default_and_rebuilds_when_configured() {
         let reader = MapObjectReader {
             objects: HashMap::new(),
             fail_keys: vec![],
@@ -1168,7 +1488,7 @@ mod tests {
         assert!(matches!(outcome, ProcessOutcome::Ack { .. }));
 
         let mut config = default_config();
-        config.events = CdcEvents::ObjectCreatedAndRemoved;
+        config.on_object_removed = OnObjectRemoved::Rebuild;
         let outcome = process_message(
             &events_dataset(),
             &config,
@@ -1183,7 +1503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_unmatched_prefix_and_poison_are_acked() {
+    async fn process_unmatched_prefix_is_left_on_queue_poison_is_acked() {
         let reader = MapObjectReader {
             objects: HashMap::new(),
             fail_keys: vec![],
@@ -1198,7 +1518,25 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(unmatched, ProcessOutcome::Ack { .. }));
+        assert!(
+            matches!(unmatched, ProcessOutcome::Leave),
+            "unmatched messages must not be deleted, got {unmatched:?}"
+        );
+
+        let other_bucket = process_message(
+            &events_dataset(),
+            &default_config(),
+            &reader,
+            &QueueMessage {
+                body: r#"{"Records":[{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"other-bucket"},"object":{"key":"events/a.parquet"}}}]}"#.into(),
+                receipt_handle: "rh-bucket".into(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(other_bucket, ProcessOutcome::Leave),
+            "other-bucket messages must not be deleted, got {other_bucket:?}"
+        );
 
         let poison = process_message(
             &events_dataset(),
@@ -1233,9 +1571,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backfill_skips_already_applied_keys() {
+        let reader = MapObjectReader {
+            objects: HashMap::from([
+                (
+                    "my-bucket/events/old.parquet".to_string(),
+                    vec![id_name_batch(&[1], &["old"])],
+                ),
+                (
+                    "my-bucket/events/new.parquet".to_string(),
+                    vec![id_name_batch(&[2], &["new"])],
+                ),
+            ]),
+            fail_keys: vec![],
+        };
+        let lister = MockLister {
+            keys: vec![
+                "events/old.parquet".into(),
+                "events/new.parquet".into(),
+                "other/skip.parquet".into(),
+            ],
+        };
+        let applied = HashSet::from(["events/old.parquet".to_string()]);
+        let result = backfill_unapplied(
+            &events_dataset(),
+            &default_config(),
+            &lister,
+            &reader,
+            &applied,
+        )
+        .await
+        .expect("backfill should succeed");
+        assert_eq!(result.keys, vec!["events/new.parquet".to_string()]);
+        assert_eq!(result.batches.len(), 1);
+        assert_eq!(result.batches[0].num_rows(), 1);
+    }
+
+    #[tokio::test]
     async fn stream_object_created_yields_create_and_commit_deletes_sqs_message() {
-        let object_batch = id_name_batch(&[7], &["created"]);
-        let snapshot_batch = id_name_batch(&[1], &["snap"]);
         let queue = Arc::new(MockQueue::with_messages(vec![QueueMessage {
             body: created_put_body("events/new.parquet"),
             receipt_handle: "rh-new".into(),
@@ -1243,18 +1616,17 @@ mod tests {
         let reader = Arc::new(MapObjectReader {
             objects: HashMap::from([(
                 "my-bucket/events/new.parquet".to_string(),
-                vec![object_batch],
+                vec![id_name_batch(&[7], &["created"])],
             )]),
             fail_keys: vec![],
         });
-        let stream = stream_s3_changes(
-            events_dataset(),
-            federated_table(snapshot_batch),
+        let stream = start_stream(
             AccelerationContents::NonEmpty,
-            Arc::clone(&queue) as Arc<dyn MessageQueue>,
+            Arc::clone(&queue),
             reader,
+            empty_lister(),
             default_config(),
-            SessionContext::new(),
+            id_name_batch(&[1], &["snap"]),
         );
         let mut envelopes = collect_until_idle(stream, 2).await;
         assert!(
@@ -1279,6 +1651,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_unmatched_message_is_not_deleted() {
+        let queue = Arc::new(MockQueue::with_messages(vec![QueueMessage {
+            body: created_put_body("other/a.parquet"),
+            receipt_handle: "rh-other".into(),
+        }]));
+        let reader = Arc::new(MapObjectReader {
+            objects: HashMap::new(),
+            fail_keys: vec![],
+        });
+        let stream = start_stream(
+            AccelerationContents::NonEmpty,
+            Arc::clone(&queue),
+            reader,
+            empty_lister(),
+            default_config(),
+            id_name_batch(&[1], &["snap"]),
+        );
+        let envelopes = collect_until_idle(stream, 2).await;
+        assert_eq!(
+            envelopes.len(),
+            1,
+            "unmatched SQS must not yield a create, got {}",
+            envelopes.len()
+        );
+        assert!(envelopes[0].is_dataset_ready());
+        assert!(
+            queue.deleted.lock().await.is_empty(),
+            "unmatched SQS messages must stay on the queue"
+        );
+    }
+
+    #[tokio::test]
     async fn stream_object_removed_rebuilds_when_configured() {
         let queue = Arc::new(MockQueue::with_messages(vec![QueueMessage {
             body: removed_body("events/gone.parquet"),
@@ -1289,15 +1693,14 @@ mod tests {
             fail_keys: vec![],
         });
         let mut config = default_config();
-        config.events = CdcEvents::ObjectCreatedAndRemoved;
-        let stream = stream_s3_changes(
-            events_dataset(),
-            federated_table(id_name_batch(&[1], &["snap"])),
+        config.on_object_removed = OnObjectRemoved::Rebuild;
+        let stream = start_stream(
             AccelerationContents::NonEmpty,
-            Arc::clone(&queue) as Arc<dyn MessageQueue>,
+            Arc::clone(&queue),
             reader,
+            empty_lister(),
             config,
-            SessionContext::new(),
+            id_name_batch(&[1], &["snap"]),
         );
         let mut envelopes = collect_until_idle(stream, 2).await;
         assert!(
@@ -1321,14 +1724,13 @@ mod tests {
             objects: HashMap::new(),
             fail_keys: vec![],
         });
-        let stream = stream_s3_changes(
-            events_dataset(),
-            federated_table(id_name_batch(&[1], &["snap"])),
+        let stream = start_stream(
             AccelerationContents::Empty,
             queue,
             reader,
+            empty_lister(),
             default_config(),
-            SessionContext::new(),
+            id_name_batch(&[1], &["snap"]),
         );
         let envelopes = collect_until_idle(stream, 2).await;
         assert_eq!(
@@ -1344,5 +1746,44 @@ mod tests {
         ));
         assert!(envelopes[1].is_dataset_ready());
         assert!(envelopes[1].is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_nonempty_lists_unapplied_objects_before_ready() {
+        let queue = Arc::new(MockQueue::with_messages(vec![]));
+        let reader = Arc::new(MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/missed.parquet".to_string(),
+                vec![id_name_batch(&[9], &["missed"])],
+            )]),
+            fail_keys: vec![],
+        });
+        let lister = Arc::new(MockLister {
+            keys: vec!["events/missed.parquet".into()],
+        });
+        let stream = start_stream(
+            AccelerationContents::NonEmpty,
+            queue,
+            reader,
+            lister,
+            default_config(),
+            id_name_batch(&[1], &["snap"]),
+        );
+        let envelopes = collect_until_idle(stream, 2).await;
+        assert_eq!(
+            envelopes.len(),
+            2,
+            "expected backfill create + ready, got {}",
+            envelopes.len()
+        );
+        assert!(!envelopes[0].is_dataset_ready());
+        assert!(matches!(
+            envelopes[0]
+                .change_batch()
+                .expect("backfill batch")
+                .op(0),
+            ChangeOperation::Create
+        ));
+        assert!(envelopes[1].is_dataset_ready());
     }
 }

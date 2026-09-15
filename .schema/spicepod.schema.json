@@ -8047,35 +8047,44 @@
           "type": "string",
           "default": "enabled"
         },
-        "s3_cdc_queue_url": {
-          "description": "SQS queue URL subscribed to S3 event notifications for `refresh_mode: changes`. Must be a queue URL, not an ARN.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+        "s3_changes_queue_url": {
+          "description": "SQS queue URL subscribed to S3 event notifications for `refresh_mode: changes`. Must be a queue URL, not an ARN. The queue must be exclusive to this dataset.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "examples": [
             "https://sqs.us-east-1.amazonaws.com/123456789012/s3-events"
           ],
           "x-secret": true
         },
-        "s3_cdc_region": {
-          "description": "AWS region of the SQS queue. Defaults to the region in `s3_cdc_queue_url`, then `s3_region`.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+        "s3_changes_region": {
+          "description": "AWS region of the SQS queue. Defaults to the region in `s3_changes_queue_url`, then `s3_region`.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "examples": [
             "us-east-1"
           ]
         },
-        "s3_cdc_events": {
-          "description": "S3 event types to apply. `object_created` appends new objects; `object_created_and_removed` rebuilds the accelerator from the listing prefix when an object is deleted.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
-          "type": "string",
-          "default": "object_created",
-          "enum": [
-            "object_created",
-            "object_created_and_removed"
-          ]
-        },
-        "s3_cdc_key_prefix": {
-          "description": "Object-key prefix to apply from the SQS queue. Defaults to the dataset `from` prefix. Must be equal to or nested under the dataset path.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+        "s3_changes_key_prefix": {
+          "description": "Object-key prefix to apply from the SQS queue and listing backfill. Defaults to the dataset `from` prefix. Must be equal to or nested under the dataset path.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
           "examples": [
             "events/year=2026/"
+          ]
+        },
+        "s3_changes_backfill_interval": {
+          "description": "How often to list the dataset prefix and apply objects not yet reflected, so SQS downtime does not permanently miss objects. Must be greater than 0.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "default": "1h",
+          "examples": [
+            "1h",
+            "30m"
+          ]
+        },
+        "s3_on_object_removed": {
+          "description": "What to do with `s3:ObjectRemoved:*` notifications. `ignore` leaves deleted objects in the accelerator. `rebuild` replaces the accelerator from the listing prefix (`history_unavailable`); this is not a row-level delete.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "default": "ignore",
+          "enum": [
+            "ignore",
+            "rebuild"
           ]
         },
         "client_timeout": {

@@ -26,7 +26,7 @@ use super::{
 };
 use crate::dataconnector::ConnectorContext;
 
-mod cdc;
+mod changes;
 mod event;
 
 use app::App;
@@ -197,23 +197,28 @@ pub static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
                 .description("Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.")
                 .default("enabled")
                 .help_link(S3_DOCS),
-            ParameterSpec::component("cdc_queue_url")
-                .description("SQS queue URL subscribed to S3 event notifications for `refresh_mode: changes`. Must be a queue URL, not an ARN.")
+            ParameterSpec::component("changes_queue_url")
+                .description("SQS queue URL subscribed to S3 event notifications for `refresh_mode: changes`. Must be a queue URL, not an ARN. The queue must be exclusive to this dataset.")
                 .examples(&["https://sqs.us-east-1.amazonaws.com/123456789012/s3-events"])
                 .help_link(S3_DOCS)
                 .secret(),
-            ParameterSpec::component("cdc_region")
-                .description("AWS region of the SQS queue. Defaults to the region in `s3_cdc_queue_url`, then `s3_region`.")
+            ParameterSpec::component("changes_region")
+                .description("AWS region of the SQS queue. Defaults to the region in `s3_changes_queue_url`, then `s3_region`.")
                 .examples(&["us-east-1"])
                 .help_link(S3_DOCS),
-            ParameterSpec::component("cdc_events")
-                .description("S3 event types to apply. `object_created` appends new objects; `object_created_and_removed` rebuilds the accelerator from the listing prefix when an object is deleted.")
-                .one_of(&["object_created", "object_created_and_removed"])
-                .default("object_created")
-                .help_link(S3_DOCS),
-            ParameterSpec::component("cdc_key_prefix")
-                .description("Object-key prefix to apply from the SQS queue. Defaults to the dataset `from` prefix. Must be equal to or nested under the dataset path.")
+            ParameterSpec::component("changes_key_prefix")
+                .description("Object-key prefix to apply from the SQS queue and listing backfill. Defaults to the dataset `from` prefix. Must be equal to or nested under the dataset path.")
                 .examples(&["events/year=2026/"])
+                .help_link(S3_DOCS),
+            ParameterSpec::component("changes_backfill_interval")
+                .description("How often to list the dataset prefix and apply objects not yet reflected, so SQS downtime does not permanently miss objects. Must be greater than 0.")
+                .default("1h")
+                .examples(&["1h", "30m"])
+                .help_link(S3_DOCS),
+            ParameterSpec::component("on_object_removed")
+                .description("What to do with `s3:ObjectRemoved:*` notifications. `ignore` leaves deleted objects in the accelerator. `rebuild` replaces the accelerator from the listing prefix (`history_unavailable`); this is not a row-level delete.")
+                .one_of(&["ignore", "rebuild"])
+                .default("ignore")
                 .help_link(S3_DOCS),
             ParameterSpec::runtime("client_timeout")
                 .description("The timeout setting for S3 client.")
@@ -358,14 +363,14 @@ impl ListingTableConnector for S3 {
     }
 
     fn supports_changes_stream(&self) -> bool {
-        // Always true so `refresh_mode: changes` without `s3_cdc_queue_url`
+        // Always true so `refresh_mode: changes` without `s3_changes_queue_url`
         // fails in `validate_dataset` with an S3-specific message instead of
         // the generic "does not support changes" error.
         true
     }
 
     fn validate_dataset(&self, dataset: &DatasetSpec) -> DataConnectorResult<()> {
-        cdc::validate_s3_cdc_config(&self.params, dataset)
+        changes::validate_s3_changes_config(&self.params, dataset)
     }
 
     async fn changes_stream(
@@ -375,7 +380,7 @@ impl ListingTableConnector for S3 {
         dataset: &DatasetSpec,
         acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
-        cdc::s3_changes_stream(self, context, federated_table, dataset, acceleration).await
+        changes::s3_changes_stream(self, context, federated_table, dataset, acceleration).await
     }
 
     fn get_tokio_io_runtime(&self) -> tokio::runtime::Handle {
