@@ -920,19 +920,24 @@ impl Query {
                         }
                     };
                     match plan_or_cached {
-                        cache::PlanOrCached::Cached(cached_result) => {
+                        cache::PlanOrCached::Cached { result, tracker } => {
                             tracing::debug!(
                                 job_id,
                                 "Returning cached result for distributed query"
                             );
                             // Return a QueryHandle with cached results
-                            let schema = cached_result.data.schema();
+                            let schema = result.data.schema();
                             return Ok(QueryHandle::new_with_cached_result(
                                 job_id.to_string(),
                                 schema,
                                 Arc::clone(&self.df),
                                 None, // Cache key already used for lookup
-                                cached_result.data,
+                                attach_query_tracker_to_stream(
+                                    trace_span.clone(),
+                                    Arc::clone(&request_context),
+                                    tracker,
+                                    result.data,
+                                ),
                                 Arc::clone(&request_context),
                                 trace_span,
                                 Arc::clone(&sql_preview),
@@ -1217,14 +1222,16 @@ impl Query {
                     CacheProbe::Hit(hit) => {
                         let raw_key = hit.raw_key();
                         match ctx.serve_probed_hit(&request_context, *hit).await {
-                            Some(query_result) => {
-                                Self::ensure_not_cancelled(
-                                    &query_cancel_token,
-                                    &query_id_str,
-                                    &timeout_state,
-                                )?;
-                                return Ok(attach_cancellation_to_query_result(
+                            Some((query_result, tracker)) => {
+                                // Do not `ensure_not_cancelled` here: that `?`
+                                // would drop the served batches and the tracker.
+                                // Cancellation is inside the tracker so a
+                                // cancel is an error the tracker finishes.
+                                return Ok(assemble_cached_query_result(
                                     query_result,
+                                    tracker,
+                                    Arc::clone(&request_context),
+                                    inner_span.clone(),
                                     query_cancel_token.clone(),
                                     Arc::clone(&query_id_str),
                                     timeout_state.clone(),
@@ -1358,14 +1365,12 @@ impl Query {
                                 )?;
                                 (plan, tracker, cache_manager)
                             }
-                            PlanOrCached::Cached(query_result) => {
-                                Self::ensure_not_cancelled(
-                                    &query_cancel_token,
-                                    &query_id_str,
-                                    &timeout_state,
-                                )?;
-                                return Ok(attach_cancellation_to_query_result(
-                                    query_result,
+                            PlanOrCached::Cached { result, tracker } => {
+                                return Ok(assemble_cached_query_result(
+                                    result,
+                                    tracker,
+                                    Arc::clone(&request_context),
+                                    inner_span.clone(),
                                     query_cancel_token.clone(),
                                     Arc::clone(&query_id_str),
                                     timeout_state.clone(),
@@ -2245,6 +2250,31 @@ where
     )
 }
 
+/// A served cache hit: source → cancellation → tracker, matching the
+/// planned path. A cancel after the batches are ready is then an error
+/// the tracker finishes, instead of dropping an unpolled tracked stream.
+fn assemble_cached_query_result<G>(
+    query_result: QueryResult,
+    tracker: Option<QueryTracker>,
+    request_context: Arc<RequestContext>,
+    span: Span,
+    cancellation_token: tokio_util::sync::CancellationToken,
+    query_id: Arc<str>,
+    timeout_state: QueryTimeoutState,
+    guard: G,
+) -> QueryResult
+where
+    G: Send + 'static,
+{
+    let QueryResult { data, cache_status } = query_result;
+    let data =
+        attach_cancellation_to_stream(data, cancellation_token, query_id, timeout_state, guard);
+    QueryResult::new(
+        attach_query_tracker_to_stream(span, request_context, tracker, data),
+        cache_status,
+    )
+}
+
 /// Wraps a record batch stream so that cancellation via the supplied
 /// [`CancellationToken`] yields a single [`DataFusionError::External`] wrapping
 /// [`Error::QueryCancelled`] — or [`Error::QueryTimedOut`] when the
@@ -3084,10 +3114,11 @@ mod tests {
     use datafusion::physical_plan::{DisplayAs, DisplayFormatType, PlanProperties};
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_functions_json::JSON_UNION_DATA_TYPE;
-    use runtime_request_context::{Protocol, RequestContext};
+    use runtime_request_context::{Protocol, RequestContext, RequestContextBuilder};
     use serde_json::json;
     use spicepod::component::caching::SQLResultsCacheConfig;
     use spicepod::component::runtime::{Flight, FlightBatchSize};
+    use std::collections::HashSet;
     use std::fmt::{Debug, Formatter};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio_util::sync::CancellationToken;
@@ -4624,6 +4655,65 @@ mod tests {
         );
         assert!(guard_dropped.load(Ordering::SeqCst));
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_cache_hit_finishes_through_the_tracker() {
+        // source → cancel → tracker: a token that is already cancelled is an
+        // error the tracker sees, instead of dropping an unpolled tracked
+        // stream (the race after `serve_probed_hit`).
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![42])) as ArrayRef],
+        )
+        .expect("batch");
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+        let request_context = Arc::new(RequestContextBuilder::new(Protocol::Internal).build());
+        let query_id = Arc::<str>::from(uuid::Uuid::new_v4().to_string());
+        let tracker = QueryTracker {
+            task_history_enabled: false,
+            captured_output_enabled: false,
+            schema: None,
+            query_duration_secs: None,
+            query_execution_duration_secs: None,
+            rows_produced: 0,
+            results_cache_hit: Some(true),
+            is_accelerated: None,
+            error_message: None,
+            error_code: None,
+            query_duration_timer: tokio::time::Instant::now(),
+            query_execution_duration_timer: tokio::time::Instant::now(),
+            datasets: Arc::new(HashSet::new()),
+        };
+        let mut result = assemble_cached_query_result(
+            QueryResult::new(
+                stream_from_batches(&schema, vec![batch]),
+                CacheStatus::CacheHit,
+            ),
+            Some(tracker),
+            request_context,
+            tracing::Span::current(),
+            cancel_token,
+            Arc::clone(&query_id),
+            QueryTimeoutState::default(),
+            (),
+        );
+        let cancellation = result
+            .data
+            .next()
+            .await
+            .expect("assembled hit should emit cancellation");
+        assert_query_cancelled(
+            cancellation.expect_err("first item should be cancellation"),
+            &query_id,
+        );
+        assert!(result.data.next().await.is_none());
     }
 
     #[tokio::test]

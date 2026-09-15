@@ -16,7 +16,6 @@ limitations under the License.
 
 use super::{
     BindingParametersSnafu, Query, QueryMethod, QueryResult, QueryTracker, ResultsCacheMode,
-    attach_query_tracker_to_stream,
 };
 use crate::datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode};
 use cache::{
@@ -43,7 +42,12 @@ use std::{collections::HashSet, hash::Hasher, sync::Arc};
 /// Returns `Plan` if the result is not cached and needs to be executed, otherwise returns `Cached`
 pub(super) enum PlanOrCached {
     Plan(Box<LogicalPlan>, Option<QueryTracker>, RequestCacheManager),
-    Cached(QueryResult),
+    /// Batches are ready; the tracker is not yet on the stream so the caller
+    /// can wrap cancellation inside it (source → cancel → tracker).
+    Cached {
+        result: QueryResult,
+        tracker: Option<QueryTracker>,
+    },
 }
 
 pub(super) struct RequestCacheManager {
@@ -363,7 +367,12 @@ async fn find_servable_entry(
 
 /// How serving a servable entry ended.
 enum Served {
-    Hit(QueryResult),
+    /// Batches are ready. The tracker is returned separately so the caller
+    /// can wrap cancellation inside it (source → cancel → tracker).
+    Hit {
+        result: QueryResult,
+        tracker: Option<QueryTracker>,
+    },
     /// The entry could not be decoded. The tracker is handed back so the query
     /// can still be planned, executed and tracked like a miss.
     Undecodable(Option<QueryTracker>),
@@ -500,8 +509,11 @@ impl Query {
         {
             CacheResponse {
                 result: CacheResult::Hit(result),
+                tracker,
                 ..
-            } => return Ok(PlanOrCached::Cached(result)),
+            } => {
+                return Ok(PlanOrCached::Cached { result, tracker });
+            }
             response => response,
         };
 
@@ -551,8 +563,11 @@ impl Query {
         {
             CacheResponse {
                 result: CacheResult::Hit(result),
+                tracker,
                 ..
-            } => return Ok(PlanOrCached::Cached(result)),
+            } => {
+                return Ok(PlanOrCached::Cached { result, tracker });
+            }
             response => response,
         };
 
@@ -757,11 +772,11 @@ impl Query {
         )
         .await
         {
-            Served::Hit(query_result) => Ok(CacheResponse::from(
-                CacheResult::Hit(query_result),
-                cache_status,
-            )
-            .with_raw_key(Some(raw_key))),
+            Served::Hit { result, tracker } => {
+                Ok(CacheResponse::from(CacheResult::Hit(result), cache_status)
+                    .with_query_tracker(tracker)
+                    .with_raw_key(Some(raw_key)))
+            }
             Served::Undecodable(tracker) => Ok(CacheResponse::miss(raw_key, tracker)),
         }
     }
@@ -894,14 +909,16 @@ fn apply_serve_time_table_clock(entry: &mut ServableEntry, validity: EntryValidi
 impl Query {
     /// Serves a hit [`Self::probe_results_cache`] found.
     ///
-    /// `None` when the entry cannot be decoded, or when the table-change clock
-    /// has invalidated it since the probe, with the query's tracker left in
-    /// place so it can still be planned, executed and tracked like a miss.
+    /// Returns the cached batches and the tracker separately so the caller
+    /// can wrap cancellation inside the tracker. `None` when the entry
+    /// cannot be decoded, or when the table-change clock has invalidated it
+    /// since the probe, with the query's tracker left in place so it can
+    /// still be planned, executed and tracked like a miss.
     pub(super) async fn serve_probed_hit(
         &mut self,
         request_context: &Arc<RequestContext>,
         hit: ProbedHit,
-    ) -> Option<QueryResult> {
+    ) -> Option<(QueryResult, Option<QueryTracker>)> {
         let ProbedHit {
             raw_key,
             mut entry,
@@ -950,7 +967,7 @@ impl Query {
         )
         .await
         {
-            Served::Hit(query_result) => Some(query_result),
+            Served::Hit { result, tracker } => Some((result, tracker)),
             Served::Undecodable(tracker) => {
                 self.tracker = tracker;
                 None
@@ -1012,20 +1029,20 @@ impl Query {
         // Duration and returned-output counters finish when this stream is
         // consumed, matching a miss. The batches are already in memory; the
         // client may still disconnect before HTTP or Flight reads them.
+        // The tracker is not attached here: the caller wraps cancellation
+        // first so a cancel is an error the tracker can finish on.
         let tracker = tracker.map(|t| {
             t.datasets(cached_result.input_tables.arc())
                 .results_cache_hit(true)
         });
 
-        Served::Hit(QueryResult::new(
-            attach_query_tracker_to_stream(
-                tracing::Span::current(),
-                Arc::clone(request_context),
-                tracker,
+        Served::Hit {
+            result: QueryResult::new(
                 Box::pin(CachedStream::new(records, cached_result.schema.arc())),
+                cache_status,
             ),
-            cache_status,
-        ))
+            tracker,
+        }
     }
 
     pub(super) fn should_cache_results(
