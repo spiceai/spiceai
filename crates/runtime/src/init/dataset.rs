@@ -120,6 +120,71 @@ pub(crate) fn warn_about_discarded_acceleration_settings(
     );
 }
 
+/// One sample of the startup `Dataset load summary` line: how many datasets have
+/// finished their first load, how many failed it, and how many are still loading.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DatasetLoadSummary {
+    pub(crate) ready: usize,
+    pub(crate) unhealthy: usize,
+    pub(crate) loading: usize,
+    pub(crate) total: usize,
+}
+
+impl DatasetLoadSummary {
+    /// Buckets each dataset by whether its first load has finished.
+    ///
+    /// `Ready` counts as ready, and so does `Refreshing` when `has_ever_been_ready`
+    /// says the dataset was loaded before (see
+    /// [`status::RuntimeStatus::has_dataset_ever_been_ready`]); a `Refreshing`
+    /// dataset that never was is on its first load and counts as loading, alongside
+    /// `Initializing`. `Error` counts as unhealthy. `Disabled`, `NotLoaded` and
+    /// `ShuttingDown` fall into no bucket: the summary reports the progress of
+    /// loads that are under way, and a dataset in one of those states has no load
+    /// in flight to report, so it neither inflates the ready count nor keeps the
+    /// sampler alive.
+    pub(crate) fn from_statuses(
+        statuses: &HashMap<TableReference, status::ComponentStatus>,
+        has_ever_been_ready: impl Fn(&TableReference) -> bool,
+    ) -> Self {
+        let mut summary = Self {
+            total: statuses.len(),
+            ..Self::default()
+        };
+        for (dataset, current) in statuses {
+            match current {
+                status::ComponentStatus::Ready => summary.ready += 1,
+                status::ComponentStatus::Refreshing if has_ever_been_ready(dataset) => {
+                    summary.ready += 1;
+                }
+                status::ComponentStatus::Refreshing | status::ComponentStatus::Initializing => {
+                    summary.loading += 1;
+                }
+                status::ComponentStatus::Error(_) => summary.unhealthy += 1,
+                status::ComponentStatus::Disabled
+                | status::ComponentStatus::NotLoaded
+                | status::ComponentStatus::ShuttingDown => {}
+            }
+        }
+        summary
+    }
+
+    /// The sampler stops once no dataset is still loading.
+    pub(crate) fn is_settled(&self) -> bool {
+        self.loading == 0
+    }
+
+    /// The line users watch for progress. Phrasing deliberately avoids "error"/"failed"
+    /// so quickstart smoke tests that grep `spice.log` for those tokens don't get false
+    /// positives on a healthy startup; real per-dataset failure is already logged at
+    /// WARN level inside `load_dataset`.
+    pub(crate) fn log_line(&self, elapsed_secs: u64) -> String {
+        format!(
+            "Dataset load summary (after {elapsed_secs}s): {}/{} ready, {} unhealthy, {} still initializing.",
+            self.ready, self.total, self.unhealthy, self.loading
+        )
+    }
+}
+
 impl Runtime {
     pub(crate) async fn load_datasets(self: Arc<Self>) {
         let Some(app) = self.read_app().await else {
@@ -278,8 +343,8 @@ impl Runtime {
         }
 
         // Spawn a best-effort follow-up summary that samples the status registry every
-        // 30s until all datasets have settled (reached Ready/Refreshing or Error), so
-        // users see periodic progress on slow-loading pods without having to query
+        // 30s until every dataset has finished its first load or failed it, so users
+        // see periodic progress on slow-loading pods without having to query
         // /v1/datasets. Uses the runtime's shutdown token so a ctrl-c stops the sampler
         // cleanly. Skipped when there are no datasets at all so we don't spawn a timer
         // that would just no-op.
@@ -295,35 +360,14 @@ impl Runtime {
                     }
                     elapsed_secs += 30;
                     let statuses = status_handle.get_dataset_statuses();
-                    let mut ready = 0usize;
-                    let mut unhealthy = 0usize;
-                    let mut initializing = 0usize;
-                    for s in statuses.values() {
-                        match s {
-                            status::ComponentStatus::Ready
-                            | status::ComponentStatus::Refreshing => {
-                                ready += 1;
-                            }
-                            status::ComponentStatus::Error(_) => unhealthy += 1,
-                            status::ComponentStatus::Initializing => initializing += 1,
-                            _ => {}
-                        }
-                    }
-                    let total = statuses.len();
-                    if total == 0 {
+                    if statuses.is_empty() {
                         return;
                     }
-                    // Phrasing deliberately avoids "error"/"failed" so quickstart smoke
-                    // tests that grep spice.log for those tokens don't get false positives
-                    // on a healthy startup. Real per-dataset failure is already logged at
-                    // WARN level inside `load_dataset`.
-                    tracing::info!(
-                        "Dataset load summary (after {elapsed_secs}s): {ready}/{total} ready, {unhealthy} unhealthy, {initializing} still initializing."
-                    );
-                    // Stop once every dataset has settled (Ready/Refreshing or Error).
-                    // `initializing` only counts Initializing; other transient states
-                    // (e.g. Disabled) are treated as settled for this summary.
-                    if initializing == 0 {
+                    let summary = DatasetLoadSummary::from_statuses(&statuses, |dataset| {
+                        status_handle.has_dataset_ever_been_ready(dataset)
+                    });
+                    tracing::info!("{}", summary.log_line(elapsed_secs));
+                    if summary.is_settled() {
                         return;
                     }
                 }
@@ -3813,6 +3857,101 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         assert!(
             (counted - 1.0).abs() < f64::EPSILON,
             "teardown counted one load error before this change; counted {counted}"
+        );
+    }
+
+    /// A dataset performing its first load reports `Refreshing`, exactly like one
+    /// refreshing data it already holds; the registry's ever-ready record is what
+    /// tells them apart, so the summary counts the first as loading and the second
+    /// as ready, and stays unsettled while the first load is in flight.
+    /// Regression test for #13974.
+    #[test]
+    fn a_first_load_counts_as_loading_and_a_refresh_of_loaded_data_as_ready() {
+        let registry = status::RuntimeStatus::new();
+        let first_load = TableReference::bare("first_load");
+        let refreshing = TableReference::bare("refreshing");
+        registry.update_dataset(&first_load, status::ComponentStatus::Initializing);
+        registry.update_dataset(&first_load, status::ComponentStatus::Refreshing);
+        registry.update_dataset(&refreshing, status::ComponentStatus::Ready);
+        registry.update_dataset(&refreshing, status::ComponentStatus::Refreshing);
+
+        let summarize = || {
+            DatasetLoadSummary::from_statuses(&registry.get_dataset_statuses(), |dataset| {
+                registry.has_dataset_ever_been_ready(dataset)
+            })
+        };
+
+        let during_first_load = summarize();
+        assert_eq!(
+            during_first_load,
+            DatasetLoadSummary {
+                ready: 1,
+                unhealthy: 0,
+                loading: 1,
+                total: 2,
+            }
+        );
+        assert!(
+            !during_first_load.is_settled(),
+            "a first load in flight keeps the sampler alive"
+        );
+        assert_eq!(
+            during_first_load.log_line(30),
+            "Dataset load summary (after 30s): 1/2 ready, 0 unhealthy, 1 still initializing."
+        );
+
+        registry.update_dataset(&first_load, status::ComponentStatus::Ready);
+        let after_first_load = summarize();
+        assert_eq!((after_first_load.ready, after_first_load.loading), (2, 0));
+        assert!(after_first_load.is_settled());
+    }
+
+    #[test]
+    fn the_summary_settles_once_nothing_is_loading() {
+        let mut statuses = HashMap::from([
+            (
+                TableReference::bare("ready"),
+                status::ComponentStatus::Ready,
+            ),
+            (
+                TableReference::bare("failed"),
+                status::ComponentStatus::error_with_message("connection refused"),
+            ),
+            (
+                TableReference::bare("disabled"),
+                status::ComponentStatus::Disabled,
+            ),
+            (
+                TableReference::bare("not_loaded"),
+                status::ComponentStatus::NotLoaded,
+            ),
+            (
+                TableReference::bare("shutting_down"),
+                status::ComponentStatus::ShuttingDown,
+            ),
+        ]);
+
+        let summary = DatasetLoadSummary::from_statuses(&statuses, |_| false);
+        assert_eq!(
+            summary,
+            DatasetLoadSummary {
+                ready: 1,
+                unhealthy: 1,
+                loading: 0,
+                total: 5,
+            }
+        );
+        assert!(summary.is_settled());
+
+        statuses.insert(
+            TableReference::bare("waiting"),
+            status::ComponentStatus::Initializing,
+        );
+        let summary = DatasetLoadSummary::from_statuses(&statuses, |_| false);
+        assert_eq!(summary.loading, 1);
+        assert!(
+            !summary.is_settled(),
+            "an Initializing dataset keeps the sampler alive"
         );
     }
 }
