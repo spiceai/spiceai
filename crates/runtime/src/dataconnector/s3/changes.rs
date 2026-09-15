@@ -1108,12 +1108,14 @@ mod tests {
     #[async_trait]
     impl MessageQueue for MockQueue {
         async fn receive(&self) -> std::result::Result<Vec<QueueMessage>, QueueError> {
-            let mut incoming = self.incoming.lock().await;
-            if incoming.is_empty() {
-                drop(incoming);
+            let messages = {
+                let mut incoming = self.incoming.lock().await;
+                std::mem::take(&mut *incoming)
+            };
+            if messages.is_empty() {
                 std::future::pending::<()>().await;
             }
-            Ok(std::mem::take(&mut *incoming))
+            Ok(messages)
         }
 
         async fn delete(&self, receipt_handle: &str) -> std::result::Result<(), QueueError> {
