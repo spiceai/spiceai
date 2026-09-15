@@ -35,6 +35,7 @@ use crate::{
     component::dataset::DatasetSpec,
     dataconnector::listing::{LISTING_TABLE_PARAMETERS, ObjectVersionType},
 };
+use async_trait::async_trait;
 use data_components::cdc::{AccelerationContents, ChangesStream};
 
 use snafu::prelude::*;
@@ -332,6 +333,7 @@ impl std::fmt::Display for S3 {
     }
 }
 
+#[async_trait]
 impl ListingTableConnector for S3 {
     fn object_versioning_type(&self) -> Option<ObjectVersionType> {
         if self.params.get("versioning").expose().ok() == Some("disabled") {

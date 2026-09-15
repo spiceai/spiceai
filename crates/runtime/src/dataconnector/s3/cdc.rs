@@ -44,7 +44,7 @@ use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use runtime_component::dataset::DatasetSpec;
 use runtime_component::dataset::acceleration::RefreshMode;
-use runtime_parameters::{ExposedParamLookup, Parameters};
+use runtime_parameters::Parameters;
 use snafu::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
