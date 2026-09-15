@@ -683,13 +683,20 @@ pub(crate) fn view_definition_closure(
         // supplied by `app.catalogs`, not by a declared dataset; rebinding catalog
         // `sales` to another endpoint keeps the view SQL and schema identical.
         // Folding only datasets would restore an archive of the old catalog's rows.
+        //
+        // Keyed as `catalog:<declared name>` so a dataset or view of the same
+        // name occupies a separate entry. `SELECT * FROM sales.orders, sales`
+        // can match catalog `sales` and dataset `sales` in one closure; sharing
+        // a key would drop one identity, which is the direction that accepts a
+        // wrong archive. The prefix cannot collide with a Spicepod identifier
+        // (those reject `:`).
         for catalog in app
             .catalogs
             .iter()
             .filter(|candidate| catalog_matches(&candidate.name, &dependency))
         {
             closure.insert(
-                catalog.name.clone(),
+                format!("catalog:{}", catalog.name),
                 catalog_definition_identity(&catalog.from, &catalog_identity_fields(catalog)),
             );
         }
@@ -2082,6 +2089,29 @@ mod tests {
         }
 
         #[test]
+        fn identical_catalogs_keep_the_view_fingerprint_stable() {
+            let v = TableReference::bare("v");
+            let sql = "SELECT * FROM sales.public.orders";
+            let closure_for = || {
+                let mut sales = catalog("postgres:db", "sales");
+                sales.params = Some(catalog_params(&[("pg_host", "db.example")]));
+                sales.dataset_params = Some(catalog_params(&[("pg_search_path", "public")]));
+                view_definition_closure(
+                    &v,
+                    sql,
+                    &[],
+                    &HashMap::new(),
+                    &app_with_catalogs(&[], &[], &[sales]),
+                )
+            };
+            assert_eq!(
+                definition_fingerprint(&closure_for()),
+                definition_fingerprint(&closure_for()),
+                "the same catalog source and params must not move the identity"
+            );
+        }
+
+        #[test]
         fn rebinding_catalog_params_changes_the_fingerprint() {
             let v = TableReference::bare("v");
             let sql = "SELECT * FROM sales.public.orders";
@@ -2217,6 +2247,55 @@ mod tests {
             assert!(
                 !other.contains("postgres:other"),
                 "a catalog whose name is not a qualifier of the relation must not contribute: {other}"
+            );
+        }
+
+        #[test]
+        fn closure_folds_in_a_catalog_alongside_a_same_named_dataset() {
+            // `sales.orders` matches catalog `sales`; bare `sales` matches a
+            // dataset of that name. They must both contribute: sharing a key
+            // would drop one identity when the SQL names both relations.
+            let outer = TableReference::bare("outer");
+            let closure = view_definition_closure(
+                &outer,
+                "SELECT * FROM sales.orders, sales",
+                &[],
+                &HashMap::new(),
+                &app_with_catalogs(
+                    &[],
+                    &[("sales", "s3://bucket/sales")],
+                    &[catalog("postgres:sales_db", "sales")],
+                ),
+            );
+            assert!(
+                closure.contains("s3://bucket/sales"),
+                "the dataset candidate must contribute: {closure}"
+            );
+            assert!(
+                closure.contains("postgres:sales_db"),
+                "the catalog candidate must contribute even though a dataset matched: {closure}"
+            );
+        }
+
+        #[test]
+        fn closure_fingerprint_follows_catalog_param_trailing_whitespace() {
+            let v = TableReference::bare("v");
+            let sql = "SELECT * FROM sales.public.orders";
+            let closure_for = |selector: &str| {
+                let mut sales = catalog("postgres:db", "sales");
+                sales.params = Some(catalog_params(&[("selector", selector)]));
+                view_definition_closure(
+                    &v,
+                    sql,
+                    &[],
+                    &HashMap::new(),
+                    &app_with_catalogs(&[], &[], &[sales]),
+                )
+            };
+            assert_ne!(
+                definition_fingerprint(&closure_for("x ")),
+                definition_fingerprint(&closure_for("x\t")),
+                "a catalog param that differs only by trailing space vs tab must change the outer fingerprint"
             );
         }
 
