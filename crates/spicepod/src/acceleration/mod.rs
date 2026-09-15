@@ -247,7 +247,9 @@ pub enum SnapshotsCreationPolicy {
 /// different position, and can store rows that never existed together in the source.
 /// Publishing that as a snapshot makes the discrepancy durable and reusable; a
 /// `bootstrap_only` consumer with the default `consistent_read` is refused rather
-/// than serving that archive without opting in.
+/// than serving that archive without opting in. Each published view archive
+/// records this setting, so a later single-read replan of the same SQL cannot
+/// restore an `accept_skew` archive either.
 ///
 /// Only meaningful for views. A dataset that sets a non-default value is refused at
 /// load: a dataset materializes a single source and always reads it once, so the
@@ -264,11 +266,14 @@ pub enum SnapshotsConsistency {
     /// query does not record, and a later refresh's attestation cannot approve the
     /// previous generation. Each published archive records this setting so a later
     /// `consistent_read` bootstrap can refuse an archive published under `accept_skew`
-    /// even if the consumer's current plan happens to read once.
+    /// even if the consumer's current plan happens to read once. A missing stamp is
+    /// refused the same way: it cannot be shown to have come from a single read.
     #[default]
     ConsistentRead,
     /// Publish or restore regardless, accepting that the stored rows may span several
     /// source positions. Choose this only when the view's consumers tolerate that.
+    /// Archives published under this setting are stamped `accept_skew` and a default
+    /// `consistent_read` consumer will not restore them.
     AcceptSkew,
 }
 
@@ -675,6 +680,11 @@ pub struct Acceleration {
     /// from a materialization that spans more than one read of the view's sources.
     ///
     /// Options: `consistent_read` (default) / `accept_skew`.
+    ///
+    /// Each published view archive records the producing setting. The default
+    /// `consistent_read` restores only archives stamped as a single read, so a
+    /// later single-read replan of the same SQL cannot serve rows captured under
+    /// `accept_skew`.
     ///
     /// Only meaningful for views. A dataset that sets `accept_skew` is refused at
     /// load — a dataset always materializes a single source read, so the option

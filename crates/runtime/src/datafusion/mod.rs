@@ -6196,10 +6196,12 @@ async fn build_snapshot_creation_config(
         } else {
             sm
         };
-        // Stamped on publish and re-checked on bootstrap. A view's identity is its SQL
-        // plus producing-read consistency (`accept_skew` vs `consistent_read`); a
-        // dataset's is its `from:` plus `refresh_sql`. Both shape the stored rows
-        // while leaving the schema untouched.
+        // Stamped on publish and re-checked on bootstrap. A view's identity is its
+        // SQL (the definition fingerprint). Producing-read consistency is a separate
+        // per-entry stamp so a `consistent_read` consumer can refuse an `accept_skew`
+        // archive of the same definition. A dataset's identity is its `from:` plus
+        // `refresh_sql`. Both shape the stored rows while leaving the schema
+        // untouched.
         let sm = sm.with_source(source);
         let sm = if let Some(gate) = publish_gate {
             sm.with_publish_gate(gate)

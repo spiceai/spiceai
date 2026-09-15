@@ -117,6 +117,50 @@ fn published_snapshots(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     found
 }
 
+/// Producing `snapshot-read-consistency` stamps from every `metadata.json` under `root`.
+fn published_read_consistencies(root: &std::path::Path) -> Vec<String> {
+    let mut stamps = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.file_name().is_none_or(|name| name != "metadata.json") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            let Some(obj) = value.as_object() else {
+                continue;
+            };
+            for dataset in obj.values() {
+                let Some(snapshots) = dataset.get("snapshots").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for snapshot in snapshots {
+                    if let Some(stamp) = snapshot
+                        .get("snapshot-read-consistency")
+                        .and_then(|v| v.as_str())
+                    {
+                        stamps.push(stamp.to_string());
+                    }
+                }
+            }
+        }
+    }
+    stamps
+}
+
 fn snapshots_config(location: &std::path::Path) -> Snapshots {
     Snapshots {
         enabled: true,
@@ -289,6 +333,11 @@ async fn accelerated_view_snapshot_round_trips() -> anyhow::Result<()> {
                 || snapshot_is_published(&snapshot_dir_for_wait),
             )
             .await?;
+            assert_eq!(
+                published_read_consistencies(&snapshot_dir),
+                vec!["consistent_read".to_string()],
+                "a consistent_read publisher must stamp consistent_read on the archive"
+            );
             drop(publisher);
 
             // Diverge the source so the two paths give different answers. From here, 2 rows
@@ -470,6 +519,118 @@ async fn multi_read_view_bootstrap_only_accept_skew_loads() -> anyhow::Result<()
             assert!(
                 published_snapshots(&snapshot_dir).is_empty(),
                 "bootstrap_only must not publish, even when accept_skew admits the view"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+async fn query_view_row_count(rt: &Runtime, sql: &str) -> anyhow::Result<usize> {
+    let results = rt
+        .datafusion()
+        .query_builder(sql)
+        .build()
+        .run()
+        .await?
+        .data
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum())
+}
+
+/// An archive published under `accept_skew` must not bootstrap into a default
+/// `consistent_read` consumer of the same SQL: catalog/pushdown can replan that
+/// SQL as single-read later, which is exactly when the load-time check would
+/// pass and torn rows would be served. The producing stamp is the gate.
+/// An `accept_skew` consumer still restores those archives — that is the opt-in.
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn accept_skew_archive_is_refused_by_consistent_read_and_allowed_by_accept_skew()
+-> anyhow::Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let csv_path = temp.path().join("orders.csv");
+            std::fs::write(&csv_path, SOURCE_CSV).expect("write source csv");
+            let snapshot_dir = temp.path().join("snapshots");
+            std::fs::create_dir_all(&snapshot_dir).expect("mkdir snapshots");
+
+            let publisher_db = temp.path().join("publisher.db");
+            let app = AppBuilder::new("view_snapshot_accept_skew_publish")
+                .with_dataset(csv_dataset(&csv_path))
+                .with_view(accelerated_view_with(
+                    "orders_us",
+                    "SELECT id FROM orders WHERE region = 'us'",
+                    &publisher_db,
+                    spicepod::acceleration::SnapshotBehavior::Enabled,
+                    SnapshotsConsistency::AcceptSkew,
+                ))
+                .with_snapshots(snapshots_config(&snapshot_dir))
+                .build();
+            let publisher = load(app).await?;
+
+            let snapshot_dir_for_wait = snapshot_dir.clone();
+            wait_until(
+                "the accept_skew view to publish a snapshot and its metadata pointer",
+                Duration::from_secs(90),
+                || snapshot_is_published(&snapshot_dir_for_wait),
+            )
+            .await?;
+            assert_eq!(
+                published_read_consistencies(&snapshot_dir),
+                vec!["accept_skew".to_string()],
+                "an accept_skew publisher must stamp accept_skew on the archive"
+            );
+            drop(publisher);
+
+            std::fs::write(&csv_path, SOURCE_CSV_DIVERGED).expect("diverge source csv");
+
+            let refused_db = temp.path().join("consistent_read_consumer.db");
+            let app = AppBuilder::new("view_snapshot_consistent_read_consumer")
+                .with_dataset(csv_dataset(&csv_path))
+                .with_view(accelerated_view(
+                    "orders_us",
+                    "SELECT id FROM orders WHERE region = 'us'",
+                    &refused_db,
+                ))
+                .with_snapshots(snapshots_config(&snapshot_dir))
+                .build();
+            let refused = load(app).await?;
+            let refused_rows =
+                query_view_row_count(refused.as_ref(), "SELECT id FROM orders_us ORDER BY id")
+                    .await?;
+            assert_eq!(
+                refused_rows, 3,
+                "consistent_read must refuse an accept_skew archive and rebuild from the diverged source (3 rows); 2 would mean the torn-capable archive was restored"
+            );
+            drop(refused);
+
+            let allowed_db = temp.path().join("accept_skew_consumer.db");
+            let app = AppBuilder::new("view_snapshot_accept_skew_consumer")
+                .with_dataset(csv_dataset(&csv_path))
+                .with_view(accelerated_view_with(
+                    "orders_us",
+                    "SELECT id FROM orders WHERE region = 'us'",
+                    &allowed_db,
+                    spicepod::acceleration::SnapshotBehavior::Enabled,
+                    SnapshotsConsistency::AcceptSkew,
+                ))
+                .with_snapshots(snapshots_config(&snapshot_dir))
+                .build();
+            let allowed = load(app).await?;
+            let allowed_rows =
+                query_view_row_count(allowed.as_ref(), "SELECT id FROM orders_us ORDER BY id")
+                    .await?;
+            assert_eq!(
+                allowed_rows, 2,
+                "accept_skew must still bootstrap the archive it opted into; 3 would mean it rebuilt from the diverged source instead"
             );
 
             Ok(())

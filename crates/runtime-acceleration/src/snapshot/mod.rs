@@ -125,13 +125,20 @@ const NETWORK_RETRY_MAX: usize = 3;
 /// not a stale one.
 pub const SOURCE_FINGERPRINT_PROPERTY: &str = "spice.source-fingerprint";
 
+/// Docs link carried on the producing-read-shape refusal so a reword cannot drop it.
+const SNAPSHOT_READ_CONSISTENCY_DOCS: &str =
+    "https://spiceai.org/docs/components/data-accelerators/snapshots";
+
 fn accept_skew_snapshot_bootstrap_reason() -> String {
-    "the snapshot was published under `snapshots_consistency: accept_skew`, so its rows may span several source positions".to_string()
+    format!(
+        "it was published under `snapshots_consistency: accept_skew`, so its rows may span several source positions. Set `snapshots_consistency: accept_skew` on this view to restore it anyway. See: {SNAPSHOT_READ_CONSISTENCY_DOCS}"
+    )
 }
 
 fn missing_read_consistency_bootstrap_reason() -> String {
-    "the snapshot records no producing-read consistency, so it cannot be shown to have come from a single consistent read"
-        .to_string()
+    format!(
+        "it records no `snapshot-read-consistency`, so it cannot be shown to have come from a single consistent read. Set `snapshots_consistency: accept_skew` on this view to restore it anyway. See: {SNAPSHOT_READ_CONSISTENCY_DOCS}"
+    )
 }
 
 // Shared with the other schema-evolution emit sites. `runtime-acceleration` cannot
@@ -3983,6 +3990,77 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "duckdb")]
+    async fn download_latest_snapshot_accepts_an_accept_skew_archive_under_accept_skew() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 1, 2, 3, 4, 5)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+
+        let contents = Bytes::from_static(b"accept-skew-snapshot-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        let checksum = compute_sha256_hex(contents.as_ref());
+        let snapshot_entry = SnapshotEntry {
+            snapshot_id: 0,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: checksum.clone(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+            snapshot_source_fingerprint: None,
+            snapshot_read_consistency: Some(SnapshotsConsistency::AcceptSkew),
+        };
+
+        let schema = sample_schema();
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: Utc::now().timestamp_millis(),
+            datasets: HashMap::from([(
+                DATASET_NAME.to_string(),
+                dataset_metadata(&schema, vec![snapshot_entry], Some(0)),
+            )]),
+        };
+
+        let metadata_path = base.join(METADATA_FILE_NAME);
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        )
+        .with_snapshots_consistency(SnapshotsConsistency::AcceptSkew);
+
+        let info = manager
+            .download_latest_snapshot()
+            .await
+            .expect("download should succeed")
+            .expect("an accept_skew consumer must restore an accept_skew archive");
+        assert_eq!(info.checksum, checksum);
+        let downloaded = fs::read(&local_path)
+            .await
+            .expect("read downloaded snapshot");
+        assert_eq!(downloaded.as_slice(), contents.as_ref());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
     async fn download_if_newer_returns_none_when_local_id_matches() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
@@ -4509,6 +4587,100 @@ mod tests {
             Some(SnapshotsConsistency::AcceptSkew),
             "an accept_skew view must stamp the archive so a consistent_read bootstrap can refuse it"
         );
+        let json = serde_json::to_value(&handle.metadata).expect("serialize metadata");
+        assert_eq!(
+            json[DATASET_NAME]["snapshots"][0]["snapshot-read-consistency"], "accept_skew",
+            "the archive field must serialize under its kebab-case name"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_stamps_consistent_read_on_a_view_that_did_not_opt_out() {
+        let store = Arc::new(InMemory::new());
+        let (_keep, local_path) = temp_snapshot_file();
+        let schema = sample_schema();
+
+        let manager = manager_for_gate_tests(&store, local_path).with_source_identity(
+            Some(crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:view".to_string(),
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::PlannedQuery,
+            }),
+            SnapshotsConsistency::ConsistentRead,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect("create snapshot")
+            .expect("snapshot created");
+
+        let handle = manager
+            .load_metadata()
+            .await
+            .expect("load metadata")
+            .expect("metadata written");
+        let entry = handle
+            .metadata
+            .datasets
+            .get(DATASET_NAME)
+            .expect("dataset recorded")
+            .current_snapshot()
+            .expect("a published archive must be current");
+        assert_eq!(
+            entry.snapshot_read_consistency,
+            Some(SnapshotsConsistency::ConsistentRead),
+            "a consistent_read view must stamp the archive so a later consumer can restore it"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_does_not_stamp_read_consistency_on_a_dataset_archive() {
+        let store = Arc::new(InMemory::new());
+        let (_keep, local_path) = temp_snapshot_file();
+        let schema = sample_schema();
+
+        let manager = manager_for_gate_tests(&store, local_path).with_source_identity(
+            Some(crate::acceleration_source::SourceDefinition {
+                fingerprint: "sha256:dataset".to_string(),
+                accept_unstamped: false,
+                materialization: crate::acceleration_source::MaterializationSource::SourceTable,
+            }),
+            SnapshotsConsistency::AcceptSkew,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        manager
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .await
+            .expect("create snapshot")
+            .expect("snapshot created");
+
+        let handle = manager
+            .load_metadata()
+            .await
+            .expect("load metadata")
+            .expect("metadata written");
+        let entry = handle
+            .metadata
+            .datasets
+            .get(DATASET_NAME)
+            .expect("dataset recorded")
+            .current_snapshot()
+            .expect("a published archive must be current");
+        assert_eq!(
+            entry.snapshot_read_consistency, None,
+            "a dataset archive is always a single source-table read, so it does not carry a view read-shape stamp"
+        );
+        let json = serde_json::to_value(&handle.metadata).expect("serialize metadata");
+        let published = &json[DATASET_NAME]["snapshots"][0];
+        assert!(
+            published.get("snapshot-read-consistency").is_none(),
+            "the optional field must be omitted from dataset archives so older readers still parse them: {published}"
+        );
     }
 
     /// The fingerprint decides whether an archive may be *served* under the definition
@@ -4627,12 +4799,20 @@ mod tests {
             refused.contains("span several source positions"),
             "{refused}"
         );
+        assert!(
+            refused.contains(SNAPSHOT_READ_CONSISTENCY_DOCS),
+            "{refused}"
+        );
 
         let unstamped = consistent
             .entry_read_consistency_permits(&dummy_snapshot_entry(None))
             .expect_err("an unstamped archive cannot be shown to have come from a single read");
         assert!(
-            unstamped.contains("producing-read consistency"),
+            unstamped.contains("`snapshot-read-consistency`"),
+            "{unstamped}"
+        );
+        assert!(
+            unstamped.contains(SNAPSHOT_READ_CONSISTENCY_DOCS),
             "{unstamped}"
         );
 
@@ -4713,15 +4893,27 @@ mod tests {
     }
 
     #[test]
-    fn accept_skew_bootstrap_reason_names_the_setting() {
-        let reason = accept_skew_snapshot_bootstrap_reason();
+    fn producing_read_consistency_refusal_messages_name_the_setting_and_a_way_out() {
         for expected in [
             "`snapshots_consistency: accept_skew`",
             "span several source positions",
+            SNAPSHOT_READ_CONSISTENCY_DOCS,
         ] {
+            let reason = accept_skew_snapshot_bootstrap_reason();
             assert!(
                 reason.contains(expected),
                 "the accept_skew bootstrap reason must contain {expected:?}: {reason}"
+            );
+        }
+        for expected in [
+            "`snapshot-read-consistency`",
+            "single consistent read",
+            SNAPSHOT_READ_CONSISTENCY_DOCS,
+        ] {
+            let reason = missing_read_consistency_bootstrap_reason();
+            assert!(
+                reason.contains(expected),
+                "the missing-stamp bootstrap reason must contain {expected:?}: {reason}"
             );
         }
     }
