@@ -3828,9 +3828,13 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             !DfError::SnapshotsIdentityUnresolvedParam {
                 component: "dataset",
                 name: "docs".to_string(),
-                param: "json_pointer".to_string(),
-                store: "secrets".to_string(),
-                key: "pointer".to_string(),
+                message: crate::view::snapshot_identity_unresolved_param_message(
+                    "dataset",
+                    "docs",
+                    "json_pointer",
+                    "secrets",
+                    "pointer",
+                ),
             }
             .is_retriable(),
             "a secret-referenced identity param needs an operator to change it"
