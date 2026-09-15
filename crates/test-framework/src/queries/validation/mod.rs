@@ -1419,6 +1419,99 @@ fn row_as_strings(batch: &RecordBatch, row: usize) -> Result<Vec<Option<String>>
         .collect()
 }
 
+fn keyed_row_key(
+    batches: &[RecordBatch],
+    row_index: usize,
+    key_columns: usize,
+) -> Result<Option<Vec<Option<String>>>> {
+    let mut remaining = row_index;
+    for batch in batches {
+        if remaining < batch.num_rows() {
+            let Some(width) = batch.num_columns().checked_sub(key_columns) else {
+                return Ok(None);
+            };
+            let mut cells = row_as_strings(batch, remaining)?;
+            return Ok(Some(cells.split_off(width)));
+        }
+        remaining -= batch.num_rows();
+    }
+    Ok(None)
+}
+
+/// True when `keyed_reference` already contains a row past the `LIMIT` whose
+/// sort key differs from the key at the cut, so the cutoff tie group has ended
+/// and later batches are not needed to decide.
+///
+/// # Errors
+/// Returns an error if a cell cannot be rendered.
+pub fn keyed_reference_cutoff_closed(
+    keyed_reference: &[RecordBatch],
+    limit: usize,
+    key_columns: usize,
+) -> Result<bool> {
+    let fetched: usize = keyed_reference.iter().map(RecordBatch::num_rows).sum();
+    let Some(cut) = limit.checked_sub(1) else {
+        return Ok(true);
+    };
+    if fetched <= cut {
+        return Ok(false);
+    }
+    let Some(cut_key) = keyed_row_key(keyed_reference, cut, key_columns)? else {
+        return Ok(false);
+    };
+    let Some(last_key) = keyed_row_key(keyed_reference, fetched - 1, key_columns)? else {
+        return Ok(false);
+    };
+    Ok(cut_key != last_key)
+}
+
+/// Feed keyed-reference batches until the cutoff tie group closes or the
+/// iterator ends. Stops as soon as later batches cannot change the verdict, so
+/// a fetch sized to `2 * LIMIT` (or the 1_048_576-row cap) does not have to
+/// stay in memory once the group that `LIMIT` cuts has ended.
+///
+/// Returns the same `Option` as [`validate_against_keyed_reference`], plus how
+/// many reference rows were consumed.
+///
+/// # Errors
+/// Returns an error if a cell cannot be rendered.
+pub fn decide_from_keyed_reference_batches(
+    actual: &[RecordBatch],
+    batches: impl IntoIterator<Item = RecordBatch>,
+    limit: usize,
+    key_columns: usize,
+    fetch_rows: usize,
+) -> Result<(Option<QueryValidationResult>, usize)> {
+    let mut keyed_reference = Vec::new();
+    let mut fetched_rows = 0;
+    for batch in batches {
+        fetched_rows = fetched_rows.saturating_add(batch.num_rows());
+        keyed_reference.push(batch);
+        if keyed_reference_cutoff_closed(&keyed_reference, limit, key_columns)? {
+            return Ok((
+                validate_against_keyed_reference(
+                    actual,
+                    &keyed_reference,
+                    limit,
+                    key_columns,
+                    false,
+                )?,
+                fetched_rows,
+            ));
+        }
+    }
+    Ok((
+        validate_against_keyed_reference(
+            actual,
+            &keyed_reference,
+            limit,
+            key_columns,
+            fetched_rows < fetch_rows,
+        )?,
+        fetched_rows,
+    ))
+}
+
 /// Checks an answer to a query with an [`UnprojectedSortLimit`] against the
 /// reference query's rows read back with their sort keys.
 ///
@@ -3556,6 +3649,44 @@ mod test {
         assert_eq!(
             validate_against_keyed_reference(&[answer], &[keyed], 10, 1, true).expect("check"),
             Some(QueryValidationResult::Pass)
+        );
+    }
+
+    #[test]
+    fn test_keyed_reference_stops_collecting_once_the_cutoff_group_closes() {
+        let full = q25_keyed_reference();
+        let needed = full.num_rows();
+        let extra = full.slice(needed - 1, 1);
+        let extra_count = 8;
+        let mut pulls = 0;
+        let batches = (0..needed)
+            .map(|row| full.slice(row, 1))
+            .chain(std::iter::repeat_with(|| extra.slice(0, extra.num_rows())).take(extra_count))
+            .inspect(|_| pulls += 1);
+        let answer = search_phrases(&["a", "a", "b", "b", "c", "d", "d", "c", "e", "e"]);
+        let (result, rows) = decide_from_keyed_reference_batches(
+            std::slice::from_ref(&answer),
+            batches,
+            10,
+            1,
+            1_048_576,
+        )
+        .expect("decide after the cutoff group closes");
+        assert_eq!(result, Some(QueryValidationResult::Pass));
+        assert_eq!(
+            pulls, needed,
+            "the {extra_count} batches after the closing key must not be pulled"
+        );
+        assert_eq!(rows, needed);
+        assert!(
+            keyed_reference_cutoff_closed(&[full.slice(0, needed)], 10, 1)
+                .expect("closed after the first later key"),
+            "row 13's key 10 ends the key-9 group that LIMIT 10 cuts"
+        );
+        assert!(
+            !keyed_reference_cutoff_closed(&[full.slice(0, needed - 1)], 10, 1)
+                .expect("still open inside the cut group"),
+            "twelve rows still end inside the key-9 group"
         );
     }
 

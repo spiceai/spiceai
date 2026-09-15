@@ -774,17 +774,27 @@ impl SpiceTestQueryWorker {
                             )
                             .await?;
                         let mut keyed_reference = Vec::new();
+                        let mut fetched_rows = 0;
+                        let mut cutoff_closed = false;
                         while let Some(batch) = futures::StreamExt::next(&mut stream).await {
-                            keyed_reference.push(batch?);
+                            let batch = batch?;
+                            fetched_rows = fetched_rows.saturating_add(batch.num_rows());
+                            keyed_reference.push(batch);
+                            if validation::keyed_reference_cutoff_closed(
+                                &keyed_reference,
+                                sort_limit.limit,
+                                sort_limit.key_columns,
+                            )? {
+                                cutoff_closed = true;
+                                break;
+                            }
                         }
-                        let fetched_rows: usize =
-                            keyed_reference.iter().map(RecordBatch::num_rows).sum();
                         if let Some(result) = validation::validate_against_keyed_reference(
                             batches,
                             &keyed_reference,
                             sort_limit.limit,
                             sort_limit.key_columns,
-                            fetched_rows < fetch_rows,
+                            !cutoff_closed && fetched_rows < fetch_rows,
                         )? {
                             validation_result = result;
                             break;
