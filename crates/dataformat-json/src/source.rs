@@ -157,10 +157,25 @@ impl FileSource for SpiceJsonSource {
     ) -> Result<Option<Arc<dyn FileSource>>> {
         let mut source = self.clone();
         let new_projection = self.projection.source.try_merge(projection)?;
+        // Classify against the full table schema (file + partition + metadata),
+        // not the file schema alone, so a projected `_location`/`_last_modified`/
+        // `_size` metadata column is substituted from each file's `ObjectMeta`
+        // rather than being misread as a partition column and indexing past the
+        // (empty) partition values. Regression test for #14113.
         let split_projection =
-            SplitProjection::new(self.table_schema.file_schema(), &new_projection);
+            SplitProjection::new_with_table_schema(&self.table_schema, &new_projection);
         source.projection = split_projection;
         Ok(Some(Arc::new(source)))
+    }
+
+    fn with_metadata_cols(
+        &self,
+        metadata_cols: Vec<datafusion_datasource::metadata::MetadataColumn>,
+    ) -> Option<Arc<dyn FileSource>> {
+        let mut source = self.clone();
+        source.table_schema = source.table_schema.with_metadata_cols(metadata_cols);
+        source.projection = SplitProjection::unprojected(&source.table_schema);
+        Some(Arc::new(source))
     }
 
     fn projection(&self) -> Option<&ProjectionExprs> {
