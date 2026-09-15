@@ -341,8 +341,13 @@ impl Refresh {
     /// `RefreshTaskRunner` calls this twice per run: `false` when the refresh is dequeued,
     /// because from that moment the rows are being replaced and no longer describe anything
     /// definite, and then the run's actual provenance once it has succeeded. Both writes
-    /// move the cell in the safe direction first, so a snapshot landing anywhere in between
-    /// declines rather than publishing rows it cannot account for.
+    /// take the accelerator write mutex first — the same lock
+    /// `create_checkpoint_and_snapshot` holds when it samples the mark — so a snapshot
+    /// cannot read the previous materialization as configured after a new refresh has
+    /// retracted, and cannot run the publish gate against a newer attestation while
+    /// still publishing the previous rows. Both writes move the cell in the safe
+    /// direction first, so a snapshot landing anywhere in between declines rather than
+    /// publishing rows it cannot account for.
     pub fn set_materialization_is_configured(&self, configured: bool) {
         self.materialization_is_configured
             .store(configured, std::sync::atomic::Ordering::Release);
@@ -352,7 +357,8 @@ impl Refresh {
     /// definition's result, and so may be published under its identity.
     ///
     /// Read while holding the accelerator write mutex — see `create_checkpoint_and_snapshot`.
-    /// Read outside it, the answer can go stale between the check and the archive.
+    /// Writers take that same mutex before changing the mark. Read outside it, the
+    /// answer can go stale between the check and the archive.
     #[must_use]
     pub fn materialization_is_configured(&self) -> bool {
         self.materialization_is_configured

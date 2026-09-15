@@ -1540,6 +1540,10 @@ impl AcceleratedTable {
     pub async fn update_refresh_sql(&self, mut refresh_sql: refresh::RefreshSQL) -> Result<()> {
         let dataset_name = &self.dataset_name;
 
+        // Write mutex first, then the `Refresh` lock — same order as
+        // `create_checkpoint_and_snapshot`, so retracting provenance here cannot
+        // race a snapshot that already sampled the previous mark.
+        let _write_guard = self.accelerator_write_mutex.lock().await;
         let mut refresh = self.refresh_params.write().await;
         // Preserve existing partition filters when updating user SQL, including
         // an empty ("no partitions assigned — load no rows") assignment.

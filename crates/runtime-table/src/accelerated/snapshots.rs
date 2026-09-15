@@ -503,10 +503,12 @@ pub async fn create_checkpoint_and_snapshot(
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
 
     // Asked HERE, under the write mutex, rather than by the caller before it: the mutex is
-    // what serialises this against the refresh that writes the rows, so inside it the rows
-    // and their provenance are one consistent pair. A caller that sampled the mark first
-    // could be overtaken by an overridden refresh and archive its rows under the configured
-    // definition's identity.
+    // what serialises this against the refresh that writes the rows *and* against the
+    // retract/restore that move the mark (and, after retract returns, the refresh scan
+    // that records a new view attestation). Inside the lock the rows, their provenance,
+    // and the attestation the publish gate will consume are one consistent pair. A caller
+    // that sampled the mark first could be overtaken by an overridden refresh and archive
+    // its rows under the configured definition's identity.
     let publishable = match provenance {
         Some(refresh) => refresh.read().await.materialization_is_configured(),
         // No provenance to consult (a path with no refresher, e.g. a CDC-fed accelerator
