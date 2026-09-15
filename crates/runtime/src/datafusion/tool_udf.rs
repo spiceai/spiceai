@@ -228,7 +228,7 @@ impl AsyncScalarUDFImpl for ToolAsScalarUdf {
         &self,
         args: ScalarFunctionArgs,
     ) -> std::result::Result<ColumnarValue, DataFusionError> {
-        if crate::http::v1::current_principal_requires_read_only().await {
+        if runtime_request_context::current_principal_requires_read_only().await {
             return Err(DataFusionError::Execution(format!(
                 "tool-backed function '{}' requires a read-write API key",
                 self.name

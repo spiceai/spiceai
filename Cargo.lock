@@ -18437,7 +18437,6 @@ dependencies = [
  "http-body-util",
  "itertools 0.14.0",
  "rmcp",
- "runtime-auth",
  "runtime-query-engine",
  "runtime-request-context",
  "runtime-search",
