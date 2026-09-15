@@ -911,33 +911,49 @@ pub fn unordered_limit(sql: &str) -> Option<UnorderedLimit> {
     })
 }
 
-/// A top-level `ORDER BY … LIMIT` whose sort does not show in its result.
-///
-/// When the first `ORDER BY` term is not a result column — `ClickBench` Q25
-/// returns `"SearchPhrase"` ordered by `to_timestamp("EventTime")` — the rows
-/// cannot show where one tie group ends and the next begins, so neither the order
-/// of tied rows nor which tied rows the `LIMIT` kept can be judged from them.
-/// Built by [`unprojected_sort_limit`].
+/// A top-level `ORDER BY … LIMIT` whose answer is judged against the reference
+/// query's leading rows read back with their sort keys, because comparing it with
+/// the reference's own answer cannot tell a wrong row from another choice among
+/// tied rows. Built by [`unprojected_sort_limit`] and [`projected_sort_limit`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnprojectedSortLimit {
+pub struct KeyedSortLimit {
     /// The `LIMIT` count.
     pub limit: usize,
-    /// How many sort-key columns [`Self::keyed_sql`] appends after the result's own.
-    pub key_columns: usize,
+    /// The `OFFSET` count, `0` when there is none.
+    pub offset: usize,
+    /// Where each row [`Self::keyed_sql`] returns carries its sort key.
+    pub key: SortKeyCells,
     keyed_sql_without_limit: String,
 }
 
-impl UnprojectedSortLimit {
-    /// The query with each `ORDER BY` term appended to its result columns, still
-    /// sorted, limited to `limit` rows.
+/// Where a row of a [`KeyedSortLimit::keyed_sql`] result carries its sort key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SortKeyCells {
+    /// In this many cells appended after the result's own columns.
+    Appended(usize),
+    /// In the result's own columns at these indexes, most significant first.
+    Returned(Vec<usize>),
+}
+
+impl KeyedSortLimit {
+    /// The query's first `rows` rows in `ORDER BY` order, counted from the top of
+    /// its result rather than from its `OFFSET`, each carrying its sort key where
+    /// [`Self::key`] says.
     #[must_use]
-    pub fn keyed_sql(&self, limit: usize) -> String {
-        format!("{} LIMIT {limit}", self.keyed_sql_without_limit)
+    pub fn keyed_sql(&self, rows: usize) -> String {
+        format!("{} LIMIT {rows}", self.keyed_sql_without_limit)
     }
 }
 
 /// The top-level `ORDER BY … LIMIT` of `sql`, when at least one sort term is not
 /// a column of `schema`, the result's.
+///
+/// When the first `ORDER BY` term is not a result column — `ClickBench` Q25
+/// returns `"SearchPhrase"` ordered by `to_timestamp("EventTime")` — the rows
+/// cannot show where one tie group ends and the next begins, so neither the order
+/// of tied rows nor which tied rows the `LIMIT` kept can be judged from them.
+/// [`KeyedSortLimit::keyed_sql`] appends each `ORDER BY` term to the result's
+/// columns, so the reference rows carry [`SortKeyCells::Appended`] keys.
 ///
 /// `Some` only for a single `SELECT` — no set operation, `DISTINCT` or `TOP` —
 /// with a top-level `ORDER BY` of expressions, an integer-literal `LIMIT`, and no
@@ -951,7 +967,7 @@ impl UnprojectedSortLimit {
 /// refused too, because the alias is not in scope in the select list the keyed
 /// query appends it to.
 #[must_use]
-pub fn unprojected_sort_limit(sql: &str, schema: &SchemaRef) -> Option<UnprojectedSortLimit> {
+pub fn unprojected_sort_limit(sql: &str, schema: &SchemaRef) -> Option<KeyedSortLimit> {
     let statement = parse_one_statement(sql)?;
     if has_nested_row_limit(&statement) {
         return None;
@@ -1021,9 +1037,79 @@ pub fn unprojected_sort_limit(sql: &str, schema: &SchemaRef) -> Option<Unproject
                 }),
         );
     query.limit_clause = None;
-    Some(UnprojectedSortLimit {
+    Some(KeyedSortLimit {
         limit,
-        key_columns,
+        offset: 0,
+        key: SortKeyCells::Appended(key_columns),
+        keyed_sql_without_limit: Statement::Query(query).to_string(),
+    })
+}
+
+/// The top-level `ORDER BY … LIMIT` of `sql`, when every sort term is a column of
+/// `schema`, the result's.
+///
+/// The rows then show their own sort keys, and so where their tie groups begin
+/// and end, but not which rows past the `LIMIT` or before the `OFFSET` tie with
+/// the rows at either end of the page: `ClickBench` Q31 keeps ten groups by
+/// `c DESC`, and over the full `hits` dataset two groups share the tenth count,
+/// `1058`, so a correct engine may return either one. [`KeyedSortLimit::keyed_sql`]
+/// is the query with its `LIMIT` raised and its `OFFSET` dropped, so its rows are
+/// the query's own, carrying [`SortKeyCells::Returned`] keys.
+///
+/// `Some` only for a query whose top-level `ORDER BY` expressions all resolve onto
+/// result columns — so none applies a `COLLATE` — with an integer-literal `LIMIT`,
+/// an optional integer-literal `OFFSET`, and no `FETCH`, `LIMIT … BY`, `TOP`,
+/// `WITH FILL` or row limit nested inside it: a nested limit leaves the rows past
+/// the page unspecified.
+#[must_use]
+pub fn projected_sort_limit(sql: &str, schema: &SchemaRef) -> Option<KeyedSortLimit> {
+    let statement = parse_one_statement(sql)?;
+    if has_nested_row_limit(&statement) {
+        return None;
+    }
+    let SortKeyResolution::Resolved {
+        key,
+        unresolved_suffix: None,
+    } = resolve_statement_sort_key(&statement, schema)
+    else {
+        return None;
+    };
+    let Statement::Query(mut query) = statement else {
+        return None;
+    };
+    if query.fetch.is_some() {
+        return None;
+    }
+    let (limit, offset) = match &query.limit_clause {
+        Some(LimitClause::LimitOffset {
+            limit: Some(limit),
+            offset,
+            limit_by,
+        }) if limit_by.is_empty() => (
+            expr_as_usize(limit)?,
+            match offset {
+                Some(offset) => expr_as_usize(&offset.value)?,
+                None => 0,
+            },
+        ),
+        _ => return None,
+    };
+    if matches!(query.body.as_ref(), SetExpr::Select(select) if select.top.is_some()) {
+        return None;
+    }
+    let Some(OrderByKind::Expressions(terms)) =
+        query.order_by.as_ref().map(|order_by| &order_by.kind)
+    else {
+        return None;
+    };
+    if terms.iter().any(|term| term.with_fill.is_some()) {
+        return None;
+    }
+    query.limit_clause = None;
+    Some(KeyedSortLimit {
+        limit,
+        offset,
+        key: SortKeyCells::Returned(key.iter().map(|column| column.index).collect()),
         keyed_sql_without_limit: Statement::Query(query).to_string(),
     })
 }

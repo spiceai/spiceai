@@ -41,13 +41,13 @@ use crate::{
 
 use super::EndCondition;
 
-/// The most reference rows read back to find where the tie group at a `LIMIT`
-/// ends, for a query whose `ORDER BY` sorts on columns its result does not include.
+/// The most reference rows past an `OFFSET` read back to find where the tie group
+/// at a `LIMIT` ends, when an `ORDER BY … LIMIT` answer differs from the reference's.
 const MAX_KEYED_REFERENCE_ROWS: usize = 1 << 20;
 
-/// First keyed-reference fetch for a `LIMIT` of `limit`. Twice the limit is
-/// enough when the cutoff group is no larger than the result itself; the cap
-/// still bounds a custom query whose `LIMIT` is already past that.
+/// First keyed-reference fetch past the `OFFSET` for a `LIMIT` of `limit`. Twice
+/// the limit is enough when the cutoff group is no larger than the result itself;
+/// the cap still bounds a custom query whose `LIMIT` is already past that.
 fn keyed_reference_fetch_rows(limit: usize) -> usize {
     limit.saturating_mul(2).clamp(1, MAX_KEYED_REFERENCE_ROWS)
 }
@@ -752,24 +752,36 @@ impl SpiceTestQueryWorker {
                     validation_result = subset_check.finish();
                 }
 
-                // An ORDER BY on something the result does not include hides where tie
-                // groups begin and end, so a mismatch there is judged against the
-                // reference rows read back with their sort keys. An arity
-                // `SchemaMismatch` stays, same as the unordered-LIMIT fallback.
+                // An ORDER BY … LIMIT answer that differs from the reference's can still
+                // be right: SQL lets each engine choose among the rows tied at the LIMIT
+                // or OFFSET cutoff, and an ORDER BY on something the result does not
+                // include hides where tie groups begin and end. Such a mismatch is
+                // judged against the reference query's leading rows read back with
+                // their sort keys. An arity `SchemaMismatch` stays, same as the
+                // unordered-LIMIT fallback.
                 if live_oracle_row_fallback_applies(&validation_result)
                     && let Some(schema) = batches.first().map(RecordBatch::schema)
                     && let Some(sort_limit) =
-                        validation::unprojected_sort_limit(&reference_query.sql, &schema)
+                        validation::unprojected_sort_limit(&reference_query.sql, &schema).or_else(
+                            || validation::projected_sort_limit(&reference_query.sql, &schema),
+                        )
                 {
-                    println!(
-                        "Worker {} - Query '{}' - ORDER BY sorts on columns the result does not include; checking the result against the reference query's rows with their sort keys",
-                        self.id, query.name
-                    );
+                    match sort_limit.key {
+                        validation::SortKeyCells::Appended(_) => println!(
+                            "Worker {} - Query '{}' - ORDER BY sorts on columns the result does not include; checking the result against the reference query's rows with their sort keys",
+                            self.id, query.name
+                        ),
+                        validation::SortKeyCells::Returned(_) => println!(
+                            "Worker {} - Query '{}' - ORDER BY with LIMIT returned rows that differ from the reference query's; checking the result against the tie groups of the reference query's rows around the LIMIT and OFFSET",
+                            self.id, query.name
+                        ),
+                    }
                     let mut fetch_rows = keyed_reference_fetch_rows(sort_limit.limit);
                     loop {
+                        let requested_rows = sort_limit.offset.saturating_add(fetch_rows);
                         let mut stream = spice_client
                             .sql_with_params(
-                                &sort_limit.keyed_sql(fetch_rows),
+                                &sort_limit.keyed_sql(requested_rows),
                                 reference_query.get_parameters_batch().transpose()?,
                             )
                             .await?;
@@ -783,7 +795,8 @@ impl SpiceTestQueryWorker {
                             if validation::keyed_reference_cutoff_closed(
                                 &keyed_reference,
                                 sort_limit.limit,
-                                sort_limit.key_columns,
+                                sort_limit.offset,
+                                &sort_limit.key,
                             )? {
                                 cutoff_closed = true;
                                 break;
@@ -793,8 +806,9 @@ impl SpiceTestQueryWorker {
                             batches,
                             &keyed_reference,
                             sort_limit.limit,
-                            sort_limit.key_columns,
-                            !cutoff_closed && fetched_rows < fetch_rows,
+                            sort_limit.offset,
+                            &sort_limit.key,
+                            !cutoff_closed && fetched_rows < requested_rows,
                         )? {
                             validation_result = result;
                             break;

@@ -47,9 +47,9 @@ use super::Query;
 pub mod sort_order;
 
 pub use sort_order::{
-    SortKeyColumn, SortKeyResolution, SortOrderViolation, UnorderedLimit, UnprojectedSortLimit,
-    has_top_level_limit, has_top_level_order_by, resolve_sort_key, unordered_limit,
-    unprojected_sort_limit,
+    KeyedSortLimit, SortKeyCells, SortKeyColumn, SortKeyResolution, SortOrderViolation,
+    UnorderedLimit, has_top_level_limit, has_top_level_order_by, projected_sort_limit,
+    resolve_sort_key, unordered_limit, unprojected_sort_limit,
 };
 
 // Not re-exported: the outcome type is plumbing between this module and
@@ -655,9 +655,6 @@ pub fn validate_batches_as_strings(
         let data_type = field.data_type();
         let expected_array = expected.column(i).as_ref();
         let actual_array = actual.column(i).as_ref();
-        // Stringified values lose their type, so the midnight normalization below
-        // is limited to the columns it is meant for.
-        let date_vs_timestamp = is_date_and_timestamp_pair(data_type, actual_array.data_type());
 
         if expected_array.len() != actual_array.len() {
             return Ok(QueryValidationResult::Fail(
@@ -672,65 +669,53 @@ pub fn validate_batches_as_strings(
         for row in 0..expected_array.len() {
             let expected_val = array_value_to_string(expected_array, row)?;
             let actual_val = array_value_to_string(actual_array, row)?;
-
-            match (expected_val, actual_val) {
-                (None, None) => {}
-                (Some(val), None) => {
-                    return Ok(QueryValidationResult::Fail(
-                        QueryValidationFailReason::DataMismatch {
-                            column: column_name,
-                            row_number: row + 1, // indexes are 0-based, counts are 1-based
-                            expected: format!("{val:?}"),
-                            actual: "None".to_string(),
-                        },
-                    ));
-                }
-                (None, Some(val)) => {
-                    return Ok(QueryValidationResult::Fail(
-                        QueryValidationFailReason::DataMismatch {
-                            column: column_name,
-                            row_number: row + 1, // indexes are 0-based, counts are 1-based
-                            expected: "None".to_string(),
-                            actual: format!("{val:?}"),
-                        },
-                    ));
-                }
-                (Some(expected_val), Some(actual_val)) => {
-                    if expected_val != actual_val {
-                        if data_type.is_numeric()
-                            && numeric_strings_match(&expected_val, &actual_val)
-                        {
-                            continue;
-                        }
-
-                        // Timestamp strings may differ only in fractional-second
-                        // padding (ns vs us engines). Treat equal after stripping
-                        // trailing fractional zeros.
-                        if timestamp_strings_equivalent(&expected_val, &actual_val) {
-                            continue;
-                        }
-
-                        if date_vs_timestamp
-                            && date_and_midnight_timestamp_equivalent(&expected_val, &actual_val)
-                        {
-                            continue;
-                        }
-
-                        return Ok(QueryValidationResult::Fail(
-                            QueryValidationFailReason::DataMismatch {
-                                column: column_name,
-                                row_number: row + 1, // indexes are 0-based, counts are 1-based
-                                expected: format!("{expected_val:?}"),
-                                actual: format!("{actual_val:?}"),
-                            },
-                        ));
-                    }
-                }
+            if cells_match(
+                expected_val.as_deref(),
+                actual_val.as_deref(),
+                data_type,
+                actual_array.data_type(),
+            ) {
+                continue;
             }
+            return Ok(QueryValidationResult::Fail(
+                QueryValidationFailReason::DataMismatch {
+                    column: column_name,
+                    row_number: row + 1, // indexes are 0-based, counts are 1-based
+                    expected: expected_val
+                        .map_or_else(|| "None".to_string(), |val| format!("{val:?}")),
+                    actual: actual_val.map_or_else(|| "None".to_string(), |val| format!("{val:?}")),
+                },
+            ));
         }
     }
 
     Ok(QueryValidationResult::Pass)
+}
+
+/// Whether two rendered cells hold the same value, by the rule every comparison
+/// here uses: the same text, numbers that [`numeric_strings_match`], timestamps
+/// that differ only in trailing fractional-second zeros (nanosecond and
+/// microsecond engines pad differently), or a date and a timestamp at its
+/// midnight. Rendered cells no longer carry their type, so the numeric rule
+/// applies only to a numeric expected column, and the midnight rule only when one
+/// column is a date and the other a timestamp.
+fn cells_match(
+    expected: Option<&str>,
+    actual: Option<&str>,
+    expected_type: &DataType,
+    actual_type: &DataType,
+) -> bool {
+    match (expected, actual) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => {
+            expected == actual
+                || (expected_type.is_numeric() && numeric_strings_match(expected, actual))
+                || timestamp_strings_equivalent(expected, actual)
+                || (is_date_and_timestamp_pair(expected_type, actual_type)
+                    && date_and_midnight_timestamp_equivalent(expected, actual))
+        }
+        (Some(_), None) | (None, Some(_)) => false,
+    }
 }
 
 pub fn validate_tpch_query(
@@ -1249,7 +1234,9 @@ pub fn compare_query_result_batches_with_sort_check(
 /// the rows were still compared — except an `ORDER BY … LIMIT` on something the
 /// result does not return: that answer must match the reference row by row, and a
 /// mismatch is left for [`validate_against_keyed_reference`], which has the sort
-/// keys. Callers that need to count that hole should use
+/// keys. A mismatch in any other `ORDER BY … LIMIT` answer can be left for it too,
+/// because the row at a `LIMIT` or `OFFSET` cutoff may be one of several that tie
+/// there. Callers that need to count that hole should use
 /// [`compare_query_result_batches_with_sort_check`] directly.
 ///
 /// # Errors
@@ -1419,56 +1406,68 @@ fn row_as_strings(batch: &RecordBatch, row: usize) -> Result<Vec<Option<String>>
         .collect()
 }
 
+/// The sort key of row `row_index` of `keyed_reference`, counted across its
+/// batches, or `None` when there is no such row or it has no cells where `key`
+/// says.
 fn keyed_row_key(
-    batches: &[RecordBatch],
+    keyed_reference: &[RecordBatch],
     row_index: usize,
-    key_columns: usize,
+    key: &SortKeyCells,
 ) -> Result<Option<Vec<Option<String>>>> {
     let mut remaining = row_index;
-    for batch in batches {
+    for batch in keyed_reference {
         if remaining < batch.num_rows() {
-            let Some(width) = batch.num_columns().checked_sub(key_columns) else {
-                return Ok(None);
-            };
-            let mut cells = row_as_strings(batch, remaining)?;
-            return Ok(Some(cells.split_off(width)));
+            let cells = row_as_strings(batch, remaining)?;
+            return Ok(match key {
+                SortKeyCells::Appended(key_columns) => cells
+                    .len()
+                    .checked_sub(*key_columns)
+                    .map(|width| cells[width..].to_vec()),
+                SortKeyCells::Returned(key_indexes) => key_indexes
+                    .iter()
+                    .map(|index| cells.get(*index).cloned())
+                    .collect(),
+            });
         }
         remaining -= batch.num_rows();
     }
     Ok(None)
 }
 
-/// True when `keyed_reference` already contains a row past the `LIMIT` whose
-/// sort key differs from the key at the cut, so the cutoff tie group has ended
-/// and later batches are not needed to decide.
+/// True when `keyed_reference` already holds a row past the page, which ends
+/// `offset + limit` rows down, whose sort key differs from the key at the cut:
+/// the tie group the `LIMIT` cuts has ended, and later batches cannot change the
+/// verdict.
 ///
 /// # Errors
 /// Returns an error if a cell cannot be rendered.
 pub fn keyed_reference_cutoff_closed(
     keyed_reference: &[RecordBatch],
     limit: usize,
-    key_columns: usize,
+    offset: usize,
+    key: &SortKeyCells,
 ) -> Result<bool> {
     let fetched: usize = keyed_reference.iter().map(RecordBatch::num_rows).sum();
-    let Some(cut) = limit.checked_sub(1) else {
+    let Some(last_row) = limit.checked_sub(1) else {
         return Ok(true);
     };
+    let cut = offset.saturating_add(last_row);
     if fetched <= cut {
         return Ok(false);
     }
-    let Some(cut_key) = keyed_row_key(keyed_reference, cut, key_columns)? else {
+    let Some(cut_key) = keyed_row_key(keyed_reference, cut, key)? else {
         return Ok(false);
     };
-    let Some(last_key) = keyed_row_key(keyed_reference, fetched - 1, key_columns)? else {
+    let Some(last_key) = keyed_row_key(keyed_reference, fetched - 1, key)? else {
         return Ok(false);
     };
     Ok(cut_key != last_key)
 }
 
-/// Feed keyed-reference batches until the cutoff tie group closes or the
-/// iterator ends. Stops as soon as later batches cannot change the verdict, so
-/// a fetch sized to `2 * LIMIT` (or the 1_048_576-row cap) does not have to
-/// stay in memory once the group that `LIMIT` cuts has ended.
+/// Feeds keyed-reference batches to [`validate_against_keyed_reference`] until
+/// the tie group the `LIMIT` cuts has closed or the batches end, so the rows past
+/// that group never have to be held in memory. `requested_rows` is the `LIMIT`
+/// the keyed query asked for; fewer rows than that means the result ended.
 ///
 /// Returns the same `Option` as [`validate_against_keyed_reference`], plus how
 /// many reference rows were consumed.
@@ -1479,21 +1478,23 @@ pub fn decide_from_keyed_reference_batches(
     actual: &[RecordBatch],
     batches: impl IntoIterator<Item = RecordBatch>,
     limit: usize,
-    key_columns: usize,
-    fetch_rows: usize,
+    offset: usize,
+    key: &SortKeyCells,
+    requested_rows: usize,
 ) -> Result<(Option<QueryValidationResult>, usize)> {
     let mut keyed_reference = Vec::new();
     let mut fetched_rows: usize = 0;
     for batch in batches {
         fetched_rows = fetched_rows.saturating_add(batch.num_rows());
         keyed_reference.push(batch);
-        if keyed_reference_cutoff_closed(&keyed_reference, limit, key_columns)? {
+        if keyed_reference_cutoff_closed(&keyed_reference, limit, offset, key)? {
             return Ok((
                 validate_against_keyed_reference(
                     actual,
                     &keyed_reference,
                     limit,
-                    key_columns,
+                    offset,
+                    key,
                     false,
                 )?,
                 fetched_rows,
@@ -1505,28 +1506,33 @@ pub fn decide_from_keyed_reference_batches(
             actual,
             &keyed_reference,
             limit,
-            key_columns,
-            fetched_rows < fetch_rows,
+            offset,
+            key,
+            fetched_rows < requested_rows,
         )?,
         fetched_rows,
     ))
 }
 
-/// Checks an answer to a query with an [`UnprojectedSortLimit`] against the
-/// reference query's rows read back with their sort keys.
+/// Checks an answer to a top-level `ORDER BY … LIMIT` against the reference
+/// query's leading rows read back with their sort keys, the rows
+/// [`KeyedSortLimit::keyed_sql`] returns.
 ///
-/// `keyed_reference` holds the reference rows in `ORDER BY` order, each followed
-/// by its `key_columns` sort-key cells, which split them into tie groups. Every
-/// tie group before the one the `LIMIT` cuts through fills exactly its own
-/// positions of `actual`, in any order within the group, and the rest of `actual`
-/// must come from the cut tie group, the only rows SQL leaves an engine free to
-/// choose among. Cells must match exactly. A row the answer holds but in another
-/// group's positions fails as [`QueryValidationFailReason::RowOutOfSortOrder`]; a
-/// row the answer cannot hold fails as [`QueryValidationFailReason::RowNotAllowedByLimit`].
+/// `keyed_reference` holds the reference rows in `ORDER BY` order from the top of
+/// its result, each carrying its sort key where `key` says, and the keys split them
+/// into tie groups. `actual` is the page that starts `offset` rows down. Every tie
+/// group inside the page fills exactly its own positions of `actual`, in any order
+/// within the group, while the positions of a tie group that the `OFFSET` or the
+/// `LIMIT` cuts through may hold any of that group's rows: those are the only rows
+/// SQL leaves an engine free to choose among. Cells match by the rule of every
+/// comparison here, so numbers match within [`NUMERIC_RELATIVE_TOLERANCE`]. A row
+/// the answer holds but in another group's positions fails as
+/// [`QueryValidationFailReason::RowOutOfSortOrder`]; a row the answer cannot hold
+/// fails as [`QueryValidationFailReason::RowNotAllowedByLimit`].
 ///
-/// Returns `None` while `keyed_reference` ends inside that tie group and
-/// `reached_end` is `false`: a verdict needs the whole group, so the caller reads
-/// more reference rows and asks again.
+/// Returns `None` while `keyed_reference` ends inside the tie group the `LIMIT`
+/// cuts through and `reached_end` is `false`: a verdict needs the whole group, so
+/// the caller reads more reference rows and asks again.
 ///
 /// # Errors
 /// Returns an error if a cell cannot be rendered.
@@ -1534,12 +1540,19 @@ pub fn validate_against_keyed_reference(
     actual: &[RecordBatch],
     keyed_reference: &[RecordBatch],
     limit: usize,
-    key_columns: usize,
+    offset: usize,
+    key: &SortKeyCells,
     reached_end: bool,
 ) -> Result<Option<QueryValidationResult>> {
     let mut reference = Vec::new();
+    let mut reference_types = Vec::new();
     for batch in keyed_reference {
-        let Some(width) = batch.num_columns().checked_sub(key_columns) else {
+        let width = match key {
+            SortKeyCells::Appended(key_columns) => batch.num_columns().checked_sub(*key_columns),
+            SortKeyCells::Returned(key_indexes) => Some(batch.num_columns())
+                .filter(|width| key_indexes.iter().all(|index| index < width)),
+        };
+        let Some(width) = width else {
             return Ok(Some(QueryValidationResult::Fail(
                 QueryValidationFailReason::SchemaMismatch,
             )));
@@ -1552,20 +1565,41 @@ pub fn validate_against_keyed_reference(
                 QueryValidationFailReason::SchemaMismatch,
             )));
         }
+        reference_types = batch
+            .schema()
+            .fields()
+            .iter()
+            .take(width)
+            .map(|field| field.data_type().clone())
+            .collect();
         for row in 0..batch.num_rows() {
             let mut cells = row_as_strings(batch, row)?;
-            let key = cells.split_off(width);
-            reference.push((cells, key));
+            let sort_key = match key {
+                SortKeyCells::Appended(_) => cells.split_off(width),
+                SortKeyCells::Returned(key_indexes) => key_indexes
+                    .iter()
+                    .map(|index| cells[*index].clone())
+                    .collect(),
+            };
+            reference.push((cells, sort_key));
         }
     }
+    let actual_types: Vec<DataType> = actual.first().map_or_else(Vec::new, |batch| {
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect()
+    });
 
     let expected_rows = if reached_end {
-        reference.len().min(limit)
+        reference.len().saturating_sub(offset).min(limit)
     } else {
         limit
     };
     let actual_rows: usize = actual.iter().map(RecordBatch::num_rows).sum();
-    let Some(cut) = expected_rows.checked_sub(1) else {
+    let Some(last_row) = expected_rows.checked_sub(1) else {
         return Ok(Some(if actual_rows == 0 {
             QueryValidationResult::Pass
         } else {
@@ -1575,17 +1609,21 @@ pub fn validate_against_keyed_reference(
             })
         }));
     };
+    // Reference rows count from the top of the result, so the page is rows
+    // `offset..page_end` and `cut` is its last row.
+    let cut = offset.saturating_add(last_row);
+    let page_end = cut.saturating_add(1);
     let Some((_, cut_key)) = reference.get(cut) else {
         return Ok(None);
     };
     let group_start = reference[..cut]
         .iter()
-        .rposition(|(_, key)| key != cut_key)
+        .rposition(|(_, row_key)| row_key != cut_key)
         .map_or(0, |index| index + 1);
     let group_end = reference[cut..]
         .iter()
-        .position(|(_, key)| key != cut_key)
-        .map_or(reference.len(), |offset| cut + offset);
+        .position(|(_, row_key)| row_key != cut_key)
+        .map_or(reference.len(), |rows| cut + rows);
     if group_end == reference.len() && !reached_end {
         return Ok(None);
     }
@@ -1605,46 +1643,72 @@ pub fn validate_against_keyed_reference(
         }
     }
 
-    // A correct answer lists each tie group before the cut in exactly that group's
-    // positions, so walk the answer one tie group at a time. The positions from
-    // `group_start` on belong to the tie group the `LIMIT` cuts through.
-    let mut block_start = 0;
-    while block_start < expected_rows {
+    // The tie group of the page's first row starts above the page when the `OFFSET`
+    // cuts through it, and the rows it skipped were the engine's to choose too.
+    let first_key = &reference[offset].1;
+    let first_group_start = reference[..offset]
+        .iter()
+        .rposition(|(_, row_key)| row_key != first_key)
+        .map_or(0, |index| index + 1);
+
+    // A correct answer lists each tie group in exactly that group's positions, so
+    // walk the page one tie group at a time. The positions from `group_start` on
+    // belong to the tie group the `LIMIT` cuts through.
+    let mut block_start = offset;
+    while block_start < page_end {
         let block_key = &reference[block_start].1;
-        let block_end = if block_start == group_start {
+        let rows_start = if block_start == offset {
+            first_group_start
+        } else {
+            block_start
+        };
+        let block_end = if block_start >= group_start {
             group_end
         } else {
             reference[block_start..group_start]
                 .iter()
-                .position(|(_, key)| key != block_key)
-                .map_or(group_start, |offset| block_start + offset)
+                .position(|(_, row_key)| row_key != block_key)
+                .map_or(group_start, |rows| block_start + rows)
         };
-        let mut block: HashMap<&[Option<String>], usize> = HashMap::new();
-        for (cells, _) in &reference[block_start..block_end] {
-            *block.entry(cells.as_slice()).or_insert(0) += 1;
+        let mut unmatched: HashMap<&[Option<String>], usize> = HashMap::new();
+        for (cells, _) in &reference[rows_start..block_end] {
+            *unmatched.entry(cells.as_slice()).or_insert(0) += 1;
         }
-        for (offset, cells) in answer[block_start..block_end.min(expected_rows)]
-            .iter()
-            .enumerate()
-        {
-            if let Some(count) = block.get_mut(cells.as_slice())
-                && *count > 0
-            {
+        // Exact matches go first, so a row that matches only within the numeric
+        // tolerance never takes a reference row another answer row equals.
+        let mut inexact = Vec::new();
+        for position in block_start..block_end.min(page_end) {
+            match unmatched.get_mut(answer[position - offset].as_slice()) {
+                Some(count) if *count > 0 => *count -= 1,
+                _ => inexact.push(position),
+            }
+        }
+        for position in inexact {
+            let cells = answer[position - offset].as_slice();
+            if let Some(count) = unmatched.iter_mut().find_map(|(reference_cells, count)| {
+                (*count > 0
+                    && rendered_rows_match(reference_cells, cells, &reference_types, &actual_types))
+                .then_some(count)
+            }) {
                 *count -= 1;
                 continue;
             }
-            let row_index = block_start + offset;
+            let row_index = position - offset;
             let row_number = row_index + 1; // indexes are 0-based, counts are 1-based
             let row = format!("{cells:?}");
-            // A row the answer may hold, not yet over its count, is in the wrong tie
-            // group; any other row is one the LIMIT does not keep.
-            let copies_allowed = reference[..group_end]
+            // A row the page may hold, not yet over its count, is in the wrong tie
+            // group; any other row is one the LIMIT and OFFSET do not keep.
+            let copies_allowed = reference[first_group_start..group_end]
                 .iter()
-                .filter(|(reference_cells, _)| reference_cells == cells)
+                .filter(|(reference_cells, _)| {
+                    rendered_rows_match(reference_cells, cells, &reference_types, &actual_types)
+                })
                 .count();
             let copies_returned = answer[..=row_index]
                 .iter()
-                .filter(|answer_cells| *answer_cells == cells)
+                .filter(|answer_cells| {
+                    rendered_rows_match(answer_cells, cells, &actual_types, &actual_types)
+                })
                 .count();
             return Ok(Some(QueryValidationResult::Fail(
                 if copies_returned <= copies_allowed {
@@ -1659,6 +1723,31 @@ pub fn validate_against_keyed_reference(
     Ok(Some(QueryValidationResult::Pass))
 }
 
+/// Whether two rendered rows match cell by cell, by [`cells_match`].
+fn rendered_rows_match(
+    expected: &[Option<String>],
+    actual: &[Option<String>],
+    expected_types: &[DataType],
+    actual_types: &[DataType],
+) -> bool {
+    expected.len() == actual.len()
+        && expected
+            .iter()
+            .zip(actual)
+            .enumerate()
+            .all(|(column, (expected, actual))| {
+                match (expected_types.get(column), actual_types.get(column)) {
+                    (Some(expected_type), Some(actual_type)) => cells_match(
+                        expected.as_deref(),
+                        actual.as_deref(),
+                        expected_type,
+                        actual_type,
+                    ),
+                    _ => expected == actual,
+                }
+            })
+}
+
 /// Compare `ORDER BY … LIMIT` results when the sort key is not unique.
 ///
 /// SQL does not define which tied rows a `LIMIT` keeps. TPC-DS Q65 orders by
@@ -1667,13 +1756,17 @@ pub fn validate_against_keyed_reference(
 /// cell equality then fails even though both honor the `ORDER BY`.
 ///
 /// Complete tie-groups (a run of equal sort keys followed by a greater key)
-/// must still match as a multiset. The last run is a cutoff only when the
-/// result filled the `LIMIT` *and* that run has more than one row — then a
-/// leftover tied row past the boundary may exist, so only the sort keys are
-/// required to match. A unique last row, or a result shorter than `LIMIT`,
-/// is compared in full: those groups were not truncated. The first run, when
-/// it has more than one row, is a cutoff the same way for a query whose
-/// `OFFSET` skipped rows, since the skipped rows may tie with it. A numeric sort key
+/// must still match as a multiset. The last run is a cutoff when the result
+/// filled the `LIMIT` and that run has more than one row, so only the sort keys
+/// are required to match there: tied rows past the boundary may have taken the
+/// places of the ones returned. A last run of one row is compared in full,
+/// although rows past the `LIMIT` may tie with it too (two of `ClickBench` Q31's
+/// groups share its tenth count), because its other cells are still worth
+/// checking; a caller that can read the reference's rows past the `LIMIT` judges
+/// a mismatch there with [`validate_against_keyed_reference`]. A result shorter
+/// than `LIMIT` was not truncated at all. The first run is a cutoff the same way
+/// for a query whose `OFFSET` skipped rows, since the skipped rows may tie with
+/// it. A numeric sort key
 /// compares the way a numeric cell does, so a key two engines round differently
 /// still puts a row in the same tie group.
 fn compare_limit_results_allowing_cutoff_ties(
@@ -3042,7 +3135,10 @@ mod test {
         let schema = search_phrases(&[]).schema();
         let sort_limit =
             unprojected_sort_limit(Q25, &schema).expect("the sort key is not a result column");
-        assert_eq!((sort_limit.limit, sort_limit.key_columns), (10, 1));
+        assert_eq!(
+            (sort_limit.limit, sort_limit.offset, &sort_limit.key),
+            (10, 0, &SortKeyCells::Appended(1))
+        );
         assert_eq!(
             sort_limit.keyed_sql(20),
             r#"SELECT "SearchPhrase", to_timestamp("EventTime") AS __validation_sort_key_0 FROM hits WHERE "SearchPhrase" <> '' ORDER BY to_timestamp("EventTime") LIMIT 20"#
@@ -3067,7 +3163,10 @@ mod test {
         let sql = "SELECT id, payload FROM t ORDER BY id, hidden LIMIT 2";
         let sort_limit = unprojected_sort_limit(sql, &schema)
             .expect("a hidden ORDER BY suffix must be read back with the result");
-        assert_eq!((sort_limit.limit, sort_limit.key_columns), (2, 2));
+        assert_eq!(
+            (sort_limit.limit, sort_limit.offset, &sort_limit.key),
+            (2, 0, &SortKeyCells::Appended(2))
+        );
         let keyed = sort_limit.keyed_sql(4);
         assert!(
             keyed.contains("__validation_sort_key_0") && keyed.contains("__validation_sort_key_1"),
@@ -3129,15 +3228,16 @@ mod test {
         )
         .expect("keyed mixed-sort reference");
         assert_eq!(
-            unprojected_sort_limit(sql, &schema).map(|s| (s.limit, s.key_columns)),
-            Some((2, 2))
+            unprojected_sort_limit(sql, &schema).map(|s| (s.limit, s.offset, s.key)),
+            Some((2, 0, SortKeyCells::Appended(2)))
         );
         assert_eq!(
             validate_against_keyed_reference(
                 std::slice::from_ref(&candidate),
                 std::slice::from_ref(&keyed),
                 2,
-                2,
+                0,
+                &SortKeyCells::Appended(2),
                 true
             )
             .expect("keyed candidate"),
@@ -3149,8 +3249,15 @@ mod test {
             ))
         );
         assert_eq!(
-            validate_against_keyed_reference(&[reference], &[keyed], 2, 2, true)
-                .expect("keyed reference"),
+            validate_against_keyed_reference(
+                &[reference],
+                &[keyed],
+                2,
+                0,
+                &SortKeyCells::Appended(2),
+                true
+            )
+            .expect("keyed reference"),
             Some(QueryValidationResult::Pass)
         );
     }
@@ -3204,8 +3311,15 @@ mod test {
         )
         .expect("keyed inversion reference");
         assert_eq!(
-            validate_against_keyed_reference(&[inverted], &[keyed], 2, 2, true)
-                .expect("keyed check"),
+            validate_against_keyed_reference(
+                &[inverted],
+                &[keyed],
+                2,
+                0,
+                &SortKeyCells::Appended(2),
+                true
+            )
+            .expect("keyed check"),
             Some(QueryValidationResult::Fail(
                 QueryValidationFailReason::RowOutOfSortOrder {
                     row_number: 1,
@@ -3281,7 +3395,8 @@ mod test {
                 std::slice::from_ref(&swapped),
                 &[keyed(["a", "b"])],
                 2,
-                2,
+                0,
+                &SortKeyCells::Appended(2),
                 true
             )
             .expect("check distinct hidden keys"),
@@ -3294,8 +3409,15 @@ mod test {
             "`hidden` orders p1 before p2"
         );
         assert_eq!(
-            validate_against_keyed_reference(&[swapped], &[keyed(["a", "a"])], 2, 2, true)
-                .expect("check tied hidden keys"),
+            validate_against_keyed_reference(
+                &[swapped],
+                &[keyed(["a", "a"])],
+                2,
+                0,
+                &SortKeyCells::Appended(2),
+                true
+            )
+            .expect("check tied hidden keys"),
             Some(QueryValidationResult::Pass),
             "rows that tie on every sort key may come in either order"
         );
@@ -3464,8 +3586,15 @@ mod test {
         );
         for answer in [reference, accelerated] {
             assert_eq!(
-                validate_against_keyed_reference(&[answer], &[q25_keyed_reference()], 10, 1, false)
-                    .expect("check"),
+                validate_against_keyed_reference(
+                    &[answer],
+                    &[q25_keyed_reference()],
+                    10,
+                    0,
+                    &SortKeyCells::Appended(1),
+                    false
+                )
+                .expect("check"),
                 Some(QueryValidationResult::Pass)
             );
         }
@@ -3475,8 +3604,15 @@ mod test {
     fn test_keyed_reference_rejects_a_row_past_the_cut_tie_group() {
         let answer = search_phrases(&["a", "a", "b", "b", "c", "d", "d", "c", "e", "g"]);
         assert_eq!(
-            validate_against_keyed_reference(&[answer], &[q25_keyed_reference()], 10, 1, false)
-                .expect("check"),
+            validate_against_keyed_reference(
+                &[answer],
+                &[q25_keyed_reference()],
+                10,
+                0,
+                &SortKeyCells::Appended(1),
+                false
+            )
+            .expect("check"),
             Some(QueryValidationResult::Fail(
                 QueryValidationFailReason::RowNotAllowedByLimit {
                     row_number: 10,
@@ -3492,8 +3628,15 @@ mod test {
         // the tie group the LIMIT cuts through.
         let answer = search_phrases(&["a", "a", "b", "b", "c", "d", "c", "e", "e", "f"]);
         assert_eq!(
-            validate_against_keyed_reference(&[answer], &[q25_keyed_reference()], 10, 1, false)
-                .expect("check"),
+            validate_against_keyed_reference(
+                &[answer],
+                &[q25_keyed_reference()],
+                10,
+                0,
+                &SortKeyCells::Appended(1),
+                false
+            )
+            .expect("check"),
             Some(QueryValidationResult::Fail(
                 QueryValidationFailReason::RowOutOfSortOrder {
                     row_number: 8,
@@ -3525,7 +3668,8 @@ mod test {
                 &[search_phrases(&["X", "X"])],
                 std::slice::from_ref(&keyed),
                 3,
-                1,
+                0,
+                &SortKeyCells::Appended(1),
                 true
             )
             .expect("check short"),
@@ -3541,7 +3685,8 @@ mod test {
                 &[search_phrases(&["X", "X", "X"])],
                 std::slice::from_ref(&keyed),
                 3,
-                1,
+                0,
+                &SortKeyCells::Appended(1),
                 true
             )
             .expect("check missing Y"),
@@ -3557,7 +3702,8 @@ mod test {
                 &[search_phrases(&["X", "Y", "X"])],
                 &[keyed],
                 3,
-                1,
+                0,
+                &SortKeyCells::Appended(1),
                 true
             )
             .expect("check complete"),
@@ -3618,8 +3764,15 @@ mod test {
     fn test_keyed_reference_rejects_a_short_answer() {
         let answer = search_phrases(&["a", "a", "b", "b", "c", "d", "d", "c", "e"]);
         assert_eq!(
-            validate_against_keyed_reference(&[answer], &[q25_keyed_reference()], 10, 1, false)
-                .expect("check"),
+            validate_against_keyed_reference(
+                &[answer],
+                &[q25_keyed_reference()],
+                10,
+                0,
+                &SortKeyCells::Appended(1),
+                false
+            )
+            .expect("check"),
             Some(QueryValidationResult::Fail(
                 QueryValidationFailReason::RowCountMismatch {
                     expected: 10,
@@ -3639,7 +3792,8 @@ mod test {
                 std::slice::from_ref(&answer),
                 std::slice::from_ref(&keyed),
                 10,
-                1,
+                0,
+                &SortKeyCells::Appended(1),
                 false
             )
             .expect("check"),
@@ -3647,8 +3801,302 @@ mod test {
         );
         // ...unless they are the whole result.
         assert_eq!(
-            validate_against_keyed_reference(&[answer], &[keyed], 10, 1, true).expect("check"),
+            validate_against_keyed_reference(
+                &[answer],
+                &[keyed],
+                10,
+                0,
+                &SortKeyCells::Appended(1),
+                true
+            )
+            .expect("check"),
             Some(QueryValidationResult::Pass)
+        );
+    }
+
+    const Q31: &str = r#"SELECT "SearchEngineID", "ClientIP", COUNT(*) AS c, SUM("IsRefresh"), AVG("ResolutionWidth") FROM hits WHERE "SearchPhrase" <> '' GROUP BY "SearchEngineID", "ClientIP" ORDER BY c DESC LIMIT 10;"#;
+
+    /// `ClickBench` Q31's first thirteen groups over the full `hits` dataset, in
+    /// `ORDER BY c DESC` order, each average as the engines rendered it. The tenth
+    /// and eleventh groups share the count 1058.
+    const Q31_LEADING_ROWS: [(i16, i32, i64, i64, &str); 13] = [
+        (2, 1_138_507_705, 1633, 35, "1408.0122473974282"),
+        (2, 1_740_861_572, 1331, 28, "1577.945905334335"),
+        (2, -807_147_100, 1144, 35, "1553.1984265734266"),
+        (2, -497_906_719, 1140, 36, "1543.4140350877192"),
+        (2, -1_945_757_555, 1105, 30, "1557.387330316742"),
+        (2, -1_870_623_097, 1102, 31, "1555.6588021778584"),
+        (2, -631_062_503, 1083, 31, "1581.8171745152354"),
+        (2, -465_813_166, 1082, 30, "1541.253234750462"),
+        (2, -1_743_596_151, 1080, 24, "1559.8092592592593"),
+        (2, -1_125_673_878, 1058, 22, "1587.0"),
+        (2, -265_917_476, 1058, 32, "1556.2003780718337"),
+        (2, -947_382_330, 1055, 23, "1569.5260663507108"),
+        (2, -748_701_126, 1043, 15, "1565.1418983700862"),
+    ];
+
+    fn q31_rows(rows: &[(i16, i32, i64, i64, &str)]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("SearchEngineID", DataType::Int16, false),
+                Field::new("ClientIP", DataType::Int32, false),
+                Field::new("c", DataType::Int64, false),
+                Field::new("sum(hits.IsRefresh)", DataType::Int64, true),
+                Field::new("avg(hits.ResolutionWidth)", DataType::Float64, true),
+            ])),
+            vec![
+                Arc::new(Int16Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(arrow::array::Int32Array::from_iter_values(
+                    rows.iter().map(|row| row.1),
+                )),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.2))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.3))),
+                Arc::new(arrow::array::Float64Array::from_iter_values(
+                    rows.iter()
+                        .map(|row| row.4.parse::<f64>().expect("rendered average")),
+                )),
+            ],
+        )
+        .expect("q31 batch")
+    }
+
+    /// Q31's answer with `tenth` as its tenth row.
+    fn q31_answer(tenth: (i16, i32, i64, i64, &'static str)) -> RecordBatch {
+        let mut rows = Q31_LEADING_ROWS[..9].to_vec();
+        rows.push(tenth);
+        q31_rows(&rows)
+    }
+
+    #[test]
+    fn test_projected_sort_limit_raises_the_limit_and_drops_the_offset() {
+        let sort_limit = projected_sort_limit(Q31, &q31_rows(&[]).schema())
+            .expect("every sort term is a result column");
+        assert_eq!(
+            (sort_limit.limit, sort_limit.offset, &sort_limit.key),
+            (10, 0, &SortKeyCells::Returned(vec![2]))
+        );
+        assert_eq!(
+            sort_limit.keyed_sql(20),
+            r#"SELECT "SearchEngineID", "ClientIP", COUNT(*) AS c, SUM("IsRefresh"), AVG("ResolutionWidth") FROM hits WHERE "SearchPhrase" <> '' GROUP BY "SearchEngineID", "ClientIP" ORDER BY c DESC LIMIT 20"#
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        for sql in [
+            // A sort term the result does not return is `unprojected_sort_limit`'s.
+            "SELECT id, v FROM t ORDER BY hidden LIMIT 10",
+            // A collation decides which rows tie, and rendered keys cannot show it.
+            "SELECT id, v FROM t ORDER BY v COLLATE NOCASE LIMIT 10",
+            // A nested row limit leaves the rows past the page unspecified.
+            "SELECT id, v FROM (SELECT id, v FROM t LIMIT 5) AS s ORDER BY v LIMIT 2",
+            "SELECT id, v FROM t ORDER BY v",
+            "SELECT id, v FROM t LIMIT 10",
+            "SELECT id, v FROM t ORDER BY v FETCH FIRST 2 ROWS ONLY",
+        ] {
+            assert_eq!(projected_sort_limit(sql, &schema), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_keyed_reference_accepts_either_group_tied_at_a_lone_cutoff_row() {
+        // ClickBench Q31 over the full `hits` dataset: the reference query kept the
+        // tenth group with ClientIP -1125673878 and federated Spice Cloud the one with
+        // -265917476. Both count 1058, so both answers are correct, though compared
+        // row by row they differ.
+        let reference_answer = q31_answer(Q31_LEADING_ROWS[9]);
+        let other_answer = q31_answer(Q31_LEADING_ROWS[10]);
+        let query = Query::new("clickbench_q31".into(), Q31.into(), false);
+        assert!(
+            matches!(
+                validate_against_reference_batches(
+                    &query,
+                    std::slice::from_ref(&other_answer),
+                    std::slice::from_ref(&reference_answer)
+                )
+                .expect("compare"),
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            ),
+            "compared row by row, the two correct answers differ in their tenth row"
+        );
+
+        let sort_limit = projected_sort_limit(Q31, &other_answer.schema())
+            .expect("every sort term is a result column");
+        let keyed_reference = q31_rows(&Q31_LEADING_ROWS);
+        let check = |answer: RecordBatch| {
+            validate_against_keyed_reference(
+                &[answer],
+                std::slice::from_ref(&keyed_reference),
+                sort_limit.limit,
+                sort_limit.offset,
+                &sort_limit.key,
+                false,
+            )
+            .expect("check")
+        };
+        assert_eq!(check(reference_answer), Some(QueryValidationResult::Pass));
+        assert_eq!(check(other_answer), Some(QueryValidationResult::Pass));
+
+        // A tenth row with the tied count but a sum neither tied group has is wrong,
+        // and so is the group with the next count down.
+        let (engine, client_ip, count, _, average) = Q31_LEADING_ROWS[10];
+        for tenth in [
+            (engine, client_ip, count, 33, average),
+            Q31_LEADING_ROWS[11],
+        ] {
+            assert!(
+                matches!(
+                    check(q31_answer(tenth)),
+                    Some(QueryValidationResult::Fail(
+                        QueryValidationFailReason::RowNotAllowedByLimit { row_number: 10, .. }
+                    ))
+                ),
+                "{tenth:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_keyed_reference_matches_cells_by_the_row_comparison_rule() {
+        // An engine that renders the tied row's average one digit shorter returned
+        // that row; an average 0.2% away is a different row.
+        let keyed_reference = q31_rows(&Q31_LEADING_ROWS);
+        let (engine, client_ip, count, sum, _) = Q31_LEADING_ROWS[10];
+        let check = |average: &'static str| {
+            validate_against_keyed_reference(
+                &[q31_answer((engine, client_ip, count, sum, average))],
+                std::slice::from_ref(&keyed_reference),
+                10,
+                0,
+                &SortKeyCells::Returned(vec![2]),
+                false,
+            )
+            .expect("check")
+        };
+        assert_eq!(
+            check("1556.200378071834"),
+            Some(QueryValidationResult::Pass)
+        );
+        assert!(matches!(
+            check("1559.4"),
+            Some(QueryValidationResult::Fail(
+                QueryValidationFailReason::RowNotAllowedByLimit { row_number: 10, .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_keyed_reference_lets_an_offset_page_start_with_a_row_tied_with_skipped_ones() {
+        // ORDER BY v DESC over (1, 10), (2, 5), (3, 5), (4, 1): the `v = 5` group holds
+        // positions two and three, so a page that starts or ends inside it may hold
+        // either of its rows.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let rows = |pairs: &[(i64, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(
+                        pairs.iter().map(|pair| pair.0),
+                    )),
+                    Arc::new(Int64Array::from_iter_values(
+                        pairs.iter().map(|pair| pair.1),
+                    )),
+                ],
+            )
+            .expect("id/v batch")
+        };
+        let sort_limit = projected_sort_limit(
+            "SELECT id, v FROM t ORDER BY v DESC LIMIT 1 OFFSET 1",
+            &schema,
+        )
+        .expect("v is a result column");
+        assert_eq!(
+            (sort_limit.limit, sort_limit.offset, &sort_limit.key),
+            (1, 1, &SortKeyCells::Returned(vec![1]))
+        );
+        assert_eq!(
+            sort_limit.keyed_sql(3),
+            "SELECT id, v FROM t ORDER BY v DESC LIMIT 3"
+        );
+
+        let reference = rows(&[(1, 10), (2, 5), (3, 5), (4, 1)]);
+        let check = |answer: &[(i64, i64)], limit: usize, offset: usize| {
+            validate_against_keyed_reference(
+                &[rows(answer)],
+                std::slice::from_ref(&reference),
+                limit,
+                offset,
+                &sort_limit.key,
+                true,
+            )
+            .expect("check")
+        };
+        let pass = Some(QueryValidationResult::Pass);
+        // LIMIT 1 OFFSET 1: either `v = 5` row, and nothing else.
+        assert_eq!(check(&[(3, 5)], 1, 1), pass);
+        assert_eq!(check(&[(2, 5)], 1, 1), pass);
+        for wrong in [(1, 10), (4, 1)] {
+            assert!(
+                matches!(
+                    check(&[wrong], 1, 1),
+                    Some(QueryValidationResult::Fail(
+                        QueryValidationFailReason::RowNotAllowedByLimit { row_number: 1, .. }
+                    ))
+                ),
+                "{wrong:?}"
+            );
+        }
+        // LIMIT 2 OFFSET 1: the whole group, each row once.
+        assert_eq!(check(&[(3, 5), (2, 5)], 2, 1), pass);
+        assert!(matches!(
+            check(&[(3, 5), (3, 5)], 2, 1),
+            Some(QueryValidationResult::Fail(
+                QueryValidationFailReason::RowNotAllowedByLimit { row_number: 2, .. }
+            ))
+        ));
+        // LIMIT 2 OFFSET 2: one `v = 5` row, then (4, 1) in its own position.
+        assert_eq!(check(&[(2, 5), (4, 1)], 2, 2), pass);
+        assert!(matches!(
+            check(&[(4, 1), (2, 5)], 2, 2),
+            Some(QueryValidationResult::Fail(
+                QueryValidationFailReason::RowOutOfSortOrder { row_number: 1, .. }
+            ))
+        ));
+        // A fetch may stop at the first row past the group the LIMIT cuts.
+        assert!(
+            !keyed_reference_cutoff_closed(
+                &[rows(&[(1, 10), (2, 5), (3, 5)])],
+                1,
+                1,
+                &sort_limit.key
+            )
+            .expect("open group")
+        );
+        assert!(
+            keyed_reference_cutoff_closed(
+                &[rows(&[(1, 10), (2, 5), (3, 5), (4, 1)])],
+                1,
+                1,
+                &sort_limit.key
+            )
+            .expect("closed group")
+        );
+        // Reference rows that end inside the group the LIMIT cuts cannot settle it.
+        assert_eq!(
+            validate_against_keyed_reference(
+                &[rows(&[(3, 5)])],
+                &[rows(&[(1, 10), (2, 5), (3, 5)])],
+                1,
+                1,
+                &sort_limit.key,
+                false,
+            )
+            .expect("check partial"),
+            None
         );
     }
 
@@ -3668,7 +4116,8 @@ mod test {
             std::slice::from_ref(&answer),
             batches,
             10,
-            1,
+            0,
+            &SortKeyCells::Appended(1),
             1_048_576,
         )
         .expect("decide after the cutoff group closes");
@@ -3679,13 +4128,23 @@ mod test {
         );
         assert_eq!(rows, needed);
         assert!(
-            keyed_reference_cutoff_closed(&[full.slice(0, needed)], 10, 1)
-                .expect("closed after the first later key"),
+            keyed_reference_cutoff_closed(
+                &[full.slice(0, needed)],
+                10,
+                0,
+                &SortKeyCells::Appended(1)
+            )
+            .expect("closed after the first later key"),
             "row 13's key 10 ends the key-9 group that `LIMIT` 10 cuts"
         );
         assert!(
-            !keyed_reference_cutoff_closed(&[full.slice(0, needed - 1)], 10, 1)
-                .expect("still open inside the cut group"),
+            !keyed_reference_cutoff_closed(
+                &[full.slice(0, needed - 1)],
+                10,
+                0,
+                &SortKeyCells::Appended(1)
+            )
+            .expect("still open inside the cut group"),
             "twelve rows still end inside the key-9 group"
         );
     }
