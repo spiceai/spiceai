@@ -3841,7 +3841,8 @@ impl DataAccelerator for CayenneAccelerator {
                     catalog,
                     source.name().to_string(),
                     path_buf.clone(),
-                )) as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>,
+                ))
+                    as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>,
             );
             Ok(download_snapshot(
                 acceleration,
