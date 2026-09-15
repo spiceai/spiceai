@@ -621,21 +621,8 @@ impl Query {
     /// For Flight SQL sessions, returns the session-specific context to preserve
     /// prepared statements. Otherwise, returns the default local context.
     fn get_session_state(&self, request_context: &Arc<RequestContext>) -> SessionState {
-        // Check if there's a Flight SQL session-specific context
-        if let Some(flight_session) =
-            request_context.extension::<super::flight_session_extension::FlightSessionExtension>()
-        {
-            // Only honor the session if it belongs to the current principal. The
-            // session is selected from a client-controlled `x-session-id` header
-            // before authentication runs; binding it to the authenticated
-            // principal here prevents one principal from executing against
-            // another's session (and its prepared statements) if a session id is
-            // leaked.
-            let current = request_context.auth_principal().and_then(|p| p.stable_id());
-            if principal_owns_session(flight_session.owner_stable_id(), current.as_deref()) {
-                // Use session-specific context to preserve prepared statements
-                return flight_session.session_context().state();
-            }
+        if let Some(flight_session) = owned_flight_session(request_context) {
+            return flight_session.session_context().state();
         }
 
         // Always use local execution for synchronous APIs (/v1/sql, FlightSQL)
@@ -872,15 +859,13 @@ impl Query {
                     let plan = if let Some(plan) = pre_parsed_plan {
                         *plan
                     } else {
-                        let cache_namespace = request_context.cache_namespace();
-                        let (ns_tag, ns_id) = cache_namespace.hash_inputs();
                         let cached_plan_key =
-                            Self::cached_plan_key(&self.df, sql.as_ref(), Some((ns_tag, ns_id)));
+                            Self::shared_plans_cache_key(&self.df, sql.as_ref(), &request_context);
                         Query::get_plan(
                             &self.df,
                             &session,
                             sql.as_ref(),
-                            &cached_plan_key,
+                            cached_plan_key.as_ref(),
                             parameters,
                         )
                         .await?
@@ -1266,7 +1251,11 @@ impl Query {
                     } => {
                         let raw_cache_key = CacheKey::Query(sql.as_ref(), parameters.as_ref())
                             .as_raw_key(Query::plan_hasher(&ctx.df));
-                        let cached_plan_key = Query::cached_plan_key(&ctx.df, sql.as_ref(), None);
+                        let cached_plan_key = if owned_flight_session(&request_context).is_some() {
+                            None
+                        } else {
+                            Some(Query::cached_plan_key(&ctx.df, sql.as_ref(), None))
+                        };
                         let plan = if let Some(plan) = pre_parsed_plan {
                             plan
                         } else {
@@ -1279,7 +1268,7 @@ impl Query {
                                 &ctx.df,
                                 &session,
                                 sql.as_ref(),
-                                &cached_plan_key,
+                                cached_plan_key.as_ref(),
                                 parameters,
                             )
                             .await
@@ -1536,8 +1525,7 @@ impl Query {
                     // Use the session-specific context if available to ensure prepared statements
                     // are scoped to individual sessions.
                     let session_ctx = if let Some(flight_session) =
-                        request_context
-                            .extension::<super::flight_session_extension::FlightSessionExtension>()
+                        owned_flight_session(&request_context)
                     {
                         tracing::debug!(
                             "Statement plan using Flight session: {}",
@@ -1546,7 +1534,7 @@ impl Query {
                         Arc::clone(flight_session.session_context())
                     } else {
                         tracing::debug!(
-                            "Statement plan using ad-hoc session (no FlightSessionExtension)"
+                            "Statement plan using ad-hoc session (no Flight session, or the session is not owned by this principal)"
                         );
                         Arc::new(SessionContext::new_with_state(ctx.df.ctx.state()))
                     };
@@ -1842,10 +1830,10 @@ impl Query {
     pub async fn get_schema(self) -> Result<(Schema, Option<Schema>), DataFusionError> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
 
-        // Check if there's a Flight SQL session-specific context for session isolation
-        let session_ctx = match request_context
-            .extension::<super::flight_session_extension::FlightSessionExtension>(
-        ) {
+        // Same ownership check as `get_session_state`: a leaked
+        // `x-session-id` must not resolve EXECUTE against another
+        // principal's prepared statements.
+        let session_ctx = match owned_flight_session(&request_context) {
             Some(flight_session) => Arc::clone(flight_session.session_context()),
             None => Arc::clone(&self.df.ctx),
         };
@@ -1861,11 +1849,16 @@ impl Query {
                 // statement whose schema is advertised here is not planned again
                 // when it runs, and one that has already run is not planned again
                 // to advertise it. The session state is only copied to plan.
-                let cache_namespace = request_context.cache_namespace();
-                let (ns_tag, ns_id) = cache_namespace.hash_inputs();
-                let cached_plan_key = Self::cached_plan_key(&self.df, sql, Some((ns_tag, ns_id)));
-                let cached_plan = match self.df.plans_cache_provider() {
-                    Some(plans) => plans.get_raw_key(&cached_plan_key.as_u64()).await,
+                // A Flight session's plans stay off this shared cache: they
+                // depend on that session's prepared statements and catalog
+                // snapshot, and caching them under the principal namespace
+                // would let `GetFlightInfo` advertise another session's schema.
+                let cached_plan_key = Self::shared_plans_cache_key(&self.df, sql, &request_context);
+                let cached_plan = match cached_plan_key.as_ref() {
+                    Some(key) => match self.df.plans_cache_provider() {
+                        Some(plans) => plans.get_raw_key(&key.as_u64()).await,
+                        None => None,
+                    },
                     None => None,
                 };
                 let planned = match cached_plan {
@@ -1874,7 +1867,7 @@ impl Query {
                         self.df
                             .get_or_create_logical_plan(
                                 &session_ctx.state(),
-                                Some(&cached_plan_key),
+                                cached_plan_key.as_ref(),
                                 sql,
                             )
                             .await
@@ -3058,6 +3051,21 @@ fn is_dml_extension(plan: &LogicalPlan) -> bool {
     )
 }
 
+/// The Flight SQL session on this request, when the current principal
+/// may use it. The session is selected from a client-controlled
+/// `x-session-id` header before authentication runs; binding it to the
+/// authenticated principal here prevents one principal from planning or
+/// executing against another's session if a session id is leaked.
+pub(super) fn owned_flight_session(
+    request_context: &RequestContext,
+) -> Option<super::flight_session_extension::FlightSessionExtension> {
+    let flight_session =
+        request_context.extension::<super::flight_session_extension::FlightSessionExtension>()?;
+    let current = request_context.auth_principal().and_then(|p| p.stable_id());
+    principal_owns_session(flight_session.owner_stable_id(), current.as_deref())
+        .then_some(flight_session)
+}
+
 /// Returns whether a Flight SQL session may be used by the current principal.
 ///
 /// An unowned session (`owner` is `None`) is always permitted, preserving
@@ -3095,6 +3103,46 @@ mod session_ownership_tests {
         ));
         // Unauthenticated caller cannot use an owned session.
         assert!(!principal_owns_session(Some("apikey:abc"), None));
+    }
+
+    #[test]
+    fn owned_flight_session_is_none_without_an_extension() {
+        let ctx = runtime_request_context::RequestContextBuilder::new(
+            runtime_request_context::Protocol::Internal,
+        )
+        .build();
+        assert!(super::owned_flight_session(&ctx).is_none());
+    }
+
+    #[test]
+    fn owned_flight_session_allows_an_unowned_session() {
+        let ext = crate::datafusion::flight_session_extension::FlightSessionExtension::new(
+            std::sync::Arc::new(datafusion::prelude::SessionContext::new()),
+            None,
+        );
+        let ctx = runtime_request_context::RequestContextBuilder::new(
+            runtime_request_context::Protocol::Internal,
+        )
+        .with_extension(ext)
+        .build();
+        assert!(super::owned_flight_session(&ctx).is_some());
+    }
+
+    #[test]
+    fn owned_flight_session_rejects_an_owned_session_without_a_matching_principal() {
+        let ext = crate::datafusion::flight_session_extension::FlightSessionExtension::new(
+            std::sync::Arc::new(datafusion::prelude::SessionContext::new()),
+            Some("apikey:abc".to_string()),
+        );
+        let ctx = runtime_request_context::RequestContextBuilder::new(
+            runtime_request_context::Protocol::Internal,
+        )
+        .with_extension(ext)
+        .build();
+        assert!(
+            super::owned_flight_session(&ctx).is_none(),
+            "an owned session must not be used by an unauthenticated caller"
+        );
     }
 }
 
@@ -3367,6 +3415,106 @@ mod tests {
         assert!(parameter_schema.is_none());
         let field = schema.field_with_name("x").expect("x field");
         assert_eq!(field.data_type(), &DataType::Decimal128(22, 2));
+    }
+
+    /// A leaked `x-session-id` must not let `GetFlightInfo` resolve
+    /// against another principal's session (and then cache that plan
+    /// under the caller's namespace).
+    #[tokio::test]
+    async fn get_schema_does_not_resolve_against_a_leaked_flight_session() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+
+        let session_ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .expect("batch");
+        session_ctx
+            .register_batch("victim", batch)
+            .expect("register victim table on the leaked session only");
+
+        let ext = crate::datafusion::flight_session_extension::FlightSessionExtension::new(
+            Arc::new(session_ctx),
+            Some("apikey:abc".to_string()),
+        );
+        let request = Arc::new(
+            RequestContext::builder(Protocol::Flight)
+                .with_extension(ext)
+                .build(),
+        );
+
+        let err = request
+            .scope(async move {
+                QueryBuilder::new("SELECT n FROM victim", df)
+                    .build()
+                    .get_schema()
+                    .await
+            })
+            .await
+            .expect_err(
+                "a leaked x-session-id must not advertise another principal's session schema",
+            );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("victim") || msg.to_ascii_lowercase().contains("not found"),
+            "expected a missing-table error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_schema_uses_an_unowned_flight_session() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+
+        let session_ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .expect("batch");
+        session_ctx
+            .register_batch("session_only", batch)
+            .expect("register table on the unowned session");
+
+        let ext = crate::datafusion::flight_session_extension::FlightSessionExtension::new(
+            Arc::new(session_ctx),
+            None,
+        );
+        let request = Arc::new(
+            RequestContext::builder(Protocol::Flight)
+                .with_extension(ext)
+                .build(),
+        );
+
+        let (schema, _) = request
+            .scope(async move {
+                QueryBuilder::new("SELECT n FROM session_only", df)
+                    .build()
+                    .get_schema()
+                    .await
+            })
+            .await
+            .expect("an unowned Flight session remains usable");
+        assert_eq!(
+            schema.field_with_name("n").expect("n field").data_type(),
+            &DataType::Int64
+        );
     }
 
     #[tokio::test]

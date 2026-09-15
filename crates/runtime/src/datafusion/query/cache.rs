@@ -519,13 +519,13 @@ impl Query {
 
         let sql_raw_cache_key =
             sql_cache_key.as_raw_key_in_namespace(Self::plan_hasher(df), ns_tag, ns_id);
-        let cached_plan_key = Self::cached_plan_key(df, sql, Some((ns_tag, ns_id)));
+        let cached_plan_key = Self::shared_plans_cache_key(df, sql, &request_context);
         let plan: Box<LogicalPlan> = if let Some(plan) = pre_parsed_plan {
             // Reuse the pre-parsed plan to avoid re-parsing. Parameters are
             // already bound from `check_read_only_sql`.
             plan
         } else {
-            match Self::get_plan(df, session, sql, &cached_plan_key, parameters).await {
+            match Self::get_plan(df, session, sql, cached_plan_key.as_ref(), parameters).await {
                 Ok(plan) => Box::new(plan),
                 Err(e) => {
                     if let super::Error::UnableToExecuteQuery { source } = e {
@@ -607,11 +607,11 @@ impl Query {
             ns_tag,
             ns_id,
         );
-        let cached_plan_key = Self::cached_plan_key(df, sql, Some((ns_tag, ns_id)));
+        let cached_plan_key = Self::shared_plans_cache_key(df, sql, request_context);
         let plan = if let Some(plan) = pre_parsed_plan {
             plan
         } else {
-            match Self::get_plan(df, session, sql, &cached_plan_key, parameters).await {
+            match Self::get_plan(df, session, sql, cached_plan_key.as_ref(), parameters).await {
                 Ok(plan) => Box::new(plan),
                 Err(super::Error::UnableToExecuteQuery { source }) => {
                     let code = ErrorCode::from(&source);
@@ -637,11 +637,11 @@ impl Query {
         df: &Arc<DataFusion>,
         session: &SessionState,
         sql: &str,
-        sql_raw_cache_key: &RawCacheKey,
+        sql_raw_cache_key: Option<&RawCacheKey>,
         parameters: Option<ParamValues>,
     ) -> super::Result<LogicalPlan> {
         let plan = match df
-            .get_or_create_logical_plan(session, Some(sql_raw_cache_key), sql)
+            .get_or_create_logical_plan(session, sql_raw_cache_key, sql)
             .await
         {
             Ok(plan) => plan,
@@ -687,6 +687,24 @@ impl Query {
             Some((tag, id)) => key.as_raw_key_in_namespace(Self::plan_hasher(df), tag, id),
             None => key.as_raw_key(Self::plan_hasher(df)),
         }
+    }
+
+    /// Plans cache key shared by `get_schema` and the planned path.
+    ///
+    /// `None` when the request carries an owned Flight SQL session: those
+    /// plans depend on that session's prepared statements and catalog
+    /// snapshot, and must not be stored under the principal-only key.
+    pub(super) fn shared_plans_cache_key(
+        df: &DataFusion,
+        sql: &str,
+        request_context: &RequestContext,
+    ) -> Option<RawCacheKey> {
+        if super::owned_flight_session(request_context).is_some() {
+            return None;
+        }
+        let cache_namespace = request_context.cache_namespace();
+        let (tag, id) = cache_namespace.hash_inputs();
+        Some(Self::cached_plan_key(df, sql, Some((tag, id))))
     }
 
     /// Return the [`Hasher`] that should be used in caching [`LogicalPlan`]s in [`DataFusion`].
@@ -830,6 +848,13 @@ impl Query {
                 )
             }
             CacheKeyType::Default => {
+                // A Flight session's plan is not in the shared cache (see
+                // `shared_plans_cache_key`). Skip the probe rather than
+                // hashing another session's cached plan into this request's
+                // results-cache key.
+                if super::owned_flight_session(request_context).is_some() {
+                    return CacheProbe::Skipped;
+                }
                 // A pre-parsed plan already has its parameters bound.
                 let plan = if let Some(plan) = pre_parsed_plan {
                     plan.as_ref()
@@ -1452,10 +1477,12 @@ mod tests {
         builder::RuntimeBuilder,
         datafusion::{
             DataFusion,
+            flight_session_extension::FlightSessionExtension,
             query::{QueryBuilder, ResultsCacheMode},
         },
         status,
     };
+    use datafusion::prelude::SessionContext;
     use runtime_request_context::{
         CacheControl, CacheKeyType, CacheNamespace, Protocol, RequestContext,
     };
@@ -1471,6 +1498,28 @@ mod tests {
                 .with_client_supplied_cache_key(user_cache_key)
                 .build(),
         )
+    }
+
+    #[tokio::test]
+    async fn a_flight_session_does_not_use_the_shared_plans_cache() {
+        let df = prepare_runtime(None).await;
+        let without_session =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Default), None);
+        assert!(
+            Query::shared_plans_cache_key(&df, "SELECT 1", &without_session).is_some(),
+            "HTTP / default context still uses the shared plans cache"
+        );
+
+        let ext = FlightSessionExtension::new(Arc::new(SessionContext::new()), None);
+        let with_session = Arc::new(
+            RequestContext::builder(Protocol::Internal)
+                .with_extension(ext)
+                .build(),
+        );
+        assert!(
+            Query::shared_plans_cache_key(&df, "SELECT 1", &with_session).is_none(),
+            "a Flight session must not read or write the shared plans cache"
+        );
     }
 
     /// Build a `RequestContext` with an explicit cache namespace. Used to
