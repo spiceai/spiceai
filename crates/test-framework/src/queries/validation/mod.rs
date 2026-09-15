@@ -3468,6 +3468,26 @@ mod test {
     }
 
     #[test]
+    fn test_unprojected_sort_limit_refuses_a_select_alias_sort_key() {
+        // A select-list alias is not in scope inside the select list that defines it,
+        // so a sort key naming one cannot be read back beside the result. TPC-DS Q36
+        // orders by `lochierarchy`, an alias, and by a `CASE` over it that the result
+        // does not return.
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        for sql in [
+            "SELECT a AS x FROM t ORDER BY x, hidden LIMIT 1",
+            "SELECT a AS x FROM t ORDER BY CASE WHEN x = 0 THEN b END LIMIT 1",
+        ] {
+            assert_eq!(unprojected_sort_limit(sql, &schema), None, "{sql}");
+        }
+        assert!(
+            unprojected_sort_limit("SELECT a AS x FROM t ORDER BY hidden LIMIT 1", &schema)
+                .is_some(),
+            "a sort key that names no alias is still read back"
+        );
+    }
+
+    #[test]
     fn test_unprojected_sort_limit_refuses_a_nested_limit() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
         // The inner LIMIT keeps unspecified rows, so no reference run fixes which

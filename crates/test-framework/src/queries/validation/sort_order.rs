@@ -929,7 +929,9 @@ impl UnprojectedSortLimit {
 /// free when `hidden` distinguishes them. `None` otherwise, including for a
 /// positional term such as `ORDER BY 1` and for a term that applies a `COLLATE`:
 /// the collation decides which rows tie, and the rendered sort keys the keyed
-/// check compares cannot show it.
+/// check compares cannot show it. A term that names a select-list alias is
+/// refused too, because the alias is not in scope in the select list the keyed
+/// query appends it to.
 #[must_use]
 pub fn unprojected_sort_limit(sql: &str, schema: &SchemaRef) -> Option<UnprojectedSortLimit> {
     let statement = parse_one_statement(sql)?;
@@ -972,6 +974,20 @@ pub fn unprojected_sort_limit(sql: &str, schema: &SchemaRef) -> Option<Unproject
         return None;
     };
     if select.distinct.is_some() || select.top.is_some() {
+        return None;
+    }
+    let aliases: Vec<String> = select
+        .projection
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+            _ => None,
+        })
+        .collect();
+    if sort_keys
+        .iter()
+        .any(|expr| names_a_select_alias(expr, &aliases))
+    {
         return None;
     }
     let key_columns = sort_keys.len();
@@ -1030,6 +1046,33 @@ fn returns_group_keys(select: &Select) -> bool {
 /// produces for the outer query is only one of the results the query allows. The
 /// checks that read that full result refuse the query rather than judge an answer
 /// against one of them.
+/// Whether `expr` names one of `aliases`, the select list's own output names. An
+/// alias is not in scope inside the select list that defines it, so a sort key
+/// that names one cannot be appended to that select list.
+fn names_a_select_alias(expr: &Expr, aliases: &[String]) -> bool {
+    struct AliasReference<'a> {
+        aliases: &'a [String],
+    }
+
+    impl Visitor for AliasReference<'_> {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if let Expr::Identifier(ident) = expr
+                && self
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(&ident.value))
+            {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    expr.visit(&mut AliasReference { aliases }).is_break()
+}
+
 /// Whether `expr` applies a `COLLATE` anywhere inside it. Under `COLLATE NOCASE`,
 /// `'a'` and `'A'` are one tie group but two different rendered strings.
 fn applies_collation(expr: &Expr) -> bool {
