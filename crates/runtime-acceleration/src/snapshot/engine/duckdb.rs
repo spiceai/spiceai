@@ -231,7 +231,7 @@ mod tests {
             .expect("persist the empty table to the main file");
         connection
             .execute(
-                &format!("INSERT INTO t SELECT i FROM generate_series(1, {rows})"),
+                &format!("INSERT INTO t SELECT * FROM generate_series(1, {rows})"),
                 [],
             )
             .expect("insert rows that should remain in the write-ahead log");

@@ -3650,6 +3650,11 @@ mod tests {
             #[cfg(feature = "duckdb")]
             AccelerationEngine::DuckDB => {
                 // `checkpoint_live` opens this file and runs `CHECKPOINT`.
+                // `NamedTempFile` leaves a 0-byte placeholder that DuckDB
+                // will not initialize, so replace it with a real database.
+                if path.exists() {
+                    std::fs::remove_file(path).expect("remove empty placeholder");
+                }
                 drop(duckdb::Connection::open(path).expect("open sample duckdb"));
             }
             _ => {
