@@ -1435,6 +1435,9 @@ mod tests {
             (shown_limit.limit, shown_limit.offset, &shown_limit.key),
             (2, 7, &SortKeyCells::Returned(vec![1]))
         );
+        let zero = projected_sort_limit("SELECT a, c FROM t ORDER BY c LIMIT 0", &schema)
+            .expect("LIMIT 0 is still an ORDER BY … LIMIT");
+        assert_eq!((zero.limit, zero.offset), (0, 0));
         assert_eq!(
             shown_limit.keyed_sql(4),
             "SELECT a, c FROM t ORDER BY c LIMIT 4"

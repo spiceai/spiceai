@@ -3932,6 +3932,49 @@ mod test {
         );
     }
 
+    /// `LIMIT 0` keeps no rows. The matcher must reject a row even when that
+    /// row is in the keyed reference: a raised-LIMIT read-back is not a cutoff
+    /// the engine is free to pick from.
+    #[test]
+    fn test_keyed_reference_limit_zero_rejects_any_row() {
+        let keyed = q25_keyed_reference();
+        let answer = search_phrases(&["a"]);
+        assert_eq!(
+            validate_against_keyed_reference(
+                &[answer],
+                std::slice::from_ref(&keyed),
+                0,
+                0,
+                &SortKeyCells::Appended(1),
+                false
+            )
+            .expect("check"),
+            Some(QueryValidationResult::Fail(
+                QueryValidationFailReason::RowCountMismatch {
+                    expected: 0,
+                    actual: 1
+                }
+            ))
+        );
+        assert_eq!(
+            validate_against_keyed_reference(
+                &[],
+                &[keyed],
+                0,
+                0,
+                &SortKeyCells::Appended(1),
+                false
+            )
+            .expect("check"),
+            Some(QueryValidationResult::Pass)
+        );
+        assert!(
+            keyed_reference_cutoff_closed(&[], 0, 0, &SortKeyCells::Appended(1))
+                .expect("empty LIMIT 0 cutoff"),
+            "LIMIT 0 has no cutoff group to finish"
+        );
+    }
+
     #[test]
     fn test_keyed_reference_needs_the_whole_cut_tie_group() {
         let keyed = q25_keyed_reference().slice(0, 10);

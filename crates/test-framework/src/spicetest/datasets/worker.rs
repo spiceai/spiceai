@@ -48,8 +48,10 @@ const MAX_KEYED_REFERENCE_ROWS: usize = 1 << 20;
 /// First keyed-reference fetch past the `OFFSET` for a `LIMIT` of `limit`. Twice
 /// the limit is enough when the cutoff group is no larger than the result itself;
 /// the cap still bounds a custom query whose `LIMIT` is already past that.
+/// `LIMIT 0` keeps no rows, so the window is 0: a floor of 1 would still request
+/// a row, and `OFFSET` plus that window would request the skipped rows too.
 fn keyed_reference_fetch_rows(limit: usize) -> usize {
-    limit.saturating_mul(2).clamp(1, MAX_KEYED_REFERENCE_ROWS)
+    limit.saturating_mul(2).min(MAX_KEYED_REFERENCE_ROWS)
 }
 
 /// Next fetch after `current` did not cover the tie group at the `LIMIT`.
@@ -793,8 +795,12 @@ impl SpiceTestQueryWorker {
                             self.id, query.name
                         ),
                     }
+                    // LIMIT 0 keeps no rows. The keyed matcher would pass an empty
+                    // answer even when a raised-LIMIT reference has rows, and a 0
+                    // window would still request OFFSET rows; the row-by-row result
+                    // already names the count.
                     let mut fetch_rows = keyed_reference_fetch_rows(sort_limit.limit);
-                    loop {
+                    while fetch_rows > 0 {
                         if sort_limit.offset >= MAX_KEYED_REFERENCE_ROWS {
                             println!(
                                 "Worker {} - Query '{}' - OFFSET {} starts past {MAX_KEYED_REFERENCE_ROWS} reference rows; keeping the row-by-row comparison's result",
@@ -1196,7 +1202,7 @@ mod tests {
     /// must stay at or below [`MAX_KEYED_REFERENCE_ROWS`].
     #[test]
     fn keyed_reference_first_request_is_clamped_to_the_cap() {
-        let unclamped = 600_000usize.saturating_mul(2).max(1);
+        let unclamped = 600_000usize.saturating_mul(2);
         assert_eq!(
             unclamped, 1_200_000,
             "the unclamped first request is 2 * LIMIT"
@@ -1210,10 +1216,25 @@ mod tests {
             MAX_KEYED_REFERENCE_ROWS
         );
         assert_eq!(keyed_reference_fetch_rows(1), 2);
-        assert_eq!(keyed_reference_fetch_rows(0), 1);
         assert_eq!(
             keyed_reference_fetch_rows(MAX_KEYED_REFERENCE_ROWS),
             MAX_KEYED_REFERENCE_ROWS
+        );
+    }
+
+    /// `LIMIT 0` keeps no rows. A floor of 1 on the window would still request a
+    /// row, and `OFFSET` plus that window would request the skipped rows too.
+    #[test]
+    fn keyed_reference_limit_zero_requests_no_rows() {
+        assert_eq!(keyed_reference_fetch_rows(0), 0);
+        assert_eq!(
+            keyed_reference_requested_rows(0, keyed_reference_fetch_rows(0)),
+            0
+        );
+        assert_eq!(
+            keyed_reference_requested_rows(2_000_000, keyed_reference_fetch_rows(0)),
+            MAX_KEYED_REFERENCE_ROWS,
+            "OFFSET plus a 0 window is still OFFSET rows; the worker must not fetch them"
         );
     }
 
