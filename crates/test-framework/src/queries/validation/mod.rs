@@ -2845,6 +2845,61 @@ mod test {
     }
 
     #[test]
+    fn test_visible_prefix_inversion_is_a_sort_order_violation() {
+        let sql = "SELECT id, payload FROM t ORDER BY id, hidden LIMIT 2";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let rows = |ids: &[i64], payloads: &[&str]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids.to_vec())),
+                    Arc::new(StringArray::from(payloads.to_vec())),
+                ],
+            )
+            .expect("id/payload batch")
+        };
+        let reference = rows(&[1, 2], &["a", "b"]);
+        let inverted = rows(&[2, 1], &["b", "a"]);
+        let query = Query::new("mixed_sort_order".into(), sql.into(), false);
+        assert!(
+            matches!(
+                validate_against_reference_batches(
+                    &query,
+                    std::slice::from_ref(&inverted),
+                    std::slice::from_ref(&reference)
+                )
+                .expect("compare"),
+                QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation { .. })
+            ),
+            "inverting a visible ORDER BY prefix must fail as SortOrderViolation"
+        );
+
+        let keyed = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, false),
+                Field::new("__validation_sort_key_0", DataType::Int64, false),
+                Field::new("__validation_sort_key_1", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+            ],
+        )
+        .expect("keyed inversion reference");
+        assert_eq!(
+            validate_against_keyed_reference(&[inverted], &[keyed], 2, 2, true)
+                .expect("keyed would accept the same rows in any order"),
+            Some(QueryValidationResult::Pass)
+        );
+    }
+
+    #[test]
     fn test_keyed_reference_accepts_any_order_of_tied_rows_and_any_pick_at_the_cutoff() {
         // The answers the reference query and the Arrow accelerator returned for Q25.
         let reference = search_phrases(&["a", "a", "b", "b", "c", "c", "d", "d", "e", "f"]);

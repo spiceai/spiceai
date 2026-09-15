@@ -1025,14 +1025,20 @@ fn zero_row_count_is_failure(
     validate_row_count && !skipped && row_count == 0 && !reference_validation_passed
 }
 
-/// LIMIT fallbacks compare rendered cells. They must not replace a
-/// [`validation::QueryValidationFailReason::SchemaMismatch`]: the live oracle
-/// uses that reason for arity, and a cell-wise retry cannot fix a width mismatch.
+/// LIMIT fallbacks compare rendered cells as a multiset. They must not replace
+/// an arity [`validation::QueryValidationFailReason::SchemaMismatch`], and they
+/// must not replace a [`validation::QueryValidationFailReason::SortOrderViolation`]:
+/// a visible-prefix inversion is still a broken `ORDER BY` even when the same
+/// rows would pass a keyed membership check.
 fn live_oracle_row_fallback_applies(result: &QueryValidationResult) -> bool {
     matches!(
         result,
         QueryValidationResult::Fail(reason)
-            if !matches!(reason, validation::QueryValidationFailReason::SchemaMismatch)
+            if !matches!(
+                reason,
+                validation::QueryValidationFailReason::SchemaMismatch
+                    | validation::QueryValidationFailReason::SortOrderViolation { .. }
+            )
     )
 }
 
@@ -1176,9 +1182,22 @@ mod tests {
     }
 
     #[test]
-    fn schema_mismatch_does_not_take_a_row_fallback() {
+    fn schema_mismatch_and_sort_violation_do_not_take_a_row_fallback() {
         assert!(!live_oracle_row_fallback_applies(
             &QueryValidationResult::Fail(validation::QueryValidationFailReason::SchemaMismatch)
+        ));
+        assert!(!live_oracle_row_fallback_applies(
+            &QueryValidationResult::Fail(
+                validation::QueryValidationFailReason::SortOrderViolation {
+                    side: "left".into(),
+                    violation: validation::SortOrderViolation {
+                        column: "id".into(),
+                        row_number: 2,
+                        previous: "2".into(),
+                        current: "1".into(),
+                    },
+                }
+            )
         ));
         assert!(live_oracle_row_fallback_applies(
             &QueryValidationResult::Fail(validation::QueryValidationFailReason::DataMismatch {
