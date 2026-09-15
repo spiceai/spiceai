@@ -25,7 +25,7 @@ use crate::cluster::partition::service::PartitionService;
 use crate::config::ClusterRole;
 use crate::config::Config;
 #[cfg(not(windows))]
-use crate::datafusion::builder::CayenneOptimizerRules;
+use crate::datafusion::builder::{CayenneOptimizerRules, OutputPreview};
 use crate::datafusion::udf::register_udfs;
 use crate::{
     Runtime, catalogconnector,
@@ -382,8 +382,7 @@ impl RuntimeBuilder {
         let dataset_parallelism = spicepod_rt.dataset_load_parallelism;
 
         let task_history = spicepod_rt.task_history.enabled;
-        let task_history_captured_output =
-            task_history_records_output_preview(&spicepod_rt.task_history);
+        let output_preview = task_history_output_preview(&spicepod_rt.task_history);
 
         let runtime_ready_state = spicepod_rt.ready_state;
 
@@ -762,7 +761,7 @@ impl RuntimeBuilder {
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
-        .with_task_history_captured_output(task_history_captured_output)
+        .with_output_preview(output_preview)
         .with_caching(caching)
         .with_metrics(metrics)
         .with_resource_monitor(resource_monitor.clone())
@@ -2064,22 +2063,27 @@ fn parse_cayenne_optimizer_rules(
     }
 }
 
-/// Whether a query's output preview is recorded. Only the `captured_output` column of
-/// `runtime.task_history` records it, so it is recorded when task history is enabled and
+/// Whether queries build the output preview. Only the `captured_output` column of
+/// `runtime.task_history` records it, so it is built when task history is enabled and
 /// `captured_output` is not `none`. A Zipkin export of the task spans never carries it:
 /// the Zipkin exporter turns each span event into an annotation holding only the event's
 /// name, and the preview is a field of its event.
 ///
 /// A `captured_output` the runtime cannot read counts as recorded, so a misconfigured
 /// value costs a preview rather than losing one.
-fn task_history_records_output_preview(
+fn task_history_output_preview(
     task_history: &spicepod::component::runtime::TaskHistory,
-) -> bool {
-    task_history.enabled
+) -> OutputPreview {
+    let recorded = task_history.enabled
         && !matches!(
             task_history.get_captured_output(),
             Ok(spicepod::component::runtime::TaskHistoryCapturedOutput::None)
-        )
+        );
+    if recorded {
+        OutputPreview::Build
+    } else {
+        OutputPreview::Skip
+    }
 }
 
 #[cfg(test)]
@@ -2096,20 +2100,26 @@ mod test {
             ..TaskHistory::default()
         };
 
-        assert!(
-            !task_history_records_output_preview(&TaskHistory::default()),
+        assert_eq!(
+            task_history_output_preview(&TaskHistory::default()),
+            OutputPreview::Skip,
             "the default `captured_output: none` records no preview"
         );
-        assert!(task_history_records_output_preview(&captured("truncated")));
-        assert!(
-            !task_history_records_output_preview(&TaskHistory {
+        assert_eq!(
+            task_history_output_preview(&captured("truncated")),
+            OutputPreview::Build
+        );
+        assert_eq!(
+            task_history_output_preview(&TaskHistory {
                 enabled: false,
                 ..captured("truncated")
             }),
+            OutputPreview::Skip,
             "with task history disabled nothing records the preview"
         );
-        assert!(
-            task_history_records_output_preview(&captured("everything")),
+        assert_eq!(
+            task_history_output_preview(&captured("everything")),
+            OutputPreview::Build,
             "a value the runtime cannot read keeps the preview"
         );
     }
