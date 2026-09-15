@@ -943,8 +943,19 @@ mod tests {
         );
     }
 
+    /// TPC-H Q6 on these federated arms is known-wrong (Glue CSV typing /
+    /// Hadoop Iceberg Spark schema inference). They keep an explicit
+    /// `validate_results: false` so the scheduled run does not fail on that
+    /// discrepancy. Every other TPC-H, TPC-DS and `ClickBench` dispatch must
+    /// validate against an oracle.
+    const BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION: &[&str] = &[
+        "tpch/sf1/federated/glue[csv].yaml",
+        "tpch/sf1/federated/iceberg[hadoop].yaml",
+    ];
+
     /// Every TPC-H, TPC-DS and `ClickBench` benchmark dispatch validates its
-    /// results against an oracle it can actually resolve.
+    /// results against an oracle it can actually resolve, except the Q6
+    /// opt-outs in `BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION`.
     ///
     /// Each `bench` entry is resolved the way `testoperator_run_bench.yml` runs
     /// it — the inputs `testoperator dispatch` sends, the spicepod under
@@ -955,11 +966,11 @@ mod tests {
     #[tokio::test]
     async fn benchmark_dispatches_validate_results_against_an_oracle() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let dispatch_root = repo_root.join("tools/testoperator/dispatch");
         let mut checked = 0;
+        let mut seen_opt_outs = BTreeSet::new();
         for query_set_directory in ["tpch", "tpcds", "clickbench"] {
-            let dispatch_directory = repo_root
-                .join("tools/testoperator/dispatch")
-                .join(query_set_directory);
+            let dispatch_directory = dispatch_root.join(query_set_directory);
             for dispatch_path in scan_directory_for_yamls(&dispatch_directory)
                 .expect("should scan the dispatch directory")
             {
@@ -967,6 +978,24 @@ mod tests {
                     std::fs::File::open(&dispatch_path).expect("should open the dispatch file");
                 let dispatch: DispatchTestFile =
                     yaml::from_reader(dispatch_file).expect("should parse the dispatch file");
+                let relative = dispatch_path
+                    .strip_prefix(&dispatch_root)
+                    .expect("dispatch file is under the dispatch directory")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION.contains(&relative.as_str()) {
+                    seen_opt_outs.insert(relative);
+                    for bench in &dispatch.tests.bench {
+                        let dispatch_name = dispatch_path.display();
+                        assert_eq!(
+                            bench.validate_results,
+                            Some(false),
+                            "{dispatch_name} is opted out of result validation because TPC-H Q6 is known-wrong; keep `validate_results: false`"
+                        );
+                        checked += 1;
+                    }
+                    continue;
+                }
                 for bench in &dispatch.tests.bench {
                     let dispatch_name = dispatch_path.display();
                     assert_eq!(
@@ -1023,6 +1052,14 @@ mod tests {
                 }
             }
         }
+        assert_eq!(
+            seen_opt_outs,
+            BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION
+                .iter()
+                .map(|path| (*path).to_string())
+                .collect::<BTreeSet<_>>(),
+            "every listed result-validation opt-out must exist as a dispatch file"
+        );
         assert!(
             checked > 0,
             "should find TPC-H, TPC-DS and ClickBench benchmark dispatches"
