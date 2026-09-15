@@ -473,6 +473,15 @@ impl Runtime {
         new_app: &Arc<App>,
     ) {
         let validated_views = Arc::clone(&self).get_valid_views(new_app, LogErrors(true));
+
+        // Same combined dataset+view snapshot checks as `load_datasets` /
+        // `apply_dataset_diff`. A view-only reload must not skip them: this is
+        // the path that would otherwise initialize a colliding view after
+        // startup validation has already passed.
+        if !self.validate_app_acceleration_snapshots(new_app).await {
+            return;
+        }
+
         let existing_validated_views =
             Arc::clone(&self).get_valid_views(current_app, LogErrors(false));
 
