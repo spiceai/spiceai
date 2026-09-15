@@ -403,8 +403,9 @@ impl CacheProbe {
 
     /// A raw hit that fails the serve-time TTL / table-clock checks cannot
     /// be handed out in place. Turn it into a miss so the hop onto the
-    /// query runtime sees planning work, not a hit `run_internal` would
-    /// reject and then plan on the request I/O runtime.
+    /// query runtime sees planning work. [`Query::run`] also serves a
+    /// remaining raw hit before that hop, so a later reject still becomes
+    /// a miss instead of planning on the request I/O runtime.
     ///
     /// Encoded hits stay hits: they already hop so they can decode, and
     /// [`Query::serve_probed_hit`] rechecks eligibility after the wait.
@@ -1850,6 +1851,59 @@ mod tests {
         assert!(
             matches!(probe, CacheProbe::Hit(_)),
             "an encoded hit stays a hit so serve_probed_hit can recheck after the hop"
+        );
+    }
+
+    /// A raw hit that passes `into_miss_if_in_place_ineligible` can still
+    /// fail at serve time (table-clock mark between those checks). That
+    /// reject must become a miss so `Query::run` hops instead of planning
+    /// on the request I/O runtime.
+    #[tokio::test]
+    async fn a_serve_time_rejected_raw_hit_is_not_servable_in_place() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+        let provider = df
+            .results_cache_provider()
+            .expect("the test runtime has a results cache");
+        let probe = dummy_probe_hit(dummy_servable_entry_for_tables(
+            cached_ago(std::time::Instant::now(), Duration::from_secs(1)),
+            HashSet::from([TableReference::bare("orders")]),
+        ));
+        let probe = probe.into_miss_if_in_place_ineligible(
+            CacheControl::Cache(CacheKeyType::Default),
+            Some(&provider),
+        );
+        assert!(
+            probe.is_servable_in_place(),
+            "the hit is still in-place before the post-classification invalidate"
+        );
+        provider
+            .invalidate_for_table(TableReference::bare("orders"))
+            .await
+            .expect("the table-change clock should record the invalidation");
+
+        let CacheProbe::Hit(hit) = probe else {
+            panic!("into_miss should have kept the fresh raw hit");
+        };
+        let raw_key = hit.raw_key();
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Default), None);
+        let mut query = QueryBuilder::new("SELECT 1", Arc::clone(&df)).build();
+        assert!(
+            query
+                .serve_probed_hit(&request_context, *hit)
+                .await
+                .is_none(),
+            "serve must reject after the table-change clock marks the input"
+        );
+        let probe = CacheProbe::Missed(raw_key);
+        assert!(
+            !probe.is_servable_in_place(),
+            "a serve-time reject must hop so planning is not on the request runtime"
         );
     }
 

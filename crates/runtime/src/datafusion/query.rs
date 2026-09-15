@@ -634,7 +634,7 @@ impl Query {
     /// # Panics
     ///
     /// Panics when running under test if no cache key is computed for the query.
-    pub async fn run(self) -> Result<QueryResult> {
+    pub async fn run(mut self) -> Result<QueryResult> {
         // Taken before the results-cache probe so Explain Analyze plan
         // capture (`min_sql_duration_ms` / `min_plan_duration_ms`) and the
         // cache-write `read_started_at` still include lookup time — the
@@ -668,13 +668,50 @@ impl Query {
             }
         };
         // A raw hit that the serve-time TTL / table-clock checks will
-        // reject is planning work. Reclassify it before the hop so
-        // `run_internal` cannot plan that fallback on the request I/O
-        // runtime after `is_servable_in_place` has already skipped it.
-        let probe = probe.into_miss_if_in_place_ineligible(
+        // reject is planning work. Reclassify it before the hop so a
+        // known-ineligible entry does not attempt an in-place serve.
+        let mut probe = probe.into_miss_if_in_place_ineligible(
             request_context.cache_control(),
             self.df.results_cache_provider().as_deref(),
         );
+        // Serve the in-place hit before the hop decision. `into_miss`
+        // and `serve_probed_hit` can disagree (TTL straddling two
+        // `Instant::now`s, a table-clock mark between them, or a
+        // decode failure). A reject here becomes a miss so planning
+        // hops onto the query runtime instead of running on the
+        // request I/O runtime after `is_servable_in_place` skipped it.
+        if probe.is_servable_in_place()
+            && let CacheProbe::Hit(hit) = probe
+        {
+            let raw_key = hit.raw_key();
+            let served = self
+                .serve_probed_hit(&request_context, *hit)
+                .instrument(spans.span.clone())
+                .instrument(spans.trace_span.clone())
+                .await;
+            match served {
+                Some((query_result, tracker)) => {
+                    return Ok(instrument_query_result(
+                        assemble_cached_query_result(
+                            query_result,
+                            tracker,
+                            Arc::clone(&request_context),
+                            spans.span.clone(),
+                            CachedHitCancel {
+                                token: guards.cancel_token.clone(),
+                                query_id: Arc::from(self.query_id.to_string()),
+                                timeout_state: guards.timeout_state.clone(),
+                                guard: (guards.active_query_guard, guards.timeout_timer_guard),
+                            },
+                        ),
+                        spans.trace_span,
+                    ));
+                }
+                None => {
+                    probe = CacheProbe::Missed(raw_key);
+                }
+            }
+        }
         if let Some(runtime_handle) = self.df.cpu_runtime().cloned()
             && !probe.is_servable_in_place()
         {
@@ -1198,10 +1235,12 @@ impl Query {
 
         let query_result =
             async {
-                // A hit found before planning is served here, ahead of the
-                // session state every planned query clones. An entry that fails
-                // to decode leaves the query to plan and run like a miss, without
-                // looking its key up a second time.
+                // Encoded hits hop and are served here, ahead of the session
+                // state every planned query clones. Raw in-place hits are
+                // served in `run` before the hop; a reject there arrives as
+                // `Missed`. An entry that fails to decode leaves the query
+                // to plan and run like a miss, without looking its key up
+                // a second time.
                 let mut ctx = self;
                 let already_looked_up = match probe {
                     CacheProbe::Hit(hit) => {
