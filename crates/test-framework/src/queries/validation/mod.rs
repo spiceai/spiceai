@@ -3914,6 +3914,44 @@ mod test {
     }
 
     #[test]
+    fn test_projected_sort_limit_keeps_positional_distinct_and_set_operation_queries() {
+        // Raising the LIMIT and dropping the OFFSET leaves the query's own rows, so a
+        // positional sort term, DISTINCT and a set operation all keep the read-back,
+        // unlike `unprojected_sort_limit`, which appends the sort terms to a SELECT.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        for (sql, offset, keyed_sql) in [
+            (
+                "SELECT id, v FROM t ORDER BY 2 DESC LIMIT 5",
+                0,
+                "SELECT id, v FROM t ORDER BY 2 DESC LIMIT 10",
+            ),
+            (
+                "SELECT DISTINCT id, v FROM t ORDER BY v LIMIT 5",
+                0,
+                "SELECT DISTINCT id, v FROM t ORDER BY v LIMIT 10",
+            ),
+            (
+                "SELECT id, v FROM t UNION ALL SELECT id, v FROM u ORDER BY v LIMIT 5 OFFSET 3",
+                3,
+                "SELECT id, v FROM t UNION ALL SELECT id, v FROM u ORDER BY v LIMIT 10",
+            ),
+        ] {
+            let sort_limit =
+                projected_sort_limit(sql, &schema).expect("sort term is a result column");
+            assert_eq!(
+                (sort_limit.limit, sort_limit.offset, &sort_limit.key),
+                (5, offset, &SortKeyCells::Returned(vec![1])),
+                "{sql}"
+            );
+            assert_eq!(sort_limit.keyed_sql(10), keyed_sql, "{sql}");
+            assert_eq!(unprojected_sort_limit(sql, &schema), None, "{sql}");
+        }
+    }
+
+    #[test]
     fn test_keyed_reference_accepts_either_group_tied_at_a_lone_cutoff_row() {
         // ClickBench Q31 over the full `hits` dataset: the reference query kept the
         // tenth group with ClientIP -1125673878 and federated Spice Cloud the one with
