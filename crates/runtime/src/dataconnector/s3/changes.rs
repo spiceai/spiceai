@@ -38,7 +38,6 @@ use data_components::cdc::{
     StreamError, build_history_unavailable_envelope, build_ready_signal_envelope, shutdown_epoch,
     wrap_data_as_change_batch,
 };
-use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
@@ -954,6 +953,10 @@ struct BackfillCreates {
     keys: Vec<String>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "snapshot and backfill share one listing apply; `pass` names the user-facing warn"
+)]
 async fn apply_unapplied_objects(
     dataset: &DatasetSpec,
     config: &S3ChangesConfig,
@@ -1257,6 +1260,7 @@ mod tests {
     use arrow::array::{Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use data_components::cdc::ChangeOperation;
+    use datafusion::datasource::TableProvider;
     use datafusion::datasource::memory::MemTable;
     use runtime_component::dataset::acceleration::Acceleration;
     use runtime_secrets::Secrets;
