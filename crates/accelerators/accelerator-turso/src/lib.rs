@@ -915,7 +915,7 @@ impl DataAccelerator for TursoAccelerator {
         PARAMETERS
     }
 
-    fn supports_snapshot_reload(&self) -> bool {
+    fn supports_provider_rebuild(&self) -> bool {
         true
     }
 
@@ -928,7 +928,7 @@ impl DataAccelerator for TursoAccelerator {
     /// the new on-disk contents. Without the eviction step, the next
     /// `provider_factory()` call would re-use the cached pool and its open
     /// connections, which can continue to observe the prior file's pages.
-    async fn reload_from_snapshot(
+    async fn rebuild_provider(
         &self,
         source: &dyn AccelerationSource,
         previous_provider: Arc<dyn TableProvider>,
