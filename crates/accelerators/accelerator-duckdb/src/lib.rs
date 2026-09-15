@@ -521,32 +521,6 @@ impl DuckDBAccelerator {
     }
 }
 
-/// Folds `DuckDB`'s write-ahead log into the database file at `path`.
-///
-/// A snapshot copies that file alone. After an unclean shutdown, committed rows
-/// can live only in the log; copying without folding would publish an incomplete
-/// file, and the `file_create` path then deletes the live acceleration. Uses an
-/// uncached connection so the shared pool — keyed by path — is not left pointing
-/// at a file the caller is about to remove.
-fn fold_duckdb_wal_into_database(path: &str) -> Result<(), duckdb::Error> {
-    let connection = duckdb::Connection::open(path)?;
-    connection.execute("CHECKPOINT", [])?;
-    Ok(())
-}
-
-/// The only explanation an operator gets when a `file_create` wipe skips its
-/// pre-recreation snapshot because the write-ahead log could not be folded.
-#[must_use]
-fn skipped_pre_recreation_snapshot_wal_warning(
-    dataset_name: &str,
-    path: &str,
-    error: &str,
-) -> String {
-    format!(
-        "Skipped snapshotting the outgoing acceleration of '{dataset_name}' before recreating it, so the snapshot series keeps its previously published contents: Spice could not fold DuckDB's write-ahead log into '{path}', and copying that file alone could omit committed rows. Cause: {error}"
-    )
-}
-
 /// Runs interrupted-file-swap recovery for a configured `DuckDB` file path once
 /// per process, before any connection pool for that file exists.
 ///
@@ -823,57 +797,35 @@ impl DataAccelerator for DuckDBAccelerator {
             if acceleration.mode == Mode::FileCreate {
                 let file_path = std::path::Path::new(&path);
                 if file_path.exists() {
-                    // The periodic path folds DuckDB's write-ahead log into the
-                    // database file first (`DuckDbDatasetCheckpointer` runs
-                    // `CHECKPOINT` ahead of the copy). This branch reaches
-                    // `create_snapshot` directly, so fold here through an
-                    // uncached connection: the shared pool is keyed by path,
-                    // and the delete below would strand a cached instance on a
-                    // removed file.
+                    // WAL fold lives in `DuckDBSnapshotEngine::checkpoint_live`,
+                    // which `snapshot_before_recreate` reaches through
+                    // `create_file_snapshot` before copying. That is the same
+                    // hook schema recreate uses, so neither call site copies a
+                    // main file that still has committed rows only in `<db>.wal`.
                     //
                     // Evict any cached instance first so the fold connection is
-                    // the only one on this file. If the log cannot be folded,
-                    // skip the publish — a main-file-only copy can omit
-                    // committed rows, and making that the store's current
-                    // snapshot is worse than keeping the previous one.
+                    // the only one on this file: the shared pool is keyed by
+                    // path, and the delete below would strand a cached instance
+                    // on a removed inode. If the log cannot be folded,
+                    // `create_file_snapshot` fails the publish rather than
+                    // making an incomplete copy the store's current snapshot.
                     if acceleration.snapshot_behavior.create_enabled() {
                         self.duckdb_factory
                             .invalidate_file_instance(path.clone())
                             .await;
 
-                        let dataset_name = source.name().to_string();
-                        let fold_path = path.clone();
-                        let fold_error = match tokio::task::spawn_blocking(move || {
-                            fold_duckdb_wal_into_database(&fold_path)
-                        })
-                        .await
-                        {
-                            Ok(Ok(())) => None,
-                            Ok(Err(error)) => Some(error.to_string()),
-                            Err(error) => Some(error.to_string()),
-                        };
-
-                        if let Some(error) = fold_error {
-                            let message = skipped_pre_recreation_snapshot_wal_warning(
-                                &dataset_name,
-                                &path,
-                                &error,
-                            );
-                            tracing::warn!("{message}");
-                        } else {
-                            snapshot_before_recreate(
-                                acceleration,
-                                source,
-                                runtime_acceleration::snapshot::AccelerationLayout::file(
-                                    PathBuf::from(&path),
-                                ),
-                                AccelerationEngine::DuckDB,
-                                Arc::new(arrow_schema::Schema::empty()),
-                                None,
-                                resolved_refresh_mode(source, acceleration),
-                            )
-                            .await;
-                        }
+                        snapshot_before_recreate(
+                            acceleration,
+                            source,
+                            runtime_acceleration::snapshot::AccelerationLayout::file(
+                                PathBuf::from(&path),
+                            ),
+                            AccelerationEngine::DuckDB,
+                            Arc::new(arrow_schema::Schema::empty()),
+                            None,
+                            resolved_refresh_mode(source, acceleration),
+                        )
+                        .await;
                     }
 
                     // Pre-recreation reads the local checkpoint through the shared
@@ -4089,113 +4041,5 @@ mod tests {
                 "DuckDB `{sql}` and the registered Spark concat must agree ({label})"
             );
         }
-    }
-
-    fn duckdb_wal_sidecar_path(database_path: &std::path::Path) -> std::path::PathBuf {
-        let mut wal = database_path.as_os_str().to_os_string();
-        wal.push(".wal");
-        std::path::PathBuf::from(wal)
-    }
-
-    fn count_rows_in_duckdb_file(path: &std::path::Path) -> i64 {
-        let connection = duckdb::Connection::open(path).expect("open DuckDB file");
-        connection
-            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
-            .expect("count rows")
-    }
-
-    /// Writes a table whose schema is in the main file and whose rows are left
-    /// in the write-ahead log — the unclean-shutdown shape a `file_create`
-    /// snapshot would otherwise copy without folding.
-    fn write_duckdb_with_wal_resident_rows(path: &std::path::Path, rows: i32) {
-        let connection = duckdb::Connection::open(path).expect("open DuckDB file");
-        connection
-            .execute_batch(
-                "PRAGMA disable_checkpoint_on_shutdown;
-                 PRAGMA checkpoint_threshold='1TB';
-                 CREATE TABLE t(id INTEGER);
-                 CHECKPOINT;",
-            )
-            .expect("persist the empty table to the main file");
-        connection
-            .execute(
-                &format!("INSERT INTO t SELECT i FROM generate_series(1, {rows})"),
-                [],
-            )
-            .expect("insert rows that should remain in the write-ahead log");
-    }
-
-    /// A snapshot copies the `DuckDB` main file alone. After an unclean
-    /// shutdown, committed rows can live only in the write-ahead log; publishing
-    /// that file then deleting the live acceleration would make a stale snapshot
-    /// the store's current one. Folding with `CHECKPOINT` on an uncached
-    /// connection makes the copy complete. Raised by Copilot on #13477.
-    #[test]
-    fn folding_the_wal_makes_a_main_file_copy_complete() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let live = dir.path().join("acceleration.db");
-        let rows = 50;
-        write_duckdb_with_wal_resident_rows(&live, rows);
-
-        let wal = duckdb_wal_sidecar_path(&live);
-        assert!(
-            wal.exists(),
-            "expected a write-ahead log so this test can show a main-file-only copy is incomplete"
-        );
-
-        let copy_without_fold = dir.path().join("copy_without_fold.db");
-        std::fs::copy(&live, &copy_without_fold).expect("copy the main file before folding");
-        assert_eq!(
-            count_rows_in_duckdb_file(&copy_without_fold),
-            0,
-            "copying the main file without folding must omit WAL-resident rows"
-        );
-
-        let live_path = live.to_string_lossy();
-        super::fold_duckdb_wal_into_database(&live_path)
-            .expect("fold the write-ahead log into the main file");
-
-        let copy_after_fold = dir.path().join("copy_after_fold.db");
-        std::fs::copy(&live, &copy_after_fold).expect("copy the main file after folding");
-        assert_eq!(
-            count_rows_in_duckdb_file(&copy_after_fold),
-            i64::from(rows),
-            "a main-file copy after CHECKPOINT must include the WAL-resident rows"
-        );
-    }
-
-    #[test]
-    fn fold_refuses_a_file_that_is_not_a_duckdb_database() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("not-a-database.db");
-        std::fs::write(&path, b"not a DuckDB database").expect("write an unverifiable file");
-
-        let path_str = path.to_string_lossy();
-        super::fold_duckdb_wal_into_database(&path_str).expect_err(
-            "fold must refuse a file that is not a DuckDB database rather than publish it",
-        );
-    }
-
-    #[test]
-    fn skipped_wal_fold_warning_names_the_dataset_and_the_consequence() {
-        let message = super::skipped_pre_recreation_snapshot_wal_warning(
-            "orders",
-            "/data/accel.db",
-            "Could not set lock on file",
-        );
-
-        assert!(
-            message.contains("'orders'") && message.contains("'/data/accel.db'"),
-            "the warning must name the dataset and the file: {message}"
-        );
-        assert!(
-            message.contains("keeps its previously published contents")
-                && message.contains("could omit committed rows"),
-            "the warning must say the snapshot is skipped and why publishing would be wrong: {message}"
-        );
-        assert!(
-            message.contains("Cause: Could not set lock on file"),
-            "the warning must carry the fold failure: {message}"
-        );
     }
 }

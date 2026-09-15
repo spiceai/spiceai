@@ -1591,9 +1591,12 @@ impl SnapshotManager {
         lock_guard: OwnedMutexGuard<()>,
     ) -> Result<(u64, String), SnapshotUploadError> {
         // Step 0: Engine-specific live checkpoint while the lock is held.
-        // For SQLite/Turso this drains the WAL into the main file so that
-        // the subsequent `fs::copy` produces a self-contained snapshot.
-        // Default (no-op) for engines without WAL.
+        // For SQLite/Turso/DuckDB this drains the WAL into the main file so
+        // that the subsequent `fs::copy` produces a self-contained snapshot.
+        // Default (no-op) for engines without WAL. This is also how
+        // `snapshot_before_recreate` (file_create and schema recreate) folds
+        // DuckDB's log: both call `create_snapshot` rather than copying
+        // themselves.
         self.snapshot_engine
             .checkpoint_live(source_local_path, &self.dataset_name)
             .await
@@ -3566,7 +3569,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
     use object_store::{memory::InMemory, path::Path};
-    use std::{io::Write, path::PathBuf, sync::Arc, time::SystemTime};
+    use std::{path::PathBuf, sync::Arc, time::SystemTime};
     use tempfile::{NamedTempFile, TempDir};
     use tokio::fs;
     use tokio::sync::Mutex;
@@ -3629,10 +3632,10 @@ mod tests {
     }
 
     /// Writes a sample local accelerator file appropriate for the engine.
-    /// For `SQLite`/`Turso`, creates a real (empty) `SQLite` WAL-mode database
-    /// so that the engine's `checkpoint_live` hook can open it. For other
-    /// engines, writes opaque test bytes since no engine-side validation
-    /// runs against the file pre-snapshot.
+    /// For engines whose `checkpoint_live` opens the file (`SQLite`, Turso,
+    /// `DuckDB`), this must be a real database. For others, opaque test bytes
+    /// suffice because no engine-side validation runs against the file
+    /// pre-snapshot.
     fn write_sample_local_db(path: &std::path::Path, engine: &AccelerationEngine) {
         match engine {
             #[cfg(any(feature = "sqlite", feature = "turso"))]
@@ -3643,6 +3646,11 @@ mod tests {
                 conn.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY)", [])
                     .expect("create sample table");
                 drop(conn);
+            }
+            #[cfg(feature = "duckdb")]
+            AccelerationEngine::DuckDB => {
+                // `checkpoint_live` opens this file and runs `CHECKPOINT`.
+                drop(duckdb::Connection::open(path).expect("open sample duckdb"));
             }
             _ => {
                 std::fs::write(path, b"test snapshot content").expect("write test file");
@@ -4447,13 +4455,13 @@ mod tests {
     }
 
     fn temp_snapshot_file() -> (tempfile::TempPath, PathBuf) {
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file
-            .write_all(b"snapshot-bytes")
-            .expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
+        let temp_file = NamedTempFile::new().expect("create temp file");
         let temp_path = temp_file.into_temp_path();
         let local_path = temp_path.to_path_buf();
+        #[cfg(feature = "duckdb")]
+        write_sample_local_db(&local_path, &AccelerationEngine::DuckDB);
+        #[cfg(not(feature = "duckdb"))]
+        std::fs::write(&local_path, b"snapshot-bytes").expect("write temp snapshot");
         (temp_path, local_path)
     }
 
@@ -5005,12 +5013,7 @@ mod tests {
     #[tokio::test]
     async fn create_snapshot_streams_file_and_updates_metadata() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-bytes".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         let manager = build_manager(
@@ -5037,7 +5040,12 @@ mod tests {
             .bytes()
             .await
             .expect("read stored snapshot");
-        assert_eq!(stored_bytes.as_ref(), contents.as_slice());
+        let live_after = std::fs::read(&local_path).expect("read live file after snapshot");
+        assert_eq!(
+            stored_bytes.as_ref(),
+            live_after.as_slice(),
+            "the uploaded snapshot must be a copy of the live file after checkpoint_live"
+        );
 
         let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let metadata_bytes = store
@@ -5058,8 +5066,11 @@ mod tests {
         assert_eq!(dataset.current_snapshot_id, Some(0));
 
         let entry = dataset.snapshots.first().expect("snapshot entry");
-        assert_eq!(entry.snapshot_size, contents.len() as u64);
-        assert_eq!(entry.snapshot_checksum, compute_sha256_hex(&contents));
+        assert_eq!(entry.snapshot_size, stored_bytes.len() as u64);
+        assert_eq!(
+            entry.snapshot_checksum,
+            compute_sha256_hex(stored_bytes.as_ref())
+        );
         assert_eq!(
             entry.snapshot_checksum_algorithm,
             SNAPSHOT_CHECKSUM_ALGORITHM
@@ -5098,12 +5109,7 @@ mod tests {
     #[tokio::test]
     async fn create_snapshot_appends_schema_version_on_widening() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-bytes".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         let manager = build_manager(
@@ -5169,12 +5175,7 @@ mod tests {
     #[tokio::test]
     async fn create_snapshot_rejects_non_widening_schema_change() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-bytes".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         let manager = build_manager(
@@ -5229,12 +5230,7 @@ mod tests {
     #[tokio::test]
     async fn create_snapshot_stores_timestamp_metadata() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-with-timestamps".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         let manager = build_manager(
@@ -5291,12 +5287,7 @@ mod tests {
     #[tokio::test]
     async fn create_snapshot_omits_zero_timestamps() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-zero-timestamps".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         let manager = build_manager(
@@ -6534,12 +6525,7 @@ mod tests {
     #[tokio::test]
     async fn on_change_policy_skips_when_no_writes_occurred() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-on-change-no-writes".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         let manager = build_manager_with_on_change_policy(&store, local_path.clone(), &schema);
@@ -6578,12 +6564,7 @@ mod tests {
     #[tokio::test]
     async fn on_change_policy_skips_when_timestamp_matches_previous() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-on-change-duplicate".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
 
@@ -6637,12 +6618,7 @@ mod tests {
     #[tokio::test]
     async fn on_change_policy_creates_first_snapshot_with_valid_timestamp() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-on-change-first".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         // Use OnChange policy directly - no previous snapshot exists
@@ -6675,12 +6651,7 @@ mod tests {
     #[tokio::test]
     async fn on_change_policy_creates_snapshot_when_timestamp_differs() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-on-change-new-update".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
 
@@ -6736,12 +6707,7 @@ mod tests {
     #[tokio::test]
     async fn always_policy_creates_snapshot_even_when_no_writes() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-always-no-writes".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         let manager = build_manager(
@@ -6772,12 +6738,7 @@ mod tests {
     #[tokio::test]
     async fn force_creates_snapshot_when_no_metadata_exists() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-force-no-metadata".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         let schema = sample_schema();
         // Use OnChange policy which would normally skip when last_updated_at is None
@@ -6803,12 +6764,7 @@ mod tests {
     #[tokio::test]
     async fn force_creates_snapshot_when_metadata_exists_but_no_snapshots_for_dataset() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-force-no-dataset-snapshots".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         // Create metadata with a different dataset (not our test dataset)
         let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
@@ -6845,12 +6801,7 @@ mod tests {
     #[tokio::test]
     async fn force_creates_snapshot_when_metadata_has_snapshots_but_no_files_exist() {
         let store = Arc::new(InMemory::new());
-        let contents = b"snapshot-force-no-files".to_vec();
-        let mut temp_file = NamedTempFile::new().expect("create temp file");
-        temp_file.write_all(&contents).expect("write temp snapshot");
-        temp_file.flush().expect("flush temp snapshot");
-        let temp_path = temp_file.into_temp_path();
-        let local_path = temp_path.to_path_buf();
+        let (_keep, local_path) = temp_snapshot_file();
 
         // Create metadata that claims snapshots exist, but don't actually create the files
         let schema = sample_schema();

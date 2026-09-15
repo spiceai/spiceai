@@ -80,8 +80,8 @@ impl SnapshotEngineError {
 pub trait SnapshotEngine: Send + Sync {
     /// Hook invoked on the **live** accelerator file *before* it is copied to a
     /// temporary snapshot location. Engines that buffer writes outside the
-    /// primary file (e.g. SQLite/Turso WAL) should checkpoint here so that the
-    /// subsequent `fs::copy` produces a self-contained file.
+    /// primary file (e.g. `SQLite`/`Turso`/`DuckDB` WAL) should checkpoint here so
+    /// that the subsequent `fs::copy` produces a self-contained file.
     ///
     /// Default implementation is a no-op.
     ///
