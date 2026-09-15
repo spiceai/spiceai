@@ -117,6 +117,22 @@ pub enum SortKeyResolution {
     Unresolved { reason: String },
 }
 
+impl SortKeyResolution {
+    /// True when at least one `ORDER BY` term does not appear in the result, so
+    /// the rows cannot show the full sort key.
+    #[must_use]
+    pub fn hides_a_sort_term(&self) -> bool {
+        matches!(
+            self,
+            Self::Unresolved { .. }
+                | Self::Resolved {
+                    unresolved_suffix: Some(_),
+                    ..
+                }
+        )
+    }
+}
+
 /// A row that breaks the query's `ORDER BY`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SortOrderViolation {
@@ -902,24 +918,23 @@ impl UnprojectedSortLimit {
     }
 }
 
-/// The top-level `ORDER BY … LIMIT` of `sql`, when its first sort term is not a
-/// column of `schema`, the result's.
+/// The top-level `ORDER BY … LIMIT` of `sql`, when at least one sort term is not
+/// a column of `schema`, the result's.
 ///
 /// `Some` only for a single `SELECT` — no set operation, `DISTINCT` or `TOP` —
 /// with a top-level `ORDER BY` of expressions, an integer-literal `LIMIT`, and no
 /// `OFFSET`, `FETCH` or `LIMIT … BY`: the shape where appending the `ORDER BY`
-/// terms to the projection leaves the rows unchanged. `None` otherwise, including
-/// for a positional term such as `ORDER BY 1`.
+/// terms to the projection leaves the rows unchanged. Includes a resolved prefix
+/// with a hidden suffix (`ORDER BY visible, hidden`): ties on `visible` are not
+/// free when `hidden` distinguishes them. `None` otherwise, including for a
+/// positional term such as `ORDER BY 1`.
 #[must_use]
 pub fn unprojected_sort_limit(sql: &str, schema: &SchemaRef) -> Option<UnprojectedSortLimit> {
     let statement = parse_one_statement(sql)?;
     if has_nested_row_limit(&statement) {
         return None;
     }
-    if !matches!(
-        resolve_statement_sort_key(&statement, schema),
-        SortKeyResolution::Unresolved { .. }
-    ) {
+    if !resolve_statement_sort_key(&statement, schema).hides_a_sort_term() {
         return None;
     }
     let Statement::Query(mut query) = statement else {

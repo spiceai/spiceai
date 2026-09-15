@@ -1534,7 +1534,11 @@ fn compare_limit_results_allowing_cutoff_ties(
         },
         |parsed| sort_order::resolve_statement_sort_key(parsed, &left.schema()),
     );
-    let SortKeyResolution::Resolved { key, .. } = resolution else {
+    let SortKeyResolution::Resolved {
+        key,
+        unresolved_suffix,
+    } = resolution
+    else {
         return compare_query_result_batches(
             query_name,
             left_batches,
@@ -1542,6 +1546,17 @@ fn compare_limit_results_allowing_cutoff_ties(
             RowOrder::Preserved,
         );
     };
+    if unresolved_suffix.is_some() {
+        // A hidden sort term means ties on the visible prefix are not free.
+        // Compare the full rows so a payload mismatch reaches the keyed-reference
+        // fallback, which has every `ORDER BY` term.
+        return compare_query_result_batches(
+            query_name,
+            left_batches,
+            right_batches,
+            RowOrder::Multiset,
+        );
+    }
 
     let n = left.num_rows();
     let mut run_start = 0_usize;
@@ -2730,6 +2745,103 @@ mod test {
         ] {
             assert_eq!(unprojected_sort_limit(sql, &schema), None, "{sql}");
         }
+    }
+
+    #[test]
+    fn test_unprojected_sort_limit_includes_a_hidden_suffix() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let sql = "SELECT id, payload FROM t ORDER BY id, hidden LIMIT 2";
+        let sort_limit = unprojected_sort_limit(sql, &schema)
+            .expect("a hidden ORDER BY suffix must be read back with the result");
+        assert_eq!((sort_limit.limit, sort_limit.key_columns), (2, 2));
+        let keyed = sort_limit.keyed_sql(4);
+        assert!(
+            keyed.contains("__validation_sort_key_0") && keyed.contains("__validation_sort_key_1"),
+            "{keyed}"
+        );
+        assert!(keyed.contains("hidden"), "{keyed}");
+    }
+
+    #[test]
+    fn test_visible_prefix_cutoff_does_not_accept_rows_a_hidden_key_excludes() {
+        // ORDER BY id, hidden LIMIT 2: id=1 ties are not free when hidden
+        // distinguishes them. Reference kept (p1, p2) at hidden='a'; candidate
+        // kept (p3, p4) at hidden='b'.
+        let sql = "SELECT id, payload FROM t ORDER BY id, hidden LIMIT 2";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let id_payload = |payloads: &[&str]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 1])),
+                    Arc::new(StringArray::from(payloads.to_vec())),
+                ],
+            )
+            .expect("id/payload batch")
+        };
+        let reference = id_payload(&["p1", "p2"]);
+        let candidate = id_payload(&["p3", "p4"]);
+        let query = Query::new("mixed_sort".into(), sql.into(), false);
+        assert!(
+            matches!(
+                validate_against_reference_batches(
+                    &query,
+                    std::slice::from_ref(&candidate),
+                    std::slice::from_ref(&reference)
+                )
+                .expect("compare"),
+                QueryValidationResult::Fail(_)
+            ),
+            "visible-key ties must not accept a different payload pair"
+        );
+
+        let keyed_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+            Field::new("__validation_sort_key_0", DataType::Int64, false),
+            Field::new("__validation_sort_key_1", DataType::Utf8, false),
+        ]));
+        let keyed = RecordBatch::try_new(
+            keyed_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 1, 1])),
+                Arc::new(StringArray::from(vec!["p1", "p2", "p3", "p4"])),
+                Arc::new(Int64Array::from(vec![1, 1, 1, 1])),
+                Arc::new(StringArray::from(vec!["a", "a", "b", "b"])),
+            ],
+        )
+        .expect("keyed mixed-sort reference");
+        assert_eq!(
+            unprojected_sort_limit(sql, &schema).map(|s| (s.limit, s.key_columns)),
+            Some((2, 2))
+        );
+        assert_eq!(
+            validate_against_keyed_reference(
+                std::slice::from_ref(&candidate),
+                std::slice::from_ref(&keyed),
+                2,
+                2,
+                true
+            )
+            .expect("keyed candidate"),
+            Some(QueryValidationResult::Fail(
+                QueryValidationFailReason::RowNotAllowedByLimit {
+                    row_number: 1,
+                    row: r#"[Some("1"), Some("p3")]"#.to_string(),
+                }
+            ))
+        );
+        assert_eq!(
+            validate_against_keyed_reference(&[reference], &[keyed], 2, 2, true)
+                .expect("keyed reference"),
+            Some(QueryValidationResult::Pass)
+        );
     }
 
     #[test]
