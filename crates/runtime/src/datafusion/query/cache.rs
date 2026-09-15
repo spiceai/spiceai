@@ -167,6 +167,75 @@ pub(super) struct ServableEntry {
     revalidate: bool,
 }
 
+/// How age is judged when deciding whether a cached result may still be served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StalePolicy {
+    /// Past `item_ttl` is a miss. Used when no stale-while-revalidate window
+    /// is configured: the cache backend expires the entry at that age, and a
+    /// captured probe hit must not outlive it while waiting on the query runtime.
+    FreshOnly,
+    /// Past `item_ttl` is served stale and revalidated; past `item_ttl` plus
+    /// this window is a miss.
+    Window(std::time::Duration),
+    /// The request's `max-stale` has no value: serve however old the entry is.
+    AnyAge,
+}
+
+fn stale_policy(
+    cache_control: CacheControl,
+    stale_while_revalidate_ttl: Option<std::time::Duration>,
+) -> StalePolicy {
+    match cache_control {
+        CacheControl::MaxStale(_, Some(duration)) => StalePolicy::Window(duration),
+        CacheControl::MaxStale(_, None) => StalePolicy::AnyAge,
+        _ => match stale_while_revalidate_ttl {
+            Some(duration) => StalePolicy::Window(duration),
+            None => StalePolicy::FreshOnly,
+        },
+    }
+}
+
+/// Re-evaluate TTL / stale-while-revalidate age. Returns `false` when the
+/// entry must not be served. Not a cache lookup: the caller already holds
+/// the captured result.
+fn apply_age_eligibility(
+    entry: &mut ServableEntry,
+    ttl: std::time::Duration,
+    policy: StalePolicy,
+    now: std::time::Instant,
+) -> bool {
+    match policy {
+        StalePolicy::AnyAge => true,
+        StalePolicy::FreshOnly => {
+            if entry.cached_result.is_stale(ttl, now) {
+                tracing::debug!(
+                    "Cache entry is past `item_ttl` with no stale-while-revalidate window, treating as cache miss"
+                );
+                false
+            } else {
+                true
+            }
+        }
+        StalePolicy::Window(stale_duration) => {
+            let max_age = ttl.saturating_add(stale_duration);
+            if entry.cached_result.is_stale(max_age, now) {
+                tracing::debug!(
+                    "Cache entry is beyond stale-while-revalidate window (max_age: {max_age:?}), treating as cache miss"
+                );
+                return false;
+            }
+            if entry.cached_result.is_stale(ttl, now) {
+                tracing::debug!(
+                    "Cache entry is stale (beyond TTL), triggering background revalidation for stale-while-revalidate"
+                );
+                entry.cache_status = CacheStatus::CacheStaleWhileRevalidate;
+                entry.revalidate = true;
+            }
+            true
+        }
+    }
+}
+
 /// Looks `raw_key` up and decides whether the entry found may be served to a
 /// request with `cache_control`.
 ///
@@ -774,14 +843,23 @@ impl Query {
         } = hit;
 
         // Encoded hits hop onto the query runtime after the probe. Recheck
-        // the table-change clock at serve time so a refresh or DML that
-        // landed while it waited cannot be served as fresh. In-place hits
-        // are sequential on this task; the check is the same and cheap.
+        // TTL/SWR age and the table-change clock at serve time so an entry
+        // that waited past `item_ttl` (or past a refresh/DML) is not served
+        // as fresh. In-place hits are sequential on this task; the check is
+        // the same and cheap. This is not a second cache lookup.
         if let Some(provider) = self.df.results_cache_provider() {
+            let now = std::time::Instant::now();
+            let policy = stale_policy(
+                request_context.cache_control(),
+                provider.stale_while_revalidate_ttl(),
+            );
+            if !apply_age_eligibility(&mut entry, provider.ttl(), policy, now) {
+                return None;
+            }
             let validity = provider.entry_validity(
                 &entry.cached_result.input_tables,
                 entry.cached_result.read_started_at,
-                std::time::Instant::now(),
+                now,
             );
             if !apply_serve_time_table_clock(&mut entry, validity) {
                 return None;
@@ -1327,19 +1405,118 @@ mod tests {
     }
 
     fn dummy_servable_entry() -> ServableEntry {
-        let now = std::time::Instant::now();
+        dummy_servable_entry_cached_at(std::time::Instant::now())
+    }
+
+    fn dummy_servable_entry_cached_at(cached_at: std::time::Instant) -> ServableEntry {
         ServableEntry {
             cached_result: cache::result::query::CachedQueryResult::new_raw(
                 vec![],
                 Arc::new(Schema::empty()),
                 Arc::new(HashSet::new()),
-                now,
-                now,
+                cached_at,
+                cached_at,
             ),
             entry_validity: cache::EntryValidity::Valid,
             cache_status: CacheStatus::CacheHit,
             revalidate: false,
         }
+    }
+
+    #[test]
+    fn a_probed_entry_past_item_ttl_is_not_served() {
+        let now = std::time::Instant::now();
+        let mut entry = dummy_servable_entry_cached_at(now - Duration::from_millis(1_500));
+        assert!(
+            !apply_age_eligibility(
+                &mut entry,
+                Duration::from_secs(1),
+                StalePolicy::FreshOnly,
+                now,
+            ),
+            "an encoded hit that waited past item_ttl must not be served"
+        );
+    }
+
+    #[test]
+    fn a_probed_entry_inside_item_ttl_is_served() {
+        let now = std::time::Instant::now();
+        let mut entry = dummy_servable_entry_cached_at(now - Duration::from_millis(500));
+        assert!(apply_age_eligibility(
+            &mut entry,
+            Duration::from_secs(1),
+            StalePolicy::FreshOnly,
+            now,
+        ));
+        assert!(!entry.revalidate);
+        assert_eq!(entry.cache_status, CacheStatus::CacheHit);
+    }
+
+    #[test]
+    fn a_probed_entry_past_ttl_inside_the_stale_window_is_marked_for_revalidation() {
+        let now = std::time::Instant::now();
+        let mut entry = dummy_servable_entry_cached_at(now - Duration::from_millis(1_500));
+        assert!(apply_age_eligibility(
+            &mut entry,
+            Duration::from_secs(1),
+            StalePolicy::Window(Duration::from_secs(1)),
+            now,
+        ));
+        assert!(entry.revalidate);
+        assert_eq!(entry.cache_status, CacheStatus::CacheStaleWhileRevalidate);
+    }
+
+    #[test]
+    fn a_probed_entry_past_the_stale_window_is_not_served() {
+        let now = std::time::Instant::now();
+        let mut entry = dummy_servable_entry_cached_at(now - Duration::from_millis(2_500));
+        assert!(!apply_age_eligibility(
+            &mut entry,
+            Duration::from_secs(1),
+            StalePolicy::Window(Duration::from_secs(1)),
+            now,
+        ));
+    }
+
+    #[test]
+    fn a_max_stale_without_a_value_serves_an_old_probed_entry() {
+        let now = std::time::Instant::now();
+        let mut entry = dummy_servable_entry_cached_at(now - Duration::from_millis(1_500));
+        assert!(apply_age_eligibility(
+            &mut entry,
+            Duration::from_secs(1),
+            StalePolicy::AnyAge,
+            now,
+        ));
+    }
+
+    #[test]
+    fn stale_policy_matches_lookup_when_the_request_sets_max_stale() {
+        assert_eq!(
+            stale_policy(CacheControl::Cache(CacheKeyType::Default), None),
+            StalePolicy::FreshOnly
+        );
+        assert_eq!(
+            stale_policy(
+                CacheControl::Cache(CacheKeyType::Default),
+                Some(Duration::from_secs(1)),
+            ),
+            StalePolicy::Window(Duration::from_secs(1))
+        );
+        assert_eq!(
+            stale_policy(
+                CacheControl::MaxStale(CacheKeyType::Default, Some(Duration::from_secs(5))),
+                Some(Duration::from_secs(1)),
+            ),
+            StalePolicy::Window(Duration::from_secs(5))
+        );
+        assert_eq!(
+            stale_policy(
+                CacheControl::MaxStale(CacheKeyType::Default, None),
+                Some(Duration::from_secs(1)),
+            ),
+            StalePolicy::AnyAge
+        );
     }
 
     #[test]

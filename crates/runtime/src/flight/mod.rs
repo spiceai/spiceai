@@ -371,12 +371,18 @@ impl Service {
         // The schema is ready immediately. Batches are encoded as the Flight
         // response is polled so a ready result is never drained through `None`
         // at construction — that poll is what finishes query telemetry.
+        // Charge the queued schema (and later each inline message) against the
+        // query memory pool so the inline path is visible to
+        // `runtime.query.memory_limit` the same way the encode-task path is.
+        let account = EgressAccount::register(memory_pool, "flight_egress");
+        account.reserve_now(flight_data_size(&schema_flight_data));
         let stream = InlineFlightStream {
             pending: VecDeque::from([Ok(schema_flight_data)]),
             data_stream: Some(query_result.data),
             spawned: None,
             taken_bytes: 0,
             taken_batches: 0,
+            account,
             encode: Some(FlightEncodeArgs {
                 needs_view_cast,
                 schema,
@@ -384,7 +390,6 @@ impl Service {
                 dict_tracker,
                 options,
                 compression_context,
-                memory_pool: Arc::clone(memory_pool),
                 cpu_runtime,
                 request_context,
             }),
@@ -444,7 +449,6 @@ struct FlightEncodeArgs {
     dict_tracker: DictionaryTracker,
     options: IpcWriteOptions,
     compression_context: CompressionContext,
-    memory_pool: Arc<dyn MemoryPool>,
     cpu_runtime: Option<Handle>,
     request_context: Arc<RequestContext>,
 }
@@ -454,17 +458,34 @@ struct FlightEncodeArgs {
 ///
 /// The record-batch stream is never polled through `None` until this stream
 /// itself is polled: that is what keeps `finish_returned_output` on the
-/// consume path.
+/// consume path. Queued `FlightData` (the schema at construction, then each
+/// inline dictionary/batch) is charged against [`EgressAccount`] and released
+/// when the message is handed to tonic — the same accounting as the spawned
+/// encode path, including when this stream falls back to it.
 struct InlineFlightStream {
     pending: VecDeque<Result<FlightData, Status>>,
     data_stream: Option<datafusion::execution::SendableRecordBatchStream>,
     spawned: Option<FlightEncodeStream>,
     taken_bytes: usize,
     taken_batches: usize,
+    account: Arc<EgressAccount>,
     encode: Option<FlightEncodeArgs>,
 }
 
 impl InlineFlightStream {
+    fn queue_encoded(&mut self, flight_data: FlightData) {
+        self.account.reserve_now(flight_data_size(&flight_data));
+        self.pending.push_back(Ok(flight_data));
+    }
+
+    fn take_pending(&mut self) -> Option<Result<FlightData, Status>> {
+        let message = self.pending.pop_front()?;
+        if let Ok(flight_data) = &message {
+            self.account.release(flight_data_size(flight_data));
+        }
+        Some(message)
+    }
+
     fn spawn_remaining(&mut self, prepend: Option<RecordBatch>) -> Result<(), Status> {
         let Some(data_stream) = self.data_stream.take() else {
             return Err(Status::internal(
@@ -482,7 +503,11 @@ impl InlineFlightStream {
                 .boxed(),
             None => data_stream.boxed(),
         };
-        self.spawned = Some(spawn_flight_encode_stream(remaining, args));
+        self.spawned = Some(spawn_flight_encode_stream(
+            remaining,
+            args,
+            Arc::clone(&self.account),
+        ));
         Ok(())
     }
 }
@@ -499,7 +524,7 @@ impl Stream for InlineFlightStream {
             if let Some(spawned) = this.spawned.as_mut() {
                 return Pin::new(spawned).poll_next(cx);
             }
-            if let Some(message) = this.pending.pop_front() {
+            if let Some(message) = this.take_pending() {
                 return Poll::Ready(Some(message));
             }
             if inline_encode_budget_exhausted(this.taken_bytes, this.taken_batches) {
@@ -536,8 +561,10 @@ impl Stream for InlineFlightStream {
                         &mut args.compression_context,
                     ) {
                         Ok((dicts, batch_data)) => {
-                            this.pending.extend(dicts.into_iter().map(Ok));
-                            this.pending.push_back(Ok(batch_data));
+                            for dict in dicts {
+                                this.queue_encoded(dict);
+                            }
+                            this.queue_encoded(batch_data);
                         }
                         Err(status) => return Poll::Ready(Some(Err(status))),
                     }
@@ -584,6 +611,7 @@ impl Stream for InlineFlightStream {
 fn spawn_flight_encode_stream(
     data_stream: BoxStream<'static, Result<RecordBatch, DataFusionError>>,
     args: FlightEncodeArgs,
+    account: Arc<EgressAccount>,
 ) -> FlightEncodeStream {
     let FlightEncodeArgs {
         needs_view_cast,
@@ -592,15 +620,14 @@ fn spawn_flight_encode_stream(
         mut dict_tracker,
         options,
         mut compression_context,
-        memory_pool,
         cpu_runtime,
         request_context,
     } = args;
 
-    // Charge the encoded FlightData buffered for send against the query
-    // memory pool so egress memory is visible to `runtime.query.memory_limit`
-    // and applies back-pressure under real pressure.
-    let account = EgressAccount::register(&memory_pool, "flight_egress");
+    // Same `EgressAccount` as the inline encoder that handed this remainder
+    // over, so schema/batch bytes already charged stay on one reservation
+    // and messages this task queues are still visible to
+    // `runtime.query.memory_limit`.
     let encode_runtime = cpu_runtime.unwrap_or_else(Handle::current);
     let (tx, rx) = mpsc::channel::<Result<FlightData, Status>>(FLIGHT_ENCODE_CHANNEL_CAPACITY);
     let span = Span::current();
@@ -1614,5 +1641,118 @@ mod tests {
         assert_eq!(taken_batches, FLIGHT_INLINE_ENCODE_MAX_BATCHES);
         assert_eq!(taken_bytes, 0);
         assert!(inline_encode_budget_exhausted(taken_bytes, taken_batches));
+    }
+
+    /// The inline Flight path must charge queued schema/batch messages against
+    /// the query memory pool — the same `runtime.query.memory_limit` the encode
+    /// task already reserved against — and release them when the response is
+    /// consumed or dropped.
+    #[tokio::test]
+    async fn inline_flight_charges_queued_messages_against_the_memory_pool() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let items = vec![Ok(batch(
+            &schema,
+            vec![Arc::new(Int64Array::from(vec![Some(1), Some(2)])) as ArrayRef],
+        ))];
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024));
+        let data: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream::iter(items),
+        ));
+        let (response, _) = Service::query_result_to_flight_stream(
+            QueryResult::new(data, CacheStatus::CacheHit),
+            IpcWriteOptions::default(),
+            None,
+            &pool,
+            Arc::new(RequestContext::builder(Protocol::FlightSQL).build()),
+        );
+
+        assert!(
+            pool.reserved() > 0,
+            "the schema queued at construction must be charged against runtime.query.memory_limit"
+        );
+
+        let (messages, error) = sent(response).await;
+        assert!(error.is_none(), "the inline result must encode: {error:?}");
+        assert!(
+            messages.len() >= 2,
+            "schema plus at least one batch must be sent"
+        );
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "every queued FlightData reservation must be released once the response is consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unconsumed_inline_flight_stream_releases_egress() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let items = vec![Ok(batch(
+            &schema,
+            vec![Arc::new(Int64Array::from(vec![Some(1)])) as ArrayRef],
+        ))];
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024));
+        let data: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream::iter(items),
+        ));
+        let (response, _) = Service::query_result_to_flight_stream(
+            QueryResult::new(data, CacheStatus::CacheHit),
+            IpcWriteOptions::default(),
+            None,
+            &pool,
+            Arc::new(RequestContext::builder(Protocol::FlightSQL).build()),
+        );
+
+        assert!(pool.reserved() > 0);
+        drop(response);
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "dropping the response must free the schema reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawned_flight_encode_shares_the_inline_egress_account() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let items = vec![Ok(batch(
+            &schema,
+            vec![Arc::new(Int64Array::from(vec![Some(1)])) as ArrayRef],
+        ))];
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024));
+        let data: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream::iter(items).then(|item| async move {
+                tokio::task::yield_now().await;
+                item
+            }),
+        ));
+        let (response, _) = Service::query_result_to_flight_stream(
+            QueryResult::new(data, CacheStatus::CacheHit),
+            IpcWriteOptions::default(),
+            None,
+            &pool,
+            Arc::new(RequestContext::builder(Protocol::FlightSQL).build()),
+        );
+
+        assert!(
+            pool.reserved() > 0,
+            "the schema is charged before the encode task runs"
+        );
+        let (messages, error) = sent(response).await;
+        assert!(error.is_none(), "{error:?}");
+        assert!(!messages.is_empty());
+        assert_eq!(pool.reserved(), 0);
     }
 }

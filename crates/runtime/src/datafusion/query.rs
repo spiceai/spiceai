@@ -339,6 +339,14 @@ struct QueryLifetimeGuards {
     active_query_guard: registry::ActiveQueryGuard,
 }
 
+/// `runtime.task_history` / Zipkin span for one query, opened before the
+/// results-cache probe so lookup time is in the same duration as planning
+/// and execution.
+struct QuerySpans {
+    span: Span,
+    trace_span: Span,
+}
+
 impl Drop for QueryTimeoutTimerGuard {
     fn drop(&mut self) {
         self.handle.abort();
@@ -413,6 +421,34 @@ impl Query {
             timeout_timer_guard,
             active_query_guard,
         }
+    }
+
+    fn query_spans(&self, request_context: &RequestContext) -> QuerySpans {
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
+        let trace_span = correlation::begin_task_trace(&span, request_context);
+        QuerySpans { span, trace_span }
+    }
+
+    /// Record a timeout or cancellation that fired during the results-cache
+    /// probe, matching `run_internal`'s tracked error path: the query span
+    /// exists, the tracker is finished, and `runtime.task_history` gets the
+    /// error.
+    fn finish_probe_cancellation(
+        self,
+        request_context: &RequestContext,
+        spans: QuerySpans,
+        error: Error,
+    ) -> Result<QueryResult> {
+        let QuerySpans { span, trace_span } = spans;
+        let _trace = trace_span.enter();
+        let _task = span.enter();
+        tracing::error!(target: "task_history", parent: &span, "{error}");
+        self.finish_with_error(
+            request_context,
+            error.to_string(),
+            ErrorCode::QueryExecutionError,
+        );
+        Err(error)
     }
 
     fn flight_batch_size_config(request_context: &RequestContext) -> FlightBatchSize {
@@ -613,27 +649,41 @@ impl Query {
     pub async fn run(self) -> Result<QueryResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
         let guards = self.lifetime_guards(&request_context);
+        let spans = self.query_spans(&request_context);
 
         // Looked up on the runtime the request arrived on: a hit held as
         // batches needs no planning or execution, so it is served from here
         // rather than paying for the hop onto the query runtime. The probe
-        // is still under `runtime.query.timeout` and the request cancel token.
-        let probe = tokio::select! {
-            biased;
-            () = guards.cancel_token.cancelled() => {
-                return Err(guards.timeout_state.cancellation_error(&self.query_id.to_string()));
+        // is still under `runtime.query.timeout`, the request cancel token,
+        // and the same `sql_query` span as planning and execution.
+        let probe = async {
+            tokio::select! {
+                biased;
+                () = guards.cancel_token.cancelled() => {
+                    Err(guards.timeout_state.cancellation_error(&self.query_id.to_string()))
+                }
+                probe = self.probe_results_cache(&request_context) => Ok(probe),
             }
-            probe = self.probe_results_cache(&request_context) => probe,
+        }
+        .instrument(spans.span.clone())
+        .instrument(spans.trace_span.clone())
+        .await;
+        let probe = match probe {
+            Ok(probe) => probe,
+            Err(error) => {
+                return self.finish_probe_cancellation(&request_context, spans, error);
+            }
         };
         if let Some(runtime_handle) = self.df.cpu_runtime().cloned()
             && !probe.is_servable_in_place()
         {
             return self
-                .run_with_managed_runtime(request_context, runtime_handle, probe, guards)
+                .run_with_managed_runtime(request_context, runtime_handle, probe, guards, spans)
                 .await;
         }
 
-        self.run_internal(request_context, probe, guards).await
+        self.run_internal(request_context, probe, guards, spans)
+            .await
     }
 
     /// Submit a query for distributed execution via Ballista and return a handle.
@@ -1048,8 +1098,9 @@ impl Query {
         runtime_handle: Handle,
         probe: CacheProbe,
         guards: QueryLifetimeGuards,
+        spans: QuerySpans,
     ) -> Result<QueryResult> {
-        let span = Span::current();
+        let span = spans.span.clone();
 
         let runtime_request_context = Arc::clone(&request_context);
         let future_request_context = request_context;
@@ -1059,7 +1110,7 @@ impl Query {
             runtime_request_context,
             span,
             async move {
-                self.run_internal(future_request_context, probe, guards)
+                self.run_internal(future_request_context, probe, guards, spans)
                     .await
                     .map(|query_result| (query_result.cache_status, query_result.data))
             },
@@ -1084,16 +1135,13 @@ impl Query {
         request_context: Arc<RequestContext>,
         probe: CacheProbe,
         guards: QueryLifetimeGuards,
+        spans: QuerySpans,
     ) -> Result<QueryResult> {
         let query_start = std::time::Instant::now();
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
-
-        // Carries this query's trace id onto every log record it produces — its
-        // own and those of everything it reaches — for the whole of planning,
-        // execution and result streaming. Unlike `span` above, it survives
-        // `runtime.task_history.enabled: false`, which is the case that
-        // otherwise leaves a failure with nothing to correlate on.
-        let trace_span = correlation::begin_task_trace(&span, &request_context);
+        // Opened in `run` before the results-cache probe so lookup time is
+        // in `runtime.task_history` / Zipkin durations, and a timeout or
+        // cancel during the lookup still finishes the tracker.
+        let QuerySpans { span, trace_span } = spans;
 
         // Armed in `run` before the results-cache probe so the timer covers
         // the query's full lifetime — cache lookup, planning, admission wait,
