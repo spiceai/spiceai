@@ -3807,6 +3807,11 @@ mod tests {
         let cancel_token = CancellationToken::new();
         let df_q = Arc::clone(&df);
         let token_q = cancel_token.clone();
+        // `lifetime_guards` registers the query before the cache probe, so
+        // waiting on the cancel registry can cancel during the probe and
+        // never queue on this runtime. The hop is `spawn` of the driver
+        // in `run_record_batch_stream_on_runtime`; wait for that task.
+        let alive_before_query = query_runtime_handle.metrics().num_alive_tasks();
         let handle = tokio::spawn(async move {
             QueryBuilder::new("SELECT 43 AS value", df_q)
                 .query_id(query_id)
@@ -3817,16 +3822,14 @@ mod tests {
                 .map(|_q| ())
         });
 
-        let registry = df.query_cancel_registry();
-        for _ in 0..500 {
-            if registry
-                .list_all()
-                .iter()
-                .any(|info| info.query_id == query_id)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        let hop_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while query_runtime_handle.metrics().num_alive_tasks() <= alive_before_query {
+            assert!(
+                tokio::time::Instant::now() < hop_deadline,
+                "query driver was never queued on the blocked query runtime (alive={}, before={alive_before_query})",
+                query_runtime_handle.metrics().num_alive_tasks()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
         cancel_token.cancel();
         release.wait();
