@@ -27,7 +27,8 @@ use crate::accelerated::refresh_completion::{RefreshCompletion, RefreshRequestId
 use crate::accelerated::refresh_task::RefreshTask;
 use crate::accelerated::snapshots::{
     SnapshotCallback, canonical_checkpoint_schema, create_checkpoint_and_snapshot,
-    create_periodic_snapshot_callback, spawn_snapshot_interval_task,
+    create_periodic_snapshot_callback, publish_snapshot_on_refresh_completion,
+    spawn_snapshot_interval_task,
 };
 use crate::federated::FederatedTable;
 use arrow::datatypes::Schema;
@@ -35,7 +36,7 @@ use cache::Caching;
 use data_accelerator_api::BootstrapStatus;
 use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
-use datafusion::datasource::TableProvider;
+use datafusion::datasource::{TableProvider, TableType};
 use datafusion_expr::Expr;
 use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
@@ -87,6 +88,26 @@ pub struct Refresh {
     pub(crate) check_interval: Option<Duration>,
     pub(crate) max_jitter: Option<Duration>,
     pub sql: Option<RefreshSQL>,
+    /// The refresh SQL the snapshot fingerprint describes — `to_sql()` of the
+    /// Spicepod `acceleration.refresh_sql` this `Refresh` was first built from.
+    ///
+    /// `PATCH /v1/datasets/{name}/acceleration` replaces [`Self::sql`] without
+    /// updating that fingerprint. A later plain refresh has no request override,
+    /// so without this the runner would mark the patched rows configured and
+    /// publish them under the startup identity. After restart the Spicepod
+    /// produces that same fingerprint and bootstrap would accept the mismatch.
+    configured_sql: Option<String>,
+    /// Whether this run must actually re-materialize, rather than take the
+    /// "source unchanged since the last fetch" skip.
+    ///
+    /// Set when the run is the one that will re-establish provenance: the mark is
+    /// currently retracted and a full replacement is what would justify re-asserting it.
+    /// The skip path returns success without writing, so a skipped run would stamp rows
+    /// produced by an earlier overridden refresh as the configured definition's result and
+    /// let the next snapshot publish them under its identity. Forcing the fetch keeps
+    /// "this run succeeded" and "these rows are the configured definition applied to the
+    /// source" the same statement.
+    pub(crate) must_materialize: bool,
     /// Raw SQL string from an override request, not yet parsed.
     /// When set, this should be parsed into a `RefreshSQL` before use.
     pub(crate) override_sql_raw: Option<String>,
@@ -101,10 +122,26 @@ pub struct Refresh {
     /// Currently populated only for Arrow and `PartitionedArrow` accelerators;
     /// `DuckDB` and Cayenne apply retention in their own write paths.
     pub write_retention_sql_delete_expr: Option<Expr>,
+    /// Generation of the rows currently in the accelerator, and whether they are
+    /// the configured definition's result.
+    ///
+    /// Stated positively, and defaulting to `configured = false`, so that every
+    /// state this cell cannot vouch for declines a publish instead of authorising
+    /// one: a fresh process, a refresh in flight, and a refresh that failed or
+    /// panicked. The epoch advances when a refresh is dequeued (under the same
+    /// write mutex the snapshot path samples). A refresh scan stamps
+    /// attestation with that epoch, so a later generation's plan cannot
+    /// approve an earlier one. Ordinary queries do not record. See
+    /// [`super::materialization::MaterializationIdentity`].
+    ///
+    /// Shared with every clone of this `Refresh`, which is what lets the refresh
+    /// runner record provenance where the rows are written and the snapshot path
+    /// sample it where the rows are archived.
+    materialization: super::materialization::MaterializationIdentity,
 }
 
 /// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct RefreshOverrides {
     /// The SQL statement used for this refresh. Defaults to the `refresh_sql` specified in the spicepod, if any.
@@ -123,6 +160,21 @@ pub struct RefreshOverrides {
     )]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, example = "10s"))]
     pub max_jitter: Option<Duration>,
+}
+
+impl RefreshOverrides {
+    /// Whether these overrides change WHICH ROWS a refresh lands in the accelerator, and
+    /// so make the result something the configured definition does not describe.
+    ///
+    /// `sql` filters and projects the rows and `mode` decides whether they replace or
+    /// accumulate; `max_jitter` only moves when the refresh starts. An empty request body
+    /// changes nothing at all. Treating a timing-only override as definition-changing
+    /// would suspend snapshots until some later plain refresh — indefinitely for a
+    /// manually refreshed dataset.
+    #[must_use]
+    pub fn changes_materialization(&self) -> bool {
+        self.sql.is_some() || self.mode.is_some()
+    }
 }
 
 fn parse_max_jitter<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
@@ -191,8 +243,39 @@ impl Refresh {
 
     #[must_use]
     pub fn refresh_sql(mut self, sql: RefreshSQL) -> Self {
+        // First assignment is the Spicepod definition the snapshot fingerprint
+        // describes. Later [`Self::apply_runtime_refresh_sql`] (PATCH
+        // `/v1/datasets/{name}/acceleration`) replaces `sql` without touching
+        // this, so a subsequent plain refresh can tell it is no longer
+        // publishing the configured definition.
+        if self.configured_sql.is_none() {
+            self.configured_sql = Some(sql.to_sql());
+        }
         self.sql = Some(sql);
         self
+    }
+
+    /// Replace the live refresh SQL, as `PATCH /v1/datasets/{name}/acceleration` does.
+    ///
+    /// Retracts snapshot provenance: the Spicepod fingerprint this `Refresh` was
+    /// built from does not describe the new SQL, and the rows currently in the
+    /// accelerator were produced by the previous one. A later plain refresh
+    /// re-establishes provenance only if the live SQL again matches
+    /// [`Self::live_refresh_sql_matches_configured`].
+    ///
+    /// Does not advance the materialization epoch: no new run has started, so a
+    /// snapshot that already sampled this generation still pairs with the
+    /// attestation that produced these rows.
+    pub fn apply_runtime_refresh_sql(&mut self, sql: RefreshSQL) {
+        self.sql = Some(sql);
+        self.set_materialization_is_configured(false);
+    }
+
+    /// Whether live [`Self::sql`] is still the Spicepod definition the snapshot
+    /// fingerprint describes.
+    #[must_use]
+    pub fn live_refresh_sql_matches_configured(&self) -> bool {
+        self.sql.as_ref().map(RefreshSQL::to_sql) == self.configured_sql
     }
 
     /// Get the display SQL string for logging/status purposes.
@@ -234,6 +317,10 @@ impl Refresh {
     /// (this requires table name and schema context).
     #[must_use]
     pub fn with_overrides(mut self, overrides: &RefreshOverrides) -> Self {
+        // Deliberately does NOT record provenance. This runs when a refresh is dequeued,
+        // and the mark describes the rows currently in the accelerator — which are still
+        // the previous run's until this one finishes. `RefreshTaskRunner` publishes it on
+        // successful completion instead; see `set_materialization_is_configured`.
         if let Some(sql_str) = &overrides.sql {
             self.override_sql_raw = Some(sql_str.clone());
         }
@@ -244,6 +331,64 @@ impl Refresh {
             self.max_jitter = Some(max_jitter);
         }
         self
+    }
+
+    /// Records whether the rows now in the accelerator are the configured definition's
+    /// result, without advancing the materialization epoch.
+    ///
+    /// `RefreshTaskRunner` re-asserts this on successful completion of the epoch
+    /// [`Self::begin_materialization`] started, while holding the accelerator write
+    /// mutex — the same lock `create_checkpoint_and_snapshot` samples under. A
+    /// snapshot that sampled that epoch then requires an attestation stamped with
+    /// the same generation; see [`super::materialization::MaterializationIdentity`].
+    pub fn set_materialization_is_configured(&self, configured: bool) {
+        self.materialization.set_configured(configured);
+    }
+
+    /// Start a new materialization generation: increment the epoch and retract
+    /// `configured`.
+    ///
+    /// Called when a refresh is dequeued, while holding the accelerator write
+    /// mutex. The epoch is what stops a snapshot that already sampled the
+    /// previous generation from adopting this run's plan-shape attestation if a
+    /// later scan records a new shape after the mutex is released.
+    #[must_use]
+    pub fn begin_materialization(&self) -> u64 {
+        self.materialization.begin_refresh()
+    }
+
+    /// Whether the rows currently in the accelerator are known to be the configured
+    /// definition's result, and so may be published under its identity.
+    ///
+    /// Read while holding the accelerator write mutex — see `create_checkpoint_and_snapshot`.
+    /// Writers take that same mutex before changing the mark. Read outside it, the
+    /// answer can go stale between the check and the archive.
+    #[must_use]
+    pub fn materialization_is_configured(&self) -> bool {
+        self.materialization.is_configured()
+    }
+
+    /// Epoch and configured bit as one consistent pair. Sample under the
+    /// accelerator write mutex with the rows being archived.
+    #[must_use]
+    pub fn sample_materialization(&self) -> super::materialization::MaterializationSample {
+        self.materialization.sample()
+    }
+
+    /// Share this `Refresh`'s materialization identity with a view attestation
+    /// so the publish gate can match plan shape to the same generation.
+    #[must_use]
+    pub fn with_materialization_identity(
+        mut self,
+        identity: super::materialization::MaterializationIdentity,
+    ) -> Self {
+        self.materialization = identity;
+        self
+    }
+
+    #[must_use]
+    pub fn materialization_identity(&self) -> super::materialization::MaterializationIdentity {
+        self.materialization.clone()
     }
 
     /// Checks that the dataset's `time_column` exists in `schema` and that its
@@ -510,6 +655,8 @@ impl Default for Refresh {
             check_interval: None,
             max_jitter: None,
             sql: None,
+            configured_sql: None,
+            must_materialize: false,
             override_sql_raw: None,
             mode: RefreshMode::Full,
             period: None,
@@ -518,6 +665,7 @@ impl Default for Refresh {
             retry_max_attempts: None,
             caching_ttl: None,
             write_retention_sql_delete_expr: None,
+            materialization: super::materialization::MaterializationIdentity::new(),
         }
     }
 }
@@ -668,6 +816,19 @@ impl Refresher {
         self
     }
 
+    /// How to name this table in a user-facing snapshot message.
+    ///
+    /// The snapshot path is shared by datasets and views. An immediately
+    /// available view provider is a view; everything else is a dataset.
+    fn component_label(&self) -> &'static str {
+        match &*self.federated {
+            FederatedTable::Immediate(provider) if provider.table_type() == TableType::View => {
+                "view"
+            }
+            _ => "dataset",
+        }
+    }
+
     /// Synchronize further refreshes with an existing accelerated table after the initial load completes
     pub fn synchronize_with(&mut self, synchronized_table: SynchronizedTable) -> &mut Self {
         self.synchronize_with = Some(synchronized_table);
@@ -813,6 +974,7 @@ impl Refresher {
         acceleration_refresh_mode: AccelerationRefreshMode,
     ) -> super::Result<Option<tokio::task::JoinHandle<()>>> {
         let dataset_name = self.dataset_name.clone();
+        let component_label = self.component_label();
         let time_column = self.refresh.read().await.time_column.clone();
         let initial_refresh_delay = {
             let refresh = self.refresh.read().await;
@@ -881,6 +1043,7 @@ impl Refresher {
                             snapshot_manager.clone(),
                             Arc::clone(&self.accelerator_write_mutex),
                             dataset_name.clone(),
+                            component_label,
                             Arc::clone(&checkpoint_schema),
                             Arc::clone(&federated_schema),
                             Arc::clone(&self.runtime_status),
@@ -888,6 +1051,11 @@ impl Refresher {
                             Arc::clone(&self.last_updated_at),
                             Some(Arc::clone(&self.accelerator)),
                             Arc::clone(&self.refresh),
+                            // A changes stream returns below without building a
+                            // `RefreshTaskRunner`, so nothing would ever move the provenance
+                            // mark off its `false` default; and it accepts no request-scoped
+                            // override, so there is nothing to gate on.
+                            None,
                         ),
                         None,
                     ),
@@ -899,6 +1067,7 @@ impl Refresher {
                             snapshot_manager,
                             Arc::clone(&self.accelerator_write_mutex),
                             &self.dataset_name,
+                            component_label,
                             Arc::clone(&checkpoint_schema),
                             Arc::clone(&federated_schema),
                             Arc::clone(&self.runtime_status),
@@ -906,6 +1075,9 @@ impl Refresher {
                             Arc::clone(&self.last_updated_at),
                             Some(Arc::clone(&self.accelerator)),
                             Arc::clone(&self.refresh),
+                            // See the interval arm above: this stream has no runner to
+                            // maintain a provenance mark, and takes no overrides.
+                            None,
                         ),
                     ),
                 };
@@ -997,6 +1169,7 @@ impl Refresher {
                         snapshot_manager.clone(),
                         Arc::clone(&self.accelerator_write_mutex),
                         dataset_name.clone(),
+                        component_label,
                         Arc::clone(&checkpoint_schema),
                         Arc::clone(&federated_schema),
                         Arc::clone(&self.runtime_status),
@@ -1004,6 +1177,9 @@ impl Refresher {
                         Arc::clone(&self.last_updated_at),
                         Some(Arc::clone(&self.accelerator)),
                         Arc::clone(&self.refresh),
+                        // This path builds a `RefreshTaskRunner` below, which maintains the
+                        // mark, so an overridden refresh's rows are not published.
+                        Some(Arc::clone(&self.refresh)),
                     ),
                     false,
                 ),
@@ -1018,7 +1194,7 @@ impl Refresher {
 
         if create_checkpoint_snapshot_after_refresh && snapshot_manager.is_some() {
             tracing::info!(
-                "Snapshots for dataset {dataset_name} will be created after every refresh"
+                "Snapshots for {component_label} '{dataset_name}' will be created after every refresh"
             );
 
             // Spawn a task to create initial snapshot once runtime is ready
@@ -1043,18 +1219,17 @@ impl Refresher {
                         return;
                     }
                     if !bootstrap_status.is_bootstrapped() {
-                        let refresh_sql = refresh_clone
-                            .read()
-                            .await
-                            .sql
-                            .as_ref()
-                            .map(RefreshSQL::to_sql);
+                        let refresh_sql = {
+                            let refresh = refresh_clone.read().await;
+                            refresh.sql.as_ref().map(RefreshSQL::to_sql)
+                        };
                         create_checkpoint_and_snapshot(
                             &checkpointer,
                             snapshot_manager_clone.as_ref(),
                             &checkpoint_schema_clone,
                             &accelerator_write_mutex_clone,
                             &dataset_name_clone,
+                            component_label,
                             &last_updated_at_clone,
                             ForceCreate(true),
                             Some(&accelerator_clone),
@@ -1062,6 +1237,8 @@ impl Refresher {
                             // start-time checkpoint schema is current.
                             None,
                             refresh_sql.as_deref(),
+                            Some(&refresh_clone),
+                            true,
                         )
                         .await;
                     }
@@ -1156,19 +1333,33 @@ impl Refresher {
                             }
                         }
 
-                        if refresh_succeeded && checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
-                            let refresh_sql = refresh.read().await.sql.as_ref().map(RefreshSQL::to_sql);
+                        if refresh_succeeded && let Some(checkpointer) = &checkpointer {
+                            let refresh_sql = {
+                                let refresh = refresh.read().await;
+                                refresh.sql.as_ref().map(RefreshSQL::to_sql)
+                            };
+                            // Persist/retract the local checkpoint fingerprint on every
+                            // successful materialization. Interval and batch triggers
+                            // publish on their own cycle; passing the manager here is
+                            // what lets the checkpoint record (or retract) the stamp
+                            // even when this refresh does not publish.
                             create_checkpoint_and_snapshot(
                                 checkpointer,
                                 snapshot_manager.as_ref(),
                                 &checkpoint_schema,
                                 &snapshot_mutex,
                                 &dataset_name,
+                                component_label,
                                 &last_updated_at,
                                 ForceCreate(false),
                                 Some(&accelerator),
                                 None,
                                 refresh_sql.as_deref(),
+                                Some(&refresh),
+                                publish_snapshot_on_refresh_completion(
+                                    create_checkpoint_snapshot_after_refresh,
+                                    checkpoint_counting_enabled.load(Ordering::Acquire),
+                                ),
                             ).await;
                         }
 
@@ -1336,6 +1527,47 @@ async fn record_refresh_done(
 
 #[cfg(test)]
 mod tests {
+    /// Only the overrides that decide WHICH ROWS land in the accelerator suspend snapshot
+    /// publication. A timing-only override that counted would disable snapshots until some
+    /// later plain refresh — indefinitely for a manually refreshed dataset.
+    #[test]
+    fn only_row_shaping_overrides_change_the_materialization() {
+        use super::RefreshOverrides;
+
+        let empty = RefreshOverrides::default();
+        assert!(
+            !empty.changes_materialization(),
+            "an empty request body changes nothing"
+        );
+
+        let jitter_only = RefreshOverrides {
+            max_jitter: Some(Duration::from_secs(5)),
+            ..RefreshOverrides::default()
+        };
+        assert!(
+            !jitter_only.changes_materialization(),
+            "jitter moves when a refresh starts, not which rows it produces"
+        );
+
+        let sql = RefreshOverrides {
+            sql: Some("SELECT 1".to_string()),
+            ..RefreshOverrides::default()
+        };
+        assert!(
+            sql.changes_materialization(),
+            "refresh_sql filters the rows"
+        );
+
+        let mode = RefreshOverrides {
+            mode: Some(RefreshMode::Append),
+            ..RefreshOverrides::default()
+        };
+        assert!(
+            mode.changes_materialization(),
+            "refresh_mode decides whether rows replace or accumulate"
+        );
+    }
+
     use arrow::{
         array::{ArrowNativeTypeOp, RecordBatch, StringArray, StructArray, UInt64Array},
         datatypes::{DataType, Field, Fields, Schema},
@@ -1456,6 +1688,7 @@ mod tests {
             &self,
             _schema: &SchemaRef,
             _refresh_sql: Option<&str>,
+            _source_fingerprint: Option<&str>,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // Not needed for this test
             Ok(())
@@ -1486,6 +1719,12 @@ mod tests {
             &self,
         ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(self.stored_refresh_sql.clone())
+        }
+
+        async fn get_source_fingerprint(
+            &self,
+        ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
         }
 
         async fn delete(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

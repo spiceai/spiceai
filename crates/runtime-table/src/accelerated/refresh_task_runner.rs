@@ -39,6 +39,7 @@ use tokio::sync::{Mutex, RwLock};
 use super::refresh::Refresh;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use opentelemetry::KeyValue;
+use runtime_component::dataset::acceleration::RefreshMode;
 use spicepod::metric::Metrics;
 
 pub struct RefreshTaskRunnerBuilder {
@@ -187,6 +188,7 @@ impl RefreshTaskRunnerBuilder {
 
     #[must_use]
     pub fn build(self) -> RefreshTaskRunner {
+        let accelerator_write_mutex = Arc::clone(&self.accelerator_write_mutex);
         let mut refresh_task_builder = RefreshTask::builder(
             self.runtime_status,
             self.dataset_name.clone(),
@@ -194,7 +196,7 @@ impl RefreshTaskRunnerBuilder {
             self.federated_source,
             self.accelerator,
             self.io_runtime,
-            self.accelerator_write_mutex,
+            accelerator_write_mutex,
         )
         .with_disable_federation(self.disable_federation)
         .with_last_updated_at(Arc::clone(&self.last_updated_at))
@@ -234,6 +236,7 @@ impl RefreshTaskRunnerBuilder {
             dataset_name: self.dataset_name,
             refresh: self.refresh,
             refresh_task,
+            accelerator_write_mutex: self.accelerator_write_mutex,
             task: None,
         }
     }
@@ -247,6 +250,10 @@ pub struct RefreshTaskRunner {
     dataset_name: TableReference,
     refresh: Arc<RwLock<Refresh>>,
     refresh_task: Arc<RefreshTask>,
+    /// Same lock `create_checkpoint_and_snapshot` holds when it samples provenance.
+    /// Retract/restore take it first so a snapshot cannot publish the previous rows
+    /// under a newer attestation or fingerprint identity.
+    accelerator_write_mutex: Arc<Mutex<()>>,
     task: Option<JoinHandle<()>>,
 }
 
@@ -314,6 +321,7 @@ impl RefreshTaskRunner {
         let base_refresh = Arc::clone(&self.refresh);
 
         let refresh_task = Arc::clone(&self.refresh_task);
+        let accelerator_write_mutex = Arc::clone(&self.accelerator_write_mutex);
 
         self.task = Some(tokio::spawn(async move {
             let mut task_completion: Option<RefreshRunFuture> = None;
@@ -322,6 +330,8 @@ impl RefreshTaskRunner {
             // arriving mid-refresh replaces both together: the running future is
             // dropped by the `select!` below, so it never reports at all.
             let mut running_request: RefreshRequestId = 0;
+            // Provenance of the run in `task_completion`, asserted only once it succeeds.
+            let mut pending_configured = false;
 
             loop {
                 if let Some(task) = task_completion.take() {
@@ -330,6 +340,18 @@ impl RefreshTaskRunner {
                             match res {
                                 Ok(Ok(())) => {
                                     tracing::debug!("Dataset {dataset_name} refreshed successfully");
+                                    // Now, and only now, do the accelerator's rows come from
+                                    // this run, so this is when its provenance may be
+                                    // asserted. A failed or panicked run asserts nothing and
+                                    // leaves the mark retracted, which declines a publish of
+                                    // whatever rows survived it. Same write mutex the snapshot
+                                    // path holds when it samples the mark.
+                                    Self::set_materialization_under_write_mutex(
+                                        &base_refresh,
+                                        pending_configured,
+                                        &accelerator_write_mutex,
+                                    )
+                                    .await;
                                     if let Err(err) = notify_refresh_complete.send((running_request, Ok(()))).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
@@ -363,7 +385,8 @@ impl RefreshTaskRunner {
                         },
                         Some((request_id, overrides_opt)) = on_start_refresh.recv() => {
                             running_request = request_id;
-                            let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            let (request, configured) = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt, &accelerator_write_mutex).await;
+                            pending_configured = configured;
                             task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
                         }
                     }
@@ -371,7 +394,8 @@ impl RefreshTaskRunner {
                     select! {
                         Some((request_id, overrides_opt)) = on_start_refresh.recv() => {
                             running_request = request_id;
-                            let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            let (request, configured) = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt, &accelerator_write_mutex).await;
+                            pending_configured = configured;
                             task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
                         }
                         else => {
@@ -401,16 +425,90 @@ impl RefreshTaskRunner {
         &self.refresh_task
     }
 
-    /// Create a new [`Refresh`] based on defaults and overrides.
+    /// Writes [`Refresh::set_materialization_is_configured`] while holding the
+    /// accelerator write mutex — the same lock
+    /// [`super::snapshots::create_checkpoint_and_snapshot`] samples under.
+    async fn set_materialization_under_write_mutex(
+        refresh: &Arc<RwLock<Refresh>>,
+        configured: bool,
+        accelerator_write_mutex: &Arc<Mutex<()>>,
+    ) {
+        let _guard = accelerator_write_mutex.lock().await;
+        refresh
+            .read()
+            .await
+            .set_materialization_is_configured(configured);
+    }
+
+    /// Create a new [`Refresh`] based on defaults and overrides, and report what this run
+    /// would let us say about the accelerator's provenance if it succeeds.
+    ///
+    /// Also begins a new materialization generation (new epoch, `configured = false`),
+    /// because from here the accelerator's rows are being replaced and describe
+    /// nothing definite until the run finishes. Retracting up front is what makes
+    /// every window safe for the configured bit: a snapshot that lands mid-refresh,
+    /// or after a refresh that failed, finds "not known configured" and declines.
+    /// The epoch is what makes the window safe for attestation: a snapshot that
+    /// already sampled the previous generation under the write mutex cannot adopt
+    /// this run's plan shape. The caller re-asserts the mark only once the run has
+    /// actually succeeded.
+    ///
+    /// Retract waits for `accelerator_write_mutex` first. A snapshot already in
+    /// `create_checkpoint_and_snapshot` holds that lock through its provenance sample
+    /// *and* the publish-gate check, so it finishes against the previous identity. This
+    /// function returns — and the refresh scan that records a new view attestation can
+    /// start — only after that snapshot releases. A snapshot that arrives later finds
+    /// the mark retracted and declines.
+    ///
+    /// A run can only *establish* provenance if it replaces the whole accelerator. An
+    /// incremental run (`Append`, `Changes`) adds to what is already there, so a clean
+    /// incremental refresh on top of rows an override appended leaves those rows in place —
+    /// re-asserting provenance there would stamp the next snapshot as the configured
+    /// definition's result while it still contains rows that definition never produced.
+    /// Incremental runs therefore carry the provenance they inherited forward at best, and
+    /// only a full replace can restore it.
+    ///
+    /// A runtime `refresh_sql` PATCH is the same class of mismatch as a request-scoped
+    /// override: it changes which rows land without updating the Spicepod fingerprint
+    /// stamped at snapshot-manager construction. A later full refresh with no override
+    /// must not re-assert provenance until the live SQL matches that configured
+    /// definition again.
     async fn create_refresh_from_overrides(
         defaults: Arc<RwLock<Refresh>>,
         overrides_opt: Option<RefreshOverrides>,
-    ) -> Refresh {
-        let mut r = defaults.read().await.clone();
-        if let Some(overrides) = overrides_opt {
-            r = r.with_overrides(&overrides);
-        }
-        r
+        accelerator_write_mutex: &Arc<Mutex<()>>,
+    ) -> (Refresh, bool) {
+        // Mutex first, then the `Refresh` lock — same order as
+        // `create_checkpoint_and_snapshot`, so the two cannot deadlock.
+        let (r, inherited) = {
+            let _guard = accelerator_write_mutex.lock().await;
+            let r = defaults.read().await.clone();
+            let inherited = r.materialization_is_configured();
+            // Retract `configured` and bump the shared epoch; snapshot bind and
+            // view attestation sample that cell later — this site has no consumer.
+            let _ = r.begin_materialization();
+            (r, inherited)
+        };
+        let live_matches_configured = r.live_refresh_sql_matches_configured();
+        let (mut request, overridden) = match overrides_opt {
+            Some(overrides) => {
+                let overridden = overrides.changes_materialization();
+                (r.with_overrides(&overrides), overridden)
+            }
+            None => (r, false),
+        };
+        // `request.mode` is the mode this run will actually use, overrides applied.
+        let replaces_everything = matches!(request.mode, RefreshMode::Full);
+        let configured =
+            !overridden && live_matches_configured && (replaces_everything || inherited);
+        // Re-establishing provenance rather than carrying it forward: the mark is retracted
+        // and only a real full replacement earns it back. `RefreshTask::run_once` can return
+        // success from the unchanged-source skip without writing anything, which would stamp
+        // an earlier override's rows as the configured definition's result, so that run has
+        // to fetch. Where the mark is merely inherited the rows already carry it and the skip
+        // changes nothing.
+        request.must_materialize = configured && !inherited;
+        (request, configured)
     }
 
     fn wrap_refresh_future(refresh_task: Arc<RefreshTask>, request: Refresh) -> RefreshRunFuture {
@@ -438,5 +536,264 @@ impl RefreshTaskRunner {
 impl Drop for RefreshTaskRunner {
     fn drop(&mut self) {
         self.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RefreshTaskRunner;
+    use crate::accelerated::refresh::Refresh;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::sql::TableReference;
+    use runtime_component::dataset::acceleration::RefreshMode;
+    use runtime_datafusion::refresh_sql::{RefreshSQL, parse_refresh_sql};
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, RwLock};
+
+    fn write_mutex() -> Arc<Mutex<()>> {
+        Arc::new(Mutex::new(()))
+    }
+
+    fn orders_refresh_sql(sql: &str) -> RefreshSQL {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        parse_refresh_sql(TableReference::bare("orders"), sql, schema)
+            .expect("test refresh SQL should parse")
+            .0
+    }
+
+    /// `PATCH /v1/datasets/{name}/acceleration` replaces live `Refresh.sql` and
+    /// then a later full refresh arrives with no request override — the
+    /// transition Copilot traced. The runner must not mark that run configured:
+    /// the snapshot fingerprint is still the Spicepod definition.
+    #[tokio::test]
+    async fn patched_refresh_sql_cannot_publish_under_the_startup_fingerprint() {
+        let configured_sql = "SELECT * FROM orders WHERE region = 'us'";
+        let live_sql_after_patch = "SELECT * FROM orders WHERE region = 'eu'";
+
+        let refresh =
+            Refresh::new(RefreshMode::Full).refresh_sql(orders_refresh_sql(configured_sql));
+        refresh.set_materialization_is_configured(true);
+        let defaults = Arc::new(RwLock::new(refresh));
+
+        let (_request, before_patch) = RefreshTaskRunner::create_refresh_from_overrides(
+            Arc::clone(&defaults),
+            None,
+            &write_mutex(),
+        )
+        .await;
+        assert!(
+            before_patch,
+            "a full refresh of the Spicepod SQL must still be publishable"
+        );
+        defaults
+            .write()
+            .await
+            .set_materialization_is_configured(true);
+
+        {
+            let mut live = defaults.write().await;
+            live.apply_runtime_refresh_sql(orders_refresh_sql(live_sql_after_patch));
+            assert!(
+                !live.live_refresh_sql_matches_configured(),
+                "live_sql_after_patch must diverge from the Spicepod definition"
+            );
+        }
+
+        let (_request, configured) = RefreshTaskRunner::create_refresh_from_overrides(
+            Arc::clone(&defaults),
+            None,
+            &write_mutex(),
+        )
+        .await;
+
+        assert!(
+            !configured,
+            "a full refresh after PATCH /acceleration must not publish under the startup fingerprint"
+        );
+    }
+
+    #[tokio::test]
+    async fn restoring_configured_refresh_sql_can_reestablish_provenance() {
+        let configured_sql = "SELECT * FROM orders WHERE region = 'us'";
+        let refresh =
+            Refresh::new(RefreshMode::Full).refresh_sql(orders_refresh_sql(configured_sql));
+        let defaults = Arc::new(RwLock::new(refresh));
+
+        defaults
+            .write()
+            .await
+            .apply_runtime_refresh_sql(orders_refresh_sql(
+                "SELECT * FROM orders WHERE region = 'eu'",
+            ));
+        let (_request, after_patch) = RefreshTaskRunner::create_refresh_from_overrides(
+            Arc::clone(&defaults),
+            None,
+            &write_mutex(),
+        )
+        .await;
+        assert!(
+            !after_patch,
+            "precondition: the patched SQL must not be treated as configured"
+        );
+
+        defaults
+            .write()
+            .await
+            .apply_runtime_refresh_sql(orders_refresh_sql(configured_sql));
+        assert!(
+            defaults.read().await.live_refresh_sql_matches_configured(),
+            "restored live SQL must match the Spicepod definition"
+        );
+        let (_request, after_restore) = RefreshTaskRunner::create_refresh_from_overrides(
+            Arc::clone(&defaults),
+            None,
+            &write_mutex(),
+        )
+        .await;
+        assert!(
+            after_restore,
+            "PATCH back to the Spicepod SQL must let a later full refresh publish again"
+        );
+    }
+
+    fn configured_full_refresh() -> Refresh {
+        let refresh = Refresh::new(RefreshMode::Full).refresh_sql(orders_refresh_sql(
+            "SELECT * FROM orders WHERE region = 'us'",
+        ));
+        refresh.set_materialization_is_configured(true);
+        refresh
+    }
+
+    /// A snapshot that already holds `accelerator_write_mutex` must finish
+    /// sampling provenance (and the publish gate) before a newly dequeued
+    /// refresh can retract the mark or start the scan that records a new
+    /// attestation. Without taking that lock here, this test fails: retract
+    /// completes while the snapshot still holds the mutex.
+    #[tokio::test]
+    async fn provenance_retract_waits_for_the_accelerator_write_mutex() {
+        let unlocked = Arc::new(RwLock::new(configured_full_refresh()));
+        let (_request, configured) = RefreshTaskRunner::create_refresh_from_overrides(
+            Arc::clone(&unlocked),
+            None,
+            &write_mutex(),
+        )
+        .await;
+        assert!(
+            configured,
+            "control: an unlocked full refresh of the Spicepod SQL is still publishable"
+        );
+        assert!(
+            !unlocked.read().await.materialization_is_configured(),
+            "control: retract must be visible once the write mutex is free"
+        );
+
+        let defaults = Arc::new(RwLock::new(configured_full_refresh()));
+        let write_mutex = write_mutex();
+        let snapshot_guard = write_mutex.lock().await;
+        let retract = tokio::spawn({
+            let defaults = Arc::clone(&defaults);
+            let write_mutex = Arc::clone(&write_mutex);
+            async move {
+                RefreshTaskRunner::create_refresh_from_overrides(defaults, None, &write_mutex).await
+            }
+        });
+
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            assert!(
+                !retract.is_finished(),
+                "create_refresh_from_overrides must not retract provenance while a snapshot holds the write mutex"
+            );
+            assert!(
+                defaults.read().await.materialization_is_configured(),
+                "a snapshot holding the write mutex must still see the previous materialization as configured"
+            );
+        }
+
+        drop(snapshot_guard);
+        let (_request, configured) = retract
+            .await
+            .expect("retract task should finish after the snapshot releases the write mutex");
+        assert!(
+            configured,
+            "the blocked full refresh must still be treated as configured once it runs"
+        );
+        assert!(
+            !defaults.read().await.materialization_is_configured(),
+            "retract must run once the snapshot releases the write mutex"
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_restore_waits_for_the_accelerator_write_mutex() {
+        let defaults = Arc::new(RwLock::new(Refresh::new(RefreshMode::Full)));
+        let write_mutex = write_mutex();
+        let snapshot_guard = write_mutex.lock().await;
+        let restore = tokio::spawn({
+            let defaults = Arc::clone(&defaults);
+            let write_mutex = Arc::clone(&write_mutex);
+            async move {
+                RefreshTaskRunner::set_materialization_under_write_mutex(
+                    &defaults,
+                    true,
+                    &write_mutex,
+                )
+                .await;
+            }
+        });
+
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            assert!(
+                !restore.is_finished(),
+                "restoring provenance must wait for the snapshot's write mutex"
+            );
+            assert!(
+                !defaults.read().await.materialization_is_configured(),
+                "restore must not become visible while the snapshot holds the write mutex"
+            );
+        }
+
+        drop(snapshot_guard);
+        restore
+            .await
+            .expect("restore task should finish after the snapshot releases the write mutex");
+        assert!(
+            defaults.read().await.materialization_is_configured(),
+            "restore must be visible once the snapshot releases the write mutex"
+        );
+    }
+
+    #[tokio::test]
+    async fn dequeue_advances_the_materialization_epoch() {
+        let refresh = Refresh::new(RefreshMode::Full);
+        let first = refresh.begin_materialization();
+        refresh.set_materialization_is_configured(true);
+        let defaults = Arc::new(RwLock::new(refresh));
+
+        let before = defaults.read().await.sample_materialization();
+        assert!(before.configured);
+        assert_eq!(before.epoch, first);
+
+        let (_request, _configured) = RefreshTaskRunner::create_refresh_from_overrides(
+            Arc::clone(&defaults),
+            None,
+            &write_mutex(),
+        )
+        .await;
+
+        let after = defaults.read().await.sample_materialization();
+        assert!(
+            !after.configured,
+            "dequeue must retract configured with the new epoch"
+        );
+        assert_eq!(
+            after.epoch,
+            first + 1,
+            "dequeue must advance the epoch so a snapshot of the previous rows cannot adopt this run's attestation"
+        );
     }
 }

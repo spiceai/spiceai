@@ -25,13 +25,14 @@ use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
+use datafusion::catalog::Session;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, DataFusionError};
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::execution::context::SessionContext;
+use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, ident};
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
@@ -39,7 +40,42 @@ use tracing::Level;
 
 use crate::error::find_datafusion_root;
 
+/// Marker stored on a refresh [`datafusion::prelude::SessionConfig`].
+///
+/// View snapshot attestation records only when this extension is present, so
+/// an ordinary query — including `on_zero_results: use_source` fallback —
+/// cannot overwrite the plan shape that produced the accelerated rows.
+#[derive(Debug)]
+pub struct RefreshScanContext;
+
+/// Stamp `state` as a refresh execution. [`get_data`] does this for the
+/// session it plans against; the refresh `SessionContext` is stamped the
+/// same way so every scan on that context is a refresh scan.
+pub fn mark_refresh_scan(state: &mut SessionState) {
+    state
+        .config_mut()
+        .set_extension(Arc::new(RefreshScanContext));
+}
+
+/// Whether `session` is the context a refresh uses to read its source.
+#[must_use]
+pub fn session_is_refresh_scan(session: &dyn Session) -> bool {
+    session
+        .config()
+        .get_extension::<RefreshScanContext>()
+        .is_some()
+}
+
+fn refresh_session_state(ctx: &SessionContext) -> SessionState {
+    let mut state = ctx.state();
+    mark_refresh_scan(&mut state);
+    state
+}
+
 /// Gets data from a table provider and returns it as a stream of `RecordBatch`es.
+///
+/// The session used to plan this scan is marked as a refresh execution so
+/// view attestation can tell it from an ordinary query of the same provider.
 ///
 /// # Errors
 ///
@@ -53,6 +89,7 @@ pub async fn get_data(
     sql: Option<String>,
     filters: Vec<Expr>,
 ) -> Result<SendableRecordBatchStream, DataFusionError> {
+    let session = refresh_session_state(ctx);
     let mut df = match sql {
         None => {
             let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
@@ -69,10 +106,9 @@ pub async fn get_data(
                 .build()
                 .map_err(find_datafusion_root)?;
 
-            DataFrame::new(ctx.state(), logical_plan)
+            DataFrame::new(session, logical_plan)
         }
         Some(sql) => {
-            let session = ctx.state();
             let mut plan = session
                 .create_logical_plan(&sql)
                 .await
@@ -144,4 +180,28 @@ fn include_computed_columns(
         .data;
 
     Ok(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mark_refresh_scan, session_is_refresh_scan};
+    use datafusion::execution::context::SessionContext;
+
+    #[test]
+    fn unmarked_session_is_not_a_refresh_scan() {
+        let ctx = SessionContext::new();
+        assert!(!session_is_refresh_scan(&ctx.state()));
+    }
+
+    #[test]
+    fn marked_session_is_a_refresh_scan() {
+        let ctx = SessionContext::new();
+        let mut state = ctx.state();
+        mark_refresh_scan(&mut state);
+        assert!(session_is_refresh_scan(&state));
+        assert!(
+            !session_is_refresh_scan(&ctx.state()),
+            "marking a clone must not leak onto the unmarked context"
+        );
+    }
 }

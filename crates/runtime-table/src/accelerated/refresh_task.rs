@@ -73,7 +73,7 @@ use runtime_datafusion::extension::bytes_processed::BytesProcessedPhysicalOptimi
 use runtime_datafusion::is_spice_internal_dataset;
 use runtime_datafusion::managed_runtime::{self, ManagedRuntimeError};
 use runtime_datafusion::optimizer_rule::avoid_vector_columns_on_index::AvoidDerivedVectorColumnOnIndexRule;
-use runtime_datafusion::refresh_scan::get_data;
+use runtime_datafusion::refresh_scan::{get_data, mark_refresh_scan};
 use runtime_datafusion::refresh_sql;
 use runtime_datafusion::schema_provider::ensure_schema_exists;
 use runtime_datafusion::session_config::get_df_default_config;
@@ -700,10 +700,15 @@ impl RefreshTask {
         // previously-materialized rows (issue #11353). When an override is present, bypass the
         // skip check and reset the provider's cached version so the *next* plain refresh
         // re-materializes the full source instead of skipping against the narrowed data.
+        //
+        // `must_materialize` bypasses it for the same reason one step later: that run is the
+        // one re-establishing snapshot provenance, and the skip returns success without
+        // writing, so taking it would mark an earlier override's rows as the configured
+        // definition's result.
         if refresh.mode == RefreshMode::Full || refresh.mode == RefreshMode::Append {
             let table_provider = self.federated.table_provider().await;
 
-            if refresh.override_sql_raw.is_some() {
+            if refresh.override_sql_raw.is_some() || refresh.must_materialize {
                 data_components::refresh_skip::reset_refresh_skip_state_for_table_provider(
                     table_provider.as_ref(),
                 )
@@ -1866,6 +1871,10 @@ impl RefreshTask {
         state
             .config_mut()
             .set_extension(RequestContext::current(AsyncMarker::new().await));
+        // View snapshot attestation records only on a refresh session, so a
+        // later `on_zero_results: use_source` scan of the same provider cannot
+        // overwrite the plan that produced the rows.
+        mark_refresh_scan(&mut state);
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             tracing::error!("Unable to register JSON functions: {e}");

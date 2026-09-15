@@ -227,6 +227,7 @@ pub fn spawn_snapshot_interval_task(
     snapshot_manager: Option<Arc<SnapshotManager>>,
     accelerator_write_mutex: Arc<Mutex<()>>,
     dataset_name: TableReference,
+    component_label: &'static str,
     checkpoint_schema: Arc<Schema>,
     federated_schema: Arc<Schema>,
     runtime_status: Arc<RuntimeStatus>,
@@ -234,13 +235,19 @@ pub fn spawn_snapshot_interval_task(
     last_updated_at: Arc<AtomicI64>,
     accelerator: Option<Arc<dyn TableProvider>>,
     refresh: Arc<RwLock<Refresh>>,
+    // The refresh whose provenance mark gates publishing, or `None` for a path whose rows
+    // cannot come from a request-scoped refresh override. Only `RefreshTaskRunner` maintains
+    // that mark and it exists only on the refresher path, so passing a `changes` stream's
+    // `refresh` here would gate every snapshot on a mark left at its `false` default —
+    // skipping snapshots forever for exactly the streaming datasets this trigger serves.
+    provenance: Option<Arc<RwLock<Refresh>>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let interval_duration = snapshots_create_interval?;
     let checkpointer = checkpointer?;
     let snapshot_manager = snapshot_manager?;
 
     tracing::info!(
-        "Snapshots for dataset {dataset_name} will be created every {}s",
+        "Snapshots for {component_label} '{dataset_name}' will be created every {}s",
         interval_duration.as_secs()
     );
 
@@ -274,18 +281,21 @@ pub fn spawn_snapshot_interval_task(
             tokio::time::sleep(initial_delay).await;
         }
 
-        let refresh_sql = refresh
-            .read()
-            .await
-            .sql
-            .as_ref()
-            .map(super::refresh::RefreshSQL::to_sql);
+        let refresh_sql = {
+            let refresh = refresh.read().await;
+            refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql)
+        };
         create_checkpoint_and_snapshot(
             &checkpointer,
+            // Always passed; `create_checkpoint_and_snapshot` withholds it under the write
+            // mutex if the rows are not known to be the configured definition's result. The
+            // checkpoint still happens either way: the rows are real and worth recording
+            // locally even when no archive of them can carry that identity.
             Some(&snapshot_manager),
             &checkpoint_schema,
             &accelerator_write_mutex,
             &dataset_name,
+            component_label,
             &last_updated_at,
             // Force creation when interval already elapsed.
             // Even though this may create a snapshot identical to the last one, we do this to avoid
@@ -295,6 +305,8 @@ pub fn spawn_snapshot_interval_task(
             accelerator.as_ref(),
             Some(&federated_schema),
             refresh_sql.as_deref(),
+            provenance.as_ref(),
+            true,
         )
         .await;
 
@@ -306,23 +318,24 @@ pub fn spawn_snapshot_interval_task(
             // Wait for the next snapshot interval (accounting for time spent during previous snapshot creation)
             ticker.tick().await;
 
-            let refresh_sql = refresh
-                .read()
-                .await
-                .sql
-                .as_ref()
-                .map(super::refresh::RefreshSQL::to_sql);
+            let refresh_sql = {
+                let refresh = refresh.read().await;
+                refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql)
+            };
             create_checkpoint_and_snapshot(
                 &checkpointer,
                 Some(&snapshot_manager),
                 &checkpoint_schema,
                 &accelerator_write_mutex,
                 &dataset_name,
+                component_label,
                 &last_updated_at,
                 ForceCreate(false),
                 accelerator.as_ref(),
                 Some(&federated_schema),
                 refresh_sql.as_deref(),
+                provenance.as_ref(),
+                true,
             )
             .await;
         }
@@ -340,6 +353,7 @@ pub fn create_periodic_snapshot_callback(
     snapshot_manager: Option<Arc<SnapshotManager>>,
     accelerator_write_mutex: Arc<Mutex<()>>,
     dataset_name: &TableReference,
+    component_label: &'static str,
     checkpoint_schema: Arc<Schema>,
     federated_schema: Arc<Schema>,
     runtime_status: Arc<RuntimeStatus>,
@@ -347,13 +361,19 @@ pub fn create_periodic_snapshot_callback(
     last_updated_at: Arc<AtomicI64>,
     accelerator: Option<Arc<dyn TableProvider>>,
     refresh: Arc<RwLock<Refresh>>,
+    // The refresh whose provenance mark gates publishing, or `None` for a path whose rows
+    // cannot come from a request-scoped refresh override. Only `RefreshTaskRunner` maintains
+    // that mark and it exists only on the refresher path, so passing a `changes` stream's
+    // `refresh` here would gate every snapshot on a mark left at its `false` default —
+    // skipping snapshots forever for exactly the streaming datasets this trigger serves.
+    provenance: Option<Arc<RwLock<Refresh>>>,
 ) -> Option<SnapshotCallback> {
     match (checkpointer, snapshot_manager) {
         (Some(checkpointer), Some(snapshot_manager)) => {
             let dataset_name = dataset_name.clone();
 
             tracing::info!(
-                "Snapshots for dataset {dataset_name} will be created every {batches} batch updates"
+                "Snapshots for {component_label} '{dataset_name}' will be created every {batches} batch updates"
             );
 
             // Track number of processed batches since last snapshot
@@ -374,28 +394,30 @@ pub fn create_periodic_snapshot_callback(
             let accelerator_write_mutex_clone = Arc::clone(&accelerator_write_mutex);
             let accelerator_clone = accelerator.clone();
             let refresh_clone = Arc::clone(&refresh);
+            let provenance_clone = provenance.clone();
             tokio::spawn(async move {
                 if runtime_status.wait_for_ready().await == WaitOutcome::ShuttingDown {
                     return;
                 }
                 if !bootstrap_status.is_bootstrapped() {
-                    let refresh_sql = refresh_clone
-                        .read()
-                        .await
-                        .sql
-                        .as_ref()
-                        .map(super::refresh::RefreshSQL::to_sql);
+                    let refresh_sql = {
+                        let refresh = refresh_clone.read().await;
+                        refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql)
+                    };
                     create_checkpoint_and_snapshot(
                         &checkpointer_clone,
                         Some(&snapshot_manager_clone),
                         &checkpoint_schema_clone,
                         &accelerator_write_mutex_clone,
                         &dataset_name_clone,
+                        component_label,
                         &last_updated_at_clone,
                         ForceCreate(true),
                         accelerator_clone.as_ref(),
                         Some(&federated_schema_clone),
                         refresh_sql.as_deref(),
+                        provenance_clone.as_ref(),
+                        true,
                     )
                     .await;
                 }
@@ -417,6 +439,7 @@ pub fn create_periodic_snapshot_callback(
                 let last_updated_at = Arc::clone(&last_updated_at);
                 let accelerator = accelerator.clone();
                 let refresh = Arc::clone(&refresh);
+                let provenance = provenance.clone();
 
                 Box::pin(async move {
                     let mut batches_processed_value = batches_processed.write().await;
@@ -430,23 +453,24 @@ pub fn create_periodic_snapshot_callback(
                     if *batches_processed_value >= batches {
                         *batches_processed_value = 0;
 
-                        let refresh_sql = refresh
-                            .read()
-                            .await
-                            .sql
-                            .as_ref()
-                            .map(super::refresh::RefreshSQL::to_sql);
+                        let refresh_sql = {
+                            let refresh = refresh.read().await;
+                            refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql)
+                        };
                         create_checkpoint_and_snapshot(
                             &checkpointer,
                             Some(&snapshot_manager),
                             &checkpoint_schema,
                             &accelerator_write_mutex,
                             &dataset_name,
+                            component_label,
                             &last_updated_at,
                             ForceCreate(false),
                             accelerator.as_ref(),
                             Some(&federated_schema),
                             refresh_sql.as_deref(),
+                            provenance.as_ref(),
+                            true,
                         )
                         .await;
                     }
@@ -467,13 +491,57 @@ pub async fn create_checkpoint_and_snapshot(
     checkpoint_schema: &Arc<Schema>,
     accelerator_write_mutex: &Arc<Mutex<()>>,
     dataset_name: &TableReference,
+    component_label: &'static str,
     last_updated_at: &Arc<AtomicI64>,
     force_create: ForceCreate,
     accelerator: Option<&Arc<dyn TableProvider>>,
     federated_schema: Option<&Arc<Schema>>,
     refresh_sql: Option<&str>,
+    provenance: Option<&Arc<RwLock<Refresh>>>,
+    publish_snapshot: bool,
 ) {
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
+
+    // Asked HERE, under the write mutex, rather than by the caller before it: the mutex
+    // serialises this against the refresh that writes the rows *and* against the
+    // dequeue retract that begins a new generation. Inside the lock the rows and the
+    // sampled `(epoch, configured)` pair are consistent. Binding that epoch on the
+    // publish gate stops a later refresh generation's attestation from approving
+    // these rows. Attestation itself is recorded only from a refresh session, so
+    // an ordinary query (including `on_zero_results: use_source`) cannot replace
+    // the plan shape that produced these rows at the same epoch.
+    let (publishable, sampled_epoch) = match provenance {
+        Some(refresh) => {
+            let sample = refresh.read().await.sample_materialization();
+            (sample.configured, Some(sample.epoch))
+        }
+        // No provenance to consult (a path with no refresher, e.g. a CDC-fed accelerator
+        // whose rows are never produced by a request-scoped refresh).
+        None => (true, None),
+    };
+    if let (Some(manager), Some(epoch)) = (snapshot_manager, sampled_epoch) {
+        manager.bind_publish_epoch(epoch);
+    }
+    // Asked under the same write mutex as the rows: the stamp written into the
+    // local checkpoint is the identity of *these* rows. A withheld override
+    // retracts the previous stamp (`None`) so a later pre-recreation cannot
+    // publish override-B rows under remote snapshot A's fingerprint.
+    let configured_fingerprint = snapshot_manager.and_then(|manager| {
+        manager
+            .source_definition_fingerprint()
+            .map(ToString::to_string)
+    });
+    let persist_fingerprint =
+        checkpoint_source_fingerprint_to_persist(publishable, configured_fingerprint.as_deref());
+    let snapshot_manager = if publishable {
+        snapshot_manager
+    } else {
+        tracing::warn!(
+            "{}",
+            skipped_snapshot_unproven_definition_warning(component_label, dataset_name)
+        );
+        None
+    };
     // Re-derive the checkpoint schema from the LIVE accelerator schema when both
     // the accelerator and the federated (source) schema are available, so an
     // in-place / live schema evolution (e.g. Cayenne CDC) that widened the
@@ -489,59 +557,126 @@ pub async fn create_checkpoint_and_snapshot(
         checkpoint_schema
     };
     if let Err(e) = checkpointer
-        .checkpoint(checkpoint_schema, refresh_sql)
+        .checkpoint(checkpoint_schema, refresh_sql, persist_fingerprint)
         .await
     {
         if is_shutdown_cancellation(e.as_ref()) {
             // Expected under shutdown — reporting it at `warn` makes a clean stop
             // look like a failure. See `is_shutdown_cancellation`.
             tracing::debug!(
-                "Did not checkpoint dataset {dataset_name}: the runtime is shutting down ({e})"
+                "{}",
+                checkpoint_shutdown_message(component_label, dataset_name, &e)
             );
         } else {
-            tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
+            tracing::warn!(
+                "{}",
+                checkpoint_failure_message(component_label, dataset_name, &e)
+            );
         }
         return;
     }
 
-    if let Some(snapshot_manager) = snapshot_manager {
-        let updated_at = match last_updated_at.load(Ordering::Acquire) {
-            0 => None,
-            i => Some(i),
-        };
+    if !publish_snapshot {
+        drop(lock_guard);
+        return;
+    }
+    let Some(snapshot_manager) = snapshot_manager else {
+        drop(lock_guard);
+        return;
+    };
 
-        // Get the current row count from the accelerator using the `DataFrame` API.
-        // This must be done after checkpoint while holding the write lock to ensure atomicity.
-        let row_count = if let Some(accelerator) = accelerator {
-            get_row_count(accelerator, dataset_name).await
-        } else {
-            None
-        };
+    let updated_at = match last_updated_at.load(Ordering::Acquire) {
+        0 => None,
+        i => Some(i),
+    };
 
-        match snapshot_manager
-            .create_snapshot(
-                checkpoint_schema,
-                lock_guard,
-                updated_at,
-                row_count,
-                force_create,
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(e) if is_shutdown_cancellation(&e) => {
-                // The snapshot engines carry a cancelled `JoinError` up this path
-                // too, in the same shutdown window as the checkpoint above. Not a
-                // snapshot failure, so it is not counted as one either.
-                tracing::debug!(dataset = %dataset_name, error = %e, "Did not create snapshot: the runtime is shutting down");
-            }
-            Err(e) => {
-                let dataset_label = dataset_name.to_string();
-                snapshot_metrics::record_snapshot_failure(&dataset_label);
-                tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create snapshot");
-            }
+    // Get the current row count from the accelerator using the `DataFrame` API.
+    // This must be done after checkpoint while holding the write lock to ensure atomicity.
+    let row_count = if let Some(accelerator) = accelerator {
+        get_row_count(accelerator, dataset_name).await
+    } else {
+        None
+    };
+
+    match snapshot_manager
+        .create_snapshot(
+            checkpoint_schema,
+            lock_guard,
+            updated_at,
+            row_count,
+            force_create,
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(e) if is_shutdown_cancellation(&e) => {
+            // The snapshot engines carry a cancelled `JoinError` up this path
+            // too, in the same shutdown window as the checkpoint above. Not a
+            // snapshot failure, so it is not counted as one either.
+            tracing::debug!(dataset = %dataset_name, error = %e, "Did not create snapshot: the runtime is shutting down");
+        }
+        Err(e) => {
+            let dataset_label = dataset_name.to_string();
+            snapshot_metrics::record_snapshot_failure(&dataset_label);
+            tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create snapshot");
         }
     }
+}
+
+/// Whether a successful refresh should also publish an archive.
+///
+/// Interval and batch triggers publish on their own cycle. Every successful
+/// refresh still checkpoints so a later `file_create` cannot stamp override-B
+/// rows with fingerprint A that only lived in memory.
+pub(crate) fn publish_snapshot_on_refresh_completion(
+    create_checkpoint_snapshot_after_refresh: bool,
+    checkpoint_counting_enabled: bool,
+) -> bool {
+    create_checkpoint_snapshot_after_refresh && checkpoint_counting_enabled
+}
+
+/// The identity written with a local checkpoint.
+///
+/// When the rows are not known to be the configured definition (`publishable`
+/// is false — a request-scoped override), the previous stamp is retracted so
+/// a later pre-recreation cannot publish those rows as the configured
+/// definition. When they are, the configured fingerprint travels with the rows.
+fn checkpoint_source_fingerprint_to_persist(
+    publishable: bool,
+    configured_fingerprint: Option<&str>,
+) -> Option<&str> {
+    if publishable {
+        configured_fingerprint
+    } else {
+        None
+    }
+}
+
+/// Datasets and views share this path, so the wording uses `component_label`
+/// (`"dataset"` / `"view"`) rather than hard-coding one of them.
+fn skipped_snapshot_unproven_definition_warning(
+    component_label: &str,
+    name: &TableReference,
+) -> String {
+    format!(
+        "Skipped creating a snapshot of {component_label} '{name}', so its snapshot series keeps the previously published contents: the rows now in the acceleration are not known to be this {component_label}'s configured definition applied to its source"
+    )
+}
+
+fn checkpoint_shutdown_message(
+    component_label: &str,
+    name: &TableReference,
+    error: impl std::fmt::Display,
+) -> String {
+    format!("Did not checkpoint {component_label} '{name}': the runtime is shutting down ({error})")
+}
+
+fn checkpoint_failure_message(
+    component_label: &str,
+    name: &TableReference,
+    error: impl std::fmt::Display,
+) -> String {
+    format!("Failed to checkpoint {component_label} '{name}': {error}")
 }
 
 /// Gets the row count from the accelerator using the `DataFrame` API.
@@ -588,6 +723,91 @@ async fn get_row_count(
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};
+
+    #[test]
+    fn skipped_snapshot_warning_names_a_view_as_a_view() {
+        let name = TableReference::bare("orders_us");
+        let message = skipped_snapshot_unproven_definition_warning("view", &name);
+        assert!(
+            message.contains("view 'orders_us'"),
+            "a skipped view snapshot must name the view, got {message}"
+        );
+        assert!(
+            message.contains("this view's configured definition"),
+            "the skip reason must use the same component label, got {message}"
+        );
+        assert!(
+            !message.contains("dataset"),
+            "a view must not be reported as a dataset: {message}"
+        );
+    }
+
+    #[test]
+    fn skipped_snapshot_warning_still_names_a_dataset_as_a_dataset() {
+        let name = TableReference::bare("orders");
+        let message = skipped_snapshot_unproven_definition_warning("dataset", &name);
+        assert!(
+            message.contains("dataset 'orders'"),
+            "a skipped dataset snapshot must keep the dataset label, got {message}"
+        );
+        assert!(
+            message.contains("this dataset's configured definition"),
+            "the skip reason must use the same component label, got {message}"
+        );
+    }
+
+    /// After snapshot A is published, a request-scoped override can replace the
+    /// local rows with B while publication is withheld. The next checkpoint must
+    /// retract A's stamp; keeping it would let pre-recreation publish B as A.
+    #[test]
+    fn override_retracts_the_local_checkpoint_fingerprint() {
+        assert_eq!(
+            checkpoint_source_fingerprint_to_persist(false, Some("sha256:A")),
+            None,
+            "override-B rows must not keep remote/configured stamp A"
+        );
+        assert_eq!(
+            checkpoint_source_fingerprint_to_persist(true, Some("sha256:A")),
+            Some("sha256:A"),
+            "configured rows persist the identity that produced them"
+        );
+        assert_eq!(
+            checkpoint_source_fingerprint_to_persist(true, None),
+            None,
+            "a source with no definition has no stamp to persist"
+        );
+    }
+
+    #[test]
+    fn interval_and_batch_refreshes_checkpoint_without_publishing() {
+        assert!(
+            !publish_snapshot_on_refresh_completion(false, true),
+            "time_interval / batches publish on their own cycle"
+        );
+        assert!(
+            !publish_snapshot_on_refresh_completion(true, false),
+            "refresh-complete must not publish before counting starts"
+        );
+        assert!(
+            publish_snapshot_on_refresh_completion(true, true),
+            "refresh-complete publishes once counting is enabled"
+        );
+    }
+
+    #[test]
+    fn checkpoint_messages_do_not_hard_code_dataset() {
+        let name = TableReference::bare("orders_us");
+        let shutdown = checkpoint_shutdown_message("view", &name, "cancelled");
+        let failure = checkpoint_failure_message("view", &name, "disk full");
+        assert!(
+            shutdown.contains("view 'orders_us'") && !shutdown.contains("dataset"),
+            "checkpoint shutdown debug must use the component label: {shutdown}"
+        );
+        assert!(
+            failure.contains("view 'orders_us'") && !failure.contains("dataset"),
+            "checkpoint failure warning must use the component label: {failure}"
+        );
+    }
 
     /// A live (in-place) widening evolution moves the accelerator ahead of the
     /// start-time federated schema; the checkpoint must record the accelerator's

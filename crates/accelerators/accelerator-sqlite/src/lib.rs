@@ -463,7 +463,7 @@ impl DataAccelerator for SqliteAccelerator {
                 if file_path.exists() {
                     snapshot_before_recreate(
                         acceleration,
-                        &source.name().to_string(),
+                        source,
                         runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(
                             &path,
                         )),
@@ -473,6 +473,13 @@ impl DataAccelerator for SqliteAccelerator {
                         resolved_refresh_mode(source, acceleration),
                     )
                     .await;
+
+                    // Pre-recreation reads the local checkpoint through the shared
+                    // pool. Evict it before deleting the file, or the next open of
+                    // this path reuses connections bound to the removed inode.
+                    self.sqlite_factory
+                        .invalidate_file_instance(path.clone())
+                        .await;
 
                     tracing::warn!(
                         "SQLite acceleration mode is 'file_create', removing existing file: {}",

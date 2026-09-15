@@ -49,7 +49,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    EXPECTED_TABLES, ExecuteParams, MetastoreBackend, MetastoreValue, QueryParams, QueryRowParams,
+    EXPECTED_TABLES, ExecuteParams, MetastoreBackend, MetastoreTransaction, MetastoreValue,
+    QueryParams, QueryRowParams,
 };
 use crate::catalog::{CatalogError, CatalogResult};
 
@@ -238,20 +239,27 @@ fn make_absolute(rel_or_abs: &str, anchor: &Path) -> String {
 }
 
 /// Lookup `table_id` for the given dataset, returning `None` if not found.
-async fn lookup_table_id(
-    metastore: &impl MetastoreBackend,
+/// Resolve `dataset_name` to its table id **inside** an open transaction, so it is read
+/// from the same snapshot as the rows keyed by it. Reading it outside would let a
+/// drop-and-recreate between the two give a slice whose children belong to a table its
+/// own `cayenne_table` row no longer describes.
+async fn lookup_table_id_in(
+    txn: &dyn MetastoreTransaction,
     dataset_name: &str,
 ) -> CatalogResult<Option<String>> {
-    let rows = metastore
-        .query(
-            QueryParams {
-                sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?",
-                params: vec![MetastoreValue::Text(dataset_name.to_string())],
-            },
-            |row| row.get_string(0),
-        )
+    let rows = txn
+        .query_values(QueryParams {
+            sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?",
+            params: vec![MetastoreValue::Text(dataset_name.to_string())],
+        })
         .await?;
-    Ok(rows.into_iter().next())
+    Ok(rows
+        .into_iter()
+        .next()
+        .and_then(|values| match values.into_iter().next() {
+            Some(MetastoreValue::Text(id)) => Some(id),
+            _ => None,
+        }))
 }
 
 /// Export this dataset's rows from the metastore as a versioned slice.
@@ -269,7 +277,24 @@ pub async fn export_dataset(
     dataset_name: &str,
     data_dir_anchor: &Path,
 ) -> CatalogResult<DatasetMetastoreSlice> {
-    let table_id = lookup_table_id(metastore, dataset_name)
+    // ONE transaction for every read below, and that is a correctness requirement, not a
+    // performance one. The write path publishes atomically — `cayenne_table`'s snapshot
+    // pointer, the `cayenne_snapshot_file` manifest, deletion metadata and the inline
+    // corpus all move in a single commit — so reading them through separate autocommit
+    // statements can observe a state that never existed: a pointer from before a publish
+    // beside a manifest from after it, or a pointer to a snapshot whose manifest rows a
+    // compaction cleanup has already deleted. A slice built from a torn read restores a
+    // table whose manifest is empty for its own current snapshot, and an empty manifest
+    // makes the scan fall back to directory listing rather than fail — so the damage
+    // surfaces as wrong rows, not as an error.
+    //
+    // Costs a brief write lock on the SQLite backend (`BEGIN IMMEDIATE`); Turso's
+    // `BEGIN CONCURRENT` takes an MVCC snapshot and blocks nobody. Snapshots are created
+    // on a refresh boundary or a multi-minute interval, and the body is a handful of
+    // indexed reads, so serializing against the write path here is cheap.
+    let txn = metastore.begin_transaction().await?;
+
+    let table_id = lookup_table_id_in(txn.as_ref(), dataset_name)
         .await?
         .ok_or_else(|| CatalogError::Database {
             message: format!(
@@ -312,15 +337,18 @@ pub async fn export_dataset(
 
         let path_cols = path_columns_for_table(expected.name);
 
-        let rows: Vec<SliceRow> = metastore
-            .query(QueryParams { sql: &sql, params }, move |row| {
+        let rows: Vec<SliceRow> = txn
+            .query_values(QueryParams { sql: &sql, params })
+            .await?
+            .into_iter()
+            .map(|values| {
                 let mut out = Vec::with_capacity(n_columns);
-                for i in 0..n_columns {
-                    out.push(SliceValue::from(&row.get_value(i)?));
+                for value in values.iter().take(n_columns) {
+                    out.push(SliceValue::from(value));
                 }
-                Ok(out)
+                out
             })
-            .await?;
+            .collect();
 
         // Rewrite path columns to be relative to anchor. If `make_relative`
         // could not strip the anchor (path is outside `data_dir_anchor`), it
@@ -344,6 +372,10 @@ pub async fn export_dataset(
 
         tables.insert(expected.name.to_string(), rows);
     }
+
+    // Read-only, so there is nothing to persist — committing is how the snapshot (and,
+    // on SQLite, the write lock) is released deterministically rather than at drop.
+    txn.commit().await?;
 
     Ok(DatasetMetastoreSlice {
         format_version: SLICE_FORMAT_VERSION,

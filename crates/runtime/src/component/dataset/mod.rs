@@ -254,6 +254,42 @@ impl AccelerationSource for Dataset {
             snapshot_behavior,
         )
     }
+
+    fn component_label(&self) -> &'static str {
+        "dataset"
+    }
+
+    fn definition_fingerprint(
+        &self,
+    ) -> Option<runtime_acceleration::acceleration_source::SourceDefinition> {
+        // A dataset's stored rows ARE the result of an editable definition: `from:` names
+        // the table they are copied from, `acceleration.refresh_sql` filters and projects
+        // them, and the connector `params` decide how the source is read at all — a
+        // `json_pointer` picks a different element of the same document. Any of those can
+        // change what the rows mean while leaving the schema — the only thing snapshot
+        // metadata previously recorded — identical.
+        //
+        // Unstamped archives are refused. `snapshot_before_recreate` publishes the
+        // outgoing rows only when their producing fingerprint was persisted with the
+        // materialization and can be recovered; it must not stamp the newly loaded
+        // Spicepod onto old rows. After a same-schema `from:` / parameter change a
+        // later cold start must rebuild rather than serve those rows as current.
+        //
+        // This is the Spicepod definition the dataset was loaded from.
+        // `PATCH /v1/datasets/{name}/acceleration` can replace the live
+        // `Refresh.sql` without updating it; publication is then declined until
+        // a refresh runs with SQL that still matches this definition (see
+        // `Refresh::live_refresh_sql_matches_configured`).
+        let identity = crate::view::dataset_definition_identity_from_spec(&self.spec);
+        Some(
+            runtime_acceleration::acceleration_source::SourceDefinition {
+                fingerprint: crate::view::definition_fingerprint(&identity),
+                accept_unstamped: false,
+                materialization:
+                    runtime_acceleration::acceleration_source::MaterializationSource::SourceTable,
+            },
+        )
+    }
 }
 
 #[cfg(test)]
@@ -341,6 +377,25 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "The column reference \"(foo,bar\" is missing a closing parenthensis."
+        );
+    }
+
+    #[tokio::test]
+    async fn dataset_snapshot_identity_refuses_unstamped_archives() {
+        let dataset = create_dataset_with_params(HashMap::new()).await;
+        let definition =
+            runtime_acceleration::acceleration_source::AccelerationSource::definition_fingerprint(
+                &dataset,
+            )
+            .expect("every dataset stamps its snapshot identity");
+
+        assert!(
+            !definition.accept_unstamped,
+            "an unstamped dataset archive must not bootstrap under a new same-schema definition"
+        );
+        assert_eq!(
+            definition.materialization,
+            runtime_acceleration::acceleration_source::MaterializationSource::SourceTable
         );
     }
 

@@ -644,6 +644,34 @@ mod tests {
     }
 
     #[test]
+    fn a_dataset_parses_snapshots_consistency_accept_skew() {
+        // Configuration-level coverage for the public Spicepod field: a dataset
+        // YAML may name `snapshots_consistency`. The runtime refuses a non-default
+        // value at load; parse must still accept the documented tokens.
+        let yaml = r"
+            name: orders
+            from: file:orders.parquet
+            acceleration:
+              engine: duckdb
+              snapshots: enabled
+              snapshots_consistency: accept_skew
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("dataset should deserialize");
+        let acceleration = dataset
+            .acceleration
+            .as_ref()
+            .expect("acceleration block should parse");
+        assert_eq!(
+            acceleration.snapshots_consistency,
+            crate::acceleration::SnapshotsConsistency::AcceptSkew
+        );
+        assert_eq!(
+            acceleration.snapshots,
+            crate::acceleration::SnapshotBehavior::Enabled
+        );
+    }
+
+    #[test]
     fn a_dataset_with_no_acceleration_block_reports_nothing() {
         let yaml = r"
             name: api_data

@@ -184,7 +184,7 @@ async fn test_postgres_checkpoint_set_schema_preserves_the_freshness_clock()
     ]));
 
     checkpointer
-        .checkpoint(&original, Some("SELECT 1"))
+        .checkpoint(&original, Some("SELECT 1"), None)
         .await
         .map_err(|e| anyhow!("Failed to seed the checkpoint: {e}"))?;
 
