@@ -26,10 +26,16 @@ use crate::{
 
 use anyhow::anyhow;
 use app::AppBuilder;
-use azure_storage_blobs::prelude::*;
 use bollard::secret::HealthConfig;
+use bytes::Bytes;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
+use object_store::{
+    ObjectStoreExt, PutPayload,
+    azure::{AzureAccessKey, AzureAuthorizer, AzureCredential, MicrosoftAzureBuilder},
+    client::{ClientOptions, HttpConnector, HttpRequestBody, ReqwestConnector},
+    path::Path,
+};
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use std::{sync::Arc, time::Duration};
@@ -42,6 +48,10 @@ use crate::{
 
 const AZURITE_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
 const AZURITE_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
+const AZURITE_ACCOUNT: &str = "devstoreaccount1";
+const AZURITE_ACCOUNT_KEY: &str =
+    "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+const AZURITE_CONTAINER: &str = "testcontainer";
 
 #[instrument]
 pub async fn start_azurite_docker_container() -> Result<RunningContainer<'static>, anyhow::Error> {
@@ -69,18 +79,47 @@ pub async fn start_azurite_docker_container() -> Result<RunningContainer<'static
 }
 
 pub async fn upload_sample_file() -> Result<(), anyhow::Error> {
-    let container_client = ClientBuilder::emulator().container_client("testcontainer");
-    container_client.create().await?;
+    create_azurite_container().await?;
     tracing::trace!("Storage container created");
     tracing::trace!("Uploading sample file");
     let sample_file = include_str!("../test_data/taxi_sample.csv");
-    let blob_client = container_client.blob_client("taxi_sample.csv");
-
-    blob_client
-        .put_block_blob(sample_file)
-        .content_type("text/csv")
-        .await?;
+    put_azurite_blob(
+        "taxi_sample.csv",
+        Bytes::copy_from_slice(sample_file.as_bytes()),
+    )
+    .await?;
     tracing::trace!("Sample file uploaded");
+    Ok(())
+}
+
+async fn create_azurite_container() -> Result<(), anyhow::Error> {
+    let credential = AzureCredential::AccessKey(AzureAccessKey::try_new(AZURITE_ACCOUNT_KEY)?);
+    let mut request = http::Request::put(format!(
+        "http://127.0.0.1:10000/{AZURITE_ACCOUNT}/{AZURITE_CONTAINER}?restype=container"
+    ))
+    .body(HttpRequestBody::empty())?;
+    AzureAuthorizer::new(&credential, AZURITE_ACCOUNT).authorize(&mut request);
+
+    let client =
+        ReqwestConnector::default().connect(&ClientOptions::default().with_allow_http(true))?;
+    let response = client.execute(request).await?;
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "Azurite container creation failed with status {}",
+            response.status()
+        ));
+    }
+    Ok(())
+}
+
+async fn put_azurite_blob(path: &str, contents: Bytes) -> Result<(), anyhow::Error> {
+    let store = MicrosoftAzureBuilder::new()
+        .with_container_name(AZURITE_CONTAINER)
+        .with_use_emulator(true)
+        .build()?;
+    store
+        .put(&Path::from(path), PutPayload::from(contents))
+        .await?;
     Ok(())
 }
 
@@ -234,8 +273,6 @@ async fn upload_parquet_file() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::parquet::arrow::ArrowWriter;
 
-    let container_client = ClientBuilder::emulator().container_client("testcontainer");
-
     // Create a simple parquet file in memory
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
@@ -249,11 +286,7 @@ async fn upload_parquet_file() -> Result<(), anyhow::Error> {
         writer.close()?;
     }
 
-    let blob_client = container_client.blob_client("test_data.parquet");
-    blob_client
-        .put_block_blob(buffer)
-        .content_type("application/octet-stream")
-        .await?;
+    put_azurite_blob("test_data.parquet", Bytes::from(buffer)).await?;
 
     tracing::trace!("Parquet file uploaded to Azure");
     Ok(())
