@@ -3622,7 +3622,7 @@
       "description": "Whether an accelerated view may publish or restore a snapshot of a materialization that spans more than one read of its sources.",
       "oneOf": [
         {
-          "description": "Snapshot only a materialization proven to come from a single read (default). A view whose query reads more than once is refused at load. Each later publish requires the read-shape recorded from the plan that executed the refresh.",
+          "description": "Snapshot only a materialization proven to come from a single read (default). A view whose query reads more than once is refused at load. Each later publish consumes the read-shape attested from the refresh scan that wrote the rows, bound to that materialization's epoch — not a fresh re-plan after the fact.",
           "type": "string",
           "const": "consistent_read"
         },

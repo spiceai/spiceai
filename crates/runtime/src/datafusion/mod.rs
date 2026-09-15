@@ -571,16 +571,12 @@ pub enum Error {
 
     #[snafu(display(
         "{}",
-        crate::view::snapshot_identity_unresolved_param_message(
-            component, name, param, store, key
-        )
+        found.refusal_message(component, name)
     ))]
     SnapshotsIdentityUnresolvedParam {
         component: &'static str,
         name: String,
-        param: String,
-        store: String,
-        key: String,
+        found: crate::view::UnresolvedClosureIdentityParam,
     },
 
     #[snafu(display(
@@ -757,9 +753,36 @@ fn ensure_snapshot_identity_params(
         return SnapshotsIdentityUnresolvedParamSnafu {
             component,
             name: name.to_string(),
-            param: unresolved.param,
-            store: unresolved.store,
-            key: unresolved.key,
+            found: crate::view::UnresolvedClosureIdentityParam {
+                source_component: component.to_string(),
+                source_name: name.to_string(),
+                param_field: "params",
+                unresolved,
+            },
+        }
+        .fail();
+    }
+    Ok(())
+}
+
+/// Refuses snapshot enablement when any identity `params` in a view's
+/// definition closure is a `${ store:key }` reference — the root view or a
+/// transitive dataset, view, or catalog.
+///
+/// See [`crate::view::first_unresolved_snapshot_identity_param_in_view_closure`].
+fn ensure_view_snapshot_identity_params(
+    name: &TableReference,
+    sql: &str,
+    params: &HashMap<String, String>,
+    app: &app::App,
+) -> Result<()> {
+    if let Some(found) = crate::view::first_unresolved_snapshot_identity_param_in_view_closure(
+        name, sql, params, app,
+    ) {
+        return SnapshotsIdentityUnresolvedParamSnafu {
+            component: "view",
+            name: name.to_string(),
+            found,
         }
         .fail();
     }
@@ -5189,7 +5212,10 @@ impl DataFusion {
         // Acceleration snapshots. A view's accelerated rows are the *result* of its
         // query, which brings two obligations a dataset does not have. A bootstrap must
         // only load an archive materialized from this same SQL — carried by
-        // `View::definition_fingerprint`, checked inside the snapshot manager. And a
+        // `View::definition_fingerprint`, checked inside the snapshot manager. Identity
+        // `params` are hashed as declared, so a `${ store:key }` reference on this
+        // view or any transitive dataset, view, or catalog is refused here rather
+        // than stamping a definition that cannot see a secret rotation. And a
         // publish must only capture a materialization that came from a single read,
         // because a query that reads its sources twice captures them at two different
         // positions and can store rows that never existed together; publishing that
@@ -5197,7 +5223,7 @@ impl DataFusion {
         // view; `ViewSnapshotPublishGate` then requires the attestation recorded from
         // the plan that executed the refresh, not a fresh re-plan at publish time.
         if !acceleration.snapshot_behavior.is_disabled() {
-            ensure_snapshot_identity_params("view", &table.to_string(), &view.params)?;
+            ensure_view_snapshot_identity_params(table, &view.sql, &view.params, &view.app)?;
         }
         match get_acceleration_layout(view, &self.accelerator_engine_registry).await {
             Ok(layout) if layout.is_enabled() => {
@@ -7976,6 +8002,45 @@ mod tests {
     }
 
     #[test]
+    fn secret_ref_on_a_dependency_dataset_refuses_view_snapshots() {
+        let mut docs =
+            spicepod::component::dataset::Dataset::new("s3://docs".to_string(), "docs".to_string());
+        docs.params = Some(spicepod::param::Params::from_string_map(HashMap::from([(
+            "json_pointer".to_string(),
+            "${secrets:pointer}".to_string(),
+        )])));
+        let app = app::AppBuilder::new("closure_test")
+            .with_dataset(docs)
+            .build();
+        let err = super::ensure_view_snapshot_identity_params(
+            &TableReference::bare("orders_us"),
+            "SELECT * FROM docs",
+            &HashMap::new(),
+            &app,
+        )
+        .expect_err("a transitive dataset secret ref must refuse the view's snapshots");
+        let message = err.to_string();
+        assert!(
+            matches!(err, Error::SnapshotsIdentityUnresolvedParam { .. }),
+            "expected an unresolved-param refusal, got: {err}"
+        );
+        for expected in [
+            "view",
+            "'orders_us'",
+            "dataset",
+            "'docs'",
+            "`params.json_pointer`",
+            "${secrets:pointer}",
+            "`snapshots: disabled` on view 'orders_us'",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal must contain {expected:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn env_ref_view_params_refuse_snapshots() {
         let params = HashMap::from([("json_pointer".to_string(), "${env:POINTER}".to_string())]);
         let err = super::ensure_snapshot_identity_params("view", "orders_us", &params)
@@ -7991,9 +8056,16 @@ mod tests {
         let message = SnapshotsIdentityUnresolvedParamSnafu {
             component: "view",
             name: "orders_us".to_string(),
-            param: "json_pointer".to_string(),
-            store: "secrets".to_string(),
-            key: "pointer".to_string(),
+            found: crate::view::UnresolvedClosureIdentityParam {
+                source_component: "view".to_string(),
+                source_name: "orders_us".to_string(),
+                param_field: "params",
+                unresolved: crate::view::UnresolvedSnapshotIdentityParam {
+                    param: "json_pointer".to_string(),
+                    store: "secrets".to_string(),
+                    key: "pointer".to_string(),
+                },
+            },
         }
         .build()
         .to_string();

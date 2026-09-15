@@ -519,97 +519,102 @@ pub(crate) fn view_definition_closure(
     params: &HashMap<String, String>,
     app: &app::App,
 ) -> String {
-    /// Every relation the SQL names, wherever it appears.
-    ///
-    /// Uses `visit_relations` rather than [`get_dependent_table_names`], which walks only
-    /// `FROM` relations and CTEs. That is the right answer for ordering view loads, but not
-    /// for an identity: a dependency reached only through an expression subquery
-    /// (`WHERE id IN (SELECT id FROM inner)`) would be missed, leaving the fingerprint
-    /// unchanged when that view's definition changes and accepting an archive of the rows it
-    /// used to produce. A relation named in a position this walk reports but planning does
-    /// not actually read costs at most an extra dependency in the identity.
-    fn dependencies_of(sql: &str) -> Vec<TableReference> {
-        use ::datafusion::sql::sqlparser::ast::visit_relations;
-        use std::ops::ControlFlow;
-
-        let Ok(statements) = parser::DFParser::parse_sql_with_dialect(
-            sql,
-            &::datafusion::sql::sqlparser::dialect::PostgreSqlDialect {},
-        ) else {
-            return Vec::new();
-        };
-        let Some(parser::Statement::Statement(statement)) = statements.front() else {
-            return Vec::new();
-        };
-
-        // A CTE name is not a dependency: it is defined by this very query, and its own
-        // body's relations are visited anyway.
-        let cte_names: HashSet<String> = {
-            let mut names = HashSet::new();
-            if let ast::Statement::Query(query) = statement.as_ref()
-                && let Some(with) = &query.with
-            {
-                for cte in &with.cte_tables {
-                    names.insert(cte.alias.name.value.to_lowercase());
-                }
-            }
-            names
-        };
-
-        let mut found = Vec::new();
-        let _ = visit_relations(statement.as_ref(), |relation| {
-            let name = relation.to_string();
-            if !cte_names.contains(&name.to_lowercase()) {
-                found.push(TableReference::parse_str(&name));
-            }
-            ControlFlow::<()>::Continue(())
-        });
-        found
-    }
-
-    // A Spicepod name and a name parsed out of SQL may spell the same table differently —
-    // `public.inner` declared, `inner` referenced. Compare the parsed forms, and treat a
-    // qualifier only as a constraint when BOTH sides state it. Matching too widely costs
-    // an occasional extra dependency in the fingerprint (a snapshot refused that need not
-    // have been); matching too narrowly drops a dependency, which is a snapshot ACCEPTED
-    // under a definition that no longer produces its rows.
-    //
-    // Because a bare reference can match more than one declaration (`public.inner` and
-    // `sales.inner` both answer to `inner`), EVERY match is folded in rather than the first.
-    // Picking one would mean picking the wrong one half the time: planning resolves the
-    // bare name through the default catalog and schema, which this code cannot see, so a
-    // change to the view actually being read would leave the fingerprint untouched whenever
-    // the arbitrary first match was some other view.
-    fn names_match(declared: &str, referenced: &TableReference) -> bool {
-        let declared = TableReference::parse_str(declared);
-        if declared.table() != referenced.table() {
-            return false;
-        }
-        match (declared.schema(), referenced.schema()) {
-            (Some(a), Some(b)) => a == b,
-            _ => true,
-        }
-    }
-
-    // A catalog is addressed by its registered name as the catalog qualifier
-    // (`sales.public.orders`) or, when the SQL only states two parts, as the
-    // first path segment (`sales.orders`). A bare table name is the default
-    // catalog's table, not a catalog, so it is not matched here: matching
-    // too widely would fold an unrelated catalog into every `FROM orders`.
-    fn catalog_matches(catalog_name: &str, referenced: &TableReference) -> bool {
-        match referenced.catalog() {
-            Some(catalog) => catalog == catalog_name,
-            None => referenced.schema() == Some(catalog_name),
-        }
-    }
-
     let mut closure: BTreeMap<String, String> = BTreeMap::new();
+    visit_view_definition_closure(name, sql, app, |member| match member {
+        ViewClosureMember::View { spec, sql } => {
+            // Keyed by the DECLARED name, so two views answering the same bare
+            // reference occupy separate entries instead of overwriting each other.
+            //
+            // Carries the dependency's value-shaping configuration for the same reason
+            // the root view's is carried: a view whose rows are read through another
+            // view's archive can change its embedding model or file format without
+            // touching a line of SQL.
+            closure.insert(
+                spec.name.clone(),
+                view_definition_identity(
+                    sql,
+                    &spec.columns,
+                    &spicepod_params_map(spec.params.as_ref()),
+                ),
+            );
+        }
+        ViewClosureMember::Dataset(dataset) => {
+            closure.insert(
+                dataset.name.clone(),
+                dataset_definition_identity(&dataset.from, &dataset_identity_fields(dataset)),
+            );
+        }
+        ViewClosureMember::Catalog(catalog) => {
+            // Keyed as `catalog:<declared name>` so a dataset or view of the same
+            // name occupies a separate entry. `SELECT * FROM sales.orders, sales`
+            // can match catalog `sales` and dataset `sales` in one closure; sharing
+            // a key would drop one identity, which is the direction that accepts a
+            // wrong archive. The prefix cannot collide with a Spicepod identifier
+            // (those reject `:`).
+            closure.insert(
+                format!("catalog:{}", catalog.name),
+                catalog_definition_identity(&catalog.from, &catalog_identity_fields(catalog)),
+            );
+        }
+    });
+
+    // The root view contributes its own value-shaping configuration too, not just its SQL —
+    // see `view_definition_identity`.
+    let mut definition = String::new();
+    push_len_prefixed(
+        &mut definition,
+        &view_definition_identity(sql, columns, params),
+    );
+    for (dependency_name, dependency_identity) in closure {
+        definition.push_str("\n-- depends on ");
+        push_len_prefixed(&mut definition, &dependency_name);
+        definition.push('\n');
+        // Already a `view_definition_identity` / `dataset_definition_identity` /
+        // `catalog_definition_identity`.
+        // Trimming it would collapse a last field that differs only by
+        // equal-length trailing whitespace (quoted YAML can preserve space vs tab).
+        push_len_prefixed(&mut definition, &dependency_identity);
+    }
+    definition
+}
+
+/// A declared Spicepod component that [`view_definition_closure`] hashes and
+/// that [`first_unresolved_snapshot_identity_param_in_view_closure`] checks
+/// for secret or env references.
+enum ViewClosureMember<'a> {
+    View {
+        spec: &'a spicepod::component::view::View,
+        sql: &'a str,
+    },
+    Dataset(&'a spicepod::component::dataset::Dataset),
+    Catalog(&'a spicepod::component::catalog::Catalog),
+}
+
+/// Walks the same dependency set [`view_definition_closure`] hashes.
+///
+/// Datasets are folded in even when a view of the same name already matched: a
+/// bare reference is resolved at planning time, so with a `sales.inner` view and
+/// a `public.inner` dataset it is the DEFAULT-schema dataset that `inner` reads.
+/// Fingerprinting only the view would leave the identity unchanged when that
+/// dataset is rebound. A dataset's own snapshot series cannot speak for rows
+/// already baked into a view's archive.
+///
+/// Catalogs contribute the same way. `sales.public.orders` is supplied by
+/// `app.catalogs`; rebinding catalog `sales` keeps the view SQL and schema
+/// identical. Folding only datasets would restore an archive of the old
+/// catalog's rows.
+fn visit_view_definition_closure(
+    name: &TableReference,
+    sql: &str,
+    app: &app::App,
+    mut visit: impl FnMut(ViewClosureMember<'_>),
+) {
     let mut pending = dependencies_of(sql);
     let mut seen: HashSet<String> = HashSet::from([name.to_string()]);
 
     while let Some(dependency) = pending.pop() {
         let key = dependency.to_string();
-        if !seen.insert(key.clone()) {
+        if !seen.insert(key) {
             continue;
         }
 
@@ -634,92 +639,119 @@ pub(crate) fn view_definition_closure(
             };
             if let Some(dependency_sql) = dependency_sql {
                 pending.extend(dependencies_of(&dependency_sql));
-                // Keyed by the DECLARED name, so two views answering the same bare
-                // reference occupy separate entries instead of overwriting each other.
-                //
-                // Carries the dependency's value-shaping configuration for the same reason
-                // the root view's is carried: a view whose rows are read through another
-                // view's archive can change its embedding model or file format without
-                // touching a line of SQL.
-                closure.insert(
-                    view.name.clone(),
-                    view_definition_identity(
-                        &dependency_sql,
-                        &view.columns,
-                        &view
-                            .params
-                            .as_ref()
-                            .map(spicepod::param::Params::as_string_map)
-                            .unwrap_or_default(),
-                    ),
-                );
+                visit(ViewClosureMember::View {
+                    spec: view,
+                    sql: &dependency_sql,
+                });
             }
         }
 
-        // Datasets contribute too, and are folded in even when a view of the same name
-        // already matched: a bare reference is resolved at planning time, so with a
-        // `sales.inner` view and a `public.inner` dataset it is the DEFAULT-schema dataset
-        // that `inner` reads. Fingerprinting only the view would leave the identity
-        // unchanged when that dataset is rebound, which restores an archive the current
-        // configuration no longer produces. Same reason every view candidate contributes
-        // rather than the first.
-        //
-        // A dataset's own snapshot series validates ITS archives,
-        // but it cannot speak for rows already baked into a view's archive: rebind
-        // `orders` to a same-schema table and `SELECT * FROM orders` keeps identical SQL
-        // while its materialized rows come from somewhere else entirely.
         for dataset in app
             .datasets
             .iter()
             .filter(|candidate| names_match(&candidate.name, &dependency))
         {
-            closure.insert(
-                dataset.name.clone(),
-                dataset_definition_identity(&dataset.from, &dataset_identity_fields(dataset)),
-            );
+            visit(ViewClosureMember::Dataset(dataset));
         }
 
-        // Catalogs contribute the same way datasets do. `sales.public.orders` is
-        // supplied by `app.catalogs`, not by a declared dataset; rebinding catalog
-        // `sales` to another endpoint keeps the view SQL and schema identical.
-        // Folding only datasets would restore an archive of the old catalog's rows.
-        //
-        // Keyed as `catalog:<declared name>` so a dataset or view of the same
-        // name occupies a separate entry. `SELECT * FROM sales.orders, sales`
-        // can match catalog `sales` and dataset `sales` in one closure; sharing
-        // a key would drop one identity, which is the direction that accepts a
-        // wrong archive. The prefix cannot collide with a Spicepod identifier
-        // (those reject `:`).
         for catalog in app
             .catalogs
             .iter()
             .filter(|candidate| catalog_matches(&candidate.name, &dependency))
         {
-            closure.insert(
-                format!("catalog:{}", catalog.name),
-                catalog_definition_identity(&catalog.from, &catalog_identity_fields(catalog)),
-            );
+            visit(ViewClosureMember::Catalog(catalog));
         }
     }
+}
 
-    // The root view contributes its own value-shaping configuration too, not just its SQL —
-    // see `view_definition_identity`.
-    let mut definition = String::new();
-    push_len_prefixed(
-        &mut definition,
-        &view_definition_identity(sql, columns, params),
-    );
-    for (dependency_name, dependency_identity) in closure {
-        definition.push_str("\n-- depends on ");
-        push_len_prefixed(&mut definition, &dependency_name);
-        definition.push('\n');
-        // Already a `view_definition_identity` / `dataset_definition_identity` /
-        // `catalog_definition_identity`.
-        // Trimming it would collapse a last field that differs only by
-        // equal-length trailing whitespace (quoted YAML can preserve space vs tab).
-        push_len_prefixed(&mut definition, &dependency_identity);
+/// Every relation the SQL names, wherever it appears.
+///
+/// Uses `visit_relations` rather than [`get_dependent_table_names`], which walks only
+/// `FROM` relations and CTEs. That is the right answer for ordering view loads, but not
+/// for an identity: a dependency reached only through an expression subquery
+/// (`WHERE id IN (SELECT id FROM inner)`) would be missed, leaving the fingerprint
+/// unchanged when that view's definition changes and accepting an archive of the rows it
+/// used to produce. A relation named in a position this walk reports but planning does
+/// not actually read costs at most an extra dependency in the identity.
+fn dependencies_of(sql: &str) -> Vec<TableReference> {
+    use ::datafusion::sql::sqlparser::ast::visit_relations;
+    use std::ops::ControlFlow;
+
+    let Ok(statements) = parser::DFParser::parse_sql_with_dialect(
+        sql,
+        &::datafusion::sql::sqlparser::dialect::PostgreSqlDialect {},
+    ) else {
+        return Vec::new();
+    };
+    let Some(parser::Statement::Statement(statement)) = statements.front() else {
+        return Vec::new();
+    };
+
+    // A CTE name is not a dependency: it is defined by this very query, and its own
+    // body's relations are visited anyway.
+    let cte_names: HashSet<String> = {
+        let mut names = HashSet::new();
+        if let ast::Statement::Query(query) = statement.as_ref()
+            && let Some(with) = &query.with
+        {
+            for cte in &with.cte_tables {
+                names.insert(cte.alias.name.value.to_lowercase());
+            }
+        }
+        names
+    };
+
+    let mut found = Vec::new();
+    let _ = visit_relations(statement.as_ref(), |relation| {
+        let name = relation.to_string();
+        if !cte_names.contains(&name.to_lowercase()) {
+            found.push(TableReference::parse_str(&name));
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    found
+}
+
+// A Spicepod name and a name parsed out of SQL may spell the same table differently —
+// `public.inner` declared, `inner` referenced. Compare the parsed forms, and treat a
+// qualifier only as a constraint when BOTH sides state it. Matching too widely costs
+// an occasional extra dependency in the fingerprint (a snapshot refused that need not
+// have been); matching too narrowly drops a dependency, which is a snapshot ACCEPTED
+// under a definition that no longer produces its rows.
+//
+// Because a bare reference can match more than one declaration (`public.inner` and
+// `sales.inner` both answer to `inner`), EVERY match is folded in rather than the first.
+// Picking one would mean picking the wrong one half the time: planning resolves the
+// bare name through the default catalog and schema, which this code cannot see, so a
+// change to the view actually being read would leave the fingerprint untouched whenever
+// the arbitrary first match was some other view.
+fn names_match(declared: &str, referenced: &TableReference) -> bool {
+    let declared = TableReference::parse_str(declared);
+    if declared.table() != referenced.table() {
+        return false;
     }
-    definition
+    match (declared.schema(), referenced.schema()) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
+}
+
+// A catalog is addressed by its registered name as the catalog qualifier
+// (`sales.public.orders`) or, when the SQL only states two parts, as the
+// first path segment (`sales.orders`). A bare table name is the default
+// catalog's table, not a catalog, so it is not matched here: matching
+// too widely would fold an unrelated catalog into every `FROM orders`.
+fn catalog_matches(catalog_name: &str, referenced: &TableReference) -> bool {
+    match referenced.catalog() {
+        Some(catalog) => catalog == catalog_name,
+        None => referenced.schema() == Some(catalog_name),
+    }
+}
+
+fn spicepod_params_map(params: Option<&spicepod::param::Params>) -> HashMap<String, String> {
+    params
+        .map(spicepod::param::Params::as_string_map)
+        .unwrap_or_default()
 }
 
 /// Appends `value` as `<byte length>:<value>`, so a value can never be mistaken for the
@@ -758,8 +790,9 @@ fn push_len_prefixed(out: &mut String, value: &str) {
 /// the identity — unchanged. This sync, secret-less path cannot see the resolved value
 /// (`get_params_with_secrets` runs where the connector is constructed), so a
 /// snapshot-enabled source whose identity `params` contain a `${ store:key }` reference
-/// is refused at load rather than accepting a stamp that cannot see that change. See
-/// [`first_unresolved_snapshot_identity_param`].
+/// is refused at load rather than accepting a stamp that cannot see that change. A
+/// snapshot-enabled view walks the same dependency closure this identity hashes —
+/// see [`first_unresolved_snapshot_identity_param_in_view_closure`].
 ///
 /// The cost of including params in full falls on SHARING a snapshot series between
 /// deployments, and it is significant: two spiced instances that materialize identical rows
@@ -801,9 +834,9 @@ pub(crate) fn dataset_definition_identity(from: &str, fields: &BTreeMap<String, 
 /// change which tables are visible.
 ///
 /// Secret and env references are hashed as the *reference*, the same way a
-/// dataset's are — see [`first_unresolved_snapshot_identity_param`]. They are
-/// not stripped from the identity: dropping them would make two catalogs that
-/// bind through different secret keys look the same.
+/// dataset's are — see [`first_unresolved_snapshot_identity_param_in_view_closure`].
+/// They are not stripped from the identity: dropping them would make two
+/// catalogs that bind through different secret keys look the same.
 #[must_use]
 pub(crate) fn catalog_definition_identity(from: &str, fields: &BTreeMap<String, String>) -> String {
     dataset_definition_identity(from, fields)
@@ -1172,6 +1205,53 @@ pub(crate) struct UnresolvedSnapshotIdentityParam {
     pub key: String,
 }
 
+/// An identity `params` entry that is a secret or env reference, located in a
+/// view's definition closure — the root view or a transitive dataset, view, or
+/// catalog it reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnresolvedClosureIdentityParam {
+    pub source_component: String,
+    pub source_name: String,
+    pub param_field: &'static str,
+    pub unresolved: UnresolvedSnapshotIdentityParam,
+}
+
+impl UnresolvedClosureIdentityParam {
+    fn is_on(&self, component: &str, name: &str) -> bool {
+        self.source_component == component && self.source_name == name
+    }
+
+    /// User-facing refusal when snapshots are enabled and this identity param
+    /// is a secret or env reference. Built as a pure function so a reword
+    /// cannot drop the resource, the consequence, or the docs link.
+    #[must_use]
+    pub(crate) fn refusal_message(&self, component: &str, name: &str) -> String {
+        let hashed = if self.is_on(component, name) {
+            format!("Spicepod `{}.{}`", self.param_field, self.unresolved.param)
+        } else {
+            format!(
+                "{} '{}' `{}.{}`",
+                self.source_component, self.source_name, self.param_field, self.unresolved.param
+            )
+        };
+        let fix = if self.is_on(component, name) {
+            format!(
+                "Set a literal value for `{}.{}`, or set `snapshots: disabled`",
+                self.param_field, self.unresolved.param
+            )
+        } else {
+            format!(
+                "Set a literal value for {} '{}' `{}.{}`, or set `snapshots: disabled` on {component} '{name}'",
+                self.source_component, self.source_name, self.param_field, self.unresolved.param
+            )
+        };
+        format!(
+            "Failed to enable acceleration snapshots for {component} '{name}': its snapshot identity hashes {hashed} as the `${{{}:{}}}` reference, so a change to the resolved value would not change the stamp and a cold start could restore rows that no longer match. {fix}. See: https://spiceai.org/docs/components/data-accelerators/snapshots",
+            self.unresolved.store, self.unresolved.key
+        )
+    }
+}
+
 /// The first identity `params` entry that is a secret or env reference, if any.
 ///
 /// Uses the same `${ store:key }` grammar as `Spicepod` secret expansion
@@ -1197,6 +1277,99 @@ pub(crate) fn first_unresolved_snapshot_identity_param(
         .min_by(|left, right| left.param.cmp(&right.param))
 }
 
+/// The first secret or env reference in a view's snapshot-identity closure.
+///
+/// Walks the same dependency set [`view_definition_closure`] hashes — the root
+/// view's `params` and every transitive view, dataset, and catalog — so a
+/// row-shaping `${secrets:pointer}` on a dependency cannot rotate without a
+/// refusal. Prefers the root view's own param when several match, then a
+/// stable `(component, name, field, param)` order.
+#[must_use]
+pub(crate) fn first_unresolved_snapshot_identity_param_in_view_closure(
+    name: &TableReference,
+    sql: &str,
+    params: &HashMap<String, String>,
+    app: &app::App,
+) -> Option<UnresolvedClosureIdentityParam> {
+    let root_name = name.to_string();
+    let mut found = Vec::new();
+
+    push_unresolved_identity_params(&mut found, "view", &root_name, "params", params);
+
+    visit_view_definition_closure(name, sql, app, |member| match member {
+        ViewClosureMember::View { spec, .. } => {
+            let params = spicepod_params_map(spec.params.as_ref());
+            push_unresolved_identity_params(&mut found, "view", &spec.name, "params", &params);
+        }
+        ViewClosureMember::Dataset(dataset) => {
+            let params = spicepod_params_map(dataset.params.as_ref());
+            push_unresolved_identity_params(
+                &mut found,
+                "dataset",
+                &dataset.name,
+                "params",
+                &params,
+            );
+        }
+        ViewClosureMember::Catalog(catalog) => {
+            let params = spicepod_params_map(catalog.params.as_ref());
+            push_unresolved_identity_params(
+                &mut found,
+                "catalog",
+                &catalog.name,
+                "params",
+                &params,
+            );
+            let dataset_params = spicepod_params_map(catalog.dataset_params.as_ref());
+            push_unresolved_identity_params(
+                &mut found,
+                "catalog",
+                &catalog.name,
+                "dataset_params",
+                &dataset_params,
+            );
+        }
+    });
+
+    found.into_iter().min_by(|left, right| {
+        closure_unresolved_sort_key(left, &root_name)
+            .cmp(&closure_unresolved_sort_key(right, &root_name))
+    })
+}
+
+fn closure_unresolved_sort_key<'a>(
+    found: &'a UnresolvedClosureIdentityParam,
+    root_name: &'a str,
+) -> (u8, &'a str, &'a str, &'a str, &'a str) {
+    let is_root = found.source_component == "view"
+        && found.source_name == root_name
+        && found.param_field == "params";
+    (
+        u8::from(!is_root),
+        found.source_component.as_str(),
+        found.source_name.as_str(),
+        found.param_field,
+        found.unresolved.param.as_str(),
+    )
+}
+
+fn push_unresolved_identity_params(
+    found: &mut Vec<UnresolvedClosureIdentityParam>,
+    source_component: &str,
+    source_name: &str,
+    param_field: &'static str,
+    params: &HashMap<String, String>,
+) {
+    if let Some(unresolved) = first_unresolved_snapshot_identity_param(params) {
+        found.push(UnresolvedClosureIdentityParam {
+            source_component: source_component.to_string(),
+            source_name: source_name.to_string(),
+            param_field,
+            unresolved,
+        });
+    }
+}
+
 /// User-facing refusal when snapshots are enabled and an identity param is a secret or
 /// env reference. Built as a pure function so a reword cannot drop the resource, the
 /// consequence, or the docs link.
@@ -1208,9 +1381,17 @@ pub(crate) fn snapshot_identity_unresolved_param_message(
     store: &str,
     key: &str,
 ) -> String {
-    format!(
-        "Failed to enable acceleration snapshots for {component} '{name}': its snapshot identity hashes Spicepod `params.{param}` as the `${{{store}:{key}}}` reference, so a change to the resolved value would not change the stamp and a cold start could restore rows that no longer match. Set a literal value for `params.{param}`, or set `snapshots: disabled`. See: https://spiceai.org/docs/components/data-accelerators/snapshots"
-    )
+    UnresolvedClosureIdentityParam {
+        source_component: component.to_string(),
+        source_name: name.to_string(),
+        param_field: "params",
+        unresolved: UnresolvedSnapshotIdentityParam {
+            param: param.to_string(),
+            store: store.to_string(),
+            key: key.to_string(),
+        },
+    }
+    .refusal_message(component, name)
 }
 
 pub(crate) fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReference> {
@@ -2222,6 +2403,188 @@ mod tests {
             assert_eq!(unresolved.key, "pg_host");
         }
 
+        fn view_with_params(
+            name: &str,
+            sql: &str,
+            params: &[(&str, &str)],
+        ) -> spicepod::component::view::View {
+            let mut view = spicepod::component::view::View::new(name.to_string());
+            view.sql = Some(sql.to_string());
+            view.params = Some(catalog_params(params));
+            view
+        }
+
+        fn dataset_with_params(
+            from: &str,
+            name: &str,
+            params: &[(&str, &str)],
+        ) -> spicepod::component::dataset::Dataset {
+            let mut dataset =
+                spicepod::component::dataset::Dataset::new(from.to_string(), name.to_string());
+            dataset.params = Some(catalog_params(params));
+            dataset
+        }
+
+        fn app_from(
+            views: Vec<spicepod::component::view::View>,
+            datasets: Vec<spicepod::component::dataset::Dataset>,
+            catalogs: Vec<spicepod::component::catalog::Catalog>,
+        ) -> app::App {
+            let mut builder = app::AppBuilder::new("closure_test");
+            for view in views {
+                builder = builder.with_view(view);
+            }
+            for dataset in datasets {
+                builder = builder.with_dataset(dataset);
+            }
+            for catalog in catalogs {
+                builder = builder.with_catalog(catalog);
+            }
+            builder.build()
+        }
+
+        /// Copilot `discussion_r4012714290`: the fingerprint hashes dependency
+        /// params as declared, so a secret on a transitive dataset is invisible
+        /// unless the load-time check walks the same closure.
+        #[test]
+        fn closure_detects_a_dependency_dataset_secret_ref() {
+            let outer = TableReference::bare("orders_us");
+            let app = app_from(
+                vec![],
+                vec![dataset_with_params(
+                    "s3://docs",
+                    "docs",
+                    &[("json_pointer", "${secrets:pointer}")],
+                )],
+                vec![],
+            );
+            let found = first_unresolved_snapshot_identity_param_in_view_closure(
+                &outer,
+                "SELECT * FROM docs",
+                &HashMap::new(),
+                &app,
+            )
+            .expect("a dependency dataset secret ref must be detected");
+            assert_eq!(found.source_component, "dataset");
+            assert_eq!(found.source_name, "docs");
+            assert_eq!(found.param_field, "params");
+            assert_eq!(found.unresolved.param, "json_pointer");
+            assert_eq!(found.unresolved.store, "secrets");
+            assert_eq!(found.unresolved.key, "pointer");
+        }
+
+        #[test]
+        fn closure_detects_a_transitive_view_secret_ref() {
+            let outer = TableReference::bare("orders_us");
+            let mid = view_with_params("mid", "SELECT * FROM inner", &[]);
+            let inner = view_with_params(
+                "inner",
+                "SELECT 1",
+                &[("json_pointer", "${secrets:pointer}")],
+            );
+            let app = app_from(vec![mid, inner], vec![], vec![]);
+            let found = first_unresolved_snapshot_identity_param_in_view_closure(
+                &outer,
+                "SELECT * FROM mid",
+                &HashMap::new(),
+                &app,
+            )
+            .expect("a two-hop dependency view secret ref must be detected");
+            assert_eq!(found.source_component, "view");
+            assert_eq!(found.source_name, "inner");
+            assert_eq!(found.unresolved.param, "json_pointer");
+        }
+
+        #[test]
+        fn closure_detects_a_dependency_catalog_secret_ref() {
+            let outer = TableReference::bare("orders_us");
+            let mut sales = catalog("postgres:sales", "sales");
+            sales.params = Some(catalog_params(&[("pg_host", "${secrets:pg_host}")]));
+            let app = app_from(vec![], vec![], vec![sales]);
+            let found = first_unresolved_snapshot_identity_param_in_view_closure(
+                &outer,
+                "SELECT * FROM sales.public.orders",
+                &HashMap::new(),
+                &app,
+            )
+            .expect("a dependency catalog secret ref must be detected");
+            assert_eq!(found.source_component, "catalog");
+            assert_eq!(found.source_name, "sales");
+            assert_eq!(found.param_field, "params");
+            assert_eq!(found.unresolved.param, "pg_host");
+        }
+
+        #[test]
+        fn closure_detects_a_catalog_dataset_params_secret_ref() {
+            let outer = TableReference::bare("orders_us");
+            let mut sales = catalog("postgres:sales", "sales");
+            sales.dataset_params = Some(catalog_params(&[("json_pointer", "${env:POINTER}")]));
+            let app = app_from(vec![], vec![], vec![sales]);
+            let found = first_unresolved_snapshot_identity_param_in_view_closure(
+                &outer,
+                "SELECT * FROM sales.public.orders",
+                &HashMap::new(),
+                &app,
+            )
+            .expect("a catalog dataset_params secret ref must be detected");
+            assert_eq!(found.source_component, "catalog");
+            assert_eq!(found.param_field, "dataset_params");
+            assert_eq!(found.unresolved.store, "env");
+            assert_eq!(found.unresolved.key, "POINTER");
+        }
+
+        #[test]
+        fn closure_allows_literal_params_on_dependencies() {
+            let outer = TableReference::bare("orders_us");
+            let app = app_from(
+                vec![view_with_params(
+                    "inner",
+                    "SELECT 1",
+                    &[("file_format", "parquet")],
+                )],
+                vec![dataset_with_params(
+                    "s3://docs",
+                    "docs",
+                    &[("json_pointer", "/us")],
+                )],
+                vec![],
+            );
+            assert!(
+                first_unresolved_snapshot_identity_param_in_view_closure(
+                    &outer,
+                    "SELECT * FROM inner, docs",
+                    &HashMap::from([("file_format".to_string(), "parquet".to_string())]),
+                    &app,
+                )
+                .is_none(),
+                "literal identity params throughout the closure must accept snapshots"
+            );
+        }
+
+        #[test]
+        fn closure_prefers_the_root_view_secret_ref() {
+            let outer = TableReference::bare("orders_us");
+            let app = app_from(
+                vec![],
+                vec![dataset_with_params(
+                    "s3://docs",
+                    "docs",
+                    &[("json_pointer", "${secrets:docs_pointer}")],
+                )],
+                vec![],
+            );
+            let found = first_unresolved_snapshot_identity_param_in_view_closure(
+                &outer,
+                "SELECT * FROM docs",
+                &HashMap::from([("json_pointer".to_string(), "${secrets:pointer}".to_string())]),
+                &app,
+            )
+            .expect("a root view secret ref must be detected");
+            assert_eq!(found.source_component, "view");
+            assert_eq!(found.source_name, "orders_us");
+            assert_eq!(found.unresolved.key, "pointer");
+        }
+
         #[test]
         fn an_unmatched_catalog_is_not_folded_into_the_closure() {
             let v = TableReference::bare("v");
@@ -2757,6 +3120,41 @@ mod tests {
             assert!(
                 message.contains(expected),
                 "the refusal must contain {expected:?}: {message}"
+            );
+        }
+        assert!(
+            !message.contains('\n'),
+            "a user-facing refusal must stay on one line: {message:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_identity_unresolved_dependency_param_refusal_names_both_components() {
+        let message = UnresolvedClosureIdentityParam {
+            source_component: "dataset".to_string(),
+            source_name: "docs".to_string(),
+            param_field: "params",
+            unresolved: UnresolvedSnapshotIdentityParam {
+                param: "json_pointer".to_string(),
+                store: "secrets".to_string(),
+                key: "pointer".to_string(),
+            },
+        }
+        .refusal_message("view", "orders_us");
+        for expected in [
+            "view",
+            "'orders_us'",
+            "dataset",
+            "'docs'",
+            "`params.json_pointer`",
+            "${secrets:pointer}",
+            "would not change the stamp",
+            "`snapshots: disabled` on view 'orders_us'",
+            "https://spiceai.org/docs/components/data-accelerators/snapshots",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the dependency refusal must contain {expected:?}: {message}"
             );
         }
         assert!(

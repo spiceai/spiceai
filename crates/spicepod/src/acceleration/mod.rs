@@ -258,9 +258,11 @@ pub enum SnapshotsCreationPolicy {
 pub enum SnapshotsConsistency {
     /// Snapshot only a materialization proven to come from a single read (default).
     /// A view whose query reads more than once is refused at load with an explanation,
-    /// whether it would publish or only bootstrap. Each later publish requires the
-    /// read-shape recorded from the plan that executed the refresh that produced
-    /// the rows — not a fresh re-plan at publish time.
+    /// whether it would publish or only bootstrap. Each later publish consumes the
+    /// read-shape attested from the refresh scan that wrote the rows, bound to that
+    /// materialization's epoch — not a fresh re-plan after the fact. An ordinary
+    /// query does not record, and a later refresh's attestation cannot approve the
+    /// previous generation.
     #[default]
     ConsistentRead,
     /// Publish or restore regardless, accepting that the stored rows may span several
