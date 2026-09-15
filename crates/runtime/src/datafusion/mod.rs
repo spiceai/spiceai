@@ -933,6 +933,7 @@ pub struct DataFusion {
     // EXECUTE (not lightweight PREPARE/DEALLOCATE/SET) — i.e. query admission
     // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
     query_admission_semaphore: Option<Arc<Semaphore>>,
+    pub(crate) query_coalescer: Arc<query::coalescing::Coalescer>,
     pub(crate) task_history_enabled: bool,
     // Dedicated runtime for CPU-bound DataFusion queries
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
@@ -5084,6 +5085,7 @@ impl DataFusion {
             );
         }
 
+        self.query_coalescer.shutdown().await;
         let accelerated_tables = self.accelerated_tables.read().await.clone();
 
         for table in &accelerated_tables {
