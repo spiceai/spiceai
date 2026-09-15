@@ -23,6 +23,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use datafusion::{common::DFSchema, logical_expr::Expr};
 use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use runtime_udfs_api::{FunctionSupportBuilder, datafusion_nested_function_names};
 
@@ -63,8 +64,9 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
 /// The [`FunctionSupport`] for `BigQuery` over ADBC, as a value for
 /// `AdbcTableFactory::with_function_support`.
 ///
-/// Three layers, all derived from [`crate::dialect`] so they cannot drift from
-/// what the dialect can actually render:
+/// Four layers. Function decisions are derived from [`crate::dialect`] so they
+/// cannot drift from what the dialect can actually render; the expression
+/// restriction records a `GoogleSQL` capability boundary:
 ///
 /// 1. the name carve-out, so the JSON extraction functions the `BigQuery`
 ///    dialect rewrites into `JSON_VALUE` federate instead of being denied;
@@ -76,7 +78,10 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
 ///    The check also gates the `DataFusion` built-ins the dialect rewrites
 ///    (e.g. `regexp_like` → `REGEXP_CONTAINS`), whose untranslatable shapes
 ///    must stay local the same way;
-/// 3. `regexp_match` is denied outright. `BigQuery` has no function of that
+/// 3. case-insensitive [`Expr::Like`] is denied because `GoogleSQL` has no
+///    `ILIKE` operator. Both positive and negated forms evaluate locally while
+///    ordinary case-sensitive `LIKE` remains pushable;
+/// 4. `regexp_match` is denied outright. `BigQuery` has no function of that
 ///    name — a federated call fails remotely with `Function not found:
 ///    regexp_match` — and no faithful rendering exists to rewrite it into: its
 ///    list-of-matches result has no `BigQuery` counterpart that survives the
@@ -96,10 +101,23 @@ pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
         .deny_also([crate::dialect::REGEXP_MATCH_NAME.to_string()])
         .scalar_call(Arc::new(crate::dialect::bigquery_can_translate))
         .build()
+        .with_expression_support(Arc::new(bigquery_can_evaluate_expression))
         // The builder carries the scalar hook; the aggregate and window hooks
         // have no builder method yet, so they are installed on the built value.
         .with_aggregate_call_support(Arc::new(crate::dialect::bigquery_can_translate_aggregate))
         .with_window_call_support(Arc::new(crate::dialect::bigquery_can_translate_window))
+}
+
+/// Whether `BigQuery` can evaluate this non-function expression shape without
+/// changing `DataFusion` semantics.
+///
+/// `GoogleSQL` has case-sensitive `LIKE` but no `ILIKE`. Rewriting through
+/// `LOWER` is not known to preserve Unicode, collation, pattern, and escape
+/// semantics, so either positive or negated case-insensitive `LIKE` stays
+/// local. Binary operator variants are intentionally outside this policy.
+#[must_use]
+pub fn bigquery_can_evaluate_expression(expr: &Expr, _schema: Option<&DFSchema>) -> bool {
+    !matches!(expr, Expr::Like(like) if like.case_insensitive)
 }
 
 /// `SQLite`-flavored deny-list as a value, for
@@ -175,7 +193,10 @@ pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
 
 #[cfg(test)]
 mod tests {
-    use super::deny_spice_functions_for_duckdb_table_providers;
+    use super::{
+        deny_spice_functions_for_bigquery_table_providers,
+        deny_spice_functions_for_duckdb_table_providers,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_replace};
     use datafusion::logical_expr::{LogicalPlan, table_scan};
@@ -236,5 +257,23 @@ mod tests {
             None,
         )));
         assert!(federates(col("s")));
+    }
+
+    #[test]
+    fn bigquery_refuses_only_case_insensitive_like_expressions() {
+        let support = deny_spice_functions_for_bigquery_table_providers();
+        for denied in [col("s").ilike(lit("u%")), col("s").not_ilike(lit("u%"))] {
+            assert!(
+                contains_unsupported_functions(&plan_projecting(denied), &support)
+                    .expect("the support check must not error"),
+                "BigQuery has no ILIKE operator, including its negated form"
+            );
+        }
+
+        assert!(
+            !contains_unsupported_functions(&plan_projecting(col("s").like(lit("u%"))), &support,)
+                .expect("the support check must not error"),
+            "ordinary LIKE is valid GoogleSQL and must keep federating"
+        );
     }
 }
