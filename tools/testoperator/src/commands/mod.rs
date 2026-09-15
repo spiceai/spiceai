@@ -959,9 +959,22 @@ mod tests {
     ///   division, no `FULL JOIN`), so it is no oracle for the answers the
     ///   accelerator returns.
     ///
+    /// - The seven `ClickBench` arms whose acceleration holds only part of the
+    ///   source, because a runner cannot hold all of it: their `refresh_sql` keeps
+    ///   a subset, while the `__test_reference.*` clone drops acceleration and
+    ///   reads every row, so it answers a different question. A `LIMIT` subset
+    ///   also keeps unspecified rows, so no reference could be built for it.
+    ///
     /// Every other scale factor 1 TPC-H, TPC-DS and `ClickBench` dispatch must
     /// validate against an oracle.
     const BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION: &[&str] = &[
+        "clickbench/sf1/accelerated/s3[parquet]-arrow.yaml",
+        "clickbench/sf1/accelerated/s3[parquet]-arrow-partitioned.yaml",
+        "clickbench/sf1/accelerated/s3[parquet]-postgres.yaml",
+        "clickbench/sf1/accelerated/s3[parquet]-sqlite[file].yaml",
+        "clickbench/sf1/accelerated/s3[parquet]-sqlite[memory].yaml",
+        "clickbench/sf1/accelerated/s3[parquet]-turso[file].yaml",
+        "clickbench/sf1/accelerated/spicecloud-arrow.yaml",
         "tpch/sf1/federated/glue[csv].yaml",
         "tpch/sf1/federated/iceberg[hadoop].yaml",
         "tpch/sf1/federated/mssql.yaml",
