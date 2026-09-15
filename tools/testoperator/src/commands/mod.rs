@@ -712,10 +712,13 @@ pub(crate) async fn process_spiced_metrics(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use clap::Parser;
-    use test_framework::spicepod::component::dataset::Dataset;
+    use test_framework::{spicepod::component::dataset::Dataset, utils::scan_directory_for_yamls};
 
     use super::*;
+    use crate::args::dispatch::DispatchTestFile;
 
     fn validation_args(query_set: &str) -> DatasetTestArgs {
         validation_args_at_scale(query_set, "100")
@@ -934,6 +937,92 @@ mod tests {
         assert_eq!(
             validation_reference_schema(&args, &app, &query_set, &queries, false),
             Some("__test_reference".to_string())
+        );
+    }
+
+    /// Every TPC-H, TPC-DS and `ClickBench` benchmark dispatch validates its
+    /// results against an oracle it can actually resolve.
+    ///
+    /// Each `bench` entry is resolved the way `testoperator_run_bench.yml` runs
+    /// it — the inputs `testoperator dispatch` sends, the spicepod under
+    /// `test/spicepods/<query set>/sf<scale factor>/`, `spiced` started by
+    /// testoperator — through the same calls a run makes before its first query.
+    /// `--validate` stops a run that has no oracle, so a dispatch that could not
+    /// be validated fails here instead of in the scheduled run.
+    #[tokio::test]
+    async fn benchmark_dispatches_validate_results_against_an_oracle() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut checked = 0;
+        for query_set_directory in ["tpch", "tpcds", "clickbench"] {
+            let dispatch_directory = repo_root
+                .join("tools/testoperator/dispatch")
+                .join(query_set_directory);
+            for dispatch_path in scan_directory_for_yamls(&dispatch_directory)
+                .expect("should scan the dispatch directory")
+            {
+                let dispatch_file =
+                    std::fs::File::open(&dispatch_path).expect("should open the dispatch file");
+                let dispatch: DispatchTestFile =
+                    yaml::from_reader(dispatch_file).expect("should parse the dispatch file");
+                for bench in &dispatch.tests.bench {
+                    let dispatch_name = dispatch_path.display();
+                    assert_eq!(
+                        bench.validate_results,
+                        Some(true),
+                        "{dispatch_name} must set `validate_results: true` on its bench test"
+                    );
+
+                    let inputs =
+                        serde_json::to_value(bench).expect("should serialize the bench inputs");
+                    let query_set = inputs["query_set"]
+                        .as_str()
+                        .expect("query_set should serialize as a string");
+                    let scale_factor = inputs
+                        .get("scale_factor")
+                        .map_or_else(|| "1".to_string(), ToString::to_string);
+                    let spicepod_path = repo_root
+                        .join("test/spicepods")
+                        .join(query_set.split('[').next().unwrap_or(query_set))
+                        .join(format!("sf{scale_factor}"))
+                        .join(&bench.spicepod_path);
+                    let spicepod_path = spicepod_path.to_string_lossy();
+
+                    let mut command_line = vec![
+                        "testoperator",
+                        "--spicepod-path",
+                        spicepod_path.as_ref(),
+                        "--query-set",
+                        query_set,
+                        "--scale-factor",
+                        scale_factor.as_str(),
+                        "--validate",
+                    ];
+                    if let Some(query_overrides) = inputs["query_overrides"].as_str() {
+                        command_line.extend(["--query-overrides", query_overrides]);
+                    }
+                    let args = DatasetTestArgs::try_parse_from(command_line).unwrap_or_else(|e| {
+                        panic!("{dispatch_name} should translate to testoperator arguments: {e}")
+                    });
+
+                    let mut app = load_app(&args.common).await.unwrap_or_else(|e| {
+                        panic!("{dispatch_name} should load its spicepod: {e}")
+                    });
+                    add_automatic_reference_datasets(&args, &mut app)
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!("{dispatch_name} should add its reference datasets: {e}")
+                        });
+                    if let Err(e) = build_test_with_validation(&args, &app, NotStarted::new()).await
+                    {
+                        panic!("{dispatch_name} cannot validate its results: {e}");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "should find TPC-H, TPC-DS and ClickBench benchmark dispatches"
         );
     }
 }

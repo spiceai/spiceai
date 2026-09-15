@@ -4,6 +4,7 @@ tests:
     query_set: tpch
     query_overrides: mssql-catalog
     runner_type: spiceai-dev-runners
+    validate_results: true
   schema:
     spicepod_path: federated/mssql[catalog].yaml
     runner_type: spiceai-dev-runners

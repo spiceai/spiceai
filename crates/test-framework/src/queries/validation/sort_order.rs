@@ -78,8 +78,8 @@ use arrow::array::{Array, ArrayRef, RecordBatch, make_comparator};
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
 use datafusion::sql::sqlparser::ast::{
-    Expr, LimitClause, OrderBy, OrderByKind, Query as SqlQuery, SelectItem, SetExpr, Statement,
-    Value,
+    Expr, Ident, LimitClause, OrderBy, OrderByKind, Query as SqlQuery, SelectItem, SetExpr,
+    Statement, Value,
 };
 use datafusion::sql::sqlparser::dialect::{Dialect, GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::parser::Parser;
@@ -789,6 +789,174 @@ pub fn top_level_limit_count(sql: &str) -> Option<usize> {
         }) => expr_as_usize(expr),
         _ => None,
     }
+}
+
+/// A top-level `LIMIT` that leaves unspecified which rows it keeps.
+///
+/// SQL lets a query with a top-level `LIMIT n [OFFSET m]` and no top-level
+/// `ORDER BY` return any `n` rows of its full result after skipping any `m`, so
+/// two correct engines — or one engine at two thread counts — can return
+/// different rows. See [`unordered_limit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnorderedLimit {
+    /// The `LIMIT` count.
+    pub limit: usize,
+    /// The `OFFSET` count, `0` when there is none.
+    pub offset: usize,
+    /// The query without its top-level `LIMIT`/`OFFSET`: the full result the
+    /// returned rows are taken from.
+    pub unlimited_sql: String,
+}
+
+impl UnorderedLimit {
+    /// Whether two results of this query can hold different rows and still both
+    /// be correct.
+    ///
+    /// The full result fixes how many rows the `LIMIT` keeps, so both sides must
+    /// agree on the count. Without an `OFFSET`, a result shorter than the `LIMIT`
+    /// is the whole full result, so only one that filled the `LIMIT` can have
+    /// left rows out.
+    #[must_use]
+    pub fn may_keep_different_rows(&self, left_rows: usize, right_rows: usize) -> bool {
+        left_rows == right_rows && (self.offset > 0 || left_rows == self.limit)
+    }
+}
+
+/// The top-level `LIMIT` of `sql`, when it leaves unspecified which rows it keeps.
+///
+/// `Some` only for a top-level `LIMIT n [OFFSET m]` with integer literals and no
+/// top-level `ORDER BY`. `None` for everything else — an `ORDER BY`, a `LIMIT`
+/// only inside a subquery, `FETCH`, `LIMIT … BY`, the `LIMIT m, n` form, or a
+/// count that is not a literal — so a caller keeps the comparison it already has.
+#[must_use]
+pub fn unordered_limit(sql: &str) -> Option<UnorderedLimit> {
+    let statement = parse_one_statement(sql)?;
+    if statement_has_top_level_order_by(&statement) {
+        return None;
+    }
+    let Statement::Query(mut query) = statement else {
+        return None;
+    };
+    if query.fetch.is_some() {
+        return None;
+    }
+    let Some(LimitClause::LimitOffset {
+        limit: Some(limit),
+        offset,
+        limit_by,
+    }) = &query.limit_clause
+    else {
+        return None;
+    };
+    if !limit_by.is_empty() {
+        return None;
+    }
+    let limit = expr_as_usize(limit)?;
+    let offset = match offset {
+        Some(offset) => expr_as_usize(&offset.value)?,
+        None => 0,
+    };
+    query.limit_clause = None;
+    Some(UnorderedLimit {
+        limit,
+        offset,
+        unlimited_sql: Statement::Query(query).to_string(),
+    })
+}
+
+/// A top-level `ORDER BY … LIMIT` whose sort does not show in its result.
+///
+/// When the first `ORDER BY` term is not a result column — `ClickBench` Q25
+/// returns `"SearchPhrase"` ordered by `to_timestamp("EventTime")` — the rows
+/// cannot show where one tie group ends and the next begins, so neither the order
+/// of tied rows nor which tied rows the `LIMIT` kept can be judged from them.
+/// Built by [`unprojected_sort_limit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnprojectedSortLimit {
+    /// The `LIMIT` count.
+    pub limit: usize,
+    /// How many sort-key columns [`Self::keyed_sql`] appends after the result's own.
+    pub key_columns: usize,
+    keyed_sql_without_limit: String,
+}
+
+impl UnprojectedSortLimit {
+    /// The query with each `ORDER BY` term appended to its result columns, still
+    /// sorted, limited to `limit` rows.
+    #[must_use]
+    pub fn keyed_sql(&self, limit: usize) -> String {
+        format!("{} LIMIT {limit}", self.keyed_sql_without_limit)
+    }
+}
+
+/// The top-level `ORDER BY … LIMIT` of `sql`, when its first sort term is not a
+/// column of `schema`, the result's.
+///
+/// `Some` only for a single `SELECT` — no set operation, `DISTINCT` or `TOP` —
+/// with a top-level `ORDER BY` of expressions, an integer-literal `LIMIT`, and no
+/// `OFFSET`, `FETCH` or `LIMIT … BY`: the shape where appending the `ORDER BY`
+/// terms to the projection leaves the rows unchanged. `None` otherwise, including
+/// for a positional term such as `ORDER BY 1`.
+#[must_use]
+pub fn unprojected_sort_limit(sql: &str, schema: &SchemaRef) -> Option<UnprojectedSortLimit> {
+    let statement = parse_one_statement(sql)?;
+    if !matches!(
+        resolve_statement_sort_key(&statement, schema),
+        SortKeyResolution::Unresolved { .. }
+    ) {
+        return None;
+    }
+    let Statement::Query(mut query) = statement else {
+        return None;
+    };
+    if query.fetch.is_some() {
+        return None;
+    }
+    let limit = match &query.limit_clause {
+        Some(LimitClause::LimitOffset {
+            limit: Some(limit),
+            offset: None,
+            limit_by,
+        }) if limit_by.is_empty() => expr_as_usize(limit)?,
+        _ => return None,
+    };
+    let Some(OrderByKind::Expressions(terms)) =
+        query.order_by.as_ref().map(|order_by| &order_by.kind)
+    else {
+        return None;
+    };
+    if terms.is_empty()
+        || terms
+            .iter()
+            .any(|term| term.with_fill.is_some() || expr_as_usize(&term.expr).is_some())
+    {
+        return None;
+    }
+    let sort_keys: Vec<Expr> = terms.iter().map(|term| term.expr.clone()).collect();
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return None;
+    };
+    if select.distinct.is_some() || select.top.is_some() {
+        return None;
+    }
+    let key_columns = sort_keys.len();
+    select
+        .projection
+        .extend(
+            sort_keys
+                .into_iter()
+                .enumerate()
+                .map(|(index, expr)| SelectItem::ExprWithAlias {
+                    expr,
+                    alias: Ident::new(format!("__validation_sort_key_{index}")),
+                }),
+        );
+    query.limit_clause = None;
+    Some(UnprojectedSortLimit {
+        limit,
+        key_columns,
+        keyed_sql_without_limit: Statement::Query(query).to_string(),
+    })
 }
 
 fn expr_as_usize(expr: &Expr) -> Option<usize> {

@@ -41,6 +41,10 @@ use crate::{
 
 use super::EndCondition;
 
+/// The most reference rows read back to find where the tie group at a `LIMIT`
+/// ends, for a query whose `ORDER BY` sorts on columns its result does not include.
+const MAX_KEYED_REFERENCE_ROWS: usize = 1 << 20;
+
 pub(crate) struct SpiceTestQueryWorker {
     id: usize,
     query_set: Vec<Query>,
@@ -699,8 +703,83 @@ impl SpiceTestQueryWorker {
                 // Validate against reference query results. Engine-vs-engine
                 // (not static TPCH CSV): scan order is not part of the answer
                 // unless the row set itself depends on ORDER BY + LIMIT.
-                let validation_result =
+                let mut validation_result =
                     validation::validate_against_reference_batches(query, batches, &ref_batches)?;
+
+                // A top-level LIMIT without ORDER BY may keep any rows, so rows that
+                // differ from the reference's fail only if one of them is not in the
+                // full result the LIMIT was taken from.
+                if matches!(validation_result, QueryValidationResult::Fail(_))
+                    && let Some(unordered_limit) = validation::unordered_limit(&reference_query.sql)
+                    && unordered_limit.may_keep_different_rows(
+                        batches.iter().map(RecordBatch::num_rows).sum(),
+                        ref_batches.iter().map(RecordBatch::num_rows).sum(),
+                    )
+                {
+                    println!(
+                        "Worker {} - Query '{}' - LIMIT without ORDER BY kept different rows than the reference query; checking each returned row against the reference query's full result",
+                        self.id, query.name
+                    );
+                    let mut subset_check =
+                        validation::UnorderedLimitSubsetCheck::new(&unordered_limit, batches)?;
+                    let mut stream = spice_client
+                        .sql_with_params(
+                            &unordered_limit.unlimited_sql,
+                            reference_query.get_parameters_batch().transpose()?,
+                        )
+                        .await?;
+                    while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                        subset_check.observe(&batch?)?;
+                    }
+                    validation_result = subset_check.finish();
+                }
+
+                // An ORDER BY on something the result does not include hides where tie
+                // groups begin and end, so a mismatch there is judged against the
+                // reference rows read back with their sort keys.
+                if matches!(validation_result, QueryValidationResult::Fail(_))
+                    && let Some(schema) = batches.first().map(RecordBatch::schema)
+                    && let Some(sort_limit) =
+                        validation::unprojected_sort_limit(&reference_query.sql, &schema)
+                {
+                    println!(
+                        "Worker {} - Query '{}' - ORDER BY sorts on columns the result does not include; checking the result against the reference query's rows with their sort keys",
+                        self.id, query.name
+                    );
+                    let mut fetch_rows = sort_limit.limit.saturating_mul(2).max(1);
+                    loop {
+                        let mut stream = spice_client
+                            .sql_with_params(
+                                &sort_limit.keyed_sql(fetch_rows),
+                                reference_query.get_parameters_batch().transpose()?,
+                            )
+                            .await?;
+                        let mut keyed_reference = Vec::new();
+                        while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                            keyed_reference.push(batch?);
+                        }
+                        let fetched_rows: usize =
+                            keyed_reference.iter().map(RecordBatch::num_rows).sum();
+                        if let Some(result) = validation::validate_against_keyed_reference(
+                            batches,
+                            &keyed_reference,
+                            sort_limit.limit,
+                            sort_limit.key_columns,
+                            fetched_rows < fetch_rows,
+                        )? {
+                            validation_result = result;
+                            break;
+                        }
+                        if fetch_rows >= MAX_KEYED_REFERENCE_ROWS {
+                            println!(
+                                "Worker {} - Query '{}' - more than {MAX_KEYED_REFERENCE_ROWS} reference rows tie at the LIMIT; keeping the row-by-row comparison's result",
+                                self.id, query.name
+                            );
+                            break;
+                        }
+                        fetch_rows = fetch_rows.saturating_mul(2);
+                    }
+                }
 
                 if let QueryValidationResult::Fail(validation_reason) = validation_result {
                     eprintln!(

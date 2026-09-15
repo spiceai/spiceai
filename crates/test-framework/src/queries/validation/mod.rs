@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     io::Seek,
     sync::{Arc, LazyLock},
 };
@@ -24,11 +24,12 @@ use anyhow::{Result, anyhow};
 
 use arrow::{
     array::{
-        Array, BooleanArray, Date32Array, Date64Array, Decimal128Array, Decimal256Array,
-        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-        LargeStringArray, RecordBatch, StringArray, StringViewArray, TimestampMicrosecondArray,
-        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-        UInt16Array, UInt32Array, UInt64Array,
+        Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+        Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
+        StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+        UInt64Array,
     },
     csv::reader::Format,
     datatypes::TimeUnit,
@@ -46,8 +47,9 @@ use super::Query;
 pub mod sort_order;
 
 pub use sort_order::{
-    SortKeyColumn, SortKeyResolution, SortOrderViolation, has_top_level_limit,
-    has_top_level_order_by, resolve_sort_key,
+    SortKeyColumn, SortKeyResolution, SortOrderViolation, UnorderedLimit, UnprojectedSortLimit,
+    has_top_level_limit, has_top_level_order_by, resolve_sort_key, unordered_limit,
+    unprojected_sort_limit,
 };
 
 // Not re-exported: the outcome type is plumbing between this module and
@@ -106,6 +108,13 @@ pub enum QueryValidationFailReason {
     SortOrderViolation {
         side: String,
         violation: SortOrderViolation,
+    },
+    /// A query with a top-level `LIMIT` returned a row its full result does not
+    /// allow at that `LIMIT`: one the full result does not have, or one past the
+    /// rows its `ORDER BY` keeps.
+    RowNotAllowedByLimit {
+        row_number: usize,
+        row: String,
     },
 }
 
@@ -348,6 +357,27 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
         DataType::Utf8 => downcast_and_stringify!(array, index, StringArray),
         DataType::LargeUtf8 => downcast_and_stringify!(array, index, LargeStringArray),
         DataType::Utf8View => downcast_and_stringify!(array, index, StringViewArray),
+        DataType::Binary => Ok(Some(bytes_to_string(
+            array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| anyhow!("Failed to downcast Binary array"))?
+                .value(index),
+        ))),
+        DataType::LargeBinary => Ok(Some(bytes_to_string(
+            array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| anyhow!("Failed to downcast LargeBinary array"))?
+                .value(index),
+        ))),
+        DataType::BinaryView => Ok(Some(bytes_to_string(
+            array
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .ok_or_else(|| anyhow!("Failed to downcast BinaryView array"))?
+                .value(index),
+        ))),
         DataType::Boolean => downcast_and_stringify!(array, index, BooleanArray),
 
         DataType::Date32 => {
@@ -489,6 +519,24 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
             "Unsupported data type for validation: {dt:?}",
         )),
     }
+}
+
+/// Renders a binary cell as the text its bytes spell, so a column read as bytes
+/// compares equal to the same values read as a string: `ClickBench` stores its
+/// text columns as parquet `BINARY`. Bytes that are not valid UTF-8 render as
+/// `\x` followed by their hex digits instead.
+fn bytes_to_string(bytes: &[u8]) -> String {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+    let mut hex = String::with_capacity(2 + 2 * bytes.len());
+    hex.push_str("\\x");
+    for byte in bytes {
+        hex.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+        hex.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+    }
+    hex
 }
 
 pub fn validate_batches_as_strings(
@@ -1124,6 +1172,256 @@ pub fn validate_against_reference_batches(
         order,
     )?;
     Ok(comparison.result)
+}
+
+/// Checks an answer to a query with an [`UnorderedLimit`] against the full result
+/// its `LIMIT` was taken from.
+///
+/// Two engines' answers to such a query cannot be compared directly, because SQL
+/// lets each keep different rows: `ClickBench` Q18 (`GROUP BY … LIMIT 10` with no
+/// `ORDER BY`) returns different groups from `DuckDB` at 1, 2, 8 and 16 threads
+/// over the same file. An answer is correct when it has as many rows as the full
+/// result leaves after the `OFFSET`, up to the `LIMIT`, and every row it returned
+/// is a row of the full result, counted as a multiset.
+///
+/// Cells render through [`array_value_to_string`] like every comparison here but
+/// must match exactly, with no numeric tolerance, so a returned row passes only if
+/// the full result holds that exact row. The full result arrives one batch at a
+/// time through [`Self::observe`] and only the returned rows are kept, so memory
+/// stays bounded by the `LIMIT` however large the full result is.
+pub struct UnorderedLimitSubsetCheck {
+    limit: usize,
+    offset: usize,
+    /// The returned rows, in the order they were returned.
+    returned: Vec<Vec<Option<String>>>,
+    /// Per distinct returned row: how many times it was returned, and how many
+    /// copies of it the full result has shown so far, capped at the former.
+    copies: HashMap<Vec<Option<String>>, (usize, usize)>,
+    /// First-column values of the returned rows, so a full-result row that cannot
+    /// match is skipped without rendering the rest of it.
+    first_column_values: HashSet<Option<String>>,
+    full_result_rows: usize,
+    schema_mismatch: bool,
+}
+
+impl UnorderedLimitSubsetCheck {
+    /// # Errors
+    /// Returns an error if a cell of a returned row cannot be rendered.
+    pub fn new(unordered_limit: &UnorderedLimit, returned: &[RecordBatch]) -> Result<Self> {
+        let mut rows = Vec::new();
+        for batch in returned {
+            for row in 0..batch.num_rows() {
+                rows.push(row_as_strings(batch, row)?);
+            }
+        }
+        let mut copies = HashMap::new();
+        for row in &rows {
+            copies.entry(row.clone()).or_insert((0, 0)).0 += 1;
+        }
+        let first_column_values = rows.iter().filter_map(|row| row.first().cloned()).collect();
+        Ok(Self {
+            limit: unordered_limit.limit,
+            offset: unordered_limit.offset,
+            returned: rows,
+            copies,
+            first_column_values,
+            full_result_rows: 0,
+            schema_mismatch: false,
+        })
+    }
+
+    /// Matches one batch of the full result against the returned rows.
+    ///
+    /// # Errors
+    /// Returns an error if a cell of `batch` cannot be rendered.
+    pub fn observe(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.full_result_rows += batch.num_rows();
+        let Some(width) = self.returned.first().map(Vec::len) else {
+            return Ok(());
+        };
+        if batch.num_columns() != width {
+            self.schema_mismatch = true;
+            return Ok(());
+        }
+        let first_column = batch.column(0).as_ref();
+        for row in 0..batch.num_rows() {
+            if !self
+                .first_column_values
+                .contains(&array_value_to_string(first_column, row)?)
+            {
+                continue;
+            }
+            if let Some((times_returned, times_seen)) =
+                self.copies.get_mut(&row_as_strings(batch, row)?)
+                && *times_seen < *times_returned
+            {
+                *times_seen += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// The verdict, once every batch of the full result has been observed.
+    #[must_use]
+    pub fn finish(mut self) -> QueryValidationResult {
+        if self.schema_mismatch {
+            return QueryValidationResult::Fail(QueryValidationFailReason::SchemaMismatch);
+        }
+        let expected_rows = self
+            .full_result_rows
+            .saturating_sub(self.offset)
+            .min(self.limit);
+        if self.returned.len() != expected_rows {
+            return QueryValidationResult::Fail(QueryValidationFailReason::RowCountMismatch {
+                expected: expected_rows,
+                actual: self.returned.len(),
+            });
+        }
+        for (index, row) in self.returned.iter().enumerate() {
+            match self.copies.get_mut(row) {
+                Some((_, times_seen)) if *times_seen > 0 => *times_seen -= 1,
+                _ => {
+                    return QueryValidationResult::Fail(
+                        QueryValidationFailReason::RowNotAllowedByLimit {
+                            row_number: index + 1,
+                            row: format!("{row:?}"),
+                        },
+                    );
+                }
+            }
+        }
+        QueryValidationResult::Pass
+    }
+}
+
+fn row_as_strings(batch: &RecordBatch, row: usize) -> Result<Vec<Option<String>>> {
+    batch
+        .columns()
+        .iter()
+        .map(|column| array_value_to_string(column.as_ref(), row))
+        .collect()
+}
+
+/// Checks an answer to a query with an [`UnprojectedSortLimit`] against the
+/// reference query's rows read back with their sort keys.
+///
+/// `keyed_reference` holds the reference rows in `ORDER BY` order, each followed
+/// by its `key_columns` sort-key cells. Every row before the tie group the
+/// `LIMIT` cuts through must be in `actual`, and the rest of `actual` must come
+/// from that tie group, the only rows SQL leaves an engine free to choose among.
+/// Cells must match exactly. The order of `actual` goes unchecked: without its
+/// sort keys it cannot be checked.
+///
+/// Returns `None` while `keyed_reference` ends inside that tie group and
+/// `reached_end` is `false`: a verdict needs the whole group, so the caller reads
+/// more reference rows and asks again.
+///
+/// # Errors
+/// Returns an error if a cell cannot be rendered.
+pub fn validate_against_keyed_reference(
+    actual: &[RecordBatch],
+    keyed_reference: &[RecordBatch],
+    limit: usize,
+    key_columns: usize,
+    reached_end: bool,
+) -> Result<Option<QueryValidationResult>> {
+    let mut reference = Vec::new();
+    for batch in keyed_reference {
+        let Some(width) = batch.num_columns().checked_sub(key_columns) else {
+            return Ok(Some(QueryValidationResult::Fail(
+                QueryValidationFailReason::SchemaMismatch,
+            )));
+        };
+        if actual
+            .iter()
+            .any(|actual_batch| actual_batch.num_columns() != width)
+        {
+            return Ok(Some(QueryValidationResult::Fail(
+                QueryValidationFailReason::SchemaMismatch,
+            )));
+        }
+        for row in 0..batch.num_rows() {
+            let mut cells = row_as_strings(batch, row)?;
+            let key = cells.split_off(width);
+            reference.push((cells, key));
+        }
+    }
+
+    let expected_rows = if reached_end {
+        reference.len().min(limit)
+    } else {
+        limit
+    };
+    let actual_rows: usize = actual.iter().map(RecordBatch::num_rows).sum();
+    let Some(cut) = expected_rows.checked_sub(1) else {
+        return Ok(Some(if actual_rows == 0 {
+            QueryValidationResult::Pass
+        } else {
+            QueryValidationResult::Fail(QueryValidationFailReason::RowCountMismatch {
+                expected: 0,
+                actual: actual_rows,
+            })
+        }));
+    };
+    let Some((_, cut_key)) = reference.get(cut) else {
+        return Ok(None);
+    };
+    let group_start = reference[..cut]
+        .iter()
+        .rposition(|(_, key)| key != cut_key)
+        .map_or(0, |index| index + 1);
+    let group_end = reference[cut..]
+        .iter()
+        .position(|(_, key)| key != cut_key)
+        .map_or(reference.len(), |offset| cut + offset);
+    if group_end == reference.len() && !reached_end {
+        return Ok(None);
+    }
+    if actual_rows != expected_rows {
+        return Ok(Some(QueryValidationResult::Fail(
+            QueryValidationFailReason::RowCountMismatch {
+                expected: expected_rows,
+                actual: actual_rows,
+            },
+        )));
+    }
+
+    let mut before_cut: HashMap<&[Option<String>], usize> = HashMap::new();
+    for (cells, _) in &reference[..group_start] {
+        *before_cut.entry(cells.as_slice()).or_insert(0) += 1;
+    }
+    let mut cut_group: HashMap<&[Option<String>], usize> = HashMap::new();
+    for (cells, _) in &reference[group_start..group_end] {
+        *cut_group.entry(cells.as_slice()).or_insert(0) += 1;
+    }
+    let mut picks_from_cut_group = expected_rows - group_start;
+
+    let mut row_number = 0;
+    for batch in actual {
+        for row in 0..batch.num_rows() {
+            row_number += 1;
+            let cells = row_as_strings(batch, row)?;
+            if let Some(count) = before_cut.get_mut(cells.as_slice())
+                && *count > 0
+            {
+                *count -= 1;
+            } else if picks_from_cut_group > 0
+                && let Some(count) = cut_group.get_mut(cells.as_slice())
+                && *count > 0
+            {
+                *count -= 1;
+                picks_from_cut_group -= 1;
+            } else {
+                return Ok(Some(QueryValidationResult::Fail(
+                    QueryValidationFailReason::RowNotAllowedByLimit {
+                        row_number,
+                        row: format!("{cells:?}"),
+                    },
+                )));
+            }
+        }
+    }
+    Ok(Some(QueryValidationResult::Pass))
 }
 
 /// Compare `ORDER BY … LIMIT` results when the sort key is not unique.
@@ -2066,6 +2364,388 @@ mod test {
                 QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
             ),
             "a unique ORDER BY key must still fail on a wrong cell: {result:?}"
+        );
+    }
+
+    const UNORDERED_GROUP_LIMIT: &str = r#"SELECT "UserID", "SearchPhrase", COUNT(*) FROM hits GROUP BY "UserID", "SearchPhrase" LIMIT 2"#;
+
+    fn user_phrase_counts(rows: &[(i64, Option<&str>, i64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("UserID", DataType::Int64, false),
+            Field::new("SearchPhrase", DataType::Utf8, true),
+            Field::new("count(*)", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.2))),
+            ],
+        )
+        .expect("user phrase count batch")
+    }
+
+    fn check_unordered_limit_subset(
+        sql: &str,
+        returned: &RecordBatch,
+        full_result: &[RecordBatch],
+    ) -> QueryValidationResult {
+        let unordered_limit = unordered_limit(sql).expect("query should have an unordered LIMIT");
+        let mut check =
+            UnorderedLimitSubsetCheck::new(&unordered_limit, std::slice::from_ref(returned))
+                .expect("subset check should build");
+        for batch in full_result {
+            check
+                .observe(batch)
+                .expect("full result batch should be observed");
+        }
+        check.finish()
+    }
+
+    #[test]
+    fn test_unordered_limit_is_only_a_top_level_limit_without_order_by() {
+        let limit = unordered_limit(UNORDERED_GROUP_LIMIT).expect("LIMIT without ORDER BY");
+        assert_eq!((limit.limit, limit.offset), (2, 0));
+        assert_eq!(
+            limit.unlimited_sql,
+            r#"SELECT "UserID", "SearchPhrase", COUNT(*) FROM hits GROUP BY "UserID", "SearchPhrase""#
+        );
+        assert_eq!(
+            unordered_limit("SELECT a FROM t LIMIT 10 OFFSET 5")
+                .map(|limit| (limit.limit, limit.offset)),
+            Some((10, 5))
+        );
+        for sql in [
+            "SELECT a FROM t ORDER BY a LIMIT 10",
+            "SELECT a FROM (SELECT a FROM t LIMIT 10) AS s",
+            "SELECT a FROM t LIMIT $1",
+            "SELECT a FROM t FETCH FIRST 10 ROWS ONLY",
+            "SELECT a FROM t",
+        ] {
+            assert_eq!(unordered_limit(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_unordered_limit_may_keep_different_rows_only_when_the_limit_can_cut() {
+        let limit = unordered_limit(UNORDERED_GROUP_LIMIT).expect("LIMIT without ORDER BY");
+        assert!(limit.may_keep_different_rows(2, 2));
+        assert!(
+            !limit.may_keep_different_rows(1, 1),
+            "a result shorter than the LIMIT is the whole full result"
+        );
+        assert!(
+            !limit.may_keep_different_rows(2, 1),
+            "the full result fixes how many rows are kept"
+        );
+        let with_offset =
+            unordered_limit("SELECT a FROM t LIMIT 2 OFFSET 1").expect("LIMIT without ORDER BY");
+        assert!(
+            with_offset.may_keep_different_rows(1, 1),
+            "an OFFSET skips rows the query does not specify"
+        );
+    }
+
+    #[test]
+    fn test_unordered_limit_subset_accepts_different_rows_of_the_full_result() {
+        let full_result = user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5), (3, Some("c"), 7)]);
+        let returned = user_phrase_counts(&[(3, Some("c"), 7), (2, None, 5)]);
+        let reference = user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5)]);
+        let query = Query::new("clickbench_q18".into(), UNORDERED_GROUP_LIMIT.into(), false);
+        assert!(
+            matches!(
+                validate_against_reference_batches(
+                    &query,
+                    std::slice::from_ref(&returned),
+                    &[reference]
+                )
+                .expect("compare"),
+                QueryValidationResult::Fail(_)
+            ),
+            "two correct answers that kept different groups do not compare equal directly"
+        );
+        assert_eq!(
+            check_unordered_limit_subset(UNORDERED_GROUP_LIMIT, &returned, &[full_result]),
+            QueryValidationResult::Pass
+        );
+    }
+
+    #[test]
+    fn test_unordered_limit_subset_rejects_a_row_the_full_result_does_not_have() {
+        let full_result = user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5), (3, Some("c"), 7)]);
+        let returned = user_phrase_counts(&[(3, Some("c"), 6), (2, None, 5)]);
+        assert_eq!(
+            check_unordered_limit_subset(UNORDERED_GROUP_LIMIT, &returned, &[full_result]),
+            QueryValidationResult::Fail(QueryValidationFailReason::RowNotAllowedByLimit {
+                row_number: 1,
+                row: r#"[Some("3"), Some("c"), Some("6")]"#.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_unordered_limit_subset_rejects_a_short_result() {
+        let full_result = user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5), (3, Some("c"), 7)]);
+        let returned = user_phrase_counts(&[(2, None, 5)]);
+        assert_eq!(
+            check_unordered_limit_subset(UNORDERED_GROUP_LIMIT, &returned, &[full_result]),
+            QueryValidationResult::Fail(QueryValidationFailReason::RowCountMismatch {
+                expected: 2,
+                actual: 1
+            })
+        );
+    }
+
+    #[test]
+    fn test_unordered_limit_subset_counts_repeated_rows() {
+        let full_result = user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5)]);
+        let returned = user_phrase_counts(&[(1, Some("a"), 3), (1, Some("a"), 3)]);
+        assert_eq!(
+            check_unordered_limit_subset(UNORDERED_GROUP_LIMIT, &returned, &[full_result]),
+            QueryValidationResult::Fail(QueryValidationFailReason::RowNotAllowedByLimit {
+                row_number: 2,
+                row: r#"[Some("1"), Some("a"), Some("3")]"#.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_unordered_limit_subset_applies_the_offset_across_batches() {
+        let sql =
+            r#"SELECT "UserID", "SearchPhrase", COUNT(*) FROM hits GROUP BY 1, 2 LIMIT 2 OFFSET 2"#;
+        let full_result = [
+            user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5)]),
+            user_phrase_counts(&[(3, Some("c"), 7)]),
+        ];
+        // Three rows, two of them skipped by the OFFSET: one row may be returned.
+        assert_eq!(
+            check_unordered_limit_subset(sql, &user_phrase_counts(&[(2, None, 5)]), &full_result),
+            QueryValidationResult::Pass
+        );
+        assert_eq!(
+            check_unordered_limit_subset(
+                sql,
+                &user_phrase_counts(&[(2, None, 5), (3, Some("c"), 7)]),
+                &full_result
+            ),
+            QueryValidationResult::Fail(QueryValidationFailReason::RowCountMismatch {
+                expected: 1,
+                actual: 2
+            })
+        );
+    }
+
+    #[test]
+    fn test_binary_cells_render_as_the_text_they_hold() {
+        let bytes: &[u8] = b"google";
+        for array in [
+            Arc::new(BinaryArray::from_iter_values([bytes])) as ArrayRef,
+            Arc::new(LargeBinaryArray::from_iter_values([bytes])),
+            Arc::new(BinaryViewArray::from_iter_values([bytes])),
+        ] {
+            assert_eq!(
+                array_value_to_string(array.as_ref(), 0).expect("binary cell should render"),
+                Some("google".to_string()),
+                "{:?}",
+                array.data_type()
+            );
+        }
+        let not_utf8 = LargeBinaryArray::from_iter_values([[0xff_u8, 0x00].as_slice()]);
+        assert_eq!(
+            array_value_to_string(&not_utf8, 0).expect("binary cell should render"),
+            Some("\\xff00".to_string())
+        );
+
+        // A column read as bytes on one side and as text on the other compares equal.
+        let schema = |data_type| {
+            Arc::new(Schema::new(vec![Field::new(
+                "SearchPhrase",
+                data_type,
+                false,
+            )]))
+        };
+        let text = RecordBatch::try_new(
+            schema(DataType::Utf8),
+            vec![Arc::new(StringArray::from(vec!["google"]))],
+        )
+        .expect("text batch");
+        let binary = RecordBatch::try_new(
+            schema(DataType::LargeBinary),
+            vec![Arc::new(LargeBinaryArray::from_iter_values([bytes]))],
+        )
+        .expect("binary batch");
+        assert_eq!(
+            compare_query_result_batches("clickbench_q13", &[text], &[binary], RowOrder::Multiset)
+                .expect("compare"),
+            QueryValidationResult::Pass
+        );
+    }
+
+    const Q25: &str = r#"SELECT "SearchPhrase" FROM hits WHERE "SearchPhrase" <> '' ORDER BY to_timestamp("EventTime") LIMIT 10"#;
+
+    fn search_phrases(values: &[&str]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "SearchPhrase",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(values.to_vec()))],
+        )
+        .expect("search phrase batch")
+    }
+
+    /// `ClickBench` Q25's first thirteen reference rows over `hits_0.parquet`, each
+    /// with its sort key: rows 6-8 share one `EventTime`, and `LIMIT 10` cuts
+    /// through the four rows that share the next.
+    fn q25_keyed_reference() -> RecordBatch {
+        let rows = [
+            ("a", 3),
+            ("a", 3),
+            ("b", 5),
+            ("b", 5),
+            ("c", 6),
+            ("d", 7),
+            ("d", 7),
+            ("c", 7),
+            ("e", 9),
+            ("e", 9),
+            ("f", 9),
+            ("f", 9),
+            ("g", 10),
+        ];
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("SearchPhrase", DataType::Utf8, false),
+                Field::new("__validation_sort_key_0", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.1))),
+            ],
+        )
+        .expect("keyed reference batch")
+    }
+
+    #[test]
+    fn test_unprojected_sort_limit_reads_the_sort_keys_back() {
+        let schema = search_phrases(&[]).schema();
+        let sort_limit =
+            unprojected_sort_limit(Q25, &schema).expect("the sort key is not a result column");
+        assert_eq!((sort_limit.limit, sort_limit.key_columns), (10, 1));
+        assert_eq!(
+            sort_limit.keyed_sql(20),
+            r#"SELECT "SearchPhrase", to_timestamp("EventTime") AS __validation_sort_key_0 FROM hits WHERE "SearchPhrase" <> '' ORDER BY to_timestamp("EventTime") LIMIT 20"#
+        );
+        for sql in [
+            r#"SELECT "SearchPhrase" FROM hits ORDER BY "SearchPhrase" LIMIT 10"#,
+            r#"SELECT DISTINCT "SearchPhrase" FROM hits ORDER BY to_timestamp("EventTime") LIMIT 10"#,
+            r#"SELECT "SearchPhrase" FROM hits ORDER BY to_timestamp("EventTime") LIMIT 10 OFFSET 5"#,
+            r#"SELECT "SearchPhrase" FROM hits ORDER BY to_timestamp("EventTime")"#,
+            r#"SELECT "SearchPhrase" FROM hits LIMIT 10"#,
+        ] {
+            assert_eq!(unprojected_sort_limit(sql, &schema), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_keyed_reference_accepts_any_order_of_tied_rows_and_any_pick_at_the_cutoff() {
+        // The answers the reference query and the Arrow accelerator returned for Q25.
+        let reference = search_phrases(&["a", "a", "b", "b", "c", "c", "d", "d", "e", "f"]);
+        let accelerated = search_phrases(&["a", "a", "b", "b", "c", "d", "d", "c", "e", "e"]);
+        let query = Query::new("clickbench_q25".into(), Q25.into(), false);
+        assert!(
+            matches!(
+                validate_against_reference_batches(
+                    &query,
+                    std::slice::from_ref(&accelerated),
+                    std::slice::from_ref(&reference)
+                )
+                .expect("compare"),
+                QueryValidationResult::Fail(_)
+            ),
+            "compared row by row, the two correct answers differ"
+        );
+        for answer in [reference, accelerated] {
+            assert_eq!(
+                validate_against_keyed_reference(&[answer], &[q25_keyed_reference()], 10, 1, false)
+                    .expect("check"),
+                Some(QueryValidationResult::Pass)
+            );
+        }
+    }
+
+    #[test]
+    fn test_keyed_reference_rejects_a_row_past_the_cut_tie_group() {
+        let answer = search_phrases(&["a", "a", "b", "b", "c", "d", "d", "c", "e", "g"]);
+        assert_eq!(
+            validate_against_keyed_reference(&[answer], &[q25_keyed_reference()], 10, 1, false)
+                .expect("check"),
+            Some(QueryValidationResult::Fail(
+                QueryValidationFailReason::RowNotAllowedByLimit {
+                    row_number: 10,
+                    row: r#"[Some("g")]"#.to_string(),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn test_keyed_reference_rejects_an_answer_missing_a_row_before_the_cut() {
+        // Both `d` rows sort before the cut, so a third tied row cannot replace one.
+        let answer = search_phrases(&["a", "a", "b", "b", "c", "d", "c", "e", "e", "f"]);
+        assert_eq!(
+            validate_against_keyed_reference(&[answer], &[q25_keyed_reference()], 10, 1, false)
+                .expect("check"),
+            Some(QueryValidationResult::Fail(
+                QueryValidationFailReason::RowNotAllowedByLimit {
+                    row_number: 10,
+                    row: r#"[Some("f")]"#.to_string(),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn test_keyed_reference_rejects_a_short_answer() {
+        let answer = search_phrases(&["a", "a", "b", "b", "c", "d", "d", "c", "e"]);
+        assert_eq!(
+            validate_against_keyed_reference(&[answer], &[q25_keyed_reference()], 10, 1, false)
+                .expect("check"),
+            Some(QueryValidationResult::Fail(
+                QueryValidationFailReason::RowCountMismatch {
+                    expected: 10,
+                    actual: 9
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn test_keyed_reference_needs_the_whole_cut_tie_group() {
+        let keyed = q25_keyed_reference().slice(0, 10);
+        let answer = search_phrases(&["a", "a", "b", "b", "c", "d", "d", "c", "e", "e"]);
+        // Ten rows end inside the tie group the LIMIT cuts, so more must be read...
+        assert_eq!(
+            validate_against_keyed_reference(
+                std::slice::from_ref(&answer),
+                std::slice::from_ref(&keyed),
+                10,
+                1,
+                false
+            )
+            .expect("check"),
+            None
+        );
+        // ...unless they are the whole result.
+        assert_eq!(
+            validate_against_keyed_reference(&[answer], &[keyed], 10, 1, true).expect("check"),
+            Some(QueryValidationResult::Pass)
         );
     }
 

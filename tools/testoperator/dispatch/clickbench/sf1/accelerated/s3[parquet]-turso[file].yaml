@@ -5,3 +5,4 @@ tests:
     query_overrides: turso
     runner_type: spiceai-dev-large-runners
     ready_wait: 1800
+    validate_results: true

@@ -476,7 +476,8 @@ async fn evaluate_query(
                             );
                         }
                         QueryValidationFailReason::SchemaMismatch
-                        | QueryValidationFailReason::ColumnLengthMismatch { .. } => {}
+                        | QueryValidationFailReason::ColumnLengthMismatch { .. }
+                        | QueryValidationFailReason::RowNotAllowedByLimit { .. } => {}
                     }
                 }
                 (
