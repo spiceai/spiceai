@@ -307,13 +307,14 @@ pub fn to_cached_record_batch_stream(
                 let cached_at = std::time::Instant::now();
                 let encoder = cache_provider.encoder();
 
-                match CachedQueryResult::from_batches(
+                match CachedQueryResult::from_batches_bounded(
                     records,
                     cache_schema,
                     input_tables,
                     cached_at,
                     read_started_at,
                     encoder,
+                    CachedQueryResult::raw_store_budget(cache_provider.max_size()),
                 )
                 .await
                 {
@@ -1398,14 +1399,15 @@ pub(crate) mod tests {
         );
 
         // Build a batch of highly compressible data (repeated zeros) whose
-        // uncompressed memory size exceeds both the 2 KiB cache limit and
-        // [`crate::result::query::RAW_STORE_MAX_BYTES`] — under that budget
-        // zstd still stores raw, which would not fit in 2 KiB.
+        // uncompressed memory size exceeds the 2 KiB cache limit but is still
+        // under [`crate::result::query::RAW_STORE_MAX_BYTES`]. The store path
+        // must encode it so the compressed entry can fit — staying raw would
+        // skip the write (see #8508).
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Int32, false),
         ]));
-        let n = 2_500; // 2500 rows × 2 cols × 4 bytes = 20_000 bytes raw
+        let n = 300; // 300 rows × 2 cols × 4 bytes = 2400 bytes raw > 2048 limit
         let col: Arc<dyn Array> = Arc::new(Int32Array::from(vec![0i32; n]));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&col), col])
             .expect("to create batch");
@@ -1417,8 +1419,8 @@ pub(crate) mod tests {
             "Test precondition: raw size ({raw_size}) must exceed cache max ({cache_max})"
         );
         assert!(
-            raw_size > crate::result::query::RAW_STORE_MAX_BYTES,
-            "Test precondition: raw size ({raw_size}) must exceed the raw-store budget so the entry is encoded"
+            raw_size <= crate::result::query::RAW_STORE_MAX_BYTES,
+            "Test precondition: raw size ({raw_size}) must be at or under the in-place raw-store budget so this is the #8508 case, not the large-result path"
         );
 
         let raw_cache_key = crate::key::CacheKey::Query("zstd-compressible", None)

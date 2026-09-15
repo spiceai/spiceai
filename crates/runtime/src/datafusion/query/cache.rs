@@ -396,9 +396,10 @@ impl CacheProbe {
     /// Only a hit on an entry held as batches qualifies, since serving it hands
     /// out batches the cache already holds. That is per-entry, not per-provider:
     /// `encoding: zstd` still stores results at or under
-    /// [`cache::result::query::RAW_STORE_MAX_BYTES`] as raw batches. Decoding an
-    /// encoded entry is CPU work, and a miss has a query to plan and execute, so
-    /// both belong on the query runtime.
+    /// [`cache::result::query::RAW_STORE_MAX_BYTES`] as raw batches when they
+    /// also fit the cache `max_size`. Decoding an encoded entry is CPU work,
+    /// and a miss has a query to plan and execute, so both belong on the query
+    /// runtime.
     pub(super) fn is_servable_in_place(&self) -> bool {
         matches!(self, Self::Hit(hit) if !hit.entry.cached_result.is_encoded())
     }
@@ -1249,13 +1250,16 @@ impl Query {
             // refreshes the entry correctly rather than leaving the previous
             // (now stale) value in place.
 
-            match cache::result::query::CachedQueryResult::from_batches(
+            match cache::result::query::CachedQueryResult::from_batches_bounded(
                 batches,
                 schema,
                 input_tables,
                 cached_at,
                 revalidation_started_at,
                 encoder,
+                cache::result::query::CachedQueryResult::raw_store_budget(
+                    cache_provider.max_size(),
+                ),
             )
             .await
             {
