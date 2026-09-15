@@ -190,7 +190,7 @@ NEXTEST_SELECTION := --all --exclude libnfs \
 # fork-ledger guards (docs/dev/fork_patches.md), live in its bin target, which
 # `kind(=lib)` does not select. `testoperator` is the same: the dispatch-file
 # oracle guard lives in its bin tests.
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=spiced) & binary(=dependency_logging)) + (package(=llms) & binary(=anthropic_stream_errors)) + (package(=llms) & binary(=list_models_errors)) + binary(=metrics) + (package(=spice-substrait-compliance) & kind(=bin)) + (package(=testoperator) & test(=benchmark_dispatches_validate_results_against_an_oracle))
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=spiced) & binary(=dependency_logging)) + (package(=llms) & binary(=anthropic_stream_errors)) + (package(=llms) & binary(=list_models_errors)) + binary(=metrics) + (package(=spice-substrait-compliance) & kind(=bin)) + (package(=testoperator) & test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would

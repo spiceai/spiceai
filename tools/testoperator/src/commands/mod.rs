@@ -953,6 +953,11 @@ mod tests {
     /// - `mssql`, `mssql[catalog]` and `odbc[athena]`: their TPC-H tables hold
     ///   different text columns than the parquet the TPC-H answer files were
     ///   computed from, so no answer file is their oracle.
+    /// - TPC-DS `mysql-duckdb[file]` and `mysql-duckdb[memory]`: their reference
+    ///   reads the same data through `MySQL` federation, which evaluates the
+    ///   pushed-down SQL with `MySQL` semantics (`||` as logical OR, `/` as decimal
+    ///   division, no `FULL JOIN`), so it is no oracle for the answers the
+    ///   accelerator returns.
     ///
     /// Every other scale factor 1 TPC-H, TPC-DS and `ClickBench` dispatch must
     /// validate against an oracle.
@@ -962,12 +967,14 @@ mod tests {
         "tpch/sf1/federated/mssql.yaml",
         "tpch/sf1/federated/mssql[catalog].yaml",
         "tpch/sf1/federated/odbc[athena].yaml",
+        "tpcds/sf1/accelerated/mysql-duckdb[file].yaml",
+        "tpcds/sf1/accelerated/mysql-duckdb[memory].yaml",
     ];
 
     /// Every scale factor 1 TPC-H, TPC-DS and `ClickBench` benchmark dispatch
     /// validates its results against an oracle it can actually resolve, except
     /// those in `BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION`. Benchmarks at
-    /// larger scale factors measure performance and must not validate.
+    /// larger scale factors measure performance and leave `validate_results` unset.
     ///
     /// Each `bench` entry is resolved the way `testoperator_run_bench.yml` runs
     /// it — the inputs `testoperator dispatch` sends, the spicepod under
@@ -1020,9 +1027,8 @@ mod tests {
                         .expect("query_set should serialize as a string");
                     let scale_factor = inputs["scale_factor"].as_str().unwrap_or("1");
                     if scale_factor != "1" {
-                        assert_ne!(
-                            bench.validate_results,
-                            Some(true),
+                        assert_eq!(
+                            bench.validate_results, None,
                             "{dispatch_name} benchmarks scale factor {scale_factor}, which measures performance; results are validated at scale factor 1, so leave `validate_results` unset"
                         );
                         checked += 1;

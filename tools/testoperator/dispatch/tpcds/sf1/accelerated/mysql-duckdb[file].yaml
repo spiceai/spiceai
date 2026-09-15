@@ -5,7 +5,13 @@ tests:
     query_overrides: duckdb
     ready_wait: 600
     runner_type: spiceai-dev-runners
-    validate_results: true
+    # This arm's reference is the same data read through MySQL federation, and MySQL
+    # evaluates the pushed-down SQL with its own semantics: `||` is logical OR (Q66
+    # `ship_carriers` and Q84 `customername` come back 0), `/` is decimal division
+    # (Q83 `sr_dev` is 31.11 where integer division gives 0), there is no FULL JOIN
+    # (Q51 and Q97 fail), and ROLLUP and collation order differ (Q5, Q80, Q99). With
+    # no oracle, this arm does not validate.
+    validate_results: false
   throughput:
     spicepod_path: accelerated/mysql-duckdb[file].yaml
     query_set: tpcds
