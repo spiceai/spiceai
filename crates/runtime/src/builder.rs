@@ -24,7 +24,6 @@ use crate::cluster::partition::service::PartitionService;
 #[cfg(not(windows))]
 use crate::config::ClusterRole;
 use crate::config::Config;
-#[cfg(not(windows))]
 use crate::datafusion::builder::{CayenneOptimizerRules, OutputPreview};
 use crate::datafusion::udf::register_udfs;
 use crate::{
