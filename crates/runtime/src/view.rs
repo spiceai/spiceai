@@ -197,7 +197,7 @@ impl AttestingViewProvider {
 
 #[async_trait]
 impl TableLayer for AttestingViewProvider {
-    /// A [`ViewTable`] returns its logical plan so DataFusion can inline the
+    /// A [`ViewTable`] returns its logical plan so `DataFusion` can inline the
     /// view SQL. Refresh `get_data` builds that scan; inlining skips this
     /// layer's `scan_with_args` and the producing-read stamp is never written.
     fn get_logical_plan<'a>(
