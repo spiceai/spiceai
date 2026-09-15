@@ -368,14 +368,16 @@ impl Service {
         let mut data_stream = query_result.data;
         let cache_status = query_result.cache_status;
 
-        // Take the batches that are already there, up to a small budget. A result
-        // that ends within it — any small cached result — is encoded here, on the
-        // request's own task, instead of by an encode task: its few messages need
-        // no second task to wait on, no channel, and no egress reservation.
+        // Take the batches that are already there, up to a small byte and
+        // batch-count budget. A result that ends within it — any small cached
+        // result — is encoded here, on the request's own task, instead of by an
+        // encode task: its few messages need no second task to wait on, no
+        // channel, and no egress reservation. The batch cap exists because empty
+        // batches do not grow the byte budget.
         let mut taken = Vec::new();
         let mut taken_bytes = 0;
         let ended = loop {
-            if taken_bytes > FLIGHT_INLINE_ENCODE_MAX_BYTES {
+            if inline_encode_budget_exhausted(taken_bytes, taken.len()) {
                 break false;
             }
             match data_stream.next().now_or_never() {
@@ -530,6 +532,20 @@ const FLIGHT_ENCODE_CHANNEL_CAPACITY: usize = 2;
 /// to encode — even with `zstd` IPC compression — well within the time a task may
 /// run without yielding.
 const FLIGHT_INLINE_ENCODE_MAX_BYTES: usize = 16 * 1024;
+
+/// Empty batches (especially with an empty schema) do not grow
+/// [`FLIGHT_INLINE_ENCODE_MAX_BYTES`]. This batch-count cap is what stops an
+/// unbounded ready stream from being encoded on the request runtime.
+const FLIGHT_INLINE_ENCODE_MAX_BATCHES: usize = 16;
+
+/// Whether the ready-batch take loop should stop and fall back to the encode
+/// task. Checked before each take so a stream that ends inside the budget is
+/// still encoded inline.
+#[must_use]
+fn inline_encode_budget_exhausted(taken_bytes: usize, taken_batches: usize) -> bool {
+    taken_bytes > FLIGHT_INLINE_ENCODE_MAX_BYTES
+        || taken_batches >= FLIGHT_INLINE_ENCODE_MAX_BATCHES
+}
 
 /// Encode one [`RecordBatch`] into its Flight dictionary + record-batch
 /// messages, applying the `Utf8View`/`BinaryView` → `Large*` cast when the
@@ -1318,5 +1334,45 @@ mod tests {
                 .is_some_and(|end| end.is_none()),
             "the response must end without waiting"
         );
+    }
+
+    /// Empty batches do not grow the byte budget. The batch-count cap must
+    /// therefore send a long ready stream of them down the encode-task path.
+    /// On this current-thread runtime a spawned encode task cannot have run
+    /// yet, so immediate messages would mean the path still encoded inline.
+    #[tokio::test]
+    async fn empty_ready_batches_do_not_encode_inline_without_a_bound() {
+        let schema: SchemaRef = Arc::new(Schema::empty());
+        let items = (0..1_000)
+            .map(|_| Ok(RecordBatch::new_empty(Arc::clone(&schema))))
+            .collect();
+        let mut response = respond(&schema, items, true);
+
+        let mut messages = Vec::new();
+        while let Some(Some(message)) = response.next().now_or_never() {
+            messages.push(message.expect("a message"));
+        }
+        assert!(
+            messages.is_empty(),
+            "a long ready stream of empty batches must fall back to the encode task, so no message is ready on this current-thread runtime; got {}",
+            messages.len()
+        );
+    }
+
+    /// One million zero-byte ready batches must stop at the batch-count cap.
+    /// The byte budget stays 0: empty batches never grow it.
+    #[test]
+    fn empty_batches_exhaust_the_inline_encode_budget() {
+        let taken_bytes = 0;
+        let mut taken_batches = 0;
+        for _ in 0..1_000_000 {
+            if inline_encode_budget_exhausted(taken_bytes, taken_batches) {
+                break;
+            }
+            taken_batches += 1;
+        }
+        assert_eq!(taken_batches, FLIGHT_INLINE_ENCODE_MAX_BATCHES);
+        assert_eq!(taken_bytes, 0);
+        assert!(inline_encode_budget_exhausted(taken_bytes, taken_batches));
     }
 }
