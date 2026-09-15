@@ -1547,7 +1547,7 @@ mod tests {
                 .expect("a single-read executing-plan attestation may publish");
         }
 
-        /// Sequential model of Copilot discussion_r4010927556.
+        /// Sequential model of Copilot `discussion_r4010927556`.
         ///
         /// A snapshot holds the write mutex and samples `configured = true` at
         /// epoch N. A new refresh then begins (retracts provenance, epoch N+1)
@@ -1695,7 +1695,7 @@ mod tests {
             );
         }
 
-        /// Sequential model of Copilot discussion_r4011722534.
+        /// Sequential model of Copilot `discussion_r4011722534`.
         ///
         /// A refresh at epoch N produced a multi-read materialization and the
         /// snapshot path sampled `(configured=true, epoch=N)`. An ordinary

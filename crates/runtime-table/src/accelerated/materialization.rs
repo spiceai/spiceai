@@ -180,7 +180,7 @@ mod tests {
         assert!(identity.is_configured());
     }
 
-    /// Sequential model of Copilot discussion_r4010927556: a snapshot samples
+    /// Sequential model of Copilot `discussion_r4010927556`: a snapshot samples
     /// `(configured=true, epoch=N)` under the write mutex, then a dequeued
     /// refresh begins `N+1` and retracts. A later `sample()` must not report
     /// `configured=true` at `N+1` — that torn pair is what would let the
