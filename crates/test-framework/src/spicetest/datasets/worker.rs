@@ -725,8 +725,9 @@ impl SpiceTestQueryWorker {
 
                 // A top-level LIMIT without ORDER BY may keep any rows, so rows that
                 // differ from the reference's fail only if one of them is not in the
-                // full result the LIMIT was taken from.
-                if matches!(validation_result, QueryValidationResult::Fail(_))
+                // full result the LIMIT was taken from. An arity `SchemaMismatch`
+                // stays: a cell-wise retry cannot fix a width mismatch.
+                if live_oracle_row_fallback_applies(&validation_result)
                     && let Some(unordered_limit) = validation::unordered_limit(&reference_query.sql)
                     && unordered_limit.may_keep_different_rows(
                         batches.iter().map(RecordBatch::num_rows).sum(),
@@ -753,8 +754,9 @@ impl SpiceTestQueryWorker {
 
                 // An ORDER BY on something the result does not include hides where tie
                 // groups begin and end, so a mismatch there is judged against the
-                // reference rows read back with their sort keys.
-                if matches!(validation_result, QueryValidationResult::Fail(_))
+                // reference rows read back with their sort keys. An arity
+                // `SchemaMismatch` stays, same as the unordered-LIMIT fallback.
+                if live_oracle_row_fallback_applies(&validation_result)
                     && let Some(schema) = batches.first().map(RecordBatch::schema)
                     && let Some(sort_limit) =
                         validation::unprojected_sort_limit(&reference_query.sql, &schema)
@@ -1023,6 +1025,17 @@ fn zero_row_count_is_failure(
     validate_row_count && !skipped && row_count == 0 && !reference_validation_passed
 }
 
+/// LIMIT fallbacks compare rendered cells. They must not replace a
+/// [`validation::QueryValidationFailReason::SchemaMismatch`]: the live oracle
+/// uses that reason for arity, and a cell-wise retry cannot fix a width mismatch.
+fn live_oracle_row_fallback_applies(result: &QueryValidationResult) -> bool {
+    matches!(
+        result,
+        QueryValidationResult::Fail(reason)
+            if !matches!(reason, validation::QueryValidationFailReason::SchemaMismatch)
+    )
+}
+
 fn should_validate_on_run(validate: bool, is_warmup: bool, has_reference_schema: bool) -> bool {
     if !validate {
         return false;
@@ -1160,6 +1173,24 @@ mod tests {
             next_keyed_reference_fetch_rows(first),
             Some(MAX_KEYED_REFERENCE_ROWS)
         );
+    }
+
+    #[test]
+    fn schema_mismatch_does_not_take_a_row_fallback() {
+        assert!(!live_oracle_row_fallback_applies(
+            &QueryValidationResult::Fail(validation::QueryValidationFailReason::SchemaMismatch)
+        ));
+        assert!(live_oracle_row_fallback_applies(
+            &QueryValidationResult::Fail(validation::QueryValidationFailReason::DataMismatch {
+                column: "value".into(),
+                row_number: 1,
+                expected: "true".into(),
+                actual: "false".into(),
+            })
+        ));
+        assert!(!live_oracle_row_fallback_applies(
+            &QueryValidationResult::Pass
+        ));
     }
 
     /// The warmup is the only run that asserts a result snapshot, so its failure has

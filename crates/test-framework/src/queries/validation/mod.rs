@@ -1457,6 +1457,21 @@ pub fn validate_against_keyed_reference(
             }
         }
     }
+    if picks_from_cut_group > 0 || before_cut.values().any(|count| *count > 0) {
+        let missing = before_cut
+            .iter()
+            .find(|(_, count)| **count > 0)
+            .map_or_else(
+                || "a row from the LIMIT cutoff group".to_string(),
+                |(cells, _)| format!("{cells:?}"),
+            );
+        return Ok(Some(QueryValidationResult::Fail(
+            QueryValidationFailReason::RowNotAllowedByLimit {
+                row_number,
+                row: missing,
+            },
+        )));
+    }
     Ok(Some(QueryValidationResult::Pass))
 }
 
@@ -2772,6 +2787,117 @@ mod test {
                     row: r#"[Some("f")]"#.to_string(),
                 }
             ))
+        );
+    }
+
+    #[test]
+    fn test_keyed_reference_rejects_a_pre_cutoff_row_replaced_by_a_cutoff_duplicate() {
+        // ORDER BY key: (X,1), (Y,2), (X,3). LIMIT 3 must keep X and Y and one X
+        // from the key-3 group. [X, X] is one short; [X, X, X] has no Y even
+        // though X also appears in the cutoff group.
+        let keyed = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("SearchPhrase", DataType::Utf8, false),
+                Field::new("__validation_sort_key_0", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["X", "Y", "X"])),
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .expect("keyed overlap reference");
+
+        assert_eq!(
+            validate_against_keyed_reference(
+                &[search_phrases(&["X", "X"])],
+                std::slice::from_ref(&keyed),
+                3,
+                1,
+                true
+            )
+            .expect("check short"),
+            Some(QueryValidationResult::Fail(
+                QueryValidationFailReason::RowCountMismatch {
+                    expected: 3,
+                    actual: 2
+                }
+            ))
+        );
+        assert_eq!(
+            validate_against_keyed_reference(
+                &[search_phrases(&["X", "X", "X"])],
+                std::slice::from_ref(&keyed),
+                3,
+                1,
+                true
+            )
+            .expect("check missing Y"),
+            Some(QueryValidationResult::Fail(
+                QueryValidationFailReason::RowNotAllowedByLimit {
+                    row_number: 3,
+                    row: r#"[Some("X")]"#.to_string(),
+                }
+            ))
+        );
+        assert_eq!(
+            validate_against_keyed_reference(
+                &[search_phrases(&["X", "Y", "X"])],
+                &[keyed],
+                3,
+                1,
+                true
+            )
+            .expect("check complete"),
+            Some(QueryValidationResult::Pass)
+        );
+    }
+
+    #[test]
+    fn test_live_oracle_schema_mismatch_is_arity_not_physical_type() {
+        let boolean = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Boolean,
+                false,
+            )])),
+            vec![Arc::new(BooleanArray::from(vec![true]))],
+        )
+        .expect("boolean batch");
+        let utf8 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "other",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(vec!["true"]))],
+        )
+        .expect("utf8 batch");
+        let query = Query::new("schema_q".into(), "SELECT true".into(), false);
+        assert_eq!(
+            validate_against_reference_batches(
+                &query,
+                std::slice::from_ref(&utf8),
+                std::slice::from_ref(&boolean)
+            )
+            .expect("direct compare"),
+            QueryValidationResult::Pass,
+            "engine-vs-engine compare stringifies cells; Boolean true and Utf8 true are equal"
+        );
+
+        let two_col = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Utf8, false),
+                Field::new("b", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["true"])),
+                Arc::new(StringArray::from(vec!["x"])),
+            ],
+        )
+        .expect("two-column batch");
+        assert_eq!(
+            validate_against_reference_batches(&query, &[utf8], &[two_col]).expect("arity compare"),
+            QueryValidationResult::Fail(QueryValidationFailReason::SchemaMismatch)
         );
     }
 
