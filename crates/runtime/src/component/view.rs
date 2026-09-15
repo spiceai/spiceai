@@ -344,14 +344,14 @@ impl AccelerationSource for View {
         &self,
     ) -> Option<runtime_acceleration::acceleration_source::SourceDefinition> {
         // A view's accelerated rows are the result of its whole definition closure — its
-        // own SQL plus every view it transitively reads — so that is what a snapshot of
-        // them is valid against. The closure also carries the configuration that shapes the
-        // stored VALUES rather than the row set: `prepare_view` builds embedding and
-        // full-text columns from `columns` and reads `file_format` from `params`, so an
-        // embedding model can be swapped for another of the same vector size without the
-        // SQL or the schema changing. Strict about unstamped archives: view snapshots have
-        // carried a stamp since the day they existed, so one without is not from this
-        // view's series.
+        // own SQL plus every view, dataset, and catalog it transitively reads — so that is
+        // what a snapshot of them is valid against. The closure also carries the
+        // configuration that shapes the stored VALUES rather than the row set:
+        // `prepare_view` builds embedding and full-text columns from `columns` and reads
+        // `file_format` from `params`, so an embedding model can be swapped for another of
+        // the same vector size without the SQL or the schema changing. Strict about
+        // unstamped archives: view snapshots have carried a stamp since the day they
+        // existed, so one without is not from this view's series.
         Some(
             runtime_acceleration::acceleration_source::SourceDefinition {
                 fingerprint: crate::view::definition_fingerprint(

@@ -496,13 +496,15 @@ fn is_non_read_leaf(name: &str) -> bool {
     matches!(name, "EmptyExec" | "PlaceholderRowExec" | "ValuesExec")
 }
 
-/// The definition string a view's snapshot identity is computed over: its own SQL plus the
-/// SQL of every view it transitively reads.
+/// The definition string a view's snapshot identity is computed over: its own SQL plus
+/// every view, dataset, and catalog it transitively reads.
 ///
 /// A view's rows are the result of its whole dependency closure, not just its outer text.
 /// `outer` = `SELECT * FROM inner` keeps identical SQL when `inner` changes from a US
 /// filter to an EU one — same schema, entirely different rows — so an identity taken from
 /// the outer text alone would accept an archive materialized under the old `inner`. The
+/// same hole exists for a catalog-backed relation: `SELECT * FROM sales.public.orders`
+/// keeps identical SQL when catalog `sales` is rebound to another endpoint. The
 /// runtime already treats this as a real dependency: `apply_view_diff` reloads unchanged
 /// views whose dependencies changed.
 ///
@@ -589,6 +591,18 @@ pub(crate) fn view_definition_closure(
         }
     }
 
+    // A catalog is addressed by its registered name as the catalog qualifier
+    // (`sales.public.orders`) or, when the SQL only states two parts, as the
+    // first path segment (`sales.orders`). A bare table name is the default
+    // catalog's table, not a catalog, so it is not matched here: matching
+    // too widely would fold an unrelated catalog into every `FROM orders`.
+    fn catalog_matches(catalog_name: &str, referenced: &TableReference) -> bool {
+        match referenced.catalog() {
+            Some(catalog) => catalog == catalog_name,
+            None => referenced.schema() == Some(catalog_name),
+        }
+    }
+
     let mut closure: BTreeMap<String, String> = BTreeMap::new();
     let mut pending = dependencies_of(sql);
     let mut seen: HashSet<String> = HashSet::from([name.to_string()]);
@@ -664,6 +678,21 @@ pub(crate) fn view_definition_closure(
                 dataset_definition_identity(&dataset.from, &dataset_identity_fields(dataset)),
             );
         }
+
+        // Catalogs contribute the same way datasets do. `sales.public.orders` is
+        // supplied by `app.catalogs`, not by a declared dataset; rebinding catalog
+        // `sales` to another endpoint keeps the view SQL and schema identical.
+        // Folding only datasets would restore an archive of the old catalog's rows.
+        for catalog in app
+            .catalogs
+            .iter()
+            .filter(|candidate| catalog_matches(&candidate.name, &dependency))
+        {
+            closure.insert(
+                catalog.name.clone(),
+                catalog_definition_identity(&catalog.from, &catalog_identity_fields(catalog)),
+            );
+        }
     }
 
     // The root view contributes its own value-shaping configuration too, not just its SQL —
@@ -677,7 +706,8 @@ pub(crate) fn view_definition_closure(
         definition.push_str("\n-- depends on ");
         push_len_prefixed(&mut definition, &dependency_name);
         definition.push('\n');
-        // Already a `view_definition_identity` / `dataset_definition_identity`.
+        // Already a `view_definition_identity` / `dataset_definition_identity` /
+        // `catalog_definition_identity`.
         // Trimming it would collapse a last field that differs only by
         // equal-length trailing whitespace (quoted YAML can preserve space vs tab).
         push_len_prefixed(&mut definition, &dependency_identity);
@@ -749,6 +779,61 @@ pub(crate) fn dataset_definition_identity(from: &str, fields: &BTreeMap<String, 
         push_len_prefixed(&mut identity, value);
     }
     identity
+}
+
+/// The definition string a CATALOG's snapshot identity is computed over: what it
+/// binds to and everything that shapes which tables — and therefore which rows —
+/// a view reading through it can see.
+///
+/// Encoded the same way as [`dataset_definition_identity`] so a catalog and a
+/// dataset cannot disagree about how `from` and its fields are written. `params`
+/// and `dataset_params` are included in full rather than filtered to a known
+/// row-shaping subset: which keys bind the catalog to a different
+/// endpoint/database is connector-specific, and a permissive allowlist is the
+/// direction that accepts an archive of the wrong rows. `include` / `exclude`
+/// change which tables are visible.
+///
+/// Secret and env references are hashed as the *reference*, the same way a
+/// dataset's are — see [`first_unresolved_snapshot_identity_param`]. They are
+/// not stripped from the identity: dropping them would make two catalogs that
+/// bind through different secret keys look the same.
+#[must_use]
+pub(crate) fn catalog_definition_identity(from: &str, fields: &BTreeMap<String, String>) -> String {
+    dataset_definition_identity(from, fields)
+}
+
+/// The identity fields of a catalog as DECLARED in a Spicepod.
+fn catalog_identity_fields(
+    catalog: &spicepod::component::catalog::Catalog,
+) -> BTreeMap<String, String> {
+    let mut fields = BTreeMap::new();
+
+    let params = catalog
+        .params
+        .as_ref()
+        .map(spicepod::param::Params::as_string_map)
+        .unwrap_or_default();
+    for (key, value) in params {
+        fields.insert(format!("param.{key}"), value);
+    }
+
+    let dataset_params = catalog
+        .dataset_params
+        .as_ref()
+        .map(spicepod::param::Params::as_string_map)
+        .unwrap_or_default();
+    for (key, value) in dataset_params {
+        fields.insert(format!("dataset_param.{key}"), value);
+    }
+
+    if !catalog.include.is_empty() {
+        fields.insert("include".to_string(), identity_value(&catalog.include));
+    }
+    if !catalog.exclude.is_empty() {
+        fields.insert("exclude".to_string(), identity_value(&catalog.exclude));
+    }
+
+    fields
 }
 
 /// The identity fields of a dataset as DECLARED in a Spicepod.
@@ -1855,6 +1940,14 @@ mod tests {
 
         /// Build an app holding one view and one dataset, to exercise the closure.
         fn app_with(views: &[(&str, &str)], datasets: &[(&str, &str)]) -> app::App {
+            app_with_catalogs(views, datasets, &[])
+        }
+
+        fn app_with_catalogs(
+            views: &[(&str, &str)],
+            datasets: &[(&str, &str)],
+            catalogs: &[spicepod::component::catalog::Catalog],
+        ) -> app::App {
             let mut builder = app::AppBuilder::new("closure_test");
             for (name, sql) in views {
                 let mut view = spicepod::component::view::View::new((*name).to_string());
@@ -1867,7 +1960,23 @@ mod tests {
                     (*name).to_string(),
                 ));
             }
+            for catalog in catalogs {
+                builder = builder.with_catalog(catalog.clone());
+            }
             builder.build()
+        }
+
+        fn catalog(from: &str, name: &str) -> spicepod::component::catalog::Catalog {
+            spicepod::component::catalog::Catalog::new(from.to_string(), name.to_string())
+        }
+
+        fn catalog_params(pairs: &[(&str, &str)]) -> spicepod::param::Params {
+            spicepod::param::Params::from_string_map(
+                pairs
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect(),
+            )
         }
 
         /// A view's rows are the result of its dependencies, so changing a view it reads
@@ -1925,6 +2034,189 @@ mod tests {
                 definition_fingerprint(&old),
                 definition_fingerprint(&new),
                 "rebinding a dataset the view reads must change the view's identity"
+            );
+        }
+
+        /// A catalog-backed relation such as `sales.public.orders` is supplied by
+        /// `app.catalogs`, not `app.datasets`. Rebinding catalog `sales` to another
+        /// endpoint keeps the view SQL and schema identical; omitting it from the
+        /// fingerprint would restore an archive of the old catalog's rows.
+        ///
+        /// Regression for Copilot `discussion_r4012670462`.
+        #[test]
+        fn closure_follows_a_dependency_catalog() {
+            let v = TableReference::bare("v");
+            let sql = "SELECT * FROM sales.public.orders";
+            let mut old_catalog = catalog("postgres:old_db", "sales");
+            old_catalog.params = Some(catalog_params(&[("pg_host", "old.example")]));
+            let mut new_catalog = catalog("postgres:new_db", "sales");
+            new_catalog.params = Some(catalog_params(&[("pg_host", "new.example")]));
+            let old = view_definition_closure(
+                &v,
+                sql,
+                &[],
+                &HashMap::new(),
+                &app_with_catalogs(&[], &[], &[old_catalog]),
+            );
+            let new = view_definition_closure(
+                &v,
+                sql,
+                &[],
+                &HashMap::new(),
+                &app_with_catalogs(&[], &[], &[new_catalog]),
+            );
+            let old_fp = definition_fingerprint(&old);
+            let new_fp = definition_fingerprint(&new);
+            eprintln!("catalog_configs_differ={}", old != new);
+            eprintln!("fingerprints_equal={}", old_fp == new_fp);
+            eprintln!("old_fp={old_fp}");
+            eprintln!("new_fp={new_fp}");
+            assert_ne!(
+                old_fp, new_fp,
+                "rebinding a catalog the view reads must change the view's identity"
+            );
+            assert!(
+                old.contains("postgres:old_db") && new.contains("postgres:new_db"),
+                "the catalog source must be folded into the closure: old={old} new={new}"
+            );
+        }
+
+        #[test]
+        fn rebinding_catalog_params_changes_the_fingerprint() {
+            let v = TableReference::bare("v");
+            let sql = "SELECT * FROM sales.public.orders";
+            let closure_for = |pg_host: &str, dataset_schema: &str| {
+                let mut sales = catalog("postgres:sales", "sales");
+                sales.params = Some(catalog_params(&[("pg_host", pg_host)]));
+                sales.dataset_params = Some(catalog_params(&[("pg_search_path", dataset_schema)]));
+                view_definition_closure(
+                    &v,
+                    sql,
+                    &[],
+                    &HashMap::new(),
+                    &app_with_catalogs(&[], &[], &[sales]),
+                )
+            };
+            assert_ne!(
+                definition_fingerprint(&closure_for("old.example", "public")),
+                definition_fingerprint(&closure_for("new.example", "public")),
+                "a catalog param that binds a different endpoint must move the identity"
+            );
+            assert_ne!(
+                definition_fingerprint(&closure_for("old.example", "public")),
+                definition_fingerprint(&closure_for("old.example", "analytics")),
+                "a catalog dataset_param that changes which rows are visible must move the identity"
+            );
+        }
+
+        #[test]
+        fn catalog_include_and_exclude_move_the_fingerprint() {
+            let v = TableReference::bare("v");
+            let sql = "SELECT * FROM sales.public.orders";
+            let closure_for = |include: &[&str], exclude: &[&str]| {
+                let mut sales = catalog("postgres:sales", "sales");
+                sales.include = include
+                    .iter()
+                    .map(|pattern| (*pattern).to_string())
+                    .collect();
+                sales.exclude = exclude
+                    .iter()
+                    .map(|pattern| (*pattern).to_string())
+                    .collect();
+                view_definition_closure(
+                    &v,
+                    sql,
+                    &[],
+                    &HashMap::new(),
+                    &app_with_catalogs(&[], &[], &[sales]),
+                )
+            };
+            assert_ne!(
+                definition_fingerprint(&closure_for(&["public.*"], &[])),
+                definition_fingerprint(&closure_for(&["analytics.*"], &[])),
+                "include decides which catalog tables are visible"
+            );
+            assert_ne!(
+                definition_fingerprint(&closure_for(&["public.*"], &[])),
+                definition_fingerprint(&closure_for(&["public.*"], &["public.secret_*"])),
+                "exclude decides which catalog tables are visible"
+            );
+        }
+
+        #[test]
+        fn a_two_part_catalog_qualifier_still_matches() {
+            // `sales.orders` has no catalog qualifier in `TableReference` (it is
+            // schema.table), but the first path segment is still the catalog name.
+            let v = TableReference::bare("v");
+            let closure = view_definition_closure(
+                &v,
+                "SELECT * FROM sales.orders",
+                &[],
+                &HashMap::new(),
+                &app_with_catalogs(&[], &[], &[catalog("postgres:sales", "sales")]),
+            );
+            assert!(
+                closure.contains("postgres:sales"),
+                "a two-part name's first segment must still match the catalog: {closure}"
+            );
+        }
+
+        #[test]
+        fn catalog_secret_ref_params_are_hashed_as_the_reference() {
+            // Identity hashes the Spicepod reference, not the resolved value — the
+            // same hole `first_unresolved_snapshot_identity_param` refuses on the
+            // snapshot-enabled component. Different keys must not share a fingerprint.
+            let v = TableReference::bare("v");
+            let sql = "SELECT * FROM sales.public.orders";
+            let closure_for = |value: &str| {
+                let mut sales = catalog("postgres:sales", "sales");
+                sales.params = Some(catalog_params(&[("pg_host", value)]));
+                view_definition_closure(
+                    &v,
+                    sql,
+                    &[],
+                    &HashMap::new(),
+                    &app_with_catalogs(&[], &[], &[sales]),
+                )
+            };
+            assert_ne!(
+                definition_fingerprint(&closure_for("${secrets:old_host}")),
+                definition_fingerprint(&closure_for("${secrets:new_host}")),
+                "distinct secret-reference keys in catalog params must move the identity"
+            );
+            let params = catalog_params(&[("pg_host", "${secrets:pg_host}")]).as_string_map();
+            let unresolved = first_unresolved_snapshot_identity_param(&params)
+                .expect("a catalog identity param that is a secret reference must be detected");
+            assert_eq!(unresolved.param, "pg_host");
+            assert_eq!(unresolved.store, "secrets");
+            assert_eq!(unresolved.key, "pg_host");
+        }
+
+        #[test]
+        fn an_unmatched_catalog_is_not_folded_into_the_closure() {
+            let v = TableReference::bare("v");
+            let sql = "SELECT * FROM sales.public.orders";
+            let sales = view_definition_closure(
+                &v,
+                sql,
+                &[],
+                &HashMap::new(),
+                &app_with_catalogs(&[], &[], &[catalog("postgres:sales", "sales")]),
+            );
+            let other = view_definition_closure(
+                &v,
+                sql,
+                &[],
+                &HashMap::new(),
+                &app_with_catalogs(&[], &[], &[catalog("postgres:other", "inventory")]),
+            );
+            assert!(
+                sales.contains("postgres:sales"),
+                "the matching catalog must contribute: {sales}"
+            );
+            assert!(
+                !other.contains("postgres:other"),
+                "a catalog whose name is not a qualifier of the relation must not contribute: {other}"
             );
         }
 
