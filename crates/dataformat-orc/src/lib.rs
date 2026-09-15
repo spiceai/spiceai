@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,17 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-mod cancel_tasks;
-mod distributed_acceleration;
-mod distributed_cayenne_catalog;
-mod distributed_http;
-#[cfg(not(target_os = "windows"))]
-mod distributed_iceberg;
-mod distributed_task_history;
-pub mod harness;
-mod in_memory_shuffle;
-mod job_store;
-#[cfg(not(target_os = "windows"))]
-mod scheduler_failover;
-mod simple;
-mod write_through_idle_timeout;
+//! Apache ORC [`datafusion::datasource::file_format::FileFormat`] built on
+//! [`orc_rust`] for Spice listing connectors (S3, GCS, ABFS, file, …).
+//!
+//! This crate is the in-repo equivalent of `dataformat-json`. It does **not**
+//! depend on `datafusion-orc`.
+
+mod file_format;
+mod object_store_reader;
+mod source;
+
+pub use file_format::OrcFormat;
+pub use source::OrcSource;
+
+#[cfg(test)]
+mod test_support;
