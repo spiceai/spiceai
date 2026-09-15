@@ -1,0 +1,267 @@
+[
+  {
+    "name": "first-query",
+    "sql": "SELECT tenant_id, COUNT(*) AS paid_orders, SUM(total_cents) AS gross_cents FROM paid_orders GROUP BY tenant_id ORDER BY tenant_id",
+    "actual": [
+      {
+        "tenant_id": "north",
+        "paid_orders": 4,
+        "gross_cents": 22200
+      },
+      {
+        "tenant_id": "south",
+        "paid_orders": 2,
+        "gross_cents": 24900
+      }
+    ],
+    "expected": [
+      {
+        "tenant_id": "north",
+        "paid_orders": 4,
+        "gross_cents": 22200
+      },
+      {
+        "tenant_id": "south",
+        "paid_orders": 2,
+        "gross_cents": 24900
+      }
+    ]
+  },
+  {
+    "name": "null-counts",
+    "sql": "SELECT COUNT(*) AS rows, COUNT(customer_id) AS known_customers, COUNT(DISTINCT customer_id) AS distinct_customers FROM orders",
+    "actual": [
+      {
+        "rows": 8,
+        "known_customers": 7,
+        "distinct_customers": 4
+      }
+    ],
+    "expected": [
+      {
+        "rows": 8,
+        "known_customers": 7,
+        "distinct_customers": 4
+      }
+    ]
+  },
+  {
+    "name": "empty-aggregate",
+    "sql": "SELECT COUNT(*) AS n, SUM(total_cents) AS total FROM orders WHERE status = 'missing'",
+    "actual": [
+      {
+        "n": 0,
+        "total": null
+      }
+    ],
+    "expected": [
+      {
+        "n": 0,
+        "total": null
+      }
+    ]
+  },
+  {
+    "name": "wrong-join",
+    "sql": "SELECT SUM(o.total_cents) AS gross_cents FROM paid_orders o JOIN order_items i ON o.order_id = i.order_id",
+    "actual": [
+      {
+        "gross_cents": 74600
+      }
+    ],
+    "expected": [
+      {
+        "gross_cents": 74600
+      }
+    ]
+  },
+  {
+    "name": "fixed-join",
+    "sql": "WITH line_totals AS (SELECT order_id, SUM(quantity * unit_price_cents) AS line_cents FROM order_items GROUP BY order_id) SELECT SUM(o.total_cents) AS gross_cents, SUM(i.line_cents) AS line_cents FROM paid_orders o JOIN line_totals i ON o.order_id = i.order_id",
+    "actual": [
+      {
+        "gross_cents": 47100,
+        "line_cents": 47100
+      }
+    ],
+    "expected": [
+      {
+        "gross_cents": 47100,
+        "line_cents": 47100
+      }
+    ]
+  },
+  {
+    "name": "net-revenue",
+    "sql": "WITH refunds AS (SELECT order_id, SUM(refund_cents) AS refund_cents FROM returns GROUP BY order_id) SELECT o.tenant_id, SUM(o.total_cents) AS gross_cents, SUM(COALESCE(r.refund_cents, 0)) AS refund_cents, SUM(o.total_cents - COALESCE(r.refund_cents, 0)) AS net_cents FROM paid_orders o LEFT JOIN refunds r ON o.order_id = r.order_id GROUP BY o.tenant_id ORDER BY o.tenant_id",
+    "actual": [
+      {
+        "tenant_id": "north",
+        "gross_cents": 22200,
+        "refund_cents": 11200,
+        "net_cents": 11000
+      },
+      {
+        "tenant_id": "south",
+        "gross_cents": 24900,
+        "refund_cents": 3300,
+        "net_cents": 21600
+      }
+    ],
+    "expected": [
+      {
+        "tenant_id": "north",
+        "gross_cents": 22200,
+        "refund_cents": 11200,
+        "net_cents": 11000
+      },
+      {
+        "tenant_id": "south",
+        "gross_cents": 24900,
+        "refund_cents": 3300,
+        "net_cents": 21600
+      }
+    ]
+  },
+  {
+    "name": "customers-without-orders",
+    "sql": "SELECT c.customer_id FROM customers c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.customer_id AND o.tenant_id = c.tenant_id) ORDER BY c.customer_id",
+    "actual": [
+      {
+        "customer_id": 5
+      }
+    ],
+    "expected": [
+      {
+        "customer_id": 5
+      }
+    ]
+  },
+  {
+    "name": "wrong-not-in",
+    "sql": "SELECT customer_id FROM customers WHERE customer_id NOT IN (SELECT customer_id FROM orders)",
+    "actual": [],
+    "expected": []
+  },
+  {
+    "name": "window",
+    "sql": "SELECT order_id, SUM(total_cents) OVER (PARTITION BY tenant_id ORDER BY ordered_at, order_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_cents FROM paid_orders WHERE tenant_id = 'north' ORDER BY order_id",
+    "actual": [
+      {
+        "order_id": 1001,
+        "running_cents": 12500
+      },
+      {
+        "order_id": 1002,
+        "running_cents": 19700
+      },
+      {
+        "order_id": 1005,
+        "running_cents": 22200
+      },
+      {
+        "order_id": 1007,
+        "running_cents": 22200
+      }
+    ],
+    "expected": [
+      {
+        "order_id": 1001,
+        "running_cents": 12500
+      },
+      {
+        "order_id": 1002,
+        "running_cents": 19700
+      },
+      {
+        "order_id": 1005,
+        "running_cents": 22200
+      },
+      {
+        "order_id": 1007,
+        "running_cents": 22200
+      }
+    ]
+  },
+  {
+    "name": "decimal",
+    "sql": "SELECT CAST(SUM(total_cents) AS DECIMAL(18,2)) / 100 AS gross_dollars FROM paid_orders",
+    "actual": [
+      {
+        "gross_dollars": 471.0
+      }
+    ],
+    "expected": null
+  },
+  {
+    "name": "schema",
+    "sql": "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' ORDER BY ordinal_position",
+    "actual": [
+      {
+        "table_name": "orders",
+        "column_name": "order_id",
+        "data_type": "Int64"
+      },
+      {
+        "table_name": "orders",
+        "column_name": "tenant_id",
+        "data_type": "Utf8"
+      },
+      {
+        "table_name": "orders",
+        "column_name": "customer_id",
+        "data_type": "Int64"
+      },
+      {
+        "table_name": "orders",
+        "column_name": "ordered_at",
+        "data_type": "Timestamp(s)"
+      },
+      {
+        "table_name": "orders",
+        "column_name": "status",
+        "data_type": "Utf8"
+      },
+      {
+        "table_name": "orders",
+        "column_name": "total_cents",
+        "data_type": "Int64"
+      }
+    ],
+    "expected": null
+  },
+  {
+    "name": "plan",
+    "sql": "EXPLAIN SELECT order_id FROM orders WHERE status = 'paid' AND total_cents > 5000",
+    "actual": [
+      {
+        "plan_type": "logical_plan",
+        "plan": "Projection: orders.order_id\n  Filter: orders.status = Utf8(\"paid\") AND orders.total_cents > Int64(5000)\n    TableScan: orders projection=[order_id, status, total_cents], partial_filters=[orders.status = Utf8(\"paid\"), orders.total_cents > Int64(5000)]"
+      },
+      {
+        "plan_type": "physical_plan",
+        "plan": "FilterExec: status@1 = paid AND total_cents@2 > 5000, projection=[order_id@0]\n  RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1\n    BytesProcessedExec\n      DataSourceExec: file_groups={1 group: [[Users/lukim/dev/spice2/book/spice-ai-in-action/companion/data/orders.csv]]}, projection=[order_id, status, total_cents], file_type=csv, has_header=true\n"
+      }
+    ],
+    "expected": null
+  },
+  {
+    "name": "analyze",
+    "sql": "EXPLAIN ANALYZE SELECT tenant_id, SUM(total_cents) FROM paid_orders GROUP BY tenant_id",
+    "actual": [
+      {
+        "plan_type": "Plan with Metrics",
+        "plan": "AggregateExec: mode=FinalPartitioned, gby=[tenant_id@0 as tenant_id], aggr=[sum(paid_orders.total_cents)], metrics=[output_rows=2, elapsed_compute=92.54\u00b5s, output_bytes=16.1 KB, output_batches=2, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, peak_mem_used=151.9 K, aggregate_arguments_time=473ns, aggregation_time=388ns, emitting_time=2.51\u00b5s, time_calculating_group_ids=1.43\u00b5s]\n  RepartitionExec: partitioning=Hash([tenant_id@0], 16), input_partitions=16, metrics=[output_rows=2, elapsed_compute=23.54\u00b5s, output_bytes=128.0 KB, output_batches=2, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, fetch_time=3.65ms, repartition_time=2.89\u00b5s, send_time=1.21\u00b5s]\n    AggregateExec: mode=Partial, gby=[tenant_id@0 as tenant_id], aggr=[sum(paid_orders.total_cents)], metrics=[output_rows=2, elapsed_compute=35.04\u00b5s, output_bytes=8.0 KB, output_batches=1, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, skipped_aggregation_rows=0, peak_mem_used=135.0 K, aggregate_arguments_time=306ns, aggregation_time=515ns, emitting_time=1.72\u00b5s, time_calculating_group_ids=1.39\u00b5s, reduction_factor=33.33% (2/6)]\n      FilterExec: status@1 = paid, projection=[tenant_id@0, total_cents@2], metrics=[output_rows=6, elapsed_compute=8.97\u00b5s, output_bytes=64.1 KB, output_batches=1, selectivity=75% (6/8)]\n        RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1, metrics=[output_rows=8, elapsed_compute=3.13\u00b5s, output_bytes=66.1 KB, output_batches=1, spill_count=0, spilled_bytes=0.0 B, spilled_rows=0, fetch_time=118.71\u00b5s, repartition_time=1ns, send_time=1.31\u00b5s]\n          BytesProcessedExec, metrics=[output_rows=8, elapsed_compute=45.04\u00b5s, output_bytes=2.1 KB, output_batches=1, batches_split=0, file_open_errors=0, file_scan_errors=0, files_opened=1, files_processed=1, time_elapsed_opening=60.33\u00b5s, time_elapsed_processing=72.92\u00b5s, time_elapsed_scanning_total=51.21\u00b5s, time_elapsed_scanning_until_data=45.38\u00b5s]\n            DataSourceExec: file_groups={1 group: [[Users/lukim/dev/spice2/book/spice-ai-in-action/companion/data/orders.csv]]}, projection=[tenant_id, status, total_cents], file_type=csv, has_header=true, metrics=[output_rows=8, elapsed_compute=45.04\u00b5s, output_bytes=2.1 KB, output_batches=1, batches_split=0, file_open_errors=0, file_scan_errors=0, files_opened=1, files_processed=1, time_elapsed_opening=60.33\u00b5s, time_elapsed_processing=72.92\u00b5s, time_elapsed_scanning_total=51.21\u00b5s, time_elapsed_scanning_until_data=45.38\u00b5s]\n"
+      }
+    ],
+    "expected": null
+  },
+  {
+    "name": "parameters",
+    "actual": [
+      {
+        "gross_cents": 22200
+      }
+    ]
+  }
+]
