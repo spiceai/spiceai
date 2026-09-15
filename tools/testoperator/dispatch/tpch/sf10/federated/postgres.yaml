@@ -4,4 +4,3 @@ tests:
     query_set: tpch
     runner_type: spiceai-dev-runners
     scale_factor: 10
-    validate_results: true

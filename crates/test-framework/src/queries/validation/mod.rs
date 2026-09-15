@@ -566,6 +566,14 @@ fn bytes_to_string(bytes: &[u8]) -> String {
     hex
 }
 
+/// The largest relative difference at which two numeric cells still compare equal.
+///
+/// Engines legitimately disagree in the last digits of the same answer — a float
+/// `avg()` summed in a different partition order, a decimal rounded to a different
+/// scale — so the comparison cannot be exact. 0.1% absorbs that while failing an
+/// answer that is wrong by more.
+pub const NUMERIC_RELATIVE_TOLERANCE: f64 = 0.001;
+
 pub fn validate_batches_as_strings(
     expected: &RecordBatch,
     actual: &RecordBatch,
@@ -619,17 +627,15 @@ pub fn validate_batches_as_strings(
                 }
                 (Some(expected_val), Some(actual_val)) => {
                     if expected_val != actual_val {
-                        if data_type.is_numeric() {
-                            let delta = 0.05;
-
-                            if let (Ok(expected_num), Ok(actual_num)) =
+                        if data_type.is_numeric()
+                            && let (Ok(expected_num), Ok(actual_num)) =
                                 (expected_val.parse::<f64>(), actual_val.parse::<f64>())
-                            {
-                                let diff = (expected_num - actual_num).abs();
-                                let tolerance = (expected_num.abs() * delta).max(1e-12); // avoid zero-multiplied tolerance
-                                if diff <= tolerance {
-                                    continue; // numeric match within tolerance
-                                }
+                        {
+                            let diff = (expected_num - actual_num).abs();
+                            let tolerance =
+                                (expected_num.abs() * NUMERIC_RELATIVE_TOLERANCE).max(1e-12); // avoid zero-multiplied tolerance
+                            if diff <= tolerance {
+                                continue; // numeric match within tolerance
                             }
                         }
 
@@ -967,7 +973,7 @@ pub fn row_order_from_sql(sql: &str) -> RowOrder {
 ///
 /// This is the engine-vs-engine parity path: both sides are treated as "actual"
 /// answers for the same SQL on the same data. Numeric comparison reuses the
-/// relative tolerance in [`validate_batches_as_strings`].
+/// relative tolerance, [`NUMERIC_RELATIVE_TOLERANCE`], in [`validate_batches_as_strings`].
 ///
 /// When `row_order` is [`RowOrder::Multiset`], both sides are concatenated and
 /// sorted into a canonical order so differing physical scan orders do not
@@ -2630,6 +2636,60 @@ mod test {
                 actual: 2
             })
         );
+    }
+
+    #[test]
+    fn test_numeric_cells_match_within_a_tenth_of_a_percent() {
+        let revenue = |value: f64| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "revenue",
+                    DataType::Float64,
+                    false,
+                )])),
+                vec![Arc::new(Float64Array::from(vec![value]))],
+            )
+            .expect("revenue batch")
+        };
+        // TPC-H SF1 Q6's answer.
+        let expected = revenue(123_141_078.228_3);
+        assert_eq!(
+            validate_batches_as_strings(&expected, &revenue(123_141_078.228_3 * 1.000_9))
+                .expect("compare"),
+            QueryValidationResult::Pass,
+            "0.09% apart"
+        );
+        assert!(
+            matches!(
+                validate_batches_as_strings(&expected, &revenue(123_141_078.228_3 * 1.001_1))
+                    .expect("compare"),
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            ),
+            "0.11% apart"
+        );
+        // What Q6 returns over a `lineitem` with 2% of its rows dropped.
+        assert!(matches!(
+            validate_batches_as_strings(&expected, &revenue(120_774_800.171_3)).expect("compare"),
+            QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+        ));
+
+        let count_order = |value: i64| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "count_order",
+                    DataType::Int64,
+                    false,
+                )])),
+                vec![Arc::new(Int64Array::from(vec![value]))],
+            )
+            .expect("count batch")
+        };
+        // TPC-H SF1 Q1's A|F `count_order`, and the count over 2% fewer `lineitem` rows.
+        assert!(matches!(
+            validate_batches_as_strings(&count_order(1_478_493), &count_order(1_449_049))
+                .expect("compare"),
+            QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+        ));
     }
 
     #[test]

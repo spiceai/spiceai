@@ -5,7 +5,6 @@ tests:
     runner_type: spiceai-dev-large-runners
     ready_wait: 600
     scale_factor: 10
-    validate_results: true
   throughput:
     spicepod_path: accelerated/file[parquet]-cayenne[file].yaml
     query_set: tpch

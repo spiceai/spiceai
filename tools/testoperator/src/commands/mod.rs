@@ -946,16 +946,17 @@ mod tests {
     /// TPC-H Q6 on these federated arms is known-wrong (Glue CSV typing /
     /// Hadoop Iceberg Spark schema inference). They keep an explicit
     /// `validate_results: false` so the scheduled run does not fail on that
-    /// discrepancy. Every other TPC-H, TPC-DS and `ClickBench` dispatch must
-    /// validate against an oracle.
+    /// discrepancy. Every other scale factor 1 TPC-H, TPC-DS and `ClickBench`
+    /// dispatch must validate against an oracle.
     const BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION: &[&str] = &[
         "tpch/sf1/federated/glue[csv].yaml",
         "tpch/sf1/federated/iceberg[hadoop].yaml",
     ];
 
-    /// Every TPC-H, TPC-DS and `ClickBench` benchmark dispatch validates its
-    /// results against an oracle it can actually resolve, except the Q6
-    /// opt-outs in `BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION`.
+    /// Every scale factor 1 TPC-H, TPC-DS and `ClickBench` benchmark dispatch
+    /// validates its results against an oracle it can actually resolve, except the
+    /// Q6 opt-outs in `BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION`. Benchmarks at
+    /// larger scale factors measure performance and must not validate.
     ///
     /// Each `bench` entry is resolved the way `testoperator_run_bench.yml` runs
     /// it — the inputs `testoperator dispatch` sends, the spicepod under
@@ -998,11 +999,6 @@ mod tests {
                 }
                 for bench in &dispatch.tests.bench {
                     let dispatch_name = dispatch_path.display();
-                    assert_eq!(
-                        bench.validate_results,
-                        Some(true),
-                        "{dispatch_name} must set `validate_results: true` on its bench test"
-                    );
 
                     // The workflow inputs, exactly as `testoperator dispatch` sends them.
                     let inputs = map_numbers_to_strings(
@@ -1012,6 +1008,20 @@ mod tests {
                         .as_str()
                         .expect("query_set should serialize as a string");
                     let scale_factor = inputs["scale_factor"].as_str().unwrap_or("1");
+                    if scale_factor != "1" {
+                        assert_ne!(
+                            bench.validate_results,
+                            Some(true),
+                            "{dispatch_name} benchmarks scale factor {scale_factor}, which measures performance; results are validated at scale factor 1, so leave `validate_results` unset"
+                        );
+                        checked += 1;
+                        continue;
+                    }
+                    assert_eq!(
+                        bench.validate_results,
+                        Some(true),
+                        "{dispatch_name} must set `validate_results: true` on its scale factor 1 bench test"
+                    );
                     let spicepod_path = repo_root
                         .join("test/spicepods")
                         .join(query_set.split('[').next().unwrap_or(query_set))
