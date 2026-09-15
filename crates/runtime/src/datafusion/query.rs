@@ -2266,9 +2266,13 @@ fn assemble_cached_query_result<G>(
 where
     G: Send + 'static,
 {
-    let QueryResult { data, cache_status } = query_result;
-    let data =
-        attach_cancellation_to_stream(data, cancellation_token, query_id, timeout_state, guard);
+    let QueryResult { data, cache_status } = attach_cancellation_to_query_result(
+        query_result,
+        cancellation_token,
+        query_id,
+        timeout_state,
+        guard,
+    );
     QueryResult::new(
         attach_query_tracker_to_stream(span, request_context, tracker, data),
         cache_status,
