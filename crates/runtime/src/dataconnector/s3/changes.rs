@@ -149,6 +149,10 @@ pub struct S3ChangesConfig {
     pub region: String,
     pub on_object_removed: OnObjectRemoved,
     pub bucket: String,
+    /// Dataset `from:` key prefix. Snapshot and `history_unavailable` rebuild
+    /// use this scope so they match the federated listing table.
+    pub dataset_prefix: String,
+    /// SQS / listing-backfill filter. Equal to or nested under `dataset_prefix`.
     pub key_prefix: String,
     pub backfill_interval: Duration,
 }
@@ -405,7 +409,7 @@ fn align_object_batches(
 struct ListingPrefixScanner {
     connector: S3,
     dataset: DatasetSpec,
-    key_prefix: String,
+    prefix: String,
 }
 
 #[async_trait]
@@ -418,10 +422,10 @@ impl ObjectLister for ListingPrefixScanner {
                 connector: "S3",
                 source: Box::new(e),
             })?;
-        let prefix = if self.key_prefix.is_empty() {
+        let prefix = if self.prefix.is_empty() {
             None
         } else {
-            Some(ObjectPath::from(self.key_prefix.as_str()))
+            Some(ObjectPath::from(self.prefix.as_str()))
         };
         let mut listing = store.list(prefix.as_ref());
         let mut keys = Vec::new();
@@ -503,7 +507,7 @@ impl S3ChangesConfig {
 
                 let (bucket, dataset_prefix) = bucket_and_key_prefix(dataset)?;
                 let key_prefix = match params.get("changes_key_prefix").expose().ok() {
-                    None => dataset_prefix,
+                    None => dataset_prefix.clone(),
                     Some(configured) => {
                         let normalized = normalize_prefix(configured);
                         ensure!(
@@ -511,7 +515,7 @@ impl S3ChangesConfig {
                             KeyPrefixOutsideDatasetSnafu {
                                 dataset_name: dataset_name.clone(),
                                 configured: configured.to_string(),
-                                dataset_prefix,
+                                dataset_prefix: dataset_prefix.clone(),
                             }
                         );
                         normalized
@@ -528,6 +532,7 @@ impl S3ChangesConfig {
                     region,
                     on_object_removed,
                     bucket,
+                    dataset_prefix,
                     key_prefix,
                     backfill_interval,
                 }))
@@ -790,7 +795,7 @@ pub async fn s3_changes_stream(
     let object_lister = Arc::new(ListingPrefixScanner {
         connector: connector.clone(),
         dataset: dataset.clone(),
-        key_prefix: config.key_prefix.clone(),
+        prefix: config.dataset_prefix.clone(),
     });
     Some(stream_s3_changes(S3ChangesStreamParts {
         dataset: dataset.clone(),
@@ -835,6 +840,7 @@ async fn process_message(
     config: &S3ChangesConfig,
     table_schema: &SchemaRef,
     object_reader: &dyn ObjectReader,
+    applied_keys: &HashSet<String>,
     message: &QueueMessage,
 ) -> ProcessOutcome {
     let receipt_handle = message.receipt_handle.clone();
@@ -898,7 +904,9 @@ async fn process_message(
     let created: Vec<&S3ObjectEvent> = matching
         .iter()
         .copied()
-        .filter(|event| event.kind == ObjectEventKind::Created)
+        .filter(|event| {
+            event.kind == ObjectEventKind::Created && !applied_keys.contains(&event.key)
+        })
         .collect();
     if created.is_empty() {
         return ProcessOutcome::Ack { receipt_handle };
@@ -964,6 +972,7 @@ async fn apply_unapplied_objects(
     object_lister: &dyn ObjectLister,
     object_reader: &dyn ObjectReader,
     applied_keys: &HashSet<String>,
+    scope_prefix: &str,
     pass: &'static str,
 ) -> std::result::Result<BackfillCreates, StreamError> {
     let listed = object_lister.list_keys().await?;
@@ -976,7 +985,7 @@ async fn apply_unapplied_objects(
             bucket: config.bucket.clone(),
             key: key.clone(),
         };
-        if !matches_dataset(&event, &config.bucket, &config.key_prefix) {
+        if !matches_dataset(&event, &config.bucket, scope_prefix) {
             continue;
         }
         if applied_keys.contains(&key) {
@@ -1109,6 +1118,7 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                 object_lister.as_ref(),
                 object_reader.as_ref(),
                 &applied_keys,
+                &config.dataset_prefix,
                 "the empty-accelerator snapshot",
             )
             .await?;
@@ -1167,7 +1177,7 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                 if shutdown_epoch() != epoch {
                     break;
                 }
-                match process_message(&dataset, &config, &schema, object_reader.as_ref(), &message).await {
+                match process_message(&dataset, &config, &schema, object_reader.as_ref(), &applied_keys, &message).await {
                     ProcessOutcome::Creates { batches, keys, receipt_handle } => {
                         match create_envelopes(&schema, batches, &queue, receipt_handle) {
                             Ok(envelopes) => {
@@ -1218,6 +1228,7 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                     object_lister.as_ref(),
                     object_reader.as_ref(),
                     &applied_keys,
+                    &config.key_prefix,
                     "a listing backfill",
                 )
                 .await
@@ -1459,6 +1470,7 @@ mod tests {
             region: "us-east-1".to_string(),
             on_object_removed: OnObjectRemoved::Ignore,
             bucket: "my-bucket".to_string(),
+            dataset_prefix: "events/".to_string(),
             key_prefix: "events/".to_string(),
             backfill_interval: Duration::from_secs(60 * 60),
         }
@@ -1528,6 +1540,7 @@ mod tests {
             .expect("valid changes config")
             .expect("changes should be enabled");
         assert_eq!(config.bucket, "my-bucket");
+        assert_eq!(config.dataset_prefix, "events/");
         assert_eq!(config.key_prefix, "events/");
         assert_eq!(config.region, "us-east-1");
         assert_eq!(config.on_object_removed, OnObjectRemoved::Ignore);
@@ -1655,6 +1668,7 @@ mod tests {
         let config = S3ChangesConfig::try_from_params(&params, &events_dataset())
             .expect("nested prefix is valid")
             .expect("changes enabled");
+        assert_eq!(config.dataset_prefix, "events/");
         assert_eq!(config.key_prefix, "events/year=2026/");
         assert_eq!(config.on_object_removed, OnObjectRemoved::Rebuild);
         assert_eq!(config.backfill_interval, Duration::from_secs(30 * 60));
@@ -1684,6 +1698,7 @@ mod tests {
             &default_config(),
             &id_name_schema(),
             &reader,
+            &HashSet::new(),
             &QueueMessage {
                 body: created_put_body("events/a.parquet"),
                 receipt_handle: "rh-1".into(),
@@ -1706,6 +1721,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_created_skips_already_applied_key() {
+        let reader = MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/a.parquet".to_string(),
+                vec![id_name_batch(&[1], &["a"])],
+            )]),
+            fail_keys: vec![],
+        };
+        let applied = HashSet::from(["events/a.parquet".to_string()]);
+        let outcome = process_message(
+            &events_dataset(),
+            &default_config(),
+            &id_name_schema(),
+            &reader,
+            &applied,
+            &QueueMessage {
+                body: created_put_body("events/a.parquet"),
+                receipt_handle: "rh-dup".into(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(outcome, ProcessOutcome::Ack { .. }),
+            "a queued ObjectCreated for a snapshotted key must not append again, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn process_removed_is_acked_by_default_and_rebuilds_when_configured() {
         let reader = MapObjectReader {
             objects: HashMap::new(),
@@ -1716,6 +1759,7 @@ mod tests {
             &default_config(),
             &id_name_schema(),
             &reader,
+            &HashSet::new(),
             &QueueMessage {
                 body: removed_body("events/a.parquet"),
                 receipt_handle: "rh-del".into(),
@@ -1731,6 +1775,7 @@ mod tests {
             &config,
             &id_name_schema(),
             &reader,
+            &HashSet::new(),
             &QueueMessage {
                 body: removed_body("events/a.parquet"),
                 receipt_handle: "rh-del".into(),
@@ -1751,6 +1796,7 @@ mod tests {
             &default_config(),
             &id_name_schema(),
             &reader,
+            &HashSet::new(),
             &QueueMessage {
                 body: created_put_body("other/a.parquet"),
                 receipt_handle: "rh-other".into(),
@@ -1767,6 +1813,7 @@ mod tests {
             &default_config(),
             &id_name_schema(),
             &reader,
+            &HashSet::new(),
             &QueueMessage {
                 body: r#"{"Records":[{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"other-bucket"},"object":{"key":"events/a.parquet"}}}]}"#.into(),
                 receipt_handle: "rh-bucket".into(),
@@ -1783,6 +1830,7 @@ mod tests {
             &default_config(),
             &id_name_schema(),
             &reader,
+            &HashSet::new(),
             &QueueMessage {
                 body: "not-json".into(),
                 receipt_handle: "rh-poison".into(),
@@ -1803,6 +1851,7 @@ mod tests {
             &default_config(),
             &id_name_schema(),
             &reader,
+            &HashSet::new(),
             &QueueMessage {
                 body: created_put_body("events/a.parquet"),
                 receipt_handle: "rh-fail".into(),
@@ -1842,6 +1891,7 @@ mod tests {
             &lister,
             &reader,
             &applied,
+            "events/",
             "a listing backfill",
         )
         .await
@@ -2224,6 +2274,7 @@ mod tests {
             &default_config(),
             &id_name_schema(),
             &reader,
+            &HashSet::new(),
             &QueueMessage {
                 body: r#"{"Records":[{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/a.parquet"}}},{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"other/b.parquet"}}}]}"#.into(),
                 receipt_handle: "rh-mixed".into(),
@@ -2400,5 +2451,86 @@ mod tests {
                 .op(0),
             ChangeOperation::Create
         ));
+    }
+
+    #[tokio::test]
+    async fn stream_empty_snapshot_does_not_reapply_queued_object_created() {
+        let queue = Arc::new(MockQueue::with_messages(vec![QueueMessage {
+            body: created_put_body("events/snap.parquet"),
+            receipt_handle: "rh-snap".into(),
+        }]));
+        let reader = Arc::new(MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/snap.parquet".to_string(),
+                vec![id_name_batch(&[1], &["snap"])],
+            )]),
+            fail_keys: vec![],
+        });
+        let lister = Arc::new(MockLister {
+            keys: vec!["events/snap.parquet".into()],
+        });
+        let stream = start_stream(
+            AccelerationContents::Empty,
+            Arc::clone(&queue),
+            reader,
+            lister,
+            default_config(),
+            id_name_batch(&[99], &["stale-federated"]),
+        );
+        let envelopes = collect_until_idle(stream, 3).await;
+        assert_eq!(
+            envelopes.len(),
+            2,
+            "queued ObjectCreated for a snapshotted key must not append again, got {}",
+            envelopes.len()
+        );
+        assert_eq!(names_in(&envelopes[0]), vec!["snap".to_string()]);
+        assert!(envelopes[1].is_dataset_ready());
+        assert_eq!(*queue.deleted.lock().await, vec!["rh-snap".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn stream_empty_snapshot_uses_dataset_prefix_not_nested_key_prefix() {
+        let queue = Arc::new(MockQueue::with_messages(vec![]));
+        let reader = Arc::new(MapObjectReader {
+            objects: HashMap::from([
+                (
+                    "my-bucket/events/year=2026/a.parquet".to_string(),
+                    vec![id_name_batch(&[1], &["y2026"])],
+                ),
+                (
+                    "my-bucket/events/year=2025/b.parquet".to_string(),
+                    vec![id_name_batch(&[2], &["y2025"])],
+                ),
+            ]),
+            fail_keys: vec![],
+        });
+        let lister = Arc::new(MockLister {
+            keys: vec![
+                "events/year=2026/a.parquet".into(),
+                "events/year=2025/b.parquet".into(),
+            ],
+        });
+        let mut config = default_config();
+        config.key_prefix = "events/year=2026/".to_string();
+        let stream = start_stream(
+            AccelerationContents::Empty,
+            queue,
+            reader,
+            lister,
+            config,
+            id_name_batch(&[99], &["stale-federated"]),
+        );
+        let envelopes = collect_until_idle(stream, 3).await;
+        let snapshot_names: Vec<String> = envelopes
+            .iter()
+            .filter(|envelope| !envelope.is_empty() && !envelope.is_dataset_ready())
+            .flat_map(names_in)
+            .collect();
+        assert!(
+            snapshot_names.contains(&"y2026".to_string())
+                && snapshot_names.contains(&"y2025".to_string()),
+            "empty snapshot must use the dataset from: prefix, not a nested s3_changes_key_prefix, got {snapshot_names:?}"
+        );
     }
 }
