@@ -45,6 +45,23 @@ use super::EndCondition;
 /// ends, for a query whose `ORDER BY` sorts on columns its result does not include.
 const MAX_KEYED_REFERENCE_ROWS: usize = 1 << 20;
 
+/// First keyed-reference fetch for a `LIMIT` of `limit`. Twice the limit is
+/// enough when the cutoff group is no larger than the result itself; the cap
+/// still bounds a custom query whose `LIMIT` is already past that.
+fn keyed_reference_fetch_rows(limit: usize) -> usize {
+    limit.saturating_mul(2).clamp(1, MAX_KEYED_REFERENCE_ROWS)
+}
+
+/// Next fetch after `current` did not cover the tie group at the `LIMIT`.
+/// `None` once the cap has already been requested.
+fn next_keyed_reference_fetch_rows(current: usize) -> Option<usize> {
+    if current >= MAX_KEYED_REFERENCE_ROWS {
+        None
+    } else {
+        Some(current.saturating_mul(2).min(MAX_KEYED_REFERENCE_ROWS))
+    }
+}
+
 pub(crate) struct SpiceTestQueryWorker {
     id: usize,
     query_set: Vec<Query>,
@@ -746,7 +763,7 @@ impl SpiceTestQueryWorker {
                         "Worker {} - Query '{}' - ORDER BY sorts on columns the result does not include; checking the result against the reference query's rows with their sort keys",
                         self.id, query.name
                     );
-                    let mut fetch_rows = sort_limit.limit.saturating_mul(2).max(1);
+                    let mut fetch_rows = keyed_reference_fetch_rows(sort_limit.limit);
                     loop {
                         let mut stream = spice_client
                             .sql_with_params(
@@ -770,14 +787,14 @@ impl SpiceTestQueryWorker {
                             validation_result = result;
                             break;
                         }
-                        if fetch_rows >= MAX_KEYED_REFERENCE_ROWS {
+                        let Some(next) = next_keyed_reference_fetch_rows(fetch_rows) else {
                             println!(
                                 "Worker {} - Query '{}' - more than {MAX_KEYED_REFERENCE_ROWS} reference rows tie at the LIMIT; keeping the row-by-row comparison's result",
                                 self.id, query.name
                             );
                             break;
-                        }
-                        fetch_rows = fetch_rows.saturating_mul(2);
+                        };
+                        fetch_rows = next;
                     }
                 }
 
@@ -1100,6 +1117,50 @@ mod tests {
 
     use super::*;
     use std::sync::Arc;
+
+    /// `LIMIT 600000` would request `2 * 600000` keyed rows; the first fetch
+    /// must stay at or below [`MAX_KEYED_REFERENCE_ROWS`].
+    #[test]
+    fn keyed_reference_first_request_is_clamped_to_the_cap() {
+        let unclamped = 600_000usize.saturating_mul(2).max(1);
+        assert_eq!(
+            unclamped, 1_200_000,
+            "the unclamped first request is 2 * LIMIT"
+        );
+        assert!(
+            unclamped > MAX_KEYED_REFERENCE_ROWS,
+            "unclamped {unclamped} must exceed cap {MAX_KEYED_REFERENCE_ROWS}"
+        );
+        assert_eq!(
+            keyed_reference_fetch_rows(600_000),
+            MAX_KEYED_REFERENCE_ROWS
+        );
+        assert_eq!(keyed_reference_fetch_rows(1), 2);
+        assert_eq!(keyed_reference_fetch_rows(0), 1);
+        assert_eq!(
+            keyed_reference_fetch_rows(MAX_KEYED_REFERENCE_ROWS),
+            MAX_KEYED_REFERENCE_ROWS
+        );
+    }
+
+    #[test]
+    fn keyed_reference_grow_does_not_exceed_the_cap() {
+        assert_eq!(
+            next_keyed_reference_fetch_rows(MAX_KEYED_REFERENCE_ROWS),
+            None
+        );
+        assert_eq!(
+            next_keyed_reference_fetch_rows(800_000),
+            Some(MAX_KEYED_REFERENCE_ROWS)
+        );
+        assert_eq!(next_keyed_reference_fetch_rows(2), Some(4));
+        let first = keyed_reference_fetch_rows(400_000);
+        assert_eq!(first, 800_000);
+        assert_eq!(
+            next_keyed_reference_fetch_rows(first),
+            Some(MAX_KEYED_REFERENCE_ROWS)
+        );
+    }
 
     /// The warmup is the only run that asserts a result snapshot, so its failure has
     /// to reach the reported status. Regression test for a benchmark that logged
