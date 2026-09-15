@@ -72,7 +72,7 @@ impl MaterializationIdentity {
     }
 
     const fn pack(epoch: u64, configured: bool) -> u64 {
-        (epoch << 1) | u64::from(configured)
+        (epoch << 1) | if configured { CONFIGURED_BIT } else { 0 }
     }
 
     /// Start a new materialization: increment the epoch and retract `configured`.
