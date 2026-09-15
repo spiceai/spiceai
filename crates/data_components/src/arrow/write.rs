@@ -2792,21 +2792,18 @@ mod tests {
             .expect("scan succeeds")
             .iter()
             .flat_map(|rb| {
-                let keys: Vec<String> = (0..rb.num_rows())
-                    .map(|i| {
-                        ScalarValue::try_from_array(rb.column(0), i)
-                            .expect("key value")
-                            .to_string()
-                    })
-                    .collect();
                 let values = rb
                     .column(1)
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .expect("values are strings");
-                keys.into_iter()
-                    .enumerate()
-                    .map(|(i, key)| (key, values.value(i).to_string()))
+                (0..rb.num_rows())
+                    .map(|i| {
+                        let key = ScalarValue::try_from_array(rb.column(0), i)
+                            .expect("key value")
+                            .to_string();
+                        (key, values.value(i).to_string())
+                    })
                     .collect::<Vec<_>>()
             })
             .collect();

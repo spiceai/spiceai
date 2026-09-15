@@ -1702,12 +1702,11 @@ mod tests {
             mut self: Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
         ) -> Poll<Option<Self::Item>> {
-            match self.batches.next() {
-                Some(next_batch) => Poll::Ready(Some(Ok(next_batch))),
-                None => {
-                    self.ended.store(true, Ordering::SeqCst);
-                    Poll::Ready(None)
-                }
+            if let Some(next_batch) = self.batches.next() {
+                Poll::Ready(Some(Ok(next_batch)))
+            } else {
+                self.ended.store(true, Ordering::SeqCst);
+                Poll::Ready(None)
             }
         }
     }

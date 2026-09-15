@@ -1205,9 +1205,12 @@ async fn assert_lookups(
         after[1] - before[1],
         after[2] - before[2],
     ];
-    assert_eq!(
-        recorded, expected,
-        "a {expected_status:?} of {sql} must be one results cache request, recorded [requests, hits, misses] = {recorded:?}"
+    assert!(
+        recorded
+            .iter()
+            .zip(expected)
+            .all(|(got, want)| (got - want).abs() < f64::EPSILON),
+        "a {expected_status:?} of {sql} must be one results cache request, recorded [requests, hits, misses] = {recorded:?}, expected {expected:?}"
     );
 }
 
@@ -1325,7 +1328,8 @@ async fn a_cache_hit_is_recorded_when_the_stream_is_consumed() {
         "consuming a cache hit must record query_returned_rows"
     );
     assert!(
-        rows_sum_read - rows_sum_before >= rows as f64,
+        rows_sum_read - rows_sum_before
+            >= f64::from(u32::try_from(rows).expect("the fixture's row count fits in a u32")),
         "query_returned_rows recorded {} rows, expected at least the {rows} the caller read",
         rows_sum_read - rows_sum_before
     );

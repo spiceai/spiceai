@@ -1588,10 +1588,17 @@ mod tests {
         }))
     }
 
+    /// The instant an entry `age` old was cached at, measured back from `now`.
+    fn cached_ago(now: std::time::Instant, age: Duration) -> std::time::Instant {
+        now.checked_sub(age)
+            .expect("the monotonic clock should be past the entry's age")
+    }
+
     #[test]
     fn a_probed_entry_past_item_ttl_is_not_served() {
         let now = std::time::Instant::now();
-        let mut entry = dummy_servable_entry_cached_at(now - Duration::from_millis(1_500));
+        let mut entry =
+            dummy_servable_entry_cached_at(cached_ago(now, Duration::from_millis(1_500)));
         assert!(
             !apply_age_eligibility(
                 &mut entry,
@@ -1606,7 +1613,7 @@ mod tests {
     #[test]
     fn a_probed_entry_inside_item_ttl_is_served() {
         let now = std::time::Instant::now();
-        let mut entry = dummy_servable_entry_cached_at(now - Duration::from_millis(500));
+        let mut entry = dummy_servable_entry_cached_at(cached_ago(now, Duration::from_millis(500)));
         assert!(apply_age_eligibility(
             &mut entry,
             Duration::from_secs(1),
@@ -1620,7 +1627,8 @@ mod tests {
     #[test]
     fn a_probed_entry_past_ttl_inside_the_stale_window_is_marked_for_revalidation() {
         let now = std::time::Instant::now();
-        let mut entry = dummy_servable_entry_cached_at(now - Duration::from_millis(1_500));
+        let mut entry =
+            dummy_servable_entry_cached_at(cached_ago(now, Duration::from_millis(1_500)));
         assert!(apply_age_eligibility(
             &mut entry,
             Duration::from_secs(1),
@@ -1634,7 +1642,8 @@ mod tests {
     #[test]
     fn a_probed_entry_past_the_stale_window_is_not_served() {
         let now = std::time::Instant::now();
-        let mut entry = dummy_servable_entry_cached_at(now - Duration::from_millis(2_500));
+        let mut entry =
+            dummy_servable_entry_cached_at(cached_ago(now, Duration::from_millis(2_500)));
         assert!(!apply_age_eligibility(
             &mut entry,
             Duration::from_secs(1),
@@ -1646,7 +1655,8 @@ mod tests {
     #[test]
     fn a_max_stale_without_a_value_serves_an_old_probed_entry() {
         let now = std::time::Instant::now();
-        let mut entry = dummy_servable_entry_cached_at(now - Duration::from_millis(1_500));
+        let mut entry =
+            dummy_servable_entry_cached_at(cached_ago(now, Duration::from_millis(1_500)));
         assert!(apply_age_eligibility(
             &mut entry,
             Duration::from_secs(1),
@@ -1713,9 +1723,10 @@ mod tests {
         }))
         .await;
         let now = std::time::Instant::now();
-        let probe = dummy_probe_hit(dummy_servable_entry_cached_at(
-            now - Duration::from_millis(1_500),
-        ));
+        let probe = dummy_probe_hit(dummy_servable_entry_cached_at(cached_ago(
+            now,
+            Duration::from_millis(1_500),
+        )));
         assert!(
             probe.is_servable_in_place(),
             "a raw hit still looks in-place before the serve-time recheck"
@@ -1743,9 +1754,10 @@ mod tests {
         }))
         .await;
         let now = std::time::Instant::now();
-        let probe = dummy_probe_hit(dummy_servable_entry_cached_at(
-            now - Duration::from_millis(500),
-        ))
+        let probe = dummy_probe_hit(dummy_servable_entry_cached_at(cached_ago(
+            now,
+            Duration::from_millis(500),
+        )))
         .into_miss_if_in_place_ineligible(
             CacheControl::Cache(CacheKeyType::Default),
             df.results_cache_provider().as_deref(),
@@ -1771,7 +1783,7 @@ mod tests {
         // The entry's read must predate the mark: a change recorded
         // before `read_started_at` is not a reason to reject it.
         let probe = dummy_probe_hit(dummy_servable_entry_for_tables(
-            std::time::Instant::now() - Duration::from_secs(1),
+            cached_ago(std::time::Instant::now(), Duration::from_secs(1)),
             HashSet::from([TableReference::bare("orders")]),
         ));
         provider
@@ -1799,9 +1811,10 @@ mod tests {
         }))
         .await;
         let now = std::time::Instant::now();
-        let probe = dummy_probe_hit(dummy_servable_entry_cached_at(
-            now - Duration::from_millis(1_500),
-        ))
+        let probe = dummy_probe_hit(dummy_servable_entry_cached_at(cached_ago(
+            now,
+            Duration::from_millis(1_500),
+        )))
         .into_miss_if_in_place_ineligible(
             CacheControl::Cache(CacheKeyType::Default),
             df.results_cache_provider().as_deref(),
@@ -1822,9 +1835,10 @@ mod tests {
         }))
         .await;
         let now = std::time::Instant::now();
-        let probe = dummy_probe_hit(dummy_encoded_entry_cached_at(
-            now - Duration::from_millis(1_500),
-        ))
+        let probe = dummy_probe_hit(dummy_encoded_entry_cached_at(cached_ago(
+            now,
+            Duration::from_millis(1_500),
+        )))
         .into_miss_if_in_place_ineligible(
             CacheControl::Cache(CacheKeyType::Default),
             df.results_cache_provider().as_deref(),
