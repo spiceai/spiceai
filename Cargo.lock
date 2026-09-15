@@ -16025,7 +16025,7 @@ dependencies = [
 
 [[package]]
 name = "qdrant"
-version = "2.3.0-unstable"
+version = "2.4.0-unstable"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -16047,7 +16047,7 @@ dependencies = [
  "derive_builder",
  "futures",
  "parking_lot",
- "prost",
+ "prost 0.14.3",
  "prost-types",
  "semver",
  "thiserror 2.0.18",
@@ -17563,9 +17563,8 @@ dependencies = [
  "podswatcher",
  "postcard",
  "prometheus",
- "prost",
- "qdrant",
  "prost 0.14.3",
+ "qdrant",
  "rand 0.10.1",
  "rayon",
  "rcgen",
