@@ -971,6 +971,46 @@ mod tests {
         "tpcds/sf1/accelerated/mysql-duckdb[memory].yaml",
     ];
 
+    /// rustc `--test` names this module's tests `commands::tests::<fn>`.
+    /// nextest's `test(=…)` matches that string exactly, so the leaf name
+    /// selects nothing and `make nextest` would stay green after a dispatch
+    /// dropped validation.
+    fn oracle_dispatch_guard_rustc_test_name() -> String {
+        format!(
+            "{}::benchmark_dispatches_validate_results_against_an_oracle",
+            module_path!()
+                .strip_prefix(concat!(env!("CARGO_PKG_NAME"), "::"))
+                .expect("unit-test module_path starts with the crate name")
+        )
+    }
+
+    fn makefile_nextest_filter() -> String {
+        let makefile =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Makefile"))
+                .expect("should read the repository Makefile");
+        makefile
+            .lines()
+            .find(|line| line.starts_with("NEXTEST_FILTER :="))
+            .expect("Makefile should define NEXTEST_FILTER")
+            .to_string()
+    }
+
+    #[test]
+    fn nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name() {
+        let rustc_test_name = oracle_dispatch_guard_rustc_test_name();
+        assert_eq!(
+            rustc_test_name,
+            "commands::tests::benchmark_dispatches_validate_results_against_an_oracle",
+            "this function's rustc --test name is what nextest's test(=…) must match"
+        );
+        let filter = makefile_nextest_filter();
+        let needle = format!("test(={rustc_test_name})");
+        assert!(
+            filter.contains(&needle),
+            "NEXTEST_FILTER must select the oracle dispatch guard with `{needle}`; a leaf-only test(=…) matches no test. filter={filter}"
+        );
+    }
+
     /// Every scale factor 1 TPC-H, TPC-DS and `ClickBench` benchmark dispatch
     /// validates its results against an oracle it can actually resolve, except
     /// those in `BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION`. Benchmarks at
@@ -984,6 +1024,7 @@ mod tests {
     /// be validated fails here instead of in the scheduled run.
     #[tokio::test]
     async fn benchmark_dispatches_validate_results_against_an_oracle() {
+        nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name();
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let dispatch_root = repo_root.join("tools/testoperator/dispatch");
         let mut checked = 0;
