@@ -845,6 +845,7 @@ impl SpiceTestQueryWorker {
                                 reference_query.get_parameters_batch().transpose()?,
                             )
                             .await?;
+                        // Held only until the cutoff group closes (or the cap).
                         let mut keyed_reference = Vec::new();
                         let mut fetched_rows: usize = 0;
                         let mut cutoff_closed = false;
@@ -1121,6 +1122,14 @@ fn zero_row_count_is_failure(
 /// arity [`validation::QueryValidationFailReason::SchemaMismatch`], and they must
 /// not replace a [`validation::QueryValidationFailReason::SortOrderViolation`]:
 /// those rows already show that the engine broke its own `ORDER BY`.
+///
+/// A [`validation::QueryValidationFailReason::RowCountMismatch`] against the
+/// limited oracle still enters the keyed path: that matcher re-derives the page
+/// length from the raised-`LIMIT` stream (`actual_rows == expected_rows`), so an
+/// extra row stays a Fail, and a correct `LIMIT` page is not stuck on a limited
+/// oracle that returned a different count. The unordered-`LIMIT` path already
+/// requires the two limited answers to have the same count
+/// ([`validation::UnorderedLimit::may_keep_different_rows`]).
 fn live_oracle_row_fallback_applies(result: &QueryValidationResult) -> bool {
     matches!(
         result,
@@ -1507,6 +1516,15 @@ mod tests {
                 actual: "false".into(),
             })
         ));
+        assert!(
+            live_oracle_row_fallback_applies(&QueryValidationResult::Fail(
+                validation::QueryValidationFailReason::RowCountMismatch {
+                    expected: 1,
+                    actual: 2,
+                }
+            )),
+            "a limited-oracle count mismatch still enters the keyed path, which re-checks the page length"
+        );
         assert!(!live_oracle_row_fallback_applies(
             &QueryValidationResult::Pass
         ));
@@ -1653,6 +1671,85 @@ mod tests {
                 )
             ),
             "a row the page cannot hold must stay a Fail"
+        );
+    }
+
+    /// An extra row past the `LIMIT` is a `RowCountMismatch` against the limited
+    /// oracle. The keyed matcher must keep that Fail: it re-checks
+    /// `actual_rows == expected_rows` against the raised-`LIMIT` stream, so
+    /// membership of the extra row in the cutoff group is not enough to Pass.
+    #[test]
+    fn live_oracle_keyed_fallback_keeps_an_extra_row_as_a_count_mismatch() {
+        let limited_reference = keyed_page(&[(10, "a")]);
+        let actual = keyed_page(&[(10, "a"), (10, "b")]);
+        let keyed_reference = keyed_page(&[(10, "a"), (10, "b"), (9, "c")]);
+        let query = Query::new("tied_cutoff".into(), PROJECTED_SORT_LIMIT.into(), false);
+        let direct = validation::validate_against_reference_batches(
+            &query,
+            std::slice::from_ref(&actual),
+            std::slice::from_ref(&limited_reference),
+        )
+        .expect("direct compare");
+        assert!(
+            matches!(
+                direct,
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::RowCountMismatch { .. }
+                )
+            ),
+            "two rows against a one-row limited oracle is a RowCountMismatch: {direct:?}"
+        );
+        assert_eq!(
+            apply_live_oracle_row_fallbacks(
+                &query,
+                std::slice::from_ref(&actual),
+                std::slice::from_ref(&limited_reference),
+                None,
+                Some(std::slice::from_ref(&keyed_reference)),
+            )
+            .expect("keyed fallback of an extra row"),
+            QueryValidationResult::Fail(validation::QueryValidationFailReason::RowCountMismatch {
+                expected: 1,
+                actual: 2,
+            })
+        );
+    }
+
+    /// The limited oracle can return a different count than a correct `LIMIT`
+    /// page (for example it ignored the `LIMIT`). The keyed path must still
+    /// Pass a single valid cutoff row, which excluding `RowCountMismatch` from
+    /// the fallback guard would leave as a Fail.
+    #[test]
+    fn live_oracle_keyed_fallback_accepts_a_correct_page_after_a_limited_count_mismatch() {
+        let limited_reference = keyed_page(&[(10, "a"), (10, "b")]);
+        let actual = keyed_page(&[(10, "b")]);
+        let keyed_reference = keyed_page(&[(10, "a"), (10, "b"), (9, "c")]);
+        let query = Query::new("tied_cutoff".into(), PROJECTED_SORT_LIMIT.into(), false);
+        let direct = validation::validate_against_reference_batches(
+            &query,
+            std::slice::from_ref(&actual),
+            std::slice::from_ref(&limited_reference),
+        )
+        .expect("direct compare");
+        assert!(
+            matches!(
+                direct,
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::RowCountMismatch { .. }
+                )
+            ),
+            "a one-row page against a two-row limited oracle is a RowCountMismatch: {direct:?}"
+        );
+        assert_eq!(
+            apply_live_oracle_row_fallbacks(
+                &query,
+                std::slice::from_ref(&actual),
+                std::slice::from_ref(&limited_reference),
+                None,
+                Some(std::slice::from_ref(&keyed_reference)),
+            )
+            .expect("keyed fallback after limited count mismatch"),
+            QueryValidationResult::Pass
         );
     }
 
