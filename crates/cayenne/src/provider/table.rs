@@ -21015,6 +21015,19 @@ impl CayenneTableProvider {
                         .and_then(|(col, _)| schema.index_of(col).ok())
                 })
             })
+            // A type the curve cannot key on maps every value to the reserved
+            // zero key: it contributes no clustering while still costing a
+            // transpose and an interleave dimension on every row. The observed
+            // branch above filters earlier because it must decide whether to
+            // fall through to the primary key; this catches the explicit
+            // `cold_clustering_columns` and `sort_columns` branches, which
+            // would otherwise carry an unclusterable column all the way in.
+            .filter(|&i| {
+                schema
+                    .fields()
+                    .get(i)
+                    .is_some_and(|f| super::clustering::is_clusterable(f.data_type()))
+            })
             .collect()
     }
 
@@ -21029,47 +21042,42 @@ impl CayenneTableProvider {
     /// normalize onto a different scale. A column the aggregate cannot describe
     /// yields `None`, which the kernel reads as "use this type's full key domain".
     ///
-    /// Goes through [`Self::maintained_column_bound`] rather than
-    /// [`Self::optimizer_table_statistics`]: the planner-facing view drops every
-    /// column's min/max once the table is wider than
-    /// [`TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT`], which would leave every
-    /// clustering dimension without a normalization range on a wide table.
+    /// Reads the maintained cache directly rather than through
+    /// [`Self::optimizer_table_statistics`]: that planner-facing view empties
+    /// `column_statistics` once the table is wider than
+    /// [`TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT`] — a costing shortcut that
+    /// would otherwise leave every clustering dimension unnormalized on exactly
+    /// the widest tables. Clustering reads only the few configured dimensions,
+    /// so it never pays the cost that limit exists to avoid.
+    ///
+    /// The lock is taken ONCE for all dimensions. A per-column acquisition could
+    /// straddle a cache clear and return a bound for one dimension and `None`
+    /// for the next, and a missing bound is a floor rather than a soft
+    /// degradation (see the `super::clustering` module docs), so a torn read
+    /// would cost the whole multi-dimensional layout for that promotion.
     fn cluster_column_bounds(
         &self,
         clustering_indices: &[usize],
     ) -> Vec<super::clustering::ColumnBounds> {
         let schema = self.table_schema();
+        let cache = self.table_statistics.read();
+        let Some(stats) = cache
+            .optimizer
+            .as_ref()
+            .or(cache.optimizer_inexact.as_ref())
+        else {
+            return vec![None; clustering_indices.len()];
+        };
         clustering_indices
             .iter()
             .map(|&i| {
-                let field = schema.fields().get(i)?;
-                self.maintained_column_bound(i, field.data_type())
+                let data_type = schema.fields().get(i)?.data_type();
+                let column = stats.column_statistics.get(i)?;
+                let lo = super::clustering::bound_key(column.min_value.get_value()?, data_type)?;
+                let hi = super::clustering::bound_key(column.max_value.get_value()?, data_type)?;
+                (lo <= hi).then_some((lo, hi))
             })
             .collect()
-    }
-
-    /// One clustering column's `[min, max]` in key space, including on tables
-    /// wider than [`TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT`].
-    ///
-    /// [`Self::optimizer_table_statistics`] is the planner-facing summary and
-    /// empties `column_statistics` past that limit so a clone of hundreds of
-    /// columns is not built only to be discarded. Clustering needs only the
-    /// few configured dimensions' bounds, so it reads those entries from the
-    /// cache directly.
-    fn maintained_column_bound(
-        &self,
-        column: usize,
-        data_type: &DataType,
-    ) -> super::clustering::ColumnBounds {
-        let cache = self.table_statistics.read();
-        let stats = cache
-            .optimizer
-            .as_ref()
-            .or(cache.optimizer_inexact.as_ref())?;
-        let column = stats.column_statistics.get(column)?;
-        let lo = super::clustering::bound_key(column.min_value.get_value()?, data_type)?;
-        let hi = super::clustering::bound_key(column.max_value.get_value()?, data_type)?;
-        (lo <= hi).then_some((lo, hi))
     }
 
     /// Cluster a stream along a Hilbert curve over `clustering_indices` by
