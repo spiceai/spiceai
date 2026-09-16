@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Origin server for the HTTP cache / rate-limit harness (Phase 0).
+"""Origin server for the HTTP cache / rate-limit harness.
 
 One FastAPI app. It serves a single data row whose integer ``version``
 increases on a fixed cadence. A load generator reads that ``version``
@@ -20,33 +20,60 @@ back through Spice and compares it with the version the origin has
 served most recently, so it can tell a FRESH response from a STALE one.
 
 Endpoints:
-  GET  /data     - the dataset source. Serves the current row.
-  POST /control  - set ``bump_interval`` (and fault-mode stubs for Phase 1).
+  GET  /data     - the dataset source. Serves the current row, shaped by
+                   the active fault profile.
+  POST /control  - set the fault profile (and ``bump_interval``). Applies
+                   immediately, no restart.
   GET  /stats    - aggregate counters plus the current high-water version.
   GET  /healthz  - liveness probe.
 
-Every request to ``/data`` is appended to a JSONL request log before the
-response is built, so the log is a true arrival record.
+Every request to ``/data`` is appended to a JSONL request log after the
+fault has been *decided* but before any fault delay is applied, so the
+log is a true arrival record with the outcome that was chosen for it.
 
-Phase 0 has no fault injection. ``error_rate``, ``mode``, ``error_status``,
-``latency_ms`` and ``timeout_hang_ms`` are accepted by ``/control`` and
-stored, but ``/data`` ignores them. Phase 1 wires them in.
+Fault modes (Section 4.4 of the harness plan). A ``/control`` profile
+picks one ``mode`` and a fraction ``error_rate`` of requests receive the
+fault; the rest are served a healthy row. Every response (healthy or
+faulted, except ``refuse``) also carries the ``latency_ms`` slowdown.
+
+  status  - return ``error_status`` (503 / 429 / ...) for the faulted
+            fraction, with any ``headers`` attached.
+  refuse  - abort the TCP connection with a RST, so the client (Spice's
+            HTTP connector) sees a connection error, not an HTTP status.
+  hang    - sleep ``timeout_hang_ms`` before responding, to force a
+            Spice-side ``client_timeout``. Uses ``asyncio.sleep`` so it
+            does not block the other requests in flight.
+  latency - a non-failing slowdown only; ``latency_ms`` on every response
+            and no errors regardless of ``error_rate``.
+
+The fault draw uses a seeded RNG (``seed`` in the profile) so a run
+replays deterministically.
 
 Payload format is selectable so the harness can confirm empirically which
 shape the Spice HTTP connector schema-infers cleanly:
   ORIGIN_PAYLOAD_FORMAT=ndjson  (default) - newline-delimited JSON objects.
   ORIGIN_PAYLOAD_FORMAT=array            - a single top-level JSON array.
   ORIGIN_PAYLOAD_FORMAT=csv              - a CSV document with a header row.
+
+Launch (programmatically, so ``refuse`` can reach the live connection
+registry that ``python -m uvicorn`` hides):
+  python origin/server.py           # reads ORIGIN_* env vars
 """
 
+import argparse
+import asyncio
 import json
 import os
+import random
+import socket
+import struct
 import threading
 import time
 from typing import Any, Optional
 
+import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 ORIGIN_NAME = os.environ.get("ORIGIN_NAME", "p1")
 BUMP_INTERVAL_S = float(os.environ.get("ORIGIN_BUMP_INTERVAL", "1.0"))
@@ -56,20 +83,32 @@ T0 = float(os.environ.get("HARNESS_T0", str(time.time())))
 SEED_VERSION = int(os.environ.get("ORIGIN_SEED_VERSION", "1"))
 
 _lock = threading.Lock()
-_state = {
+_state: dict[str, Any] = {
     "version": SEED_VERSION,
     "bump_interval": BUMP_INTERVAL_S,
-    # Fault stubs (accepted, ignored in Phase 0).
+    # Fault profile (see module docstring).
+    "id": "healthy",
     "error_rate": 0.0,
     "mode": "healthy",
     "error_status": 503,
     "latency_ms": {"base": 0, "jitter": 0},
     "timeout_hang_ms": 0,
+    "headers": {},
+    "seed": 0,
     # Counters.
     "data_requests": 0,
     "total_requests": 0,
+    "faulted_requests": 0,
     "recent": [],  # recv_epoch_ms of recent /data hits, for a rolling rate
+    "request_seq": 0,
 }
+
+# Seeded RNG for the fault draw. Reset whenever a profile carries a seed.
+_rng = random.Random(0)
+
+# Populated in ``main()`` with the live uvicorn ``ServerState.connections``
+# set, so ``refuse`` can find and abort the current connection's transport.
+SERVER_STATE: dict[str, Any] = {}
 
 
 def _now_ms() -> int:
@@ -89,14 +128,27 @@ def _bump_loop() -> None:
             _state["version"] += 1
 
 
-def _log_request(recv_ms: int, path: str, method: str, version_served: Optional[int]) -> None:
+def _log_request(
+    recv_ms: int,
+    path: str,
+    method: str,
+    version_served: Optional[int],
+    applied_status: Any = None,
+    applied_delay_ms: Any = None,
+    fault_profile_id: Optional[str] = None,
+    request_seq: Optional[int] = None,
+) -> None:
     row = {
         "recv_epoch_ms": recv_ms,
         "t_rel_s": round(_t_rel(recv_ms), 4),
         "origin": ORIGIN_NAME,
         "method": method,
         "path": path,
+        "applied_status": applied_status,
+        "applied_delay_ms": applied_delay_ms,
+        "fault_profile_id": fault_profile_id,
         "version_served": version_served,
+        "request_seq": request_seq,
     }
     # Append-only; one JSON object per line.
     with open(REQUEST_LOG_PATH, "a", encoding="utf-8") as fh:
@@ -125,6 +177,50 @@ def _render_payload(row: dict[str, Any]) -> tuple[str, str]:
     return json.dumps(row) + "\n", "application/x-ndjson"
 
 
+def _profile_headers() -> dict[str, str]:
+    """Copy the profile's extra headers as plain strings."""
+    hdrs = _state.get("headers") or {}
+    out = {"X-Origin-Version": str(_state["version"])}
+    for k, v in hdrs.items():
+        out[str(k)] = str(v)
+    return out
+
+
+def _abort_connection(request: Request) -> bool:
+    """Abort the current client's TCP connection with a RST.
+
+    Finds the uvicorn protocol whose transport peer matches this request's
+    client address in the live connection registry and aborts it, first
+    forcing SO_LINGER=0 so the close is a RST the client reports as a
+    connection error rather than a clean EOF. Returns True if a connection
+    was aborted.
+    """
+    client = request.client
+    conns = SERVER_STATE.get("connections")
+    if not client or not conns:
+        return False
+    target = (client.host, client.port)
+    for proto in list(conns):
+        transport = getattr(proto, "transport", None)
+        if transport is None:
+            continue
+        peer = transport.get_extra_info("peername")
+        if peer and tuple(peer[:2]) == target:
+            sock = transport.get_extra_info("socket")
+            if sock is not None:
+                try:
+                    sock.setsockopt(
+                        socket.SOL_SOCKET,
+                        socket.SO_LINGER,
+                        struct.pack("ii", 1, 0),
+                    )
+                except OSError:
+                    pass
+            transport.abort()
+            return True
+    return False
+
+
 app = FastAPI()
 
 
@@ -134,35 +230,113 @@ def _startup() -> None:
     t.start()
 
 
-def _serve_data(path: str) -> Any:
+async def _serve_data(request: Request, path: str) -> Any:
+    """Serve ``/data`` shaped by the active fault profile.
+
+    Decides the outcome (fault draw + delay) first, records the arrival in
+    the request log, and only then applies the delay / builds the
+    response, so the logged ``recv_epoch_ms`` is a true arrival time.
+    """
     recv_ms = _now_ms()
     with _lock:
         version = _state["version"]
         _state["data_requests"] += 1
         _state["total_requests"] += 1
+        _state["request_seq"] += 1
+        seq = _state["request_seq"]
         _state["recent"].append(recv_ms)
-        # Keep only the last 10 seconds of arrivals.
         cutoff = recv_ms - 10_000
         _state["recent"] = [r for r in _state["recent"] if r >= cutoff]
-    _log_request(recv_ms, path, "GET", version)
+
+        mode = _state["mode"]
+        error_rate = float(_state["error_rate"])
+        error_status = int(_state["error_status"])
+        lat = _state["latency_ms"] or {}
+        base = float(lat.get("base", 0))
+        jitter = float(lat.get("jitter", 0))
+        hang_ms = float(_state["timeout_hang_ms"])
+        profile_id = _state.get("id")
+
+        faulted = mode in ("status", "refuse", "hang") and _rng.random() < error_rate
+        if faulted:
+            _state["faulted_requests"] += 1
+        latency_delay_ms = base + (_rng.random() * jitter if jitter > 0 else 0.0)
+
+        if faulted and mode == "refuse":
+            applied_status: Any = "refuse"
+            applied_delay_ms: float = 0.0
+        elif faulted and mode == "hang":
+            applied_status = "hang"
+            applied_delay_ms = hang_ms
+        elif faulted and mode == "status":
+            applied_status = error_status
+            applied_delay_ms = latency_delay_ms
+        else:
+            applied_status = 200
+            applied_delay_ms = latency_delay_ms
+
+    _log_request(
+        recv_ms,
+        path,
+        "GET",
+        version,
+        applied_status=applied_status,
+        applied_delay_ms=round(applied_delay_ms, 2),
+        fault_profile_id=profile_id,
+        request_seq=seq,
+    )
+
+    if applied_status == "refuse":
+        aborted = _abort_connection(request)
+        if aborted:
+            # The connection is gone; the returned response is discarded.
+            return Response(status_code=444)
+        # Fallback if we could not reach the transport: a 503 still
+        # records a Failure to the controller and a hard error to caching.
+        await asyncio.sleep(applied_delay_ms / 1000.0)
+        return PlainTextResponse(
+            content="connection refused (fallback 503)",
+            status_code=503,
+            headers=_profile_headers(),
+        )
+
+    if applied_status == "hang":
+        await asyncio.sleep(applied_delay_ms / 1000.0)
+        # The client (Spice) has almost certainly timed out and dropped the
+        # socket by now; respond anyway (harmless if the peer is gone).
+        body, media_type = _render_payload(_current_row(_state["version"], _now_ms()))
+        return PlainTextResponse(
+            content=body, media_type=media_type, headers=_profile_headers()
+        )
+
+    if applied_delay_ms > 0:
+        await asyncio.sleep(applied_delay_ms / 1000.0)
+
+    if applied_status != 200:
+        # A faulted HTTP status. Carry the profile headers (Retry-After,
+        # RateLimit, ...) so the cooldown / IETF paths can be exercised.
+        return PlainTextResponse(
+            content=f"origin fault: status {applied_status}",
+            status_code=int(applied_status),
+            headers=_profile_headers(),
+        )
+
     body, media_type = _render_payload(_current_row(version, recv_ms))
     return PlainTextResponse(
-        content=body,
-        media_type=media_type,
-        headers={"X-Origin-Version": str(version)},
+        content=body, media_type=media_type, headers=_profile_headers()
     )
 
 
 @app.get("/data")
-def get_data() -> Any:
-    return _serve_data("/data")
+async def get_data(request: Request) -> Any:
+    return await _serve_data(request, "/data")
 
 
 # File-like alias so the object-store listing connector fetches the URL with
 # a plain GET instead of a WebDAV PROPFIND collection listing.
 @app.get("/data.json")
-def get_data_json() -> Any:
-    return _serve_data("/data.json")
+async def get_data_json(request: Request) -> Any:
+    return await _serve_data(request, "/data.json")
 
 
 @app.head("/data.json")
@@ -182,27 +356,36 @@ def head_data_json() -> Any:
 async def post_control(request: Request) -> Any:
     profile = await request.json()
     recv_ms = _now_ms()
+    global _rng
     with _lock:
         _state["total_requests"] += 1
         for key in (
+            "id",
             "bump_interval",
             "error_rate",
             "mode",
             "error_status",
             "latency_ms",
             "timeout_hang_ms",
+            "headers",
+            "seed",
         ):
             if key in profile:
                 _state[key] = profile[key]
+        if "seed" in profile:
+            _rng = random.Random(int(profile["seed"]))
         applied = {
+            "id": _state["id"],
             "bump_interval": _state["bump_interval"],
             "error_rate": _state["error_rate"],
             "mode": _state["mode"],
             "error_status": _state["error_status"],
             "latency_ms": _state["latency_ms"],
             "timeout_hang_ms": _state["timeout_hang_ms"],
+            "headers": _state["headers"],
+            "seed": _state["seed"],
         }
-    _log_request(recv_ms, "/control", "POST", None)
+    _log_request(recv_ms, "/control", "POST", None, fault_profile_id=applied["id"])
     return JSONResponse({"applied": applied, "server_epoch_ms": recv_ms})
 
 
@@ -216,8 +399,11 @@ def get_stats() -> Any:
             "origin": ORIGIN_NAME,
             "hwm_version": _state["version"],
             "bump_interval": _state["bump_interval"],
+            "mode": _state["mode"],
+            "fault_profile_id": _state["id"],
             "data_requests": _state["data_requests"],
             "total_requests": _state["total_requests"],
+            "faulted_requests": _state["faulted_requests"],
             "data_requests_last_10s": len(recent),
             "server_epoch_ms": recv_ms,
             "t_rel_s": round(_t_rel(recv_ms), 4),
@@ -228,3 +414,28 @@ def get_stats() -> Any:
 @app.get("/healthz")
 def healthz() -> Any:
     return PlainTextResponse("ok")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Harness origin server")
+    p.add_argument("--host", default=os.environ.get("ORIGIN_HOST", "127.0.0.1"))
+    p.add_argument(
+        "--port", type=int, default=int(os.environ.get("ORIGIN_PORT", "9001"))
+    )
+    p.add_argument(
+        "--log-level", default=os.environ.get("ORIGIN_LOG_LEVEL", "warning")
+    )
+    args = p.parse_args()
+
+    config = uvicorn.Config(
+        app, host=args.host, port=args.port, log_level=args.log_level
+    )
+    server = uvicorn.Server(config)
+    # Expose the live connection registry so ``refuse`` can abort a
+    # connection by RST from inside a request handler.
+    SERVER_STATE["connections"] = server.server_state.connections
+    server.run()
+
+
+if __name__ == "__main__":
+    main()

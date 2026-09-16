@@ -1,97 +1,159 @@
-# HTTP cache / rate-limit harness — Phase 0
+# HTTP cache / rate-limit harness
 
 A closed test rig that measures how a Spice.ai `refresh_mode: caching`
-accelerator behaves in front of a live, changing HTTP origin. Phase 0 is
-the smallest useful slice: one origin, one caching dataset, and a load
-generator that decides — from evidence — whether the cache serves fresh
-data, bounds staleness, and shields the origin from load.
+accelerator behaves in front of a live, changing HTTP origin. It decides —
+from evidence (origin request logs, per-response samples, a shared clock) —
+whether the cache serves fresh data, bounds staleness, shields the origin
+from load, and (Phase 1) keeps serving stale data while the origin fails.
+
+- **Phase 0** — one origin, one caching dataset, steady state. Proves the
+  freshness oracle: fresh serve, bounded staleness, load absorption.
+- **Phase 1** — origin fault injection + a shared-clock scenario driver.
+  Proves (or refutes) RFC 5861 **stale-if-error (SIE)**: a failing origin
+  should not stop the cache from serving the last good rows.
 
 ```
-  loadgen/run_phase0.py            spiced (:8090)              origin (:9001)
-  ------------------------         ----------------           --------------
-  every 1/QPS seconds:             dataset d1                 GET /data
-    GET  /stats  -> hwm     --->   duckdb, refresh_mode:  --> {"id":1,
-    POST /v1/sql (filtered)        caching (max_age 3s,       "version":N,
-      SELECT version, _fetched_at    swr 6s)                   ...}
-      FROM d1 WHERE origin='p1'                               version N bumps
-    compare version_seen vs hwm                              +1 every 1s
+  loadgen (driver+oracle)          spiced (:8090)              origin (:9001)
+  -----------------------          ----------------            --------------
+  shared clock T0                  dataset d1                  GET  /data
+  step origin fault profile  --->  duckdb, refresh_mode:  -->  POST /control
+  poll SELECT ... WHERE origin      caching (max_age 3s,        (fault profile)
+    compare version_seen vs hwm     swr 6s, sie enabled)       version bumps +1/s
 ```
 
 ## Components
 
 - `origin/server.py` — FastAPI origin. Serves one row whose integer
-  `version` increases on a fixed cadence (`ORIGIN_BUMP_INTERVAL`, default
-  1s). `GET /stats` reports the high-water `version` and a `/data` request
-  counter; every `/data` GET is appended to `ORIGIN_REQUEST_LOG`.
-- `spicepod/spicepod.caching.yaml` — one dataset `d1`, DuckDB accelerator,
-  `refresh_mode: caching` (`caching_ttl: 3s`, `caching_stale_while_revalidate_ttl: 6s`).
-- `loadgen/run_phase0.py` — the load generator **and** the freshness
-  oracle. Drives queries, records per-response samples, and emits a
-  pass/fail verdict.
-- `run_phase0.sh` — one-command orchestration: start origin + spiced, wait
-  until ready, run the load, tear down.
+  `version` increases each second. `POST /control` sets the fault profile
+  (below); `GET /stats` reports the high-water `version` and counters;
+  every `/data` GET is appended to `ORIGIN_REQUEST_LOG` (arrival time, the
+  applied outcome, the fault id). Launch it with `python origin/server.py`
+  (not `uvicorn origin.server:app`) so the `refuse` mode can reach the live
+  connection registry it needs to reset a socket.
+- `spicepod/spicepod.caching.yaml` — Phase 0 dataset (SWR only).
+- `spicepod/spicepod.sie.yaml` — Phase 1 dataset, `caching_stale_if_error: enabled`.
+- `spicepod/spicepod.sie.expiry.yaml` — duration-bounded SIE (PENDING, see below).
+- `loadgen/run_phase0.py` — Phase 0 load generator + freshness oracle.
+- `loadgen/run_phase1.py` — Phase 1 scenario driver + load generator + SIE
+  oracle in one process (so the fault timeline and the samples share T0).
+- `run_phase0.sh`, `run_phase1.sh` — one-command orchestration per phase.
+
+## Origin fault modes (`POST /control`)
+
+A profile picks one `mode`; a fraction `error_rate` (0..1) of `/data`
+requests get the fault, drawn from a seeded RNG; the rest are served a
+healthy row. Every response (except `refuse`) also carries the
+`latency_ms` slowdown. The arrival is logged **before** any fault delay,
+so the request log stays a true arrival record.
+
+| mode | field(s) | effect | Spice sees |
+|---|---|---|---|
+| `status` | `error_status` (503/429), `headers` | return that HTTP status | retryable HTTP failure |
+| `hang` | `timeout_hang_ms` | `asyncio.sleep` then respond | request timeout (a send error) if `> client_timeout` |
+| `refuse` | — | abort the TCP connection with a RST | connection error (a send error) |
+| `latency` | `latency_ms {base,jitter}` | slow but healthy | success, just slow |
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:9001/control -H 'Content-Type: application/json' \
+  -d '{"id":"p1-503","mode":"status","error_status":503,"error_rate":1.0,
+       "headers":{"Retry-After":"2"},"seed":12345}'
+```
 
 ## Run it
 
 ```bash
 cd test/harness/http_cache_ratelimit
-python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt   # once
+# venv once (repo-root .venv is picked up automatically):
+python3 -m venv ../../../.venv && ../../../.venv/bin/pip install -r requirements.txt
+
+# Phase 0 (steady-state freshness):
 QPS=10 DURATION_S=20 ./run_phase0.sh
+
+# Phase 1 (stale-if-error scenarios):
+./run_phase1.sh caching-sie-timeout     # MANDATORY
+./run_phase1.sh caching-sie-refuse
+./run_phase1.sh caching-sie-503
+./run_phase1.sh caching-sie-expiry
 ```
 
-Artifacts land in `$RUN_DIR` (default `/tmp/http_cache_phase0_run`):
-`samples.csv` (one row per query), `assertions.json` (the verdict),
-`spiced.log`, `origin.stdout.log`. Exit code is the oracle verdict
-(0 = all assertions pass).
+Artifacts land in `$RUN_DIR` (Phase 1 default
+`/tmp/http_cache_phase1_run/<scenario>/`): `samples.csv` (one row per
+query), `driver_events.csv` (fault steps on the shared clock),
+`assertions.json` (the verdict), `origin_p1.jsonl`, `spiced.log`. The exit
+code is the verdict: **0 = PASS, 1 = FAIL, 2 = BLOCKED / PENDING**.
 
-## What the oracle asserts
+## Phase 1 scenarios and what the oracle asserts
 
-For each query it samples the origin high-water version (`hwm_at_send`)
-just before reading `version` back through the cache, so
-`lag_versions = hwm_at_send - version_seen`.
+Each scenario warms the cache (healthy), injects a fault at `t = warmup_s`,
+recovers at `t = warmup_s + fault_s`. The **SIE window** is
+`[warmup_s + max_age + swr, fault_end]` — the span where the entry is past
+max-age + stale-while-revalidate AND the origin is failing, so the SIE
+decision is what serves the response.
 
-| assertion | claim |
-|---|---|
-| `all_queries_returned_data` | every read returned a row (no errors) |
-| `cache_absorbs_load` | origin `/data` fetches ≪ query count |
-| `fetch_count_near_max_age_cadence` | fetches ≈ `duration / max_age`, not one per query |
-| `staleness_bounded` | `max lag ≤ ceil((max_age + swr)/bump) + margin` |
-| `cache_never_ahead_of_origin` | `version_seen ≤ hwm` always (correctness) |
-| `served_version_monotonic` | `version_seen` never regresses |
+| scenario | fault | expected on the SIE feature | prebuilt v2.3.1 |
+|---|---|---|---|
+| `caching-sie-timeout` | `hang` > `client_timeout` | serve stale (send error) | **PASS** |
+| `caching-sie-refuse` | connection reset | serve stale (send error) | **PASS** |
+| `caching-sie-503` | HTTP 503 | serve stale (RFC 5861) | **BLOCKED** — returns empty |
+| `caching-sie-expiry` | long error window | stale then fail-closed at the bound | **PENDING** — duration SIE not in binary |
 
-## Three findings that shape the config (verified against prebuilt `spiced` v2.3.1, `f3ca9d17dc`)
+Assertions (per run): `cache_never_ahead_of_origin` (correctness — never
+serve a version the origin has not produced, checked against the origin
+high-water mark sampled *after* the query so a blocked fetch does not false
+-positive), `warmup_served_data`, `sie_serves_stale_through_error`
+(stale served ≥1, never empty/error in the SIE window),
+`sie_stale_version_is_frozen_and_below_hwm`,
+`connector_timed_out_not_full_hang` (timeout scenario), and
+`recovery_resumes_freshness`.
 
-1. **A caching HTTP dataset needs the dynamic-API provider, not the
-   listing connector.** `file_format: json` alone routes to the
-   object-store listing connector, which issues WebDAV `PROPFIND` /
-   `Range` requests a dynamic endpoint answers with `405` (or an empty
-   listing → empty schema). Setting `allowed_request_paths` selects the
-   dynamic JSON API provider, which does a plain `GET` on the base URL.
+## Findings (verified against prebuilt `spiced` v2.3.1, `f3ca9d17dc`)
 
-2. **`refresh_mode: caching` only refreshes on a *filtered* query.**
-   `CachingAccelerationScanExec::execute` returns cached rows directly
-   when the scan has no filters (`self.filters.is_empty()`), skipping the
-   staleness check and the source fetch entirely. A cold, unfiltered
-   `SELECT version FROM d1` therefore returns `[]` with zero origin hits,
-   silently. The load generator always queries **with a `WHERE`**.
+These are behaviors *observed by running the harness*, not code reading.
 
-3. **Filter on a string column, not an integer.**
-   `... WHERE id = 1` (or any numeric-column predicate) fails with
-   `Internal error: Could not create ExprBoundaries: ... col_index has
-   gone out of bounds`. `... WHERE origin = 'p1'` works and triggers the
-   fetch. The generator uses the string filter.
+1. **Stale-if-error serves stale on a SEND error, but returns EMPTY on a
+   503.** Past max-age + SWR with the origin failing, a connection timeout
+   (`is_timeout`) or reset (`is_connect`) makes the cache serve the last
+   good rows (SIE works). A retryable HTTP **503** instead yields an empty
+   result set (`HTTP 200`, `[]`) — not the cached copy and not an error.
+   RFC 5861 SIE should serve stale on a 5xx too, and an empty result is a
+   silent-wrong-result risk. This is why `caching-sie-503` is reported
+   BLOCKED rather than failed: SIE is present for send errors, absent for
+   status errors. (Reproduce: `caching-sie-503` returns empty in the SIE
+   window; `caching-sie-timeout` / `caching-sie-refuse` return stale.)
 
-The `_fetched_at` cache-timestamp column **is** selectable and is
-surfaced by `SELECT *`; it advances in lockstep with each cache refresh,
-so it doubles as an independent freshness marker in `samples.csv`.
+2. **`caching_stale_if_error` accepts only `enabled` / `disabled`; a
+   duration is rejected at load.** `caching_stale_if_error: "60s"` fails
+   dataset registration with *"Invalid 'caching_stale_if_error' value:
+   '60s'. Expected 'enabled' or 'disabled'."* The duration-bounded SIE
+   window (fail-closed once staleness passes the bound) is a newer feature
+   (#14126) not in this binary, so `caching-sie-expiry` is PENDING that
+   build. `spicepod.sie.expiry.yaml` is the config to use once it lands.
 
-## Example evidence (QPS=10, 20s, bump 1s, max_age 3s, swr 6s)
+3. **`client_timeout` is enforced only with a BARE integer of seconds.** A
+   suffixed duration (`"2s"`, `"500ms"`) is silently ignored: a 4s origin
+   hang under `client_timeout: "2s"` waits the full 4s and returns 200,
+   while `client_timeout: "1"` aborts the fetch at ~1s. The Phase 1
+   spicepods use bare `"1"`. (The Phase 0 `spicepod.caching.yaml` still
+   uses `"2s"`, which is a no-op there because Phase 0 injects no
+   timeouts.)
+
+Evidence for finding 1 (SIE window, per-response transitions):
 
 ```
-queries=200 ok=200 errors=0
-origin HWM 2 -> 22; origin /data fetches during run = 10 (log window = 10)
-max lag = 2 versions (bound 12)
+caching-sie-timeout   t+32.17s  STALE  seen=13  hwm=32  lat=11205ms   -> serves stale on timeout
+caching-sie-refuse    t+26.98s  STALE  seen=13  hwm=27  lat=6086ms    -> serves stale on reset
+caching-sie-503       t+20.99s  EMPTY  seen=None hwm=21  lat=6149ms    -> returns [] on 503
 ```
 
-200 reads, 10 origin fetches (20:1 absorption), lag never past 2 — all six
-assertions pass.
+Evidence for finding 3 (`caching-sie-timeout`, origin hang-fetch arrivals):
+hang fetches re-arrive ~1.0s apart (client_timeout) though each hang would
+only respond at +3000ms — the connector abandoned each attempt at the
+timeout, it did not wait the full hang.
+
+## Not in this phase
+
+The second origin (p2), the adaptive rate-control assertions, the metrics
+scraper, and docker-compose are later phases (see
+`docs/dev/http_cache_ratelimit_harness_plan.md`, Sections 4.7 and 11).
