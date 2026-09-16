@@ -119,7 +119,9 @@ fn write_regexp_count_source(path: &Path) -> Result<(), anyhow::Error> {
          5,ab,\n\
          6,,\n\
          7,aaa,a\n\
-         8,xy\u{661},a\n",
+         8,xy\u{661},a\n\
+         9,\u{212A},a\n\
+         10,\u{17F},a\n",
     )?;
     Ok(())
 }
@@ -795,6 +797,8 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
                 ("regexp_count(s, '\u{661}')", "a non-ASCII literal"),
                 ("regexp_count(s, '(a{1}){3}')", "nested counted repetitions"),
                 ("regexp_count(s, '(a{100}){10}')", "nested bounds at RE2's product limit of 1000"),
+                ("regexp_count(s, '[Kkx]|a')", "an alternation over a three-character class (rows 9 and 10)"),
+                ("regexp_count(s, 'k|K')", "an alternation of plain literals (rows 9 and 10)"),
             ];
             for (call, what) in shapes {
                 let sql = format!("SELECT id, {call} AS c FROM {{table}} ORDER BY id");
@@ -840,6 +844,8 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
                     "| 6  | 0     | 0      |",
                     "| 7  | 3     | 2      |",
                     "| 8  | 0     | 0      |",
+                    "| 9  | 0     | 0      |",
+                    "| 10 | 0     | 0      |",
                     "+----+-------+--------+",
                 ],
                 &run_query(&rt, pinned).await?
@@ -852,7 +858,10 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
             let accelerated = run_query(&rt, &filtered.replace("{table}", "accelerated")).await?;
             let local = run_query(&rt, &filtered.replace("{table}", "local")).await?;
             assert_batches_eq!(
-                ["+----+", "| id |", "+----+", "| 2  |", "| 4  |", "| 6  |", "| 8  |", "+----+"],
+                [
+                    "+----+", "| id |", "+----+", "| 2  |", "| 4  |", "| 6  |", "| 8  |", "| 9  |",
+                    "| 10 |", "+----+",
+                ],
                 &accelerated
             );
             assert_eq!(
@@ -871,7 +880,11 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
             // (RE2 rejects it), nested counted repetitions whose product passes
             // RE2's limit of 1000, a quantifier stacked on a quantifier (RE2
             // rejects `a++`), a counted bound spelled with a leading zero (RE2 reads
-            // `a{01}` as literal text), a start past DuckDB's SUBSTRING range, and
+            // `a{01}` as literal text), a two-character class of case variants
+            // (RE2 rewrites `[Kk]` into a case-folded literal and folds it across
+            // Unicode when it factors an alternation — rows 9 and 10, the Kelvin
+            // sign and the long s, are where `([Kk]|a)` and `([Ss]|a)` counted 1
+            // remotely and 0 locally), a start past DuckDB's SUBSTRING range, and
             // any flags argument — `i` included, because the
             // engines' case-folding tables track different Unicode versions and
             // the pinned regex-syntax folds U+1C89 where RE2 does not.
@@ -886,6 +899,8 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
                 "regexp_count(s, '(a{100}){11}')",
                 "regexp_count(s, 'a++')",
                 "regexp_count(s, 'a{01}')",
+                "regexp_count(s, '([Kk]|a)')",
+                "regexp_count(s, '([Ss]|a)')",
                 "regexp_count(s, 'a', 4294967296)",
                 "regexp_count(s, 'a', 1, 'm')",
                 "regexp_count(s, 'a', 1, 'i')",

@@ -458,6 +458,10 @@ mod tests {
                 "a counted bound with a leading zero, which RE2 reads literally",
             ),
             (
+                "([Kk]|a)",
+                "a two-character class of case variants, which RE2 folds across Unicode when it factors an alternation",
+            ),
+            (
                 "(?i)a",
                 "case-insensitive matching, whose folding tables differ by Unicode version",
             ),

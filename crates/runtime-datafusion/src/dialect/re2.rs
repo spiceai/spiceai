@@ -43,7 +43,15 @@ limitations under the License.
 //! `regex-syntax` folds U+1C89 to U+1C8A where RE2's table does not, so
 //! `(?i)\x{1C89}` over `ᲊ` counts 1 locally and 0 remotely — and Unicode
 //! properties, POSIX classes, named groups and the remaining flags have not
-//! been measured to agree. `.`, `[^a]` and `[0-9]` were measured to agree.
+//! been measured to agree. A bracketed class of exactly two case variants
+//! (`[Kk]`, `[Ss]`) is refused wherever it appears: RE2 rewrites it into a
+//! case-folded literal, and when it merges that literal into a character class
+//! while factoring an alternation it folds across all of Unicode, so
+//! `([Kk]|a)` counts the Kelvin sign `K` and `([Ss]|a)` the long s `ſ` remotely
+//! where the kernel counts neither (measured on the bundled `DuckDB`); the bare
+//! class agrees, but the rewrite is what RE2 does with the class, not with the
+//! alternation. `.`, `[^a]`, `[0-9]`, `[Kkx]|a` and `k|K` were measured to
+//! agree.
 //!
 //! A caller with a stricter need layers its own predicate on the returned
 //! syntax tree — the `DuckDB` `regexp_count` rendering also requires a minimum
@@ -53,10 +61,11 @@ limitations under the License.
 use std::fmt;
 
 use regex_syntax::ast::{
-    AssertionKind, Ast, ClassSetBinaryOp, ClassSetItem, Flags, GroupKind, HexLiteralKind, Literal,
-    LiteralKind, Repetition, RepetitionKind, RepetitionRange, SpecialLiteralKind, Visitor,
-    parse::Parser, visit,
+    AssertionKind, Ast, ClassBracketed, ClassSet, ClassSetBinaryOp, ClassSetItem, Flags, GroupKind,
+    HexLiteralKind, Literal, LiteralKind, Repetition, RepetitionKind, RepetitionRange,
+    SpecialLiteralKind, Visitor, parse::Parser, visit,
 };
+use regex_syntax::hir::{ClassUnicode, ClassUnicodeRange};
 
 /// RE2's cap on counted repetition (`kMaxRepeat` in `re2/parse.cc`): the
 /// product of the `{n}`/`{n,m}` bounds along a nesting path may not exceed
@@ -101,6 +110,11 @@ pub(super) enum EngineDependentSyntax {
     /// a leading zero or a space (`a{01}`, `a{1, 2}`) — which the kernel
     /// parses as a repetition and RE2 reads as literal text.
     RepetitionSpelling,
+    /// A bracketed class of exactly two case variants of one character
+    /// (`[Kk]`), which RE2 rewrites into a case-folded literal and then folds
+    /// across all of Unicode when it factors an alternation (`([Kk]|a)`
+    /// matches the Kelvin sign remotely and not locally).
+    CaseFoldPair,
 }
 
 impl fmt::Display for EngineDependentSyntax {
@@ -129,6 +143,9 @@ impl fmt::Display for EngineDependentSyntax {
             }
             Self::StackedRepetition => {
                 "it applies a quantifier directly to another quantifier, which RE2 rejects"
+            }
+            Self::CaseFoldPair => {
+                "it uses a two-character class of case variants, which RE2 folds across Unicode when it factors an alternation"
             }
             Self::RepetitionSpelling => {
                 "it spells a counted repetition with a leading zero or a space, which RE2 reads as literal text"
@@ -191,6 +208,44 @@ impl EngineNeutralSyntax<'_> {
         }
     }
 
+    /// Refuses a positive class of exactly two case variants of one character
+    /// (`[Kk]`, `[sS]`), the shape RE2 rewrites into a case-folded literal.
+    /// Variants are judged with the kernel's own simple case folding, which is
+    /// a superset of the ASCII pairs RE2 rewrites — a class it refuses that
+    /// RE2 would keep only costs a pushdown.
+    fn class(class: &ClassBracketed) -> Result<(), EngineDependentSyntax> {
+        if class.negated {
+            return Ok(());
+        }
+        let ClassSet::Item(ClassSetItem::Union(union)) = &class.kind else {
+            return Ok(());
+        };
+        let mut members = union.items.iter().map(|item| match item {
+            ClassSetItem::Literal(literal) => Some(literal.c),
+            ClassSetItem::Range(range) if range.start.c == range.end.c => Some(range.start.c),
+            _ => None,
+        });
+        let (Some(Some(first)), Some(Some(second)), None) =
+            (members.next(), members.next(), members.next())
+        else {
+            return Ok(());
+        };
+        if first != second && Self::case_variants(first, second) {
+            return Err(EngineDependentSyntax::CaseFoldPair);
+        }
+        Ok(())
+    }
+
+    /// Whether `second` is in `first`'s simple case-folding orbit.
+    fn case_variants(first: char, second: char) -> bool {
+        let mut orbit = ClassUnicode::new([ClassUnicodeRange::new(first, first)]);
+        orbit.try_case_fold_simple().is_ok()
+            && orbit
+                .ranges()
+                .iter()
+                .any(|range| range.start() <= second && second <= range.end())
+    }
+
     /// Enters a repetition: refuses a quantifier stacked on a quantifier and a
     /// counted bound not spelled canonically, then multiplies the enclosing
     /// counted bounds by this one's (`?`, `*` and `+` count as 1, as in RE2)
@@ -242,11 +297,8 @@ impl Visitor for EngineNeutralSyntax<'_> {
 
     fn visit_pre(&mut self, ast: &Ast) -> Result<(), EngineDependentSyntax> {
         match ast {
-            Ast::Empty(_)
-            | Ast::Dot(_)
-            | Ast::Alternation(_)
-            | Ast::Concat(_)
-            | Ast::ClassBracketed(_) => Ok(()),
+            Ast::Empty(_) | Ast::Dot(_) | Ast::Alternation(_) | Ast::Concat(_) => Ok(()),
+            Ast::ClassBracketed(class) => Self::class(class),
             Ast::Literal(literal) => Self::literal(literal),
             Ast::Repetition(repetition) => self.enter_repetition(repetition),
             Ast::Flags(set) => Self::flags(&set.flags),
