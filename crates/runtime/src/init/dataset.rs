@@ -1188,7 +1188,7 @@ impl Runtime {
             .invalidate_for_table(ds.name.clone())
             .await
         {
-            tracing::warn!(
+            tracing::debug!(
                 "Dataset '{}' is updating, but the results cached from its previous contents could not be invalidated, so queries may be answered from them until they expire. Cause: {e}",
                 ds.name
             );

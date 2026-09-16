@@ -290,10 +290,13 @@ mod tests {
     }
 
     #[test]
-    fn eligible_keeps_a_slow_lookup_when_exec_is_below_the_threshold() {
-        // 120ms cache lookup + 1ms exec at min_sql_duration_ms=100: measuring
-        // from after the probe would drop the Explain Analyze plan row
-        // (1 < 100); measuring from query start keeps it (121 >= 100).
+    fn eligible_uses_the_sql_query_span_clock() {
+        // Plan capture is gated on the same clock as the parent `sql_query`
+        // span: after the results-cache probe, and after a hop onto the query
+        // runtime. Including lookup (or hop-wait) would emit a plan row whose
+        // parent is then dropped by `min_sql_duration_ms` (span ≈ exec only).
+        // 120ms lookup + 1ms exec at min_sql=100 is therefore ineligible;
+        // 121ms of span time is eligible.
         let config = cfg(TaskHistoryCapturedPlan::ExplainAnalyze, None, Some(100.0));
         assert!(!plan_capture_eligible(1.0, &config));
         assert!(plan_capture_eligible(121.0, &config));
