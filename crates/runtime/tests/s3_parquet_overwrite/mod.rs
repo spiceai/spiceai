@@ -871,7 +871,7 @@ async fn explain_analyze(rt: &Runtime, sql: &str) -> Result<String, anyhow::Erro
 async fn a_predicate_scan_of_bloom_filtered_parquet_pins_one_generation(
     mix: &MixProxy,
     proxy: &str,
-    minio: &str,
+    store_endpoint: &str,
     bucket: &str,
     bloom_filtered: Vec<u8>,
 ) -> Result<(), anyhow::Error> {
@@ -890,7 +890,7 @@ async fn a_predicate_scan_of_bloom_filtered_parquet_pins_one_generation(
     let query = format!("SELECT COUNT(*) AS matches FROM overwrite_race WHERE payload = '{probe}'");
     let query = query.as_str();
 
-    ensure_bucket_and_object(minio, bucket, bloom_filtered, true).await?;
+    ensure_bucket_and_object(store_endpoint, bucket, bloom_filtered, true).await?;
     let rt = run_runtime(proxy, bucket).await?;
     // Schema inference has run by now and GETs without a pin; only the query's own
     // reads are under assertion.
@@ -1211,7 +1211,7 @@ async fn listing_table_scan_does_not_decode_a_replaced_object() -> Result<(), an
                 a_predicate_scan_of_bloom_filtered_parquet_pins_one_generation(
                     &mix,
                     &proxy,
-                    &minio,
+                    &store_endpoint,
                     "overwrite-race-bloom",
                     write_bloom_filtered_parquet(&gen_a),
                 )
