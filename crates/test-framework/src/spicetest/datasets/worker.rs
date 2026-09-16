@@ -41,8 +41,10 @@ use crate::{
 
 use super::EndCondition;
 
-/// The most reference rows past an `OFFSET` read back to find where the tie group
-/// at a `LIMIT` ends, when an `ORDER BY … LIMIT` answer differs from the reference's.
+/// Hard cap on keyed-reference rows fetched from the top of the result
+/// (`OFFSET` plus the window past it) when an `ORDER BY … LIMIT` answer differs
+/// from the reference's. The matcher indexes from the top, so skipped `OFFSET`
+/// rows count; this is not a bound on rows past the `OFFSET` alone.
 const MAX_KEYED_REFERENCE_ROWS: usize = 1 << 20;
 
 /// First keyed-reference fetch past the `OFFSET` for a `LIMIT` of `limit`. Twice
@@ -1433,6 +1435,19 @@ mod tests {
         assert_eq!(
             keyed_reference_requested_rows(MAX_KEYED_REFERENCE_ROWS, fetch),
             MAX_KEYED_REFERENCE_ROWS
+        );
+        // Capping only the window (rows past OFFSET) and then adding OFFSET
+        // would still request OFFSET + window and defeat the total-row cap.
+        let if_cap_were_rows_past_offset =
+            fetch.min(MAX_KEYED_REFERENCE_ROWS).saturating_add(offset);
+        assert!(
+            if_cap_were_rows_past_offset > MAX_KEYED_REFERENCE_ROWS,
+            "capping only rows past OFFSET then adding OFFSET ({if_cap_were_rows_past_offset}) exceeds the total cap"
+        );
+        assert_eq!(
+            keyed_reference_requested_rows(offset, fetch),
+            MAX_KEYED_REFERENCE_ROWS,
+            "the cap is total keyed-reference rows (OFFSET + window), not rows past OFFSET"
         );
     }
 
