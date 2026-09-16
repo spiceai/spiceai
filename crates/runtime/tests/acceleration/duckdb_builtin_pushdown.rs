@@ -855,7 +855,9 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
             // syntax and reads `[a&&a]` as a class of `a` and `&`), the `x` flag
             // (RE2 rejects it), nested counted repetitions whose product passes
             // RE2's limit of 1000, a quantifier stacked on a quantifier (RE2
-            // rejects `a++`), and any flags argument — `i` included, because the
+            // rejects `a++`), a counted bound spelled with a leading zero (RE2 reads
+            // `a{01}` as literal text), a start past DuckDB's SUBSTRING range, and
+            // any flags argument — `i` included, because the
             // engines' case-folding tables track different Unicode versions and
             // the pinned regex-syntax folds U+1C89 where RE2 does not.
             for call in [
@@ -868,6 +870,8 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
                 "regexp_count(s, '(?x)a b')",
                 "regexp_count(s, '(a{100}){11}')",
                 "regexp_count(s, 'a++')",
+                "regexp_count(s, 'a{01}')",
+                "regexp_count(s, 'a', 4294967296)",
                 "regexp_count(s, 'a', 1, 'm')",
                 "regexp_count(s, 'a', 1, 'i')",
                 "regexp_count(s, '(?i)a')",

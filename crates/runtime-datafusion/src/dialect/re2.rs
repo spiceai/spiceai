@@ -37,7 +37,8 @@ limitations under the License.
 //! are syntax RE2 does not have, so it reads `[a&&a]` as a class of `a` and
 //! `&`; RE2 rejects the `x` flag, the `\u` escapes and a quantifier applied
 //! directly to another quantifier (`a++`, `a{1}{2}`, "bad repetition
-//! operator") outright; case-insensitive matching is refused because the two
+//! operator") outright and reads a counted bound spelled with a leading zero
+//! or a space (`a{01}`, `a{1, 2}`) as literal text; case-insensitive matching is refused because the two
 //! engines' case-folding tables track different Unicode versions — the pinned
 //! `regex-syntax` folds U+1C89 to U+1C8A where RE2's table does not, so
 //! `(?i)\x{1C89}` over `ᲊ` counts 1 locally and 0 remotely — and Unicode
@@ -96,6 +97,10 @@ pub(super) enum EngineDependentSyntax {
     /// A quantifier applied directly to another quantifier (`a++`, `a{1}{2}`),
     /// which RE2 rejects as a bad repetition operator; `(a+)+` is fine.
     StackedRepetition,
+    /// A counted repetition spelled other than `{n}`, `{n,}` or `{n,m}` —
+    /// a leading zero or a space (`a{01}`, `a{1, 2}`) — which the kernel
+    /// parses as a repetition and RE2 reads as literal text.
+    RepetitionSpelling,
 }
 
 impl fmt::Display for EngineDependentSyntax {
@@ -125,6 +130,9 @@ impl fmt::Display for EngineDependentSyntax {
             Self::StackedRepetition => {
                 "it applies a quantifier directly to another quantifier, which RE2 rejects"
             }
+            Self::RepetitionSpelling => {
+                "it spells a counted repetition with a leading zero or a space, which RE2 reads as literal text"
+            }
         })
     }
 }
@@ -135,20 +143,29 @@ pub(super) fn engine_neutral_ast(pattern: &str) -> Result<Ast, EngineDependentSy
     let ast = Parser::new()
         .parse(pattern)
         .map_err(|_| EngineDependentSyntax::Unparseable)?;
-    visit(&ast, EngineNeutralSyntax::default())?;
+    visit(
+        &ast,
+        EngineNeutralSyntax {
+            pattern,
+            repetition_products: Vec::new(),
+        },
+    )?;
     Ok(ast)
 }
 
 /// Walks a pattern's syntax tree and fails on the first
 /// [`EngineDependentSyntax`] it meets.
-#[derive(Default)]
-struct EngineNeutralSyntax {
+struct EngineNeutralSyntax<'p> {
+    /// The pattern text, so a counted repetition's spelling can be read back
+    /// from its span: the parser accepts `{01}` and `{1, 2}` as `{1}` and
+    /// `{1,2}`, and the text is what `DuckDB` receives.
+    pattern: &'p str,
     /// The product of the counted-repetition bounds enclosing the node being
     /// visited, one entry per enclosing repetition so `visit_post` can unwind.
     repetition_products: Vec<u32>,
 }
 
-impl EngineNeutralSyntax {
+impl EngineNeutralSyntax<'_> {
     fn literal(literal: &Literal) -> Result<(), EngineDependentSyntax> {
         match literal.kind {
             LiteralKind::Verbatim
@@ -174,19 +191,37 @@ impl EngineNeutralSyntax {
         }
     }
 
-    /// Enters a repetition: multiplies the enclosing counted bounds by this
-    /// one's (`?`, `*` and `+` count as 1, as in RE2) and refuses the pattern
-    /// once the product passes [`RE2_MAX_REPETITION`].
+    /// Enters a repetition: refuses a quantifier stacked on a quantifier and a
+    /// counted bound not spelled canonically, then multiplies the enclosing
+    /// counted bounds by this one's (`?`, `*` and `+` count as 1, as in RE2)
+    /// and refuses the pattern once the product passes
+    /// [`RE2_MAX_REPETITION`].
     fn enter_repetition(&mut self, repetition: &Repetition) -> Result<(), EngineDependentSyntax> {
         if matches!(*repetition.ast, Ast::Repetition(_)) {
             return Err(EngineDependentSyntax::StackedRepetition);
         }
         let bound = match repetition.op.kind {
-            RepetitionKind::Range(
-                RepetitionRange::Exactly(n)
-                | RepetitionRange::AtLeast(n)
-                | RepetitionRange::Bounded(_, n),
-            ) => n,
+            RepetitionKind::Range(ref range) => {
+                let canonical = match *range {
+                    RepetitionRange::Exactly(n) => format!("{{{n}}}"),
+                    RepetitionRange::AtLeast(n) => format!("{{{n},}}"),
+                    RepetitionRange::Bounded(n, m) => format!("{{{n},{m}}}"),
+                };
+                let lazy = if repetition.greedy { "" } else { "?" };
+                let span = &repetition.op.span;
+                let spelled = self
+                    .pattern
+                    .get(span.start.offset..span.end.offset)
+                    .unwrap_or_default();
+                if spelled != format!("{canonical}{lazy}") {
+                    return Err(EngineDependentSyntax::RepetitionSpelling);
+                }
+                match *range {
+                    RepetitionRange::Exactly(n)
+                    | RepetitionRange::AtLeast(n)
+                    | RepetitionRange::Bounded(_, n) => n,
+                }
+            }
             RepetitionKind::ZeroOrOne | RepetitionKind::ZeroOrMore | RepetitionKind::OneOrMore => 1,
         };
         let enclosing = self.repetition_products.last().copied().unwrap_or(1);
@@ -199,7 +234,7 @@ impl EngineNeutralSyntax {
     }
 }
 
-impl Visitor for EngineNeutralSyntax {
+impl Visitor for EngineNeutralSyntax<'_> {
     type Output = ();
     type Err = EngineDependentSyntax;
 

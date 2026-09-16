@@ -398,6 +398,24 @@ mod tests {
             ))),
             "an integer start position renders as a DuckDB substring offset"
         );
+        assert!(
+            duckdb_can_translate(&call_of(regexp_count(
+                col("s"),
+                lit("a"),
+                Some(lit(4_294_967_295_i64)),
+                None,
+            ))),
+            "the last offset DuckDB's SUBSTRING accepts still renders"
+        );
+        assert!(
+            !duckdb_can_translate(&call_of(regexp_count(
+                col("s"),
+                lit("a"),
+                Some(lit(4_294_967_296_i64)),
+                None,
+            ))),
+            "a start past DuckDB's SUBSTRING range has no rendering and stays local"
+        );
     }
 
     /// `regexp_count` is rendered only for the call shapes `DuckDB` has been
@@ -432,6 +450,10 @@ mod tests {
             (
                 "a++",
                 "a quantifier applied to a quantifier, which RE2 rejects",
+            ),
+            (
+                "a{01}",
+                "a counted bound with a leading zero, which RE2 reads literally",
             ),
             (
                 "(?i)a",

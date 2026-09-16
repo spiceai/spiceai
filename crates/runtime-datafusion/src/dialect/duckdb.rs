@@ -684,7 +684,9 @@ impl DuckDBRegexpFunction {
     /// `SUBSTRING(str, start)` first — `SUBSTRING` is 1-based in both engines,
     /// so the position is passed through unchanged. A start that is not an
     /// integer literal cannot become an offset at unparse time and is refused,
-    /// as is one below 1, which the kernel rejects.
+    /// as is one below 1, which the kernel rejects, and one above `u32::MAX`,
+    /// which `DuckDB`'s `SUBSTRING` rejects (`Substring offset outside of
+    /// supported range`) where the kernel accepts it.
     ///
     /// **Flags.** A call with a flags argument is refused. The one candidate,
     /// `i`, is spelled the same in both engines but folds case by each
@@ -726,6 +728,11 @@ impl DuckDBRegexpFunction {
             if start < 1 {
                 return Err(DataFusionError::Plan(format!(
                     "Start position must be a positive integer for regular expression function {name}, received {start}"
+                )));
+            }
+            if start > u64::from(u32::MAX) {
+                return Err(DataFusionError::Plan(format!(
+                    "Start position {start} is outside the range DuckDB's SUBSTRING accepts for regular expression function {name}"
                 )));
             }
 
@@ -1361,6 +1368,12 @@ mod tests {
             "a++",
             "a{1}{2}",
             "a*?+",
+            "a{01}",
+            "a{1, 2}",
+            "a{1 }",
+            "a{ 1}",
+            "a{1,02}",
+            "a{1,}?x{0}",
             "(?P<n>a)",
             "(?<n>a)",
             "\\p{Nd}",
