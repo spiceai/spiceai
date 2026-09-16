@@ -36,8 +36,7 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use data_components::cdc::{
     AccelerationContents, ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter,
-    StreamError, build_history_unavailable_envelope, build_ready_signal_envelope, shutdown_epoch,
-    wrap_data_as_change_batch,
+    StreamError, build_ready_signal_envelope, shutdown_epoch, wrap_data_as_change_batch,
 };
 use futures::StreamExt;
 use object_store::ObjectStore;
@@ -56,6 +55,8 @@ const SQS_LONG_POLL_SECONDS: i32 = 20;
 const SQS_MAX_MESSAGES: i32 = 10;
 const SQS_VISIBILITY_TIMEOUT_SECONDS: i32 = 300;
 const RECEIVE_ERROR_BACKOFF_CAP: Duration = Duration::from_secs(30);
+const LISTING_RETRY_BACKOFF: Duration = Duration::from_millis(200);
+const LISTING_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(30);
 const DEFAULT_BACKFILL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Snafu)]
@@ -1051,10 +1052,59 @@ async fn process_message(
 struct BackfillCreates {
     batches: Vec<RecordBatch>,
     keys: Vec<String>,
-    /// Prefix-matching keys from this listing, including those skipped as known
-    /// or left unread. Distinguishes an empty prefix from "listed objects but
-    /// none could be read".
-    listed_matching: usize,
+    /// Prefix-matching keys that failed to read or align. Snapshot and rebuild
+    /// refuse the pass when this is non-empty; periodic backfill skips them.
+    unread_keys: Vec<String>,
+}
+
+impl BackfillCreates {
+    fn is_complete(&self) -> bool {
+        self.unread_keys.is_empty()
+    }
+}
+
+fn unread_keys_display(keys: &[String]) -> String {
+    const LIMIT: usize = 3;
+    let shown: Vec<String> = keys
+        .iter()
+        .take(LIMIT)
+        .map(|key| format!("'{key}'"))
+        .collect();
+    match keys.len() {
+        0 => "(none)".to_string(),
+        n if n <= LIMIT => shown.join(", "),
+        n => format!("{}, and {} more", shown.join(", "), n - LIMIT),
+    }
+}
+
+fn incomplete_listing_warning(
+    dataset_name: impl std::fmt::Display,
+    pass: &str,
+    unread_keys: &[String],
+    impact: &str,
+) -> String {
+    format!(
+        "Dataset '{dataset_name}' could not read every listed object during {pass}, so {impact}. Unread objects: {}. See: {S3_DOCS}",
+        unread_keys_display(unread_keys)
+    )
+}
+
+fn unread_object_warning(
+    dataset_name: impl std::fmt::Display,
+    bucket: &str,
+    key: &str,
+    pass: &str,
+    error: &impl std::fmt::Display,
+    best_effort: bool,
+) -> String {
+    let impact = if best_effort {
+        "that object will be retried on the next `s3_changes_backfill_interval`"
+    } else {
+        "that object was not applied and this pass is incomplete"
+    };
+    format!(
+        "Dataset '{dataset_name}' failed to read s3://{bucket}/{key} during {pass}, so {impact}. Cause: {error}. See: {S3_DOCS}"
+    )
 }
 
 #[expect(
@@ -1071,11 +1121,12 @@ async fn apply_unapplied_objects(
     scope_prefix: &str,
     pass: &'static str,
     skip_known: bool,
+    best_effort: bool,
 ) -> std::result::Result<BackfillCreates, StreamError> {
     let listed = object_lister.list_keys().await?;
     let mut batches = Vec::new();
     let mut keys = Vec::new();
-    let mut listed_matching = 0;
+    let mut unread_keys = Vec::new();
     for key in listed {
         let event = S3ObjectEvent {
             event_name: pass.to_string(),
@@ -1086,7 +1137,6 @@ async fn apply_unapplied_objects(
         if !matches_dataset(&event, &config.bucket, scope_prefix) {
             continue;
         }
-        listed_matching += 1;
         if skip_known && applied_keys.lock().is_known(&key) {
             continue;
         }
@@ -1102,27 +1152,43 @@ async fn apply_unapplied_objects(
                 }
                 Err(error) => {
                     tracing::warn!(
-                        "Dataset '{}' failed to align s3://{}/{} to the dataset schema during {pass}, so that object will be retried on the next `s3_changes_backfill_interval`. Cause: {error}. See: {S3_DOCS}",
-                        dataset.name,
-                        config.bucket,
-                        key
+                        "{}",
+                        unread_object_warning(
+                            &dataset.name,
+                            &config.bucket,
+                            &key,
+                            pass,
+                            &error,
+                            best_effort
+                        )
                     );
+                    unread_keys.push(key);
                 }
             },
             Err(error) => {
                 tracing::warn!(
-                    "Dataset '{}' failed to read s3://{}/{} during {pass}, so that object will be retried on the next `s3_changes_backfill_interval`. Cause: {error}. See: {S3_DOCS}",
-                    dataset.name,
-                    config.bucket,
-                    key
+                    "{}",
+                    unread_object_warning(
+                        &dataset.name,
+                        &config.bucket,
+                        &key,
+                        pass,
+                        &error,
+                        best_effort
+                    )
                 );
+                unread_keys.push(key);
             }
         }
+    }
+    if !best_effort && !unread_keys.is_empty() {
+        batches.clear();
+        keys.clear();
     }
     Ok(BackfillCreates {
         batches,
         keys,
-        listed_matching,
+        unread_keys,
     })
 }
 
@@ -1140,20 +1206,6 @@ fn concat_listing_batches(
         return Ok(batch);
     }
     concat_batches(schema, &batches).map_err(|error| StreamError::Arrow(error.to_string()))
-}
-
-fn federated_history_unavailable_envelope(
-    schema: &SchemaRef,
-    inner: Box<dyn CommitChange + Send + Sync>,
-) -> std::result::Result<ChangeEnvelope, StreamError> {
-    let (_, batch, is_dataset_ready, _) =
-        build_history_unavailable_envelope(schema)?.into_parts()?;
-    Ok(ChangeEnvelope::from_parts(
-        inner,
-        batch,
-        is_dataset_ready,
-        true,
-    ))
 }
 
 fn listing_rebuild_envelope(
@@ -1175,21 +1227,74 @@ fn listing_rebuild_envelope(
 }
 
 fn listing_rebuild_from_objects(
-    dataset: &DatasetSpec,
     schema: &SchemaRef,
     applied: &Arc<Mutex<AppliedKeySet>>,
     listed: BackfillCreates,
     inner: Box<dyn CommitChange + Send + Sync>,
-    pass: &'static str,
-) -> std::result::Result<ChangeEnvelope, StreamError> {
-    if listed.listed_matching > 0 && listed.keys.is_empty() {
-        tracing::warn!(
-            "Dataset '{}' listed objects during {pass} but could not read any of them, so the accelerator will be rebuilt from the federated table instead and those objects will be retried on the next `s3_changes_backfill_interval`. See: {S3_DOCS}",
-            dataset.name
-        );
-        return federated_history_unavailable_envelope(schema, inner);
+) -> std::result::Result<Option<ChangeEnvelope>, StreamError> {
+    if !listed.is_complete() {
+        return Ok(None);
     }
-    listing_rebuild_envelope(schema, applied, listed.keys, listed.batches, inner)
+    listing_rebuild_envelope(schema, applied, listed.keys, listed.batches, inner).map(Some)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "startup snapshot and restart replace share one complete-listing retry"
+)]
+async fn retry_until_complete_listing(
+    dataset: &DatasetSpec,
+    config: &S3ChangesConfig,
+    table_schema: &SchemaRef,
+    object_lister: &dyn ObjectLister,
+    object_reader: &dyn ObjectReader,
+    applied_keys: &Mutex<AppliedKeySet>,
+    scope_prefix: &str,
+    pass: &'static str,
+    skip_known: bool,
+    epoch: u64,
+) -> std::result::Result<Option<BackfillCreates>, StreamError> {
+    let mut backoff = LISTING_RETRY_BACKOFF;
+    loop {
+        if shutdown_epoch() != epoch {
+            return Ok(None);
+        }
+        match apply_unapplied_objects(
+            dataset,
+            config,
+            table_schema,
+            object_lister,
+            object_reader,
+            applied_keys,
+            scope_prefix,
+            pass,
+            skip_known,
+            false,
+        )
+        .await
+        {
+            Ok(listed) if listed.is_complete() => return Ok(Some(listed)),
+            Ok(listed) => {
+                tracing::warn!(
+                    "{}",
+                    incomplete_listing_warning(
+                        &dataset.name,
+                        pass,
+                        &listed.unread_keys,
+                        "that pass was not applied and will retry. The dataset will not be marked ready and the accelerator will not be overwritten from a partial listing"
+                    )
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Dataset '{}' failed to list objects during {pass}, so that pass was not applied and will retry. The dataset will not be marked ready. Cause: {error}. See: {S3_DOCS}",
+                    dataset.name
+                );
+            }
+        }
+        sleep(backoff).await;
+        backoff = (backoff * 2).min(LISTING_RETRY_BACKOFF_CAP);
+    }
 }
 
 fn create_envelopes(
@@ -1285,8 +1390,9 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
             );
             // One listing is both the snapshot and the applied-key manifest.
             // A later listing can include objects that were never read here; those
-            // must stay eligible for the completeness backfill.
-            let snapshot = apply_unapplied_objects(
+            // must stay eligible for the completeness backfill. A partial read
+            // is not a snapshot: unread keys stay eligible and ready waits.
+            if let Some(snapshot) = retry_until_complete_listing(
                 &dataset,
                 &config,
                 &schema,
@@ -1296,17 +1402,21 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                 &config.dataset_prefix,
                 "the empty-accelerator snapshot",
                 true,
+                epoch,
             )
-            .await?;
-            let envelopes = backfill_envelopes(
-                &schema,
-                snapshot.batches,
-                false,
-                &applied_keys,
-                snapshot.keys,
-            )?;
-            for envelope in envelopes {
-                yield envelope;
+            .await?
+            {
+                let envelopes = backfill_envelopes(
+                    &schema,
+                    snapshot.batches,
+                    false,
+                    &applied_keys,
+                    snapshot.keys,
+                )?;
+                for envelope in envelopes {
+                    yield envelope;
+                }
+                yield build_ready_signal_envelope(&schema)?;
             }
         } else {
             tracing::info!(
@@ -1317,7 +1427,8 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
             // One listing is both the replacement rows and the applied-key
             // manifest. A later federated scan can include objects this listing
             // never read; those must stay eligible for the completeness backfill.
-            match apply_unapplied_objects(
+            // A partial read is not a replace: do not overwrite from a subset.
+            if let Some(listed) = retry_until_complete_listing(
                 &dataset,
                 &config,
                 &schema,
@@ -1327,30 +1438,21 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                 &config.dataset_prefix,
                 "the non-empty restart replace",
                 false,
+                epoch,
             )
-            .await
+            .await?
             {
-                Ok(listed) => {
-                    yield listing_rebuild_from_objects(
-                        &dataset,
-                        &schema,
-                        &applied_keys,
-                        listed,
-                        Box::new(NoOpCommitter),
-                        "the non-empty restart replace",
-                    )?;
+                if let Some(envelope) = listing_rebuild_from_objects(
+                    &schema,
+                    &applied_keys,
+                    listed,
+                    Box::new(NoOpCommitter),
+                )? {
+                    yield envelope;
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        "Dataset '{}' could not list or read the S3 objects for the restart replace of the accelerator, so the accelerator will be rebuilt from the federated table instead and the next listing backfill may re-apply those objects. Cause: {error}. See: {S3_DOCS}",
-                        dataset.name
-                    );
-                    yield build_history_unavailable_envelope(&schema)?;
-                }
+                yield build_ready_signal_envelope(&schema)?;
             }
         }
-
-        yield build_ready_signal_envelope(&schema)?;
 
         let mut receive_backoff = Duration::from_secs(1);
         let mut last_backfill = Instant::now();
@@ -1410,25 +1512,36 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                             &config.dataset_prefix,
                             "an ObjectRemoved rebuild",
                             false,
+                            false,
                         )
                         .await
                         {
-                            Ok(listed) => {
-                                yield listing_rebuild_from_objects(
-                                    &dataset,
+                            Ok(listed) if listed.is_complete() => {
+                                if let Some(envelope) = listing_rebuild_from_objects(
                                     &schema,
                                     &applied_keys,
                                     listed,
                                     sqs,
-                                    "an ObjectRemoved rebuild",
-                                )?;
+                                )? {
+                                    yield envelope;
+                                }
+                            }
+                            Ok(listed) => {
+                                tracing::warn!(
+                                    "{}",
+                                    incomplete_listing_warning(
+                                        &dataset.name,
+                                        "an ObjectRemoved rebuild",
+                                        &listed.unread_keys,
+                                        "the accelerator was not overwritten and the SQS message was left on the queue (not deleted)"
+                                    )
+                                );
                             }
                             Err(error) => {
                                 tracing::warn!(
-                                    "Dataset '{}' could not list or read the S3 objects for an ObjectRemoved rebuild, so the accelerator will be rebuilt from the federated table instead and the next listing backfill may re-apply current objects. Cause: {error}. See: {S3_DOCS}",
+                                    "Dataset '{}' could not list the S3 objects for an ObjectRemoved rebuild, so the accelerator was not overwritten and the SQS message was left on the queue (not deleted). Cause: {error}. See: {S3_DOCS}",
                                     dataset.name
                                 );
-                                yield federated_history_unavailable_envelope(&schema, sqs)?;
                             }
                         }
                     }
@@ -1454,6 +1567,7 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                     applied_keys.as_ref(),
                     &config.key_prefix,
                     "a listing backfill",
+                    true,
                     true,
                 )
                 .await
@@ -1579,6 +1693,34 @@ mod tests {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| StreamError::External(format!("no fixture for s3://{id}")))
+        }
+    }
+
+    struct TransientFailReader {
+        inner: MapObjectReader,
+        remaining: Mutex<HashMap<String, usize>>,
+    }
+
+    #[async_trait]
+    impl ObjectReader for TransientFailReader {
+        async fn read_object(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> std::result::Result<Vec<RecordBatch>, StreamError> {
+            let id = format!("{bucket}/{key}");
+            {
+                let mut remaining = self.remaining.lock().await;
+                if let Some(count) = remaining.get_mut(&id)
+                    && *count > 0
+                {
+                    *count -= 1;
+                    return Err(StreamError::External(format!(
+                        "simulated transient read failure for s3://{id}"
+                    )));
+                }
+            }
+            self.inner.read_object(bucket, key).await
         }
     }
 
@@ -2164,12 +2306,100 @@ mod tests {
             "events/",
             "a listing backfill",
             true,
+            true,
         )
         .await
         .expect("backfill should succeed");
         assert_eq!(result.keys, vec!["events/new.parquet".to_string()]);
         assert_eq!(result.batches.len(), 1);
         assert_eq!(result.batches[0].num_rows(), 1);
+        assert!(result.unread_keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_unapplied_objects_strict_pass_discards_partial_reads() {
+        let reader = MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/a.parquet".to_string(),
+                vec![id_name_batch(&[1], &["a"])],
+            )]),
+            fail_keys: vec!["my-bucket/events/b.parquet".into()],
+        };
+        let lister = MockLister {
+            keys: vec!["events/a.parquet".into(), "events/b.parquet".into()],
+        };
+        let applied = applied_mutex([]);
+        let result = apply_unapplied_objects(
+            &events_dataset(),
+            &default_config(),
+            &id_name_schema(),
+            &lister,
+            &reader,
+            &applied,
+            "events/",
+            "the empty-accelerator snapshot",
+            true,
+            false,
+        )
+        .await
+        .expect("strict listing should return the unread set");
+        assert!(
+            result.keys.is_empty() && result.batches.is_empty(),
+            "a strict pass must not apply a subset of the listing, got keys {:?}",
+            result.keys
+        );
+        assert_eq!(result.unread_keys, vec!["events/b.parquet".to_string()]);
+        assert!(!result.is_complete());
+    }
+
+    #[tokio::test]
+    async fn apply_unapplied_objects_best_effort_keeps_readable_objects() {
+        let reader = MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/a.parquet".to_string(),
+                vec![id_name_batch(&[1], &["a"])],
+            )]),
+            fail_keys: vec!["my-bucket/events/b.parquet".into()],
+        };
+        let lister = MockLister {
+            keys: vec!["events/a.parquet".into(), "events/b.parquet".into()],
+        };
+        let applied = applied_mutex([]);
+        let result = apply_unapplied_objects(
+            &events_dataset(),
+            &default_config(),
+            &id_name_schema(),
+            &lister,
+            &reader,
+            &applied,
+            "events/",
+            "a listing backfill",
+            true,
+            true,
+        )
+        .await
+        .expect("best-effort backfill should succeed");
+        assert_eq!(result.keys, vec!["events/a.parquet".to_string()]);
+        assert_eq!(result.unread_keys, vec!["events/b.parquet".to_string()]);
+        assert_eq!(result.batches.len(), 1);
+    }
+
+    #[test]
+    fn incomplete_listing_warning_names_dataset_unread_keys_and_impact() {
+        let message = incomplete_listing_warning(
+            "events",
+            "the empty-accelerator snapshot",
+            &["events/b.parquet".to_string()],
+            "that pass was not applied and will retry. The dataset will not be marked ready and the accelerator will not be overwritten from a partial listing",
+        );
+        assert!(
+            message.contains("Dataset 'events'")
+                && message.contains("'events/b.parquet'")
+                && message.contains("will not be marked ready")
+                && message.contains("will not be overwritten")
+                && message.contains(S3_DOCS),
+            "warning must name the dataset, unread key, impact, and docs link, got {message}"
+        );
     }
 
     #[tokio::test]
@@ -2335,6 +2565,165 @@ mod tests {
         assert_eq!(names_in(&envelopes[0]), vec!["snap".to_string()]);
         assert!(envelopes[1].is_dataset_ready());
         assert!(envelopes[1].is_empty());
+    }
+
+    /// Copilot harness: listed keys `a,b`, only `a` readable, must not mark
+    /// ready or treat `b` as applied. `python3` fallback predicate
+    /// `listed_matching > 0 && keys.is_empty()` produced
+    /// `replacement_rows=['a']` and `missing_rows=['b']` on the old warn-and-
+    /// continue path.
+    #[tokio::test]
+    async fn stream_empty_snapshot_does_not_ready_on_partial_listing() {
+        let queue = Arc::new(MockQueue::with_messages(vec![]));
+        let reader = Arc::new(MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/a.parquet".to_string(),
+                vec![id_name_batch(&[1], &["a"])],
+            )]),
+            fail_keys: vec!["my-bucket/events/b.parquet".into()],
+        });
+        let lister = Arc::new(MockLister {
+            keys: vec!["events/a.parquet".into(), "events/b.parquet".into()],
+        });
+        let stream = start_stream(
+            AccelerationContents::Empty,
+            queue,
+            reader,
+            lister,
+            default_config(),
+            id_name_batch(&[99], &["stale-federated"]),
+        );
+        let envelopes = collect_until_idle(stream, 2).await;
+        assert!(
+            envelopes.is_empty(),
+            "a partial snapshot must not emit creates or ready, got {} envelopes",
+            envelopes.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_empty_snapshot_retries_until_every_listed_object_is_read() {
+        let queue: Arc<dyn MessageQueue> = Arc::new(MockQueue::with_messages(vec![]));
+        let reader: Arc<dyn ObjectReader> = Arc::new(TransientFailReader {
+            inner: MapObjectReader {
+                objects: HashMap::from([
+                    (
+                        "my-bucket/events/a.parquet".to_string(),
+                        vec![id_name_batch(&[1], &["a"])],
+                    ),
+                    (
+                        "my-bucket/events/b.parquet".to_string(),
+                        vec![id_name_batch(&[2], &["b"])],
+                    ),
+                ]),
+                fail_keys: vec![],
+            },
+            remaining: Mutex::new(HashMap::from([(
+                "my-bucket/events/b.parquet".to_string(),
+                1,
+            )])),
+        });
+        let lister: Arc<dyn ObjectLister> = Arc::new(MockLister {
+            keys: vec!["events/a.parquet".into(), "events/b.parquet".into()],
+        });
+        let stream = stream_s3_changes(S3ChangesStreamParts {
+            dataset: events_dataset(),
+            federated_table: federated_table(id_name_batch(&[99], &["stale-federated"])),
+            acceleration: AccelerationContents::Empty,
+            queue,
+            object_reader: reader,
+            object_lister: lister,
+            config: default_config(),
+        });
+        let envelopes = collect_until_idle(stream, 3).await;
+        assert!(
+            envelopes.len() >= 3,
+            "snapshot must retry until every listed object is read, then mark ready, got {}",
+            envelopes.len()
+        );
+        let names: Vec<String> = envelopes
+            .iter()
+            .filter(|envelope| !envelope.is_empty() && !envelope.is_dataset_ready())
+            .flat_map(names_in)
+            .collect();
+        assert!(
+            names.contains(&"a".to_string()) && names.contains(&"b".to_string()),
+            "retry must apply both listed objects, got {names:?}"
+        );
+        assert!(envelopes.iter().any(ChangeEnvelope::is_dataset_ready));
+    }
+
+    #[tokio::test]
+    async fn stream_nonempty_rebuild_does_not_overwrite_on_partial_listing() {
+        let queue = Arc::new(MockQueue::with_messages(vec![]));
+        let reader = Arc::new(MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/a.parquet".to_string(),
+                vec![id_name_batch(&[1], &["a"])],
+            )]),
+            fail_keys: vec!["my-bucket/events/b.parquet".into()],
+        });
+        let lister = Arc::new(MockLister {
+            keys: vec!["events/a.parquet".into(), "events/b.parquet".into()],
+        });
+        let stream = start_stream(
+            AccelerationContents::NonEmpty,
+            queue,
+            reader,
+            lister,
+            default_config(),
+            id_name_batch(&[99], &["stale-federated"]),
+        );
+        let envelopes = collect_until_idle(stream, 2).await;
+        assert!(
+            envelopes.is_empty(),
+            "a partial rebuild must not overwrite or mark ready, got {} envelopes",
+            envelopes.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_object_removed_partial_listing_leaves_message() {
+        let queue = Arc::new(MockQueue::with_messages(vec![QueueMessage {
+            body: removed_body("events/gone.parquet"),
+            receipt_handle: "rh-gone".into(),
+        }]));
+        let reader = Arc::new(MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/a.parquet".to_string(),
+                vec![id_name_batch(&[1], &["a"])],
+            )]),
+            fail_keys: vec!["my-bucket/events/b.parquet".into()],
+        });
+        let lister: Arc<dyn ObjectLister> = Arc::new(SequenceLister {
+            listings: Mutex::new(vec![
+                Vec::new(),
+                vec!["events/a.parquet".into(), "events/b.parquet".into()],
+            ]),
+        });
+        let mut config = default_config();
+        config.on_object_removed = OnObjectRemoved::Rebuild;
+        let stream = start_stream(
+            AccelerationContents::NonEmpty,
+            Arc::clone(&queue),
+            reader,
+            lister,
+            config,
+            id_name_batch(&[1], &["snap"]),
+        );
+        let envelopes = collect_until_idle(stream, 3).await;
+        assert_eq!(
+            envelopes.len(),
+            2,
+            "partial ObjectRemoved must not overwrite, got {}",
+            envelopes.len()
+        );
+        assert!(envelopes[0].history_unavailable());
+        assert!(envelopes[1].is_dataset_ready());
+        assert!(
+            queue.deleted.lock().await.is_empty(),
+            "partial ObjectRemoved must leave the SQS message on the queue"
+        );
     }
 
     #[tokio::test]
