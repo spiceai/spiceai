@@ -401,8 +401,8 @@ mod tests {
 
     /// `regexp_count` is rendered only for the call shapes `DuckDB` has been
     /// measured to count as the kernel does (#13870): a string-literal pattern
-    /// that cannot match the empty string and uses no Perl class or word
-    /// boundary, and at most the `i` flag. Every other shape stays local
+    /// that cannot match the empty string and uses only syntax both engines
+    /// read alike, and at most the `i` flag. Every other shape stays local
     /// rather than answering differently.
     #[test]
     fn duckdb_declines_a_regexp_count_it_cannot_count_faithfully() {
@@ -419,6 +419,11 @@ mod tests {
                 "\\ba",
                 "a word boundary, which the two engines read differently",
             ),
+            (
+                "[a&&a]",
+                "a class intersection, which RE2 reads as a class of `a` and `&`",
+            ),
+            ("(?x)a b", "the `x` flag, which RE2 rejects"),
         ] {
             assert!(
                 !duckdb_can_translate(&call_of(regexp_count(col("s"), lit(pattern), None, None))),

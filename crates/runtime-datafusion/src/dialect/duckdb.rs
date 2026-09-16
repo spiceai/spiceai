@@ -200,20 +200,28 @@ fn number_literal(digits: &str) -> ast::Expr {
 /// Whether `DuckDB` counts the matches of the literal `pattern` exactly as the
 /// kernel does, judged on the pattern's syntax with the same crate the
 /// kernel's `regex` compiles it with — so what is judged is what the kernel
-/// would run. Two properties are required, each measured to diverge on the
-/// bundled `DuckDB` without it (issue #13870):
+/// would run. Two properties are required (issue #13870):
 ///
 /// - **Every match is at least one character long.** The kernel skips an
 ///   empty match that abuts the match before it, RE2's extraction loop keeps
 ///   it, so `'a*'` over `ab` counts 2 locally and 3 federated. A minimum match
 ///   length of one or more rules the case out; `None` (a pattern that can
 ///   never match, such as `[a&&b]`) is refused as unmeasured.
-/// - **No Perl class and no word boundary.** `\d`, `\w`, `\s`, their
-///   negations, and `\b`/`\B` are Unicode-aware in the kernel and ASCII-only
-///   in RE2, so `'\d'` over `xy١` counts 1 locally and 0 federated. Explicit
-///   classes (`[0-9]`, `[^a]`), `.`, Unicode properties (`\p{Nd}`) and
-///   case-insensitive matching of non-ASCII letters were measured to agree and
-///   pass through.
+/// - **Only syntax both engines read alike**, as an allow-list walked by
+///   [`EngineNeutralSyntax`]: literals (verbatim, `\.`-style escapes, `\xHH`,
+///   `\x{H..}`, `\n`-style specials), `.`, bracketed classes of literals and
+///   ranges (negated or not), `?`/`*`/`+`/`{m,n}` repetitions within RE2's
+///   bound of 1000, greedy or lazy, alternation, indexed or non-capturing
+///   groups, the `^`/`$`/`\A`/`\z` anchors, and the `i` flag. Everything
+///   else is refused — Perl classes and word boundaries because they are
+///   Unicode-aware in the kernel and ASCII-only in RE2 (`'\d'` over `xy١`
+///   counts 1 locally and 0 federated); class-set operations and nested
+///   classes because RE2 has no such syntax and reads `[a&&a]` as a class of
+///   `a` and `&` (2 matches over `a&b` federated, 1 locally); the `x` flag and
+///   the `\u` escapes because RE2 rejects them; and Unicode properties, POSIX
+///   classes, named groups and the other flags because their agreement is
+///   unmeasured. `.`, `[^a]`, `[0-9]` and case-insensitive matching of
+///   non-ASCII letters were measured to agree.
 ///
 /// An unparseable pattern is refused too: the kernel's own error is the right
 /// one for the user to see, and local evaluation delivers it.
@@ -231,19 +239,80 @@ fn duckdb_counts_pattern_identically(pattern: &str) -> bool {
         .is_some_and(|min| min > 0)
 }
 
-/// The syntax whose meaning depends on which engine compiles it — see
-/// [`duckdb_counts_pattern_identically`].
+/// RE2's cap on a counted repetition; a larger `{n}` fails the query remotely.
+const RE2_MAX_REPETITION: u32 = 1000;
+
+/// The syntax [`duckdb_counts_pattern_identically`] refuses — see there for
+/// why each is outside what both engines read alike.
 #[derive(Debug)]
 enum EngineDependentSyntax {
     /// `\d`, `\w`, `\s` or a negation, bare or inside a bracketed class.
     PerlClass,
     /// `\b`, `\B` or one of the word-start/word-end assertions.
     WordBoundary,
+    /// `\p{..}`, `\pL` or a negation, bare or inside a bracketed class.
+    UnicodeProperty,
+    /// `[[:alpha:]]` and the other POSIX classes.
+    AsciiClass,
+    /// `&&`, `--` or `~~` between class-set items.
+    ClassSetOperation,
+    /// A bracketed class inside a bracketed class, or an empty one.
+    NestedOrEmptyClass,
+    /// Any flag but `i`, or a negated flag.
+    Flag,
+    /// `(?P<name>..)` and `(?<name>..)`.
+    NamedGroup,
+    /// An escape outside the shared set: `\u..`, `\U..`, octal, or an
+    /// escaped ordinary character.
+    Escape,
+    /// A counted repetition above [`RE2_MAX_REPETITION`].
+    RepetitionBound,
 }
 
 /// Walks a pattern's syntax tree and fails on the first
 /// [`EngineDependentSyntax`] it meets.
 struct EngineNeutralSyntax;
+
+impl EngineNeutralSyntax {
+    fn literal(literal: &regex_syntax::ast::Literal) -> Result<(), EngineDependentSyntax> {
+        use regex_syntax::ast::{HexLiteralKind, LiteralKind, SpecialLiteralKind};
+        match literal.kind {
+            LiteralKind::Verbatim
+            | LiteralKind::Meta
+            | LiteralKind::HexFixed(HexLiteralKind::X)
+            | LiteralKind::HexBrace(HexLiteralKind::X) => Ok(()),
+            LiteralKind::Special(ref special) if *special != SpecialLiteralKind::Space => Ok(()),
+            _ => Err(EngineDependentSyntax::Escape),
+        }
+    }
+
+    fn flags(flags: &regex_syntax::ast::Flags) -> Result<(), EngineDependentSyntax> {
+        use regex_syntax::ast::{Flag, FlagsItemKind};
+        if flags
+            .items
+            .iter()
+            .all(|item| matches!(item.kind, FlagsItemKind::Flag(Flag::CaseInsensitive)))
+        {
+            Ok(())
+        } else {
+            Err(EngineDependentSyntax::Flag)
+        }
+    }
+
+    fn repetition(repetition: &regex_syntax::ast::Repetition) -> Result<(), EngineDependentSyntax> {
+        use regex_syntax::ast::{RepetitionKind, RepetitionRange};
+        let bound = match repetition.op.kind {
+            RepetitionKind::Range(RepetitionRange::Exactly(n) | RepetitionRange::AtLeast(n)) => n,
+            RepetitionKind::Range(RepetitionRange::Bounded(_, n)) => n,
+            RepetitionKind::ZeroOrOne | RepetitionKind::ZeroOrMore | RepetitionKind::OneOrMore => 0,
+        };
+        if bound > RE2_MAX_REPETITION {
+            Err(EngineDependentSyntax::RepetitionBound)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 impl regex_syntax::ast::Visitor for EngineNeutralSyntax {
     type Output = ();
@@ -254,23 +323,32 @@ impl regex_syntax::ast::Visitor for EngineNeutralSyntax {
     }
 
     fn visit_pre(&mut self, ast: &regex_syntax::ast::Ast) -> Result<(), EngineDependentSyntax> {
-        use regex_syntax::ast::{AssertionKind, Ast};
+        use regex_syntax::ast::{AssertionKind, Ast, GroupKind};
         match ast {
-            Ast::ClassPerl(_) => Err(EngineDependentSyntax::PerlClass),
+            Ast::Empty(_)
+            | Ast::Dot(_)
+            | Ast::Alternation(_)
+            | Ast::Concat(_)
+            | Ast::ClassBracketed(_) => Ok(()),
+            Ast::Literal(literal) => Self::literal(literal),
+            Ast::Repetition(repetition) => Self::repetition(repetition),
+            Ast::Flags(set) => Self::flags(&set.flags),
+            Ast::Group(group) => match &group.kind {
+                GroupKind::CaptureIndex(_) => Ok(()),
+                GroupKind::NonCapturing(flags) => Self::flags(flags),
+                GroupKind::CaptureName { .. } => Err(EngineDependentSyntax::NamedGroup),
+            },
             // Anchors are the only assertions both engines read alike; every
             // other kind is a word boundary, today's and any added later.
-            Ast::Assertion(assertion)
-                if !matches!(
-                    assertion.kind,
-                    AssertionKind::StartLine
-                        | AssertionKind::EndLine
-                        | AssertionKind::StartText
-                        | AssertionKind::EndText
-                ) =>
-            {
-                Err(EngineDependentSyntax::WordBoundary)
-            }
-            _ => Ok(()),
+            Ast::Assertion(assertion) => match assertion.kind {
+                AssertionKind::StartLine
+                | AssertionKind::EndLine
+                | AssertionKind::StartText
+                | AssertionKind::EndText => Ok(()),
+                _ => Err(EngineDependentSyntax::WordBoundary),
+            },
+            Ast::ClassUnicode(_) => Err(EngineDependentSyntax::UnicodeProperty),
+            Ast::ClassPerl(_) => Err(EngineDependentSyntax::PerlClass),
         }
     }
 
@@ -278,10 +356,27 @@ impl regex_syntax::ast::Visitor for EngineNeutralSyntax {
         &mut self,
         item: &regex_syntax::ast::ClassSetItem,
     ) -> Result<(), EngineDependentSyntax> {
+        use regex_syntax::ast::ClassSetItem;
         match item {
-            regex_syntax::ast::ClassSetItem::Perl(_) => Err(EngineDependentSyntax::PerlClass),
-            _ => Ok(()),
+            ClassSetItem::Union(_) => Ok(()),
+            ClassSetItem::Literal(literal) => Self::literal(literal),
+            ClassSetItem::Range(range) => {
+                Self::literal(&range.start).and_then(|()| Self::literal(&range.end))
+            }
+            ClassSetItem::Empty(_) | ClassSetItem::Bracketed(_) => {
+                Err(EngineDependentSyntax::NestedOrEmptyClass)
+            }
+            ClassSetItem::Ascii(_) => Err(EngineDependentSyntax::AsciiClass),
+            ClassSetItem::Unicode(_) => Err(EngineDependentSyntax::UnicodeProperty),
+            ClassSetItem::Perl(_) => Err(EngineDependentSyntax::PerlClass),
         }
+    }
+
+    fn visit_class_set_binary_op_pre(
+        &mut self,
+        _op: &regex_syntax::ast::ClassSetBinaryOp,
+    ) -> Result<(), EngineDependentSyntax> {
+        Err(EngineDependentSyntax::ClassSetOperation)
     }
 }
 
@@ -715,8 +810,9 @@ impl DuckDBRegexpFunction {
     ///
     /// **Pattern.** Only a string literal is rendered, and only one
     /// [`duckdb_counts_pattern_identically`] accepts: no empty match possible,
-    /// no Perl class, no word boundary. Anything else — including a pattern
-    /// read from a column, whose values cannot be inspected here — stays local.
+    /// and only syntax both engines read alike. Anything else — including a
+    /// pattern read from a column, whose values cannot be inspected here —
+    /// stays local.
     ///
     /// **Start.** The kernel counts from a 1-based character position, which
     /// `DuckDB` has no regexp argument for, so the input is narrowed to
@@ -1385,20 +1481,31 @@ mod tests {
     /// The pattern screen, pinned on the patterns that decide it. Anchors are
     /// zero-width but do not make the match itself empty when something
     /// non-empty follows; a quantifier admitting zero repetitions or a bare
-    /// zero-width branch does. Explicit classes, `.` and Unicode properties
-    /// read alike in both engines; Perl classes and word boundaries do not.
+    /// zero-width branch does. The allow-list admits what both engines read
+    /// alike and nothing else.
     #[test]
     fn a_pattern_is_rendered_only_when_duckdb_counts_it_identically() {
         for pattern in [
             "a",
             "^a+$",
+            "\\Aa\\z",
             "[0-9]{2,}",
+            "a{1,1000}",
             "a|bc",
             ".",
             "[^a]",
-            "\\p{Nd}",
+            "[^a-c]",
             "x\\.",
+            "\\x41",
+            "\\x{1F600}",
+            "\\n",
             "(?i)k",
+            "(?i:k)a",
+            "a+?",
+            "(a)(b)",
+            "(?:ab)+",
+            "é",
+            "\\&",
         ] {
             assert!(
                 duckdb_counts_pattern_identically(pattern),
@@ -1417,6 +1524,33 @@ mod tests {
             assert!(
                 !duckdb_counts_pattern_identically(pattern),
                 "`{pattern}` is Unicode-aware in the kernel and ASCII-only in RE2, so it must stay local"
+            );
+        }
+        for pattern in [
+            "[a&&a]",
+            "[a--b]",
+            "[a~~b]",
+            "[a[b]]",
+            "(?x)a b",
+            "(?s)a",
+            "(?m)a",
+            "(?-i)a",
+            "(?i-s)a",
+            "(?P<n>a)",
+            "(?<n>a)",
+            "\\p{Nd}",
+            "\\pL",
+            "[\\p{Nd}]",
+            "[[:alpha:]]",
+            "\\u0041",
+            "\\U00000041",
+            "\\u{41}",
+            "a{1001}",
+            "a{2,1001}",
+        ] {
+            assert!(
+                !duckdb_counts_pattern_identically(pattern),
+                "`{pattern}` is syntax RE2 reads differently, rejects, or that is unmeasured, so it must stay local"
             );
         }
     }

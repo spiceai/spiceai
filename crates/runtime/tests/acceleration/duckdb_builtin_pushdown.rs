@@ -854,13 +854,17 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
             // pattern, a pattern that can match the empty string (DuckDB keeps an
             // empty match abutting the one before it, the kernel skips it), a Perl
             // class (Unicode-aware in the kernel, ASCII-only in RE2 — row 8 is
-            // where `\d` parts company), and a flag other than `i`.
+            // where `\d` parts company), a class intersection (RE2 has no such
+            // syntax and reads `[a&&a]` as a class of `a` and `&`), the `x` flag
+            // (RE2 rejects it), and a flag other than `i`.
             for call in [
                 "regexp_count(s, 'a', id)",
                 "regexp_count(s, p)",
                 "regexp_count(s, 'a*')",
                 "regexp_count(s, 'a|\\b')",
                 "regexp_count(s, '\\d')",
+                "regexp_count(s, '[a&&a]')",
+                "regexp_count(s, '(?x)a b')",
                 "regexp_count(s, 'a', 1, 'm')",
             ] {
                 let sql = format!("SELECT id, {call} AS c FROM {{table}} ORDER BY id");
