@@ -71,7 +71,7 @@ impl QueryTracker {
     }
 
     /// [`Self::finish`] for a caller that has already built this query's
-    /// [`RequestContext::to_dimensions`], which then end its labels instead of being
+    /// [`RequestContext::to_dimensions`], which are then added to its labels instead of being
     /// built a second time.
     pub(crate) fn finish_with_dimensions(
         mut self,

@@ -44,7 +44,12 @@ pub enum CachedData {
     /// Raw `RecordBatches` stored directly (encoding: none)
     Raw(Arc<Vec<RecordBatch>>),
     /// IPC-serialized bytes, additionally compressed (e.g., with zstd)
-    Encoded(Bytes),
+    Encoded {
+        bytes: Bytes,
+        /// The size of the Arrow IPC stream `bytes` decodes to. See
+        /// [`crate::encoding::Encoded::decoded_len`].
+        decoded_len: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -99,9 +104,12 @@ impl CachedQueryResult {
     }
 
     /// Create a new cached query result with encoded data.
+    ///
+    /// `decoded_len` is the size of the Arrow IPC stream `encoded_data` decodes to.
     #[must_use]
     pub fn new(
         encoded_data: Bytes,
+        decoded_len: usize,
         schema: Arc<Schema>,
         input_tables: Arc<HashSet<TableReference>>,
         cached_at: Instant,
@@ -109,7 +117,10 @@ impl CachedQueryResult {
         encoder: Option<Arc<dyn Encoder>>,
     ) -> Self {
         Self {
-            data: CachedData::Encoded(encoded_data),
+            data: CachedData::Encoded {
+                bytes: encoded_data,
+                decoded_len,
+            },
             schema: crate::intern::schema::intern(schema),
             input_tables: crate::intern::table_set::intern(input_tables),
             cached_at,
@@ -137,8 +148,11 @@ impl CachedQueryResult {
     ) -> Result<Self, crate::encoding::Error> {
         // Only store encoded data if an encoder is provided
         let data = if let Some(encoder) = encoder.as_ref() {
-            let encoded_data = encoder.encode(&records).await?;
-            CachedData::Encoded(Bytes::from(encoded_data))
+            let payload = encoder.encode(&records).await?;
+            CachedData::Encoded {
+                bytes: Bytes::from(payload.bytes),
+                decoded_len: payload.decoded_len,
+            }
         } else {
             CachedData::Raw(Arc::new(super::prepare_for_storage(records)))
         };
@@ -161,7 +175,7 @@ impl CachedQueryResult {
     pub async fn records(&self) -> Result<Arc<Vec<RecordBatch>>, crate::encoding::Error> {
         match &self.data {
             CachedData::Raw(batches) => Ok(Arc::clone(batches)),
-            CachedData::Encoded(bytes) => {
+            CachedData::Encoded { bytes, .. } => {
                 if let Some(encoder) = &self.encoder {
                     encoder.decode(bytes).await.map(Arc::new)
                 } else {
@@ -171,13 +185,18 @@ impl CachedQueryResult {
         }
     }
 
-    /// Whether this entry holds encoded bytes rather than the batches themselves.
+    /// The size of the Arrow IPC stream an encoded entry decodes to, or `None` for an entry
+    /// held as batches.
     ///
-    /// Reading an encoded entry decompresses and decodes it, which is CPU work;
-    /// reading a raw one hands out the batches it already holds.
+    /// Reading an encoded entry decompresses and decodes all of that stream, so this, not the
+    /// size of the stored payload, is what the read costs; reading a raw entry hands out the
+    /// batches it already holds.
     #[must_use]
-    pub fn is_encoded(&self) -> bool {
-        matches!(self.data, CachedData::Encoded(_))
+    pub fn decoded_len(&self) -> Option<usize> {
+        match &self.data {
+            CachedData::Raw(_) => None,
+            CachedData::Encoded { decoded_len, .. } => Some(*decoded_len),
+        }
     }
 
     /// Check if the cached data is stale (older than the given TTL).
@@ -241,7 +260,7 @@ impl CachedQueryResult {
                         BUFFER_OVERHEAD_BYTES * arrow_tools::record_batch::buffers_in_batch(batch);
                 }
             }
-            CachedData::Encoded(bytes) => {
+            CachedData::Encoded { bytes, .. } => {
                 size += bytes.len();
             }
         }
@@ -430,6 +449,7 @@ mod tests {
 
         let cached_result = CachedQueryResult::new(
             encoded_data.clone(),
+            64,
             schema,
             input_tables,
             cached_at,

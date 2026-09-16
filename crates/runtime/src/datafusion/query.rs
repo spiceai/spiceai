@@ -337,11 +337,18 @@ struct QueryLifetimeGuards {
     timeout_state: QueryTimeoutState,
     timeout_timer_guard: Option<QueryTimeoutTimerGuard>,
     active_query_guard: registry::ActiveQueryGuard,
+    /// When the query began, before the results-cache probe. A result the
+    /// query stores is checked against table changes from this instant (see
+    /// `CachedQueryResult::read_started_at`), so a change that lands while the
+    /// query waits for a query runtime worker still keeps that result from
+    /// being served as fresh.
+    started_at: std::time::Instant,
 }
 
-/// `runtime.task_history` / Zipkin span for one query, opened before the
-/// results-cache probe so lookup time is in the same duration as planning
-/// and execution.
+/// `runtime.task_history` / Zipkin span for one query. It opens where the query is
+/// answered, once the results-cache probe has decided how: on the request's runtime
+/// for a hit served there, and on the query runtime for a query that hops there, so
+/// its duration never includes a wait for a query runtime worker.
 struct QuerySpans {
     span: Span,
     trace_span: Span,
@@ -420,6 +427,7 @@ impl Query {
             timeout_state,
             timeout_timer_guard,
             active_query_guard,
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -635,39 +643,30 @@ impl Query {
     ///
     /// Panics when running under test if no cache key is computed for the query.
     pub async fn run(mut self) -> Result<QueryResult> {
-        // Taken before the results-cache probe so Explain Analyze plan
-        // capture (`min_sql_duration_ms` / `min_plan_duration_ms`) and the
-        // cache-write `read_started_at` still include lookup time — the
-        // same clock `run_internal` used when the probe lived inside it.
-        let query_start = std::time::Instant::now();
         let request_context = RequestContext::current(AsyncMarker::new().await);
         let guards = self.lifetime_guards(&request_context);
-        let spans = self.query_spans(&request_context);
 
-        // Looked up on the runtime the request arrived on: a hit held as
-        // batches needs no planning or execution, so it is served from here
-        // rather than paying for the hop onto the query runtime. The probe
-        // is still under `runtime.query.timeout`, the request cancel token,
-        // and the same `sql_query` span as planning and execution.
-        let probe = async {
-            tokio::select! {
-                biased;
-                () = guards.cancel_token.cancelled() => {
-                    Err(guards.timeout_state.cancellation_error(&self.query_id.to_string()))
-                }
-                probe = self.probe_results_cache(&request_context) => Ok(probe),
+        // Looked up on the runtime the request arrived on: a hit needs no
+        // planning or execution, so one that is cheap to serve (see
+        // `CacheProbe::is_servable_in_place`) is served from here rather than
+        // paying for the hop onto the query runtime. The probe is still under
+        // `runtime.query.timeout` and the request cancel token. The query's
+        // spans are not open yet; they open where it is answered.
+        let probe = tokio::select! {
+            biased;
+            () = guards.cancel_token.cancelled() => {
+                Err(guards.timeout_state.cancellation_error(&self.query_id.to_string()))
             }
-        }
-        .instrument(spans.span.clone())
-        .instrument(spans.trace_span.clone())
-        .await;
+            probe = self.probe_results_cache(&request_context) => Ok(probe),
+        };
         let probe = match probe {
             Ok(probe) => probe,
             Err(error) => {
+                let spans = self.query_spans(&request_context);
                 return self.finish_probe_cancellation(&request_context, spans, error);
             }
         };
-        // A raw hit that the serve-time TTL / table-clock checks will
+        // An in-place hit that the serve-time TTL / table-clock checks will
         // reject is planning work. Reclassify it before the hop so a
         // known-ineligible entry does not attempt an in-place serve.
         let mut probe = probe.into_miss_if_in_place_ineligible(
@@ -684,13 +683,9 @@ impl Query {
             && let CacheProbe::Hit(hit) = probe
         {
             let raw_key = hit.raw_key();
-            let served = self
-                .serve_probed_hit(&request_context, *hit)
-                .instrument(spans.span.clone())
-                .instrument(spans.trace_span.clone())
-                .await;
-            match served {
+            match self.serve_probed_hit(&request_context, *hit).await {
                 Some((query_result, tracker)) => {
+                    let spans = self.query_spans(&request_context);
                     return Ok(instrument_query_result(
                         assemble_cached_query_result(
                             query_result,
@@ -716,19 +711,19 @@ impl Query {
             && !probe.is_servable_in_place()
         {
             return self
-                .run_with_managed_runtime(
-                    request_context,
-                    runtime_handle,
-                    probe,
-                    guards,
-                    spans,
-                    query_start,
-                )
+                .run_with_managed_runtime(request_context, runtime_handle, probe, guards)
                 .await;
         }
 
-        self.run_internal(request_context, probe, guards, spans, query_start)
-            .await
+        let spans = self.query_spans(&request_context);
+        self.run_internal(
+            request_context,
+            probe,
+            guards,
+            spans,
+            std::time::Instant::now(),
+        )
+        .await
     }
 
     /// Submit a query for distributed execution via Ballista and return a handle.
@@ -1146,19 +1141,20 @@ impl Query {
         runtime_handle: Handle,
         probe: CacheProbe,
         guards: QueryLifetimeGuards,
-        spans: QuerySpans,
-        query_start: std::time::Instant,
     ) -> Result<QueryResult> {
-        let span = spans.span.clone();
-
         let runtime_request_context = Arc::clone(&request_context);
         let future_request_context = request_context;
 
         let managed_stream = managed_runtime::run_record_batch_stream_on_runtime(
             runtime_handle,
             runtime_request_context,
-            span,
+            Span::current(),
             async move {
+                // Started once the driver is running on the query runtime, so
+                // neither the query's spans nor its clock count a wait for one
+                // of that runtime's workers.
+                let query_start = std::time::Instant::now();
+                let spans = self.query_spans(&future_request_context);
                 self.run_internal(future_request_context, probe, guards, spans, query_start)
                     .await
                     .map(|query_result| (query_result.cache_status, query_result.data))
@@ -1187,9 +1183,9 @@ impl Query {
         spans: QuerySpans,
         query_start: std::time::Instant,
     ) -> Result<QueryResult> {
-        // Opened in `run` before the results-cache probe so lookup time is
-        // in `runtime.task_history` / Zipkin durations, and a timeout or
-        // cancel during the lookup still finishes the tracker.
+        // Opened where the query is answered (see [`QuerySpans`]). A timeout
+        // or cancel that fired during the lookup, or while the query waited
+        // for a query runtime worker, still finishes the tracker below.
         let QuerySpans { span, trace_span } = spans;
 
         // Armed in `run` before the results-cache probe so the timer covers
@@ -1206,6 +1202,7 @@ impl Query {
             timeout_state,
             timeout_timer_guard,
             active_query_guard,
+            started_at,
         } = guards;
 
         // Registered in `run` before the results-cache probe. The SQL preview
@@ -1235,12 +1232,12 @@ impl Query {
 
         let query_result =
             async {
-                // Encoded hits hop and are served here, ahead of the session
-                // state every planned query clones. Raw in-place hits are
-                // served in `run` before the hop; a reject there arrives as
-                // `Missed`. An entry that fails to decode leaves the query
-                // to plan and run like a miss, without looking its key up
-                // a second time.
+                // Hits too large to decode in place hop and are served here,
+                // ahead of the session state every planned query clones. Hits
+                // cheap to serve are served in `run` before the hop; a reject
+                // there arrives as `Missed`. An entry that fails to decode
+                // leaves the query to plan and run like a miss, without looking
+                // its key up a second time.
                 let mut ctx = self;
                 let already_looked_up = match probe {
                     CacheProbe::Hit(hit) => {
@@ -1761,7 +1758,7 @@ impl Query {
                         res_stream,
                         cache_manager.raw_cache_key,
                         datasets,
-                        query_start,
+                        started_at,
                     )
                 } else {
                     res_stream

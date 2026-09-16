@@ -378,6 +378,20 @@ enum Served {
     Undecodable(Option<QueryTracker>),
 }
 
+/// The largest Arrow IPC stream an encoded hit is decoded from where the request
+/// arrived, instead of on the query runtime.
+///
+/// A decode reads the whole stream, so its cost follows the size of the stream,
+/// not of the compressed payload the entry holds. In
+/// `crates/cache/benches/cache_hit_costs.rs` on an Apple M3 Max a decode costs
+/// about 4.5 µs plus 0.4–1.9 µs per KiB of stream across row, column and batch
+/// counts and compressibility, while per KiB of payload the same decodes cost
+/// 3–850 µs (256 empty batches compress to 194 bytes). At this size the slowest
+/// shape measured decodes in about 36 µs, well within the time a task may run
+/// without yielding. It matches `FLIGHT_INLINE_ENCODE_MAX_BYTES`, the budget for
+/// encoding a response on the same runtime.
+const INLINE_DECODE_MAX_BYTES: usize = 16 * 1024;
+
 /// What looking a query up in the results cache found before anything was
 /// planned. See [`Query::probe_results_cache`].
 pub(super) enum CacheProbe {
@@ -393,22 +407,24 @@ impl CacheProbe {
     /// Whether the request can be served where it arrived, without the query
     /// runtime.
     ///
-    /// Only a hit on an entry held as batches qualifies, since serving it hands
-    /// out batches the cache already holds. Decoding an encoded entry is CPU
-    /// work, and a miss has a query to plan and execute, so both belong on the
+    /// Only a hit that is cheap to serve qualifies: one held as batches hands
+    /// out the batches the cache already holds, and an encoded one is decoded
+    /// there while its stream is within [`INLINE_DECODE_MAX_BYTES`]. A larger
+    /// decode, and a miss, which has a query to plan and execute, belong on the
     /// query runtime.
     pub(super) fn is_servable_in_place(&self) -> bool {
-        matches!(self, Self::Hit(hit) if !hit.entry.cached_result.is_encoded())
+        matches!(self, Self::Hit(hit) if hit.serves_in_place())
     }
 
-    /// A raw hit that fails the serve-time TTL / table-clock checks cannot
-    /// be handed out in place. Turn it into a miss so the hop onto the
-    /// query runtime sees planning work. [`Query::run`] also serves a
-    /// remaining raw hit before that hop, so a later reject still becomes
+    /// A hit servable in place that fails the serve-time TTL / table-clock
+    /// checks cannot be handed out in place. Turn it into a miss so the hop
+    /// onto the query runtime sees planning work. [`Query::run`] also serves a
+    /// remaining in-place hit before that hop, so a later reject still becomes
     /// a miss instead of planning on the request I/O runtime.
     ///
-    /// Encoded hits stay hits: they already hop so they can decode, and
-    /// [`Query::serve_probed_hit`] rechecks eligibility after the wait.
+    /// A hit too large to decode in place stays a hit: it hops so it can
+    /// decode, and [`Query::serve_probed_hit`] rechecks eligibility after the
+    /// wait.
     #[must_use]
     pub(super) fn into_miss_if_in_place_ineligible(
         self,
@@ -417,7 +433,7 @@ impl CacheProbe {
     ) -> Self {
         match self {
             Self::Hit(hit)
-                if !hit.entry.cached_result.is_encoded()
+                if hit.serves_in_place()
                     && !entry_still_servable(&hit.entry, provider, cache_control) =>
             {
                 Self::Missed(hit.raw_key())
@@ -441,6 +457,15 @@ pub(super) struct ProbedHit {
 impl ProbedHit {
     pub(super) fn raw_key(&self) -> RawCacheKey {
         self.raw_key
+    }
+
+    /// Whether serving this hit is cheap enough to do where the request
+    /// arrived. See [`CacheProbe::is_servable_in_place`].
+    fn serves_in_place(&self) -> bool {
+        self.entry
+            .cached_result
+            .decoded_len()
+            .is_none_or(|len| len <= INLINE_DECODE_MAX_BYTES)
     }
 }
 
@@ -952,11 +977,11 @@ impl Query {
             revalidation_plan,
         } = hit;
 
-        // Encoded hits hop onto the query runtime after the probe. Recheck
-        // TTL/SWR age and the table-change clock at serve time so an entry
-        // that waited past `item_ttl` (or past a refresh/DML) is not served
-        // as fresh. In-place hits are sequential on this task; the check is
-        // the same and cheap. This is not a second cache lookup.
+        // A hit too large to decode in place hops onto the query runtime after
+        // the probe. Recheck TTL/SWR age and the table-change clock at serve
+        // time so an entry that waited past `item_ttl` (or past a refresh/DML)
+        // is not served as fresh. In-place hits are sequential on this task;
+        // the check is the same and cheap. This is not a second cache lookup.
         if let Some(provider) = self.df.results_cache_provider() {
             let now = std::time::Instant::now();
             let policy = stale_policy(
@@ -1564,10 +1589,15 @@ mod tests {
         }
     }
 
-    fn dummy_encoded_entry_cached_at(cached_at: std::time::Instant) -> ServableEntry {
+    /// An encoded entry whose payload decodes to an Arrow IPC stream of `decoded_len` bytes.
+    fn dummy_encoded_entry_cached_at(
+        cached_at: std::time::Instant,
+        decoded_len: usize,
+    ) -> ServableEntry {
         ServableEntry {
             cached_result: cache::result::query::CachedQueryResult::new(
                 bytes::Bytes::new(),
+                decoded_len,
                 Arc::new(Schema::empty()),
                 Arc::new(HashSet::new()),
                 cached_at,
@@ -1828,7 +1858,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_encoded_hit_past_item_ttl_stays_a_hit_and_is_not_servable_in_place() {
+    async fn an_encoded_hit_over_the_inline_decode_budget_stays_a_hit_and_is_not_servable_in_place()
+    {
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
             item_ttl: Some("1s".to_string()),
             cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
@@ -1836,21 +1867,55 @@ mod tests {
         }))
         .await;
         let now = std::time::Instant::now();
-        let probe = dummy_probe_hit(dummy_encoded_entry_cached_at(cached_ago(
-            now,
-            Duration::from_millis(1_500),
-        )))
+        let probe = dummy_probe_hit(dummy_encoded_entry_cached_at(
+            cached_ago(now, Duration::from_millis(1_500)),
+            INLINE_DECODE_MAX_BYTES + 1,
+        ))
         .into_miss_if_in_place_ineligible(
             CacheControl::Cache(CacheKeyType::Default),
             df.results_cache_provider().as_deref(),
         );
         assert!(
             !probe.is_servable_in_place(),
-            "an encoded hit always hops so it can decode on the query runtime"
+            "an encoded hit over the inline decode budget hops so it can decode on the query runtime"
         );
         assert!(
             matches!(probe, CacheProbe::Hit(_)),
             "an encoded hit stays a hit so serve_probed_hit can recheck after the hop"
+        );
+    }
+
+    /// A small encoded hit is decoded where the request arrived, so like a raw hit it has to
+    /// pass the serve-time checks before it counts as servable there: past `item_ttl` it is a
+    /// miss, and the query hops onto the query runtime to plan.
+    #[tokio::test]
+    async fn a_small_encoded_hit_past_item_ttl_is_not_servable_in_place() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("1s".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+        let now = std::time::Instant::now();
+        let probe = dummy_probe_hit(dummy_encoded_entry_cached_at(
+            cached_ago(now, Duration::from_millis(1_500)),
+            64,
+        ));
+        assert!(
+            probe.is_servable_in_place(),
+            "a small encoded hit is decoded where the request arrived"
+        );
+        let probe = probe.into_miss_if_in_place_ineligible(
+            CacheControl::Cache(CacheKeyType::Default),
+            df.results_cache_provider().as_deref(),
+        );
+        assert!(
+            !probe.is_servable_in_place(),
+            "a small encoded hit past item_ttl must hop so planning is not on the request runtime"
+        );
+        assert!(
+            matches!(probe, CacheProbe::Missed(_)),
+            "the ineligible encoded hit is a miss so already_looked_up skips a second counted lookup"
         );
     }
 
@@ -1910,6 +1975,11 @@ mod tests {
     async fn prepare_runtime(
         results_cache_config: Option<SQLResultsCacheConfig>,
     ) -> Arc<DataFusion> {
+        let plans_cache = Arc::new(SimpleCache::new(
+            512,
+            Duration::from_hours(1),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
+        ));
         let results_cache_config = results_cache_config.unwrap_or(SQLResultsCacheConfig {
             item_ttl: Some("10m".to_string()),
             cache_key_type: spicepod::component::caching::CacheKeyType::Plan,
@@ -1920,11 +1990,6 @@ mod tests {
             QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))
                 .expect("valid cache provider");
 
-        let plan_cache_provider = Arc::new(SimpleCache::new(
-            512,
-            Duration::from_hours(1),
-            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
-        ));
         let runtime = RuntimeBuilder::new().build().await;
 
         Arc::new(
@@ -1936,7 +2001,7 @@ mod tests {
             .with_caching(Arc::new(
                 Caching::new()
                     .with_results_cache(Arc::new(cache_provider))
-                    .with_plans_cache(plan_cache_provider),
+                    .with_plans_cache(plans_cache),
             ))
             .build(),
         )
@@ -3707,94 +3772,261 @@ mod tests {
         tracing::info!("Single-in-flight test completed successfully");
     }
 
-    /// A hit on an entry held as batches is served where the request arrived: it
-    /// has nothing to plan or execute, so it must not wait on the query runtime.
-    /// Every worker of that runtime is held while the hit is requested, so a query
-    /// that still crossed onto it could not finish.
+    /// A hit is served where the request arrived: it has nothing to plan or execute, so it
+    /// must not wait on the query runtime. That holds for an entry held as batches and, under
+    /// `encoding: zstd`, for a small encoded entry, which is decoded there. Every worker of
+    /// that runtime is held while the hit is requested, so a query that still crossed onto it
+    /// could not finish.
     #[tokio::test]
     async fn a_hit_is_served_without_the_query_runtime() {
-        use spicepod::component::caching::CacheKeyType as ConfiguredCacheKeyType;
+        use spicepod::component::caching::{CacheKeyType as ConfiguredCacheKeyType, Encoding};
 
-        for (configured, cache_control, client_key) in [
-            (
-                ConfiguredCacheKeyType::Plan,
-                CacheControl::Cache(CacheKeyType::Default),
-                None,
-            ),
-            (
-                ConfiguredCacheKeyType::Sql,
-                CacheControl::Cache(CacheKeyType::Raw),
-                None,
-            ),
-            (
-                ConfiguredCacheKeyType::Sql,
-                CacheControl::Cache(CacheKeyType::ClientSupplied),
-                Some("served-in-place".to_string()),
-            ),
-        ] {
-            let df = prepare_runtime(Some(SQLResultsCacheConfig {
-                item_ttl: Some("10m".to_string()),
-                cache_key_type: configured,
-                ..Default::default()
-            }))
-            .await;
-            let query_runtime = runtime_async::ManagedTokioRuntime::try_new()
-                .expect("the query runtime should start");
-            let query_runtime_handle = query_runtime.handle().clone();
-            df.set_cpu_runtime(query_runtime);
-            let request_context = create_test_request_context(cache_control, client_key);
-
-            let first = Arc::clone(&request_context)
-                .scope(run_i64_query(&df, "SELECT 7", ResultsCacheMode::Default))
+        for encoding in [Encoding::None, Encoding::Zstd] {
+            for (configured, cache_control, client_key) in [
+                (
+                    ConfiguredCacheKeyType::Plan,
+                    CacheControl::Cache(CacheKeyType::Default),
+                    None,
+                ),
+                (
+                    ConfiguredCacheKeyType::Sql,
+                    CacheControl::Cache(CacheKeyType::Raw),
+                    None,
+                ),
+                (
+                    ConfiguredCacheKeyType::Sql,
+                    CacheControl::Cache(CacheKeyType::ClientSupplied),
+                    Some("served-in-place".to_string()),
+                ),
+            ] {
+                let df = prepare_runtime(Some(SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    cache_key_type: configured,
+                    encoding,
+                    ..Default::default()
+                }))
                 .await;
-            assert_eq!(
-                first,
-                (CacheStatus::CacheMiss, 7),
-                "{cache_control:?}: the first run executes on the query runtime and stores the result"
-            );
-
-            // Hold every worker of the query runtime until the hit has been served.
-            let workers = query_runtime_handle.metrics().num_workers();
-            let release = Arc::new(std::sync::Barrier::new(workers + 1));
-            let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            for _ in 0..workers {
-                let release = Arc::clone(&release);
-                let held = Arc::clone(&held);
-                query_runtime_handle.spawn(async move {
-                    held.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    release.wait();
-                });
-            }
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            while held.load(std::sync::atomic::Ordering::SeqCst) < workers {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "only {} of {workers} query runtime workers were held",
-                    held.load(std::sync::atomic::Ordering::SeqCst)
+                assert_eq!(
+                    df.results_cache_provider()
+                        .expect("the test runtime has a results cache")
+                        .encoder()
+                        .is_some(),
+                    encoding == Encoding::Zstd,
+                    "{encoding:?}: results are stored encoded exactly when an encoding is configured"
                 );
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                let query_runtime = runtime_async::ManagedTokioRuntime::try_new()
+                    .expect("the query runtime should start");
+                let query_runtime_handle = query_runtime.handle().clone();
+                df.set_cpu_runtime(query_runtime);
+                let request_context = create_test_request_context(cache_control, client_key);
+
+                let first = Arc::clone(&request_context)
+                    .scope(run_i64_query(&df, "SELECT 7", ResultsCacheMode::Default))
+                    .await;
+                assert_eq!(
+                    first,
+                    (CacheStatus::CacheMiss, 7),
+                    "{encoding:?}, {cache_control:?}: the first run executes on the query runtime and stores the result"
+                );
+
+                // Hold every worker of the query runtime until the hit has been served.
+                let workers = query_runtime_handle.metrics().num_workers();
+                let release = Arc::new(std::sync::Barrier::new(workers + 1));
+                let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                for _ in 0..workers {
+                    let release = Arc::clone(&release);
+                    let held = Arc::clone(&held);
+                    query_runtime_handle.spawn(async move {
+                        held.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        release.wait();
+                    });
+                }
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while held.load(std::sync::atomic::Ordering::SeqCst) < workers {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "only {} of {workers} query runtime workers were held",
+                        held.load(std::sync::atomic::Ordering::SeqCst)
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+
+                let hit = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    Arc::clone(&request_context).scope(run_i64_query(
+                        &df,
+                        "SELECT 7",
+                        ResultsCacheMode::Default,
+                    )),
+                )
+                .await;
+                release.wait();
+
+                let Ok(hit) = hit else {
+                    panic!(
+                        "{encoding:?}, {cache_control:?}: a cache hit waited on the busy query runtime"
+                    );
+                };
+                assert_eq!(
+                    hit,
+                    (CacheStatus::CacheHit, 7),
+                    "{encoding:?}, {cache_control:?}: the second run is served from the cache"
+                );
+            }
+        }
+    }
+
+    /// `runtime.task_history.execution_duration_ms` is the lifetime of the query's `sql_query`
+    /// span. A query that waits for a query runtime worker must not count that wait, only the
+    /// work it does once it runs there, so the span opens on the query runtime.
+    #[tokio::test]
+    async fn a_wait_for_a_query_runtime_worker_is_not_in_the_task_history_duration() {
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
+
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+
+        const SQL: &str = "SELECT 11 AS query_runtime_wait";
+        // How long every query runtime worker is held before the query can run there. The
+        // delay is the behavior under test, so it is a fixed sleep.
+        const HOLD: Duration = Duration::from_millis(500);
+
+        type Lifetimes = Arc<parking_lot::Mutex<Vec<(String, Duration)>>>;
+
+        /// Records how long each `sql_query` span lived, by the SQL it ran.
+        struct SqlQueryLifetimes(Lifetimes);
+
+        struct Opened {
+            input: String,
+            at: Instant,
+        }
+
+        #[derive(Default)]
+        struct Input(Option<String>);
+
+        impl Visit for Input {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "input" {
+                    self.0 = Some(value.to_string());
+                }
             }
 
-            let hit = tokio::time::timeout(
-                Duration::from_secs(10),
-                Arc::clone(&request_context).scope(run_i64_query(
-                    &df,
-                    "SELECT 7",
-                    ResultsCacheMode::Default,
-                )),
-            )
-            .await;
-            release.wait();
-
-            let Ok(hit) = hit else {
-                panic!("{cache_control:?}: a cache hit waited on the busy query runtime");
-            };
-            assert_eq!(
-                hit,
-                (CacheStatus::CacheHit, 7),
-                "{cache_control:?}: the second run is served from the cache"
-            );
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "input" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
         }
+
+        impl<S> tracing_subscriber::Layer<S> for SqlQueryLifetimes
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+                if attrs.metadata().name() != "sql_query" {
+                    return;
+                }
+                let mut input = Input::default();
+                attrs.record(&mut input);
+                if let (Some(input), Some(span)) = (input.0, ctx.span(id)) {
+                    span.extensions_mut().insert(Opened {
+                        input,
+                        at: Instant::now(),
+                    });
+                }
+            }
+
+            fn on_close(&self, id: Id, ctx: Context<'_, S>) {
+                if let Some(span) = ctx.span(&id)
+                    && let Some(opened) = span.extensions().get::<Opened>()
+                {
+                    self.0
+                        .lock()
+                        .push((opened.input.clone(), opened.at.elapsed()));
+                }
+            }
+        }
+
+        // The span can open on a query runtime worker thread, which a thread-local subscriber
+        // does not reach, so the recorder is installed for the whole process. Nothing else in
+        // this test binary installs a global subscriber.
+        static LIFETIMES: OnceLock<Lifetimes> = OnceLock::new();
+        let lifetimes = LIFETIMES.get_or_init(|| {
+            let lifetimes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(SqlQueryLifetimes(Arc::clone(&lifetimes))),
+            )
+            .expect("no other test in this binary installs a global tracing subscriber");
+            lifetimes
+        });
+
+        let df = prepare_runtime(None).await;
+        let query_runtime =
+            runtime_async::ManagedTokioRuntime::try_new().expect("the query runtime should start");
+        let query_runtime_handle = query_runtime.handle().clone();
+        df.set_cpu_runtime(query_runtime);
+
+        let workers = query_runtime_handle.metrics().num_workers();
+        let release = Arc::new(std::sync::Barrier::new(workers + 1));
+        let held = Arc::new(AtomicUsize::new(0));
+        for _ in 0..workers {
+            let release = Arc::clone(&release);
+            let held = Arc::clone(&held);
+            query_runtime_handle.spawn(async move {
+                held.fetch_add(1, Ordering::SeqCst);
+                release.wait();
+            });
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while held.load(Ordering::SeqCst) < workers {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "only {} of {workers} query runtime workers were held",
+                held.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(HOLD);
+            release.wait();
+        });
+
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Default), None);
+        let result = request_context
+            .scope(run_i64_query(&df, SQL, ResultsCacheMode::Default))
+            .await;
+        releaser
+            .join()
+            .expect("the thread releasing the workers should finish");
+        assert_eq!(
+            result,
+            (CacheStatus::CacheMiss, 11),
+            "the query misses the cache and runs on the query runtime"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let lifetime = loop {
+            if let Some((_, lifetime)) = lifetimes.lock().iter().find(|(input, _)| input == SQL) {
+                break *lifetime;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the query's sql_query span never closed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        eprintln!(
+            "the sql_query span lasted {lifetime:?}; every query runtime worker was held for {HOLD:?} before the query could run"
+        );
+        assert!(
+            lifetime < HOLD,
+            "the sql_query span lasted {lifetime:?}, which includes the {HOLD:?} the query waited for a query runtime worker"
+        );
     }
 
     /// A cached result served over HTTP keeps the streamed JSON framing. Sending
