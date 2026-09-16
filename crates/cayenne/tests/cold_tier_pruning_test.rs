@@ -223,14 +223,17 @@ const CLUSTER_PAD_BYTES: usize = 256;
 const CLUSTER_PAD_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
 fn cluster_pad(row: i64) -> Vec<u8> {
-    let mut buf = vec![0_u8; CLUSTER_PAD_BYTES];
+    // Filled by extension rather than `vec![0; N]` then overwrite: every byte
+    // is replaced, so the zeroing pass is pure waste — and at this fixture's
+    // size it is tens of MiB of memset before the engine sees a row.
+    let mut buf = Vec::with_capacity(CLUSTER_PAD_BYTES);
     let mut x = row
         .cast_unsigned()
         .wrapping_mul(CLUSTER_PAD_MIX)
         .wrapping_add(1);
-    for slot in buf.chunks_exact_mut(8) {
+    while buf.len() < CLUSTER_PAD_BYTES {
         x = x.wrapping_mul(CLUSTER_PAD_MIX).wrapping_add(1);
-        slot.copy_from_slice(&x.to_le_bytes());
+        buf.extend_from_slice(&x.to_le_bytes());
     }
     buf
 }
