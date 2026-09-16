@@ -39,6 +39,13 @@ limitations under the License.
 //! this index is always safe to drop, which is what lets it degrade rather than
 //! fail.
 //!
+//! Each key is held as sorted, compressed Vortex arrays: its two columns in their
+//! stored types and one packed `(file, position)` column, ordered by key and then
+//! by address. Resident size is therefore close to the compressed size of the key
+//! columns. A lookup finds the block of [`BLOCK_ROWS`] entries its key can fall in
+//! from the row-encoded key retained for the start of every block, decodes only
+//! that block, and compares row-encoded keys inside it.
+//!
 //! Footguns this code depends on:
 //!
 //! * Row positions are file-local physical positions in unfiltered scan order.
@@ -48,50 +55,93 @@ limitations under the License.
 //! * The index answers `key -> candidate positions` only. Every original
 //!   predicate still runs, so a candidate that fails `Active = 1` is discarded
 //!   by the scan's own filter rather than by the index.
+//! * A key is matched by its stored value. A predicate that casts the COLUMN can
+//!   hold for stored values other than the literal (`CAST(score AS BIGINT) = 5`
+//!   holds for 5.2), so such predicates must never reach [`LookupIndexState::probe`].
+//! * The build sorts with Arrow's lexicographic sort and a lookup compares
+//!   `RowConverter` bytes. Those orders agree for every type the converter
+//!   supports, and the build re-checks them while it records block heads: a block
+//!   searched in the wrong order would answer with a false empty.
 //! * A selection of N row positions is not a promise of N decoded rows. Vortex
 //!   reads whole encoded segments and dictionaries that cover those positions.
 
-// `vortex::arrow::IntoArrowArray::into_arrow_preferred` is deprecated in favour of
-// `execute_arrow(ctx)`; the delete path has the same pending migration. Use `expect`
-// (not `allow`) so it resurfaces once that migration lands.
-#![expect(deprecated)]
-
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use crate::row_converter::{RowConverter, SortField};
 use arc_swap::ArcSwapOption;
-use arrow::array::{Array, ArrayRef};
+use arrow::array::{Array, ArrayRef, AsArray, UInt32Array, UInt64Array};
+use arrow::compute::SortColumn;
+use arrow::datatypes::UInt64Type;
 use arrow::record_batch::RecordBatch;
-use arrow_schema::DataType;
-use datafusion_common::ScalarValue;
+use arrow_schema::{DataType, Field, FieldRef};
+use datafusion_common::{ScalarValue, Statistics};
+use datafusion_datasource::{PartitionedFile, file_groups::FileGroup};
 use futures::StreamExt;
-use object_store::ObjectStore;
+use object_store::{ObjectMeta, ObjectStore};
+use parking_lot::Mutex;
 use vortex::VortexSessionDefault;
-use vortex::arrow::IntoArrowArray;
+use vortex::array::arrays::ChunkedArray;
+use vortex::array::{ExecutionCtx, IntoArray, VortexSessionExecute};
+use vortex::arrow::ArrowSessionExt;
 use vortex::buffer::Buffer;
+use vortex::compressor::{BtrBlocksCompressor, BtrBlocksCompressorBuilder};
+use vortex::dtype::Nullability;
 use vortex::file::OpenOptionsSessionExt;
+use vortex::layout::layouts::row_idx::row_idx;
+use vortex_datafusion::{VortexAccessPlan, VortexAccessPlanProvider};
+use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
 
-/// Floor used when a table's derived budget would be smaller. Matches the PK
-/// keyset's own floor, the structure this one is sized alongside.
-const DEFAULT_BUDGET_FLOOR: usize = 256 * 1024 * 1024;
+/// Floor used when a table's derived budget would be smaller: the PK keyset's
+/// default budget, the structure this one is sized alongside.
+const DEFAULT_BUDGET_FLOOR: usize = super::context::DEFAULT_PK_KEYSET_CACHE_MAX_BYTES;
 
 /// Bits reserved for the file-local row position inside a packed posting.
 const POSITION_BITS: u32 = 40;
 const POSITION_MASK: u64 = (1u64 << POSITION_BITS) - 1;
+/// File ids above this would not survive the shift into a packed posting.
+const MAX_FILE_ID: u32 = (1u32 << (u64::BITS - POSITION_BITS)) - 1;
 
-/// Why a probe did not attach a row selection. Doubles as the `outcome`
-/// dimension on `cayenne_lookup_index_probe_total`.
-pub(crate) mod outcome {
-    pub(crate) const SELECTED: &str = "selected";
-    pub(crate) const EMPTY: &str = "empty";
-    pub(crate) const UNBUILT: &str = "unbuilt";
-    pub(crate) const SNAPSHOT_MISMATCH: &str = "snapshot_mismatch";
-    pub(crate) const DELETIONS: &str = "deletions";
+/// Sorted entries per block. A lookup decodes the block(s) its key can fall in,
+/// and one row-encoded key is retained per block to find them, so this trades
+/// resident head bytes against the work of every lookup.
+const BLOCK_ROWS: usize = 256;
+
+/// Sorted entries compressed together. A multiple of [`BLOCK_ROWS`], so blocks
+/// never straddle chunks, and small enough that a build holds one sorted chunk of
+/// the key columns at a time rather than a second sorted copy of all of them.
+const COMPRESS_CHUNK_ROWS: usize = BLOCK_ROWS * 256;
+
+/// Name of the file-local row position column the read-back build projects.
+const READ_BACK_POSITION_COLUMN: &str = "__cayenne_lookup_row_idx";
+
+/// How a probe ended. [`Self::as_str`] is the `outcome` dimension on
+/// `cayenne_lookup_index_probe_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeOutcome {
+    /// A row selection was attached to the scan.
+    Selected,
+    /// The key has no posting, so the scan reads no file.
+    Empty,
+    /// No index has been published yet.
+    Unbuilt,
+    /// The scan's files are not the ones the index was built from.
+    SnapshotMismatch,
+}
+
+impl ProbeOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Selected => "selected",
+            Self::Empty => "empty",
+            Self::Unbuilt => "unbuilt",
+            Self::SnapshotMismatch => "snapshot_mismatch",
+        }
+    }
 }
 
 /// One composite key the index is maintained on, in predicate order.
@@ -156,7 +206,7 @@ pub(crate) fn state_for(
     if config.lookup_index_keys.is_empty() {
         return None;
     }
-    let mut states = STATES.lock().ok()?;
+    let mut states = STATES.lock();
     if let Some(state) = states.get(table_id) {
         return Some(Arc::clone(state));
     }
@@ -198,201 +248,79 @@ pub(crate) struct IndexedFile {
     pub(crate) last_modified_ms: i64,
 }
 
-/// Row addresses for one composite key. Most keys have a single match, so the
-/// first posting is stored inline.
-struct Postings {
-    first: u64,
-    rest: Option<Box<PostingTail>>,
-}
-
-/// Overflow postings for a non-unique key. Boxed so `Postings` stays 16 bytes
-/// wide for the single-match keys that dominate the table.
-#[derive(Default)]
-struct PostingTail(Vec<u64>);
-
-impl Postings {
-    fn new(packed: u64) -> Self {
-        Self {
-            first: packed,
-            rest: None,
-        }
-    }
-
-    fn push(&mut self, packed: u64) {
-        self.rest.get_or_insert_with(Box::default).0.push(packed);
-    }
-
-    fn iter(&self) -> impl Iterator<Item = u64> + '_ {
-        std::iter::once(self.first).chain(self.rest.iter().flat_map(|tail| tail.0.iter().copied()))
-    }
-}
-
-/// One composite-key index over the snapshot.
-struct KeyMap {
-    spec: KeySpec,
-    entries: HashMap<(u32, u32), Postings>,
-    postings: usize,
-}
-
-impl KeyMap {
-    /// Structural estimate, kept O(1) so the byte cap can be checked per batch:
-    /// one hash-table slot per distinct key plus the spilled posting lists.
-    fn approx_bytes(&self) -> usize {
-        const SLOT_BYTES: usize = 32;
-        const SPILLED_POSTING_BYTES: usize = 24;
-        self.entries.len() * SLOT_BYTES
-            + self.postings.saturating_sub(self.entries.len()) * SPILLED_POSTING_BYTES
-    }
-}
-
-/// Interned distinct values of ONE key column.
-///
-/// Values are `RowConverter`-encoded, the same encoding the primary-key path
-/// uses, so the index is type-general rather than string-only and inherits that
-/// codec's null and ordering semantics. Interning is per COLUMN, not per row:
-/// these keys are composites of columns with far fewer distinct values than
-/// rows, so a row-wise encoding would re-store the shared column on every row.
-///
-/// Every array is cast to the column's stored type before encoding, so the same
-/// value encodes identically whether it arrived from the write stream or from a
-/// scan that decoded it as a view type.
-struct ColumnDictionary {
-    /// The column's stored type. Both the build and the probe cast to it, so an
-    /// encoding never depends on how the value reached us.
+/// One key column, resolved against the table schema.
+#[derive(Clone, Debug)]
+struct KeyColumn {
+    /// The column's name in the table schema.
+    name: String,
+    /// The column's stored type. Build and probe both cast to it, so an encoding
+    /// never depends on how a value reached the index.
     data_type: DataType,
-    converter: RowConverter,
-    ids: HashMap<Arc<[u8]>, u32>,
-    /// `id -> encoded value`, so a key can be read back out of the index. Two
-    /// builds intern in different orders, so comparing them needs the values.
-    values: Vec<Arc<[u8]>>,
-    value_bytes: usize,
+    /// Whether the stored column admits nulls.
+    nullable: bool,
 }
 
-impl ColumnDictionary {
-    fn new(data_type: DataType) -> Result<Self, String> {
-        let converter = RowConverter::new(vec![SortField::new(data_type.clone())])
-            .map_err(|e| format!("row converter for {data_type}: {e}"))?;
+impl KeyColumn {
+    /// Resolves a configured key column: an exact name wins, then a unique
+    /// case-insensitive match. Two case-insensitive candidates are an error
+    /// rather than a guess, because building from one column and probing with
+    /// the other would miss rows.
+    fn resolve(schema: &arrow_schema::Schema, configured: &str) -> Result<Self, String> {
+        let field = if let Ok(field) = schema.field_with_name(configured) {
+            field
+        } else {
+            let mut candidates = schema
+                .fields()
+                .iter()
+                .filter(|f| f.name().eq_ignore_ascii_case(configured));
+            let field = candidates
+                .next()
+                .ok_or_else(|| format!("key column '{configured}' is not in the table schema"))?;
+            if candidates.next().is_some() {
+                return Err(format!(
+                    "key column '{configured}' matches more than one table column when case is ignored"
+                ));
+            }
+            field.as_ref()
+        };
         Ok(Self {
-            data_type,
-            converter,
-            ids: HashMap::new(),
-            values: Vec::new(),
-            value_bytes: 0,
+            name: field.name().clone(),
+            data_type: field.data_type().clone(),
+            nullable: field.is_nullable(),
         })
     }
 
-    /// Encodes a whole column, returning one id per row and `None` for nulls.
-    ///
-    /// A NULL can never satisfy an equality predicate, so null rows are not
-    /// indexed at all rather than interned under an encoded-null key.
-    fn intern_column(&mut self, array: &ArrayRef) -> Result<Vec<Option<u32>>, String> {
-        let array = cast_to(array, &self.data_type)?;
-        let rows = self
-            .converter
-            .convert_columns(std::slice::from_ref(&array))
-            .map_err(|e| format!("encode column: {e}"))?;
-        let mut ids = Vec::with_capacity(array.len());
-        for row in 0..array.len() {
-            if array.is_null(row) {
-                ids.push(None);
-                continue;
-            }
-            ids.push(Some(self.intern(rows.row(row).as_ref())?));
-        }
-        Ok(ids)
+    /// The field of this column inside the index, where nulls never appear.
+    fn indexed_field(&self) -> Field {
+        Field::new(&self.name, self.data_type.clone(), false)
     }
 
-    fn intern(&mut self, encoded: &[u8]) -> Result<u32, String> {
-        if let Some(id) = self.ids.get(encoded) {
-            return Ok(*id);
-        }
-        let id = u32::try_from(self.values.len())
-            .map_err(|_| "column dictionary overflowed u32".to_string())?;
-        let shared: Arc<[u8]> = Arc::from(encoded);
-        self.value_bytes += encoded.len();
-        self.ids.insert(Arc::clone(&shared), id);
-        self.values.push(shared);
-        Ok(id)
-    }
-
-    /// The id of a literal the query pinned, or `None` when this column holds no
-    /// such value. The literal is cast to the column's stored type first, so
-    /// `id = '5'` against an `Int64` column resolves rather than silently missing.
-    fn lookup_scalar(&self, scalar: &ScalarValue) -> Option<u32> {
-        let casted = scalar.cast_to(&self.data_type).ok()?;
-        let array = casted.to_array_of_size(1).ok()?;
-        if array.is_null(0) {
-            return None;
-        }
-        let rows = self
-            .converter
-            .convert_columns(std::slice::from_ref(&array))
-            .ok()?;
-        self.ids.get(rows.row(0).as_ref()).copied()
-    }
-
-    fn value(&self, id: u32) -> Option<&[u8]> {
-        self.values.get(id as usize).map(Arc::as_ref)
-    }
-
-    /// Resident bytes, computed from ALLOCATED capacity rather than occupancy.
-    ///
-    /// This figure is reserved against the `DataFusion` memory pool, so it has to
-    /// bound what the allocator actually holds — a figure derived from `len()`
-    /// understates a hash table by its whole load-factor headroom, and reserving
-    /// too little is worse than not reserving at all.
-    fn approx_bytes(&self) -> usize {
-        const ARC_SLICE_PTR: usize = std::mem::size_of::<Arc<[u8]>>();
-        // Arc<[u8]> allocation: two atomic counters plus the payload.
-        const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
-        let table = self.ids.capacity() * (ARC_SLICE_PTR + std::mem::size_of::<u32>() + 1);
-        let reverse = self.values.capacity() * ARC_SLICE_PTR;
-        let payload = self.value_bytes + self.values.len() * ARC_HEADER;
-        table + reverse + payload
+    /// The field of this column as a scan of the table's files returns it.
+    fn stored_field(&self) -> FieldRef {
+        Arc::new(Field::new(
+            &self.name,
+            self.data_type.clone(),
+            self.nullable,
+        ))
     }
 }
 
-/// The per-column dictionaries backing one table's indexes, keyed by column name
-/// so a column shared between two lookup shapes is interned once.
-struct Dictionaries {
-    columns: HashMap<String, ColumnDictionary>,
+fn postings_field() -> Field {
+    Field::new("postings", DataType::UInt64, false)
 }
 
-impl Dictionaries {
-    fn new(columns: &[String], schema: &arrow_schema::Schema) -> Result<Self, String> {
-        let mut out = HashMap::new();
-        for column in columns {
-            let field = schema
-                .fields()
-                .iter()
-                .find(|f| f.name() == column || f.name().eq_ignore_ascii_case(column))
-                .ok_or_else(|| format!("key column '{column}' is not in the table schema"))?;
-            out.insert(
-                column.clone(),
-                ColumnDictionary::new(field.data_type().clone())?,
-            );
-        }
-        Ok(Self { columns: out })
-    }
-
-    fn get(&self, column: &str) -> Option<&ColumnDictionary> {
-        self.columns.get(column)
-    }
-
-    fn get_mut(&mut self, column: &str) -> Option<&mut ColumnDictionary> {
-        self.columns.get_mut(column)
-    }
-
-    fn distinct_values(&self) -> usize {
-        self.columns.values().map(|d| d.values.len()).sum()
-    }
-
-    fn approx_bytes(&self) -> usize {
-        self.columns
-            .values()
-            .map(ColumnDictionary::approx_bytes)
-            .sum()
-    }
+/// The byte-comparable encoding of one `(first, second)` key.
+fn key_converter(columns: &[KeyColumn; 2]) -> Result<RowConverter, String> {
+    RowConverter::new(vec![
+        SortField::new(columns[0].data_type.clone()),
+        SortField::new(columns[1].data_type.clone()),
+    ])
+    .map_err(|e| {
+        format!(
+            "key ({}, {}) cannot be row-encoded: {e}",
+            columns[0].data_type, columns[1].data_type
+        )
+    })
 }
 
 /// Casts `array` to `data_type`, or returns it unchanged when it already matches.
@@ -404,17 +332,248 @@ fn cast_to(array: &ArrayRef, data_type: &DataType) -> Result<ArrayRef, String> {
         .map_err(|e| format!("cast {} -> {data_type}: {e}", array.data_type()))
 }
 
+/// The first index in `0..len` for which `pred` is false, for a `pred` that is
+/// true on a prefix of the range.
+fn partition_point(len: usize, pred: impl Fn(usize) -> bool) -> usize {
+    let (mut lo, mut hi) = (0usize, len);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if pred(mid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+fn usize_of(bytes: u64) -> usize {
+    usize::try_from(bytes).unwrap_or(usize::MAX)
+}
+
+/// Splits a packed posting into its file id and file-local row position.
+fn unpack(packed: u64) -> (usize, u64) {
+    (usize_of(packed >> POSITION_BITS), packed & POSITION_MASK)
+}
+
+/// Decodes `range` of an index array into Arrow as `field`'s type.
+fn decode(
+    session: &VortexSession,
+    array: &vortex::array::ArrayRef,
+    range: Range<usize>,
+    field: &Field,
+    ctx: &mut ExecutionCtx,
+) -> Result<ArrayRef, String> {
+    let slice = array
+        .slice(range)
+        .map_err(|e| format!("slice {}: {e}", field.name()))?;
+    session
+        .arrow()
+        .execute_arrow(slice, Some(field), ctx)
+        .map_err(|e| format!("decode {}: {e}", field.name()))
+}
+
 /// Measured cost of one index build, reported separately from query execution.
 #[derive(Clone, Debug)]
 pub(crate) struct BuildStats {
     pub(crate) duration: Duration,
     pub(crate) files: usize,
     pub(crate) rows: u64,
-    pub(crate) distinct_strings: usize,
+    pub(crate) distinct_keys: usize,
     pub(crate) approx_bytes: usize,
     pub(crate) rss_before: Option<u64>,
     pub(crate) rss_after: Option<u64>,
     pub(crate) per_key_entries: Vec<(String, usize, usize)>,
+}
+
+/// What one key shape answers for a pinned key.
+enum ShapeProbe {
+    /// Every packed posting of the key, sorted; empty when no row holds it.
+    Postings(Vec<u64>),
+    /// The key could not be resolved against this index, so it proves nothing.
+    Unanswerable,
+}
+
+/// One composite key over the snapshot, as sorted compressed arrays.
+struct ShapeIndex {
+    label: String,
+    columns: [KeyColumn; 2],
+    converter: RowConverter,
+    /// The key columns and packed postings, sorted by key and then by posting.
+    first: vortex::array::ArrayRef,
+    second: vortex::array::ArrayRef,
+    postings: vortex::array::ArrayRef,
+    len: usize,
+    /// The row-encoded key of the first entry of every block, concatenated.
+    heads: Vec<u8>,
+    /// Block `i`'s head is `heads[head_offsets[i]..head_offsets[i + 1]]`.
+    head_offsets: Vec<usize>,
+    distinct_keys: usize,
+}
+
+impl ShapeIndex {
+    fn blocks(&self) -> usize {
+        self.head_offsets.len().saturating_sub(1)
+    }
+
+    fn head(&self, block: usize) -> &[u8] {
+        &self.heads[self.head_offsets[block]..self.head_offsets[block + 1]]
+    }
+
+    /// Resident bytes: the compressed arrays' buffers plus the retained heads.
+    fn resident_bytes(&self) -> usize {
+        usize_of(self.first.nbytes())
+            .saturating_add(usize_of(self.second.nbytes()))
+            .saturating_add(usize_of(self.postings.nbytes()))
+            .saturating_add(self.heads.capacity())
+            .saturating_add(self.head_offsets.capacity() * std::mem::size_of::<usize>())
+    }
+
+    /// The entries of every block that can hold `key`.
+    ///
+    /// A block whose head is below `key` may hold it; so may a block whose head
+    /// equals it, and the block before the first such block may end with it.
+    fn candidate_range(&self, key: &[u8]) -> Range<usize> {
+        let blocks = self.blocks();
+        let below = partition_point(blocks, |block| self.head(block) < key);
+        let through = partition_point(blocks, |block| self.head(block) <= key);
+        if through == 0 {
+            return 0..0;
+        }
+        let start = below.saturating_sub(1) * BLOCK_ROWS;
+        let end = (through * BLOCK_ROWS).min(self.len);
+        start..end
+    }
+
+    /// The packed postings of the key `first + second`.
+    fn probe(
+        &self,
+        session: &VortexSession,
+        first: &ScalarValue,
+        second: &ScalarValue,
+    ) -> ShapeProbe {
+        let literal = |scalar: &ScalarValue, column: &KeyColumn| {
+            scalar
+                .cast_to(&column.data_type)
+                .ok()?
+                .to_array_of_size(1)
+                .ok()
+        };
+        let (Some(first), Some(second)) = (
+            literal(first, &self.columns[0]),
+            literal(second, &self.columns[1]),
+        ) else {
+            return ShapeProbe::Unanswerable;
+        };
+        // A NULL literal never satisfies an equality predicate.
+        if first.is_null(0) || second.is_null(0) {
+            return ShapeProbe::Postings(Vec::new());
+        }
+        let Ok(rows) = self.converter.convert_columns(&[first, second]) else {
+            return ShapeProbe::Unanswerable;
+        };
+        let key = rows.row(0);
+        let range = self.candidate_range(key.as_ref());
+        if range.is_empty() {
+            return ShapeProbe::Postings(Vec::new());
+        }
+        match self.postings_in(session, range, key.as_ref()) {
+            Ok(postings) => ShapeProbe::Postings(postings),
+            Err(error) => {
+                tracing::debug!(shape = %self.label, %error, "Point-lookup index block could not be read; scanning instead");
+                ShapeProbe::Unanswerable
+            }
+        }
+    }
+
+    /// Decodes both key columns of the entries `range`.
+    fn decode_keys(
+        &self,
+        session: &VortexSession,
+        range: Range<usize>,
+        ctx: &mut ExecutionCtx,
+    ) -> Result<[ArrayRef; 2], String> {
+        Ok([
+            decode(
+                session,
+                &self.first,
+                range.clone(),
+                &self.columns[0].indexed_field(),
+                ctx,
+            )?,
+            decode(
+                session,
+                &self.second,
+                range,
+                &self.columns[1].indexed_field(),
+                ctx,
+            )?,
+        ])
+    }
+
+    /// Decodes the packed postings of the entries `range`.
+    fn decode_postings(
+        &self,
+        session: &VortexSession,
+        range: Range<usize>,
+        ctx: &mut ExecutionCtx,
+    ) -> Result<UInt64Array, String> {
+        decode(session, &self.postings, range, &postings_field(), ctx)?
+            .as_primitive_opt::<UInt64Type>()
+            .cloned()
+            .ok_or_else(|| "postings did not decode as UInt64".to_string())
+    }
+
+    /// The postings of `key` within the entries `range`.
+    fn postings_in(
+        &self,
+        session: &VortexSession,
+        range: Range<usize>,
+        key: &[u8],
+    ) -> Result<Vec<u64>, String> {
+        let mut ctx = session.create_execution_ctx();
+        let rows = self
+            .converter
+            .convert_columns(&self.decode_keys(session, range.clone(), &mut ctx)?)
+            .map_err(|e| format!("encode block: {e}"))?;
+        let lo = partition_point(rows.num_rows(), |row| rows.row(row).as_ref() < key);
+        let hi = partition_point(rows.num_rows(), |row| rows.row(row).as_ref() <= key);
+        if lo == hi {
+            return Ok(Vec::new());
+        }
+        let postings =
+            self.decode_postings(session, range.start + lo..range.start + hi, &mut ctx)?;
+        Ok(postings.values().to_vec())
+    }
+
+    /// Every entry as `(row-encoded key, file path, position)`, sorted.
+    fn resolved_entries(
+        &self,
+        index: &SnapshotLookupIndex,
+    ) -> Result<Vec<(Vec<u8>, String, u64)>, String> {
+        if self.len == 0 {
+            return Ok(Vec::new());
+        }
+        let session = &index.session;
+        let mut ctx = session.create_execution_ctx();
+        let keys = self.decode_keys(session, 0..self.len, &mut ctx)?;
+        let postings = self.decode_postings(session, 0..self.len, &mut ctx)?;
+        let rows = self
+            .converter
+            .convert_columns(&keys)
+            .map_err(|e| format!("encode entries: {e}"))?;
+        let mut entries = Vec::with_capacity(self.len);
+        for (row, &packed) in postings.values().iter().enumerate() {
+            let (file_id, position) = unpack(packed);
+            let path = index
+                .files
+                .get(file_id)
+                .map_or_else(|| format!("<unknown file {file_id}>"), |f| f.path.clone());
+            entries.push((rows.row(row).as_ref().to_vec(), path, position));
+        }
+        entries.sort();
+        Ok(entries)
+    }
 }
 
 /// An index over exactly one immutable snapshot file set.
@@ -422,8 +581,8 @@ pub(crate) struct SnapshotLookupIndex {
     snapshot_id: String,
     files: Vec<IndexedFile>,
     file_ids: HashMap<String, u32>,
-    dictionaries: Dictionaries,
-    maps: Vec<KeyMap>,
+    shapes: Vec<ShapeIndex>,
+    session: VortexSession,
     stats: BuildStats,
 }
 
@@ -432,63 +591,50 @@ impl SnapshotLookupIndex {
         &self.snapshot_id
     }
 
-    pub(crate) fn stats(&self) -> &BuildStats {
-        &self.stats
-    }
-
     /// Resolves `filters` against one indexed key, returning the candidate row
     /// addresses grouped by file path. `None` means no indexed key is fully
-    /// pinned to literals by these filters.
+    /// pinned to literals by these filters, or none of the pinned ones could be
+    /// answered, so the ordinary scan must run.
     fn probe(&self, scalar_for: &dyn Fn(&str) -> Option<ScalarValue>) -> Option<ProbeHit> {
-        for map in &self.maps {
-            let Some(first) = scalar_for(&map.spec.columns[0]) else {
+        for shape in &self.shapes {
+            let Some(first) = scalar_for(&shape.columns[0].name) else {
                 continue;
             };
-            let Some(second) = scalar_for(&map.spec.columns[1]) else {
+            let Some(second) = scalar_for(&shape.columns[1].name) else {
                 continue;
             };
-            let (Some(first_dict), Some(second_dict)) = (
-                self.dictionaries.get(&map.spec.columns[0]),
-                self.dictionaries.get(&map.spec.columns[1]),
-            ) else {
-                continue;
+            let postings = match shape.probe(&self.session, &first, &second) {
+                ShapeProbe::Postings(postings) => postings,
+                ShapeProbe::Unanswerable => continue,
             };
 
-            let mut per_file: HashMap<String, Vec<u64>> = HashMap::new();
-            let mut rows = 0usize;
-            // A literal this column never held resolves to no id, which is a
-            // complete miss rather than a reason to fall back.
-            if let (Some(a), Some(b)) = (
-                first_dict.lookup_scalar(&first),
-                second_dict.lookup_scalar(&second),
-            ) && let Some(postings) = map.entries.get(&(a, b))
-            {
-                for packed in postings.iter() {
-                    let file_id = (packed >> POSITION_BITS) as usize;
-                    let position = packed & POSITION_MASK;
-                    let Some(file) = self.files.get(file_id) else {
-                        // A posting that cannot be resolved to a file means the
-                        // index is not internally consistent; refuse the probe
-                        // rather than returning a partial selection.
-                        return None;
-                    };
-                    per_file
-                        .entry(file.path.clone())
-                        .or_default()
-                        .push(position);
-                    rows += 1;
-                }
+            // Grouped under the index's own path strings, so each candidate
+            // file's path is copied once rather than once per posting.
+            let mut by_file: HashMap<&str, Vec<u64>> = HashMap::new();
+            for &packed in &postings {
+                let (file_id, position) = unpack(packed);
+                // A posting that cannot be resolved to a file means the index is
+                // not internally consistent; refuse the probe rather than
+                // returning a partial selection.
+                let file = self.files.get(file_id)?;
+                by_file
+                    .entry(file.path.as_str())
+                    .or_default()
+                    .push(position);
             }
-
-            for positions in per_file.values_mut() {
-                positions.sort_unstable();
-                positions.dedup();
-            }
+            let per_file = by_file
+                .into_iter()
+                .map(|(path, mut positions)| {
+                    positions.sort_unstable();
+                    positions.dedup();
+                    (path.to_string(), positions)
+                })
+                .collect();
 
             return Some(ProbeHit {
-                shape: map.spec.label.clone(),
+                shape: shape.label.clone(),
                 per_file,
-                rows,
+                rows: postings.len(),
             });
         }
         None
@@ -502,7 +648,7 @@ struct ProbeHit {
 }
 
 /// A resolved row selection awaiting validation against the scan's own file
-/// list. Nothing is applied until [`Self::validate`] accepts that file list.
+/// list. Nothing is applied until [`Self::restrict`] accepts that file list.
 pub(crate) struct LookupSelection {
     state: Arc<LookupIndexState>,
     index: Arc<SnapshotLookupIndex>,
@@ -512,36 +658,71 @@ pub(crate) struct LookupSelection {
 }
 
 impl LookupSelection {
-    /// Records the outcome of a probe that did NOT end in an attached
-    /// selection, so a run that silently fell back is visible in the metrics.
-    pub(crate) fn record_outcome(&self, outcome: &str) {
-        self.state.record_probe(&self.shape, outcome);
-    }
-
-    /// Records an attached selection and the work it left for the scan.
-    pub(crate) fn record_selected(&self, files: u64, rows: u64) {
-        self.state.record_selection(&self.shape, files, rows);
-    }
-
-    pub(crate) fn candidate_rows(&self) -> usize {
-        self.rows
+    /// Narrows a scan's file groups to the files that hold a candidate row, and
+    /// returns the access-plan provider that carries their positions into the
+    /// Vortex scan. Either way the probe's outcome is recorded, so a run that
+    /// silently fell back is visible in the metrics.
+    ///
+    /// The selection is honored ONLY for the exact snapshot and files it was
+    /// captured from: for any other file set the groups come back untouched and
+    /// no provider is returned, so a stale or incomplete index can never turn
+    /// into a false empty result. `table_plans` is the provider the scan would
+    /// otherwise attach, which carries the table's position-delete vectors.
+    pub(crate) fn restrict(
+        self,
+        snapshot_id: &str,
+        file_groups: Vec<FileGroup>,
+        table_plans: Arc<dyn VortexAccessPlanProvider>,
+    ) -> (Vec<FileGroup>, Option<Arc<dyn VortexAccessPlanProvider>>) {
+        if !self.validate(snapshot_id, file_groups.iter().flat_map(FileGroup::iter)) {
+            self.state
+                .record_probe(&self.shape, ProbeOutcome::SnapshotMismatch);
+            return (file_groups, None);
+        }
+        let file_groups: Vec<FileGroup> = file_groups
+            .into_iter()
+            .filter_map(|group| {
+                let files: Vec<PartitionedFile> = group
+                    .into_inner()
+                    .into_iter()
+                    .filter(|file| {
+                        let path: &str = file.object_meta.location.as_ref();
+                        self.per_file.contains_key(path)
+                    })
+                    .collect();
+                (!files.is_empty()).then(|| FileGroup::new(files))
+            })
+            .collect();
+        let candidate_files: usize = file_groups.iter().map(FileGroup::len).sum();
+        if candidate_files == 0 {
+            self.state.record_probe(&self.shape, ProbeOutcome::Empty);
+            return (file_groups, None);
+        }
+        self.state
+            .record_selection(&self.shape, candidate_files as u64, self.rows as u64);
+        let provider = LookupAccessPlanProvider {
+            state: self.state,
+            selections: self.per_file,
+            table: table_plans,
+        };
+        (file_groups, Some(Arc::new(provider)))
     }
 
     /// Accepts this selection only for the exact snapshot and files it was built
     /// from. `files` is the scan's own (already pruned) list: a file pruned away
     /// by statistics provably holds no matching row, so its absence is fine,
     /// while a file the index has never seen means the snapshot moved under us.
-    pub(crate) fn validate<'a>(
+    fn validate<'a>(
         &self,
         snapshot_id: &str,
-        files: impl Iterator<Item = &'a datafusion_datasource::PartitionedFile>,
+        files: impl Iterator<Item = &'a PartitionedFile>,
     ) -> bool {
         if self.index.snapshot_id != snapshot_id {
             return false;
         }
         for file in files {
-            let path = file.object_meta.location.to_string();
-            let Some(&id) = self.index.file_ids.get(&path) else {
+            let path: &str = file.object_meta.location.as_ref();
+            let Some(&id) = self.index.file_ids.get(path) else {
                 return false;
             };
             let Some(indexed) = self.index.files.get(id as usize) else {
@@ -555,58 +736,69 @@ impl LookupSelection {
         }
         true
     }
-
-    /// Sorted file-local row positions to read from `path`, or `None` when the
-    /// file holds no candidate and should be dropped from the scan.
-    pub(crate) fn positions_for(&self, path: &str) -> Option<&[u64]> {
-        self.per_file.get(path).map(Vec::as_slice)
-    }
 }
 
-/// Per-file row selections handed to the Vortex scan.
-pub(crate) struct LookupAccessPlanProvider {
+/// Per-file row selections handed to the Vortex scan, composed with the table's
+/// own per-file access plans.
+///
+/// A file carries exactly one access plan, and position-delete vectors travel
+/// in it. So the lookup's candidate positions are intersected with whatever the
+/// table's provider would have attached — a deleted candidate is never selected
+/// — instead of replacing it.
+struct LookupAccessPlanProvider {
     state: Arc<LookupIndexState>,
-    selections: HashMap<String, Buffer<u64>>,
+    selections: HashMap<String, Vec<u64>>,
+    table: Arc<dyn VortexAccessPlanProvider>,
 }
 
 impl std::fmt::Debug for LookupAccessPlanProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LookupAccessPlanProvider")
             .field("files", &self.selections.len())
+            .field("table", &self.table)
             .finish_non_exhaustive()
     }
 }
 
-impl LookupAccessPlanProvider {
-    pub(crate) fn new(selection: &LookupSelection) -> Self {
-        let selections = selection
-            .per_file
-            .iter()
-            .map(|(path, positions)| (path.clone(), Buffer::copy_from(positions.as_slice())))
-            .collect();
-        Self {
-            state: Arc::clone(&selection.state),
-            selections,
-        }
+/// Whether `selection` keeps the row at `position`.
+fn selection_keeps(selection: &Selection, position: u64) -> bool {
+    match selection {
+        Selection::All => true,
+        Selection::IncludeByIndex(rows) => rows.binary_search(&position).is_ok(),
+        Selection::ExcludeByIndex(rows) => rows.binary_search(&position).is_err(),
+        Selection::IncludeRoaring(rows) => rows.contains(position),
+        Selection::ExcludeRoaring(rows) => !rows.contains(position),
     }
 }
 
-impl vortex_datafusion::VortexAccessPlanProvider for LookupAccessPlanProvider {
-    fn access_plan_for_file(
-        &self,
-        file: &datafusion_datasource::PartitionedFile,
-    ) -> Option<Arc<vortex_datafusion::VortexAccessPlan>> {
-        let path = file.object_meta.location.to_string();
-        let positions = self.selections.get(&path)?;
+impl VortexAccessPlanProvider for LookupAccessPlanProvider {
+    fn access_plan_for_file(&self, file: &PartitionedFile) -> Option<Arc<VortexAccessPlan>> {
+        let path: &str = file.object_meta.location.as_ref();
+        let table_plan = self.table.access_plan_for_file(file);
+        let Some(candidates) = self.selections.get(path) else {
+            // Not a file this lookup selected from: leave it exactly as the table
+            // would read it.
+            return table_plan;
+        };
+        let positions = match table_plan.as_deref().and_then(VortexAccessPlan::selection) {
+            None | Some(Selection::All) => Buffer::copy_from(candidates.as_slice()),
+            Some(table_selection) => candidates
+                .iter()
+                .copied()
+                .filter(|&position| selection_keeps(table_selection, position))
+                .collect::<Buffer<u64>>(),
+        };
         self.state
             .counters
             .access_plans_attached
             .fetch_add(1, Ordering::Relaxed);
         Some(Arc::new(
-            vortex_datafusion::VortexAccessPlan::default().with_selection(
-                vortex_scan::selection::Selection::IncludeByIndex(positions.clone()),
-            ),
+            VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(positions)),
         ))
+    }
+
+    fn adjust_statistics(&self, object: &ObjectMeta, statistics: Statistics) -> Statistics {
+        self.table.adjust_statistics(object, statistics)
     }
 }
 
@@ -623,16 +815,14 @@ pub struct LookupIndexCounters {
     pub unbuilt: u64,
     /// Probes refused because the scan's files are not the indexed ones.
     pub snapshot_mismatch: u64,
-    /// Probes refused because position deletes also need the file's access plan.
-    pub deletions: u64,
     /// Candidate files summed over selected probes.
     pub candidate_files: u64,
     /// Candidate row positions summed over selected probes.
     pub candidate_rows: u64,
     /// Files that were actually handed a Vortex row selection.
     pub access_plans_attached: u64,
-    /// Estimated resident bytes of the published index, as reserved against the
-    /// table's `DataFusion` memory pool. Zero when nothing is published.
+    /// Resident bytes of the published index, as reserved against the table's
+    /// `DataFusion` memory pool. Zero when nothing is published.
     pub index_bytes: u64,
 }
 
@@ -642,7 +832,6 @@ struct Counters {
     empty: AtomicU64,
     unbuilt: AtomicU64,
     snapshot_mismatch: AtomicU64,
-    deletions: AtomicU64,
     candidate_files: AtomicU64,
     candidate_rows: AtomicU64,
     access_plans_attached: AtomicU64,
@@ -656,7 +845,6 @@ impl Counters {
             empty: self.empty.load(Ordering::Relaxed),
             unbuilt: self.unbuilt.load(Ordering::Relaxed),
             snapshot_mismatch: self.snapshot_mismatch.load(Ordering::Relaxed),
-            deletions: self.deletions.load(Ordering::Relaxed),
             candidate_files: self.candidate_files.load(Ordering::Relaxed),
             candidate_rows: self.candidate_rows.load(Ordering::Relaxed),
             access_plans_attached: self.access_plans_attached.load(Ordering::Relaxed),
@@ -664,14 +852,12 @@ impl Counters {
         }
     }
 
-    fn record(&self, outcome: &str) {
+    fn record(&self, outcome: ProbeOutcome) {
         let counter = match outcome {
-            outcome::SELECTED => &self.selected,
-            outcome::EMPTY => &self.empty,
-            outcome::UNBUILT => &self.unbuilt,
-            outcome::SNAPSHOT_MISMATCH => &self.snapshot_mismatch,
-            outcome::DELETIONS => &self.deletions,
-            _ => return,
+            ProbeOutcome::Selected => &self.selected,
+            ProbeOutcome::Empty => &self.empty,
+            ProbeOutcome::Unbuilt => &self.unbuilt,
+            ProbeOutcome::SnapshotMismatch => &self.snapshot_mismatch,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -681,8 +867,8 @@ impl Counters {
 /// state (the table configures no lookup index).
 #[must_use]
 pub fn counters_for_table(table_name: &str) -> Option<LookupIndexCounters> {
-    let states = STATES.lock().ok()?;
-    states
+    STATES
+        .lock()
         .values()
         .find(|state| state.table_name == table_name)
         .map(|state| state.counters.snapshot())
@@ -694,8 +880,8 @@ pub(crate) struct LookupIndexState {
     /// An explicit `cayenne_lookup_index_max_bytes`, which outranks the figure
     /// derived from the table's memory configuration.
     configured_max_bytes: Option<usize>,
-    /// Cap on the index's estimated resident bytes. Seeded from the table's
-    /// Cayenne memory configuration and overridden by the environment.
+    /// Cap on the index's bytes, both while it is being built and once it is
+    /// resident. Seeded from the table's Cayenne memory configuration.
     max_bytes: AtomicUsize,
     /// Publishes the index's resident bytes into the table's `DataFusion` pool
     /// reservation, so a query plans against the budget this index is actually
@@ -709,19 +895,6 @@ pub(crate) struct LookupIndexState {
 }
 
 impl LookupIndexState {
-    /// Columns the build must read: the union of every indexed key's columns.
-    pub(crate) fn key_columns(&self) -> Vec<String> {
-        let mut columns: Vec<String> = Vec::new();
-        for spec in &self.specs {
-            for column in &spec.columns {
-                if !columns.iter().any(|c| c == column) {
-                    columns.push(column.clone());
-                }
-            }
-        }
-        columns
-    }
-
     pub(crate) fn published(&self) -> Option<Arc<SnapshotLookupIndex>> {
         self.index.load_full()
     }
@@ -742,7 +915,9 @@ impl LookupIndexState {
             .is_ok()
     }
 
-    fn release_build(&self) {
+    /// Releases the build slot taken by [`Self::claim_build`], whether the build
+    /// finished or could not start.
+    pub(crate) fn release_build(&self) {
         self.build_in_flight.store(false, Ordering::Release);
     }
 
@@ -766,9 +941,8 @@ impl LookupIndexState {
                 Ordering::Relaxed,
             );
         }
-        if let Ok(mut slot) = self.account.lock()
-            && slot.is_none()
-        {
+        let mut slot = self.account.lock();
+        if slot.is_none() {
             *slot = Some(Arc::clone(account));
         }
     }
@@ -778,24 +952,13 @@ impl LookupIndexState {
     }
 
     /// Publishes the index's resident bytes into the table's pool reservation.
-    ///
-    /// The estimate is computed from ALLOCATED capacity, not occupancy: it is
-    /// what the pool plans against, and a figure derived from occupancy
-    /// understates every hash table by its load-factor headroom.
     fn account_bytes(&self, bytes: usize) {
         self.counters
             .index_bytes
             .store(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
-        if let Ok(slot) = self.account.lock()
-            && let Some(account) = slot.as_ref()
-        {
+        if let Some(account) = self.account.lock().as_ref() {
             account.set_lookup_index_bytes(bytes);
         }
-    }
-
-    /// Releases a build slot claimed by a caller that could not start the build.
-    pub(crate) fn abandon_build(&self) {
-        self.release_build();
     }
 
     /// Starts a write-time build for a snapshot that is not visible yet. The
@@ -823,54 +986,34 @@ impl LookupIndexState {
                 return None;
             }
         };
-        let mut pending = self.pending.lock().ok()?;
-        *pending = Some(Arc::clone(&builder));
+        *self.pending.lock() = Some(Arc::clone(&builder));
         Some(builder)
     }
 
     /// Promotes a completed write-time build, so the index is in place BEFORE the
     /// snapshot becomes visible and no query is served by a full scan in between.
     ///
-    /// Returns `false` when nothing was published — a failed or capped build, or
-    /// a file set that does not match the listing. The snapshot must still
-    /// publish in that case: data availability never depends on this index.
-    pub(crate) fn publish_pending(&self, snapshot_id: &str, files: &[IndexedFile]) -> bool {
-        let Ok(mut slot) = self.pending.lock() else {
-            return false;
+    /// Nothing is published for a failed or capped build, or for a file set that
+    /// does not match the listing. The snapshot must still publish in that case:
+    /// data availability never depends on this index.
+    pub(crate) async fn publish_pending(&self, snapshot_id: &str, files: Vec<IndexedFile>) {
+        let Some(builder) = self.pending.lock().take() else {
+            return;
         };
-        let Some(builder) = slot.take() else {
-            return false;
-        };
-        drop(slot);
         if builder.snapshot_id() != snapshot_id {
-            return false;
+            return;
         }
-        match builder.finish(files) {
-            Ok(Some(index)) => {
-                let stats = index.stats().clone();
-                let dimensions = [telemetry::KeyValue::new("table", self.table_name.clone())];
-                telemetry::cayenne::track_lookup_index_build_duration(stats.duration, &dimensions);
-                telemetry::cayenne::track_lookup_index_bytes(
-                    u64::try_from(stats.approx_bytes).unwrap_or(u64::MAX),
-                    &dimensions,
-                );
-                tracing::info!(
-                    table = %self.table_name,
-                    snapshot_id = %snapshot_id,
-                    build_ms = stats.duration.as_millis(),
-                    files = stats.files,
-                    rows = stats.rows,
-                    distinct_strings = stats.distinct_strings,
-                    approx_bytes = stats.approx_bytes,
-                    rss_before = ?stats.rss_before,
-                    rss_after = ?stats.rss_after,
-                    per_key = ?stats.per_key_entries,
-                    "Published write-time Cayenne point-lookup index with its snapshot"
-                );
-                self.account_bytes(stats.approx_bytes);
-                self.index.store(Some(Arc::new(index)));
-                true
-            }
+        // Sorting and compressing the index is CPU work that runs for seconds on a
+        // large table, so it goes to the blocking pool rather than the runtime.
+        let finished = match tokio::task::spawn_blocking(move || builder.finish(&files)).await {
+            Ok(finished) => finished,
+            Err(error) => Err(format!("index build task failed: {error}")),
+        };
+        match finished {
+            Ok(Some(index)) => self.publish(
+                index,
+                "Published write-time Cayenne point-lookup index with its snapshot",
+            ),
             Ok(None) => {
                 tracing::warn!(
                     table = %self.table_name,
@@ -878,7 +1021,6 @@ impl LookupIndexState {
                     max_bytes = self.max_bytes(),
                     "Write-time point-lookup index exceeded its byte cap; not published"
                 );
-                false
             }
             Err(error) => {
                 tracing::warn!(
@@ -887,21 +1029,39 @@ impl LookupIndexState {
                     %error,
                     "Write-time point-lookup index not published"
                 );
-                false
             }
         }
     }
 
-    /// Drops a write-time build whose write did not commit.
-    pub(crate) fn discard_pending(&self) {
-        if let Ok(mut slot) = self.pending.lock() {
-            *slot = None;
-        }
+    /// Records a finished index's cost and makes it the one probes read.
+    fn publish(&self, index: SnapshotLookupIndex, message: &'static str) {
+        let stats = &index.stats;
+        let dimensions = [telemetry::KeyValue::new("table", self.table_name.clone())];
+        telemetry::cayenne::track_lookup_index_build_duration(stats.duration, &dimensions);
+        telemetry::cayenne::track_lookup_index_bytes(
+            u64::try_from(stats.approx_bytes).unwrap_or(u64::MAX),
+            &dimensions,
+        );
+        tracing::info!(
+            table = %self.table_name,
+            snapshot_id = %index.snapshot_id(),
+            build_ms = stats.duration.as_millis(),
+            files = stats.files,
+            rows = stats.rows,
+            distinct_keys = stats.distinct_keys,
+            approx_bytes = stats.approx_bytes,
+            rss_before = ?stats.rss_before,
+            rss_after = ?stats.rss_after,
+            per_key = ?stats.per_key_entries,
+            "{message}"
+        );
+        self.account_bytes(stats.approx_bytes);
+        self.index.store(Some(Arc::new(index)));
     }
 
-    pub(crate) fn published_for(&self, snapshot_id: &str) -> Option<Arc<SnapshotLookupIndex>> {
-        self.published()
-            .filter(|index| index.snapshot_id == snapshot_id)
+    /// Drops a write-time build whose write did not commit.
+    pub(crate) fn discard_pending(&self) {
+        *self.pending.lock() = None;
     }
 
     /// The indexed key these filters fully pin to literals, if any. Used to
@@ -920,6 +1080,9 @@ impl LookupIndexState {
     /// Resolves a candidate row selection for `scalar_for`. Returns `None`
     /// whenever the ordinary scan must be used; the caller records the final
     /// outcome once it has validated the selection against its own file list.
+    ///
+    /// `scalar_for` must only answer for predicates that compare the bare column
+    /// with a value: see the module's note on column-side casts.
     pub(crate) fn probe(
         self: &Arc<Self>,
         scalar_for: &dyn Fn(&str) -> Option<ScalarValue>,
@@ -928,7 +1091,7 @@ impl LookupIndexState {
             // Only count a probe once the filters actually name an indexed key,
             // so ordinary analytical scans do not show up as index misses.
             if let Some(shape) = self.matched_shape(scalar_for) {
-                self.record_probe(shape, outcome::UNBUILT);
+                self.record_probe(shape, ProbeOutcome::Unbuilt);
             }
             return None;
         };
@@ -943,16 +1106,16 @@ impl LookupIndexState {
         })
     }
 
-    pub(crate) fn record_probe(&self, shape: &str, outcome: &str) {
+    fn record_probe(&self, shape: &str, outcome: ProbeOutcome) {
         self.counters.record(outcome);
         telemetry::cayenne::track_lookup_index_probe(&[
             telemetry::KeyValue::new("table", self.table_name.clone()),
             telemetry::KeyValue::new("shape", shape.to_string()),
-            telemetry::KeyValue::new("outcome", outcome.to_string()),
+            telemetry::KeyValue::new("outcome", outcome.as_str()),
         ]);
     }
 
-    pub(crate) fn record_selection(&self, shape: &str, files: u64, rows: u64) {
+    fn record_selection(&self, shape: &str, files: u64, rows: u64) {
         self.counters
             .candidate_files
             .fetch_add(files, Ordering::Relaxed);
@@ -965,7 +1128,7 @@ impl LookupIndexState {
         ];
         telemetry::cayenne::track_lookup_index_candidate_files(files, &dimensions);
         telemetry::cayenne::track_lookup_index_candidate_rows(rows, &dimensions);
-        self.record_probe(shape, outcome::SELECTED);
+        self.record_probe(shape, ProbeOutcome::Selected);
     }
 }
 
@@ -987,33 +1150,7 @@ pub(crate) fn spawn_build(
             "Building Cayenne point-lookup index"
         );
         match build(&state, snapshot_id.clone(), &store, files, &schema).await {
-            Ok(Some(index)) => {
-                let build_stats = index.stats().clone();
-                let dimensions = [telemetry::KeyValue::new("table", table.clone())];
-                telemetry::cayenne::track_lookup_index_build_duration(
-                    build_stats.duration,
-                    &dimensions,
-                );
-                telemetry::cayenne::track_lookup_index_bytes(
-                    u64::try_from(build_stats.approx_bytes).unwrap_or(u64::MAX),
-                    &dimensions,
-                );
-                tracing::info!(
-                    table = %table,
-                    snapshot_id = %snapshot_id,
-                    build_ms = build_stats.duration.as_millis(),
-                    files = build_stats.files,
-                    rows = build_stats.rows,
-                    distinct_strings = build_stats.distinct_strings,
-                    approx_bytes = build_stats.approx_bytes,
-                    rss_before = ?build_stats.rss_before,
-                    rss_after = ?build_stats.rss_after,
-                    per_key = ?build_stats.per_key_entries,
-                    "Published Cayenne point-lookup index"
-                );
-                state.account_bytes(build_stats.approx_bytes);
-                state.index.store(Some(Arc::new(index)));
-            }
+            Ok(Some(index)) => state.publish(index, "Published Cayenne point-lookup index"),
             Ok(None) => {
                 tracing::warn!(
                     table = %table,
@@ -1035,23 +1172,305 @@ pub(crate) fn spawn_build(
     });
 }
 
-/// `Ok(None)` means the byte cap stopped the build.
+/// Where a batch's rows sit in their file.
+#[derive(Clone, Copy)]
+enum RowPositions<'a> {
+    /// Rows occupy consecutive positions from this one — what a writer reports.
+    Contiguous(u64),
+    /// One position per row — what a read-back scan's `row_idx()` reports.
+    Explicit(&'a UInt64Array),
+}
+
+impl RowPositions<'_> {
+    fn position(self, row: u32) -> u64 {
+        match self {
+            Self::Contiguous(start) => start + u64::from(row),
+            Self::Explicit(positions) => positions.value(row as usize),
+        }
+    }
+}
+
+/// Entries for one key shape, accumulated until the snapshot is complete.
+struct ShapeBuild {
+    label: String,
+    columns: [KeyColumn; 2],
+    /// Compacted, null-free key column chunks and their packed postings, in
+    /// arrival order.
+    first: Vec<ArrayRef>,
+    second: Vec<ArrayRef>,
+    postings: Vec<u64>,
+}
+
+impl ShapeBuild {
+    /// Appends the rows of `batch` whose key columns are both non-null.
+    ///
+    /// Returns the bytes this retained. The key columns are copied, so a batch
+    /// that is a slice of a larger buffer does not keep that buffer alive.
+    fn ingest(
+        &mut self,
+        file_id: u32,
+        positions: RowPositions<'_>,
+        batch: &RecordBatch,
+        file_path: &str,
+    ) -> Result<usize, String> {
+        let column = |key: &KeyColumn| {
+            let array = batch
+                .column_by_name(&key.name)
+                .ok_or_else(|| format!("{file_path}: column '{}' not in the batch", key.name))?;
+            cast_to(array, &key.data_type).map_err(|e| format!("{file_path}: {}: {e}", key.name))
+        };
+        let first = column(&self.columns[0])?;
+        let second = column(&self.columns[1])?;
+        let num_rows = u32::try_from(batch.num_rows())
+            .map_err(|_| format!("{file_path}: batch has more than u32::MAX rows"))?;
+
+        // A NULL can never satisfy an equality predicate, so an incomplete key
+        // is simply not indexed.
+        let indices = if first.null_count() == 0 && second.null_count() == 0 {
+            UInt32Array::from_iter_values(0..num_rows)
+        } else {
+            let keep = arrow::compute::and(
+                &arrow::compute::is_not_null(first.as_ref()).map_err(|e| e.to_string())?,
+                &arrow::compute::is_not_null(second.as_ref()).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            UInt32Array::from_iter_values(
+                keep.values()
+                    .set_indices()
+                    .filter_map(|row| u32::try_from(row).ok()),
+            )
+        };
+
+        self.postings.reserve(indices.len());
+        for &row in indices.values() {
+            let position = positions.position(row);
+            if position > POSITION_MASK {
+                return Err(format!(
+                    "{file_path}: row position {position} does not fit the index's address"
+                ));
+            }
+            self.postings
+                .push((u64::from(file_id) << POSITION_BITS) | position);
+        }
+        let first = arrow::compute::take(first.as_ref(), &indices, None)
+            .map_err(|e| format!("{file_path}: {e}"))?;
+        let second = arrow::compute::take(second.as_ref(), &indices, None)
+            .map_err(|e| format!("{file_path}: {e}"))?;
+        let retained = first.get_array_memory_size()
+            + second.get_array_memory_size()
+            + indices.len() * std::mem::size_of::<u64>();
+        self.first.push(first);
+        self.second.push(second);
+        Ok(retained)
+    }
+
+    /// Sorts the entries and compresses them into a [`ShapeIndex`], one chunk of
+    /// `chunk_rows` sorted entries at a time.
+    fn finish(
+        self,
+        session: &VortexSession,
+        compressor: &BtrBlocksCompressor,
+        chunk_rows: usize,
+    ) -> Result<ShapeIndex, String> {
+        let Self {
+            label,
+            columns,
+            first,
+            second,
+            postings,
+        } = self;
+        let converter = key_converter(&columns)?;
+        let concat = |chunks: Vec<ArrayRef>, column: &KeyColumn| -> Result<ArrayRef, String> {
+            if chunks.is_empty() {
+                return Ok(arrow::array::new_empty_array(&column.data_type));
+            }
+            let parts: Vec<&dyn Array> = chunks.iter().map(AsRef::as_ref).collect();
+            arrow::compute::concat(&parts).map_err(|e| format!("{}: {e}", column.name))
+        };
+        let first = concat(first, &columns[0])?;
+        let second = concat(second, &columns[1])?;
+        let postings: ArrayRef = Arc::new(UInt64Array::from(postings));
+
+        let order = arrow::compute::lexsort_to_indices(
+            &[
+                SortColumn {
+                    values: Arc::clone(&first),
+                    options: None,
+                },
+                SortColumn {
+                    values: Arc::clone(&second),
+                    options: None,
+                },
+                SortColumn {
+                    values: Arc::clone(&postings),
+                    options: None,
+                },
+            ],
+            None,
+        )
+        .map_err(|e| format!("sort {label}: {e}"))?;
+
+        let fields = [
+            columns[0].indexed_field(),
+            columns[1].indexed_field(),
+            postings_field(),
+        ];
+        let mut ctx = session.create_execution_ctx();
+        let mut heads = BlockHeads::new();
+        let mut compressed: [Vec<vortex::array::ArrayRef>; 3] = Default::default();
+        let len = first.len();
+        let mut start = 0usize;
+        while start < len {
+            let rows = chunk_rows.min(len - start);
+            let indices = order.slice(start, rows);
+            let sorted = [&first, &second, &postings].map(|array| {
+                arrow::compute::take(array.as_ref(), &indices, None)
+                    .map_err(|e| format!("sort {label}: {e}"))
+            });
+            let [first_chunk, second_chunk, postings_chunk] = sorted;
+            let chunk = [first_chunk?, second_chunk?, postings_chunk?];
+            heads
+                .extend(&converter, &chunk[0], &chunk[1])
+                .map_err(|e| format!("{label}: {e}"))?;
+            for ((array, field), out) in chunk.into_iter().zip(&fields).zip(&mut compressed) {
+                let imported = session
+                    .arrow()
+                    .from_arrow_array(array, field)
+                    .map_err(|e| format!("import {}: {e}", field.name()))?;
+                out.push(
+                    compressor
+                        .compress(&imported, &mut ctx)
+                        .map_err(|e| format!("compress {}: {e}", field.name()))?,
+                );
+            }
+            start += rows;
+        }
+        drop((order, first, second, postings));
+
+        let [first_chunks, second_chunks, posting_chunks] = compressed;
+        let assemble = |chunks: Vec<vortex::array::ArrayRef>, field: &Field| {
+            if chunks.len() == 1 {
+                return chunks
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| format!("{}: no chunk", field.name()));
+            }
+            let Some(dtype) = chunks.first().map(|chunk| chunk.dtype().clone()) else {
+                return session
+                    .arrow()
+                    .from_arrow_array(arrow::array::new_empty_array(field.data_type()), field)
+                    .map_err(|e| format!("import {}: {e}", field.name()));
+            };
+            ChunkedArray::try_new(chunks, dtype)
+                .map(IntoArray::into_array)
+                .map_err(|e| format!("chunk {}: {e}", field.name()))
+        };
+        let (heads, head_offsets, distinct_keys) = heads.finish();
+        Ok(ShapeIndex {
+            label,
+            converter,
+            first: assemble(first_chunks, &fields[0])?,
+            second: assemble(second_chunks, &fields[1])?,
+            postings: assemble(posting_chunks, &fields[2])?,
+            columns,
+            len,
+            heads,
+            head_offsets,
+            distinct_keys,
+        })
+    }
+}
+
+/// The row-encoded key at the start of every block of sorted `(first, second)`
+/// entries, and the number of distinct keys, fed one sorted chunk at a time.
+///
+/// Encodes one block at a time, so the whole index is never row-encoded at
+/// once. Fails if any entry encodes below its predecessor: the sort and the
+/// encoding disagree for this key's types, and a lookup would miss rows.
+struct BlockHeads {
+    heads: Vec<u8>,
+    /// Block `i`'s head is `heads[offsets[i]..offsets[i + 1]]`.
+    offsets: Vec<usize>,
+    distinct_keys: usize,
+    /// The last key seen, which continues the order check and the distinct count
+    /// from one chunk into the next.
+    previous: Option<Vec<u8>>,
+}
+
+impl BlockHeads {
+    fn new() -> Self {
+        Self {
+            heads: Vec::new(),
+            offsets: vec![0],
+            distinct_keys: 0,
+            previous: None,
+        }
+    }
+
+    /// Records the next sorted entries, which start on a block boundary.
+    fn extend(
+        &mut self,
+        converter: &RowConverter,
+        first: &ArrayRef,
+        second: &ArrayRef,
+    ) -> Result<(), String> {
+        let len = first.len();
+        let mut start = 0usize;
+        while start < len {
+            let block = BLOCK_ROWS.min(len - start);
+            let rows = converter
+                .convert_columns(&[first.slice(start, block), second.slice(start, block)])
+                .map_err(|e| format!("encode block: {e}"))?;
+            self.heads.extend_from_slice(rows.row(0).as_ref());
+            self.offsets.push(self.heads.len());
+            for row in 0..rows.num_rows() {
+                let current = rows.row(row);
+                let prior_row = row.checked_sub(1).map(|prior| rows.row(prior));
+                let prior = match &prior_row {
+                    Some(prior_row) => Some(prior_row.as_ref()),
+                    None => self.previous.as_deref(),
+                };
+                match prior.map(|prior| prior.cmp(current.as_ref())) {
+                    None | Some(std::cmp::Ordering::Less) => self.distinct_keys += 1,
+                    Some(std::cmp::Ordering::Equal) => {}
+                    Some(std::cmp::Ordering::Greater) => {
+                        return Err(
+                            "sorted keys are out of order in their row encoding".to_string()
+                        );
+                    }
+                }
+            }
+            self.previous = Some(rows.row(rows.num_rows() - 1).as_ref().to_vec());
+            start += block;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> (Vec<u8>, Vec<usize>, usize) {
+        self.heads.shrink_to_fit();
+        (self.heads, self.offsets, self.distinct_keys)
+    }
+}
+
 /// Accumulates postings for one snapshot.
 ///
 /// Shared by both builders — the read-back build that scans finished files and
 /// the write-time build fed by the Vortex sink — so the two cannot drift apart
-/// in how they intern keys, pack postings or account for memory.
+/// in how they select, pack or sort entries.
 struct BuildState {
-    dictionaries: Dictionaries,
-    maps: Vec<KeyMap>,
+    shapes: Vec<ShapeBuild>,
     file_ids: HashMap<String, u32>,
     /// `file_id -> path`, in assignment order.
     file_order: Vec<String>,
     rows: u64,
+    /// Bytes held by the accumulated entries.
+    accumulated_bytes: usize,
     max_bytes: usize,
-    /// Set once the estimate passes the cap; the index is then abandoned rather
+    /// Set once a byte count passes the cap; the index is then abandoned rather
     /// than published with silently-dropped postings.
     capped: bool,
+    /// Sorted entries compressed together; [`COMPRESS_CHUNK_ROWS`] outside tests.
+    chunk_rows: usize,
 }
 
 impl BuildState {
@@ -1060,30 +1479,39 @@ impl BuildState {
         max_bytes: usize,
         schema: &arrow_schema::Schema,
     ) -> Result<Self, String> {
-        let mut columns: Vec<String> = Vec::new();
-        for spec in specs {
-            for column in &spec.columns {
-                if !columns.iter().any(|c| c == column) {
-                    columns.push(column.clone());
-                }
-            }
-        }
-        Ok(Self {
-            dictionaries: Dictionaries::new(&columns, schema)?,
-            maps: specs
-                .iter()
-                .map(|spec| KeyMap {
-                    spec: spec.clone(),
-                    entries: HashMap::new(),
-                    postings: 0,
+        let shapes = specs
+            .iter()
+            .map(|spec| {
+                Ok(ShapeBuild {
+                    label: spec.label.clone(),
+                    columns: [
+                        KeyColumn::resolve(schema, &spec.columns[0])?,
+                        KeyColumn::resolve(schema, &spec.columns[1])?,
+                    ],
+                    first: Vec::new(),
+                    second: Vec::new(),
+                    postings: Vec::new(),
                 })
-                .collect(),
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self {
+            shapes,
             file_ids: HashMap::new(),
             file_order: Vec::new(),
             rows: 0,
+            accumulated_bytes: 0,
             max_bytes,
             capped: false,
+            chunk_rows: COMPRESS_CHUNK_ROWS,
         })
+    }
+
+    /// Compresses `rows` sorted entries at a time, so a test can cross chunks
+    /// without millions of rows.
+    #[cfg(test)]
+    fn with_chunk_rows(mut self, rows: usize) -> Self {
+        self.chunk_rows = rows;
+        self
     }
 
     /// Ids are assigned on first sight, so the write-time builder does not need
@@ -1092,18 +1520,21 @@ impl BuildState {
         if let Some(id) = self.file_ids.get(path) {
             return Ok(*id);
         }
-        let id = u32::try_from(self.file_order.len()).map_err(|_| "too many files".to_string())?;
+        let id = u32::try_from(self.file_order.len())
+            .ok()
+            .filter(|&id| id <= MAX_FILE_ID)
+            .ok_or_else(|| "too many files for the index's address".to_string())?;
         self.file_ids.insert(path.to_string(), id);
         self.file_order.push(path.to_string());
         Ok(id)
     }
 
-    /// Columns the build has to read: the union of every indexed key's columns.
-    fn key_columns(&self) -> Vec<String> {
-        let mut columns: Vec<String> = Vec::new();
-        for map in &self.maps {
-            for column in &map.spec.columns {
-                if !columns.iter().any(|c| c == column) {
+    /// The key columns the read-back build projects, once each.
+    fn key_columns(&self) -> Vec<KeyColumn> {
+        let mut columns: Vec<KeyColumn> = Vec::new();
+        for shape in &self.shapes {
+            for column in &shape.columns {
+                if !columns.iter().any(|c| c.name == column.name) {
                     columns.push(column.clone());
                 }
             }
@@ -1114,23 +1545,28 @@ impl BuildState {
     fn ingest(
         &mut self,
         file_id: u32,
-        start_position: u64,
+        positions: RowPositions<'_>,
         batch: &RecordBatch,
         file_path: &str,
     ) -> Result<(), String> {
         if self.capped {
             return Ok(());
         }
-        index_batch(
-            batch,
-            file_id,
-            start_position,
-            &mut self.dictionaries,
-            &mut self.maps,
-            file_path,
-        )?;
+        if let RowPositions::Explicit(explicit) = positions
+            && explicit.len() != batch.num_rows()
+        {
+            return Err(format!(
+                "{file_path}: {} row positions for {} rows",
+                explicit.len(),
+                batch.num_rows()
+            ));
+        }
+        for shape in &mut self.shapes {
+            let retained = shape.ingest(file_id, positions, batch, file_path)?;
+            self.accumulated_bytes = self.accumulated_bytes.saturating_add(retained);
+        }
         self.rows += batch.num_rows() as u64;
-        if approx_bytes(&self.dictionaries, &self.maps) > self.max_bytes {
+        if self.accumulated_bytes > self.max_bytes {
             self.capped = true;
         }
         Ok(())
@@ -1149,12 +1585,23 @@ impl BuildState {
         files: &[IndexedFile],
         started: Instant,
         rss_before: Option<u64>,
+        session: VortexSession,
     ) -> Result<Option<SnapshotLookupIndex>, String> {
-        if self.capped {
+        let Self {
+            shapes,
+            file_ids,
+            file_order,
+            rows,
+            max_bytes,
+            capped,
+            chunk_rows,
+            ..
+        } = self;
+        if capped {
             return Ok(None);
         }
         let listed: HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
-        let observed: HashSet<&str> = self.file_order.iter().map(String::as_str).collect();
+        let observed: HashSet<&str> = file_order.iter().map(String::as_str).collect();
         if listed != observed {
             return Err(format!(
                 "indexed file set does not match the snapshot listing ({} observed, {} listed)",
@@ -1164,23 +1611,32 @@ impl BuildState {
         }
         // Re-key the postings' file ids onto the listing's order so `files[id]`
         // resolves, whatever order the build happened to see the files in.
-        let mut files_by_id: Vec<IndexedFile> = Vec::with_capacity(self.file_order.len());
-        for path in &self.file_order {
+        let mut files_by_id: Vec<IndexedFile> = Vec::with_capacity(file_order.len());
+        for path in &file_order {
             let file = files
                 .iter()
                 .find(|f| &f.path == path)
                 .ok_or_else(|| format!("listing lost {path}"))?;
             files_by_id.push(file.clone());
         }
-        let file_ids = self.file_ids;
-        let approx = approx_bytes(&self.dictionaries, &self.maps);
-        let per_key_entries = self
-            .maps
+
+        let compressor = BtrBlocksCompressorBuilder::default().build();
+        let mut built = Vec::with_capacity(shapes.len());
+        let mut resident = 0usize;
+        for shape in shapes {
+            let shape = shape.finish(&session, &compressor, chunk_rows)?;
+            resident = resident.saturating_add(shape.resident_bytes());
+            built.push(shape);
+        }
+        if resident > max_bytes {
+            return Ok(None);
+        }
+
+        let per_key_entries = built
             .iter()
-            .map(|map| (map.spec.label.clone(), map.entries.len(), map.postings))
+            .map(|shape| (shape.label.clone(), shape.distinct_keys, shape.len))
             .collect();
         let file_count = files_by_id.len();
-
         Ok(Some(SnapshotLookupIndex {
             snapshot_id,
             files: files_by_id,
@@ -1188,15 +1644,15 @@ impl BuildState {
             stats: BuildStats {
                 duration: started.elapsed(),
                 files: file_count,
-                rows: self.rows,
-                distinct_strings: self.dictionaries.distinct_values(),
-                approx_bytes: approx,
+                rows,
+                distinct_keys: built.iter().map(|shape| shape.distinct_keys).sum(),
+                approx_bytes: resident,
                 rss_before,
-                rss_after: resident_bytes(),
+                rss_after: super::tuning::proc_self_rss_bytes(),
                 per_key_entries,
             },
-            dictionaries: self.dictionaries,
-            maps: self.maps,
+            shapes: built,
+            session,
         }))
     }
 }
@@ -1205,9 +1661,9 @@ impl BuildState {
 /// snapshot.
 ///
 /// The write-time index trusts that the writer appends batches in arrival order,
-/// so its positions are only as good as that invariant. Diffing it against an
-/// index built by actually scanning the finished files is what turns that from
-/// an assumption into a check.
+/// so its positions are only as good as that invariant. The read-back build takes
+/// every position from Vortex's own `row_idx()`, so diffing the two turns that
+/// invariant from an assumption into a check.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LookupIndexVerification {
     /// The snapshot both indexes describe.
@@ -1219,7 +1675,7 @@ pub struct LookupIndexVerification {
     pub keys_per_shape: Vec<(String, usize, usize)>,
     /// Postings per lookup shape, as `(shape, write-time, read-back)`.
     pub postings_per_shape: Vec<(String, usize, usize)>,
-    /// Keys whose postings were compared value-for-value.
+    /// Distinct keys whose postings were compared value-for-value.
     pub keys_compared: usize,
     /// Every disagreement found, described in full.
     pub mismatches: Vec<String>,
@@ -1233,9 +1689,11 @@ impl LookupIndexVerification {
     }
 }
 
-/// Compares two indexes over the same snapshot, key for key and address for
-/// address. Ids are build-order dependent, so the comparison goes through the
-/// interned strings and the resolved file paths.
+/// How many entry disagreements a verification spells out before summarizing.
+const MAX_REPORTED_MISMATCHES: usize = 20;
+
+/// Compares two indexes over the same snapshot, entry for entry. File ids are
+/// build-order dependent, so the comparison goes through resolved file paths.
 fn diff_indexes(
     write_time: &SnapshotLookupIndex,
     read_back: &SnapshotLookupIndex,
@@ -1252,111 +1710,90 @@ fn diff_indexes(
         ));
         return report;
     }
-    if write_time.maps.len() != read_back.maps.len() {
+    if write_time.shapes.len() != read_back.shapes.len() {
         report
             .mismatches
             .push("different key-shape counts".to_string());
         return report;
     }
 
-    for (write_map, read_map) in write_time.maps.iter().zip(&read_back.maps) {
+    for (write_shape, read_shape) in write_time.shapes.iter().zip(&read_back.shapes) {
+        let label = &write_shape.label;
         report.keys_per_shape.push((
-            write_map.spec.label.clone(),
-            write_map.entries.len(),
-            read_map.entries.len(),
+            label.clone(),
+            write_shape.distinct_keys,
+            read_shape.distinct_keys,
         ));
-        report.postings_per_shape.push((
-            write_map.spec.label.clone(),
-            write_map.postings,
-            read_map.postings,
-        ));
-        if write_map.entries.len() != read_map.entries.len() {
+        report
+            .postings_per_shape
+            .push((label.clone(), write_shape.len, read_shape.len));
+        if write_shape.distinct_keys != read_shape.distinct_keys {
             report.mismatches.push(format!(
-                "{}: {} keys write-time vs {} read-back",
-                write_map.spec.label,
-                write_map.entries.len(),
-                read_map.entries.len()
+                "{label}: {} keys write-time vs {} read-back",
+                write_shape.distinct_keys, read_shape.distinct_keys
             ));
         }
 
-        let (Some(read_first), Some(read_second), Some(write_first), Some(write_second)) = (
-            read_back.dictionaries.get(&read_map.spec.columns[0]),
-            read_back.dictionaries.get(&read_map.spec.columns[1]),
-            write_time.dictionaries.get(&write_map.spec.columns[0]),
-            write_time.dictionaries.get(&write_map.spec.columns[1]),
-        ) else {
-            report
-                .mismatches
-                .push(format!("{}: missing a dictionary", write_map.spec.label));
-            continue;
-        };
-
-        for (&(a, b), read_postings) in &read_map.entries {
-            let (Some(first), Some(second)) = (read_first.value(a), read_second.value(b)) else {
+        let entries = write_shape
+            .resolved_entries(write_time)
+            .and_then(|w| read_shape.resolved_entries(read_back).map(|r| (w, r)));
+        let (written, read) = match entries {
+            Ok(entries) => entries,
+            Err(error) => {
                 report
                     .mismatches
-                    .push(format!("{}: unresolvable key ids", write_map.spec.label));
+                    .push(format!("{label}: could not read entries: {error}"));
                 continue;
-            };
-            report.keys_compared += 1;
-            let expected = resolve_postings(read_back, read_postings);
-            let found = write_first
-                .ids
-                .get(first)
-                .copied()
-                .zip(write_second.ids.get(second).copied())
-                .and_then(|(x, y)| write_map.entries.get(&(x, y)))
-                .map(|postings| resolve_postings(write_time, postings));
-            match found {
-                Some(found) if found == expected => {}
-                Some(found) => report.mismatches.push(format!(
-                    "{} [{first:?}, {second:?}]: write-time {found:?} vs read-back {expected:?}",
-                    write_map.spec.label
-                )),
-                None => report.mismatches.push(format!(
-                    "{} [{first:?}, {second:?}]: missing from the write-time index",
-                    write_map.spec.label
-                )),
             }
+        };
+        report.keys_compared += read_shape.distinct_keys;
+        if written.len() != read.len() {
+            report.mismatches.push(format!(
+                "{label}: {} postings write-time vs {} read-back",
+                written.len(),
+                read.len()
+            ));
+        }
+        let mut disagreements = 0usize;
+        for (index, (w, r)) in written.iter().zip(&read).enumerate() {
+            if w == r {
+                continue;
+            }
+            disagreements += 1;
+            if disagreements <= MAX_REPORTED_MISMATCHES {
+                report.mismatches.push(format!(
+                    "{label} entry {index}: write-time ({:?}, {}) vs read-back ({:?}, {})",
+                    w.1, w.2, r.1, r.2
+                ));
+            }
+        }
+        if disagreements > MAX_REPORTED_MISMATCHES {
+            report.mismatches.push(format!(
+                "{label}: {} further entries disagree",
+                disagreements - MAX_REPORTED_MISMATCHES
+            ));
         }
     }
     report
 }
 
-/// Postings as sorted `(file path, file-local position)` pairs, so two builds
-/// that assigned different file ids still compare equal.
-fn resolve_postings(index: &SnapshotLookupIndex, postings: &Postings) -> Vec<(String, u64)> {
-    let mut out: Vec<(String, u64)> = postings
-        .iter()
-        .map(|packed| {
-            let file_id = (packed >> POSITION_BITS) as usize;
-            let path = index
-                .files
-                .get(file_id)
-                .map_or_else(|| format!("<unknown file {file_id}>"), |f| f.path.clone());
-            (path, packed & POSITION_MASK)
-        })
-        .collect();
-    out.sort();
-    out
-}
-
-/// Diffs the published index against a fresh read-back build of the same
-/// snapshot's files.
+/// Diffs `published` against a fresh read-back build of the same snapshot's
+/// `files`.
 pub(crate) async fn verify_against_read_back(
     state: &LookupIndexState,
+    published: Arc<SnapshotLookupIndex>,
     store: &Arc<dyn ObjectStore>,
     files: Vec<IndexedFile>,
     schema: &arrow_schema::Schema,
 ) -> Result<LookupIndexVerification, String> {
-    let published = state
-        .published()
-        .ok_or_else(|| "no published index to verify".to_string())?;
     let snapshot_id = published.snapshot_id.clone();
     let read_back = build(state, snapshot_id, store, files, schema)
         .await?
         .ok_or_else(|| "read-back build exceeded the byte cap".to_string())?;
-    Ok(diff_indexes(&published, &read_back))
+    // Decoding every entry of both indexes is CPU work, like building them.
+    tokio::task::spawn_blocking(move || diff_indexes(&published, &read_back))
+        .await
+        .map_err(|e| format!("index verification task failed: {e}"))
 }
 
 /// Builds the index from the rows as they are WRITTEN, instead of reading the
@@ -1406,7 +1843,7 @@ impl IncrementalIndexBuilder {
             state: Mutex::new(Some(BuildState::new(specs, max_bytes, schema)?)),
             failure: Mutex::new(None),
             started: Instant::now(),
-            rss_before: resident_bytes(),
+            rss_before: super::tuning::proc_self_rss_bytes(),
         })
     }
 
@@ -1415,9 +1852,8 @@ impl IncrementalIndexBuilder {
     }
 
     fn record_failure(&self, message: String) {
-        if let Ok(mut failure) = self.failure.lock()
-            && failure.is_none()
-        {
+        let mut failure = self.failure.lock();
+        if failure.is_none() {
             tracing::warn!(
                 table = %self.table_name,
                 snapshot_id = %self.snapshot_id,
@@ -1432,13 +1868,12 @@ impl IncrementalIndexBuilder {
     /// the scan lists it, which also supplies the sizes and modification times
     /// the scan-time snapshot check compares.
     fn finish(&self, files: &[IndexedFile]) -> Result<Option<SnapshotLookupIndex>, String> {
-        if let Some(failure) = self.failure.lock().map_err(|e| e.to_string())?.clone() {
+        if let Some(failure) = self.failure.lock().clone() {
             return Err(failure);
         }
         let state = self
             .state
             .lock()
-            .map_err(|e| e.to_string())?
             .take()
             .ok_or_else(|| "index accumulator already consumed".to_string())?;
         state.into_index(
@@ -1446,6 +1881,7 @@ impl IncrementalIndexBuilder {
             files,
             self.started,
             self.rss_before,
+            VortexSession::default(),
         )
     }
 }
@@ -1457,11 +1893,8 @@ impl vortex_datafusion::VortexWriteObserver for IncrementalIndexBuilder {
         first_row_position: u64,
         batch: &RecordBatch,
     ) {
-        let path = file_path.to_string();
-        let Ok(mut slot) = self.state.lock() else {
-            self.record_failure("index accumulator lock poisoned".to_string());
-            return;
-        };
+        let path: &str = file_path.as_ref();
+        let mut slot = self.state.lock();
         // `None` once the build has been consumed; a late batch then has nowhere
         // to go, and publishing a partial index is never acceptable.
         let Some(state) = slot.as_mut() else {
@@ -1472,7 +1905,7 @@ impl vortex_datafusion::VortexWriteObserver for IncrementalIndexBuilder {
         if state.capped {
             return;
         }
-        let file_id = match state.file_id(&path) {
+        let file_id = match state.file_id(path) {
             Ok(id) => id,
             Err(e) => {
                 drop(slot);
@@ -1480,13 +1913,23 @@ impl vortex_datafusion::VortexWriteObserver for IncrementalIndexBuilder {
                 return;
             }
         };
-        if let Err(e) = state.ingest(file_id, first_row_position, batch, &path) {
+        if let Err(e) = state.ingest(
+            file_id,
+            RowPositions::Contiguous(first_row_position),
+            batch,
+            path,
+        ) {
             drop(slot);
             self.record_failure(e);
         }
     }
 }
 
+/// Builds the index by reading the snapshot's finished files.
+///
+/// Every position comes from Vortex's `row_idx()` rather than from counting the
+/// rows a scan returns, so this build shares no assumption about row order with
+/// the write-time one it verifies.
 async fn build(
     state: &LookupIndexState,
     snapshot_id: String,
@@ -1494,11 +1937,31 @@ async fn build(
     files: Vec<IndexedFile>,
     schema: &arrow_schema::Schema,
 ) -> Result<Option<SnapshotLookupIndex>, String> {
+    use vortex::expr::{get_item, pack, root};
+
     let started = Instant::now();
-    let rss_before = resident_bytes();
+    let rss_before = super::tuning::proc_self_rss_bytes();
     let mut build = BuildState::new(&state.specs, state.max_bytes(), schema)?;
     let columns = build.key_columns();
     let session = VortexSession::default();
+
+    let mut target_fields: Vec<FieldRef> = columns.iter().map(KeyColumn::stored_field).collect();
+    target_fields.push(Arc::new(Field::new(
+        READ_BACK_POSITION_COLUMN,
+        DataType::UInt64,
+        false,
+    )));
+    let target = Field::new_struct("", target_fields, false);
+    let projection = pack(
+        columns
+            .iter()
+            .map(|column| (column.name.clone(), get_item(column.name.as_str(), root())))
+            .chain(std::iter::once((
+                READ_BACK_POSITION_COLUMN.to_string(),
+                row_idx(),
+            ))),
+        Nullability::NonNullable,
+    );
 
     for file in &files {
         let file_id = build.file_id(&file.path)?;
@@ -1509,130 +1972,61 @@ async fn build(
             .await
             .map_err(|e| format!("open {}: {e}", file.path))?;
 
-        let mut scan_builder = vxf.scan().map_err(|e| format!("scan {}: {e}", file.path))?;
-        {
-            use vortex::expr::{root, select};
-            let projected: Vec<&str> = columns.iter().map(String::as_str).collect();
-            scan_builder = scan_builder.with_projection(select(projected, root()));
-        }
-
-        let mut stream = scan_builder
+        let mut stream = vxf
+            .scan()
+            .map_err(|e| format!("scan {}: {e}", file.path))?
+            .with_projection(projection.clone())
             .into_stream()
             .map_err(|e| format!("stream {}: {e}", file.path))?;
 
-        // An unfiltered ordered scan yields rows in physical order, so a manual
-        // counter is the file-local position — the same convention the write-time
-        // builder gets straight from the sink.
-        let mut position: u64 = 0;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| format!("read {}: {e}", file.path))?;
-            let array = chunk
-                .into_arrow_preferred()
-                .map_err(|e| format!("to arrow {}: {e}", file.path))?;
-            if array.is_empty() {
+            if chunk.is_empty() {
                 continue;
             }
-            let struct_array = array
-                .as_any()
-                .downcast_ref::<arrow::array::StructArray>()
-                .ok_or_else(|| format!("{}: scan did not return a StructArray", file.path))?;
-            let batch = RecordBatch::from(struct_array);
-
-            build.ingest(file_id, position, &batch, &file.path)?;
-            position += batch.num_rows() as u64;
+            let mut ctx = session.create_execution_ctx();
+            let array = session
+                .arrow()
+                .execute_arrow(chunk, Some(&target), &mut ctx)
+                .map_err(|e| format!("to arrow {}: {e}", file.path))?;
+            let batch = RecordBatch::from(
+                array
+                    .as_struct_opt()
+                    .ok_or_else(|| format!("{}: scan did not return a struct", file.path))?,
+            );
+            let positions = batch
+                .column_by_name(READ_BACK_POSITION_COLUMN)
+                .and_then(|column| column.as_primitive_opt::<UInt64Type>())
+                .ok_or_else(|| format!("{}: row positions are not UInt64", file.path))?
+                .clone();
+            build.ingest(
+                file_id,
+                RowPositions::Explicit(&positions),
+                &batch,
+                &file.path,
+            )?;
             if build.capped {
                 return Ok(None);
             }
         }
     }
 
-    build.into_index(snapshot_id, &files, started, rss_before)
-}
-
-fn index_batch(
-    batch: &RecordBatch,
-    file_id: u32,
-    start: u64,
-    dictionaries: &mut Dictionaries,
-    maps: &mut [KeyMap],
-    file_path: &str,
-) -> Result<(), String> {
-    let num_rows = batch.num_rows();
-
-    // Interned ids for every indexed column, resolved once per batch.
-    let mut per_column: HashMap<String, Vec<Option<u32>>> = HashMap::new();
-    for map in maps.iter() {
-        for column in &map.spec.columns {
-            if per_column.contains_key(column) {
-                continue;
-            }
-            let index = batch
-                .schema()
-                .column_with_name(column)
-                .map(|(index, _)| index)
-                .or_else(|| {
-                    batch
-                        .schema()
-                        .fields()
-                        .iter()
-                        .position(|f| f.name().eq_ignore_ascii_case(column))
-                })
-                .ok_or_else(|| format!("{file_path}: column '{column}' not in the scan output"))?;
-            let ids = dictionaries
-                .get_mut(column)
-                .ok_or_else(|| format!("no dictionary for key column '{column}'"))?
-                .intern_column(batch.column(index))
-                .map_err(|e| format!("{file_path}: {column}: {e}"))?;
-            per_column.insert(column.clone(), ids);
-        }
-    }
-
-    for map in maps.iter_mut() {
-        let first = &per_column[&map.spec.columns[0]];
-        let second = &per_column[&map.spec.columns[1]];
-        for row in 0..num_rows {
-            // A NULL can never satisfy an equality predicate, so an incomplete
-            // key is simply not indexed.
-            let (Some(a), Some(b)) = (first[row], second[row]) else {
-                continue;
-            };
-            let packed = (u64::from(file_id) << POSITION_BITS) | (start + row as u64);
-            match map.entries.entry((a, b)) {
-                Entry::Occupied(mut occupied) => occupied.get_mut().push(packed),
-                Entry::Vacant(vacant) => {
-                    vacant.insert(Postings::new(packed));
-                }
-            }
-            map.postings += 1;
-        }
-    }
-
-    Ok(())
-}
-
-/// Structural estimate of the resident index, not a measured allocator
-/// footprint: key bytes, one hash-table slot per entry, and posting lists.
-fn approx_bytes(dictionaries: &Dictionaries, maps: &[KeyMap]) -> usize {
-    dictionaries.approx_bytes() + maps.iter().map(KeyMap::approx_bytes).sum::<usize>()
-}
-
-/// Process resident set size, when the platform exposes it cheaply.
-fn resident_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
+    // Sorting and compressing the index is CPU work that runs for seconds on a
+    // large table, so it goes to the blocking pool rather than the runtime.
+    match tokio::task::spawn_blocking(move || {
+        build.into_index(snapshot_id, &files, started, rss_before, session)
+    })
+    .await
     {
-        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-        Some(pages * 4096)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
+        Ok(index) => index,
+        Err(error) => Err(format!("index build task failed: {error}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Int64Array, StringArray};
 
     #[test]
     fn key_spec_requires_exactly_two_columns() {
@@ -1647,17 +2041,215 @@ mod tests {
     }
 
     #[test]
-    fn postings_keep_every_duplicate_key_match() {
-        let mut postings = Postings::new(1);
-        postings.push(7);
-        postings.push(9);
-        assert_eq!(postings.iter().collect::<Vec<_>>(), vec![1, 7, 9]);
+    fn packed_postings_round_trip_file_and_position() {
+        let packed = (u64::from(MAX_FILE_ID) << POSITION_BITS) | POSITION_MASK;
+        assert_eq!(packed >> POSITION_BITS, u64::from(MAX_FILE_ID));
+        assert_eq!(packed & POSITION_MASK, POSITION_MASK);
     }
 
     #[test]
-    fn packed_postings_round_trip_file_and_position() {
-        let packed = (u64::from(3u32) << POSITION_BITS) | 0x000c_1fff;
-        assert_eq!(packed >> POSITION_BITS, 3);
-        assert_eq!(packed & POSITION_MASK, 0x000c_1fff);
+    fn a_table_selection_removes_deleted_candidates() {
+        let deleted: roaring::RoaringTreemap = [3u64, 9].into_iter().collect();
+        let exclude = Selection::ExcludeRoaring(deleted);
+        let kept: Vec<u64> = [1u64, 3, 5, 9]
+            .into_iter()
+            .filter(|&p| selection_keeps(&exclude, p))
+            .collect();
+        assert_eq!(kept, vec![1, 5]);
+        let include = Selection::IncludeByIndex(Buffer::from_iter([5u64, 9]));
+        assert!(selection_keeps(&include, 9));
+        assert!(!selection_keeps(&include, 1));
+        assert!(selection_keeps(&Selection::All, 1));
+    }
+
+    #[test]
+    fn a_column_matching_by_case_only_twice_is_refused() {
+        let schema = arrow_schema::Schema::new(vec![
+            Field::new("TenantId", DataType::Utf8, false),
+            Field::new("tenantid", DataType::Utf8, false),
+            Field::new("Service", DataType::Utf8, true),
+        ]);
+        assert_eq!(
+            KeyColumn::resolve(&schema, "tenantid").expect("exact").name,
+            "tenantid"
+        );
+        KeyColumn::resolve(&schema, "TENANTID").expect_err("a name matching two columns by case");
+        let service = KeyColumn::resolve(&schema, "service").expect("unique by case");
+        assert_eq!(service.name, "Service");
+        assert!(service.nullable);
+    }
+
+    fn keyed_batch(tenants: Vec<Option<i64>>, services: Vec<Option<String>>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![
+                Field::new("tenant", DataType::Int64, true),
+                Field::new("service", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(tenants)),
+                Arc::new(StringArray::from(services)),
+            ],
+        )
+        .expect("batch")
+    }
+
+    /// Every key, including keys that straddle and coincide with block heads,
+    /// resolves to exactly the addresses a brute-force map holds, and absent or
+    /// NULL keys resolve to nothing.
+    #[test]
+    fn probes_match_a_brute_force_map_across_blocks_and_files() {
+        let schema = arrow_schema::Schema::new(vec![
+            Field::new("tenant", DataType::Int64, true),
+            Field::new("service", DataType::Utf8, true),
+        ]);
+        let spec = KeySpec::parse("tenant+service").expect("spec");
+        let mut build = BuildState::new(&[spec], usize::MAX, &schema)
+            .expect("build state")
+            .with_chunk_rows(BLOCK_ROWS * 2);
+
+        let mut expected: HashMap<(i64, String), Vec<(String, u64)>> = HashMap::new();
+        let mut files = Vec::new();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for file in 0..3u64 {
+            let path = format!("snapshot/file-{file}.vortex");
+            files.push(IndexedFile {
+                path: path.clone(),
+                size: 1,
+                last_modified_ms: 0,
+            });
+            let file_id = build.file_id(&path).expect("file id");
+            let mut position = 0u64;
+            for _batch in 0..4 {
+                let mut tenants = Vec::new();
+                let mut services = Vec::new();
+                for _ in 0..(BLOCK_ROWS * 3 / 2) {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    // Few distinct keys, so most keys repeat across blocks and files.
+                    let tenant = i64::try_from((state >> 33) % 7).expect("small");
+                    let service = format!("s{}", (state >> 13) % 40);
+                    let null = (state >> 7).is_multiple_of(23);
+                    if !null {
+                        expected
+                            .entry((tenant, service.clone()))
+                            .or_default()
+                            .push((path.clone(), position));
+                    }
+                    tenants.push(if null { None } else { Some(tenant) });
+                    services.push(Some(service));
+                    position += 1;
+                }
+                let start = position - tenants.len() as u64;
+                build
+                    .ingest(
+                        file_id,
+                        RowPositions::Contiguous(start),
+                        &keyed_batch(tenants, services),
+                        &path,
+                    )
+                    .expect("ingest");
+            }
+        }
+
+        let index = build
+            .into_index(
+                "snapshot".to_string(),
+                &files,
+                Instant::now(),
+                None,
+                VortexSession::default(),
+            )
+            .expect("finish")
+            .expect("under the cap");
+        assert!(
+            index.shapes[0].blocks() > 4,
+            "fixture must span many blocks"
+        );
+        assert_eq!(index.shapes[0].distinct_keys, expected.len());
+
+        for ((tenant, service), addresses) in &expected {
+            let hit = index
+                .probe(&|column| match column {
+                    "tenant" => Some(ScalarValue::Int64(Some(*tenant))),
+                    "service" => Some(ScalarValue::Utf8(Some(service.clone()))),
+                    _ => None,
+                })
+                .expect("pinned key");
+            let mut found: Vec<(String, u64)> = hit
+                .per_file
+                .iter()
+                .flat_map(|(path, positions)| positions.iter().map(|p| (path.clone(), *p)))
+                .collect();
+            found.sort();
+            let mut wanted = addresses.clone();
+            wanted.sort();
+            assert_eq!(found, wanted, "key ({tenant}, {service})");
+        }
+
+        let miss = index
+            .probe(&|column| match column {
+                "tenant" => Some(ScalarValue::Int64(Some(3))),
+                "service" => Some(ScalarValue::Utf8(Some("absent".to_string()))),
+                _ => None,
+            })
+            .expect("pinned key");
+        assert!(miss.per_file.is_empty());
+        let null = index
+            .probe(&|column| match column {
+                "tenant" => Some(ScalarValue::Int64(None)),
+                "service" => Some(ScalarValue::Utf8(Some("s1".to_string()))),
+                _ => None,
+            })
+            .expect("pinned key");
+        assert!(null.per_file.is_empty());
+    }
+
+    /// A single shifted address is reported, so the read-back verification can
+    /// actually fail.
+    #[test]
+    fn verification_reports_a_shifted_address() {
+        let schema = arrow_schema::Schema::new(vec![
+            Field::new("tenant", DataType::Int64, true),
+            Field::new("service", DataType::Utf8, true),
+        ]);
+        let files = vec![IndexedFile {
+            path: "snapshot/file.vortex".to_string(),
+            size: 1,
+            last_modified_ms: 0,
+        }];
+        let index_with = |shift: u64| {
+            let spec = KeySpec::parse("tenant+service").expect("spec");
+            let mut build = BuildState::new(&[spec], usize::MAX, &schema).expect("build state");
+            let file_id = build.file_id(&files[0].path).expect("file id");
+            build
+                .ingest(
+                    file_id,
+                    RowPositions::Contiguous(shift),
+                    &keyed_batch(
+                        vec![Some(1), Some(2)],
+                        vec![Some("a".to_string()), Some("b".to_string())],
+                    ),
+                    &files[0].path,
+                )
+                .expect("ingest");
+            build
+                .into_index(
+                    "snapshot".to_string(),
+                    &files,
+                    Instant::now(),
+                    None,
+                    VortexSession::default(),
+                )
+                .expect("finish")
+                .expect("under the cap")
+        };
+        assert!(diff_indexes(&index_with(0), &index_with(0)).agrees());
+        let report = diff_indexes(&index_with(1), &index_with(0));
+        assert!(!report.agrees());
+        assert_eq!(
+            report.keys_per_shape,
+            vec![("tenant+service".to_string(), 2, 2)]
+        );
     }
 }

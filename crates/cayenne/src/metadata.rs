@@ -834,8 +834,9 @@ pub struct VortexConfig {
     /// `configuration_matches` — turning it on or off never recreates the table.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lookup_index_keys: Vec<String>,
-    /// Cap on the point-lookup index's estimated resident bytes
-    /// (`cayenne_lookup_index_max_bytes`). `None` derives the cap from
+    /// Cap on the point-lookup index's bytes (`cayenne_lookup_index_max_bytes`):
+    /// both what a build accumulates before it compresses the index and the
+    /// resident index it publishes. `None` derives the cap from
     /// [`Self::pk_keyset_cache_mb`], since both are long-lived per-table resident
     /// state outside query execution. A build that exceeds the cap is abandoned
     /// and the table keeps scanning normally. Runtime-only.

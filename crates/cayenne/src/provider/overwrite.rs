@@ -233,6 +233,14 @@ impl PreparedOverwrite {
     ///
     /// Returns an error if swapping the listing table fails. Other steps are best-effort.
     pub async fn finish(self) -> Result<u64> {
+        // Publish the point-lookup index ahead of the visibility flip: an index
+        // keyed to a snapshot no scan can see yet is inert (the scan-time
+        // snapshot check refuses it), so publishing it early is safe, while
+        // publishing it late would leave a window in which every lookup falls
+        // back to a full scan.
+        self.table
+            .publish_lookup_index_for_snapshot(&self.new_snapshot_id)
+            .await;
         // Publish the new snapshot as a single atomic visibility flip under the listing
         // fence (snapshot id + deletion caches + inline cache + listing swap), so a
         // concurrent scan never observes a torn state. Full rationale on
@@ -242,13 +250,6 @@ impl PreparedOverwrite {
         // catalog clear and insert already committed together, so the in-memory
         // inline counters must go from "old corpus" to "these rows" without a
         // window in which the new snapshot is paired with an empty inline view.
-        // Ahead of the visibility flip: an index keyed to a snapshot no scan can
-        // see yet is inert (the scan-time snapshot check refuses it), so
-        // publishing it early is safe, while publishing it late would leave a
-        // window in which every lookup falls back to a full scan.
-        self.table
-            .publish_lookup_index_for_snapshot(&self.new_snapshot_id)
-            .await;
         self.table
             .publish_overwrite_snapshot(
                 &self.new_snapshot_id,
@@ -583,24 +584,25 @@ impl CayenneTableProvider {
             self.sort_overwrite_input(data, target_partitions)?;
 
         let target_size_bytes = self.target_file_size_bytes();
-        // Overwrite replaces the entire table, and anything that reached here did
-        // not fit the inline caps, so it is large by definition; shard across the
-        // full write concurrency (no size cap on the fan-out). Deliberately NOT
-        // sized from the bytes the probe buffered: that is only a lower bound, and
-        // under-sharding a multi-GB refresh to one writer would serialize the encode.
         // Build the point-lookup index from the rows this write is already
         // touching. The sink reports each batch's file and file-local position,
         // so the index is complete when the write is — no second pass over the
         // finished files, and nothing to rebuild after the flip.
         let lookup_index_observer = self.begin_lookup_index_build(&new_snapshot_id);
+        // Overwrite replaces the entire table, and anything that reached here did
+        // not fit the inline caps, so it is large by definition; shard across the
+        // full write concurrency (no size cap on the fan-out). Deliberately NOT
+        // sized from the bytes the probe buffered: that is only a lower bound, and
+        // under-sharding a multi-GB refresh to one writer would serialize the encode.
         let (row_count, _files_written, write_stats_acc) = self
-            .write_to_snapshot_observed(
+            .write_to_snapshot_range_partitioned(
                 data,
                 target_size_bytes,
                 &new_snapshot_id,
                 target_partitions,
                 None,
                 write_policy,
+                None,
                 lookup_index_observer,
             )
             .await?;

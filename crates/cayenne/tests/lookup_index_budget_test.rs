@@ -50,9 +50,11 @@ const SMALL_ROWS: usize = 4_000;
 /// A composite of an INT64 and a string: the encoding has to be type-general,
 /// which it only is because keys go through the `RowConverter`.
 const INDEX_KEY: &str = "TenantId+ServiceId";
-/// Chosen to separate the two fixtures with room to spare: the 4,000-row index
-/// measures ~0.75 MiB against this, the 40,000-row one several times over it.
-const MAX_BYTES: usize = 2 * 1024 * 1024;
+/// Chosen to separate the two fixtures with room to spare. The cap bounds what a
+/// build accumulates as well as the resident index: the 4,000-row build
+/// accumulates ~0.2 MiB and resides in ~55 KiB, while the 40,000-row build
+/// accumulates ~2 MiB, twice this, before it could compress anything.
+const MAX_BYTES: usize = 1024 * 1024;
 
 fn service_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -223,14 +225,14 @@ async fn an_index_over_its_byte_cap_is_not_published() {
         .downcast_ref::<Int64Array>()
         .expect("count is i64")
         .value(0);
-    assert_eq!(count, i64::try_from(ROWS).unwrap());
+    assert_eq!(count, i64::try_from(ROWS).expect("fits i64"));
 }
 
 /// A composite `(INT64, Utf8)` key is indexed and used.
 ///
-/// Keys are `RowConverter`-encoded per column, so the index is not limited to
-/// string keys — and this is what keeps the cap test above honest, by showing
-/// the same key shape working when it fits.
+/// Keys are held in their stored types and compared through the `RowConverter`
+/// encoding, so the index is not limited to string keys — and this is what keeps
+/// the cap test above honest, by showing the same key shape working when it fits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_mixed_type_composite_key_is_indexed() {
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)

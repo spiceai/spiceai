@@ -2814,11 +2814,14 @@ pub mod cayenne {
     static MEMORY_ACCOUNT_RESERVED_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 
     /// Records the memory Cayenne accounts for one table against the `DataFusion`
-    /// query pool: the three computed components, and the reservation those
-    /// components actually resized on the pool.
+    /// query pool: the computed components, and the reservation those components
+    /// actually resized on the pool.
     ///
     /// `dimensions` carries `table`; the components are split by a `kind` label
-    /// (`keyset` / `deletion_index` / `cold_existence`).
+    /// (`keyset` / `deletion_index` / `cold_existence` / `lookup_index`). The
+    /// `lookup_index` component is `None` for a table that configures no
+    /// point-lookup index, which publishes no series for it rather than a `0`
+    /// that would read as an empty index.
     ///
     /// **Publishing both halves is the point.** `process_resident_memory_bytes`
     /// describes fact and the pool gauges describe intent, and closing the gap
@@ -2832,6 +2835,7 @@ pub mod cayenne {
         keyset_bytes: u64,
         deletion_bytes: u64,
         cold_existence_bytes: u64,
+        lookup_index_bytes: Option<u64>,
         reserved_bytes: u64,
         dimensions: &[KeyValue],
     ) {
@@ -2839,16 +2843,20 @@ pub mod cayenne {
             operational_meter()
                 .u64_gauge("cayenne_memory_account_bytes")
                 .with_description(
-                    "Memory Cayenne has COMPUTED for one table and registered against the DataFusion query pool, by kind (`keyset`, `deletion_index`, `cold_existence`). Compare the sum against `cayenne_memory_account_reserved_bytes`.",
+                    "Memory Cayenne has COMPUTED for one table and registered against the DataFusion query pool, by kind (`keyset`, `deletion_index`, `cold_existence`, `lookup_index`). Compare the sum against `cayenne_memory_account_reserved_bytes`.",
                 )
                 .with_unit("By")
                 .build()
         });
         for (kind, bytes) in [
-            ("keyset", keyset_bytes),
-            ("deletion_index", deletion_bytes),
-            ("cold_existence", cold_existence_bytes),
+            ("keyset", Some(keyset_bytes)),
+            ("deletion_index", Some(deletion_bytes)),
+            ("cold_existence", Some(cold_existence_bytes)),
+            ("lookup_index", lookup_index_bytes),
         ] {
+            let Some(bytes) = bytes else {
+                continue;
+            };
             let d = with_label(dimensions, "kind", kind);
             components.record(bytes, &d);
         }
@@ -3177,9 +3185,8 @@ pub mod cayenne {
     /// scan. Outcomes (the `outcome` dimension): `selected` (row selection
     /// attached), `empty` (complete index miss, no candidate rows), `unbuilt`
     /// (no published index yet), `snapshot_mismatch` (the scan's file set does
-    /// not match the indexed snapshot), `deletions` (deletion state the
-    /// index does not combine with a row selection). `dimensions` carries
-    /// `table`, `shape` and `outcome`.
+    /// not match the indexed snapshot). `dimensions` carries `table`, `shape`
+    /// and `outcome`.
     pub fn track_lookup_index_probe(dimensions: &[KeyValue]) {
         LOOKUP_INDEX_PROBE
             .get_or_init(|| {
@@ -3235,8 +3242,9 @@ pub mod cayenne {
     static LOOKUP_INDEX_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 
     /// Estimated resident size of a published point-lookup index. This is a
-    /// structural estimate (key bytes, table slots, posting lists), NOT a
-    /// measured allocator footprint; compare it with process RSS.
+    /// structural estimate (the compressed key and posting arrays plus the
+    /// retained block heads), NOT a measured allocator footprint; compare it
+    /// with process RSS.
     pub fn track_lookup_index_bytes(bytes: u64, dimensions: &[KeyValue]) {
         LOOKUP_INDEX_BYTES
             .get_or_init(|| {

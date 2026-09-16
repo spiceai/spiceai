@@ -751,14 +751,10 @@ async fn run_shard_writer(
             // observer can never be left holding positions for rows that were
             // not written.
             if let Some(observer) = write_observer.as_ref() {
-                let file_path = active_writer
-                    .as_ref()
-                    .ok_or_else(|| {
-                        exec_datafusion_err!("Missing active file writer while observing a batch")
-                    })?
-                    .path
-                    .clone();
-                observer.batch_written(&file_path, rows_in_file, &batch);
+                let writer = active_writer.as_ref().ok_or_else(|| {
+                    exec_datafusion_err!("Missing active file writer while observing a batch")
+                })?;
+                observer.batch_written(&writer.path, rows_in_file, &batch);
             }
             rows_in_file = rows_in_file
                 .checked_add(batch.num_rows() as u64)

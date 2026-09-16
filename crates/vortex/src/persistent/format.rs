@@ -279,6 +279,7 @@ pub struct WriteShardConfig {
 }
 
 /// Vortex implementation of a `DataFusion` [`FileFormat`].
+#[derive(Clone)]
 pub struct VortexFormat {
     session: VortexSession,
     opts: VortexTableOptions,
@@ -609,12 +610,8 @@ impl VortexFormat {
         access_plan_provider: Arc<dyn VortexAccessPlanProvider>,
     ) -> Self {
         Self {
-            session: self.session.clone(),
-            opts: self.opts.clone(),
             access_plan_provider: Some(access_plan_provider),
-            write_observer: self.write_observer.clone(),
-            segment_cache: self.segment_cache.clone(),
-            write_shard: self.write_shard.clone(),
+            ..self.clone()
         }
     }
 
@@ -624,12 +621,8 @@ impl VortexFormat {
     #[must_use]
     pub fn with_write_observer(&self, write_observer: Arc<dyn VortexWriteObserver>) -> Self {
         Self {
-            session: self.session.clone(),
-            opts: self.opts.clone(),
-            access_plan_provider: self.access_plan_provider.clone(),
             write_observer: Some(write_observer),
-            segment_cache: self.segment_cache.clone(),
-            write_shard: self.write_shard.clone(),
+            ..self.clone()
         }
     }
 
@@ -642,12 +635,8 @@ impl VortexFormat {
     #[must_use]
     pub fn with_write_shard(&self, config: WriteShardConfig) -> Self {
         Self {
-            session: self.session.clone(),
-            opts: self.opts.clone(),
-            access_plan_provider: self.access_plan_provider.clone(),
-            write_observer: self.write_observer.clone(),
-            segment_cache: self.segment_cache.clone(),
             write_shard: Some(config),
+            ..self.clone()
         }
     }
 

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Correctness checks for the point-lookup index index, run on
+//! Correctness checks for the point-lookup index, run on
 //! the REAL scan path: two identical Cayenne tables over identical data, one
 //! configured with `cayenne_lookup_index_keys` and one without, so the same
 //! process compares an indexed scan against an ordinary one.
@@ -44,7 +44,8 @@ use datafusion::prelude::SessionContext;
 
 /// The indexed table; every probe goes through the index.
 const INDEXED: &str = "svc_indexed";
-/// The identical control table, never named, so it always scans normally.
+/// The identical control table, built without index keys, so it always scans
+/// normally.
 const PLAIN: &str = "svc_plain";
 /// The plan-evidence test uses its own pair: index state is keyed per table for
 /// the whole process, so two tests sharing a table name would share (and
@@ -60,8 +61,8 @@ const INDEX_KEYS: [&str; 2] = ["TenantId+ServiceId", "TenantId+PoolId"];
 const ROWS: usize = 40_000;
 /// Accounts and pools are low-cardinality, so `(TenantId, PoolId)` is
 /// genuinely non-unique — the index must keep every candidate position.
-const ACCOUNTS: usize = 500;
-const POOLS: usize = 300;
+const ACCOUNTS: i64 = 500;
+const POOLS: i64 = 300;
 
 /// A key planted with three rows, the first two inactive, so `LIMIT 1` with
 /// `\"Active\" = 1` cannot be satisfied by taking the first indexed candidate.
@@ -112,12 +113,12 @@ fn service_rows(offset: i64, rows: usize) -> RecordBatch {
     for i in 0..rows {
         let id = offset + i64::try_from(i).expect("fits i64");
         auto_id.push(id);
-        account.push(format!("AC{:032x}", id % i64::try_from(ACCOUNTS).unwrap()));
+        account.push(format!("AC{:032x}", id % ACCOUNTS));
         application.push(format!("MG{id:032x}"));
         // A NULL key column can never satisfy an equality predicate, so the
         // index must simply not hold those rows.
         pool.push(if i % 10 < 7 {
-            Some(format!("NP{:032x}", id % i64::try_from(POOLS).unwrap()))
+            Some(format!("NP{:032x}", id % POOLS))
         } else {
             None
         });
@@ -127,7 +128,7 @@ fn service_rows(offset: i64, rows: usize) -> RecordBatch {
 
     // Three rows on one key; only the LAST is active.
     for (index, is_active) in [0, 0, 1].into_iter().enumerate() {
-        auto_id.push(offset + 900_000 + i64::try_from(index).unwrap());
+        auto_id.push(offset + 900_000 + i64::try_from(index).expect("fits i64"));
         account.push(DUP_ACCOUNT.to_string());
         application.push(DUP_APPLICATION.to_string());
         pool.push(Some(format!("NP{:032x}", 777)));
@@ -162,20 +163,16 @@ fn service_rows(offset: i64, rows: usize) -> RecordBatch {
 async fn build_table(
     fixture: &common::TestFixture,
     table_name: &str,
+    index_keys: &[&str],
     runtime_env: Arc<RuntimeEnv>,
 ) -> Arc<CayenneTableProvider> {
     // A small target file size so the table spans several Vortex files and the
-    // index has candidate FILES to prune, not just rows within one file.
-    // Only the tables under test are indexed; their controls are configured
-    // identically except for this one field, which is the whole comparison.
-    let lookup_index_keys = if table_name.starts_with("svc_indexed") {
-        INDEX_KEYS.iter().map(|k| (*k).to_string()).collect()
-    } else {
-        Vec::new()
-    };
+    // index has candidate FILES to prune, not just rows within one file. A table
+    // under test and its control differ only in `index_keys`, which is the whole
+    // comparison.
     let vortex_config = VortexConfig {
         target_vortex_file_size_mb: 1,
-        lookup_index_keys,
+        lookup_index_keys: index_keys.iter().map(|k| (*k).to_string()).collect(),
         ..VortexConfig::default()
     };
     let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), table_name);
@@ -306,15 +303,13 @@ async fn wait_for_index(provider: &Arc<CayenneTableProvider>, table: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lookup_index_matches_the_ordinary_scan() {
-    // Must be set before anything reads the index's configuration, which is
-    // resolved once per process.
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
     let runtime_env = Arc::new(RuntimeEnv::default());
 
-    let indexed = build_table(&fixture, INDEXED, Arc::clone(&runtime_env)).await;
-    let plain = build_table(&fixture, PLAIN, Arc::clone(&runtime_env)).await;
+    let indexed = build_table(&fixture, INDEXED, &INDEX_KEYS, Arc::clone(&runtime_env)).await;
+    let plain = build_table(&fixture, PLAIN, &[], Arc::clone(&runtime_env)).await;
 
     let batch = service_rows(0, ROWS);
     insert(&indexed, INDEXED, batch.clone()).await;
@@ -332,7 +327,7 @@ async fn lookup_index_matches_the_ordinary_scan() {
     let mut checked = 0;
     for i in 0..20i64 {
         let id = i * 97;
-        let account = format!("AC{:032x}", id % i64::try_from(ACCOUNTS).unwrap());
+        let account = format!("AC{:032x}", id % ACCOUNTS);
         let application = format!("MG{id:032x}");
         let sql = format!(
             "SELECT * FROM {{table}} WHERE \"TenantId\" = '{account}' \
@@ -350,8 +345,8 @@ async fn lookup_index_matches_the_ordinary_scan() {
 
     for i in 0..20i64 {
         let id = i * 131;
-        let account = format!("AC{:032x}", id % i64::try_from(ACCOUNTS).unwrap());
-        let pool = format!("NP{:032x}", id % i64::try_from(POOLS).unwrap());
+        let account = format!("AC{:032x}", id % ACCOUNTS);
+        let pool = format!("NP{:032x}", id % POOLS);
         let sql = format!(
             "SELECT * FROM {{table}} WHERE \"TenantId\" = '{account}' \
              AND \"PoolId\" = '{pool}' AND \"Active\" = 1 ORDER BY \"AutoId\""
@@ -472,7 +467,7 @@ async fn lookup_index_matches_the_ordinary_scan() {
     insert(&plain, PLAIN, new_batch).await;
 
     let new_id = 2_000_000i64 + 7;
-    let new_account = format!("AC{:032x}", new_id % i64::try_from(ACCOUNTS).unwrap());
+    let new_account = format!("AC{:032x}", new_id % ACCOUNTS);
     let new_application = format!("MG{new_id:032x}");
     let new_sql = format!(
         "SELECT * FROM {{table}} WHERE \"TenantId\" = '{new_account}' \
@@ -521,8 +516,14 @@ async fn lookup_index_plan_evidence() {
         .await
         .expect("fixture");
     let runtime_env = Arc::new(RuntimeEnv::default());
-    let indexed = build_table(&fixture, INDEXED_EVIDENCE, Arc::clone(&runtime_env)).await;
-    let plain = build_table(&fixture, PLAIN_EVIDENCE, Arc::clone(&runtime_env)).await;
+    let indexed = build_table(
+        &fixture,
+        INDEXED_EVIDENCE,
+        &INDEX_KEYS,
+        Arc::clone(&runtime_env),
+    )
+    .await;
+    let plain = build_table(&fixture, PLAIN_EVIDENCE, &[], Arc::clone(&runtime_env)).await;
 
     let batch = service_rows(0, ROWS);
     insert(&indexed, INDEXED_EVIDENCE, batch.clone()).await;
@@ -530,7 +531,7 @@ async fn lookup_index_plan_evidence() {
     wait_for_index(&indexed, INDEXED_EVIDENCE).await;
 
     let id = 12_345i64;
-    let account = format!("AC{:032x}", id % i64::try_from(ACCOUNTS).unwrap());
+    let account = format!("AC{:032x}", id % ACCOUNTS);
     let application = format!("MG{id:032x}");
     let sql = format!(
         "EXPLAIN ANALYZE SELECT * FROM {{table}} WHERE \"TenantId\" = '{account}' \
@@ -559,7 +560,13 @@ async fn write_time_index_matches_a_read_back_build() {
         .await
         .expect("fixture");
     let runtime_env = Arc::new(RuntimeEnv::default());
-    let table = build_table(&fixture, INDEXED_WRITE_TIME, Arc::clone(&runtime_env)).await;
+    let table = build_table(
+        &fixture,
+        INDEXED_WRITE_TIME,
+        &INDEX_KEYS,
+        Arc::clone(&runtime_env),
+    )
+    .await;
 
     // A full-refresh overwrite is the write the index is built during.
     overwrite(&table, service_rows(0, ROWS)).await;
@@ -644,7 +651,7 @@ async fn write_time_index_matches_a_read_back_build() {
     );
 
     let new_id = 3_000_000i64 + 11;
-    let new_account = format!("AC{:032x}", new_id % i64::try_from(ACCOUNTS).unwrap());
+    let new_account = format!("AC{:032x}", new_id % ACCOUNTS);
     let new_application = format!("MG{new_id:032x}");
     let before = counters_of(INDEXED_WRITE_TIME);
     let sql = format!(

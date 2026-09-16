@@ -6842,12 +6842,20 @@ impl CayenneTableProvider {
         strategy: &PkDeletionStrategyWithCache,
         session_config: &SessionConfig,
     ) -> ListingOptions {
-        let provider = Arc::new(PositionDeletionAccessPlanProvider::new(Arc::clone(
-            strategy.position_cache(),
-        )));
-        let file_format: Arc<dyn FileFormat> =
-            Arc::new(vortex_format.with_access_plan_provider(provider));
+        let file_format: Arc<dyn FileFormat> = Arc::new(
+            vortex_format.with_access_plan_provider(Self::position_deletion_plans(strategy)),
+        );
         ListingOptions::new(file_format).with_session_config_options(session_config)
+    }
+
+    /// The per-file access plans every scan of this table attaches: the
+    /// position-delete vectors described on [`Self::create_listing_options`].
+    fn position_deletion_plans(
+        strategy: &PkDeletionStrategyWithCache,
+    ) -> Arc<dyn VortexAccessPlanProvider> {
+        Arc::new(PositionDeletionAccessPlanProvider::new(Arc::clone(
+            strategy.position_cache(),
+        )))
     }
 
     /// Construct the snapshot directory URL string.
@@ -8855,36 +8863,6 @@ impl CayenneTableProvider {
         .await
     }
 
-    /// [`Self::write_to_snapshot`], reporting each batch's file and file-local
-    /// row position to `observer` as it is written.
-    ///
-    /// Used by the full-refresh overwrite to build the point-lookup index from
-    /// the rows it is already writing, so the index publishes with the snapshot
-    /// instead of being rebuilt from the finished files afterwards.
-    #[expect(clippy::too_many_arguments)]
-    pub(crate) async fn write_to_snapshot_observed(
-        &self,
-        stream: SendableRecordBatchStream,
-        target_size_bytes: usize,
-        snapshot_id: &str,
-        target_partitions: usize,
-        estimated_bytes: Option<u64>,
-        policy: super::delta_encoding::WritePolicy,
-        observer: Option<Arc<dyn VortexWriteObserver>>,
-    ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
-        self.write_to_snapshot_range_partitioned(
-            stream,
-            target_size_bytes,
-            snapshot_id,
-            target_partitions,
-            estimated_bytes,
-            policy,
-            None,
-            observer,
-        )
-        .await
-    }
-
     /// [`Self::write_to_snapshot`], with ascending split points that
     /// range-partition the shard key instead of hashing it.
     ///
@@ -8892,6 +8870,11 @@ impl CayenneTableProvider {
     /// can supply these — a rewrite reads them off the statistics of the plan it
     /// is merging. A streaming write has no such view, passes `None`, and hashes
     /// as before.
+    ///
+    /// `write_observer`, when set, is told each batch's file and file-local row
+    /// position as it is written: the full-refresh overwrite builds the
+    /// point-lookup index from it, so the index publishes with the snapshot
+    /// instead of being rebuilt from the finished files afterwards.
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn write_to_snapshot_range_partitioned(
         &self,
@@ -9563,10 +9546,17 @@ impl CayenneTableProvider {
         // either side of a concurrent mutation and manufacture a gap.
         let accounted = self.table_memory.snapshot();
         let to_gauge = |bytes: usize| u64::try_from(bytes).unwrap_or(u64::MAX);
+        let lookup_index = (!self
+            .table_metadata
+            .vortex_config
+            .lookup_index_keys
+            .is_empty())
+        .then(|| to_gauge(accounted.lookup_index));
         telemetry::cayenne::track_memory_account(
             to_gauge(accounted.keyset),
             to_gauge(accounted.deletion_index),
             to_gauge(accounted.cold_existence),
+            lookup_index,
             to_gauge(accounted.reserved),
             &[telemetry::KeyValue::new(
                 "table",
@@ -32302,56 +32292,23 @@ impl CayenneTableProvider {
             })
             .await?;
 
-        // Point-lookup index: restrict the scan to the files that
-        // hold a candidate row, and carry their positions into the Vortex scan.
-        // The selection is honored ONLY for the exact snapshot and files it was
-        // captured from; anything else keeps the ordinary scan, so a stale or
-        // incomplete index can never turn into a false empty result.
+        // Point-lookup index: restrict the scan to the files that hold a
+        // candidate row, and carry their positions into the Vortex scan. A file
+        // carries exactly ONE access plan, and position-delete vectors travel in
+        // it, so the selection is composed with the provider this scan would
+        // otherwise attach: deleted candidates are removed from the selection,
+        // never resurrected.
         let mut lookup_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>> = None;
         if let Some(selection) = lookup_selection {
-            // A file carries exactly ONE access plan, and the row selection
-            // replaces the position-delete vector that would otherwise exclude
-            // deleted rows. Refuse the index rather than resurrect them.
-            let position_deletes = !self.pk_deletion_strategy.position_cache().load().is_empty();
-            if position_deletes {
-                selection.record_outcome(super::lookup_index::outcome::DELETIONS);
-            } else if selection.validate(
+            (partitioned_file_lists, lookup_plan_provider) = selection.restrict(
                 snapshot_id,
-                partitioned_file_lists.iter().flat_map(FileGroup::iter),
-            ) {
-                let mut candidate_files = 0usize;
-                let mut kept_groups = Vec::with_capacity(partitioned_file_lists.len());
-                for group in partitioned_file_lists {
-                    let files: Vec<PartitionedFile> = group
-                        .into_inner()
-                        .into_iter()
-                        .filter(|file| {
-                            selection
-                                .positions_for(file.object_meta.location.as_ref())
-                                .is_some()
-                        })
-                        .collect();
-                    if !files.is_empty() {
-                        candidate_files += files.len();
-                        kept_groups.push(FileGroup::new(files));
-                    }
-                }
-                partitioned_file_lists = kept_groups;
-
-                if candidate_files == 0 {
-                    selection.record_outcome(super::lookup_index::outcome::EMPTY);
-                } else {
-                    selection
-                        .record_selected(candidate_files as u64, selection.candidate_rows() as u64);
-                    lookup_plan_provider = Some(Arc::new(
-                        super::lookup_index::LookupAccessPlanProvider::new(&selection),
-                    ));
-                    // A row selection makes the footer row count an upper bound,
-                    // so exact-aggregate optimizations must not read it as live.
-                    statistics = statistics.to_inexact();
-                }
-            } else {
-                selection.record_outcome(super::lookup_index::outcome::SNAPSHOT_MISMATCH);
+                partitioned_file_lists,
+                Self::position_deletion_plans(&self.pk_deletion_strategy),
+            );
+            if lookup_plan_provider.is_some() {
+                // A row selection makes the footer row count an upper bound,
+                // so exact-aggregate optimizations must not read it as live.
+                statistics = statistics.to_inexact();
             }
         }
 
@@ -33492,8 +33449,14 @@ impl CayenneTableProvider {
             .lookup_index_snapshot_files(&session, published.snapshot_id(), &read_schema)
             .await
             .ok_or_else(|| "could not list the indexed snapshot's files".to_string())?;
-        super::lookup_index::verify_against_read_back(&state, &store, files, &self.table_schema())
-            .await
+        super::lookup_index::verify_against_read_back(
+            &state,
+            published,
+            &store,
+            files,
+            &self.table_schema(),
+        )
+        .await
     }
 
     /// This table's point-lookup index state, with its memory budget and pool
@@ -33553,7 +33516,7 @@ impl CayenneTableProvider {
             .await
         {
             Some((_store, files)) => {
-                state.publish_pending(snapshot_id, &files);
+                state.publish_pending(snapshot_id, files).await;
             }
             None => {
                 state.discard_pending();
@@ -33587,14 +33550,14 @@ impl CayenneTableProvider {
                     files,
                     self.table_schema(),
                 ),
-                None => index_state.abandon_build(),
+                None => index_state.release_build(),
             }
         }
 
         let scalar_for = |column: &str| {
             filters
                 .iter()
-                .find_map(|filter| scalar_for_column_ignoring_case(filter, column))
+                .find_map(|filter| bare_column_scalar_for(filter, column))
         };
         index_state.probe(&scalar_for)
     }
@@ -33814,18 +33777,30 @@ fn pk_column_equals_literal(expr: &Expr, pk_name: &str) -> bool {
 /// pinned to a single literal — the caller then marks the read footprint
 /// incomplete. Mirrors [`pk_column_equals_literal`], returning the value.
 fn pk_scalar_for(expr: &Expr, pk_name: &str) -> Option<ScalarValue> {
+    equality_value_for(expr, &|e| matches_column(e, pk_name), &literal_scalar)
+}
+
+/// The value a conjunctive filter pins a column to: `column = value` in either
+/// operand order, recursing through `AND`. `is_column` recognizes the column
+/// side and `value_of` evaluates the other side.
+fn equality_value_for(
+    expr: &Expr,
+    is_column: &dyn Fn(&Expr) -> bool,
+    value_of: &dyn Fn(&Expr) -> Option<ScalarValue>,
+) -> Option<ScalarValue> {
     match expr {
         Expr::BinaryExpr(bin) if bin.op == Operator::Eq => {
-            if matches_column(&bin.left, pk_name) {
-                literal_scalar(&bin.right)
-            } else if matches_column(&bin.right, pk_name) {
-                literal_scalar(&bin.left)
+            if is_column(&bin.left) {
+                value_of(&bin.right)
+            } else if is_column(&bin.right) {
+                value_of(&bin.left)
             } else {
                 None
             }
         }
         Expr::BinaryExpr(bin) if bin.op == Operator::And => {
-            pk_scalar_for(&bin.left, pk_name).or_else(|| pk_scalar_for(&bin.right, pk_name))
+            equality_value_for(&bin.left, is_column, value_of)
+                .or_else(|| equality_value_for(&bin.right, is_column, value_of))
         }
         _ => None,
     }
@@ -33841,35 +33816,35 @@ fn literal_scalar(expr: &Expr) -> Option<ScalarValue> {
     }
 }
 
-/// The equality-literal `ScalarValue` constraining `name`, matching the column
-/// name case-insensitively. The query engine preserves identifier case, so an
-/// experiment configured with a differently-cased column name still resolves
-/// instead of silently leaving every query on the ordinary scan.
-fn scalar_for_column_ignoring_case(expr: &Expr, name: &str) -> Option<ScalarValue> {
-    match expr {
-        Expr::BinaryExpr(bin) if bin.op == Operator::Eq => {
-            if matches_column_ignoring_case(&bin.left, name) {
-                literal_scalar(&bin.right)
-            } else if matches_column_ignoring_case(&bin.right, name) {
-                literal_scalar(&bin.left)
-            } else {
-                None
-            }
-        }
-        Expr::BinaryExpr(bin) if bin.op == Operator::And => {
-            scalar_for_column_ignoring_case(&bin.left, name)
-                .or_else(|| scalar_for_column_ignoring_case(&bin.right, name))
-        }
-        _ => None,
-    }
+/// The value a filter pins the BARE column `name` to, for the point-lookup
+/// index.
+///
+/// Unlike [`pk_scalar_for`] this refuses a cast on the column side: a cast can
+/// map several stored values onto the literal (`CAST(score AS BIGINT) = 5` holds
+/// for 5.2), while the index finds rows by their stored value, so answering such
+/// a predicate from it would drop rows. A cast on the value side is evaluated
+/// rather than stripped, so the index is probed with the value the predicate
+/// actually compares against.
+fn bare_column_scalar_for(expr: &Expr, name: &str) -> Option<ScalarValue> {
+    equality_value_for(
+        expr,
+        &|e| matches!(e, Expr::Column(col) if col.name == name),
+        &evaluated_literal,
+    )
 }
 
-fn matches_column_ignoring_case(expr: &Expr, name: &str) -> bool {
+/// The constant `expr` evaluates to: a literal, or casts applied to one. `None`
+/// when a cast cannot be applied, which leaves the predicate to the scan.
+fn evaluated_literal(expr: &Expr) -> Option<ScalarValue> {
     match expr {
-        Expr::Column(col) => col.name.eq_ignore_ascii_case(name),
-        Expr::Cast(c) => matches_column_ignoring_case(&c.expr, name),
-        Expr::TryCast(c) => matches_column_ignoring_case(&c.expr, name),
-        _ => false,
+        Expr::Literal(scalar, _) => Some(scalar.clone()),
+        Expr::Cast(c) => evaluated_literal(&c.expr)?
+            .cast_to(c.field.data_type())
+            .ok(),
+        Expr::TryCast(c) => evaluated_literal(&c.expr)?
+            .cast_to(c.field.data_type())
+            .ok(),
+        _ => None,
     }
 }
 
@@ -34317,21 +34292,21 @@ impl TableProvider for CayenneTableProvider {
                 ))
             })?;
 
+        // Point-lookup index: candidate row addresses for an exact composite
+        // equality key. The first scan of a table also kicks off the one-shot
+        // background build. `None` keeps every query on the ordinary scan, which
+        // is what an unset `cayenne_lookup_index_keys` and every unsupported
+        // predicate shape resolve to.
+        let lookup_selection = self
+            .resolve_lookup_index_selection(state, &current_snapshot_id, scan_filters, &read_schema)
+            .await;
+
         // For PK point lookups (e.g. `WHERE pk_col = K`), force the inner
         // `ListingTable` to use `target_partitions = 1` so DataFusion does NOT
         // byte-range-split the matching file across N file_groups. The fan-out
         // pays per-group Vortex footer-open cost (~50 µs each) without speeding
         // up the lookup because only one chunk in one file_group actually
         // contains K. See `pk_lookup_file_group_fanout` bench.
-        // Point-lookup index (index): candidate row addresses
-        // for an exact composite equality key. The first scan of a table also
-        // kicks off the one-shot background build. `None` keeps every query on
-        // the ordinary scan, which is what an unset `cayenne_lookup_index_keys` and
-        // every unsupported predicate shape resolve to.
-        let lookup_selection = self
-            .resolve_lookup_index_selection(state, &current_snapshot_id, scan_filters, &read_schema)
-            .await;
-
         let is_pk_selective_scan =
             self.is_pk_selective_scan(scan_filters) || lookup_selection.is_some();
         let scan_listing_config_override;
