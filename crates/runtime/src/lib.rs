@@ -108,10 +108,6 @@ pub mod flight;
 mod http;
 pub use http::v1::datasets::dataset_infos_with_status;
 
-pub mod http_types {
-    pub use crate::http::v1::queries::SubmitQueryRequest;
-}
-
 mod init;
 pub mod internal_table;
 pub mod jobs;

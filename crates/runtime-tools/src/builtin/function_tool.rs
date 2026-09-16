@@ -46,9 +46,8 @@ use serde_json::{Map, Value};
 use spicepod::component::function::{Function, FunctionArg, FunctionKind};
 use tools::SpiceModelTool;
 
-use runtime_auth::AuthRequestContext;
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
-use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_request_context::current_principal_requires_read_only;
 
 /// Build a [`FunctionAsTool`] from a user-declared [`Function`]. Fails
 /// when the function's signature references Arrow types the tool bridge
@@ -192,16 +191,6 @@ impl SpiceModelTool for FunctionAsTool {
 
         extract_single_cell_as_json(&batches)
     }
-}
-
-pub(crate) async fn current_principal_requires_read_only() -> bool {
-    let context = RequestContext::current(AsyncMarker::new().await);
-    AuthRequestContext::auth_principal(context.as_ref()).is_some_and(|principal| {
-        !principal
-            .groups()
-            .iter()
-            .any(|group| *group == "write" || *group == "read_write")
-    })
 }
 
 fn function_call_sql(function_name: &str, literals: &[String]) -> String {
