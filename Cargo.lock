@@ -6344,6 +6344,7 @@ dependencies = [
  "object_store 0.13.2",
  "opentelemetry",
  "runtime-api-types",
+ "runtime-component",
  "runtime-metrics",
  "runtime-parameters",
  "runtime-rate-control",

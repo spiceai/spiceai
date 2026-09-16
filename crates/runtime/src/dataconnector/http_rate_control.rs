@@ -88,6 +88,7 @@ mod tests {
             requests_per_minute: None,
             jitter_min: Duration::ZERO,
             jitter_max: Duration::ZERO,
+            adaptive_rate_control: AdaptiveRateControl::Disabled,
         }
     }
 
@@ -101,6 +102,7 @@ mod tests {
             requests_per_minute: None,
             jitter_min: Duration::ZERO,
             jitter_max: Duration::ZERO,
+            adaptive_rate_control: AdaptiveRateControl::Disabled,
         }
     }
 

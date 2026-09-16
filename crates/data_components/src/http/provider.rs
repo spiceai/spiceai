@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::json_nest::{HttpJsonNesting, decompose_json_row};
-use crate::rate_limit::RateLimiter;
+use crate::rate_limit::{RateLimiter, RequestOutcome};
 use arrow::{
     array::{ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder},
     compute::cast,
@@ -1484,6 +1484,15 @@ impl HttpTableProvider {
         }
     }
 
+    /// Feed a request's outcome to the origin's rate limiter so an adaptive
+    /// controller can raise or lower the effective rate. A no-op for limiters
+    /// without adaptive control.
+    fn record_request_outcome(&self, outcome: RequestOutcome) {
+        if let Some(rate_limiter) = &self.rate_limiter {
+            rate_limiter.record_request_outcome(outcome);
+        }
+    }
+
     async fn perform_request_with_retry(
         &self,
         url: Url,
@@ -1598,13 +1607,25 @@ impl HttpTableProvider {
 
         let response = request_builder.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {e}");
+            // A timeout or connection error is a failure signal for adaptive
+            // rate control: the origin is unreachable or too slow, so admit
+            // fewer requests until it recovers.
+            self.record_request_outcome(RequestOutcome::Failure);
             RetryError::transient(Error::HttpRequest { source: e })
         })?;
 
-        let status_code = response.status().as_u16();
+        let status = response.status();
+        let status_code = status.as_u16();
         let response_headers = response.headers().clone();
         self.update_rate_limiter_from_headers(&response_headers)
             .await;
+        // A retryable status (408/429/5xx) is a failure signal for adaptive rate
+        // control; any other status counts as a success.
+        self.record_request_outcome(if crate::resilient_http::status_is_retryable(status) {
+            RequestOutcome::Failure
+        } else {
+            RequestOutcome::Success
+        });
 
         // 5xx/429: retry with backoff (transient server issue or rate limiting)
         // After retries exhausted, we'll accept the response as valid data.
