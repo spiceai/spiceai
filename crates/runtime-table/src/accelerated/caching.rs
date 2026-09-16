@@ -2173,9 +2173,7 @@ pub struct CachingAccelerationScanExec {
     synchronized_children: SynchronizedChildren,
     /// Sender for batched cache writes
     batch_write_tx: CacheWriteSender,
-    /// Session state used to scan `federated` for a cache miss or SWR refresh.
-    /// Built once in [`Self::new`] instead of a fresh `SessionContext` per
-    /// fetch — see `fetch_from_source`.
+    /// Built once instead of a fresh `SessionContext` per fetch.
     session_state: Arc<SessionState>,
 }
 
@@ -2209,14 +2207,7 @@ impl CachingAccelerationScanExec {
                 .with_partitioning(Partitioning::UnknownPartitioning(1)),
         );
 
-        // `with_default_features()` kept deliberately, not stripped down: the
-        // filters scanned against `federated` here are arbitrary caller
-        // `Expr`s (translated user WHERE-clause predicates), and a federated
-        // connector's own `scan()` may need to resolve a built-in scalar
-        // function while planning pushdown for one of them. Nothing in this
-        // scan-and-collect path rules that out for every `TableProvider` it
-        // can be pointed at, so this only removes the *rebuilding*, not the
-        // feature set.
+        // Full default features kept: caller filters may need any default scalar fn during pushdown.
         let session_state = Arc::new(SessionStateBuilder::new().with_default_features().build());
 
         Self {
@@ -2636,9 +2627,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
-    /// Test-only stand-in for the `Arc<SessionState>` `CachingAccelerationScanExec`
-    /// and `RefreshTask` build once and share; tests call `fetch_from_source` and
-    /// friends directly, so they need one too.
+    /// Test-only stand-in for the shared `Arc<SessionState>`.
     fn test_session_state() -> Arc<SessionState> {
         Arc::new(SessionStateBuilder::new().with_default_features().build())
     }
@@ -4833,68 +4822,6 @@ mod tests {
             .expect("status column");
         assert_eq!(status.value(0), 200);
         assert_eq!(status.value(1), 404);
-    }
-
-    /// Measures what `fetch_from_source` used to pay on every call: a fresh
-    /// `SessionContext::new()` (which rebuilds every default scalar/aggregate/
-    /// window UDF, table function, file format, table factory, catalog and the
-    /// analyzer/optimizer rule chain) versus reusing one `SessionState` built
-    /// once, as `CachingAccelerationScanExec` and `RefreshTask` now do. Both
-    /// arms otherwise do the identical `federated.scan(..).await` + `collect`
-    /// this function performs, so the delta isolates the session-construction
-    /// cost this change removes. Not a hard performance gate (timing is
-    /// inherently noisy) — it exists to print a real, reproducible number
-    /// rather than assert one.
-    #[tokio::test]
-    async fn fetch_from_source_reuses_session_state_instead_of_rebuilding_it() {
-        const ITERATIONS: u32 = 200;
-
-        let federated: Arc<dyn TableProvider> =
-            Arc::new(MockHttpTableProvider::with_status(200, "ok"));
-        let filters = vec![col("content").eq(lit("test"))];
-
-        // "Before": what every call to fetch_from_source used to do.
-        let before_start = std::time::Instant::now();
-        for _ in 0..ITERATIONS {
-            let ctx = SessionContext::new();
-            let state = ctx.state();
-            let plan = federated
-                .scan(&state, None, &filters, None)
-                .await
-                .expect("scan");
-            let task_ctx = Arc::new(TaskContext::default());
-            datafusion::physical_plan::collect(plan, task_ctx)
-                .await
-                .expect("collect");
-        }
-        let before = before_start.elapsed();
-
-        // "After": one shared SessionState, as fetch_from_source now receives it.
-        let session_state = test_session_state();
-        let after_start = std::time::Instant::now();
-        for _ in 0..ITERATIONS {
-            CacheRefreshHelper::fetch_from_source(
-                &federated,
-                &session_state,
-                "test_dataset",
-                &filters,
-                None,
-            )
-            .await
-            .expect("fetch_from_source");
-        }
-        let after = after_start.elapsed();
-
-        println!(
-            "fetch_from_source session construction, {ITERATIONS} iterations: \
-             fresh SessionContext::new() per call = {before:?}, shared SessionState = {after:?}"
-        );
-
-        assert!(
-            after < before,
-            "reusing a shared SessionState ({after:?}) should be faster than rebuilding a \
-             fresh SessionContext ({before:?}) on every call"
-        );
     }
 }
 

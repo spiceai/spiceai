@@ -432,14 +432,7 @@ impl RefreshTaskBuilder {
 
         let dataset_metric_labels = DatasetMetricLabels::new(&self.dataset_name);
 
-        // `with_default_features()` kept deliberately: `refresh_stale_cached_rows`
-        // scans the accelerator and the federated source with caller-supplied
-        // filter `Expr`s (arbitrary user WHERE-clause predicates translated by
-        // the query layer), and a federated connector's `scan()` may need to
-        // resolve a built-in scalar function while planning pushdown for one of
-        // them. There was no evidence a stripped-down function/table-factory
-        // set is safe across every `TableProvider` this can be pointed at, so
-        // this keeps the full default set and only removes the *rebuilding*.
+        // Full default features kept: caller filters may need any default scalar fn during pushdown.
         let session_state = Arc::new(SessionStateBuilder::new().with_default_features().build());
 
         RefreshTask {
@@ -554,10 +547,7 @@ pub struct RefreshTask {
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
     in_flight_revalidations: super::caching::InFlightRevalidations,
-    /// Shared session state for scanning the federated source during
-    /// `refresh_stale_cached_rows` (`RefreshMode::Caching`). Built once here
-    /// rather than per stale entry — see `CachingAccelerationScanExec::session_state`
-    /// for why a fresh `SessionContext` per fetch was expensive.
+    /// Built once instead of a fresh `SessionContext` per stale entry.
     session_state: Arc<SessionState>,
 }
 
