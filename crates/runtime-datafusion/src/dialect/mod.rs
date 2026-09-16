@@ -424,6 +424,10 @@ mod tests {
                 "a class intersection, which RE2 reads as a class of `a` and `&`",
             ),
             ("(?x)a b", "the `x` flag, which RE2 rejects"),
+            (
+                "(a{100}){11}",
+                "nested counted repetitions whose product passes RE2's limit of 1000",
+            ),
         ] {
             assert!(
                 !duckdb_can_translate(&call_of(regexp_count(col("s"), lit(pattern), None, None))),

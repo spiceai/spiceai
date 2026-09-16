@@ -210,8 +210,9 @@ fn number_literal(digits: &str) -> ast::Expr {
 /// - **Only syntax both engines read alike**, as an allow-list walked by
 ///   [`EngineNeutralSyntax`]: literals (verbatim, `\.`-style escapes, `\xHH`,
 ///   `\x{H..}`, `\n`-style specials), `.`, bracketed classes of literals and
-///   ranges (negated or not), `?`/`*`/`+`/`{m,n}` repetitions within RE2's
-///   bound of 1000, greedy or lazy, alternation, indexed or non-capturing
+///   ranges (negated or not), `?`/`*`/`+`/`{m,n}` repetitions whose nested
+///   counted bounds multiply to at most RE2's 1000, greedy or lazy,
+///   alternation, indexed or non-capturing
 ///   groups, the `^`/`$`/`\A`/`\z` anchors, and the `i` flag. Everything
 ///   else is refused — Perl classes and word boundaries because they are
 ///   Unicode-aware in the kernel and ASCII-only in RE2 (`'\d'` over `xy١`
@@ -229,7 +230,7 @@ fn duckdb_counts_pattern_identically(pattern: &str) -> bool {
     let Ok(ast) = regex_syntax::ast::parse::Parser::new().parse(pattern) else {
         return false;
     };
-    if regex_syntax::ast::visit(&ast, EngineNeutralSyntax).is_err() {
+    if regex_syntax::ast::visit(&ast, EngineNeutralSyntax::default()).is_err() {
         return false;
     }
     regex_syntax::hir::translate::Translator::new()
@@ -239,7 +240,9 @@ fn duckdb_counts_pattern_identically(pattern: &str) -> bool {
         .is_some_and(|min| min > 0)
 }
 
-/// RE2's cap on a counted repetition; a larger `{n}` fails the query remotely.
+/// RE2's cap on counted repetition: the product of the `{n}`/`{n,m}` bounds
+/// along a nesting path may not exceed it, so `(a{100}){11}` fails the query
+/// remotely with `invalid repetition size` where the kernel compiles it.
 const RE2_MAX_REPETITION: u32 = 1000;
 
 /// The syntax [`duckdb_counts_pattern_identically`] refuses — see there for
@@ -265,13 +268,19 @@ enum EngineDependentSyntax {
     /// An escape outside the shared set: `\u..`, `\U..`, octal, or an
     /// escaped ordinary character.
     Escape,
-    /// A counted repetition above [`RE2_MAX_REPETITION`].
+    /// Counted repetitions whose nested product exceeds
+    /// [`RE2_MAX_REPETITION`].
     RepetitionBound,
 }
 
 /// Walks a pattern's syntax tree and fails on the first
 /// [`EngineDependentSyntax`] it meets.
-struct EngineNeutralSyntax;
+#[derive(Default)]
+struct EngineNeutralSyntax {
+    /// The product of the counted-repetition bounds enclosing the node being
+    /// visited, one entry per enclosing repetition so `visit_post` can unwind.
+    repetition_products: Vec<u32>,
+}
 
 impl EngineNeutralSyntax {
     fn literal(literal: &regex_syntax::ast::Literal) -> Result<(), EngineDependentSyntax> {
@@ -299,18 +308,26 @@ impl EngineNeutralSyntax {
         }
     }
 
-    fn repetition(repetition: &regex_syntax::ast::Repetition) -> Result<(), EngineDependentSyntax> {
+    /// Enters a repetition: multiplies the enclosing counted bounds by this
+    /// one's (`?`, `*` and `+` count as 1, as in RE2) and refuses the pattern
+    /// once the product passes [`RE2_MAX_REPETITION`].
+    fn enter_repetition(
+        &mut self,
+        repetition: &regex_syntax::ast::Repetition,
+    ) -> Result<(), EngineDependentSyntax> {
         use regex_syntax::ast::{RepetitionKind, RepetitionRange};
         let bound = match repetition.op.kind {
             RepetitionKind::Range(RepetitionRange::Exactly(n) | RepetitionRange::AtLeast(n)) => n,
             RepetitionKind::Range(RepetitionRange::Bounded(_, n)) => n,
-            RepetitionKind::ZeroOrOne | RepetitionKind::ZeroOrMore | RepetitionKind::OneOrMore => 0,
+            RepetitionKind::ZeroOrOne | RepetitionKind::ZeroOrMore | RepetitionKind::OneOrMore => 1,
         };
-        if bound > RE2_MAX_REPETITION {
-            Err(EngineDependentSyntax::RepetitionBound)
-        } else {
-            Ok(())
+        let enclosing = self.repetition_products.last().copied().unwrap_or(1);
+        let product = enclosing.saturating_mul(bound.max(1));
+        if product > RE2_MAX_REPETITION {
+            return Err(EngineDependentSyntax::RepetitionBound);
         }
+        self.repetition_products.push(product);
+        Ok(())
     }
 }
 
@@ -331,7 +348,7 @@ impl regex_syntax::ast::Visitor for EngineNeutralSyntax {
             | Ast::Concat(_)
             | Ast::ClassBracketed(_) => Ok(()),
             Ast::Literal(literal) => Self::literal(literal),
-            Ast::Repetition(repetition) => Self::repetition(repetition),
+            Ast::Repetition(repetition) => self.enter_repetition(repetition),
             Ast::Flags(set) => Self::flags(&set.flags),
             Ast::Group(group) => match &group.kind {
                 GroupKind::CaptureIndex(_) => Ok(()),
@@ -350,6 +367,13 @@ impl regex_syntax::ast::Visitor for EngineNeutralSyntax {
             Ast::ClassUnicode(_) => Err(EngineDependentSyntax::UnicodeProperty),
             Ast::ClassPerl(_) => Err(EngineDependentSyntax::PerlClass),
         }
+    }
+
+    fn visit_post(&mut self, ast: &regex_syntax::ast::Ast) -> Result<(), EngineDependentSyntax> {
+        if matches!(ast, regex_syntax::ast::Ast::Repetition(_)) {
+            self.repetition_products.pop();
+        }
+        Ok(())
     }
 
     fn visit_class_set_item_pre(
@@ -1506,6 +1530,10 @@ mod tests {
             "(?:ab)+",
             "é",
             "\\&",
+            "(a{100}){10}",
+            "((a{10}){10}){10}",
+            "(a{2}){3}b{500}",
+            "(a+){1000}",
         ] {
             assert!(
                 duckdb_counts_pattern_identically(pattern),
@@ -1547,6 +1575,9 @@ mod tests {
             "\\u{41}",
             "a{1001}",
             "a{2,1001}",
+            "(a{100}){11}",
+            "((a{10}){10}){11}",
+            "(a{100,}){11}",
         ] {
             assert!(
                 !duckdb_counts_pattern_identically(pattern),

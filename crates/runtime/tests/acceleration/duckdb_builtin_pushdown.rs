@@ -856,7 +856,8 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
             // class (Unicode-aware in the kernel, ASCII-only in RE2 — row 8 is
             // where `\d` parts company), a class intersection (RE2 has no such
             // syntax and reads `[a&&a]` as a class of `a` and `&`), the `x` flag
-            // (RE2 rejects it), and a flag other than `i`.
+            // (RE2 rejects it), nested counted repetitions whose product passes
+            // RE2's limit of 1000, and a flag other than `i`.
             for call in [
                 "regexp_count(s, 'a', id)",
                 "regexp_count(s, p)",
@@ -865,6 +866,7 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
                 "regexp_count(s, '\\d')",
                 "regexp_count(s, '[a&&a]')",
                 "regexp_count(s, '(?x)a b')",
+                "regexp_count(s, '(a{100}){11}')",
                 "regexp_count(s, 'a', 1, 'm')",
             ] {
                 let sql = format!("SELECT id, {call} AS c FROM {{table}} ORDER BY id");
