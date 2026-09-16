@@ -1211,7 +1211,7 @@ async fn listing_table_scan_does_not_decode_a_replaced_object() -> Result<(), an
                 a_predicate_scan_of_bloom_filtered_parquet_pins_one_generation(
                     &mix,
                     &proxy,
-                    &minio,
+                    &store_endpoint,
                     "overwrite-race-bloom",
                     write_bloom_filtered_parquet(&gen_a),
                 )
