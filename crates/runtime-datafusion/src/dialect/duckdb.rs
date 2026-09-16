@@ -39,15 +39,6 @@ const LEN_NAME: &str = "len";
 /// [`DuckDBRegexpFunction::postprocess_function`].
 const COALESCE_NAME: &str = "coalesce";
 
-/// `regexp_extract_all`'s group argument for the whole match, which is what
-/// `regexp_count` counts, and which has to precede the options when
-/// `regexp_count` carries flags.
-const WHOLE_MATCH_GROUP: &str = "0";
-
-/// The one regexp flag rendered for `regexp_count`: case-insensitive matching,
-/// spelled `i` in both engines and measured to mean the same thing in both.
-const CASE_INSENSITIVE_FLAG: &str = "i";
-
 /// `DuckDB`'s name for the both-ends trim `DataFusion` calls `btrim`.
 pub(crate) const TRIM_NAME: &str = "trim";
 
@@ -695,11 +686,10 @@ impl DuckDBRegexpFunction {
     /// integer literal cannot become an offset at unparse time and is refused,
     /// as is one below 1, which the kernel rejects.
     ///
-    /// **Flags.** `regexp_extract_all`'s third argument is the capture group,
-    /// not the options, so the flags are preceded by group `0` (the whole
-    /// match) to land in the options slot. Only the literal `i` is rendered:
-    /// it is the one flag whose meaning has been measured identical in both
-    /// engines, and `DuckDB` requires the options to be a non-NULL constant.
+    /// **Flags.** A call with a flags argument is refused. The one candidate,
+    /// `i`, is spelled the same in both engines but folds case by each
+    /// engine's own Unicode tables, which differ by version (see
+    /// [`re2`]); the rest RE2 reads differently or rejects.
     fn process_args(&self, ast_args: &mut Vec<FunctionArg>) -> Result<(), DataFusionError> {
         if !matches!(self, DuckDBRegexpFunction::Count) {
             return Ok(());
@@ -759,15 +749,9 @@ impl DuckDBRegexpFunction {
         if ast_args.len() == 3 {
             // The start has been folded into the input, so a remaining third
             // argument is the flags.
-            if ast_args.get(2).and_then(string_literal) != Some(CASE_INSENSITIVE_FLAG) {
-                return Err(DataFusionError::Plan(format!(
-                    "Only the literal `{CASE_INSENSITIVE_FLAG}` flag is supported for regular expression function {name} with DuckDB"
-                )));
-            }
-            ast_args.insert(
-                2,
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(number_literal(WHOLE_MATCH_GROUP))),
-            );
+            return Err(DataFusionError::Plan(format!(
+                "Regular expression flags are not supported for function {name} with DuckDB: case folding follows each engine's own Unicode tables"
+            )));
         }
 
         Ok(())
@@ -1253,8 +1237,7 @@ mod tests {
     /// The `coalesce(.., 0)` is the point: `regexp_extract_all` is NULL for a
     /// NULL input and `len(NULL)` is NULL, where the kernel counts zero
     /// matches and answers `0`. The `SUBSTRING` offset is the kernel's 1-based
-    /// start passed through unchanged, and the flags follow a `0` group so
-    /// they land in `regexp_extract_all`'s options slot.
+    /// start passed through unchanged.
     #[test]
     fn regexp_count_unparses_to_a_null_preserving_match_count() {
         let dialect = new_duckdb_dialect();
@@ -1282,16 +1265,6 @@ mod tests {
             "SUBSTRING is 1-based in both engines, so the start is passed through"
         );
         assert_eq!(
-            render(regexp_count(
-                s.clone(),
-                lit("a"),
-                Some(lit(1)),
-                Some(lit("i"))
-            )),
-            r#"coalesce(len(regexp_extract_all(SUBSTRING("t"."s", 1), 'a', 0, 'i')), 0)"#,
-            "flags must follow the whole-match group to reach the options slot"
-        );
-        assert_eq!(
             render(regexp_count(s, lit("^a+$"), None, None)),
             r#"coalesce(len(regexp_extract_all("t"."s", '^a+$')), 0)"#,
             "anchors are zero-width but the match itself is not empty, so the call renders"
@@ -1307,7 +1280,7 @@ mod tests {
         let dialect = new_duckdb_dialect();
         let unparser = Unparser::new(dialect.as_ref());
 
-        for flags in [col("f"), lit(ScalarValue::Utf8(None)), lit("m")] {
+        for flags in [col("f"), lit(ScalarValue::Utf8(None)), lit("m"), lit("i")] {
             let call = regexp_count(col("s"), lit("a"), Some(lit(1)), Some(flags.clone()));
             assert!(
                 unparser.expr_to_sql(&call).is_err(),
@@ -1344,8 +1317,6 @@ mod tests {
             "\\x41",
             "\\x{1F600}",
             "\\n",
-            "(?i)k",
-            "(?i:k)a",
             "a+?",
             "(a)(b)",
             "(?:ab)+",
@@ -1383,8 +1354,13 @@ mod tests {
             "(?x)a b",
             "(?s)a",
             "(?m)a",
+            "(?i)k",
+            "(?i:k)a",
             "(?-i)a",
             "(?i-s)a",
+            "a++",
+            "a{1}{2}",
+            "a*?+",
             "(?P<n>a)",
             "(?<n>a)",
             "\\p{Nd}",

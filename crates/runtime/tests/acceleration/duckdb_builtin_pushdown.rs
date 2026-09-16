@@ -100,7 +100,8 @@ fn write_regexp_source(path: &Path) -> Result<(), anyhow::Error> {
 }
 
 /// Strings and patterns for `regexp_count`: rows where the input, the pattern,
-/// or both are NULL, a mixed-case row for the `i` flag, a row long enough for
+/// or both are NULL, a mixed-case row (case-insensitive matching must stay
+/// local), a row long enough for
 /// a start offset to drop matches, and a row holding an Arabic-Indic digit
 /// (`U+0661`) that the kernel's `\d` matches and RE2's does not.
 ///
@@ -771,15 +772,13 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
             load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
 
             // Every shape the dialect renders: the plain call, an integer start,
-            // a start past the end of the input, the `i` flag, and an anchored
-            // pattern. Each is measured federated against local, and each has a
+            // a start past the end of the input, and an anchored pattern. Each is measured federated against local, and each has a
             // NULL row in the fixture that the bare `len(regexp_extract_all(..))`
             // got wrong.
             let shapes = [
                 ("regexp_count(s, 'a')", "the plain call"),
                 ("regexp_count(s, 'a', 2)", "an integer start position"),
                 ("regexp_count(s, 'a', 9)", "a start position past the end of the input"),
-                ("regexp_count(s, 'a', 1, 'i')", "a start position and the `i` flag"),
                 ("regexp_count(s, '^a+$')", "an anchored pattern"),
             ];
             for (call, what) in shapes {
@@ -808,27 +807,25 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
             }
 
             // The values themselves, so the agreement above is not two engines
-            // agreeing on a wrong answer: a NULL input counts 0, the start offset
-            // drops the match before it (a `start - 1` offset into DuckDB's
-            // 1-based SUBSTRING would keep it), and `i` matches the upper-case
-            // rows (flags in `regexp_extract_all`'s group slot would fail the
-            // query remotely with "Pattern has 0 groups").
-            let pinned = "SELECT id, regexp_count(s, 'a') AS plain, regexp_count(s, 'a', 2) AS from_2, \
-                          regexp_count(s, 'a', 1, 'i') AS insensitive FROM accelerated ORDER BY id";
+            // agreeing on a wrong answer: a NULL input counts 0, and the start
+            // offset drops the match before it (a `start - 1` offset into
+            // DuckDB's 1-based SUBSTRING would keep it).
+            let pinned = "SELECT id, regexp_count(s, 'a') AS plain, regexp_count(s, 'a', 2) AS from_2 \
+                          FROM accelerated ORDER BY id";
             assert_batches_eq!(
                 [
-                    "+----+-------+--------+-------------+",
-                    "| id | plain | from_2 | insensitive |",
-                    "+----+-------+--------+-------------+",
-                    "| 1  | 1     | 0      | 1           |",
-                    "| 2  | 0     | 0      | 0           |",
-                    "| 3  | 1     | 0      | 2           |",
-                    "| 4  | 0     | 0      | 0           |",
-                    "| 5  | 1     | 0      | 1           |",
-                    "| 6  | 0     | 0      | 0           |",
-                    "| 7  | 3     | 2      | 3           |",
-                    "| 8  | 0     | 0      | 0           |",
-                    "+----+-------+--------+-------------+",
+                    "+----+-------+--------+",
+                    "| id | plain | from_2 |",
+                    "+----+-------+--------+",
+                    "| 1  | 1     | 0      |",
+                    "| 2  | 0     | 0      |",
+                    "| 3  | 1     | 0      |",
+                    "| 4  | 0     | 0      |",
+                    "| 5  | 1     | 0      |",
+                    "| 6  | 0     | 0      |",
+                    "| 7  | 3     | 2      |",
+                    "| 8  | 0     | 0      |",
+                    "+----+-------+--------+",
                 ],
                 &run_query(&rt, pinned).await?
             );
@@ -857,7 +854,10 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
             // where `\d` parts company), a class intersection (RE2 has no such
             // syntax and reads `[a&&a]` as a class of `a` and `&`), the `x` flag
             // (RE2 rejects it), nested counted repetitions whose product passes
-            // RE2's limit of 1000, and a flag other than `i`.
+            // RE2's limit of 1000, a quantifier stacked on a quantifier (RE2
+            // rejects `a++`), and any flags argument — `i` included, because the
+            // engines' case-folding tables track different Unicode versions and
+            // the pinned regex-syntax folds U+1C89 where RE2 does not.
             for call in [
                 "regexp_count(s, 'a', id)",
                 "regexp_count(s, p)",
@@ -867,7 +867,10 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
                 "regexp_count(s, '[a&&a]')",
                 "regexp_count(s, '(?x)a b')",
                 "regexp_count(s, '(a{100}){11}')",
+                "regexp_count(s, 'a++')",
                 "regexp_count(s, 'a', 1, 'm')",
+                "regexp_count(s, 'a', 1, 'i')",
+                "regexp_count(s, '(?i)a')",
             ] {
                 let sql = format!("SELECT id, {call} AS c FROM {{table}} ORDER BY id");
                 let accelerated = run_query(&rt, &sql.replace("{table}", "accelerated")).await?;

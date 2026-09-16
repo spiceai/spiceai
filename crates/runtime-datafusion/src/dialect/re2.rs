@@ -30,15 +30,19 @@ limitations under the License.
 //! and ranges (negated or not), `?`/`*`/`+`/`{m,n}` repetitions whose nested
 //! counted bounds multiply to at most [`RE2_MAX_REPETITION`], greedy or lazy,
 //! alternation, indexed or non-capturing groups, the `^`/`$`/`\A`/`\z`
-//! anchors, and the `i` flag. Everything else is refused, and
+//! anchors. Everything else is refused, and
 //! [`EngineDependentSyntax`] says why: Perl classes and word boundaries are
 //! Unicode-aware in the kernel and ASCII-only in RE2 (`'\d'` over `xy١`
 //! matches locally and not remotely); class-set operations and nested classes
 //! are syntax RE2 does not have, so it reads `[a&&a]` as a class of `a` and
-//! `&`; RE2 rejects the `x` flag and the `\u` escapes outright; and Unicode
-//! properties, POSIX classes, named groups and the other flags have not been
-//! measured to agree. `.`, `[^a]`, `[0-9]` and case-insensitive matching of
-//! non-ASCII letters were measured to agree.
+//! `&`; RE2 rejects the `x` flag, the `\u` escapes and a quantifier applied
+//! directly to another quantifier (`a++`, `a{1}{2}`, "bad repetition
+//! operator") outright; case-insensitive matching is refused because the two
+//! engines' case-folding tables track different Unicode versions — the pinned
+//! `regex-syntax` folds U+1C89 to U+1C8A where RE2's table does not, so
+//! `(?i)\x{1C89}` over `ᲊ` counts 1 locally and 0 remotely — and Unicode
+//! properties, POSIX classes, named groups and the remaining flags have not
+//! been measured to agree. `.`, `[^a]` and `[0-9]` were measured to agree.
 //!
 //! A caller with a stricter need layers its own predicate on the returned
 //! syntax tree — the `DuckDB` `regexp_count` rendering also requires a minimum
@@ -48,9 +52,9 @@ limitations under the License.
 use std::fmt;
 
 use regex_syntax::ast::{
-    AssertionKind, Ast, ClassSetBinaryOp, ClassSetItem, Flag, Flags, FlagsItemKind, GroupKind,
-    HexLiteralKind, Literal, LiteralKind, Repetition, RepetitionKind, RepetitionRange,
-    SpecialLiteralKind, Visitor, parse::Parser, visit,
+    AssertionKind, Ast, ClassSetBinaryOp, ClassSetItem, Flags, GroupKind, HexLiteralKind, Literal,
+    LiteralKind, Repetition, RepetitionKind, RepetitionRange, SpecialLiteralKind, Visitor,
+    parse::Parser, visit,
 };
 
 /// RE2's cap on counted repetition (`kMaxRepeat` in `re2/parse.cc`): the
@@ -78,7 +82,8 @@ pub(super) enum EngineDependentSyntax {
     ClassSetOperation,
     /// A bracketed class inside a bracketed class, or an empty one.
     NestedOrEmptyClass,
-    /// Any flag but `i`, or a negated flag.
+    /// Any flag, `i` included: case folding follows each engine's own
+    /// Unicode tables, which differ by version.
     Flag,
     /// `(?P<name>..)` and `(?<name>..)`.
     NamedGroup,
@@ -88,6 +93,9 @@ pub(super) enum EngineDependentSyntax {
     /// Counted repetitions whose nested product exceeds
     /// [`RE2_MAX_REPETITION`].
     RepetitionBound,
+    /// A quantifier applied directly to another quantifier (`a++`, `a{1}{2}`),
+    /// which RE2 rejects as a bad repetition operator; `(a+)+` is fine.
+    StackedRepetition,
 }
 
 impl fmt::Display for EngineDependentSyntax {
@@ -106,11 +114,16 @@ impl fmt::Display for EngineDependentSyntax {
                 "it uses a class-set operation (`&&`, `--`, `~~`), which RE2 reads as literal punctuation"
             }
             Self::NestedOrEmptyClass => "it uses a nested or empty bracketed class, which RE2 has no syntax for",
-            Self::Flag => "it uses a flag other than `i`, which RE2 reads differently or rejects",
+            Self::Flag => {
+                "it sets a flag; case-insensitive matching follows each engine's own Unicode case-folding tables and the other flags RE2 reads differently or rejects"
+            }
             Self::NamedGroup => "it uses a named group, whose agreement is unmeasured",
             Self::Escape => "it uses an escape RE2 rejects or reads differently",
             Self::RepetitionBound => {
                 "its nested counted repetitions multiply past RE2's limit of 1000"
+            }
+            Self::StackedRepetition => {
+                "it applies a quantifier directly to another quantifier, which RE2 rejects"
             }
         })
     }
@@ -147,12 +160,14 @@ impl EngineNeutralSyntax {
         }
     }
 
+    /// Every flag is refused. `i` was the one candidate — it is spelled the
+    /// same in both engines — but case folding follows each engine's own
+    /// Unicode tables, and the pinned `regex-syntax` is a newer Unicode than
+    /// the pinned `DuckDB`'s RE2, so a code point added in between folds in one
+    /// and not the other (U+1C89 ↔ U+1C8A). The remaining flags RE2 either
+    /// reads differently (`m`) or rejects (`x`, `u`, `U`, `R`).
     fn flags(flags: &Flags) -> Result<(), EngineDependentSyntax> {
-        if flags
-            .items
-            .iter()
-            .all(|item| matches!(item.kind, FlagsItemKind::Flag(Flag::CaseInsensitive)))
-        {
+        if flags.items.is_empty() {
             Ok(())
         } else {
             Err(EngineDependentSyntax::Flag)
@@ -163,6 +178,9 @@ impl EngineNeutralSyntax {
     /// one's (`?`, `*` and `+` count as 1, as in RE2) and refuses the pattern
     /// once the product passes [`RE2_MAX_REPETITION`].
     fn enter_repetition(&mut self, repetition: &Repetition) -> Result<(), EngineDependentSyntax> {
+        if matches!(*repetition.ast, Ast::Repetition(_)) {
+            return Err(EngineDependentSyntax::StackedRepetition);
+        }
         let bound = match repetition.op.kind {
             RepetitionKind::Range(
                 RepetitionRange::Exactly(n)

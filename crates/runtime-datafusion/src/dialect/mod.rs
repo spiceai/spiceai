@@ -89,7 +89,7 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
             ) as ScalarFnToSqlHandler,
         ),
         (
-            // DuckDB dialect: coalesce(len(regexp_extract_all(string, pattern[, group = 0, options])), 0)
+            // DuckDB dialect: coalesce(len(regexp_extract_all(string, pattern)), 0)
             // DataFusion dialect: regexp_count(str, regexp[, start, flags])
             REGEXP_COUNT_NAME,
             Box::new(
@@ -403,7 +403,7 @@ mod tests {
     /// `regexp_count` is rendered only for the call shapes `DuckDB` has been
     /// measured to count as the kernel does (#13870): a string-literal pattern
     /// that cannot match the empty string and uses only syntax both engines
-    /// read alike, and at most the `i` flag. Every other shape stays local
+    /// read alike, and no flags. Every other shape stays local
     /// rather than answering differently.
     #[test]
     fn duckdb_declines_a_regexp_count_it_cannot_count_faithfully() {
@@ -429,6 +429,14 @@ mod tests {
                 "(a{100}){11}",
                 "nested counted repetitions whose product passes RE2's limit of 1000",
             ),
+            (
+                "a++",
+                "a quantifier applied to a quantifier, which RE2 rejects",
+            ),
+            (
+                "(?i)a",
+                "case-insensitive matching, whose folding tables differ by Unicode version",
+            ),
         ] {
             assert!(
                 !duckdb_can_translate(&call_of(regexp_count(col("s"), lit(pattern), None, None))),
@@ -439,7 +447,7 @@ mod tests {
             !duckdb_can_translate(&call_of(regexp_count(col("s"), col("p"), None, None))),
             "a pattern read from a column cannot be inspected and stays local"
         );
-        for flags in ["m", "s", "c", "gi"] {
+        for flags in ["i", "m", "s", "c", "gi"] {
             assert!(
                 !duckdb_can_translate(&call_of(regexp_count(
                     col("s"),
@@ -447,7 +455,7 @@ mod tests {
                     Some(lit(1)),
                     Some(lit(flags)),
                 ))),
-                "flags `{flags}` have not been measured to mean the same in DuckDB and stay local"
+                "flags `{flags}` are refused (case folding differs by Unicode version, the rest RE2 reads differently) and stay local"
             );
         }
         assert!(
@@ -461,13 +469,11 @@ mod tests {
         );
 
         // The shapes that are rendered: the plain call, an anchored pattern
-        // (zero-width anchors do not make the match itself empty), a start, and
-        // the `i` flag.
+        // (zero-width anchors do not make the match itself empty), and a start.
         for expr in [
             regexp_count(col("s"), lit("a"), None, None),
             regexp_count(col("s"), lit("^a+$"), None, None),
             regexp_count(col("s"), lit("[0-9]{2,}"), Some(lit(3)), None),
-            regexp_count(col("s"), lit("a"), Some(lit(1)), Some(lit("i"))),
         ] {
             assert!(
                 duckdb_can_translate(&call_of(expr.clone())),
