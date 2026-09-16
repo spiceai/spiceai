@@ -407,14 +407,11 @@ impl CacheProbe {
     /// Whether the request can be served where it arrived, without the query
     /// runtime.
     ///
-    /// Only a hit that is cheap to serve qualifies. One held as batches hands
-    /// out the batches the cache already holds, which is per-entry rather than
-    /// per-provider: `encoding: zstd` still stores results at or under
-    /// [`cache::result::query::RAW_STORE_MAX_BYTES`] as raw batches when they
-    /// also fit the cache `max_size`. An encoded entry is decoded here while
-    /// the stream it decodes to is within [`INLINE_DECODE_MAX_BYTES`]. A larger
-    /// decode, and a miss, which has a query to plan and execute, belong on the
-    /// query runtime.
+    /// Only a hit that is cheap to serve qualifies: one held as batches hands
+    /// out the batches the cache already holds, and an encoded one is decoded
+    /// here while the stream it decodes to is within [`INLINE_DECODE_MAX_BYTES`].
+    /// A larger decode, and a miss, which has a query to plan and execute,
+    /// belong on the query runtime.
     pub(super) fn is_servable_in_place(&self) -> bool {
         matches!(self, Self::Hit(hit) if hit.serves_in_place())
     }
@@ -1275,14 +1272,13 @@ impl Query {
             // refreshes the entry correctly rather than leaving the previous
             // (now stale) value in place.
 
-            match cache::result::query::CachedQueryResult::from_batches_bounded(
+            match cache::result::query::CachedQueryResult::from_batches(
                 batches,
                 schema,
                 input_tables,
                 cached_at,
                 revalidation_started_at,
                 encoder,
-                cache_provider.max_size(),
             )
             .await
             {

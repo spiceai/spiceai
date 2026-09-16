@@ -307,14 +307,13 @@ pub fn to_cached_record_batch_stream(
                 let cached_at = std::time::Instant::now();
                 let encoder = cache_provider.encoder();
 
-                match CachedQueryResult::from_batches_bounded(
+                match CachedQueryResult::from_batches(
                     records,
                     cache_schema,
                     input_tables,
                     cached_at,
                     read_started_at,
                     encoder,
-                    cache_provider.max_size(),
                 )
                 .await
                 {
@@ -1399,10 +1398,9 @@ pub(crate) mod tests {
         );
 
         // Build a batch of highly compressible data (repeated zeros) whose
-        // uncompressed memory size exceeds the 2 KiB cache limit but is still
-        // under [`crate::result::query::RAW_STORE_MAX_BYTES`]. The store path
-        // must encode it so the compressed entry can fit — staying raw would
-        // skip the write (see #8508).
+        // uncompressed memory size exceeds the 2 KiB cache limit. The store
+        // path encodes it, so the entry it writes is the compressed one and
+        // fits (see #8508).
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Int32, false),
@@ -1418,11 +1416,6 @@ pub(crate) mod tests {
             raw_size > cache_max,
             "Test precondition: raw size ({raw_size}) must exceed cache max ({cache_max})"
         );
-        assert!(
-            raw_size <= crate::result::query::RAW_STORE_MAX_BYTES,
-            "Test precondition: raw size ({raw_size}) must be at or under the in-place raw-store budget so this is the #8508 case, not the large-result path"
-        );
-
         let raw_cache_key = crate::key::CacheKey::Query("zstd-compressible", None)
             .as_raw_key(cache_provider.hasher());
         let stream = Box::pin(RecordBatchStreamAdapter::new(
