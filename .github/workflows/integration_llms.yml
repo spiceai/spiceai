@@ -132,6 +132,11 @@ jobs:
           token: ${{ github.token }}
           bucket: build
           region: us-west-1
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
 
       - name: Upload test binary to spiceio
         if: env.HAS_SPICEIO_SECRET == 'true'
@@ -184,6 +189,11 @@ jobs:
           token: ${{ github.token }}
           bucket: build
           region: us-west-1
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
 
       - name: Download test binary from spiceio
         if: env.HAS_SPICEIO_SECRET == 'true'
