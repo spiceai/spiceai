@@ -101,9 +101,10 @@ pub enum Error {
 
     #[snafu(display(
         "Failed to fetch {endpoint} for {dataset}: the origin answered {status}, which \
-        `on_error_response` is set to treat as a failed request rather than as data. \
-        Fix the origin, or set `on_error_response: store` on this dataset to keep recording \
-        the response body as a row. \
+        `on_error_response` treats as a failed request rather than as data. \
+        Fix the origin, or set `on_error_response: warn` on this dataset to record the body as a \
+        row and log that a full refresh would replace the dataset's previous contents. \
+        `store` records it without the log line and is not recommended. \
         See: https://spiceai.org/docs/components/data-connectors/https"
     ))]
     ErrorResponse {
@@ -8146,6 +8147,17 @@ mod tests {
         assert!(
             message.contains("spiceai.org/docs/components/data-connectors/https"),
             "the failure must link the connector's docs: {message}"
+        );
+        // The remedy has to point at `warn`, which records the body *and* says so. Pointing
+        // at `store` hands the operator the silent form as the golden path, which is the
+        // behaviour this parameter exists to stop being the accident.
+        assert!(
+            message.contains("`on_error_response: warn`"),
+            "the failure must offer `warn` as the remedy: {message}"
+        );
+        assert!(
+            !message.contains("`on_error_response: store`"),
+            "the failure must not offer the silent form as the remedy: {message}"
         );
         // Several datasets can share one endpoint with different request filters, so the
         // endpoint alone does not say which one failed.
