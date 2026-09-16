@@ -115,7 +115,7 @@ async fn test_cold_tier_selective_query_prunes_files_impl(
         partition_column: None,
         vortex_config: VortexConfig {
             cold_tier_location: Some(format!("file://{}", cold_dir.to_string_lossy())),
-            cold_clustering_columns: vec!["id".to_string()],
+            cluster_by: vec!["id".to_string()],
             cold_tier_warm_max_files: 1,
             deletion_mode: DeletionMode::Key,
             ..VortexConfig::default()
@@ -207,6 +207,7 @@ async fn test_cold_tier_selective_query_prunes_files_impl(
 }
 
 test_with_backends!(test_cold_tier_normalized_clustering_prunes_both_dimensions_impl);
+test_with_backends!(test_warm_tier_normalized_clustering_prunes_both_dimensions_impl);
 
 /// DataFusion's default write batch is 8192 rows. The Vortex sink checks the
 /// 1 MB cold target at batch boundaries, so a pad just over 128 B makes each
@@ -242,6 +243,127 @@ fn int64_bound(value: &datafusion_common::stats::Precision<ScalarValue>) -> Opti
     }
 }
 
+/// A warm-tier rewrite must use the explicit multi-dimensional cluster key and
+/// ignore the inference-derived sort key. This exercises the real Vortex write,
+/// footer-statistics, planning, and scan paths before any datalake promotion.
+async fn test_warm_tier_normalized_clustering_prunes_both_dimensions_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("tenant", DataType::Int64, false),
+        Field::new("pad", DataType::Binary, false),
+    ]));
+
+    let table_options = CreateTableOptions {
+        table_name: "warm_cluster_prune_t".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec!["id".to_string()],
+        on_conflict: None,
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: VortexConfig {
+            cluster_by: vec!["ts".to_string(), "tenant".to_string()],
+            // Schema inference commonly supplies the primary key as an inferred
+            // sort. Explicit clustering must suppress it, not reject the table
+            // or lexicographically sort by it.
+            sort_columns: vec!["id".to_string()],
+            sort_columns_origin: cayenne::metadata::SortColumnsOrigin::Inferred,
+            target_vortex_file_size_mb: 1,
+            ..VortexConfig::default()
+        },
+    };
+
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
+    ctx.register_table(
+        "warm_cluster_prune_t",
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    )?;
+
+    let ids: Vec<i64> = (0..CLUSTER_ROWS).collect();
+    let timestamps: Vec<i64> = (0..CLUSTER_ROWS)
+        .map(|i| CLUSTER_TS_BASE + i * CLUSTER_TS_STEP)
+        .collect();
+    let tenants: Vec<i64> = (0..CLUSTER_ROWS)
+        .map(|i| (i * 7) % CLUSTER_TENANTS)
+        .collect();
+    let pads: Vec<Vec<u8>> = (0..CLUSTER_ROWS).map(cluster_pad).collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(Int64Array::from(timestamps)),
+            Arc::new(Int64Array::from(tenants)),
+            Arc::new(BinaryArray::from_iter_values(pads)),
+        ],
+    )?;
+    common::insert_batch(table.as_ref(), batch).await?;
+    table.flush_pending_maintenance().await?;
+    table.checkpoint_inlined_data().await?;
+    table.checkpoint_mem_tier().await?;
+
+    assert!(
+        table.effective_sort_columns_for_rewrite().is_empty(),
+        "automatic/inferred sort columns must be disabled by explicit cluster_by"
+    );
+    table.sort_and_rewrite_data(1024 * 1024).await?;
+
+    let all_files = planned_files_for(&ctx, "SELECT id FROM warm_cluster_prune_t").await?;
+    assert!(
+        all_files >= 8,
+        "the warm rewrite must roll several files so pruning is observable, got {all_files}"
+    );
+
+    let probe_row = CLUSTER_ROWS / 2;
+    let probe_ts = CLUSTER_TS_BASE + probe_row * CLUSTER_TS_STEP;
+    let probe_tenant = (probe_row * 7) % CLUSTER_TENANTS;
+    let ts_files = planned_files_for(
+        &ctx,
+        &format!("SELECT id FROM warm_cluster_prune_t WHERE ts = {probe_ts}"),
+    )
+    .await?;
+    let tenant_files = planned_files_for(
+        &ctx,
+        &format!("SELECT id FROM warm_cluster_prune_t WHERE tenant = {probe_tenant}"),
+    )
+    .await?;
+    assert!(
+        ts_files < all_files,
+        "a warm-tier timestamp point filter pruned nothing: {ts_files} of {all_files} files planned"
+    );
+    assert!(
+        tenant_files < all_files,
+        "a warm-tier tenant point filter pruned nothing: {tenant_files} of {all_files} files planned"
+    );
+
+    assert_eq!(
+        collect_ids(
+            &ctx,
+            &format!("SELECT id FROM warm_cluster_prune_t WHERE ts = {probe_ts}")
+        )
+        .await?,
+        vec![probe_row]
+    );
+    let expected_tenant: Vec<i64> = (0..CLUSTER_ROWS)
+        .filter(|i| (*i * 7) % CLUSTER_TENANTS == probe_tenant)
+        .collect();
+    assert_eq!(
+        collect_ids(
+            &ctx,
+            &format!("SELECT id FROM warm_cluster_prune_t WHERE tenant = {probe_tenant}")
+        )
+        .await?,
+        expected_tenant
+    );
+    Ok(())
+}
+
 /// One promotion of the timestamp/tenant fixture. Predicates on *both*
 /// differently-scaled clustering columns must drop cold files — the defect the
 /// normalized `Hilbert` key exists to fix. Kernel tests can pass while statistics
@@ -268,7 +390,7 @@ async fn test_cold_tier_normalized_clustering_prunes_both_dimensions_impl(
         partition_column: None,
         vortex_config: VortexConfig {
             cold_tier_location: Some(format!("file://{}", cold_dir.to_string_lossy())),
-            cold_clustering_columns: vec!["ts".to_string(), "tenant".to_string()],
+            cluster_by: vec!["ts".to_string(), "tenant".to_string()],
             cold_tier_warm_max_files: 1,
             cold_target_file_size_mb: 1,
             deletion_mode: DeletionMode::Key,

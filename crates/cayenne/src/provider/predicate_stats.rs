@@ -17,7 +17,7 @@ limitations under the License.
 //! Per-table filter-column hit histogram for default-on adaptive cold layout (F4).
 //!
 //! Scans record which columns appear in pushdown filters. When operators leave
-//! `sort_columns` / `cold_clustering_columns` empty, compaction consults
+//! `sort_columns` / `cluster_by` empty, compaction consults
 //! [`FilterColumnObservations::top_columns`] and sorts the rewrite by the hottest
 //! columns so zone maps prune selective queries without any spicepod setup.
 

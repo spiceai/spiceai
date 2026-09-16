@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Multi-column clustering key (Hilbert curve) for the cold object-store tier.
+//! Multi-column clustering key (Hilbert curve) for warm and datalake files.
 //!
-//! The cold-tier promotion stage rewrites settled warm data as read-optimized
-//! Vortex files. To make a file's per-column zone maps (footer min/max) tight on
+//! Warm rewrites and datalake promotion produce read-optimized Vortex files. To
+//! make a file's per-column zone maps (footer min/max) tight on
 //! *every* clustering dimension at once — so a selective predicate on any of
 //! them prunes most cold files — the rows are sorted along a **space-filling
 //! curve** over the clustering columns (liquid-clustering-style multi-dimensional

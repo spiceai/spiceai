@@ -1186,10 +1186,14 @@ pub struct VortexConfig {
     /// `configuration_matches`, so toggling it never recreates the table (the
     /// cold tier is a strict superset of behavior over an unchanged warm tier).
     pub cold_tier_location: Option<String>,
-    /// Liquid-clustering key columns for cold files (multi-column curve).
-    /// Empty = fall back to `sort_columns`, then the primary key. Set from
-    /// `cayenne_datalake_clustering_columns`.
-    pub cold_clustering_columns: Vec<String>,
+    /// Hilbert-clustering key columns for warm and datalake files.
+    /// Empty leaves layout selection to the existing automatic policy. Set from
+    /// `cayenne_cluster_by` or a Cayenne DDL `CLUSTER BY` clause.
+    ///
+    /// The alias preserves metadata written by preview builds that stored the
+    /// cold-tier-only field name. New metadata is always written as `cluster_by`.
+    #[serde(alias = "cold_clustering_columns")]
+    pub cluster_by: Vec<String>,
     /// Target size for cold Vortex files in MB. Larger than the warm
     /// `target_vortex_file_size_mb` because object stores favor fewer, larger
     /// objects and cold scans are range reads. Set from
@@ -1566,7 +1570,7 @@ impl Default for VortexConfig {
             force_view_read_schema: false,
             integrity_checksums: false,
             cold_tier_location: None,
-            cold_clustering_columns: Vec::new(),
+            cluster_by: Vec::new(),
             cold_target_file_size_mb: 512,
             cold_clustering_run_size_mb: None,
             cold_tier_warm_max_bytes: 0,

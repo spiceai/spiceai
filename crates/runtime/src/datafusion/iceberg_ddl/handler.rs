@@ -83,6 +83,12 @@ impl CatalogDdlHandler for IcebergDdlHandler {
         catalog_list: Arc<dyn CatalogProviderList>,
         _session_state: &SessionState,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if !params.extension.cluster_by.is_empty() {
+            return Err(DataFusionError::Plan(format!(
+                "Failed to create table '{}.{}.{}' (iceberg): `CLUSTER BY` is supported only for Cayenne catalogs.",
+                params.catalog_name, params.schema_name, params.table_name
+            )));
+        }
         let iceberg_catalog = Self::get_iceberg_catalog(&params.catalog_name, &catalog_list)
             .ok_or_else(|| {
                 DataFusionError::Plan(format!(

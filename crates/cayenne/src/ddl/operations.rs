@@ -32,6 +32,7 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::ExprSchemable;
 use datafusion::prelude::{Expr, SessionContext};
 use datafusion::sql::TableReference;
+use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
@@ -78,12 +79,33 @@ pub struct CreateTableParams {
     /// Raw SQL text for the `PARTITION BY` expression.
     /// Parsed and validated at execution time inside [`CayenneCreateTableExec`].
     pub partition_expr_sql: Option<String>,
+    /// Hilbert-clustering columns from `CLUSTER BY`.
+    pub cluster_by: Vec<String>,
     /// If `true`, do not error when the table already exists.
     pub if_not_exists: bool,
     /// Source table for `CREATE TABLE … (LIKE …)`.
     pub like_source_table: Option<TableReference>,
     /// `SessionContext` used to parse the partition expression at execution time.
     pub ctx: Option<Arc<SessionContext>>,
+}
+
+/// Validate a Cayenne `CLUSTER BY` clause and return its column names.
+///
+/// # Errors
+///
+/// Returns a planning error when an expression is not a simple column
+/// identifier. Column existence and data-type support are validated against
+/// the transformed table schema during creation.
+pub fn cluster_by_column_names(table_name: &str, expressions: &[SqlExpr]) -> DFResult<Vec<String>> {
+    expressions
+        .iter()
+        .map(|expression| match expression {
+            SqlExpr::Identifier(identifier) => Ok(identifier.value.clone()),
+            _ => Err(DataFusionError::Plan(format!(
+                "Failed to create table '{table_name}' (cayenne): unsupported clustering expression '{expression}'. `CLUSTER BY` accepts column names only."
+            ))),
+        })
+        .collect()
 }
 
 // ── Operations ────────────────────────────────────────────────────────────────
@@ -105,7 +127,10 @@ pub async fn create_table(
 ) -> DFResult<CreateTableOutcome> {
     let metadata_catalog = Arc::clone(cayenne_provider.metadata_catalog());
     let data_base_path = cayenne_provider.data_base_path().to_string();
-    let vortex_config = cayenne_provider.vortex_config().clone();
+    let mut vortex_config = cayenne_provider.vortex_config().clone();
+    if !params.cluster_by.is_empty() {
+        vortex_config.cluster_by.clone_from(&params.cluster_by);
+    }
 
     let metadata_table_name = format!("{}/{}", params.schema_name, params.table_name);
 

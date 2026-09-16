@@ -124,7 +124,7 @@ async fn test_cold_tier_promotion_cross_tier_scan_and_delete_impl(
             // Cold tier on the local fs, clustered by `id`, triggered by ANY
             // warm file so the test is deterministic.
             cold_tier_location: Some(cold_url),
-            cold_clustering_columns: vec!["id".to_string()],
+            cluster_by: vec!["id".to_string()],
             cold_tier_warm_max_files: 1,
             cold_target_file_size_mb: 16,
             deletion_mode: DeletionMode::Key,
@@ -323,7 +323,7 @@ async fn test_cold_tier_carry_forward_promotion_impl(
         partition_column: None,
         vortex_config: VortexConfig {
             cold_tier_location: Some(cold_url),
-            cold_clustering_columns: vec!["id".to_string()],
+            cluster_by: vec!["id".to_string()],
             cold_tier_warm_max_files: 1,
             cold_target_file_size_mb: 16,
             deletion_mode: DeletionMode::Key,
@@ -483,7 +483,7 @@ fn cold_table_options_with_conflict(
         partition_column: None,
         vortex_config: VortexConfig {
             cold_tier_location: Some(format!("file://{}", cold_dir.to_string_lossy())),
-            cold_clustering_columns: vec!["id".to_string()],
+            cluster_by: vec!["id".to_string()],
             cold_tier_warm_max_files: 1,
             cold_target_file_size_mb: 16,
             cold_tier_gc_interval_ms: gc_interval_ms,
@@ -1677,7 +1677,7 @@ async fn test_cold_tier_bounded_clustering_multi_run_promotion_impl(
         vortex_config: VortexConfig {
             cold_tier_location: Some(cold_url),
             // Multi-column key exercises real bit-interleaving across runs.
-            cold_clustering_columns: vec!["id".to_string(), "value".to_string()],
+            cluster_by: vec!["id".to_string(), "value".to_string()],
             cold_tier_warm_max_files: 1,
             cold_target_file_size_mb: 16,
             cold_clustering_run_size_mb: Some(run_size_mb),

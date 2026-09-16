@@ -16756,6 +16756,16 @@ impl CayenneTableProvider {
         usize,
         super::delta_encoding::WritePolicy,
     )> {
+        if self.context.has_cluster_by() {
+            let ctx = self.create_session_context();
+            let clustered = self.cluster_sort_stream(
+                data,
+                self.configured_clustering_indices(),
+                &ctx.task_ctx(),
+                None,
+            )?;
+            return Ok((clustered, 1, rewrite_write_policy(true)));
+        }
         if !self.context.sort_columns_are_authoritative() {
             return Ok((data, target_partitions, rewrite_write_policy(false)));
         }
@@ -16789,6 +16799,14 @@ impl CayenneTableProvider {
     /// reaching private compaction internals.
     #[must_use]
     pub fn effective_sort_columns_for_rewrite(&self) -> Vec<String> {
+        // An explicit multi-dimensional cluster key is the complete layout
+        // instruction. Do not layer inferred, observed, or configured
+        // lexicographic sorting on top of it; hierarchical clustering is a
+        // separate future contract.
+        if self.context.has_cluster_by() {
+            return Vec::new();
+        }
+
         // Auto-observed columns feed a `SortExec` row-format merge whose
         // `RowConverter` rejects `Map`/`Union`/nested types (e.g. a `Map` recorded
         // from an `attrs['k'] = ...` filter). Restrict inferred layouts to scalar
@@ -16910,6 +16928,7 @@ impl CayenneTableProvider {
             return Ok(());
         }
 
+        let clustering = self.configured_clustering_indices();
         let rewrite_sort_columns = self.effective_sort_columns_for_rewrite();
         tracing::debug!(
             "Sorting and rewriting data for table {} by columns {:?} (auto_from_filters={})",
@@ -16928,9 +16947,12 @@ impl CayenneTableProvider {
         // An empty list resolves to no key at all, and `sort_stream_by_columns`
         // then hands the stream back untouched — so whether this rewrite is
         // sorted is a property of the resolved list, not of the entry point.
-        let rewrite_is_sorted = !rewrite_sort_columns.is_empty();
-        let sorted_stream =
-            self.sort_stream_by_columns(stream, &rewrite_sort_columns, &ctx.task_ctx())?;
+        let rewrite_is_sorted = !clustering.is_empty() || !rewrite_sort_columns.is_empty();
+        let sorted_stream = if clustering.is_empty() {
+            self.sort_stream_by_columns(stream, &rewrite_sort_columns, &ctx.task_ctx())?
+        } else {
+            self.cluster_sort_stream(stream, clustering, &ctx.task_ctx(), None)?
+        };
 
         // Write sorted data to a new snapshot directory. Because SortExec lazily
         // reads input files via DataSourceExec, writing to a separate directory
@@ -17445,7 +17467,7 @@ impl CayenneTableProvider {
     ) -> bool {
         subset_rewrite_eligibility(
             self.should_capture_positions() || self.pk_deletion_strategy.is_position_based(),
-            self.context.has_sort_columns(),
+            self.context.has_sort_columns() || self.context.has_cluster_by(),
             self.protected_snapshots.load().len(),
             candidate.paths.len(),
             files.len(),
@@ -20532,9 +20554,18 @@ impl CayenneTableProvider {
         // Configured sort_columns win; otherwise (default empty) sort by the
         // hottest observed filter columns so selective scans prune zone maps
         // without spicepod setup (F4 adaptive cold layout).
+        let clustering = self.configured_clustering_indices();
         let rewrite_sort_columns = self.effective_sort_columns_for_rewrite();
-        let rewrite_is_sorted = !rewrite_sort_columns.is_empty();
-        if rewrite_is_sorted {
+        let rewrite_is_sorted = !clustering.is_empty() || !rewrite_sort_columns.is_empty();
+        if !clustering.is_empty() {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                cluster_by = ?self.context.cluster_by(),
+                "Clustering compaction rewrite before writing consolidated output files"
+            );
+            stream = self.cluster_sort_stream(stream, clustering, &ctx.task_ctx(), None)?;
+        } else if !rewrite_sort_columns.is_empty() {
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -20951,16 +20982,28 @@ impl CayenneTableProvider {
         Ok((stream, generation_before))
     }
 
+    /// Resolve the explicitly configured clustering columns to schema indices.
+    /// Registration validates every name, so an empty result means no explicit
+    /// cluster key rather than a partially accepted configuration.
+    fn configured_clustering_indices(&self) -> Vec<usize> {
+        let schema = self.table_schema();
+        self.context
+            .cluster_by()
+            .iter()
+            .filter_map(|name| schema.index_of(name).ok())
+            .collect()
+    }
+
     /// Resolve the cold-tier clustering columns to schema indices:
-    /// `cayenne_datalake_clustering_columns` → else `cayenne_sort_columns` →
+    /// `cayenne_cluster_by` → else `cayenne_sort_columns` →
     /// else hottest observed filter columns (F4 default-on) → else the primary
     /// key. Returns the indices that exist in the schema (empty = no
     /// clustering, promotion writes unsorted).
     fn resolve_cold_clustering_indices(&self) -> Vec<usize> {
         let schema = self.table_schema();
         let vc = &self.table_metadata.vortex_config;
-        let names: Vec<String> = if !vc.cold_clustering_columns.is_empty() {
-            vc.cold_clustering_columns.clone()
+        let names: Vec<String> = if !vc.cluster_by.is_empty() {
+            vc.cluster_by.clone()
         } else if self.context.sort_columns_are_authoritative() {
             // Only an EXPLICIT sort order outranks observed filters here. An
             // inference-derived one (the primary key, for most CDC tables) drops
@@ -21073,25 +21116,20 @@ impl CayenneTableProvider {
     }
 
     /// Cluster a stream along a Hilbert curve over `clustering_indices` by
-    /// appending a transient key column, sorting on it in byte-bounded runs via
-    /// [`super::streaming::bounded_sort_stream`] (per-run `SortExec`:
-    /// pool-accounted, disk-spilling), then stripping the key. Bounding the
-    /// sort caps per-run memory and first-batch latency; curve ranges may
-    /// overlap across runs, which only weakens per-file min/max pruning
-    /// slightly — cold files advertise no ordering, so this is a
-    /// clustering-quality trade-off, not a correctness change. The run cap is
-    /// [`crate::metadata::VortexConfig::cold_clustering_run_size_bytes`],
-    /// measured on the augmented batches (key included — what `SortExec`
-    /// actually buffers). Empty `clustering_indices` returns the stream
+    /// appending a transient key column, sorting on it with a pool-accounted,
+    /// disk-spilling `SortExec`, then stripping the key. `max_run_size_bytes`
+    /// bounds datalake promotions into sequential runs; `None` gives warm-tier
+    /// rewrites one global order. Empty `clustering_indices` returns the stream
     /// unchanged.
     fn cluster_sort_stream(
         &self,
         stream: SendableRecordBatchStream,
         clustering_indices: Vec<usize>,
         task_ctx: &Arc<datafusion_execution::TaskContext>,
-    ) -> SendableRecordBatchStream {
+        max_run_size_bytes: Option<usize>,
+    ) -> Result<SendableRecordBatchStream> {
         if clustering_indices.is_empty() {
-            return stream;
+            return Ok(stream);
         }
         let original_schema = stream.schema();
         let augmented_schema = super::clustering::cluster_augmented_schema(&original_schema);
@@ -21107,20 +21145,26 @@ impl CayenneTableProvider {
             Arc::clone(&augmented_schema),
             augmented,
         ));
-        let sorted = super::streaming::bounded_sort_stream(
-            &self.table_metadata.table_name,
-            augmented_stream,
-            vec![super::clustering::CLUSTER_KEY_COLUMN_NAME.to_string()],
-            task_ctx,
-            self.table_metadata
-                .vortex_config
-                .cold_clustering_run_size_bytes(),
-        );
+        let cluster_key = vec![super::clustering::CLUSTER_KEY_COLUMN_NAME.to_string()];
+        let sorted = if let Some(max_run_size_bytes) = max_run_size_bytes {
+            super::streaming::bounded_sort_stream(
+                &self.table_metadata.table_name,
+                augmented_stream,
+                cluster_key,
+                task_ctx,
+                max_run_size_bytes,
+            )
+        } else {
+            self.sort_stream_by_columns(augmented_stream, &cluster_key, task_ctx)?
+        };
         let orig = Arc::clone(&original_schema);
         let stripped = sorted.map(move |res| {
             res.and_then(|b| super::clustering::strip_cluster_key_column(&b, &orig))
         });
-        Box::pin(RecordBatchStreamAdapter::new(original_schema, stripped))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            original_schema,
+            stripped,
+        )))
     }
 
     /// Per-file row cap so a file's PK bloom (~10 bits/key) stays within
@@ -21747,10 +21791,10 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             source_tier = "warm",
             target_tier = "datalake",
-            clustering = "z_order",
+            clustering = "hilbert",
             warm_bytes,
             warm_files,
-            "Moving warm-tier data to the datalake (Z-order clustered)"
+            "Moving warm-tier data to the datalake (Hilbert clustered)"
         );
 
         // Exclude writers for the whole graduation (mirrors begin_overwrite).
@@ -21853,7 +21897,16 @@ impl CayenneTableProvider {
         let clustering = self.resolve_cold_clustering_indices();
         let clustering_is_empty = clustering.is_empty();
         let task_ctx = ctx.task_ctx();
-        let stream = self.cluster_sort_stream(stream, clustering, &task_ctx);
+        let stream = self.cluster_sort_stream(
+            stream,
+            clustering,
+            &task_ctx,
+            Some(
+                self.table_metadata
+                    .vortex_config
+                    .cold_clustering_run_size_bytes(),
+            ),
+        )?;
 
         // Write the clustered, deletes-applied rows to the cold object store.
         let (cold_files, total_rows) = self
@@ -33840,7 +33893,7 @@ impl TableProvider for CayenneTableProvider {
         // collected. Gating this on `has_sort_columns()` instead is what made the
         // adaptive layout inert on every catalog-visible CDC deployment, since
         // inference fills `cayenne_sort_columns` on all of them.
-        if !self.context.sort_columns_are_authoritative() {
+        if !self.context.has_cluster_by() && !self.context.sort_columns_are_authoritative() {
             self.filter_column_observations.record_filters(filters);
         }
 
