@@ -96,14 +96,8 @@ impl FileSource for OrcSource {
     ) -> Result<Option<Arc<dyn FileSource>>> {
         let mut source = self.clone();
         let new_projection = self.projection.source.try_merge(projection)?;
-        // Classify against the full table schema (file + partition + metadata),
-        // not the file schema alone, so a projected `_location`/`_last_modified`/
-        // `_size` metadata column is substituted from each file's `ObjectMeta`
-        // rather than being misread as a partition column and indexing past the
-        // (empty) partition values. Regression test for #14113.
-        let split_projection =
+        source.projection =
             SplitProjection::new_with_table_schema(&self.table_schema, &new_projection);
-        source.projection = split_projection;
         Ok(Some(Arc::new(source)))
     }
 
