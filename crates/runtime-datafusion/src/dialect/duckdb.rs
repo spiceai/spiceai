@@ -28,6 +28,24 @@ pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_matches";
 pub(crate) const REGEXP_REPLACE_NAME: &str = "regexp_replace";
 pub(crate) const REGEXP_COUNT_NAME: &str = "regexp_extract_all";
 
+/// `DuckDB`'s list-length function, applied over `regexp_extract_all` to
+/// count the matches `regexp_count` asks for.
+const LEN_NAME: &str = "len";
+
+/// `DuckDB`'s NULL-defaulting function, applied over that count so a NULL
+/// input answers `0` as the kernel does — see
+/// [`DuckDBRegexpFunction::postprocess_function`].
+const COALESCE_NAME: &str = "coalesce";
+
+/// `regexp_extract_all`'s group argument for the whole match, which is what
+/// `regexp_count` counts, and which has to precede the options when
+/// `regexp_count` carries flags.
+const WHOLE_MATCH_GROUP: &str = "0";
+
+/// The one regexp flag rendered for `regexp_count`: case-insensitive matching,
+/// spelled `i` in both engines and measured to mean the same thing in both.
+const CASE_INSENSITIVE_FLAG: &str = "i";
+
 /// `DuckDB`'s name for the both-ends trim `DataFusion` calls `btrim`.
 pub(crate) const TRIM_NAME: &str = "trim";
 
@@ -169,6 +187,102 @@ fn call_ast_fn(function_name: &str, args: Vec<ast::Expr>) -> ast::Expr {
 /// Renders `inner` as the sole argument of a call to `function_name`.
 fn wrap_in_call(inner: ast::Expr, function_name: &str) -> ast::Expr {
     call_ast_fn(function_name, vec![inner])
+}
+
+/// An unsigned integer literal.
+fn number_literal(digits: &str) -> ast::Expr {
+    ast::Expr::Value(ValueWithSpan {
+        value: sqlparser::ast::Value::Number(digits.to_string(), false),
+        span: sqlparser::tokenizer::Span::empty(),
+    })
+}
+
+/// Whether `DuckDB` counts the matches of the literal `pattern` exactly as the
+/// kernel does, judged on the pattern's syntax with the same crate the
+/// kernel's `regex` compiles it with — so what is judged is what the kernel
+/// would run. Two properties are required, each measured to diverge on the
+/// bundled `DuckDB` without it (issue #13870):
+///
+/// - **Every match is at least one character long.** The kernel skips an
+///   empty match that abuts the match before it, RE2's extraction loop keeps
+///   it, so `'a*'` over `ab` counts 2 locally and 3 federated. A minimum match
+///   length of one or more rules the case out; `None` (a pattern that can
+///   never match, such as `[a&&b]`) is refused as unmeasured.
+/// - **No Perl class and no word boundary.** `\d`, `\w`, `\s`, their
+///   negations, and `\b`/`\B` are Unicode-aware in the kernel and ASCII-only
+///   in RE2, so `'\d'` over `xy١` counts 1 locally and 0 federated. Explicit
+///   classes (`[0-9]`, `[^a]`), `.`, Unicode properties (`\p{Nd}`) and
+///   case-insensitive matching of non-ASCII letters were measured to agree and
+///   pass through.
+///
+/// An unparseable pattern is refused too: the kernel's own error is the right
+/// one for the user to see, and local evaluation delivers it.
+fn duckdb_counts_pattern_identically(pattern: &str) -> bool {
+    let Ok(ast) = regex_syntax::ast::parse::Parser::new().parse(pattern) else {
+        return false;
+    };
+    if regex_syntax::ast::visit(&ast, EngineNeutralSyntax).is_err() {
+        return false;
+    }
+    regex_syntax::hir::translate::Translator::new()
+        .translate(pattern, &ast)
+        .ok()
+        .and_then(|hir| hir.properties().minimum_len())
+        .is_some_and(|min| min > 0)
+}
+
+/// The syntax whose meaning depends on which engine compiles it — see
+/// [`duckdb_counts_pattern_identically`].
+#[derive(Debug)]
+enum EngineDependentSyntax {
+    /// `\d`, `\w`, `\s` or a negation, bare or inside a bracketed class.
+    PerlClass,
+    /// `\b`, `\B` or one of the word-start/word-end assertions.
+    WordBoundary,
+}
+
+/// Walks a pattern's syntax tree and fails on the first
+/// [`EngineDependentSyntax`] it meets.
+struct EngineNeutralSyntax;
+
+impl regex_syntax::ast::Visitor for EngineNeutralSyntax {
+    type Output = ();
+    type Err = EngineDependentSyntax;
+
+    fn finish(self) -> Result<(), EngineDependentSyntax> {
+        Ok(())
+    }
+
+    fn visit_pre(&mut self, ast: &regex_syntax::ast::Ast) -> Result<(), EngineDependentSyntax> {
+        use regex_syntax::ast::{AssertionKind, Ast};
+        match ast {
+            Ast::ClassPerl(_) => Err(EngineDependentSyntax::PerlClass),
+            // Anchors are the only assertions both engines read alike; every
+            // other kind is a word boundary, today's and any added later.
+            Ast::Assertion(assertion)
+                if !matches!(
+                    assertion.kind,
+                    AssertionKind::StartLine
+                        | AssertionKind::EndLine
+                        | AssertionKind::StartText
+                        | AssertionKind::EndText
+                ) =>
+            {
+                Err(EngineDependentSyntax::WordBoundary)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn visit_class_set_item_pre(
+        &mut self,
+        item: &regex_syntax::ast::ClassSetItem,
+    ) -> Result<(), EngineDependentSyntax> {
+        match item {
+            regex_syntax::ast::ClassSetItem::Perl(_) => Err(EngineDependentSyntax::PerlClass),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Lower-cases `DuckDB`'s `to_hex`, which upper-cases the digits `DataFusion`
@@ -499,16 +613,7 @@ fn finite_or_null(value: ast::Expr) -> ast::Expr {
         ],
     );
 
-    call_ast_fn(
-        LIST_EXTRACT_NAME,
-        vec![
-            screened,
-            ast::Expr::Value(ValueWithSpan {
-                value: sqlparser::ast::Value::Number("1".to_string(), false),
-                span: sqlparser::tokenizer::Span::empty(),
-            }),
-        ],
-    )
+    call_ast_fn(LIST_EXTRACT_NAME, vec![screened, number_literal("1")])
 }
 
 /// Converts `array_distance(query, embed_col)` to `DuckDB` `array_distance` with explicit
@@ -602,80 +707,140 @@ pub(super) enum DuckDBRegexpFunction {
 }
 
 impl DuckDBRegexpFunction {
+    /// Reshapes the arguments of `regexp_count(str, regexp[, start[, flags]])`
+    /// into those of `regexp_extract_all(str, regexp[, group, options])`, and
+    /// refuses every call whose count `DuckDB` would not answer as the kernel
+    /// does. A refusal is not an error the user sees: `duckdb_can_translate`
+    /// turns it into "evaluate locally", so the call still answers (#13900).
+    ///
+    /// **Pattern.** Only a string literal is rendered, and only one
+    /// [`duckdb_counts_pattern_identically`] accepts: no empty match possible,
+    /// no Perl class, no word boundary. Anything else — including a pattern
+    /// read from a column, whose values cannot be inspected here — stays local.
+    ///
+    /// **Start.** The kernel counts from a 1-based character position, which
+    /// `DuckDB` has no regexp argument for, so the input is narrowed to
+    /// `SUBSTRING(str, start)` first — `SUBSTRING` is 1-based in both engines,
+    /// so the position is passed through unchanged. A start that is not an
+    /// integer literal cannot become an offset at unparse time and is refused,
+    /// as is one below 1, which the kernel rejects.
+    ///
+    /// **Flags.** `regexp_extract_all`'s third argument is the capture group,
+    /// not the options, so the flags are preceded by group `0` (the whole
+    /// match) to land in the options slot. Only the literal `i` is rendered:
+    /// it is the one flag whose meaning has been measured identical in both
+    /// engines, and `DuckDB` requires the options to be a non-NULL constant.
     fn process_args(&self, ast_args: &mut Vec<FunctionArg>) -> Result<(), DataFusionError> {
-        match self {
-            DuckDBRegexpFunction::Count if ast_args.len() == 3 => {
-                // arg #3 is start position
-                // DuckDB has no equivalent for column or function name, but we can use list slicing if an integer start is specified
-                let Some(start_arg) = ast_args.get(2) else {
-                    unreachable!("start_arg should be present")
-                };
-
-                match start_arg {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(
-                        ValueWithSpan {
-                            value: sqlparser::ast::Value::Number(num_str, _),
-                            ..
-                        },
-                    ))) => {
-                        let start: u64 = num_str.parse().map_err(|e| {
-                            DataFusionError::Plan(format!(
-                                "Could not parse start position {num_str} as integer for function {}: {e}", self.federated_function_name()
-                            ))
-                        })?;
-                        // DuckDB uses 0-based indexing, DataFusion uses 1-based indexing
-                        if start < 1 {
-                            return Err(DataFusionError::Plan(format!(
-                                "Start position must be a positive integer for regular expression function {}, received {start}",
-                                self.federated_function_name()
-                            )));
-                        }
-                        let duckdb_start = start - 1;
-                        ast_args.remove(2);
-
-                        // wrap the input column/value with a substring. ``substring(string, start[, length])``
-                        // length can be omitted as only the start value is specified
-                        let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))) =
-                            ast_args.first()
-                        else {
-                            unreachable!("input_arg should be present")
-                        };
-
-                        ast_args[0] =
-                            FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Substring {
-                                expr: Box::new(expr.clone()),
-                                substring_from: Some(Box::new(ast::Expr::Value(ValueWithSpan {
-                                    value: sqlparser::ast::Value::Number(
-                                        duckdb_start.to_string(),
-                                        false,
-                                    ),
-                                    span: sqlparser::tokenizer::Span::empty(),
-                                }))),
-                                substring_for: None,
-                                special: true,
-                                shorthand: false,
-                            }));
-                    }
-                    _ => {
-                        return Err(DataFusionError::Plan(format!(
-                            "Only integer start positions are supported for regular expression function {} with DuckDB",
-                            self.federated_function_name()
-                        )));
-                    }
-                }
-            }
-            _ => {}
+        if !matches!(self, DuckDBRegexpFunction::Count) {
+            return Ok(());
         }
+        let name = self.federated_function_name();
+
+        let pattern = match ast_args.get(1) {
+            Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(
+                ValueWithSpan {
+                    value:
+                        sqlparser::ast::Value::SingleQuotedString(pattern)
+                        | sqlparser::ast::Value::DoubleQuotedString(pattern),
+                    ..
+                },
+            )))) => pattern,
+            _ => {
+                return Err(DataFusionError::Plan(format!(
+                    "Only string literal patterns are supported for regular expression function {name} with DuckDB"
+                )));
+            }
+        };
+        if !duckdb_counts_pattern_identically(pattern) {
+            return Err(DataFusionError::Plan(format!(
+                "Pattern `{pattern}` is not supported for regular expression function {name} with DuckDB: it can match the empty string, or uses a class or word boundary the two engines read differently"
+            )));
+        }
+
+        if ast_args.len() >= 3 {
+            let start_arg = ast_args.remove(2);
+            let FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(ValueWithSpan {
+                value: sqlparser::ast::Value::Number(num_str, _),
+                ..
+            }))) = start_arg
+            else {
+                return Err(DataFusionError::Plan(format!(
+                    "Only integer start positions are supported for regular expression function {name} with DuckDB"
+                )));
+            };
+            let start: u64 = num_str.parse().map_err(|e| {
+                DataFusionError::Plan(format!(
+                    "Could not parse start position {num_str} as integer for function {name}: {e}"
+                ))
+            })?;
+            if start < 1 {
+                return Err(DataFusionError::Plan(format!(
+                    "Start position must be a positive integer for regular expression function {name}, received {start}"
+                )));
+            }
+
+            let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(input))) = ast_args.first_mut()
+            else {
+                return Err(DataFusionError::Plan(format!(
+                    "Regular expression function {name} requires an input expression as its first argument"
+                )));
+            };
+            let placeholder = ast::Expr::Value(ValueWithSpan {
+                value: sqlparser::ast::Value::Null,
+                span: sqlparser::tokenizer::Span::empty(),
+            });
+            *input = ast::Expr::Substring {
+                expr: Box::new(std::mem::replace(input, placeholder)),
+                substring_from: Some(Box::new(number_literal(&start.to_string()))),
+                substring_for: None,
+                special: true,
+                shorthand: false,
+            };
+        }
+
+        if ast_args.len() == 3 {
+            // The start has been folded into the input, so a remaining third
+            // argument is the flags.
+            let is_case_insensitive_flag = matches!(
+                ast_args.get(2),
+                Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(ValueWithSpan {
+                    value:
+                        sqlparser::ast::Value::SingleQuotedString(flags)
+                        | sqlparser::ast::Value::DoubleQuotedString(flags),
+                    ..
+                })))) if flags == CASE_INSENSITIVE_FLAG
+            );
+            if !is_case_insensitive_flag {
+                return Err(DataFusionError::Plan(format!(
+                    "Only the literal `{CASE_INSENSITIVE_FLAG}` flag is supported for regular expression function {name} with DuckDB"
+                )));
+            }
+            ast_args.insert(
+                2,
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(number_literal(WHOLE_MATCH_GROUP))),
+            );
+        }
+
         Ok(())
     }
 
-    fn postprocess_function(&self, mut ast_fn: ast::Expr) -> ast::Expr {
-        if matches!(self, DuckDBRegexpFunction::Count) {
-            // Wrap the extract array in a ``len()``
-            ast_fn = wrap_in_call(ast_fn, "len");
+    /// `regexp_count` counts zero matches in a NULL input and answers `0`,
+    /// where `regexp_extract_all(NULL, p)` is NULL and so is `len(NULL)`. A
+    /// count that is NULL rather than `0` propagates differently through
+    /// `SUM`, through `= 0` and through a `WHERE` built on it, so an
+    /// accelerated dataset gained or lost rows against an unaccelerated one
+    /// (issue #13870). The count is therefore
+    /// `coalesce(len(regexp_extract_all(..)), 0)`, which is `0` exactly where
+    /// the kernel is. The other two regexp functions propagate NULL in both
+    /// engines and are left alone.
+    fn postprocess_function(&self, ast_fn: ast::Expr) -> ast::Expr {
+        match self {
+            DuckDBRegexpFunction::Count => call_ast_fn(
+                COALESCE_NAME,
+                vec![wrap_in_call(ast_fn, LEN_NAME), number_literal("0")],
+            ),
+            DuckDBRegexpFunction::Like | DuckDBRegexpFunction::Replace => ast_fn,
         }
-
-        ast_fn
     }
 
     fn federated_function_name(&self) -> &str {
@@ -755,9 +920,10 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use datafusion::{
         common::{Column, Spans},
+        functions::regex::expr_fn::regexp_count,
         functions_nested::make_array::make_array_udf,
         logical_expr::expr::ScalarFunction,
-        prelude::{Expr, lit},
+        prelude::{Expr, col, lit},
         scalar::ScalarValue,
         sql::{TableReference, unparser::Unparser},
     };
@@ -1120,10 +1286,11 @@ mod tests {
             "duckdb_native_function_names() missing rand; got {names:?}"
         );
         // Still derived from the override list, so the two cannot drift — but the
-        // relation is "overrides minus the denied built-ins" rather than 1:1.
-        // `regexp_count` has a handler and is denied (#13870), so it is in one and
-        // not the other; asserting equal lengths would forbid that combination and
-        // force the handler to be deleted to express the deny.
+        // relation is "overrides minus the denied built-ins" rather than 1:1. A
+        // handler whose rendering turns out unfaithful can be denied by name
+        // while it is fixed (#13870 is the precedent); asserting equal lengths
+        // would forbid that combination and force the handler to be deleted to
+        // express the deny.
         let overrides: BTreeSet<&str> = crate::dialect::duckdb_scalar_overrides()
             .into_iter()
             .map(|(name, _)| name)
@@ -1137,6 +1304,121 @@ mod tests {
             &overrides - &denied,
             "the advertised names must be exactly the overrides that are not denied"
         );
+    }
+
+    /// Every shape of `regexp_count` the dialect renders, pinned as the SQL
+    /// `DuckDB` is sent (issue #13870).
+    ///
+    /// The `coalesce(.., 0)` is the point: `regexp_extract_all` is NULL for a
+    /// NULL input and `len(NULL)` is NULL, where the kernel counts zero
+    /// matches and answers `0`. The `SUBSTRING` offset is the kernel's 1-based
+    /// start passed through unchanged, and the flags follow a `0` group so
+    /// they land in `regexp_extract_all`'s options slot.
+    #[test]
+    fn regexp_count_unparses_to_a_null_preserving_match_count() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let s = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "s".to_string(),
+            spans: Spans::new(),
+        });
+
+        let render = |expr: Expr| {
+            unparser
+                .expr_to_sql(&expr)
+                .expect("regexp_count unparses for DuckDB")
+                .to_string()
+        };
+
+        assert_eq!(
+            render(regexp_count(s.clone(), lit("a"), None, None)),
+            r#"coalesce(len(regexp_extract_all("t"."s", 'a')), 0)"#
+        );
+        assert_eq!(
+            render(regexp_count(s.clone(), lit("a"), Some(lit(2)), None)),
+            r#"coalesce(len(regexp_extract_all(SUBSTRING("t"."s", 2), 'a')), 0)"#,
+            "SUBSTRING is 1-based in both engines, so the start is passed through"
+        );
+        assert_eq!(
+            render(regexp_count(
+                s.clone(),
+                lit("a"),
+                Some(lit(1)),
+                Some(lit("i"))
+            )),
+            r#"coalesce(len(regexp_extract_all(SUBSTRING("t"."s", 1), 'a', 0, 'i')), 0)"#,
+            "flags must follow the whole-match group to reach the options slot"
+        );
+        assert_eq!(
+            render(regexp_count(s, lit("^a+$"), None, None)),
+            r#"coalesce(len(regexp_extract_all("t"."s", '^a+$')), 0)"#,
+            "anchors are zero-width but the match itself is not empty, so the call renders"
+        );
+    }
+
+    /// The shapes the handler refuses are refused by the unparser itself, not
+    /// only by the per-call check that consults it: a flags argument `DuckDB`
+    /// would reject remotely (it requires a non-NULL constant), a pattern that
+    /// can match the empty string, and a pattern read from a column.
+    #[test]
+    fn regexp_count_refuses_what_duckdb_would_count_differently() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+
+        for flags in [col("f"), lit(ScalarValue::Utf8(None)), lit("m")] {
+            let call = regexp_count(col("s"), lit("a"), Some(lit(1)), Some(flags.clone()));
+            assert!(
+                unparser.expr_to_sql(&call).is_err(),
+                "flags {flags:?} have no DuckDB rendering and must be refused"
+            );
+        }
+        for pattern in [lit("a*"), lit(""), col("p")] {
+            let call = regexp_count(col("s"), pattern.clone(), None, None);
+            assert!(
+                unparser.expr_to_sql(&call).is_err(),
+                "pattern {pattern:?} has no faithful DuckDB rendering and must be refused"
+            );
+        }
+    }
+
+    /// The pattern screen, pinned on the patterns that decide it. Anchors are
+    /// zero-width but do not make the match itself empty when something
+    /// non-empty follows; a quantifier admitting zero repetitions or a bare
+    /// zero-width branch does. Explicit classes, `.` and Unicode properties
+    /// read alike in both engines; Perl classes and word boundaries do not.
+    #[test]
+    fn a_pattern_is_rendered_only_when_duckdb_counts_it_identically() {
+        for pattern in [
+            "a",
+            "^a+$",
+            "[0-9]{2,}",
+            "a|bc",
+            ".",
+            "[^a]",
+            "\\p{Nd}",
+            "x\\.",
+            "(?i)k",
+        ] {
+            assert!(
+                duckdb_counts_pattern_identically(pattern),
+                "`{pattern}` is counted identically and must render"
+            );
+        }
+        for pattern in ["a*", "a?", "a{0,}", "", "^", "\\b", "a|\\b", "(", "[a&&b]"] {
+            assert!(
+                !duckdb_counts_pattern_identically(pattern),
+                "`{pattern}` can match the empty string, never matches, or does not compile"
+            );
+        }
+        for pattern in [
+            "\\d", "\\w", "\\s", "\\D", "[\\d]", "[a\\w]", "\\ba", "a\\B", "\\<a", "a\\>",
+        ] {
+            assert!(
+                !duckdb_counts_pattern_identically(pattern),
+                "`{pattern}` is Unicode-aware in the kernel and ASCII-only in RE2, so it must stay local"
+            );
+        }
     }
 
     #[test]

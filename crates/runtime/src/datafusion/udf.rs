@@ -1223,25 +1223,25 @@ mod tests {
     }
 
     #[test]
-    fn duckdb_denies_three_regexp_builtins_and_federates_the_other_two() {
-        // Three of the five DataFusion regexp built-ins have no value-preserving
+    fn duckdb_denies_two_regexp_builtins_and_federates_the_other_three() {
+        // Two of the five DataFusion regexp built-ins have no value-preserving
         // DuckDB rendering: `regexp_extract` returns the whole match rather than
         // the capture groups and the empty string rather than NULL for a
-        // non-match (#13809); DuckDB has no `regexp_instr` at all; and
-        // `len(regexp_extract_all(NULL, p))` is NULL where `regexp_count`
-        // answers 0 (#13870). All three must stay local, while the two DuckDB
-        // does answer identically keep federating.
+        // non-match (#13809), and DuckDB has no `regexp_instr` at all. Both must
+        // stay local, while the three the dialect renders faithfully keep
+        // federating — `regexp_count` among them, whose rendering coalesces the
+        // NULL `len(regexp_extract_all(NULL, p))` to the kernel's 0 (#13870).
         for support in [
             deny_spice_functions_for_duckdb(),
             Arc::new(deny_spice_functions_for_duckdb_table_providers()),
         ] {
-            for name in ["regexp_match", "regexp_instr", "regexp_count"] {
+            for name in ["regexp_match", "regexp_instr"] {
                 assert!(
                     !support.supports(&make_named_expr(name), None),
                     "{name} has no value-preserving DuckDB rendering and must not be pushed down"
                 );
             }
-            for name in ["regexp_like", "regexp_replace"] {
+            for name in ["regexp_like", "regexp_replace", "regexp_count"] {
                 assert!(
                     support.supports(&make_named_expr(name), None),
                     "{name} is rendered natively by the DuckDB dialect and must be pushed down"

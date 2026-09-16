@@ -88,7 +88,7 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
             ) as ScalarFnToSqlHandler,
         ),
         (
-            // DuckDB dialect: len(regex_extract_all(string, pattern[, group = 0, options]))
+            // DuckDB dialect: coalesce(len(regexp_extract_all(string, pattern[, group = 0, options])), 0)
             // DataFusion dialect: regexp_count(str, regexp[, start, flags])
             REGEXP_COUNT_NAME,
             Box::new(
@@ -155,10 +155,10 @@ fn duckdb_builtin_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)
 /// and the deny-list stay in sync automatically.
 ///
 /// A name in [`crate::function_support::DUCKDB_DENIED_BUILTINS`] is filtered out
-/// rather than trusted not to appear: a handler whose rendering is not
-/// value-preserving stays in the dialect so a later fix has it to work from
-/// (`regexp_count`, #13870), and "has a handler" must not be read as "may be
-/// pushed down" while that is true.
+/// rather than trusted not to appear: a handler whose rendering turns out not
+/// to be value-preserving can stay in the dialect while it is fixed (#13870 is
+/// the precedent), and "has a handler" must not be read as "may be pushed
+/// down" while that is true.
 #[must_use]
 pub fn duckdb_native_function_names() -> Vec<&'static str> {
     duckdb_scalar_overrides()
@@ -301,9 +301,8 @@ pub fn new_bigquery_dialect() -> Arc<dyn Dialect> {
 #[cfg(test)]
 mod tests {
     use super::{
-        REGEXP_COUNT_NAME, bigquery, bigquery_native_function_names,
-        duckdb_builtin_scalar_overrides, duckdb_can_translate, duckdb_native_function_names,
-        new_duckdb_dialect,
+        bigquery, bigquery_native_function_names, duckdb_builtin_scalar_overrides,
+        duckdb_can_translate, duckdb_native_function_names, new_duckdb_dialect,
     };
     use datafusion::functions::expr_fn::upper;
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_like, regexp_replace};
@@ -400,6 +399,73 @@ mod tests {
         );
     }
 
+    /// `regexp_count` is rendered only for the call shapes `DuckDB` has been
+    /// measured to count as the kernel does (#13870): a string-literal pattern
+    /// that cannot match the empty string and uses no Perl class or word
+    /// boundary, and at most the `i` flag. Every other shape stays local
+    /// rather than answering differently.
+    #[test]
+    fn duckdb_declines_a_regexp_count_it_cannot_count_faithfully() {
+        for (pattern, why) in [
+            ("a*", "a pattern that can match the empty string"),
+            ("a|\\b", "an alternation with a zero-width branch"),
+            ("", "the empty pattern"),
+            ("(", "a pattern the kernel cannot compile"),
+            (
+                "\\d",
+                "a Perl class, Unicode-aware in the kernel and ASCII-only in RE2",
+            ),
+            (
+                "\\ba",
+                "a word boundary, which the two engines read differently",
+            ),
+        ] {
+            assert!(
+                !duckdb_can_translate(&call_of(regexp_count(col("s"), lit(pattern), None, None))),
+                "{why} (`{pattern}`) has no faithful DuckDB rendering"
+            );
+        }
+        assert!(
+            !duckdb_can_translate(&call_of(regexp_count(col("s"), col("p"), None, None))),
+            "a pattern read from a column cannot be inspected and stays local"
+        );
+        for flags in ["m", "s", "c", "gi"] {
+            assert!(
+                !duckdb_can_translate(&call_of(regexp_count(
+                    col("s"),
+                    lit("a"),
+                    Some(lit(1)),
+                    Some(lit(flags)),
+                ))),
+                "flags `{flags}` have not been measured to mean the same in DuckDB and stay local"
+            );
+        }
+        assert!(
+            !duckdb_can_translate(&call_of(regexp_count(
+                col("s"),
+                lit("a"),
+                Some(lit(1)),
+                Some(col("f")),
+            ))),
+            "a flags column is not a constant DuckDB accepts and stays local"
+        );
+
+        // The shapes that are rendered: the plain call, an anchored pattern
+        // (zero-width anchors do not make the match itself empty), a start, and
+        // the `i` flag.
+        for expr in [
+            regexp_count(col("s"), lit("a"), None, None),
+            regexp_count(col("s"), lit("^a+$"), None, None),
+            regexp_count(col("s"), lit("[0-9]{2,}"), Some(lit(3)), None),
+            regexp_count(col("s"), lit("a"), Some(lit(1)), Some(lit("i"))),
+        ] {
+            assert!(
+                duckdb_can_translate(&call_of(expr.clone())),
+                "{expr:?} has a faithful DuckDB rendering and must federate"
+            );
+        }
+    }
+
     /// A function the dialect installs no handler for is deferred to, so an
     /// ordinary call keeps federating.
     #[test]
@@ -425,6 +491,11 @@ mod tests {
             regexp_count(col("s"), lit("a"), Some(col("start")), None),
             regexp_count(col("s"), lit("a"), Some(lit(0)), None),
             regexp_count(col("s"), lit("a"), Some(lit(2)), None),
+            regexp_count(col("s"), lit("a*"), None, None),
+            regexp_count(col("s"), lit("\\d"), None, None),
+            regexp_count(col("s"), col("p"), None, None),
+            regexp_count(col("s"), lit("a"), Some(lit(1)), Some(lit("i"))),
+            regexp_count(col("s"), lit("a"), Some(lit(1)), Some(lit("m"))),
             upper(col("s")),
         ] {
             let renders = unparser.expr_to_sql(&expr).is_ok();
@@ -452,8 +523,8 @@ mod tests {
     fn no_denied_builtin_is_advertised_as_a_native_duckdb_function() {
         // `duckdb_native_function_names` is what the deny-list reads as its
         // carve-out, so a denied name appearing there would un-deny it and push
-        // down a call DuckDB answers differently (#13809, #13870). Driven from
-        // the deny-list itself rather than a hardcoded name, so denying another
+        // down a call DuckDB answers differently (#13809). Driven from the
+        // deny-list itself rather than a hardcoded name, so denying another
         // built-in cannot skip this check.
         for name in crate::function_support::DUCKDB_DENIED_BUILTINS {
             assert!(
@@ -464,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn the_constructed_duckdb_dialect_renders_no_denied_builtin_except_regexp_count() {
+    fn the_constructed_duckdb_dialect_renders_no_denied_builtin() {
         // Asserted against the dialect `new_duckdb_dialect` actually builds, not
         // against `duckdb_scalar_overrides` alone: the constructor chains
         // `duckdb_builtin_scalar_overrides` too, so checking one list would leave
@@ -479,11 +550,6 @@ mod tests {
         let args = [col("c0"), col("c1")];
 
         for name in crate::function_support::DUCKDB_DENIED_BUILTINS {
-            // `regexp_count` keeps its handler on purpose (#13870), so it is
-            // exempt from this one; the carve-out check above still covers it.
-            if *name == REGEXP_COUNT_NAME {
-                continue;
-            }
             assert!(
                 matches!(
                     dialect.scalar_function_to_sql_overrides(&unparser, name, &args),

@@ -99,6 +99,30 @@ fn write_regexp_source(path: &Path) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Strings and patterns for `regexp_count`: rows where the input, the pattern,
+/// or both are NULL, a mixed-case row for the `i` flag, a row long enough for
+/// a start offset to drop matches, and a row holding an Arabic-Indic digit
+/// (`U+0661`) that the kernel's `\d` matches and RE2's does not.
+///
+/// The NULL cases are the point (issue #13870): `regexp_count` counts zero
+/// matches in a NULL input or against a NULL pattern and answers `0`, where
+/// `DuckDB`'s `regexp_extract_all` answers NULL for either.
+fn write_regexp_count_source(path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::write(
+        path,
+        "id,s,p\n\
+         1,ab,a\n\
+         2,xyz,a\n\
+         3,aXbAb,a\n\
+         4,,a\n\
+         5,ab,\n\
+         6,,\n\
+         7,aaa,a\n\
+         8,xy\u{661},a\n",
+    )?;
+    Ok(())
+}
+
 /// Strings whose SHA-256 exercises the hex-text-vs-bytes divergence: ASCII, a
 /// mixed-case string with a space, a non-ASCII one (whose UTF-8 bytes are what
 /// gets hashed), and NULL.
@@ -669,9 +693,9 @@ async fn duckdb_accelerated_regexp_builtins_agree_with_local() -> Result<(), any
             );
 
             // All three remaining regexp built-ins agree with local evaluation over
-            // every row, the NULL one included — `regexp_like` and `regexp_replace`
-            // because DuckDB answers them identically and they are still pushed
-            // down, `regexp_count` because it is denied and so evaluated locally.
+            // every row, the NULL one included, and all three are pushed down —
+            // `regexp_count` at a rendering that coalesces DuckDB's NULL count of a
+            // NULL input to the kernel's 0 (#13870).
             let siblings = "SELECT id, regexp_like(s, '(a)(b)') AS l, \
                             regexp_replace(s, '(a)(b)', 'X') AS r, \
                             regexp_count(s, 'a') AS c FROM {table} ORDER BY id";
@@ -684,11 +708,10 @@ async fn duckdb_accelerated_regexp_builtins_agree_with_local() -> Result<(), any
             );
 
             // The NULL row is where `regexp_count` used to part company: the dialect
-            // renders it `len(regexp_extract_all(..))`, and `regexp_extract_all(NULL,
+            // rendered it `len(regexp_extract_all(..))`, and `regexp_extract_all(NULL,
             // p)` is NULL in DuckDB, so the federated answer was NULL where
-            // DataFusion counts zero matches and answers 0. Denying it makes both
-            // sides 0; #13870 tracks restoring the pushdown with a NULL-preserving
-            // rewrite, at which point this assertion still has to hold.
+            // DataFusion counts zero matches and answers 0 (#13870). Both sides must
+            // answer 0 with the call pushed down.
             let null_row = "SELECT regexp_count(s, 'a') AS c FROM {table} WHERE s IS NULL";
             let accelerated = run_query(&rt, &null_row.replace("{table}", "accelerated")).await?;
             let local = run_query(&rt, &null_row.replace("{table}", "local")).await?;
@@ -696,14 +719,13 @@ async fn duckdb_accelerated_regexp_builtins_agree_with_local() -> Result<(), any
                 assert_batches_eq!(["+---+", "| c |", "+---+", "| 0 |", "+---+",], batches);
             }
 
-            // And it is no longer sent to DuckDB at all.
             let plan = to_pretty_display(
                 &run_query(&rt, "EXPLAIN SELECT regexp_count(s, 'a') FROM accelerated").await?,
             )?
             .to_string();
             assert!(
-                !pushed_down_sql(&plan).contains("regexp_extract_all"),
-                "regexp_count must not be pushed down as len(regexp_extract_all(..)); \
+                pushed_down_sql(&plan).contains("coalesce(len(regexp_extract_all("),
+                "regexp_count must be pushed down as coalesce(len(regexp_extract_all(..)), 0); \
                  plan was:\n{plan}"
             );
 
@@ -716,6 +738,148 @@ async fn duckdb_accelerated_regexp_builtins_agree_with_local() -> Result<(), any
                 "regexp_like must still be pushed down as DuckDB's regexp_matches; \
                  plan was:\n{plan}"
             );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// `regexp_count` is pushed down to `DuckDB` again, and every shape of the call
+/// the dialect renders answers what local evaluation answers — the NULL rows
+/// included (regression test for #13870).
+#[tokio::test]
+async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("regexp_count.csv");
+            write_regexp_count_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("duckdb_builtin_pushdown_regexp_count")
+                .with_dataset(duckdb_accelerated(&from, "accelerated"))
+                .with_dataset(unaccelerated(&from, "local"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            // Every shape the dialect renders: the plain call, an integer start,
+            // a start past the end of the input, the `i` flag, and an anchored
+            // pattern. Each is measured federated against local, and each has a
+            // NULL row in the fixture that the bare `len(regexp_extract_all(..))`
+            // got wrong.
+            let shapes = [
+                ("regexp_count(s, 'a')", "the plain call"),
+                ("regexp_count(s, 'a', 2)", "an integer start position"),
+                ("regexp_count(s, 'a', 9)", "a start position past the end of the input"),
+                ("regexp_count(s, 'a', 1, 'i')", "a start position and the `i` flag"),
+                ("regexp_count(s, '^a+$')", "an anchored pattern"),
+            ];
+            for (call, what) in shapes {
+                let sql = format!("SELECT id, {call} AS c FROM {{table}} ORDER BY id");
+                let accelerated = run_query(&rt, &sql.replace("{table}", "accelerated")).await?;
+                let local = run_query(&rt, &sql.replace("{table}", "local")).await?;
+                assert_eq!(
+                    to_pretty_display(&accelerated)?.to_string(),
+                    to_pretty_display(&local)?.to_string(),
+                    "{what} ({call}) must agree with local evaluation on every row"
+                );
+
+                // And it must have reached DuckDB for the agreement to mean
+                // anything: a call evaluated locally on both sides passes
+                // whatever the dialect renders.
+                let plan = to_pretty_display(
+                    &run_query(&rt, &format!("EXPLAIN SELECT {call} FROM accelerated")).await?,
+                )?
+                .to_string();
+                let remote_sql = pushed_down_sql(&plan);
+                assert!(
+                    remote_sql.contains("coalesce(len(regexp_extract_all("),
+                    "{what} ({call}) must be pushed down as coalesce(len(regexp_extract_all(..)), 0); \
+                     plan was:\n{plan}"
+                );
+            }
+
+            // The values themselves, so the agreement above is not two engines
+            // agreeing on a wrong answer: a NULL input counts 0, the start offset
+            // drops the match before it (a `start - 1` offset into DuckDB's
+            // 1-based SUBSTRING would keep it), and `i` matches the upper-case
+            // rows (flags in `regexp_extract_all`'s group slot would fail the
+            // query remotely with "Pattern has 0 groups").
+            let pinned = "SELECT id, regexp_count(s, 'a') AS plain, regexp_count(s, 'a', 2) AS from_2, \
+                          regexp_count(s, 'a', 1, 'i') AS insensitive FROM accelerated ORDER BY id";
+            assert_batches_eq!(
+                [
+                    "+----+-------+--------+-------------+",
+                    "| id | plain | from_2 | insensitive |",
+                    "+----+-------+--------+-------------+",
+                    "| 1  | 1     | 0      | 1           |",
+                    "| 2  | 0     | 0      | 0           |",
+                    "| 3  | 1     | 0      | 2           |",
+                    "| 4  | 0     | 0      | 0           |",
+                    "| 5  | 1     | 0      | 1           |",
+                    "| 6  | 0     | 0      | 0           |",
+                    "| 7  | 3     | 2      | 3           |",
+                    "| 8  | 0     | 0      | 0           |",
+                    "+----+-------+--------+-------------+",
+                ],
+                &run_query(&rt, pinned).await?
+            );
+
+            // A count that is NULL rather than 0 changes which rows a predicate
+            // keeps, which is why the divergence mattered: the NULL rows must
+            // survive `= 0` accelerated exactly as they do locally.
+            let filtered = "SELECT id FROM {table} WHERE regexp_count(s, 'a') = 0 ORDER BY id";
+            let accelerated = run_query(&rt, &filtered.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &filtered.replace("{table}", "local")).await?;
+            assert_batches_eq!(
+                ["+----+", "| id |", "+----+", "| 2  |", "| 4  |", "| 6  |", "| 8  |", "+----+"],
+                &accelerated
+            );
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "a WHERE built on regexp_count must keep the same rows accelerated and local"
+            );
+
+            // Shapes the dialect cannot render stay local rather than failing the
+            // query remotely or answering differently: a column start, a column
+            // pattern, a pattern that can match the empty string (DuckDB keeps an
+            // empty match abutting the one before it, the kernel skips it), a Perl
+            // class (Unicode-aware in the kernel, ASCII-only in RE2 — row 8 is
+            // where `\d` parts company), and a flag other than `i`.
+            for call in [
+                "regexp_count(s, 'a', id)",
+                "regexp_count(s, p)",
+                "regexp_count(s, 'a*')",
+                "regexp_count(s, 'a|\\b')",
+                "regexp_count(s, '\\d')",
+                "regexp_count(s, 'a', 1, 'm')",
+            ] {
+                let sql = format!("SELECT id, {call} AS c FROM {{table}} ORDER BY id");
+                let accelerated = run_query(&rt, &sql.replace("{table}", "accelerated")).await?;
+                let local = run_query(&rt, &sql.replace("{table}", "local")).await?;
+                assert_eq!(
+                    to_pretty_display(&accelerated)?.to_string(),
+                    to_pretty_display(&local)?.to_string(),
+                    "{call} has no faithful DuckDB rendering and must still answer, locally, as unaccelerated does"
+                );
+                let plan = to_pretty_display(
+                    &run_query(&rt, &format!("EXPLAIN SELECT {call} FROM accelerated")).await?,
+                )?
+                .to_string();
+                assert!(
+                    !pushed_down_sql(&plan).contains("regexp_extract_all"),
+                    "{call} must not reach DuckDB; plan was:\n{plan}"
+                );
+            }
 
             rt.shutdown().await;
             Ok(())
