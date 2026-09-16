@@ -374,6 +374,16 @@ impl Display for OnConflictBehavior {
     }
 }
 
+/// How long a cached entry stays fresh when a `refresh_mode: caching` dataset
+/// sets no `caching_ttl`.
+///
+/// Defined here, below every crate that reads it, so the parser that checks the
+/// caching windows fit a `Duration`, the scan that decides whether a row may be
+/// served and the sweep that decides whether it may be kept all read one value:
+/// a sweep with a shorter default than the scan would delete rows the scan still
+/// calls fresh.
+pub const DEFAULT_CACHING_TTL: Duration = Duration::from_secs(30);
+
 /// Behavior when a caching-mode origin fetch fails and an expired entry is still
 /// held. Models RFC 5861 `stale-if-error`: how much staleness — measured from the
 /// point the entry passed `caching_ttl` — an operator will tolerate before the
@@ -994,6 +1004,11 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         let caching_stale_while_revalidate_ttl =
             parse_caching_stale_while_revalidate_ttl(&mut params)?;
         let caching_stale_if_error = parse_caching_stale_if_error(&mut params)?;
+        ensure_caching_windows_fit(
+            caching_ttl,
+            caching_stale_while_revalidate_ttl,
+            caching_stale_if_error,
+        )?;
         let caching_max_size = parse_caching_max_size(&mut params)?;
         let caching_max_items = parse_caching_max_items(&mut params)?;
 
@@ -1236,12 +1251,18 @@ fn parse_caching_stale_while_revalidate_ttl(
 /// Parse `caching_stale_if_error` from params for caching mode.
 ///
 /// Accepts (RFC 5861 `stale-if-error`):
-/// - `enabled`/`true` → `Enabled` (∞ — always serve stale, unbounded retention),
-/// - `disabled`/`false` → `Disabled` (0 — never serve stale),
+/// - `enabled` → `Enabled` (∞ — always serve stale, unbounded retention),
+/// - `disabled` → `Disabled` (0 — never serve stale),
 /// - a duration such as `600s` or `10m` → `For(d)` (serve stale only while its
 ///   staleness is at most `d`); `0` normalizes to `Disabled`.
 ///
-/// `infinity`/`inf` is deliberately not an alias — use `enabled`.
+/// The two keywords match case-insensitively. A duration is handed to `fundu`
+/// as written, the way `caching_ttl` and the other duration params are, because
+/// its units are case-sensitive: `Ms` is microseconds and `ms` milliseconds.
+///
+/// `infinity`/`inf` is deliberately not an alias — use `enabled`. Booleans
+/// (`true`/`false` strings, or a YAML bool) are rejected: the setting names a
+/// behavior, not a switch.
 fn parse_caching_stale_if_error(params: &mut Option<Params>) -> Result<StaleIfError, ParseError> {
     let Some(params) = params else {
         return Ok(StaleIfError::default());
@@ -1251,15 +1272,17 @@ fn parse_caching_stale_if_error(params: &mut Option<Params>) -> Result<StaleIfEr
     };
     match value {
         spicepod::param::ParamValue::String(s) => match s.to_lowercase().as_str() {
-            "enabled" | "true" => Ok(StaleIfError::Enabled),
-            "disabled" | "false" => Ok(StaleIfError::Disabled),
-            other => {
+            "enabled" => Ok(StaleIfError::Enabled),
+            "disabled" => Ok(StaleIfError::Disabled),
+            _ => {
                 let invalid = || ParseError::InvalidAccelerationConfiguration {
                     detail: format!(
                         "Invalid 'caching_stale_if_error' value: '{s}'. Expected a duration such as '600s', or 'enabled'/'disabled'."
                     ),
                 };
-                match fundu::parse_duration(other) {
+                // `s` as written, not the lowercased match key: `fundu`'s time
+                // units are case-sensitive.
+                match fundu::parse_duration(&s) {
                     // A zero window can never serve stale, so it is exactly
                     // `Disabled` — normalized here to avoid a `staleness <= 0`
                     // boundary case.
@@ -1274,19 +1297,41 @@ fn parse_caching_stale_if_error(params: &mut Option<Params>) -> Result<StaleIfEr
                 }
             }
         },
-        // A YAML boolean (`caching_stale_if_error: true`) never reached the string
-        // arm, so it was rejected before; accept it as the operator plainly meant.
-        spicepod::param::ParamValue::Bool(b) => Ok(if b {
-            StaleIfError::Enabled
-        } else {
-            StaleIfError::Disabled
-        }),
         _ => Err(ParseError::InvalidAccelerationConfiguration {
             detail: format!(
                 "Invalid 'caching_stale_if_error' param value: {value:?}. Expected a duration such as '600s', or 'enabled'/'disabled'."
             ),
         }),
     }
+}
+
+/// Reject caching windows whose eviction deadline does not fit a `Duration`.
+///
+/// The retention paths compute the deadline as `caching_ttl` plus the longer of
+/// a finite `caching_stale_if_error` and `caching_stale_while_revalidate_ttl`.
+/// `fundu` saturates an oversized duration at `Duration::MAX` rather than
+/// failing, so without this check such a value parses and the addition panics
+/// while the dataset loads. `enabled` derives no deadline and has nothing to
+/// overflow.
+fn ensure_caching_windows_fit(
+    caching_ttl: Option<Duration>,
+    caching_stale_while_revalidate_ttl: Option<Duration>,
+    caching_stale_if_error: StaleIfError,
+) -> Result<(), ParseError> {
+    let Some(window) =
+        caching_stale_if_error.error_retention_window(caching_stale_while_revalidate_ttl)
+    else {
+        return Ok(());
+    };
+    let ttl = caching_ttl.unwrap_or(DEFAULT_CACHING_TTL);
+    if ttl.checked_add(window).is_some() {
+        return Ok(());
+    }
+    Err(ParseError::InvalidAccelerationConfiguration {
+        detail: format!(
+            "Invalid caching windows: 'caching_ttl' ({ttl:?}) plus the longer of 'caching_stale_if_error' and 'caching_stale_while_revalidate_ttl' ({window:?}) exceeds the longest supported duration. Lower one of them so the sum fits."
+        ),
+    })
 }
 
 /// Helper to parse a duration parameter from params.
@@ -1401,25 +1446,31 @@ mod tests {
             StaleIfError::Disabled
         );
 
-        // Boolean strings map onto the same two, closing the YAML-bool gap.
-        assert_eq!(parse_sie("true").expect("parse"), StaleIfError::Enabled);
-        assert_eq!(parse_sie("false").expect("parse"), StaleIfError::Disabled);
+        // The keywords match regardless of case.
+        assert_eq!(parse_sie("Enabled").expect("parse"), StaleIfError::Enabled);
+        assert_eq!(
+            parse_sie("DISABLED").expect("parse"),
+            StaleIfError::Disabled
+        );
 
-        // A YAML boolean arrives as `ParamValue::Bool`, not a string.
-        for (b, expected) in [
-            (true, StaleIfError::Enabled),
-            (false, StaleIfError::Disabled),
-        ] {
-            let params = Params::from_string_map(HashMap::new());
-            let mut params = Some(params);
+        // Booleans are not spellings of this setting: the setting names a
+        // behavior, not a switch, so `true`/`false` strings and a YAML bool
+        // are rejected, and the error names the accepted forms.
+        for s in ["true", "false"] {
+            let err = parse_sie(s).expect_err("boolean strings are rejected");
+            let msg = format!("{err}");
+            assert!(msg.contains("'enabled'/'disabled'"), "{msg}");
+        }
+        for b in [true, false] {
+            let mut params = Some(Params::from_string_map(HashMap::new()));
             if let Some(p) = params.as_mut() {
                 p.data
                     .insert("caching_stale_if_error".to_string(), ParamValue::Bool(b));
             }
-            assert_eq!(
-                parse_caching_stale_if_error(&mut params).expect("parse"),
-                expected
-            );
+            let err =
+                parse_caching_stale_if_error(&mut params).expect_err("a YAML boolean is rejected");
+            let msg = format!("{err}");
+            assert!(msg.contains("'enabled'/'disabled'"), "{msg}");
         }
 
         // A duration is the new form.
@@ -1451,6 +1502,103 @@ mod tests {
             parse_caching_stale_if_error(&mut None).expect("parse"),
             StaleIfError::Disabled
         );
+    }
+
+    /// `fundu` time units are case-sensitive — `Ms` is microseconds, `ms` is
+    /// milliseconds, and `M` (month) is not a unit it accepts at all. The value
+    /// must reach it as written: lowercasing it first would turn a 500µs window
+    /// into a 500ms one and read `1M` as one minute.
+    #[test]
+    fn stale_if_error_duration_units_keep_their_case() {
+        assert_eq!(
+            parse_sie("500Ms").expect("parse"),
+            StaleIfError::For(Duration::from_micros(500))
+        );
+        assert_eq!(
+            parse_sie("500ms").expect("parse"),
+            StaleIfError::For(Duration::from_millis(500))
+        );
+        parse_sie("1M").expect_err("`M` is not a supported unit and must not be read as `m`");
+        // The same value through the sibling duration parser `caching_ttl`
+        // uses, so the two cannot disagree on what a unit means.
+        let params = Params::from_string_map(HashMap::from([(
+            "caching_ttl".to_string(),
+            "500Ms".to_string(),
+        )]));
+        assert_eq!(
+            parse_caching_ttl(&mut Some(params)).expect("parse"),
+            Some(Duration::from_micros(500))
+        );
+    }
+
+    /// `fundu` saturates an oversized duration at `Duration::MAX` instead of
+    /// failing, and the retention paths add the stale window to `caching_ttl`.
+    /// A window that fits on its own but not in that sum is a configuration
+    /// error when the Spicepod is parsed, not a panic when the dataset loads.
+    #[test]
+    fn caching_windows_that_overflow_the_eviction_deadline_are_rejected() {
+        // `Duration::MAX` is 18446744073709551615.999999999s; two seconds under
+        // it parses as a finite window that no `caching_ttl` can be added to.
+        const NEAR_MAX: &str = "18446744073709551613s";
+
+        for (param, other) in [
+            (
+                "caching_stale_if_error",
+                "caching_stale_while_revalidate_ttl",
+            ),
+            (
+                "caching_stale_while_revalidate_ttl",
+                "caching_stale_if_error",
+            ),
+        ] {
+            let acceleration = spicepod_acceleration::Acceleration {
+                refresh_mode: Some(spicepod_acceleration::RefreshMode::Caching),
+                params: Some(Params::from_string_map(HashMap::from([(
+                    param.to_string(),
+                    NEAR_MAX.to_string(),
+                )]))),
+                ..Default::default()
+            };
+            let err = Acceleration::try_from(acceleration)
+                .expect_err("a window that overflows `caching_ttl` + window is rejected");
+            let msg = format!("{err}");
+            assert!(msg.contains("caching_ttl"), "{msg}");
+            assert!(msg.contains(param), "{msg}");
+            assert!(msg.contains(other), "{msg}");
+            assert!(!msg.contains('\n'), "{msg}");
+        }
+
+        // The check is on the sum: an explicit `caching_ttl` counts too.
+        let acceleration = spicepod_acceleration::Acceleration {
+            refresh_mode: Some(spicepod_acceleration::RefreshMode::Caching),
+            params: Some(Params::from_string_map(HashMap::from([
+                (
+                    "caching_ttl".to_string(),
+                    "18446744073709551600s".to_string(),
+                ),
+                ("caching_stale_if_error".to_string(), "1m".to_string()),
+            ]))),
+            ..Default::default()
+        };
+        Acceleration::try_from(acceleration).expect_err("`caching_ttl` + 1m overflows");
+
+        // `enabled` derives no deadline, so it has no sum to overflow, and a
+        // window that fits is accepted unchanged.
+        for (value, expected) in [
+            ("enabled", StaleIfError::Enabled),
+            ("10m", StaleIfError::For(Duration::from_mins(10))),
+        ] {
+            let acceleration = spicepod_acceleration::Acceleration {
+                refresh_mode: Some(spicepod_acceleration::RefreshMode::Caching),
+                params: Some(Params::from_string_map(HashMap::from([(
+                    "caching_stale_if_error".to_string(),
+                    value.to_string(),
+                )]))),
+                ..Default::default()
+            };
+            let parsed = Acceleration::try_from(acceleration).expect("a window that fits parses");
+            assert_eq!(parsed.caching_stale_if_error, expected);
+        }
     }
 
     #[test]

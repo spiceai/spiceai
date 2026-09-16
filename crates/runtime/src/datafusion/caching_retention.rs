@@ -29,10 +29,7 @@ limitations under the License.
 
 use std::time::Duration;
 
-use runtime_acceleration::acceleration::StaleIfError;
-
-/// `caching_ttl`'s own default, applied when the dataset does not set one.
-const DEFAULT_CACHING_TTL: Duration = Duration::from_secs(30);
+use runtime_acceleration::acceleration::{DEFAULT_CACHING_TTL, StaleIfError};
 
 /// Floor on the derived check interval, so a sub-second `caching_ttl` does not
 /// put the accelerator under a delete every tick of it.
@@ -123,12 +120,19 @@ pub(crate) fn caching_retention(
     // finite deadline — `caching_ttl` plus the error-retention window — so that
     // deadline derives a bounded policy. Only `Enabled` keeps entries with no
     // upper bound on their age, and so derives no deadline at all.
-    if !matches!(stale_if_error, StaleIfError::Enabled) {
-        let extra = stale_if_error
-            .error_retention_window(caching_stale_while_revalidate_ttl)
-            .unwrap_or_default();
-        let period = caching_ttl.unwrap_or(DEFAULT_CACHING_TTL) + extra;
-
+    //
+    // The Spicepod parser rejects caching windows whose sum does not fit a
+    // `Duration`, so a loaded dataset always derives here. `checked_add` keeps
+    // a caller that bypassed that check from panicking: an unrepresentable
+    // deadline derives no policy and falls through to whatever else bounds the
+    // accelerator.
+    if !matches!(stale_if_error, StaleIfError::Enabled)
+        && let Some(period) = caching_ttl.unwrap_or(DEFAULT_CACHING_TTL).checked_add(
+            stale_if_error
+                .error_retention_window(caching_stale_while_revalidate_ttl)
+                .unwrap_or_default(),
+        )
+    {
         return CachingRetention::Derive {
             period,
             check_interval: check_interval_for(period),
@@ -171,7 +175,8 @@ pub(crate) fn unbounded_caching_retention_warning(dataset_name: &str) -> String 
         `caching_ttl` and `caching_stale_while_revalidate_ttl` bound how long an entry is served \
         fresh, not how long it is stored. Prefer a finite `caching_stale_if_error: <duration>` \
         (for example '10m'): it keeps the stale-on-error fallback for that window and evicts at \
-        `caching_ttl` + that window, bounding the accelerator on its own. Or set \
+        `caching_ttl` + the longer of that window and `caching_stale_while_revalidate_ttl`, \
+        bounding the accelerator on its own. Or set \
         `retention_check_enabled: true` with a `retention_period`, a `retention_check_interval` and \
         the dataset's `time_column` — a policy missing any one of those starts nothing, so check \
         all four if you have already set some. Or set `caching_stale_if_error: disabled` to evict \
@@ -257,11 +262,13 @@ mod tests {
             false,
         );
 
+        // A 65s period sits between the 30s floor and the 1h ceiling, so it is
+        // its own check interval.
         assert_eq!(
             retention,
             CachingRetention::Derive {
                 period: Duration::from_secs(65),
-                check_interval: MIN_CHECK_INTERVAL,
+                check_interval: Duration::from_secs(65),
             }
         );
     }
@@ -281,6 +288,22 @@ mod tests {
         };
 
         assert_eq!(period, Duration::from_secs(125), "5s ttl + max(60s, 120s)");
+    }
+
+    /// A window so long that `caching_ttl + window` does not fit a `Duration`
+    /// is rejected by the Spicepod parser; should one reach here anyway, it
+    /// derives no policy rather than panicking on the addition.
+    #[test]
+    fn a_deadline_that_overflows_derives_no_policy() {
+        let retention = caching_retention(
+            StaleIfError::For(Duration::MAX - Duration::from_secs(1)),
+            Some(Duration::from_secs(30)),
+            None,
+            false,
+            false,
+        );
+
+        assert_eq!(retention, CachingRetention::Unbounded);
     }
 
     /// The reported half of #13525: enabling `caching_stale_if_error` left the
@@ -396,9 +419,17 @@ mod tests {
             "{warning}"
         );
         // The deprecation hint toward a finite duration, tied to the
-        // unbounded-growth path this warning covers.
+        // unbounded-growth path this warning covers — and the bound it promises
+        // is the one `caching_retention` derives, `caching_ttl` plus the longer
+        // of the two windows, not the error window alone.
         assert!(
             warning.contains("`caching_stale_if_error: <duration>`"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains(
+                "`caching_ttl` + the longer of that window and `caching_stale_while_revalidate_ttl`"
+            ),
             "{warning}"
         );
         assert!(warning.contains("https://spiceai.org/docs"), "{warning}");

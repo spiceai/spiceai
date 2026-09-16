@@ -126,10 +126,11 @@ pub const CACHE_REFRESHED_AT_COLUMN: &str = "_fetched_at";
 
 /// How long a cached entry stays fresh when the dataset sets no `caching_ttl`.
 ///
-/// Read by both the scan that decides whether a row may be served and the sweep
-/// that decides whether it may be kept. One constant, because a sweep with a
+/// Read by the scan that decides whether a row may be served, the sweep that
+/// decides whether it may be kept, and the Spicepod parser that checks the
+/// caching windows fit a `Duration`. One constant, because a sweep with a
 /// shorter default than the scan would delete rows the scan still calls fresh.
-pub const DEFAULT_CACHING_TTL: Duration = Duration::from_secs(30);
+pub use runtime_acceleration::acceleration::DEFAULT_CACHING_TTL;
 
 /// The TTL a caching scan actually applies, filling in [`DEFAULT_CACHING_TTL`]
 /// for a dataset that configured none.
@@ -2033,7 +2034,7 @@ impl CacheRefreshHelper {
                     let staleness = staleness_past_max_age(&batches, max_age);
                     if stale_if_error.within_error_window(staleness) {
                         tracing::warn!(
-                            "Cache miss fetch failed for dataset {dataset_name}, serving stale data because `caching_stale_if_error` allows it: {e}"
+                            "Origin fetch for dataset '{dataset_name}' failed, so the expired cached response is being served instead because `caching_stale_if_error` allows it. Cause: {e}"
                         );
                         let batch_schema = batches[0].schema();
                         let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));

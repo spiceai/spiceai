@@ -497,12 +497,16 @@ fn fetched_at_between(
 /// The grace is the larger of the stale-while-revalidate window and a finite
 /// `stale_if_error` window (see [`StaleIfError::error_retention_window`]).
 /// Returns `None` for `stale_if_error: enabled`, whose fallback has no upper
-/// bound on age and so no deadline at which an entry becomes unservable.
+/// bound on age and so no deadline at which an entry becomes unservable — and
+/// for a deadline that does not fit a `Duration`. The Spicepod parser rejects
+/// caching windows whose sum overflows, so a loaded dataset never hits that
+/// case; a caller that bypassed the parser gets "no deadline" rather than a
+/// panic in the sweep.
 fn expiry_cutoff(limits: &CacheLimits) -> Option<i64> {
     let grace = limits
         .stale_if_error
         .error_retention_window(limits.stale_while_revalidate)?;
-    let window = effective_max_age(limits.ttl) + grace;
+    let window = effective_max_age(limits.ttl).checked_add(grace)?;
     nanos_since_epoch(SystemTime::now().checked_sub(window)?)
 }
 
@@ -1691,6 +1695,19 @@ mod tests {
             (observed_age - i128::try_from(expected_age).expect("fits")).unsigned_abs() < slack,
             "cutoff should sit ~{expected_age}ns in the past, was {observed_age}ns"
         );
+    }
+
+    /// A grace so long that `caching_ttl + grace` does not fit a `Duration` is
+    /// rejected by the Spicepod parser; should one reach the sweep anyway, it
+    /// yields no deadline rather than a panic.
+    #[test]
+    fn an_expiry_deadline_that_overflows_yields_no_cutoff() {
+        let limits = CacheLimits {
+            ttl: Some(Duration::from_secs(30)),
+            stale_if_error: StaleIfError::For(Duration::MAX - Duration::from_secs(1)),
+            ..Default::default()
+        };
+        assert!(expiry_cutoff(&limits).is_none());
     }
 
     #[test]
