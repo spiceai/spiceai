@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, SystemTime};
 
@@ -2148,6 +2149,13 @@ impl CacheRefreshHelper {
 /// Type alias for synchronized child accelerators
 pub type SynchronizedChildren = Arc<RwLock<Vec<Arc<dyn TableProvider>>>>;
 
+/// Shared across every `CachingAccelerationScanExec`: the filters passed into `scan()` are
+/// arbitrary caller `Expr`s, so full default features are kept rather than a stripped-down
+/// set, but the registry itself never varies by dataset or query, so it's built once for the
+/// process instead of once per exec.
+pub(crate) static SHARED_SESSION_STATE: LazyLock<Arc<SessionState>> =
+    LazyLock::new(|| Arc::new(SessionStateBuilder::new().with_default_features().build()));
+
 /// Caching acceleration execution plan that checks staleness and triggers background refresh
 pub struct CachingAccelerationScanExec {
     input: Arc<dyn ExecutionPlan>,
@@ -2207,8 +2215,7 @@ impl CachingAccelerationScanExec {
                 .with_partitioning(Partitioning::UnknownPartitioning(1)),
         );
 
-        // Full default features kept: caller filters may need any default scalar fn during pushdown.
-        let session_state = Arc::new(SessionStateBuilder::new().with_default_features().build());
+        let session_state = Arc::clone(&SHARED_SESSION_STATE);
 
         Self {
             input,

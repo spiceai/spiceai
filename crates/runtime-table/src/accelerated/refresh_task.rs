@@ -432,8 +432,7 @@ impl RefreshTaskBuilder {
 
         let dataset_metric_labels = DatasetMetricLabels::new(&self.dataset_name);
 
-        // Full default features kept: caller filters may need any default scalar fn during pushdown.
-        let session_state = Arc::new(SessionStateBuilder::new().with_default_features().build());
+        let session_state = Arc::clone(&crate::accelerated::caching::SHARED_SESSION_STATE);
 
         RefreshTask {
             runtime_status: self.runtime_status,
