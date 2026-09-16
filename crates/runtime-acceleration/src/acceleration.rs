@@ -1253,17 +1253,26 @@ fn parse_caching_stale_if_error(params: &mut Option<Params>) -> Result<StaleIfEr
         spicepod::param::ParamValue::String(s) => match s.to_lowercase().as_str() {
             "enabled" | "true" => Ok(StaleIfError::Enabled),
             "disabled" | "false" => Ok(StaleIfError::Disabled),
-            other => match fundu::parse_duration(other) {
-                // A zero window can never serve stale, so it is exactly `Disabled`
-                // — normalized here to avoid a `staleness <= 0` boundary case.
-                Ok(d) if d.is_zero() => Ok(StaleIfError::Disabled),
-                Ok(d) => Ok(StaleIfError::For(d)),
-                Err(_) => Err(ParseError::InvalidAccelerationConfiguration {
+            other => {
+                let invalid = || ParseError::InvalidAccelerationConfiguration {
                     detail: format!(
                         "Invalid 'caching_stale_if_error' value: '{s}'. Expected a duration such as '600s', or 'enabled'/'disabled'."
                     ),
-                }),
-            },
+                };
+                match fundu::parse_duration(other) {
+                    // A zero window can never serve stale, so it is exactly
+                    // `Disabled` — normalized here to avoid a `staleness <= 0`
+                    // boundary case.
+                    Ok(d) if d.is_zero() => Ok(StaleIfError::Disabled),
+                    // `fundu` accepts `inf`/`infinity` as a saturated
+                    // `Duration::MAX`. That is not a finite window, and infinity
+                    // is deliberately not an alias for `enabled` (decision 3), so
+                    // reject it rather than store a ~584-billion-year window.
+                    Ok(d) if d == Duration::MAX => Err(invalid()),
+                    Ok(d) => Ok(StaleIfError::For(d)),
+                    Err(_) => Err(invalid()),
+                }
+            }
         },
         // A YAML boolean (`caching_stale_if_error: true`) never reached the string
         // arm, so it was rejected before; accept it as the operator plainly meant.
