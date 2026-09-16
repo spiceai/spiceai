@@ -1837,6 +1837,10 @@ impl QueryObservations {
 static QUERY_OBSERVATIONS: LazyLock<RwLock<HashMap<String, Arc<QueryObservations>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// How many tables [`QUERY_OBSERVATIONS`] holds, readable without its lock, so a
+/// process with no registered table skips [`record_query_latency`]'s lookups.
+static QUERY_OBSERVATIONS_REGISTERED: AtomicUsize = AtomicUsize::new(0);
+
 /// Normalize a dataset/table name to the bare table-name key used by the query
 /// registry. Both the register side (the Cayenne context) and the push side (the
 /// runtime, via `TableReference::table()`) must agree on this; using the bare name
@@ -1857,12 +1861,10 @@ pub fn register_query_observations(name: &str) -> Arc<QueryObservations> {
     if let Some(existing) = QUERY_OBSERVATIONS.read().get(&key) {
         return Arc::clone(existing);
     }
-    Arc::clone(
-        QUERY_OBSERVATIONS
-            .write()
-            .entry(key)
-            .or_insert_with(|| Arc::new(QueryObservations::new())),
-    )
+    Arc::clone(QUERY_OBSERVATIONS.write().entry(key).or_insert_with(|| {
+        QUERY_OBSERVATIONS_REGISTERED.fetch_add(1, Ordering::Relaxed);
+        Arc::new(QueryObservations::new())
+    }))
 }
 
 /// Push one finished query's wall latency to a table's observations, if it is a
@@ -1871,6 +1873,12 @@ pub fn register_query_observations(name: &str) -> Arc<QueryObservations> {
 /// `true` iff the table was Cayenne-registered, so the caller can decide whether
 /// the query touched Cayenne at all (and thus counts toward global QPH).
 pub fn record_query_latency(name: &str, latency_ms: f64) -> bool {
+    // Every finished query reports here for every dataset it read. With no table
+    // registered there is nothing to record against, and the lookups below — the
+    // second of which parses the name and allocates — could only miss.
+    if QUERY_OBSERVATIONS_REGISTERED.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
     let map = QUERY_OBSERVATIONS.read();
     // Fast path: the runtime pushes the already-bare table name
     // (`TableReference::table()`), so a borrowed lookup hits with no allocation or
@@ -1895,7 +1903,13 @@ pub fn record_query_latency(name: &str, latency_ms: f64) -> bool {
 /// histogram/QPH baseline. Call this only on genuine teardown, to reset that baseline
 /// and avoid leaking handles.
 pub fn deregister_query_observations(name: &str) {
-    QUERY_OBSERVATIONS.write().remove(&table_registry_key(name));
+    let removed = QUERY_OBSERVATIONS
+        .write()
+        .remove(&table_registry_key(name))
+        .is_some();
+    if removed {
+        QUERY_OBSERVATIONS_REGISTERED.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Process-global query observations aggregating EVERY Cayenne-touching query
