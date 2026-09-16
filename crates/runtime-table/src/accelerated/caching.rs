@@ -272,7 +272,9 @@ const MAX_CONCURRENT_REFRESHES: usize = 10;
 /// traffic rather than batched up front, so the bound is enforced with a
 /// semaphore (shared across every `CachingAccelerationScanExec` for a dataset,
 /// so it caps the total regardless of how many distinct keys go stale
-/// concurrently) instead of `buffer_unordered` (spiceai/spiceai#14102).
+/// concurrently) instead of `buffer_unordered`. A stale hit that finds no permit
+/// free serves the cached entry and skips its refresh rather than queuing it;
+/// `handle_cache_hit` says why (spiceai/spiceai#14102).
 pub(crate) const MAX_CONCURRENT_SWR_REFRESHES: usize = 10;
 
 /// Channel capacity for batched cache writes. Allows buffering many concurrent requests.
@@ -2078,65 +2080,78 @@ impl CacheRefreshHelper {
                             );
                         }
 
-                        let federated_clone = Arc::clone(federated);
-                        let dataset_name_clone = dataset_name.to_string();
-                        let filters_for_refresh: Vec<Expr> = filters.to_vec();
-                        let batch_write_tx_clone = batch_write_tx;
-                        let namespace_clone = namespace;
-                        let swr_refresh_semaphore = Arc::clone(swr_refresh_semaphore);
-
-                        // The claim is held for the whole refresh (including
-                        // the wait below), so a duplicate hit on this key
-                        // sees should_revalidate=false rather than queuing a
-                        // second refresh behind the same permit. Spawning
-                        // unconditionally and queuing on the semaphore here,
-                        // instead of a non-blocking `try_acquire` before the
-                        // spawn, never blocks the client-facing request path
-                        // (this task already runs in the background) and
-                        // guarantees the entry is eventually revalidated
-                        // instead of only if some future stale hit happens to
-                        // land while a permit is free (spiceai/spiceai#14102).
-                        io_runtime.spawn(async move {
-                            let Ok(_permit) = swr_refresh_semaphore.acquire_owned().await else {
-                                // Semaphore is never closed; unreachable in practice.
-                                return;
-                            };
-                            tracing::debug!(
-                                "SWR: Background refresh for single entry started for dataset={dataset_name_clone}"
-                            );
-                            let result = Self::refresh_entry(
-                                federated_clone,
-                                &dataset_name_clone,
-                                &filters_for_refresh,
-                                namespace_clone,
-                                batch_write_tx_clone,
-                                claim,
-                            )
-                            .await;
-
-                            match result {
-                                Ok(RevalidationOutcome::OriginUnavailable) => {
-                                    // Not an error to the caller: the entry is
-                                    // still inside its stale-while-revalidate
-                                    // window and keeps being served. Said out
-                                    // loud because "refreshed 0 rows" would
-                                    // read as an origin with nothing to give.
-                                    tracing::warn!(
-                                        "Background revalidation for dataset '{dataset_name_clone}' could not reach a healthy origin, so the cached response is being served past its `caching_ttl` until the origin recovers or the entry falls out of its `caching_stale_while_revalidate_ttl` window."
-                                    );
-                                }
-                                Ok(outcome) => {
-                                    tracing::debug!("Background refresh task completed for dataset={dataset_name_clone}, refreshed {rows} rows", rows = outcome.rows());
-                                }
-                                Err(e) => {
-                                    // The claim was dropped with the failed
-                                    // refresh, so the key is already released.
-                                    tracing::error!(
-                                        "Background refresh task failed for dataset={dataset_name_clone}: {e}"
-                                    );
-                                }
+                        // Non-blocking: a hit that finds every permit taken
+                        // serves the cached entry and drops its claim rather
+                        // than queuing a refresh task behind the permit.
+                        // Queuing would bound only the origin scans, not the
+                        // tasks (one waiter per distinct stale key), and each
+                        // waiter would keep its key claimed for as long as the
+                        // queue took to drain, during which a cache miss on
+                        // that key fetches from the origin but cannot write
+                        // what it fetched (`handle_cache_miss` writes only
+                        // under its own claim), so under sustained load the
+                        // queued keys would stop being cached at all.
+                        // Dropping keeps revalidation demand-driven: the next
+                        // stale hit on this key retries, and a key nobody hits
+                        // again expires into an ordinary miss
+                        // (spiceai/spiceai#14102).
+                        match Arc::clone(swr_refresh_semaphore).try_acquire_owned() {
+                            Err(_) => {
+                                tracing::debug!(
+                                    "Skipping background refresh for dataset={dataset_name}: {MAX_CONCURRENT_SWR_REFRESHES} refreshes are already in flight, so the cached entry is served stale until its next stale hit retries"
+                                );
+                                // Releases the key so a miss on it can still write.
+                                drop(claim);
                             }
-                        });
+                            Ok(permit) => {
+                                let federated_clone = Arc::clone(federated);
+                                let dataset_name_clone = dataset_name.to_string();
+                                let filters_for_refresh: Vec<Expr> = filters.to_vec();
+                                let batch_write_tx_clone = batch_write_tx;
+                                let namespace_clone = namespace;
+
+                                io_runtime.spawn(async move {
+                                    // Held for the whole refresh, including the
+                                    // wait for write-channel capacity.
+                                    let _permit = permit;
+                                    tracing::debug!(
+                                        "SWR: Background refresh for single entry started for dataset={dataset_name_clone}"
+                                    );
+                                    let result = Self::refresh_entry(
+                                        federated_clone,
+                                        &dataset_name_clone,
+                                        &filters_for_refresh,
+                                        namespace_clone,
+                                        batch_write_tx_clone,
+                                        claim,
+                                    )
+                                    .await;
+
+                                    match result {
+                                        Ok(RevalidationOutcome::OriginUnavailable) => {
+                                            // Not an error to the caller: the entry is
+                                            // still inside its stale-while-revalidate
+                                            // window and keeps being served. Said out
+                                            // loud because "refreshed 0 rows" would
+                                            // read as an origin with nothing to give.
+                                            tracing::warn!(
+                                                "Background revalidation for dataset '{dataset_name_clone}' could not reach a healthy origin, so the cached response is being served past its `caching_ttl` until the origin recovers or the entry falls out of its `caching_stale_while_revalidate_ttl` window."
+                                            );
+                                        }
+                                        Ok(outcome) => {
+                                            tracing::debug!("Background refresh task completed for dataset={dataset_name_clone}, refreshed {rows} rows", rows = outcome.rows());
+                                        }
+                                        Err(e) => {
+                                            // The claim was dropped with the failed
+                                            // refresh, so the key is already released.
+                                            tracing::error!(
+                                                "Background refresh task failed for dataset={dataset_name_clone}: {e}"
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                        }
                     } else {
                         tracing::debug!(
                             "Skipping background refresh for dataset={dataset_name} because should_revalidate=false (revalidation already in progress for this cache key)"
@@ -2938,6 +2953,34 @@ mod tests {
             RuntimeStatus::new(),
         );
         (tx, handle)
+    }
+
+    /// Polls `condition` every 10ms until it holds or `timeout` elapses, and says
+    /// which. Readiness is waited for, never slept for: a fixed delay passes on a
+    /// fast machine and observes nothing on a loaded runner.
+    async fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if condition() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Whether any batch's `data` column holds `value`.
+    fn data_column_contains(batches: &[RecordBatch], value: &str) -> bool {
+        batches.iter().any(|batch| {
+            batch
+                .schema()
+                .index_of("data")
+                .ok()
+                .and_then(|idx| batch.column(idx).as_any().downcast_ref::<StringArray>())
+                .is_some_and(|col| (0..col.len()).any(|i| col.value(i) == value))
+        })
     }
 
     #[async_trait]
@@ -3934,23 +3977,11 @@ mod tests {
         );
     }
 
-    /// Reproduces spiceai/spiceai#14102: before the `swr_refresh_semaphore` bound was
-    /// added, `handle_cache_hit`'s `Stale` branch spawned one unbounded background
-    /// refresh task per distinct stale key. Under many concurrent stale hits on
-    /// distinct keys (the Zipf-skewed, short-`caching_ttl` traffic pattern the issue
-    /// reproduced OOMs under) that meant an unbounded number of tasks alive at once.
-    ///
-    /// Drives more concurrent stale hits (on distinct keys, so the per-key
-    /// `in_flight_revalidations` dedupe cannot itself bound concurrency) than
-    /// `MAX_CONCURRENT_SWR_REFRESHES`, uses `FilterTrackingTableProvider`'s scan delay
-    /// to hold each refresh open long enough to observe overlap, and asserts the
-    /// federated source never sees more concurrent scans than the bound allows.
-    #[tokio::test]
-    async fn test_swr_refresh_concurrency_is_bounded() {
-        const NUM_STALE_KEYS: usize = MAX_CONCURRENT_SWR_REFRESHES * 3;
-        const SCAN_DELAY: Duration = Duration::from_millis(200);
-
-        let schema = Arc::new(Schema::new(vec![
+    /// The schema a `refresh_mode: caching` entry is stored under in these tests:
+    /// the request key columns, a `data` payload, the response status, and the
+    /// `_fetched_at` stamp freshness is judged by.
+    fn cached_entry_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
             Field::new("request_path", DataType::Utf8, true),
             Field::new("request_query", DataType::Utf8, true),
             Field::new("data", DataType::Utf8, true),
@@ -3960,33 +3991,109 @@ mod tests {
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
                 true,
             ),
-        ]));
+        ]))
+    }
 
-        let fresh_data = RecordBatch::try_new(
-            Arc::clone(&schema),
+    /// One cached entry for request `path`/`query`, fetched at `fetched_at_nanos`.
+    fn cached_entry(
+        schema: &SchemaRef,
+        path: &str,
+        query: &str,
+        data: &str,
+        fetched_at_nanos: i64,
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
             vec![
-                Arc::new(StringArray::from(vec!["/api/entry"])),
-                Arc::new(StringArray::from(vec!["id=0"])),
-                Arc::new(StringArray::from(vec!["fresh"])),
+                Arc::new(StringArray::from(vec![path])),
+                Arc::new(StringArray::from(vec![query])),
+                Arc::new(StringArray::from(vec![data])),
                 Arc::new(UInt16Array::from(vec![200])),
-                Arc::new(TimestampNanosecondArray::from(vec![Some(0)])),
+                Arc::new(TimestampNanosecondArray::from(vec![Some(fetched_at_nanos)])),
             ],
         )
-        .expect("Should create batch");
+        .expect("Should create batch")
+    }
 
-        let federated = Arc::new(FilterTrackingTableProvider::new_with_scan_delay(
-            Arc::clone(&schema),
-            vec![fresh_data],
-            SCAN_DELAY,
-        ));
+    /// The access filters a request for `path`/`query` arrives with, which is
+    /// also what the entry's cache key is derived from.
+    fn entry_filters(path: &str, query: &str) -> Vec<Expr> {
+        vec![
+            col("request_path").eq(lit(path)),
+            col("request_query").eq(lit(query)),
+        ]
+    }
 
+    /// Nanoseconds since the epoch, two minutes ago: past a one-minute
+    /// `caching_ttl` but well inside a five-minute stale-while-revalidate window.
+    fn two_minutes_ago_nanos() -> i64 {
         #[expect(clippy::cast_possible_truncation)]
-        let two_min_ago = (SystemTime::now()
+        let nanos = (SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("Time went backwards")
             .as_nanos()
             - Duration::from_mins(2).as_nanos()) as i64;
+        nanos
+    }
 
+    /// Drives `count` stale cache hits through `handle_cache_hit`, each on its
+    /// own key so the per-key in-flight dedupe cannot itself bound concurrency.
+    /// Key `i` is request `/api/entry/{i}?id={i}`.
+    fn hit_distinct_stale_keys(
+        count: usize,
+        schema: &SchemaRef,
+        federated: &Arc<dyn TableProvider>,
+        in_flight_revalidations: &InFlightRevalidations,
+        batch_write_tx: &CacheWriteSender,
+        swr_refresh_semaphore: &Arc<Semaphore>,
+    ) {
+        let io_runtime = tokio::runtime::Handle::current();
+        let two_min_ago = two_minutes_ago_nanos();
+        for i in 0..count {
+            let path = format!("/api/entry/{i}");
+            let query = format!("id={i}");
+            let stale = cached_entry(schema, &path, &query, "stale", two_min_ago);
+            let _stream = CacheRefreshHelper::handle_cache_hit(
+                vec![stale],
+                federated,
+                "test_dataset",
+                Some(Duration::from_mins(1)),
+                Some(Duration::from_mins(5)),
+                &io_runtime,
+                Arc::clone(schema),
+                &entry_filters(&path, &query),
+                in_flight_revalidations,
+                batch_write_tx.clone(),
+                CacheNamespace::Public,
+                swr_refresh_semaphore,
+            );
+        }
+    }
+
+    /// Reproduces spiceai/spiceai#14102: before the `swr_refresh_semaphore` bound was
+    /// added, `handle_cache_hit`'s `Stale` branch spawned one unbounded background
+    /// refresh task per distinct stale key. Under many concurrent stale hits on
+    /// distinct keys (the Zipf-skewed, short-`caching_ttl` traffic pattern the issue
+    /// reproduced OOMs under) that meant an unbounded number of tasks alive at once.
+    ///
+    /// Drives three times `MAX_CONCURRENT_SWR_REFRESHES` stale hits on distinct keys,
+    /// uses `FilterTrackingTableProvider`'s scan delay to hold each refresh open long
+    /// enough to observe overlap, and asserts the origin saw *exactly* the bound in
+    /// flight at the peak — more is the unbounded spawn of the issue; fewer means a
+    /// permit is capped or leaked — and that only the hits holding a permit reached
+    /// the origin, since a hit that found none free skips its refresh rather than
+    /// queuing it.
+    #[tokio::test]
+    async fn test_swr_refresh_concurrency_is_bounded() {
+        const NUM_STALE_KEYS: usize = MAX_CONCURRENT_SWR_REFRESHES * 3;
+        const SCAN_DELAY: Duration = Duration::from_millis(200);
+
+        let schema = cached_entry_schema();
+        let federated = Arc::new(FilterTrackingTableProvider::new_with_scan_delay(
+            Arc::clone(&schema),
+            vec![cached_entry(&schema, "/api/entry", "id=0", "fresh", 0)],
+            SCAN_DELAY,
+        ));
         let accelerator = Arc::new(MockAcceleratorTableProvider::new(
             Arc::clone(&schema),
             vec![],
@@ -3998,66 +4105,141 @@ mod tests {
         let swr_refresh_semaphore: Arc<Semaphore> =
             Arc::new(Semaphore::new(MAX_CONCURRENT_SWR_REFRESHES));
 
-        let io_runtime = tokio::runtime::Handle::current();
-        let max_age = Some(Duration::from_mins(1));
-        let stale_while_revalidate = Some(Duration::from_mins(5));
-
-        // Drive NUM_STALE_KEYS distinct stale cache hits "concurrently" (one per
-        // simulated request), each on its own key so the in-flight dedupe cannot
-        // itself be the thing bounding concurrency.
-        for i in 0..NUM_STALE_KEYS {
-            let path = format!("/api/entry/{i}");
-            let query = format!("id={i}");
-            let stale_batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(StringArray::from(vec![path.clone()])),
-                    Arc::new(StringArray::from(vec![query.clone()])),
-                    Arc::new(StringArray::from(vec!["stale"])),
-                    Arc::new(UInt16Array::from(vec![200])),
-                    Arc::new(TimestampNanosecondArray::from(vec![Some(two_min_ago)])),
-                ],
-            )
-            .expect("Should create batch");
-
-            let access_filters = vec![
-                col("request_path").eq(lit(path)),
-                col("request_query").eq(lit(query)),
-            ];
-
-            let _stream = CacheRefreshHelper::handle_cache_hit(
-                vec![stale_batch],
-                &(Arc::clone(&federated) as Arc<dyn TableProvider>),
-                "test_dataset",
-                max_age,
-                stale_while_revalidate,
-                &io_runtime,
-                Arc::clone(&schema),
-                &access_filters,
-                &in_flight_revalidations,
-                batch_write_tx.clone(),
-                CacheNamespace::Public,
-                &swr_refresh_semaphore,
-            );
-        }
-
-        // Give every spawned refresh task time to reach (and hold) the scan
-        // delay, then time for the bound to drain and the rest to run.
-        tokio::time::sleep(SCAN_DELAY * 5 + Duration::from_millis(500)).await;
-
-        let observed_max_concurrency = federated.max_concurrent_scans();
-        assert!(
-            observed_max_concurrency <= MAX_CONCURRENT_SWR_REFRESHES,
-            "SWR background refreshes must never exceed MAX_CONCURRENT_SWR_REFRESHES \
-             ({MAX_CONCURRENT_SWR_REFRESHES}) concurrently in flight, observed \
-             {observed_max_concurrency} out of {NUM_STALE_KEYS} distinct stale keys \
-             hit at once. An unbounded observed value here is exactly \
-             spiceai/spiceai#14102."
+        hit_distinct_stale_keys(
+            NUM_STALE_KEYS,
+            &schema,
+            &(Arc::clone(&federated) as Arc<dyn TableProvider>),
+            &in_flight_revalidations,
+            &batch_write_tx,
+            &swr_refresh_semaphore,
         );
+
+        // A refresh holding a permit releases its key when its write lands, and
+        // a hit that found no permit released its key before returning, so an
+        // empty in-flight set means every refresh this burst will ever run has
+        // run. Polled, not slept for: see `wait_until`.
+        let settled = wait_until(Duration::from_secs(10), || {
+            in_flight_revalidations.lock().is_empty()
+        })
+        .await;
+        let observed_max_concurrency = federated.max_concurrent_scans();
+        let scans = federated.get_recorded_filters().len();
         assert!(
-            observed_max_concurrency > 0,
-            "test setup problem: no refresh ever ran, so this assertion cannot \
-             distinguish a bounded fix from a broken test"
+            settled,
+            "SWR refreshes did not settle within 10s: {} keys still claimed, {scans} \
+             origin scans started, peak concurrency {observed_max_concurrency}",
+            in_flight_revalidations.lock().len()
+        );
+        assert_eq!(
+            observed_max_concurrency, MAX_CONCURRENT_SWR_REFRESHES,
+            "SWR background refreshes must saturate but never exceed \
+             MAX_CONCURRENT_SWR_REFRESHES ({MAX_CONCURRENT_SWR_REFRESHES}) when \
+             {NUM_STALE_KEYS} distinct stale keys are hit at once: more is \
+             spiceai/spiceai#14102, fewer means a permit is capped or leaked"
+        );
+        assert_eq!(
+            scans, MAX_CONCURRENT_SWR_REFRESHES,
+            "a stale hit that finds no permit free serves the cached entry and skips \
+             its refresh instead of queuing it, so exactly the \
+             {MAX_CONCURRENT_SWR_REFRESHES} hits that got a permit reach the origin"
+        );
+    }
+
+    /// A stale hit that finds every SWR permit taken must serve the cached entry
+    /// and release its key claim, not queue a refresh task behind the permit.
+    ///
+    /// The claim is what makes queuing costly, beyond the one live task per
+    /// distinct stale key: a queued waiter keeps its key claimed for as long as
+    /// the queue takes to drain, and `handle_cache_miss` on a claimed key fetches
+    /// from the origin but writes nothing back — so under sustained load a queued
+    /// key stops being cached at all. Holds every permit with a scan that outlives
+    /// the test, then checks that a key a skipped hit released is one a cache miss
+    /// can still write through.
+    #[tokio::test]
+    async fn a_stale_hit_at_the_swr_limit_releases_its_key_for_the_miss_path() {
+        use futures::StreamExt;
+
+        const NUM_STALE_KEYS: usize = MAX_CONCURRENT_SWR_REFRESHES * 3;
+        // Longer than the test runs, so every permit stays taken to the end.
+        const HOLD_SCAN_OPEN: Duration = Duration::from_mins(1);
+
+        let schema = cached_entry_schema();
+        let held_origin = Arc::new(FilterTrackingTableProvider::new_with_scan_delay(
+            Arc::clone(&schema),
+            vec![cached_entry(&schema, "/api/entry", "id=0", "fresh", 0)],
+            HOLD_SCAN_OPEN,
+        ));
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight_revalidations: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+        let (batch_write_tx, _consumer_handle) =
+            spawn_test_cache_write_consumer(&accelerator, &in_flight_revalidations);
+        let swr_refresh_semaphore: Arc<Semaphore> =
+            Arc::new(Semaphore::new(MAX_CONCURRENT_SWR_REFRESHES));
+
+        hit_distinct_stale_keys(
+            NUM_STALE_KEYS,
+            &schema,
+            &(Arc::clone(&held_origin) as Arc<dyn TableProvider>),
+            &in_flight_revalidations,
+            &batch_write_tx,
+            &swr_refresh_semaphore,
+        );
+
+        // The last key hit found no permit free. A cache miss for it — the
+        // entry has since expired — asks an origin that answers at once and
+        // must be able to write the response it fetched.
+        let skipped = NUM_STALE_KEYS - 1;
+        let path = format!("/api/entry/{skipped}");
+        let query = format!("id={skipped}");
+        let filters = entry_filters(&path, &query);
+        let cache_key = compute_cache_key_from_filters_and_namespace(
+            &filters,
+            CacheNamespace::Public.storage_id(),
+        );
+        let miss_origin = Arc::new(FilterTrackingTableProvider::new(
+            Arc::clone(&schema),
+            vec![cached_entry(&schema, &path, &query, "written_by_miss", 0)],
+        ));
+        let mut stream = CacheRefreshHelper::handle_cache_miss(
+            miss_origin as Arc<dyn TableProvider>,
+            "test_dataset",
+            &filters,
+            None,
+            Arc::clone(&schema),
+            true,
+            false,
+            None,
+            &tokio::runtime::Handle::current(),
+            Arc::new(vec![].into()),
+            batch_write_tx.clone(),
+            CacheNamespace::Public,
+            Arc::clone(&in_flight_revalidations),
+        )
+        .await;
+        while let Some(batch) = stream.next().await {
+            batch.expect("stream");
+        }
+        drop(stream);
+
+        let written = wait_until(Duration::from_secs(5), || {
+            data_column_contains(&accelerator.get_data(), "written_by_miss")
+        })
+        .await;
+        assert!(
+            written,
+            "the miss for '{path}' fetched its response but never cached it; key still \
+             claimed: {}. A stale hit that finds no SWR permit must release its claim \
+             rather than hold it while queued behind the permit",
+            in_flight_revalidations.lock().contains(&cache_key)
+        );
+        assert_eq!(
+            in_flight_revalidations.lock().len(),
+            MAX_CONCURRENT_SWR_REFRESHES,
+            "only the refreshes holding a permit may keep their key claimed"
         );
     }
 
