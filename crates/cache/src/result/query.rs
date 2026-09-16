@@ -44,7 +44,12 @@ pub enum CachedData {
     /// Raw `RecordBatches` stored directly (encoding: none)
     Raw(Arc<Vec<RecordBatch>>),
     /// IPC-serialized bytes, additionally compressed (e.g., with zstd)
-    Encoded(Bytes),
+    Encoded {
+        bytes: Bytes,
+        /// The size of the Arrow IPC stream `bytes` decodes to. See
+        /// [`crate::encoding::Encoded::decoded_len`].
+        decoded_len: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -99,9 +104,12 @@ impl CachedQueryResult {
     }
 
     /// Create a new cached query result with encoded data.
+    ///
+    /// `decoded_len` is the size of the Arrow IPC stream `encoded_data` decodes to.
     #[must_use]
     pub fn new(
         encoded_data: Bytes,
+        decoded_len: usize,
         schema: Arc<Schema>,
         input_tables: Arc<HashSet<TableReference>>,
         cached_at: Instant,
@@ -109,7 +117,10 @@ impl CachedQueryResult {
         encoder: Option<Arc<dyn Encoder>>,
     ) -> Self {
         Self {
-            data: CachedData::Encoded(encoded_data),
+            data: CachedData::Encoded {
+                bytes: encoded_data,
+                decoded_len,
+            },
             schema: crate::intern::schema::intern(schema),
             input_tables: crate::intern::table_set::intern(input_tables),
             cached_at,
@@ -119,7 +130,11 @@ impl CachedQueryResult {
     }
 
     /// Create a cached query result from record batches.
-    /// Only store encoded data if an encoder is provided.
+    ///
+    /// Encoded whenever an encoder is configured, which is what
+    /// `caching.sql_results.encoding` selects. A hit on a small encoded entry is
+    /// still served where the request arrived: the decode is bounded there by
+    /// the runtime's `INLINE_DECODE_MAX_BYTES`, read from [`Self::decoded_len`].
     ///
     /// The `schema` parameter must be provided explicitly to ensure the correct
     /// schema is preserved even when `records` is empty (e.g., 0-row query results).
@@ -135,10 +150,18 @@ impl CachedQueryResult {
         read_started_at: Instant,
         encoder: Option<Arc<dyn Encoder>>,
     ) -> Result<Self, crate::encoding::Error> {
-        // Only store encoded data if an encoder is provided
+        // An encoder is configured for the whole cache, so every entry it can
+        // encode is encoded: `caching.sql_results.encoding` says what the cache
+        // compresses with, and storing some entries raw would make it describe
+        // only part of what it holds. A hit on a small encoded entry is still
+        // served where the request arrived — the decode is bounded there by
+        // `INLINE_DECODE_MAX_BYTES`, which reads `Self::decoded_len`.
         let data = if let Some(encoder) = encoder.as_ref() {
-            let encoded_data = encoder.encode(&records).await?;
-            CachedData::Encoded(Bytes::from(encoded_data))
+            let payload = encoder.encode(&records).await?;
+            CachedData::Encoded {
+                bytes: Bytes::from(payload.bytes),
+                decoded_len: payload.decoded_len,
+            }
         } else {
             CachedData::Raw(Arc::new(super::prepare_for_storage(records)))
         };
@@ -161,13 +184,33 @@ impl CachedQueryResult {
     pub async fn records(&self) -> Result<Arc<Vec<RecordBatch>>, crate::encoding::Error> {
         match &self.data {
             CachedData::Raw(batches) => Ok(Arc::clone(batches)),
-            CachedData::Encoded(bytes) => {
+            CachedData::Encoded { bytes, .. } => {
                 if let Some(encoder) = &self.encoder {
                     encoder.decode(bytes).await.map(Arc::new)
                 } else {
                     Err(crate::encoding::Error::NoEncoderSpecified)
                 }
             }
+        }
+    }
+
+    /// Whether this entry holds encoded bytes rather than the batches themselves.
+    #[must_use]
+    pub fn is_encoded(&self) -> bool {
+        matches!(self.data, CachedData::Encoded { .. })
+    }
+
+    /// The size of the Arrow IPC stream an encoded entry decodes to, or `None` for an entry
+    /// held as batches.
+    ///
+    /// Reading an encoded entry decompresses and decodes all of that stream, so this, not the
+    /// size of the stored payload, is what the read costs; reading a raw entry hands out the
+    /// batches it already holds.
+    #[must_use]
+    pub fn decoded_len(&self) -> Option<usize> {
+        match &self.data {
+            CachedData::Raw(_) => None,
+            CachedData::Encoded { decoded_len, .. } => Some(*decoded_len),
         }
     }
 
@@ -232,7 +275,7 @@ impl CachedQueryResult {
                         BUFFER_OVERHEAD_BYTES * arrow_tools::record_batch::buffers_in_batch(batch);
                 }
             }
-            CachedData::Encoded(bytes) => {
+            CachedData::Encoded { bytes, .. } => {
                 size += bytes.len();
             }
         }
@@ -421,6 +464,7 @@ mod tests {
 
         let cached_result = CachedQueryResult::new(
             encoded_data.clone(),
+            64,
             schema,
             input_tables,
             cached_at,
@@ -748,5 +792,173 @@ mod tests {
             3,
             "CachedStream schema must match the original schema"
         );
+    }
+
+    fn encoder() -> Option<Arc<dyn crate::encoding::Encoder>> {
+        crate::encoding::get_encoder(spicepod::component::caching::Encoding::Zstd)
+    }
+
+    /// A small result is encoded too when zstd is configured: the setting names
+    /// what the cache compresses with, not which entries it compresses. A hit on
+    /// one is still served where the request arrived, decoded within the
+    /// runtime's inline budget.
+    #[tokio::test]
+    async fn a_small_result_is_encoded_when_an_encoder_is_configured() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("batch");
+        let cached_result = CachedQueryResult::from_batches(
+            vec![batch],
+            schema,
+            Arc::new(HashSet::new()),
+            Instant::now(),
+            Instant::now(),
+            encoder(),
+        )
+        .await
+        .expect("should create cached result");
+
+        assert!(
+            cached_result.is_encoded(),
+            "`encoding: zstd` encodes every entry it can, whatever the result's size"
+        );
+        let records = cached_result.records().await.expect("decoded batches");
+        assert_eq!(records[0].num_rows(), 3);
+    }
+
+    /// A large result is encoded when zstd is configured, and round-trips.
+    #[tokio::test]
+    async fn a_large_result_is_encoded_when_an_encoder_is_configured() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        // ~20 KiB of zeros: large, and highly compressible.
+        let values = vec![0i32; 5_000];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(values))],
+        )
+        .expect("batch");
+
+        let cached_result = CachedQueryResult::from_batches(
+            vec![batch],
+            schema,
+            Arc::new(HashSet::new()),
+            Instant::now(),
+            Instant::now(),
+            encoder(),
+        )
+        .await
+        .expect("should create cached result");
+
+        assert!(
+            cached_result.is_encoded(),
+            "a result over the raw-store budget must still be encoded under zstd"
+        );
+        let records = cached_result.records().await.expect("decoded batches");
+        assert_eq!(records[0].num_rows(), 5_000);
+    }
+
+    /// A compressible result larger than the cache `max_size` raw is stored,
+    /// because it is encoded first (regression for
+    /// <https://github.com/spiceai/spiceai/issues/8508>).
+    #[tokio::test]
+    async fn a_result_over_a_small_cache_limit_is_encoded() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let n = 300;
+        let col = Arc::new(Int32Array::from(vec![0i32; n]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::clone(&col) as _, Arc::clone(&col) as _],
+        )
+        .expect("batch");
+        let raw_bytes = batch.get_array_memory_size();
+        let cache_max = 2 * 1024;
+        assert!(
+            raw_bytes > cache_max,
+            "fixture must exceed a 2 KiB cache, got {raw_bytes}"
+        );
+        let cached_result = CachedQueryResult::from_batches(
+            vec![batch],
+            schema,
+            Arc::new(HashSet::new()),
+            Instant::now(),
+            Instant::now(),
+            encoder(),
+        )
+        .await
+        .expect("should create cached result");
+
+        assert!(
+            cached_result.is_encoded(),
+            "a result that cannot fit raw in the cache must still be encoded under zstd"
+        );
+        let records = cached_result.records().await.expect("decoded batches");
+        assert_eq!(records[0].num_rows(), n);
+    }
+
+    /// Array bytes under `max_size` can still weigh more than `max_size` once
+    /// the weigher adds entry and buffer overhead. Those must encode under
+    /// zstd or the store path skips them (the #8508 weigher boundary).
+    #[tokio::test]
+    async fn a_result_under_max_size_in_array_bytes_is_encoded_when_the_weigher_does_not_fit() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let n = 200;
+        let col = Arc::new(Int32Array::from(vec![0i32; n]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::clone(&col) as _, Arc::clone(&col) as _],
+        )
+        .expect("batch");
+        let cache_max = 2 * 1024;
+        let raw_bytes = batch.get_array_memory_size();
+        assert!(
+            raw_bytes <= cache_max,
+            "fixture must sit under max_size in array bytes, got {raw_bytes}"
+        );
+
+        let now = Instant::now();
+        let raw = CachedQueryResult::new_raw(
+            vec![batch.clone()],
+            Arc::clone(&schema),
+            Arc::new(HashSet::new()),
+            now,
+            now,
+        );
+        assert!(
+            raw.memory_size() > u64::try_from(cache_max).expect("2 KiB"),
+            "fixture must exceed max_size once weighed, got {} vs {cache_max}",
+            raw.memory_size()
+        );
+
+        let cached_result = CachedQueryResult::from_batches(
+            vec![batch],
+            schema,
+            Arc::new(HashSet::new()),
+            now,
+            now,
+            encoder(),
+        )
+        .await
+        .expect("should create cached result");
+
+        assert!(
+            cached_result.is_encoded(),
+            "a result whose weigher exceeds max_size must still be encoded under zstd"
+        );
+        assert!(
+            cached_result.memory_size() <= u64::try_from(cache_max).expect("2 KiB"),
+            "encoded entry must fit the cache, got {}",
+            cached_result.memory_size()
+        );
+        let records = cached_result.records().await.expect("decoded batches");
+        assert_eq!(records[0].num_rows(), n);
     }
 }
