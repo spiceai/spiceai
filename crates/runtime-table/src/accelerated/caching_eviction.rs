@@ -614,7 +614,10 @@ fn unmeasurable_payload_columns(schema: &arrow::datatypes::Schema) -> Vec<String
 /// batches, so [`read_utf8`]'s allocation only happens for the entries a
 /// delete predicate actually names.
 enum EntryKey {
-    Deferred { batch: usize, row: usize },
+    Deferred {
+        batch: usize,
+        row: usize,
+    },
     /// Lets a unit test build an [`EntryCost`] without a real `RecordBatch` to
     /// point back into.
     #[cfg(test)]
@@ -1179,13 +1182,13 @@ mod tests {
     use crate::federated::FederatedTable;
     use arrow::datatypes::{Field, Schema, TimeUnit};
 
-    // Proves the deferral rather than trusting the diff: a test-only tally of
-    // how many times `EntryKey::resolve` actually reads a key back off a
-    // `RecordBatch`. Thread-local because `#[tokio::test]`'s default
-    // current-thread runtime keeps a test's whole body — setup, sweep and
-    // assertion — on the one OS thread the harness gave it, so this cannot be
-    // corrupted by another test's sweep running concurrently on another
-    // thread.
+    // A test-only tally of how many times `EntryKey::resolve` actually reads a
+    // key back off a `RecordBatch`, so a test can assert deferral happened
+    // instead of only asserting the entries it deleted. Thread-local because
+    // `#[tokio::test]`'s default current-thread runtime keeps a test's whole
+    // body — setup, sweep and assertion — on the one OS thread the harness gave
+    // it, so this cannot be corrupted by another test's sweep running
+    // concurrently on another thread.
     thread_local! {
         static KEY_EXTRACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
