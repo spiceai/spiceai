@@ -27,6 +27,8 @@ use arrow_tools::format::SchemaDisplay;
 use datafusion::common::{DataFusionError, Result as DataFusionResult, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
+use datafusion::execution::context::SessionState;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::{Expr, dml::InsertOp, not};
 use datafusion::logical_expr::{col, lit};
 use datafusion::physical_plan::execution_plan::EmissionType;
@@ -903,14 +905,12 @@ impl CacheRefreshHelper {
     pub async fn refresh_all_stale_rows(
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
+        session_state: Arc<SessionState>,
         dataset_name: &str,
         ttl: Duration,
         accelerator_write_mutex: Arc<Mutex<()>>,
         in_flight_revalidations: InFlightRevalidations,
     ) -> DataFusionResult<usize> {
-        let ctx = SessionContext::new();
-        let state = ctx.state();
-
         // Data fetched before this threshold is considered stale
         #[expect(clippy::cast_possible_truncation)] // Safe: nanoseconds won't exceed i64::MAX
         let stale_threshold = (SystemTime::now() - ttl)
@@ -932,7 +932,9 @@ impl CacheRefreshHelper {
                 ))),
             ];
 
-        let plan = accelerator.scan(&state, None, &filters, None).await?;
+        let plan = accelerator
+            .scan(session_state.as_ref(), None, &filters, None)
+            .await?;
         let task_ctx = Arc::new(TaskContext::default());
 
         // Collect all stale rows from accelerator
@@ -957,6 +959,7 @@ impl CacheRefreshHelper {
         let refresh_futures = stale_entries.into_iter().map(|entry| {
             let federated = Arc::clone(&federated);
             let accelerator = Arc::clone(&accelerator);
+            let session_state = Arc::clone(&session_state);
             let dataset_name = dataset_name.to_string();
             let accelerator_write_mutex = Arc::clone(&accelerator_write_mutex);
             let in_flight_revalidations = Arc::clone(&in_flight_revalidations);
@@ -991,8 +994,14 @@ impl CacheRefreshHelper {
                     row_filters.len()
                 );
 
-                let batches =
-                    Self::fetch_from_source(&federated, &dataset_name, &row_filters, None).await?;
+                let batches = Self::fetch_from_source(
+                    &federated,
+                    &session_state,
+                    &dataset_name,
+                    &row_filters,
+                    None,
+                )
+                .await?;
 
                 if batches.is_empty() {
                     return Ok::<usize, datafusion::error::DataFusionError>(0);
@@ -1081,6 +1090,7 @@ impl CacheRefreshHelper {
     /// this entry, or if the refreshed rows cannot be queued for write.
     pub async fn refresh_entry(
         federated: Arc<dyn TableProvider>,
+        session_state: &SessionState,
         dataset_name: &str,
         filters: &[Expr],
         namespace: CacheNamespace,
@@ -1093,7 +1103,8 @@ impl CacheRefreshHelper {
         );
 
         // Fetch fresh data for this specific entry
-        let batches = Self::fetch_from_source(&federated, dataset_name, filters, None).await?;
+        let batches =
+            Self::fetch_from_source(&federated, session_state, dataset_name, filters, None).await?;
 
         // Skip cache writes if the source response contains transient HTTP
         // errors. Returning here drops `claim`, releasing the key.
@@ -1768,6 +1779,7 @@ impl CacheRefreshHelper {
     /// Fetch data from federated source for given filters
     async fn fetch_from_source(
         federated: &Arc<dyn TableProvider>,
+        session_state: &SessionState,
         dataset_name: &str,
         filters: &[Expr],
         limit: Option<usize>,
@@ -1780,12 +1792,9 @@ impl CacheRefreshHelper {
             tracing::debug!("Source fetch filter {i}: {}", filter.human_display());
         }
 
-        let ctx = SessionContext::new();
-        let state = ctx.state();
-
         // Query source with same filters/limit but all columns
         tracing::debug!("About to scan federated source for dataset={dataset_name}");
-        let plan = federated.scan(&state, None, filters, limit).await?;
+        let plan = federated.scan(session_state, None, filters, limit).await?;
         tracing::debug!(
             "Federated source SCAN successful for dataset={dataset_name}, plan has {} partitions",
             plan.properties().output_partitioning().partition_count()
@@ -1825,6 +1834,7 @@ impl CacheRefreshHelper {
     #[expect(clippy::too_many_arguments)]
     async fn handle_cache_miss(
         federated: Arc<dyn TableProvider>,
+        session_state: &SessionState,
         dataset_name: &str,
         filters: &[Expr],
         limit: Option<usize>,
@@ -1845,7 +1855,8 @@ impl CacheRefreshHelper {
             compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id()),
         );
 
-        match Self::fetch_from_source(&federated, dataset_name, filters, limit).await {
+        match Self::fetch_from_source(&federated, session_state, dataset_name, filters, limit).await
+        {
             Ok(batches) if !batches.is_empty() => {
                 let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
                 tracing::debug!(
@@ -2006,6 +2017,7 @@ impl CacheRefreshHelper {
     fn handle_cache_hit(
         cached_batches: Vec<RecordBatch>,
         federated: &Arc<dyn TableProvider>,
+        session_state: &Arc<SessionState>,
         dataset_name: &str,
         max_age: Option<Duration>,
         stale_while_revalidate: Option<Duration>,
@@ -2063,6 +2075,7 @@ impl CacheRefreshHelper {
                         }
 
                         let federated_clone = Arc::clone(federated);
+                        let session_state_clone = Arc::clone(session_state);
                         let dataset_name_clone = dataset_name.to_string();
                         let filters_for_refresh: Vec<Expr> = filters.to_vec();
                         let batch_write_tx_clone = batch_write_tx;
@@ -2074,6 +2087,7 @@ impl CacheRefreshHelper {
                             );
                             let result = Self::refresh_entry(
                                 federated_clone,
+                                &session_state_clone,
                                 &dataset_name_clone,
                                 &filters_for_refresh,
                                 namespace_clone,
@@ -2159,6 +2173,10 @@ pub struct CachingAccelerationScanExec {
     synchronized_children: SynchronizedChildren,
     /// Sender for batched cache writes
     batch_write_tx: CacheWriteSender,
+    /// Session state used to scan `federated` for a cache miss or SWR refresh.
+    /// Built once in [`Self::new`] instead of a fresh `SessionContext` per
+    /// fetch — see `fetch_from_source`.
+    session_state: Arc<SessionState>,
 }
 
 impl CachingAccelerationScanExec {
@@ -2191,6 +2209,16 @@ impl CachingAccelerationScanExec {
                 .with_partitioning(Partitioning::UnknownPartitioning(1)),
         );
 
+        // `with_default_features()` kept deliberately, not stripped down: the
+        // filters scanned against `federated` here are arbitrary caller
+        // `Expr`s (translated user WHERE-clause predicates), and a federated
+        // connector's own `scan()` may need to resolve a built-in scalar
+        // function while planning pushdown for one of them. Nothing in this
+        // scan-and-collect path rules that out for every `TableProvider` it
+        // can be pointed at, so this only removes the *rebuilding*, not the
+        // feature set.
+        let session_state = Arc::new(SessionStateBuilder::new().with_default_features().build());
+
         Self {
             input,
             plan_properties,
@@ -2208,6 +2236,7 @@ impl CachingAccelerationScanExec {
             in_flight_revalidations,
             synchronized_children,
             batch_write_tx,
+            session_state,
         }
     }
 }
@@ -2307,6 +2336,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         let schema_clone = Arc::clone(&schema);
 
         let federated = Arc::clone(&self.federated);
+        let session_state = Arc::clone(&self.session_state);
         let dataset_name = self.dataset_name.clone();
         let filters = self.filters.clone();
         let limit = self.limit;
@@ -2385,6 +2415,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         };
                         return CacheRefreshHelper::handle_cache_miss(
                             federated,
+                            &session_state,
                             &dataset_name,
                             &filters,
                             limit,
@@ -2406,6 +2437,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 CacheRefreshHelper::handle_cache_hit(
                     cached_batches,
                     &federated,
+                    &session_state,
                     &dataset_name,
                     max_age,
                     stale_while_revalidate,
@@ -2423,6 +2455,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 );
                 CacheRefreshHelper::handle_cache_miss(
                     federated,
+                    &session_state,
                     &dataset_name,
                     &filters,
                     limit,
@@ -2602,6 +2635,13 @@ mod tests {
     use parking_lot::RwLock;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
+
+    /// Test-only stand-in for the `Arc<SessionState>` `CachingAccelerationScanExec`
+    /// and `RefreshTask` build once and share; tests call `fetch_from_source` and
+    /// friends directly, so they need one too.
+    fn test_session_state() -> Arc<SessionState> {
+        Arc::new(SessionStateBuilder::new().with_default_features().build())
+    }
 
     /// Mock `TableProvider` that records filters passed to `scan()` for verification.
     #[derive(Debug)]
@@ -3758,6 +3798,7 @@ mod tests {
         let _stream = CacheRefreshHelper::handle_cache_hit(
             vec![stale_cached_data],
             &(Arc::clone(&federated) as Arc<dyn TableProvider>),
+            &test_session_state(),
             "test_dataset",
             max_age,
             stale_while_revalidate,
@@ -3924,6 +3965,7 @@ mod tests {
         // --- 500 request ---
         let mut stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source_500) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))],
             None,
@@ -3963,6 +4005,7 @@ mod tests {
 
         let mut stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source_429) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))],
             None,
@@ -4052,6 +4095,7 @@ mod tests {
 
         let stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))],
             None,
@@ -4098,6 +4142,7 @@ mod tests {
 
         let stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))],
             None,
@@ -4135,6 +4180,7 @@ mod tests {
 
         let outcome = CacheRefreshHelper::refresh_entry(
             Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))],
             CacheNamespace::Public,
@@ -4180,6 +4226,7 @@ mod tests {
 
         let mut stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &filters,
             None,
@@ -4317,6 +4364,7 @@ mod tests {
         let refreshed = CacheRefreshHelper::refresh_all_stale_rows(
             Arc::clone(&origin) as Arc<dyn TableProvider>,
             Arc::clone(&accelerator),
+            test_session_state(),
             "test_dataset",
             Duration::from_secs(1),
             Arc::new(Mutex::new(())),
@@ -4353,6 +4401,7 @@ mod tests {
 
         let mut stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))],
             None,
@@ -4420,6 +4469,7 @@ mod tests {
         let refreshed = CacheRefreshHelper::refresh_all_stale_rows(
             Arc::clone(&origin) as Arc<dyn TableProvider>,
             Arc::clone(&accelerator),
+            test_session_state(),
             "test_dataset",
             Duration::from_secs(1),
             Arc::new(Mutex::new(())),
@@ -4484,6 +4534,7 @@ mod tests {
         // 2. Call handle_cache_miss - this is what happens when user queries and cache is empty
         let mut stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))], // filters
             None,                              // limit
@@ -4782,6 +4833,68 @@ mod tests {
             .expect("status column");
         assert_eq!(status.value(0), 200);
         assert_eq!(status.value(1), 404);
+    }
+
+    /// Measures what `fetch_from_source` used to pay on every call: a fresh
+    /// `SessionContext::new()` (which rebuilds every default scalar/aggregate/
+    /// window UDF, table function, file format, table factory, catalog and the
+    /// analyzer/optimizer rule chain) versus reusing one `SessionState` built
+    /// once, as `CachingAccelerationScanExec` and `RefreshTask` now do. Both
+    /// arms otherwise do the identical `federated.scan(..).await` + `collect`
+    /// this function performs, so the delta isolates the session-construction
+    /// cost this change removes. Not a hard performance gate (timing is
+    /// inherently noisy) — it exists to print a real, reproducible number
+    /// rather than assert one.
+    #[tokio::test]
+    async fn fetch_from_source_reuses_session_state_instead_of_rebuilding_it() {
+        const ITERATIONS: u32 = 200;
+
+        let federated: Arc<dyn TableProvider> =
+            Arc::new(MockHttpTableProvider::with_status(200, "ok"));
+        let filters = vec![col("content").eq(lit("test"))];
+
+        // "Before": what every call to fetch_from_source used to do.
+        let before_start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            let ctx = SessionContext::new();
+            let state = ctx.state();
+            let plan = federated
+                .scan(&state, None, &filters, None)
+                .await
+                .expect("scan");
+            let task_ctx = Arc::new(TaskContext::default());
+            datafusion::physical_plan::collect(plan, task_ctx)
+                .await
+                .expect("collect");
+        }
+        let before = before_start.elapsed();
+
+        // "After": one shared SessionState, as fetch_from_source now receives it.
+        let session_state = test_session_state();
+        let after_start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            CacheRefreshHelper::fetch_from_source(
+                &federated,
+                &session_state,
+                "test_dataset",
+                &filters,
+                None,
+            )
+            .await
+            .expect("fetch_from_source");
+        }
+        let after = after_start.elapsed();
+
+        println!(
+            "fetch_from_source session construction, {ITERATIONS} iterations: \
+             fresh SessionContext::new() per call = {before:?}, shared SessionState = {after:?}"
+        );
+
+        assert!(
+            after < before,
+            "reusing a shared SessionState ({after:?}) should be faster than rebuilding a \
+             fresh SessionContext ({before:?}) on every call"
+        );
     }
 }
 

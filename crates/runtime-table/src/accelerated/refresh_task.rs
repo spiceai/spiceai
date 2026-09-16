@@ -41,7 +41,7 @@ use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use datafusion::catalog::MemoryCatalogProvider;
 use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::execution::SessionStateBuilder;
-use datafusion::execution::context::SessionContext;
+use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_planner::ExtensionPlanner;
 use datafusion::{
@@ -432,6 +432,16 @@ impl RefreshTaskBuilder {
 
         let dataset_metric_labels = DatasetMetricLabels::new(&self.dataset_name);
 
+        // `with_default_features()` kept deliberately: `refresh_stale_cached_rows`
+        // scans the accelerator and the federated source with caller-supplied
+        // filter `Expr`s (arbitrary user WHERE-clause predicates translated by
+        // the query layer), and a federated connector's `scan()` may need to
+        // resolve a built-in scalar function while planning pushdown for one of
+        // them. There was no evidence a stripped-down function/table-factory
+        // set is safe across every `TableProvider` this can be pointed at, so
+        // this keeps the full default set and only removes the *rebuilding*.
+        let session_state = Arc::new(SessionStateBuilder::new().with_default_features().build());
+
         RefreshTask {
             runtime_status: self.runtime_status,
             dataset_name: self.dataset_name,
@@ -464,6 +474,7 @@ impl RefreshTaskBuilder {
             cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
             cdc_param_overrides: self.cdc_param_overrides,
             in_flight_revalidations: self.in_flight_revalidations,
+            session_state,
         }
     }
 }
@@ -543,6 +554,11 @@ pub struct RefreshTask {
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
     in_flight_revalidations: super::caching::InFlightRevalidations,
+    /// Shared session state for scanning the federated source during
+    /// `refresh_stale_cached_rows` (`RefreshMode::Caching`). Built once here
+    /// rather than per stale entry — see `CachingAccelerationScanExec::session_state`
+    /// for why a fresh `SessionContext` per fetch was expensive.
+    session_state: Arc<SessionState>,
 }
 
 impl std::fmt::Debug for RefreshTask {
@@ -1230,6 +1246,7 @@ impl RefreshTask {
         let refreshed_count = CacheRefreshHelper::refresh_all_stale_rows(
             federated_provider,
             Arc::clone(&self.accelerator),
+            Arc::clone(&self.session_state),
             self.dataset_name.to_string().as_str(),
             ttl,
             Arc::clone(&self.accelerator_write_mutex),
