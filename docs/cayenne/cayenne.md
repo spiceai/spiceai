@@ -1342,7 +1342,7 @@ Both axes classify every component kind that creates a Cayenne table: datasets, 
 | `cayenne_cdc_mem_tier_seal_age_ms` | seal cadence: max age of the un-sealed ingestion piece before a durable shadow + slot advance; `0` disables (slot ack reverts to checkpoint cadence); keep ≤ the age cap | `2_000` |
 | `cayenne_datalake_location` | `s3://` URI for the optional datalake (cold) tier; presence enables it (dormant otherwise; requires `refresh_mode: changes`/`append`, forces key-based deletes) | (unset) |
 | `cayenne_datalake_s3_auth` / `_s3_key` / `_s3_secret` / `_s3_region` / `_s3_endpoint` / … | dedicated datalake S3 credentials/client options, validated by a write probe at load | (unset) |
-| `cayenne_datalake_clustering_columns` | columns to cluster datalake files by, along a multi-dimensional space-filling curve | (operator-set `cayenne_sort_columns`, else hot observed filters, else inferred `cayenne_sort_columns`, else PK) |
+| `cayenne_datalake_clustering_columns` | columns to Z-order-cluster datalake files by | (operator-set `cayenne_sort_columns`, else hot observed filters, else inferred `cayenne_sort_columns`, else PK) |
 | `cayenne_sort_columns_origin` | provenance of `cayenne_sort_columns`: `user` (authoritative) or `inferred` (a guess, outranked by observed filter columns) | `user` |
 | `cayenne_datalake_target_file_size_mb` | datalake Vortex file target size | `512` |
 | `cayenne_datalake_warm_max_bytes` / `_max_files` | warm→datalake promotion triggers (size / file count) | 16 × `cayenne_datalake_target_file_size_mb` / (unset) |

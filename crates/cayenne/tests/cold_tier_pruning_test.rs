@@ -40,6 +40,7 @@ use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::*;
+use datafusion_common::ScalarValue;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::source::DataSourceExec;
@@ -207,15 +208,18 @@ async fn test_cold_tier_selective_query_prunes_files_impl(
 
 test_with_backends!(test_cold_tier_normalized_clustering_prunes_both_dimensions_impl);
 
-/// Rows and pad width sized so one promotion rolls several 1 MB cold files.
-/// Vortex rolls on estimated compressed size; the pad is a per-row 1 KiB of
-/// mixed bytes so that estimate stays near the Arrow footprint instead of
-/// collapsing under dictionary coding.
-const CLUSTER_ROWS: i64 = 16_384;
+/// DataFusion's default write batch is 8192 rows. The Vortex sink checks the
+/// 1 MB cold target at batch boundaries, so a pad just over 128 B makes each
+/// batch its own file. Sixteen files is the coarsest layout that can still
+/// show a tenant point probe skipping files: in arrival/timestamp order every
+/// file would still carry all 16 tenants.
+const CLUSTER_BATCH_ROWS: i64 = 8192;
+const CLUSTER_FILE_COUNT: i64 = 16;
+const CLUSTER_ROWS: i64 = CLUSTER_BATCH_ROWS * CLUSTER_FILE_COUNT;
 const CLUSTER_TENANTS: i64 = 16;
 const CLUSTER_TS_BASE: i64 = 1_700_000_000_000_000;
 const CLUSTER_TS_STEP: i64 = 1_000;
-const CLUSTER_PAD_BYTES: usize = 1024;
+const CLUSTER_PAD_BYTES: usize = 256;
 const CLUSTER_PAD_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
 fn cluster_pad(row: i64) -> Vec<u8> {
@@ -229,6 +233,13 @@ fn cluster_pad(row: i64) -> Vec<u8> {
         slot.copy_from_slice(&x.to_le_bytes());
     }
     buf
+}
+
+fn int64_bound(value: &datafusion_common::stats::Precision<ScalarValue>) -> Option<i64> {
+    match value.get_value()? {
+        ScalarValue::Int64(Some(v)) => Some(*v),
+        _ => None,
+    }
 }
 
 /// One promotion of the timestamp/tenant fixture. Predicates on *both*
@@ -297,14 +308,51 @@ async fn test_cold_tier_normalized_clustering_prunes_both_dimensions_impl(
     table.flush_pending_maintenance().await?;
     table.checkpoint_inlined_data().await?;
     table.checkpoint_mem_tier().await?;
+    let maintained = table
+        .optimizer_table_statistics()
+        .expect("maintained statistics must be warm before promotion");
+    assert!(
+        int64_bound(&maintained.column_statistics[1].min_value).is_some()
+            && int64_bound(&maintained.column_statistics[2].min_value).is_some(),
+        "promotion has no [min, max] for ts/tenant, so the kernel would fall back to raw keys"
+    );
+
     assert!(
         table.promote_warm_to_cold().await?,
         "promotion should fire with cold_tier_warm_max_files = 1"
     );
 
+    let cold_files = fixture
+        .catalog
+        .list_cold_tier_files(table.table_id())
+        .await?;
+    assert!(
+        cold_files.len() >= 8,
+        "one clustered promotion must roll several cold files so pruning is observable, got {}",
+        cold_files.len()
+    );
+
+    let mut tenant_ranges = Vec::new();
+    for file in &cold_files {
+        let stats = cayenne::stats::file_statistics_to_df(
+            &cayenne::stats::deserialize_file_statistics(&file.statistics_blob, schema.as_ref())?,
+            file.row_count,
+        );
+        let lo = int64_bound(&stats.column_statistics[2].min_value);
+        let hi = int64_bound(&stats.column_statistics[2].max_value);
+        tenant_ranges.push((lo, hi));
+    }
+    assert!(
+        tenant_ranges.iter().any(|(lo, hi)| match (lo, hi) {
+            (Some(lo), Some(hi)) => *hi - *lo < CLUSTER_TENANTS - 1,
+            _ => false,
+        }),
+        "every cold file still spans all {CLUSTER_TENANTS} tenants {tenant_ranges:?} — clustering did not tighten the narrow dimension"
+    );
+
     let all_files = planned_files_for(&ctx, "SELECT id FROM cluster_prune_t").await?;
     assert!(
-        all_files >= 4,
+        all_files >= 8,
         "one clustered promotion must roll several cold files so pruning is observable, got {all_files}"
     );
 
