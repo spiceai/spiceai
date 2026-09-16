@@ -437,6 +437,7 @@ datasets:
       on_conflict:
         id: upsert # drop, upsert, upsert_dedup, upsert_dedup_by_row_id
       snapshots: enabled # disabled, enabled, bootstrap_only, create_only
+      snapshots_consistency: consistent_read # consistent_read, accept_skew
       params:
         duckdb_file: ./data/postgres.duckdb
         file_watcher: 'true'

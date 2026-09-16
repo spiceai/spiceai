@@ -37,6 +37,8 @@ const SCHEMA_MIGRATION_01_STMT: &str =
     "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS schema_json TEXT";
 const REFRESH_SQL_MIGRATION_STMT: &str =
     "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS refresh_sql TEXT";
+const SOURCE_FINGERPRINT_MIGRATION_STMT: &str =
+    "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS source_fingerprint TEXT";
 
 /// Dataset schema/refresh-SQL checkpoint backed by a `DuckDB` accelerator.
 pub struct DuckDbDatasetCheckpointer {
@@ -166,6 +168,7 @@ impl DuckDbDatasetCheckpointer {
         pool: &Arc<DuckDbConnectionPool>,
         schema: &SchemaRef,
         refresh_sql: Option<&str>,
+        source_fingerprint: Option<&str>,
     ) -> Result<(), CheckpointError> {
         let write_gate = pool.write_gate();
         let _write_guard = write_gate
@@ -179,15 +182,15 @@ impl DuckDbDatasetCheckpointer {
 
         let schema_json = serialize_schema(schema).map_err(store_error)?;
         let upsert = format!(
-            "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, created_at, updated_at, schema_json, refresh_sql)
-             VALUES (?, now(), now(), ?, ?)
+            "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, created_at, updated_at, schema_json, refresh_sql, source_fingerprint)
+             VALUES (?, now(), now(), ?, ?, ?)
              ON CONFLICT (dataset_name) DO UPDATE
-             SET updated_at = now(), schema_json = excluded.schema_json, refresh_sql = excluded.refresh_sql"
+             SET updated_at = now(), schema_json = excluded.schema_json, refresh_sql = excluded.refresh_sql, source_fingerprint = excluded.source_fingerprint"
         );
         duckdb_conn
             .execute(
                 &upsert,
-                duckdb::params![dataset_name, &schema_json, refresh_sql],
+                duckdb::params![dataset_name, &schema_json, refresh_sql, source_fingerprint],
             )
             .map_err(store_error)?;
 
@@ -226,10 +229,11 @@ impl DuckDbDatasetCheckpointer {
             .execute(&update, duckdb::params![&schema_json, dataset_name])
             .map_err(store_error)?;
 
-        // A repair that only reached the WAL is invisible to a snapshot: the upload path
-        // copies the database file alone, and `DuckDBSnapshotEngine` inherits the no-op
-        // `SnapshotEngine::checkpoint_live`, so nothing else flushes it. Gate on the row
-        // count so an absent checkpoint stays untouched, as above.
+        // A repair that only reached the WAL is invisible until something folds
+        // it. `DuckDBSnapshotEngine::checkpoint_live` does that immediately
+        // before a snapshot copy, but `set_schema` can run without a snapshot
+        // this cycle. Gate on the row count so an absent checkpoint stays
+        // untouched, as above.
         if create_snapshot && rows_changed > 0 {
             duckdb_conn.execute("CHECKPOINT", []).map_err(store_error)?;
         }
@@ -254,6 +258,10 @@ impl DuckDbDatasetCheckpointer {
 
         duckdb_conn
             .execute(REFRESH_SQL_MIGRATION_STMT, [])
+            .map_err(store_error)?;
+
+        duckdb_conn
+            .execute(SOURCE_FINGERPRINT_MIGRATION_STMT, [])
             .map_err(store_error)?;
 
         Ok(())
@@ -312,6 +320,31 @@ impl DuckDbDatasetCheckpointer {
         }
     }
 
+    /// Blocking `DuckDB` I/O. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
+    fn get_source_fingerprint_duckdb(
+        dataset_name: &str,
+        pool: &Arc<DuckDbConnectionPool>,
+    ) -> Result<Option<String>, CheckpointError> {
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(store_error)?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(store_error)?
+            .get_underlying_conn_mut();
+
+        let query = format!(
+            "SELECT source_fingerprint FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
+        );
+        let mut stmt = duckdb_conn.prepare(&query).map_err(store_error)?;
+        let mut rows = stmt.query([dataset_name]).map_err(store_error)?;
+
+        if let Some(row) = rows.next().map_err(store_error)? {
+            let source_fingerprint: Option<String> = row.get(0).map_err(store_error)?;
+            Ok(source_fingerprint)
+        } else {
+            Ok(None)
+        }
+    }
+
     fn delete_duckdb(
         dataset_name: &str,
         pool: &Arc<DuckDbConnectionPool>,
@@ -349,12 +382,14 @@ impl DatasetCheckpointer for DuckDbDatasetCheckpointer {
         &self,
         schema: &SchemaRef,
         refresh_sql: Option<&str>,
+        source_fingerprint: Option<&str>,
     ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
         let pool = Arc::clone(&self.pool);
         let dataset_name = self.dataset_name.clone();
         let create_snapshot = self.snapshot_behavior.create_enabled();
         let schema = Arc::clone(schema);
         let refresh_sql = refresh_sql.map(ToString::to_string);
+        let source_fingerprint = source_fingerprint.map(ToString::to_string);
         spawn_checkpoint_blocking(move || {
             Self::checkpoint_duckdb(
                 &dataset_name,
@@ -362,6 +397,7 @@ impl DatasetCheckpointer for DuckDbDatasetCheckpointer {
                 &pool,
                 &schema,
                 refresh_sql.as_deref(),
+                source_fingerprint.as_deref(),
             )
         })
         .await
@@ -409,6 +445,16 @@ impl DatasetCheckpointer for DuckDbDatasetCheckpointer {
         let pool = Arc::clone(&self.pool);
         let dataset_name = self.dataset_name.clone();
         spawn_checkpoint_blocking(move || Self::get_refresh_sql_duckdb(&dataset_name, &pool))
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_source_fingerprint(
+        &self,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
+        let pool = Arc::clone(&self.pool);
+        let dataset_name = self.dataset_name.clone();
+        spawn_checkpoint_blocking(move || Self::get_source_fingerprint_duckdb(&dataset_name, &pool))
             .await
             .map_err(Into::into)
     }
@@ -492,7 +538,7 @@ mod tests {
 
         // Save the schema
         checkpoint
-            .checkpoint(&schema_ref, None)
+            .checkpoint(&schema_ref, None, None)
             .await
             .expect("Failed to save schema");
 
@@ -530,7 +576,7 @@ mod tests {
         let schema_ref = std::sync::Arc::new(schema.clone());
 
         checkpoint
-            .checkpoint(&schema_ref, None)
+            .checkpoint(&schema_ref, None, None)
             .await
             .expect("Failed to save schema after migration");
 
@@ -562,7 +608,7 @@ mod tests {
 
         // Create the checkpoint with schema
         checkpoint
-            .checkpoint(&schema_ref, None)
+            .checkpoint(&schema_ref, None, None)
             .await
             .expect("Failed to create checkpoint");
 
@@ -588,7 +634,7 @@ mod tests {
 
         // Create the initial checkpoint
         checkpoint
-            .checkpoint(&schema_ref1, None)
+            .checkpoint(&schema_ref1, None, None)
             .await
             .expect("Failed to create initial checkpoint");
 
@@ -604,7 +650,7 @@ mod tests {
 
         // Update the checkpoint with new schema
         checkpoint
-            .checkpoint(&schema_ref2, None)
+            .checkpoint(&schema_ref2, None, None)
             .await
             .expect("Failed to update checkpoint");
 
@@ -662,7 +708,7 @@ mod tests {
 
         // Store a refresh_sql
         checkpoint
-            .checkpoint(&schema_ref, Some("SELECT * FROM source_table"))
+            .checkpoint(&schema_ref, Some("SELECT * FROM source_table"), None)
             .await
             .expect("Failed to store checkpoint with refresh_sql");
 
@@ -678,6 +724,7 @@ mod tests {
             .checkpoint(
                 &schema_ref,
                 Some("SELECT id FROM source_table WHERE id > 10"),
+                None,
             )
             .await
             .expect("Failed to update refresh_sql");
@@ -691,7 +738,7 @@ mod tests {
 
         // Clear refresh_sql by passing None — should overwrite (no COALESCE)
         checkpoint
-            .checkpoint(&schema_ref, None)
+            .checkpoint(&schema_ref, None, None)
             .await
             .expect("Failed to clear refresh_sql");
 
@@ -702,6 +749,43 @@ mod tests {
         assert!(
             cleared.is_none(),
             "refresh_sql should be None after passing None (no COALESCE)"
+        );
+    }
+
+    /// The producing identity is written with the local checkpoint so
+    /// pre-recreation can stamp from local provenance. A withheld override
+    /// must retract the previous stamp in the same upsert.
+    #[tokio::test]
+    async fn test_duckdb_source_fingerprint_roundtrip_and_retract() {
+        let (checkpoint, _) = create_in_memory_duckdb_checkpoint();
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let schema_ref = std::sync::Arc::new(schema);
+
+        checkpoint
+            .checkpoint(&schema_ref, None, Some("sha256:A"))
+            .await
+            .expect("persist configured fingerprint A");
+        assert_eq!(
+            checkpoint
+                .get_source_fingerprint()
+                .await
+                .expect("read fingerprint")
+                .as_deref(),
+            Some("sha256:A")
+        );
+
+        checkpoint
+            .checkpoint(&schema_ref, None, None)
+            .await
+            .expect("retract fingerprint after override B");
+        assert!(
+            checkpoint
+                .get_source_fingerprint()
+                .await
+                .expect("read retracted fingerprint")
+                .is_none(),
+            "override-B rows must not keep stamp A"
         );
     }
 
@@ -727,7 +811,7 @@ mod tests {
 
         // Create the checkpoint
         checkpoint
-            .checkpoint(&schema_ref, None)
+            .checkpoint(&schema_ref, None, None)
             .await
             .expect("Failed to create checkpoint");
 
@@ -750,7 +834,7 @@ mod tests {
 
         // Update the checkpoint
         checkpoint
-            .checkpoint(&schema_ref, None)
+            .checkpoint(&schema_ref, None, None)
             .await
             .expect("Failed to update checkpoint");
 
@@ -804,7 +888,8 @@ mod tests {
             .recv()
             .expect("the swap thread should take the write gate exclusively");
 
-        let checkpointing = tokio::spawn(async move { checkpoint.checkpoint(&schema, None).await });
+        let checkpointing =
+            tokio::spawn(async move { checkpoint.checkpoint(&schema, None, None).await });
 
         let probe_ran = Arc::new(AtomicBool::new(false));
         let probe = tokio::spawn({
@@ -855,7 +940,7 @@ mod tests {
         ]));
 
         checkpoint
-            .checkpoint(&original, Some("SELECT 1"))
+            .checkpoint(&original, Some("SELECT 1"), Some("sha256:A"))
             .await
             .expect("seed checkpoint");
 
@@ -905,6 +990,16 @@ mod tests {
             Some("SELECT 1".to_string()),
             "a schema-only write must preserve the stored refresh SQL"
         );
+
+        assert_eq!(
+            reader
+                .get_source_fingerprint()
+                .await
+                .expect("read source fingerprint")
+                .as_deref(),
+            Some("sha256:A"),
+            "a schema-only write must preserve the persisted producing identity"
+        );
     }
 
     /// A dataset with no checkpoint must not gain one — a row created here would carry a
@@ -950,9 +1045,9 @@ mod tests {
     }
 
     /// A schema repair on a snapshot-enabled store must reach the database file, not just
-    /// the WAL: the upload path copies that file alone and `DuckDBSnapshotEngine` inherits
-    /// the no-op `SnapshotEngine::checkpoint_live`, so a WAL-resident repair would ship a
-    /// snapshot carrying the schema the repair replaced. Raised by Copilot on #13894.
+    /// the WAL: the upload path copies that file alone, and `set_schema` can run without
+    /// a snapshot this cycle, so a WAL-resident repair would still be invisible to any
+    /// copy taken before `checkpoint_live`. Raised by Copilot on #13894.
     #[tokio::test]
     async fn set_schema_reaches_the_database_file_when_snapshots_are_enabled() {
         use duckdb::AccessMode;
@@ -988,7 +1083,7 @@ mod tests {
         ]));
 
         checkpoint
-            .checkpoint(&original, Some("SELECT 1"))
+            .checkpoint(&original, Some("SELECT 1"), None)
             .await
             .expect("seed checkpoint");
         checkpoint

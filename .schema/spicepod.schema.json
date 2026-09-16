@@ -3143,6 +3143,11 @@
         },
         "snapshots_creation_policy": {
           "$ref": "#/$defs/SnapshotsCreationPolicy"
+        },
+        "snapshots_consistency": {
+          "description": "For an accelerated view: whether a snapshot may be published or restored from a materialization that spans more than one read of the view's sources.\n\nOptions: `consistent_read` (default) / `accept_skew`.\n\nEach published view archive records the producing setting. The default `consistent_read` restores only archives stamped as a single read, so a later single-read replan of the same SQL cannot serve rows captured under `accept_skew`.\n\nOnly meaningful for views. A dataset that sets `accept_skew` is refused at load.",
+          "$ref": "#/$defs/SnapshotsConsistency",
+          "default": "consistent_read"
         }
       },
       "additionalProperties": false,
@@ -3611,6 +3616,21 @@
       "enum": [
         "always",
         "on_change"
+      ]
+    },
+    "SnapshotsConsistency": {
+      "description": "Whether an accelerated view may publish or restore a snapshot of a materialization that spans more than one read of its sources. Each published view archive records this setting, so a later single-read replan of the same SQL cannot restore an `accept_skew` archive.",
+      "oneOf": [
+        {
+          "description": "Snapshot only a materialization proven to come from a single read (default). A view whose query reads more than once is refused at load. Each published archive records this setting so a later `consistent_read` bootstrap can refuse an archive published under `accept_skew` even if the consumer's current plan happens to read once. A missing stamp is refused the same way.",
+          "type": "string",
+          "const": "consistent_read"
+        },
+        {
+          "description": "Publish or restore regardless, accepting that the stored rows may span several source positions. Choose this only when the view's consumers tolerate that. Archives published under this setting are stamped `accept_skew` and a default `consistent_read` consumer will not restore them.",
+          "type": "string",
+          "const": "accept_skew"
+        }
       ]
     },
     "ColumnEmbeddingConfig": {

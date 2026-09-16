@@ -36,7 +36,8 @@ use crate::{
     DurableWriteBackUndeclaredPrimaryKeySnafu, DurableWriteBackUnsupportedBySourceSnafu,
     DurableWriteBackWithRetentionSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
     HotReloadRefreshTimedOutSnafu, LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu,
-    Result, Runtime, UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
+    Result, Runtime, SnapshotsConsistencyNotForDatasetSnafu, SnapshotsIdentityUnresolvedParamSnafu,
+    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
     UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
     UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
     accelerated::AcceleratedTable,
@@ -56,6 +57,7 @@ use crate::{
     },
     embeddings::connector::EmbeddingConnector,
     federated::FederatedTable,
+    init::view::ValidatedView,
     search::full_text::connector::FullTextConnector,
     status,
     tracing_util::dataset_registered_trace,
@@ -130,9 +132,6 @@ impl Runtime {
         // the same `runtime.dataset_load_parallelism` budget.
         let semaphore = Arc::clone(&self.dataset_load_semaphore);
 
-        // Before loading datasets, we must initialize views accelerators (if any).
-        // This is required for acceleration federation for some engines (e.g. `DuckDB`).
-        //
         // `LogErrors(true)` here, and `LogErrors(false)` in `load_views` below, because
         // the two validate the same views and only one of them may report: this pre-pass
         // is the one that always runs. The snapshot validations between here and
@@ -140,37 +139,41 @@ impl Runtime {
         // loses every view's load error, its status update, and its
         // discarded-acceleration warning on exactly the startups that already went wrong.
         let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(true));
-        self.initialize_views_accelerators(&valid_views).await;
+        let startup_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
 
-        let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
-        let startup_datasets = valid_datasets;
-
-        // Validate Cayenne snapshot consistency before initializing accelerators.
-        // All Cayenne datasets sharing the same metadata directory must have the same
-        // snapshot configuration (either all enabled or all disabled).
-        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
-            startup_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
-            tracing::error!("{err}");
+        // Validate snapshot consistency before initializing ANY accelerator — views
+        // included, and ahead of `initialize_views_accelerators` below, because the
+        // check exists to refuse a configuration before it writes anything. Running it
+        // after the views had already opened their accelerations would let the very
+        // collision it names happen first.
+        //
+        // Views take part in this sweep and in `validate_snapshot_paths` below: a view
+        // carries its own `acceleration` block and joins the same accelerator instance,
+        // so a view sharing a `duckdb_file` or a Cayenne metadata directory with a
+        // dataset is exactly the collision these checks refuse. Walking datasets alone
+        // leaves it to surface as a corrupted restore instead. (Same shape as #12160,
+        // which fixed the DuckDB pool-sizing and `replace_file` walks.)
+        //
+        // Disabled accelerations do not join a store, so they are dropped before
+        // validation: a disabled Cayenne view with defaulted snapshots must not
+        // abort a snapshot-enabled dataset in the shared default metastore.
+        if !self
+            .validate_acceleration_snapshots(Self::enabled_acceleration_sources(
+                &startup_datasets,
+                &valid_views,
+            ))
+            .await
+        {
             return;
         }
+
+        // Views' accelerators initialize before the datasets load: acceleration
+        // federation needs them in place for some engines (e.g. `DuckDB`).
+        self.initialize_views_accelerators(&valid_views).await;
 
         let init_results = self
             .initialize_datasets_accelerators(&startup_datasets)
             .await;
-
-        // Validate that no datasets with snapshots share acceleration files
-        let initialized_sources: Vec<Arc<dyn AccelerationSource>> = startup_datasets
-            .iter()
-            .filter(|ds| init_results.get(&ds.name).is_some_and(Result::is_ok))
-            .map(|ds| ds.clone_arc())
-            .collect();
-        if let Err(err) =
-            validate_snapshot_paths(initialized_sources, &self.accelerator_engine_registry).await
-        {
-            tracing::error!("{err}");
-            return;
-        }
 
         // Create a map of dataset names to their futures
         let mut dataset_futures = HashMap::new();
@@ -1778,6 +1781,66 @@ impl Runtime {
         Ok(())
     }
 
+    /// Enabled accelerations of `datasets` and `views` — the set both snapshot
+    /// checks walk. Disabled accelerations do not join a store, so they are
+    /// dropped: a disabled Cayenne view with defaulted snapshots must not abort
+    /// a snapshot-enabled dataset in the shared default metastore.
+    fn enabled_acceleration_sources(
+        datasets: &[Arc<Dataset>],
+        views: &[ValidatedView],
+    ) -> Vec<Arc<dyn AccelerationSource>> {
+        datasets
+            .iter()
+            .map(|ds| ds.clone_arc())
+            .chain(views.iter().map(|vv| vv.view.clone_arc()))
+            .filter(|source| source.acceleration().is_some_and(|a| a.enabled))
+            .collect()
+    }
+
+    /// Combined dataset+view snapshot consistency and shared-file checks.
+    ///
+    /// Must run before any accelerator `init`: `validate_snapshot_paths` refuses
+    /// two snapshot-enabled sources that share one acceleration file, and both
+    /// `init` paths can bootstrap or recreate that file. Checking afterwards
+    /// would name a collision that had already happened.
+    /// `acceleration_file_path` resolves from configuration and the engine
+    /// registry, so it does not need an initialized accelerator to answer.
+    ///
+    /// Returns `false` after logging when the configuration is refused.
+    async fn validate_acceleration_snapshots(
+        &self,
+        sources: Vec<Arc<dyn AccelerationSource>>,
+    ) -> bool {
+        if let Err(err) = validate_snapshot_consistency(&sources) {
+            tracing::error!("{err}");
+            return false;
+        }
+
+        if let Err(err) = validate_snapshot_paths(sources, &self.accelerator_engine_registry).await
+        {
+            tracing::error!("{err}");
+            return false;
+        }
+
+        true
+    }
+
+    /// Same combined dataset+view snapshot checks `load_datasets` runs at
+    /// startup, built from `new_app` so a hot reload cannot walk datasets
+    /// alone or skip `validate_snapshot_paths`.
+    ///
+    /// The `get_valid_*` walks here use `LogErrors(false)` so a caller that
+    /// already reported those walks does not log a failed view twice.
+    pub(crate) async fn validate_app_acceleration_snapshots(
+        self: &Arc<Self>,
+        app: &Arc<App>,
+    ) -> bool {
+        let datasets = Arc::clone(self).get_valid_datasets(app, LogErrors(false));
+        let views = Arc::clone(self).get_valid_views(app, LogErrors(false));
+        self.validate_acceleration_snapshots(Self::enabled_acceleration_sources(&datasets, &views))
+            .await
+    }
+
     pub(crate) async fn apply_dataset_diff(
         self: Arc<Self>,
         current_app: &Arc<App>,
@@ -1785,11 +1848,11 @@ impl Runtime {
     ) {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
 
-        // Validate Cayenne snapshot consistency before initializing accelerators.
-        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
-            valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
-            tracing::error!("{err}");
+        // Same combined dataset+view snapshot checks as `load_datasets`, before
+        // this diff initializes any accelerator. Walking datasets alone would
+        // miss a newly added snapshot-enabled view that shares a `duckdb_file`
+        // or a Cayenne metadata directory with a dataset.
+        if !self.validate_app_acceleration_snapshots(new_app).await {
             return;
         }
 
@@ -2156,7 +2219,8 @@ fn is_permanent_dataset_failure(err: &Error) -> bool {
         | Error::DurableWriteBackCompositePrimaryKey { .. }
         | Error::DurableWriteBackUndeclaredPrimaryKey { .. }
         | Error::DurableWriteBackPrerequisitesUnmet { .. }
-        | Error::DurableWriteBackUnsupportedBySource { .. } => true,
+        | Error::DurableWriteBackUnsupportedBySource { .. }
+        | Error::SnapshotsIdentityUnresolvedParam { .. } => true,
         // Connector creation boxes its error, so recover the type the way the
         // catalog load path does before asking it to classify itself.
         Error::UnableToInitializeDataConnector { source } => {
@@ -2291,6 +2355,36 @@ fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
     let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) else {
         return Ok(());
     };
+
+    // `snapshots_consistency` is a view-only consistency gate (publish and
+    // bootstrap). A dataset always materializes one source read, so a
+    // non-default value would load and then do nothing — refuse it here rather
+    // than accept a no-op that looks valid.
+    if acceleration.snapshots_consistency != spicepod::acceleration::SnapshotsConsistency::default()
+    {
+        return Err(SnapshotsConsistencyNotForDatasetSnafu {
+            dataset_name: ds.name.to_string(),
+            connector: ds.source().to_string(),
+        }
+        .build());
+    }
+
+    // Snapshot identity hashes Spicepod `params` as written, and this path cannot
+    // see resolved secret/env values. A row-shaping parameter such as
+    // `json_pointer: ${secrets:pointer}` can move without changing the stamp, so
+    // accepting `snapshots: enabled` would restore the old rows. Refuse rather
+    // than stamp a definition this context cannot see.
+    if !acceleration.snapshot_behavior.is_disabled()
+        && let Some(unresolved) = crate::view::first_unresolved_snapshot_identity_param(&ds.params)
+    {
+        return Err(SnapshotsIdentityUnresolvedParamSnafu {
+            dataset_name: ds.name.to_string(),
+            param: unresolved.param,
+            store: unresolved.store,
+            key: unresolved.key,
+        }
+        .build());
+    }
 
     // `write_mode: write_back` selects the write-back path on its own, but only a
     // configuration that resolves to DURABLE write-back records markers and runs a
@@ -2707,6 +2801,167 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn validate_dataset_refuses_accept_skew_snapshots_consistency() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+
+        let accept_skew = spicepod::acceleration::Acceleration {
+            snapshots_consistency: spicepod::acceleration::SnapshotsConsistency::AcceptSkew,
+            ..spicepod::acceleration::Acceleration::default()
+        };
+        let err = validate_dataset(&dataset_with_acceleration(&runtime, accept_skew))
+            .expect_err("accept_skew on a dataset is a no-op and must be refused");
+        assert!(
+            matches!(err, Error::SnapshotsConsistencyNotForDataset { .. }),
+            "expected a snapshots_consistency refusal, got: {err}"
+        );
+        for expected in [
+            "orders",
+            "postgres",
+            "snapshots_consistency: accept_skew",
+            "only valid for accelerated views",
+            "https://spiceai.org/docs/components/data-accelerators/snapshots",
+        ] {
+            assert!(
+                err.to_string().contains(expected),
+                "the refusal must contain {expected:?}: {err}"
+            );
+        }
+
+        let consistent_read = spicepod::acceleration::Acceleration {
+            snapshots_consistency: spicepod::acceleration::SnapshotsConsistency::ConsistentRead,
+            ..spicepod::acceleration::Acceleration::default()
+        };
+        assert!(
+            validate_dataset(&dataset_with_acceleration(&runtime, consistent_read)).is_ok(),
+            "the default snapshots_consistency must still load on a dataset"
+        );
+    }
+
+    fn snapshot_dataset_with_params(
+        runtime: &Arc<crate::Runtime>,
+        params: HashMap<String, String>,
+        snapshots_enabled: bool,
+    ) -> Arc<Dataset> {
+        let mut spec = spicepod::component::dataset::Dataset::new("s3://bucket/data", "docs");
+        spec.params = Some(spicepod::param::Params::from_string_map(params));
+        spec.acceleration = Some(spicepod::acceleration::Acceleration {
+            enabled: true,
+            snapshots: if snapshots_enabled {
+                spicepod::acceleration::SnapshotBehavior::Enabled
+            } else {
+                spicepod::acceleration::SnapshotBehavior::Disabled
+            },
+            ..spicepod::acceleration::Acceleration::default()
+        });
+        let app = app::AppBuilder::new("validate_dataset")
+            .with_dataset(spec.clone())
+            .build();
+        let mut dataset = DatasetBuilder::try_from(spec)
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::clone(runtime))
+            .build()
+            .expect("valid runtime dataset");
+        if snapshots_enabled && let Some(acceleration) = dataset.acceleration.as_mut() {
+            enable_runtime_snapshots(acceleration);
+        }
+        Arc::new(dataset)
+    }
+
+    #[tokio::test]
+    async fn validate_dataset_allows_literal_params_with_snapshots() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let dataset = snapshot_dataset_with_params(
+            &runtime,
+            HashMap::from([("json_pointer".to_string(), "/us".to_string())]),
+            true,
+        );
+        assert!(
+            validate_dataset(&dataset).is_ok(),
+            "a literal row-shaping param is visible to the stamp and must accept snapshots"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_dataset_refuses_secret_ref_in_a_row_shaping_param() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let dataset = snapshot_dataset_with_params(
+            &runtime,
+            HashMap::from([("json_pointer".to_string(), "${secrets:pointer}".to_string())]),
+            true,
+        );
+        let err = validate_dataset(&dataset)
+            .expect_err("a secret-referenced row-shaping param must refuse snapshots");
+        assert!(
+            matches!(err, Error::SnapshotsIdentityUnresolvedParam { .. }),
+            "expected an unresolved-param refusal, got: {err}"
+        );
+        for expected in [
+            "dataset",
+            "'docs'",
+            "`params.json_pointer`",
+            "${secrets:pointer}",
+            "`snapshots: disabled`",
+            "https://spiceai.org/docs/components/data-accelerators/snapshots",
+        ] {
+            assert!(
+                err.to_string().contains(expected),
+                "the refusal must contain {expected:?}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_dataset_refuses_env_ref_in_a_row_shaping_param() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let dataset = snapshot_dataset_with_params(
+            &runtime,
+            HashMap::from([("json_pointer".to_string(), "${env:POINTER}".to_string())]),
+            true,
+        );
+        let err = validate_dataset(&dataset)
+            .expect_err("an env-referenced row-shaping param must refuse snapshots");
+        assert!(
+            matches!(err, Error::SnapshotsIdentityUnresolvedParam { .. }),
+            "expected an unresolved-param refusal, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("${env:POINTER}"),
+            "the refusal must name the env reference: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_dataset_allows_secret_refs_when_snapshots_are_disabled() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let dataset = snapshot_dataset_with_params(
+            &runtime,
+            HashMap::from([("json_pointer".to_string(), "${secrets:pointer}".to_string())]),
+            false,
+        );
+        assert!(
+            validate_dataset(&dataset).is_ok(),
+            "secret-referenced params are ordinary when snapshots are off"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_dataset_ignores_accept_skew_on_a_disabled_acceleration() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+
+        let acceleration = spicepod::acceleration::Acceleration {
+            enabled: false,
+            snapshots_consistency: spicepod::acceleration::SnapshotsConsistency::AcceptSkew,
+            ..spicepod::acceleration::Acceleration::default()
+        };
+
+        assert!(
+            validate_dataset(&dataset_with_acceleration(&runtime, acceleration)).is_ok(),
+            "snapshots_consistency on a disabled acceleration is inert, not refused"
+        );
+    }
+
     /// A disabled acceleration accelerates nothing, so its write-back settings
     /// acknowledge nothing for delivery and are not judged — a configuration
     /// write-back could not deliver is unremarkable there.
@@ -2754,6 +3009,55 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn the_snapshot_identity_unresolved_param_rejection_names_the_param_and_a_way_out() {
+        let message = SnapshotsIdentityUnresolvedParamSnafu {
+            dataset_name: "docs".to_string(),
+            param: "json_pointer".to_string(),
+            store: "secrets".to_string(),
+            key: "pointer".to_string(),
+        }
+        .build()
+        .to_string();
+        for expected in [
+            "dataset",
+            "'docs'",
+            "`params.json_pointer`",
+            "${secrets:pointer}",
+            "`snapshots: disabled`",
+            "https://spiceai.org/docs/components/data-accelerators/snapshots",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the rejection must contain {expected:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_snapshots_consistency_rejection_names_the_setting_and_a_way_out() {
+        let message = SnapshotsConsistencyNotForDatasetSnafu {
+            dataset_name: "orders".to_string(),
+            connector: "postgres".to_string(),
+        }
+        .build()
+        .to_string();
+        for expected in [
+            "'orders'",
+            "postgres",
+            "`snapshots_consistency: accept_skew`",
+            "only valid for accelerated views",
+            "Remove `snapshots_consistency`",
+            "https://spiceai.org/docs/components/data-accelerators/snapshots",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the rejection must contain {expected:?}: {message}"
+            );
+        }
+    }
+
     use crate::component::dataset::DatasetSpec;
     use crate::dataconnector::{
         ConnectorParams, DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
@@ -3565,6 +3869,21 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             "an out-of-range Spicepod value needs an operator to change it"
         );
         assert!(
+            !DfError::SnapshotsIdentityUnresolvedParam {
+                component: "dataset",
+                name: "docs".to_string(),
+                message: crate::view::snapshot_identity_unresolved_param_message(
+                    "dataset",
+                    "docs",
+                    "json_pointer",
+                    "secrets",
+                    "pointer",
+                ),
+            }
+            .is_retriable(),
+            "a secret-referenced identity param needs an operator to change it"
+        );
+        assert!(
             DfError::TableAlreadyExists {}.is_retriable(),
             "an unclassified registration failure must keep retrying"
         );
@@ -3610,6 +3929,11 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             .map_or(0.0, |metric| metric.get_counter().value())
     }
 
+    /// Shared file path every `RecordingAccelerator` source resolves to, so a
+    /// snapshot-enabled dataset and view that both use this engine collide in
+    /// `validate_snapshot_paths`.
+    const RECORDING_ACCELERATOR_FILE_PATH: &str = "/tmp/spice_recording_accelerator.db";
+
     /// A `DataAccelerator` that records whether the runtime ever asked it to
     /// initialize. `init` is where a `mode: file_create` accelerator is dropped,
     /// so "was `init` called" is the same question as "was the accelerator, and
@@ -3654,6 +3978,13 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
 
         fn parameters(&self) -> &'static [runtime_parameters::ParameterSpec] {
             &[]
+        }
+
+        fn file_path(
+            &self,
+            _source: &dyn AccelerationSource,
+        ) -> std::result::Result<String, data_accelerator_api::FilePathError> {
+            Ok(RECORDING_ACCELERATOR_FILE_PATH.to_string())
         }
 
         async fn init(
@@ -4003,6 +4334,255 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         assert!(
             (counted - 1.0).abs() < f64::EPSILON,
             "teardown counted one load error before this change; counted {counted}"
+        );
+    }
+
+    fn file_cayenne_acceleration(
+        enabled: bool,
+        snapshots: spicepod::acceleration::SnapshotBehavior,
+    ) -> spicepod::acceleration::Acceleration {
+        spicepod::acceleration::Acceleration {
+            enabled,
+            engine: Some("cayenne".to_string()),
+            mode: spicepod::acceleration::Mode::File,
+            snapshots,
+            ..Default::default()
+        }
+    }
+
+    fn spicepod_dataset_with_acceleration(
+        name: &str,
+        acceleration: spicepod::acceleration::Acceleration,
+    ) -> spicepod::component::dataset::Dataset {
+        let mut spec = spicepod::component::dataset::Dataset::new("postgres:orders", name);
+        spec.acceleration = Some(acceleration);
+        spec
+    }
+
+    fn spicepod_view_with_acceleration(
+        name: &str,
+        sql: &str,
+        acceleration: spicepod::acceleration::Acceleration,
+    ) -> spicepod::component::view::View {
+        spicepod::component::view::View::new(name.to_string())
+            .with_sql(sql)
+            .with_acceleration(acceleration)
+    }
+
+    fn app_with_pod_snapshots(
+        name: &str,
+        datasets: impl IntoIterator<Item = spicepod::component::dataset::Dataset>,
+        views: impl IntoIterator<Item = spicepod::component::view::View>,
+    ) -> Arc<app::App> {
+        let mut builder =
+            app::AppBuilder::new(name).with_snapshots(spicepod::component::snapshot::Snapshots {
+                enabled: true,
+                location: Some("file:///tmp/spice_reload_snapshot_validation".to_string()),
+                ..Default::default()
+            });
+        for dataset in datasets {
+            builder = builder.with_dataset(dataset);
+        }
+        for view in views {
+            builder = builder.with_view(view);
+        }
+        Arc::new(builder.build())
+    }
+
+    fn enable_runtime_snapshots(acceleration: &mut Acceleration) {
+        acceleration.snapshot_behavior = runtime_acceleration::snapshot::SnapshotBehavior::Enabled(
+            Arc::new(spicepod::component::snapshot::Snapshots::default()),
+            std::sync::Weak::new(),
+            tokio::runtime::Handle::current(),
+            spicepod::acceleration::SnapshotsCompaction::Disabled,
+        );
+    }
+
+    /// The reload source list is the same combined dataset+view set startup
+    /// walks: an enabled view must be present, and a disabled acceleration
+    /// must not be.
+    #[tokio::test]
+    async fn reload_snapshot_sources_include_views_and_drop_disabled() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let app = app_with_pod_snapshots(
+            "reload_snapshot_sources",
+            [spicepod_dataset_with_acceleration(
+                "orders",
+                file_cayenne_acceleration(true, spicepod::acceleration::SnapshotBehavior::Enabled),
+            )],
+            [
+                spicepod_view_with_acceleration(
+                    "orders_view",
+                    "SELECT 1",
+                    file_cayenne_acceleration(
+                        true,
+                        spicepod::acceleration::SnapshotBehavior::Enabled,
+                    ),
+                ),
+                spicepod_view_with_acceleration(
+                    "disabled_view",
+                    "SELECT 2",
+                    file_cayenne_acceleration(
+                        false,
+                        spicepod::acceleration::SnapshotBehavior::Enabled,
+                    ),
+                ),
+            ],
+        );
+
+        let datasets = Arc::clone(&runtime).get_valid_datasets(&app, LogErrors(false));
+        let views = Arc::clone(&runtime).get_valid_views(&app, LogErrors(false));
+        let sources = Runtime::enabled_acceleration_sources(&datasets, &views);
+        let names: Vec<String> = sources
+            .iter()
+            .map(|source| source.name().to_string())
+            .collect();
+
+        assert!(
+            names.iter().any(|name| name == "orders"),
+            "the dataset must join the snapshot sweep: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "orders_view"),
+            "an enabled view must join the snapshot sweep with the dataset: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "disabled_view"),
+            "a disabled acceleration must not join the snapshot sweep: {names:?}"
+        );
+        assert_eq!(
+            names.len(),
+            2,
+            "only the enabled dataset and view belong in the sweep: {names:?}"
+        );
+    }
+
+    /// The shared validation refuses a snapshot-enabled view that shares an
+    /// acceleration file with a dataset — the collision `validate_snapshot_paths`
+    /// exists to catch. Snapshot behavior is set on the built sources so this
+    /// does not depend on the `snapshots` feature resolving `SnapshotBehavior::from`.
+    #[tokio::test]
+    async fn combined_snapshot_validation_refuses_a_view_sharing_a_dataset_file() {
+        let (runtime, _accelerator) = runtime_with_recording_accelerator().await;
+        let app = app_with_pod_snapshots(
+            "reload_snapshot_collision",
+            [spicepod_dataset_with_acceleration(
+                "orders",
+                file_cayenne_acceleration(true, spicepod::acceleration::SnapshotBehavior::Enabled),
+            )],
+            [spicepod_view_with_acceleration(
+                "orders_view",
+                "SELECT 1",
+                file_cayenne_acceleration(true, spicepod::acceleration::SnapshotBehavior::Enabled),
+            )],
+        );
+
+        let datasets = Arc::clone(&runtime).get_valid_datasets(&app, LogErrors(false));
+        let views = Arc::clone(&runtime).get_valid_views(&app, LogErrors(false));
+        assert_eq!(datasets.len(), 1, "the colliding dataset must parse");
+        assert_eq!(views.len(), 1, "the colliding view must parse");
+
+        let mut dataset = (*datasets[0]).clone();
+        if let Some(acceleration) = dataset.acceleration.as_mut() {
+            enable_runtime_snapshots(acceleration);
+        }
+        let mut view = (*views[0].view).clone();
+        if let Some(acceleration) = view.acceleration.as_mut() {
+            enable_runtime_snapshots(acceleration);
+        }
+
+        let sources = Runtime::enabled_acceleration_sources(
+            &[Arc::new(dataset)],
+            &[ValidatedView {
+                view: Arc::new(view),
+                dependencies: Vec::new(),
+            }],
+        );
+        assert!(
+            !runtime.validate_acceleration_snapshots(sources).await,
+            "a snapshot-enabled view sharing the dataset file must be refused"
+        );
+    }
+
+    /// Hot reload must run that same combined check before either diff
+    /// initializes an accelerator. A newly added snapshot-enabled view that
+    /// shares the dataset's file is the case startup already refuses.
+    #[cfg(feature = "snapshots")]
+    #[tokio::test]
+    async fn apply_diffs_refuse_a_snapshot_view_that_shares_the_dataset_file() {
+        let (runtime, accelerator) = runtime_with_recording_accelerator().await;
+        let current = Arc::new(app::AppBuilder::new("reload_snapshot_collision").build());
+        let colliding = app_with_pod_snapshots(
+            "reload_snapshot_collision",
+            [spicepod_dataset_with_acceleration(
+                "orders",
+                file_cayenne_acceleration(true, spicepod::acceleration::SnapshotBehavior::Enabled),
+            )],
+            [spicepod_view_with_acceleration(
+                "orders_view",
+                "SELECT 1",
+                file_cayenne_acceleration(true, spicepod::acceleration::SnapshotBehavior::Enabled),
+            )],
+        );
+
+        assert!(
+            !runtime
+                .validate_app_acceleration_snapshots(&colliding)
+                .await,
+            "the reload helper must refuse the colliding new-app set"
+        );
+
+        Arc::clone(&runtime)
+            .apply_dataset_diff(&current, &colliding)
+            .await;
+        assert!(
+            !accelerator.was_initialized(),
+            "apply_dataset_diff must abort before initializing either accelerator"
+        );
+
+        Arc::clone(&runtime)
+            .apply_view_diff(&current, &colliding)
+            .await;
+        let view_name = TableReference::parse_str("orders_view");
+        assert!(
+            !runtime.status.get_view_statuses().contains_key(&view_name),
+            "apply_view_diff must abort before loading the colliding view"
+        );
+        assert!(
+            !accelerator.was_initialized(),
+            "apply_view_diff must not initialize the colliding view's accelerator"
+        );
+    }
+
+    /// The control for `apply_diffs_refuse_a_snapshot_view_that_shares_the_dataset_file`:
+    /// the same dataset without a colliding view still reaches `init`.
+    #[cfg(feature = "snapshots")]
+    #[tokio::test]
+    async fn apply_dataset_diff_still_initializes_a_dataset_without_a_colliding_view() {
+        let (runtime, accelerator) = runtime_with_recording_accelerator().await;
+        let current = Arc::new(app::AppBuilder::new("reload_snapshot_collision").build());
+        let dataset_only = app_with_pod_snapshots(
+            "reload_snapshot_collision",
+            [spicepod_dataset_with_acceleration(
+                "orders",
+                file_cayenne_acceleration(true, spicepod::acceleration::SnapshotBehavior::Enabled),
+            )],
+            Vec::new(),
+        );
+
+        assert!(
+            runtime
+                .validate_app_acceleration_snapshots(&dataset_only)
+                .await,
+            "a single snapshot-enabled dataset is not a collision"
+        );
+
+        Arc::clone(&runtime)
+            .apply_dataset_diff(&current, &dataset_only)
+            .await;
+        assert!(
+            accelerator.was_initialized(),
+            "so `init` is reachable, and the refusal above is what stopped it"
         );
     }
 }

@@ -80,8 +80,8 @@ impl SnapshotEngineError {
 pub trait SnapshotEngine: Send + Sync {
     /// Hook invoked on the **live** accelerator file *before* it is copied to a
     /// temporary snapshot location. Engines that buffer writes outside the
-    /// primary file (e.g. SQLite/Turso WAL) should checkpoint here so that the
-    /// subsequent `fs::copy` produces a self-contained file.
+    /// primary file (e.g. `SQLite`/`Turso`/`DuckDB` WAL) should checkpoint here so
+    /// that the subsequent `fs::copy` produces a self-contained file.
     ///
     /// Default implementation is a no-op.
     ///
@@ -131,6 +131,34 @@ pub trait SnapshotEngine: Send + Sync {
     ) -> Result<DirectorySnapshotPlan, SnapshotEngineError> {
         let _ = (dirs, dataset_name);
         Ok(DirectorySnapshotPlan::default())
+    }
+
+    /// Hook invoked by `SnapshotManager` *after* the directory-layout archive has been
+    /// written but *before* it is uploaded, so an engine can check that the archive
+    /// matches the metadata it emitted from `prepare_directory_snapshot`.
+    ///
+    /// Load-bearing because the two are captured at different instants: the metadata is
+    /// read first, then the directories are walked, and nothing pins the files the
+    /// metadata names across that window. An engine that can tell whether a referenced
+    /// file went missing should say so here — returning an error discards the archive and
+    /// leaves the previously published snapshot as the store's current one, which is
+    /// strictly better than publishing an archive that cannot be restored.
+    ///
+    /// `members` is the set of paths the archive actually contains, so an engine checks
+    /// the artifact it is about to publish rather than the filesystem it was built from.
+    /// Those answer different questions, and disagree whenever a file was skipped (the
+    /// walker skips symlinks), lies outside the archived directories, or was recreated
+    /// after the walk passed it.
+    ///
+    /// Default implementation accepts everything.
+    async fn verify_directory_snapshot(
+        &self,
+        dirs: &[(PathBuf, String)],
+        members: &HashSet<String>,
+        dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError> {
+        let _ = (dirs, members, dataset_name);
+        Ok(())
     }
 
     /// Hook invoked by `SnapshotManager` *after* extracting a directory-layout
