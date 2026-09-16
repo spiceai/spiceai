@@ -3,7 +3,7 @@ tests:
     spicepod_path: federated/glue[csv].yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
-    # TPCH Q6 fails with incorrect result, going back to v1.5.0
-    # Expected: 246282156.4566
-    # Actual: 75207768.18549998
+    # TPC-H Q6 returns 75207768.19 here instead of 123141078.2283: the Glue table
+    # types `l_discount` as double, and Spice types the literal `0.06 + 0.01` as
+    # Float64 0.06999999999999999, so Q6's BETWEEN drops every row at 0.07.
     validate_results: false
