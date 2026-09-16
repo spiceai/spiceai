@@ -58,6 +58,7 @@ limitations under the License.
 //! match length above zero, because the two engines count an empty match
 //! differently.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use regex_syntax::ast::{
@@ -208,11 +209,12 @@ impl EngineNeutralSyntax<'_> {
         }
     }
 
-    /// Refuses a positive class of exactly two case variants of one character
-    /// (`[Kk]`, `[sS]`), the shape RE2 rewrites into a case-folded literal.
-    /// Variants are judged with the kernel's own simple case folding, which is
-    /// a superset of the ASCII pairs RE2 rewrites — a class it refuses that
-    /// RE2 would keep only costs a pushdown.
+    /// Refuses a positive class whose distinct members are exactly two case
+    /// variants of one character (`[Kk]`, `[sS]`, `[KkK]`, `[K-Kk]`), the
+    /// shape RE2 rewrites into a case-folded literal once it has deduplicated
+    /// the class. Variants are judged with the kernel's own simple case
+    /// folding, which is a superset of the ASCII pairs RE2 rewrites — a class
+    /// it refuses that RE2 would keep only costs a pushdown.
     fn class(class: &ClassBracketed) -> Result<(), EngineDependentSyntax> {
         if class.negated {
             return Ok(());
@@ -220,17 +222,26 @@ impl EngineNeutralSyntax<'_> {
         let ClassSet::Item(ClassSetItem::Union(union)) = &class.kind else {
             return Ok(());
         };
-        let mut members = union.items.iter().map(|item| match item {
-            ClassSetItem::Literal(literal) => Some(literal.c),
-            ClassSetItem::Range(range) if range.start.c == range.end.c => Some(range.start.c),
-            _ => None,
-        });
-        let (Some(Some(first)), Some(Some(second)), None) =
-            (members.next(), members.next(), members.next())
-        else {
-            return Ok(());
-        };
-        if first != second && Self::case_variants(first, second) {
+        let mut members = BTreeSet::new();
+        for item in &union.items {
+            let (start, end) = match item {
+                ClassSetItem::Literal(literal) => (literal.c, literal.c),
+                ClassSetItem::Range(range) => (range.start.c, range.end.c),
+                // Anything else is refused on its own account, or is not a
+                // set of code points RE2 would collapse into a pair.
+                _ => return Ok(()),
+            };
+            // A range of three or more code points already rules out a pair.
+            if u32::from(end).saturating_sub(u32::from(start)) >= 2 {
+                return Ok(());
+            }
+            members.insert(start);
+            members.insert(end);
+        }
+        let mut members = members.into_iter();
+        if let (Some(first), Some(second), None) = (members.next(), members.next(), members.next())
+            && Self::case_variants(first, second)
+        {
             return Err(EngineDependentSyntax::CaseFoldPair);
         }
         Ok(())
