@@ -64,6 +64,19 @@ fn next_keyed_reference_fetch_rows(current: usize) -> Option<usize> {
     }
 }
 
+/// Whether the keyed-reference loop should issue a larger window. False once
+/// the cutoff group is closed (further batches would only add rows the matcher
+/// does not read), or once this window already asked for the cap.
+fn keyed_reference_should_request_another_window(
+    cutoff_closed: bool,
+    requested_rows: usize,
+    current_window: usize,
+) -> bool {
+    !cutoff_closed
+        && requested_rows < MAX_KEYED_REFERENCE_ROWS
+        && next_keyed_reference_fetch_rows(current_window).is_some()
+}
+
 /// Rows the keyed query asks for: `offset` plus the window past it, never more
 /// than [`MAX_KEYED_REFERENCE_ROWS`]. The matcher indexes from the top of the
 /// result, so the rows an `OFFSET` skips have to be in the stream; a query that
@@ -741,13 +754,12 @@ impl SpiceTestQueryWorker {
                 // differ from the reference's fail only if one of them is not in the
                 // full result the LIMIT was taken from. An arity `SchemaMismatch`
                 // stays: a cell-wise retry cannot fix a width mismatch.
-                if live_oracle_row_fallback_applies(&validation_result)
-                    && let Some(unordered_limit) = validation::unordered_limit(&reference_query.sql)
-                    && unordered_limit.may_keep_different_rows(
-                        batches.iter().map(RecordBatch::num_rows).sum(),
-                        ref_batches.iter().map(RecordBatch::num_rows).sum(),
-                    )
-                {
+                if let Some(unordered_limit) = live_oracle_unordered_limit_fallback_applies(
+                    &validation_result,
+                    &reference_query.sql,
+                    batches.iter().map(RecordBatch::num_rows).sum(),
+                    ref_batches.iter().map(RecordBatch::num_rows).sum(),
+                ) {
                     println!(
                         "Worker {} - Query '{}' - LIMIT without ORDER BY kept different rows than the reference query; checking each returned row against the reference query's full result",
                         self.id, query.name
@@ -778,12 +790,12 @@ impl SpiceTestQueryWorker {
                 // judged against the reference query's leading rows read back with
                 // their sort keys. An arity `SchemaMismatch` stays, same as the
                 // unordered-LIMIT fallback.
-                if live_oracle_row_fallback_applies(&validation_result)
-                    && let Some(schema) = batches.first().map(RecordBatch::schema)
-                    && let Some(sort_limit) =
-                        validation::unprojected_sort_limit(&reference_query.sql, &schema).or_else(
-                            || validation::projected_sort_limit(&reference_query.sql, &schema),
-                        )
+                if let Some(schema) = batches.first().map(RecordBatch::schema)
+                    && let Some(sort_limit) = live_oracle_keyed_sort_fallback_applies(
+                        &validation_result,
+                        &reference_query.sql,
+                        schema.as_ref(),
+                    )
                 {
                     match sort_limit.key {
                         validation::SortKeyCells::Appended(_) => println!(
@@ -844,21 +856,22 @@ impl SpiceTestQueryWorker {
                             validation_result = result;
                             break;
                         }
-                        if requested_rows >= MAX_KEYED_REFERENCE_ROWS {
-                            println!(
-                                "Worker {} - Query '{}' - more than {MAX_KEYED_REFERENCE_ROWS} reference rows tie at the LIMIT; keeping the row-by-row comparison's result",
-                                self.id, query.name
-                            );
+                        if keyed_reference_should_request_another_window(
+                            cutoff_closed,
+                            requested_rows,
+                            fetch_rows,
+                        ) && let Some(next) = next_keyed_reference_fetch_rows(fetch_rows)
+                        {
+                            fetch_rows = next;
+                        } else {
+                            if !cutoff_closed {
+                                println!(
+                                    "Worker {} - Query '{}' - more than {MAX_KEYED_REFERENCE_ROWS} reference rows tie at the LIMIT; keeping the row-by-row comparison's result",
+                                    self.id, query.name
+                                );
+                            }
                             break;
                         }
-                        let Some(next) = next_keyed_reference_fetch_rows(fetch_rows) else {
-                            println!(
-                                "Worker {} - Query '{}' - more than {MAX_KEYED_REFERENCE_ROWS} reference rows tie at the LIMIT; keeping the row-by-row comparison's result",
-                                self.id, query.name
-                            );
-                            break;
-                        };
-                        fetch_rows = next;
                     }
                 }
 
@@ -1103,6 +1116,97 @@ fn live_oracle_row_fallback_applies(result: &QueryValidationResult) -> bool {
     )
 }
 
+fn live_oracle_unordered_limit_fallback_applies(
+    result: &QueryValidationResult,
+    sql: &str,
+    actual_rows: usize,
+    limited_reference_rows: usize,
+) -> Option<validation::UnorderedLimit> {
+    if !live_oracle_row_fallback_applies(result) {
+        return None;
+    }
+    let unordered_limit = validation::unordered_limit(sql)?;
+    unordered_limit
+        .may_keep_different_rows(actual_rows, limited_reference_rows)
+        .then_some(unordered_limit)
+}
+
+fn live_oracle_keyed_sort_fallback_applies(
+    result: &QueryValidationResult,
+    sql: &str,
+    schema: &arrow::datatypes::Schema,
+) -> Option<validation::KeyedSortLimit> {
+    if !live_oracle_row_fallback_applies(result) {
+        return None;
+    }
+    validation::unprojected_sort_limit(sql, schema)
+        .or_else(|| validation::projected_sort_limit(sql, schema))
+}
+
+/// The same fallbacks [`SpiceTestQueryWorker::execute_query`] applies after the
+/// live oracle's limited answer fails the row-by-row compare. `unlimited_reference`
+/// is the un-`LIMIT`ed stream of an unordered `LIMIT`; `keyed_reference` is the
+/// raised-`LIMIT` stream of an `ORDER BY … LIMIT`. A missing stream leaves that
+/// fallback's verdict unchanged.
+fn apply_live_oracle_row_fallbacks(
+    query: &Query,
+    actual: &[RecordBatch],
+    limited_reference: &[RecordBatch],
+    unlimited_reference: Option<&[RecordBatch]>,
+    keyed_reference: Option<&[RecordBatch]>,
+) -> Result<QueryValidationResult> {
+    let mut validation_result =
+        validation::validate_against_reference_batches(query, actual, limited_reference)?;
+
+    if let Some(unordered_limit) = live_oracle_unordered_limit_fallback_applies(
+        &validation_result,
+        &query.sql,
+        actual.iter().map(RecordBatch::num_rows).sum(),
+        limited_reference.iter().map(RecordBatch::num_rows).sum(),
+    ) && let Some(unlimited_reference) = unlimited_reference
+    {
+        let mut subset_check =
+            validation::UnorderedLimitSubsetCheck::new(&unordered_limit, actual)?;
+        if !subset_check.observation_complete() {
+            for batch in unlimited_reference {
+                subset_check.observe(batch)?;
+                if subset_check.observation_complete() {
+                    break;
+                }
+            }
+        }
+        validation_result = subset_check.finish();
+    }
+
+    if let Some(schema) = actual.first().map(RecordBatch::schema)
+        && let Some(sort_limit) =
+            live_oracle_keyed_sort_fallback_applies(&validation_result, &query.sql, schema.as_ref())
+        && keyed_reference_fetch_rows(sort_limit.limit) > 0
+        && let Some(keyed_reference) = keyed_reference
+    {
+        let fetched_rows: usize = keyed_reference.iter().map(RecordBatch::num_rows).sum();
+        let requested_rows = keyed_reference_requested_rows(
+            sort_limit.offset,
+            keyed_reference_fetch_rows(sort_limit.limit),
+        )
+        .max(fetched_rows);
+        if let Some(result) = validation::decide_from_keyed_reference_batches(
+            actual,
+            keyed_reference.iter().cloned(),
+            sort_limit.limit,
+            sort_limit.offset,
+            &sort_limit.key,
+            requested_rows,
+        )?
+        .0
+        {
+            validation_result = result;
+        }
+    }
+
+    Ok(validation_result)
+}
+
 fn should_validate_on_run(validate: bool, is_warmup: bool, has_reference_schema: bool) -> bool {
     if !validate {
         return false;
@@ -1223,16 +1327,23 @@ mod tests {
     }
 
     /// `LIMIT 0` keeps no rows. A floor of 1 on the window would still request a
-    /// row, and `OFFSET` plus that window would request the skipped rows too.
+    /// row, so the worker skips the keyed path when this is 0.
     #[test]
-    fn keyed_reference_limit_zero_requests_no_rows() {
+    fn keyed_reference_limit_zero_window_is_zero() {
         assert_eq!(keyed_reference_fetch_rows(0), 0);
         assert_eq!(
             keyed_reference_requested_rows(0, keyed_reference_fetch_rows(0)),
             0
         );
+    }
+
+    /// `OFFSET` plus a 0 window is still the `OFFSET` rows. The worker must not
+    /// call [`keyed_reference_requested_rows`] for `LIMIT 0`, because that would
+    /// fetch the skipped rows even though the window is empty.
+    #[test]
+    fn keyed_reference_offset_plus_zero_window_still_counts_the_offset() {
         assert_eq!(
-            keyed_reference_requested_rows(2_000_000, keyed_reference_fetch_rows(0)),
+            keyed_reference_requested_rows(2_000_000, 0),
             MAX_KEYED_REFERENCE_ROWS,
             "OFFSET plus a 0 window is still OFFSET rows; the worker must not fetch them"
         );
@@ -1254,6 +1365,26 @@ mod tests {
         assert_eq!(
             next_keyed_reference_fetch_rows(first),
             Some(MAX_KEYED_REFERENCE_ROWS)
+        );
+        assert!(
+            !keyed_reference_should_request_another_window(true, 4, 2),
+            "a closed cutoff must not grow the window"
+        );
+        assert!(
+            !keyed_reference_should_request_another_window(
+                false,
+                MAX_KEYED_REFERENCE_ROWS,
+                800_000
+            ),
+            "a window that already asked for the cap must not grow"
+        );
+        assert!(
+            !keyed_reference_should_request_another_window(false, 4, MAX_KEYED_REFERENCE_ROWS),
+            "a current window at the cap has no next size"
+        );
+        assert!(
+            keyed_reference_should_request_another_window(false, 4, 2),
+            "an open cutoff under the cap may double"
         );
     }
 
@@ -1318,6 +1449,194 @@ mod tests {
         assert!(!live_oracle_row_fallback_applies(
             &QueryValidationResult::Pass
         ));
+    }
+
+    const UNORDERED_GROUP_LIMIT: &str = r#"SELECT "UserID", "SearchPhrase", COUNT(*) FROM hits GROUP BY "UserID", "SearchPhrase" LIMIT 2"#;
+    const PROJECTED_SORT_LIMIT: &str = "SELECT k, v FROM t ORDER BY k DESC LIMIT 1";
+    const VISIBLE_PREFIX_ORDER: &str = "SELECT k, v FROM t ORDER BY k LIMIT 2";
+
+    fn user_phrase_counts(rows: &[(i64, Option<&str>, i64)]) -> RecordBatch {
+        use arrow::{
+            array::{Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("UserID", DataType::Int64, false),
+                Field::new("SearchPhrase", DataType::Utf8, true),
+                Field::new("count(*)", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.2))),
+            ],
+        )
+        .expect("user phrase count batch")
+    }
+
+    fn keyed_page(rows: &[(i64, &str)]) -> RecordBatch {
+        use arrow::{
+            array::{Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("v", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("keyed page")
+    }
+
+    /// Direct mismatch of two correct Q18 groups becomes a Pass after the
+    /// unordered-LIMIT fallback; a row the full result does not have stays Fail.
+    #[test]
+    fn live_oracle_unordered_limit_fallback_turns_a_group_mismatch_into_a_pass() {
+        let full_result = user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5), (3, Some("c"), 7)]);
+        let returned = user_phrase_counts(&[(3, Some("c"), 7), (2, None, 5)]);
+        let limited_reference = user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5)]);
+        let query = Query::new("clickbench_q18".into(), UNORDERED_GROUP_LIMIT.into(), false);
+        let direct = validation::validate_against_reference_batches(
+            &query,
+            std::slice::from_ref(&returned),
+            std::slice::from_ref(&limited_reference),
+        )
+        .expect("direct compare");
+        assert!(
+            matches!(direct, QueryValidationResult::Fail(_)),
+            "two correct answers that kept different groups do not compare equal directly: {direct:?}"
+        );
+        assert_eq!(
+            apply_live_oracle_row_fallbacks(
+                &query,
+                std::slice::from_ref(&returned),
+                std::slice::from_ref(&limited_reference),
+                Some(std::slice::from_ref(&full_result)),
+                None,
+            )
+            .expect("unordered fallback"),
+            QueryValidationResult::Pass
+        );
+
+        let not_in_full = user_phrase_counts(&[(3, Some("c"), 6), (2, None, 5)]);
+        assert!(
+            matches!(
+                apply_live_oracle_row_fallbacks(
+                    &query,
+                    std::slice::from_ref(&not_in_full),
+                    std::slice::from_ref(&limited_reference),
+                    Some(std::slice::from_ref(&full_result)),
+                    None,
+                )
+                .expect("unordered fallback of a foreign row"),
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::RowNotAllowedByLimit { .. }
+                )
+            ),
+            "a row the full result does not have must stay a Fail"
+        );
+    }
+
+    /// A lone cutoff row that differs from the limited reference but belongs to
+    /// the tied group becomes a Pass after the keyed fallback.
+    #[test]
+    fn live_oracle_keyed_sort_fallback_turns_a_tied_cutoff_mismatch_into_a_pass() {
+        let limited_reference = keyed_page(&[(10, "a")]);
+        let actual = keyed_page(&[(10, "b")]);
+        let keyed_reference = keyed_page(&[(10, "a"), (10, "b"), (9, "c")]);
+        let query = Query::new("tied_cutoff".into(), PROJECTED_SORT_LIMIT.into(), false);
+        let direct = validation::validate_against_reference_batches(
+            &query,
+            std::slice::from_ref(&actual),
+            std::slice::from_ref(&limited_reference),
+        )
+        .expect("direct compare");
+        assert!(
+            matches!(direct, QueryValidationResult::Fail(_)),
+            "the two tied cutoff rows do not compare equal directly: {direct:?}"
+        );
+        assert_eq!(
+            apply_live_oracle_row_fallbacks(
+                &query,
+                std::slice::from_ref(&actual),
+                std::slice::from_ref(&limited_reference),
+                None,
+                Some(std::slice::from_ref(&keyed_reference)),
+            )
+            .expect("keyed fallback"),
+            QueryValidationResult::Pass
+        );
+
+        let foreign = keyed_page(&[(8, "z")]);
+        assert!(
+            matches!(
+                apply_live_oracle_row_fallbacks(
+                    &query,
+                    std::slice::from_ref(&foreign),
+                    std::slice::from_ref(&limited_reference),
+                    None,
+                    Some(std::slice::from_ref(&keyed_reference)),
+                )
+                .expect("keyed fallback of a foreign row"),
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::RowNotAllowedByLimit { .. }
+                )
+            ),
+            "a row the page cannot hold must stay a Fail"
+        );
+    }
+
+    /// Schema and sort-order failures must not enter either fallback, even when
+    /// in-memory streams that would otherwise Pass are supplied.
+    #[test]
+    fn live_oracle_fallbacks_do_not_replace_schema_or_sort_failures() {
+        let returned = user_phrase_counts(&[(3, Some("c"), 7), (2, None, 5)]);
+        let full_result = user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5), (3, Some("c"), 7)]);
+        let other_schema = keyed_page(&[(1, "a"), (2, "b")]);
+        let unordered_query =
+            Query::new("clickbench_q18".into(), UNORDERED_GROUP_LIMIT.into(), false);
+        assert_eq!(
+            apply_live_oracle_row_fallbacks(
+                &unordered_query,
+                std::slice::from_ref(&returned),
+                std::slice::from_ref(&other_schema),
+                Some(std::slice::from_ref(&full_result)),
+                None,
+            )
+            .expect("schema mismatch"),
+            QueryValidationResult::Fail(validation::QueryValidationFailReason::SchemaMismatch)
+        );
+
+        let reference = keyed_page(&[(1, "a"), (2, "b")]);
+        let inverted = keyed_page(&[(2, "b"), (1, "a")]);
+        let keyed_reference = keyed_page(&[(1, "a"), (2, "b"), (3, "c")]);
+        let sort_query = Query::new("prefix_order".into(), VISIBLE_PREFIX_ORDER.into(), false);
+        let result = apply_live_oracle_row_fallbacks(
+            &sort_query,
+            std::slice::from_ref(&inverted),
+            std::slice::from_ref(&reference),
+            None,
+            Some(std::slice::from_ref(&keyed_reference)),
+        )
+        .expect("sort violation");
+        assert!(
+            matches!(
+                result,
+                QueryValidationResult::Fail(
+                    validation::QueryValidationFailReason::SortOrderViolation { .. }
+                )
+            ),
+            "an inverted visible ORDER BY must stay a SortOrderViolation: {result:?}"
+        );
     }
 
     /// The warmup is the only run that asserts a result snapshot, so its failure has
