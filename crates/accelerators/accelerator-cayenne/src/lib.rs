@@ -3129,9 +3129,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["true", "false"])
             .default("true"),
         ParameterSpec::component("datalake_location")
-            .description("Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background tiering loop moves warm local-disk data to read-optimized, Z-order-clustered Vortex files on this store, and queries span warm + datalake with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported."),
+            .description("Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background tiering loop moves warm local-disk data to read-optimized, clustered Vortex files on this store, and queries span warm + datalake with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported."),
         ParameterSpec::component("datalake_clustering_columns")
-            .description("Comma-separated liquid-clustering key columns for datalake files (multi-column Z-order), e.g. 'tenant_id,ts'. When unset, falls back to cayenne_sort_columns, then the primary key. Clustering tightens each cold file's per-column zone maps so selective queries on any clustering dimension prune at the storage layer."),
+            .description("Comma-separated liquid-clustering key columns for datalake files, e.g. 'tenant_id,ts'. When unset, falls back to cayenne_sort_columns, then the primary key. Rows are laid out along a multi-dimensional space-filling curve, which tightens each cold file's per-column zone maps so selective queries on any clustering dimension prune at the storage layer."),
         ParameterSpec::component("datalake_s3_auth")
             .description("Authentication method for the datalake S3 store. 'iam_role' (default) uses environment/SDK credentials; 'key' uses cayenne_datalake_s3_key/_secret.")
             .one_of(&["iam_role", "key"])

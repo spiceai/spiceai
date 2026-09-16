@@ -32,7 +32,7 @@ use parking_lot::Mutex;
 /// Maximum distinct filter columns retained in the histogram.
 const MAX_TRACKED_COLUMNS: usize = 32;
 
-/// Default number of hot columns to feed into compaction sort / Z-order.
+/// Default number of hot columns to feed into compaction sort / clustering.
 pub(crate) const DEFAULT_AUTO_CLUSTER_TOP_K: usize = 2;
 
 /// Bounded per-table filter-column hit counts shared across provider clones.

@@ -1186,7 +1186,7 @@ pub struct VortexConfig {
     /// `configuration_matches`, so toggling it never recreates the table (the
     /// cold tier is a strict superset of behavior over an unchanged warm tier).
     pub cold_tier_location: Option<String>,
-    /// Liquid-clustering key columns for cold files (multi-column Z-order).
+    /// Liquid-clustering key columns for cold files (multi-column curve).
     /// Empty = fall back to `sort_columns`, then the primary key. Set from
     /// `cayenne_datalake_clustering_columns`.
     pub cold_clustering_columns: Vec<String>,
@@ -1195,7 +1195,7 @@ pub struct VortexConfig {
     /// objects and cold scans are range reads. Set from
     /// `cayenne_datalake_target_file_size_mb`. Defaults to 512.
     pub cold_target_file_size_mb: usize,
-    /// Max input bytes (in MB) fed to one bounded Z-order sort run during a
+    /// Max input bytes (in MB) fed to one bounded clustering sort run during a
     /// warm-to-datalake move. `None` (the default) derives
     /// [`Self::cold_clustering_run_size_bytes`] as `cold_target_file_size_mb *
     /// 16` — 16 target files' worth of input gives enough locality for good
@@ -1233,7 +1233,7 @@ impl VortexConfig {
             .is_some_and(|s| !s.trim().is_empty())
     }
 
-    /// Effective byte cap for one bounded Z-order sort run during cold
+    /// Effective byte cap for one bounded clustering sort run during cold
     /// promotion: an explicit [`Self::cold_clustering_run_size_mb`], else
     /// derived as `cold_target_file_size_mb * 16`. The single derivation rule
     /// for standalone and runtime paths — never returns 0.
@@ -1987,7 +1987,7 @@ pub struct SnapshotFile {
 ///
 /// The cold tier is the bottom of the storage cascade (RAM mem-tier →
 /// local-disk warm Vortex snapshot → object-store cold). A background promotion
-/// stage rewrites settled/aged warm files as read-optimized (Z-order clustered)
+/// stage rewrites settled/aged warm files as read-optimized (curve-clustered)
 /// Vortex files on the cold object store and records one row here per file.
 ///
 /// Unlike [`SnapshotFile`], cold files are **table-scoped** (not a member of any

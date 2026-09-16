@@ -3188,7 +3188,7 @@ enum WriteShapeDecision {
     /// columns — the structural case.
     SerialSortColumns = 0,
     /// The write must produce one sequence of files for another reason (position
-    /// deletes, a Z-order-clustered promotion).
+    /// deletes, a curve-clustered promotion).
     SerialRequired = 1,
     /// The byte estimate produced fewer shards than the concurrency cap.
     SizeBounded = 2,
@@ -3604,7 +3604,7 @@ pub(crate) enum EncodeFanOut {
     /// One encoder, whatever the configuration says. Required where the output
     /// must be a single sequence of files: a position-delete table's merge
     /// (its tombstones are file-path scoped and the rewrite's position bake-in
-    /// assumes one output sequence), a Z-order-clustered cold promotion
+    /// assumes one output sequence), a curve-clustered cold promotion
     /// (sharding scatters the clustering the promotion exists to create), and a
     /// globally sorted rewrite (splitting the sorted stream across shard files
     /// would give each file the whole key range, forfeiting the pruning the
@@ -9243,7 +9243,7 @@ impl CayenneTableProvider {
         // is scattered across shard files and each file's zone maps span the
         // whole range — forfeiting exactly the pruning the sort was for. Every
         // stream that goes through `sort_stream_by_columns` or
-        // `zorder_sort_stream` states that with [`EncodeFanOut::Serial`], which
+        // `cluster_sort_stream` states that with [`EncodeFanOut::Serial`], which
         // is handled above. A low `session_target_partitions` is NOT a
         // substitute: it bounds only the unset default, while a configured
         // `cayenne_write_concurrency` is honored above it (see
@@ -20761,11 +20761,11 @@ impl CayenneTableProvider {
             // workload instead of for a guess.
             self.context.sort_columns().to_vec()
         } else {
-            // Auto-observed columns only cluster if the Z-order encoder can key on
-            // them; `Decimal`, `Map`, and other types unsupported by
-            // `column_order_keys` collapse to the all-zero key (no clustering), so
-            // drop them and keep the primary-key fallback rather than writing an
-            // effectively unclustered cold run.
+            // Auto-observed columns only cluster if the curve encoder can key on
+            // them; `Decimal256`, `Map`, and other types unsupported by
+            // `column_order_keys` collapse to the reserved zero key (no
+            // clustering), so drop them and keep the primary-key fallback rather
+            // than writing an effectively unclustered cold run.
             let observed: Vec<String> = self
                 .filter_column_observations
                 .top_columns(
@@ -20776,7 +20776,7 @@ impl CayenneTableProvider {
                 .filter(|n| {
                     schema
                         .field_with_name(n)
-                        .is_ok_and(|f| super::zorder::is_zorder_clusterable(f.data_type()))
+                        .is_ok_and(|f| super::clustering::is_clusterable(f.data_type()))
                 })
                 .collect();
             if observed.is_empty() {
@@ -20799,7 +20799,7 @@ impl CayenneTableProvider {
             .filter_map(|n| {
                 // Resolve an exact field name first; else parse the extended
                 // `col [ASC|DESC] [NULLS ...]` syntax that `sort_columns` accepts
-                // (direction is irrelevant to the Z-order curve) so a configured
+                // (direction is irrelevant to the clustering curve) so a configured
                 // `sort_columns: ["amount DESC"]` still clusters cold files rather
                 // than being silently dropped by a literal-name lookup.
                 schema.index_of(n.trim()).ok().or_else(|| {
@@ -20810,11 +20810,42 @@ impl CayenneTableProvider {
             .collect()
     }
 
-    /// Z-order (Morton) cluster a stream by appending a transient interleaved-bits
-    /// key column, sorting on it in byte-bounded runs via
+    /// The `[min, max]` each clustering column's curve coordinate is normalized
+    /// against, positionally matching `clustering_indices`.
+    ///
+    /// Read from the maintained metastore aggregate — already warm, O(1), and
+    /// covering the *whole* table rather than the rows this promotion happens to
+    /// carry, so every promotion maps values onto the same coordinate space and
+    /// the files they write stay mutually comparable. A column the aggregate
+    /// cannot describe yields `None`, which the kernel reads as "use this type's
+    /// full key domain".
+    fn cluster_column_bounds(
+        &self,
+        clustering_indices: &[usize],
+    ) -> Vec<super::clustering::ColumnBounds> {
+        let schema = self.table_schema();
+        let Some(stats) = self.optimizer_table_statistics() else {
+            return vec![None; clustering_indices.len()];
+        };
+        clustering_indices
+            .iter()
+            .map(|&i| {
+                let field = schema.fields().get(i)?;
+                let column = stats.column_statistics.get(i)?;
+                let lo =
+                    super::clustering::bound_key(column.min_value.get_value()?, field.data_type())?;
+                let hi =
+                    super::clustering::bound_key(column.max_value.get_value()?, field.data_type())?;
+                (lo <= hi).then_some((lo, hi))
+            })
+            .collect()
+    }
+
+    /// Cluster a stream along a Hilbert curve over `clustering_indices` by
+    /// appending a transient key column, sorting on it in byte-bounded runs via
     /// [`super::streaming::bounded_sort_stream`] (per-run `SortExec`:
     /// pool-accounted, disk-spilling), then stripping the key. Bounding the
-    /// sort caps per-run memory and first-batch latency; Z-order ranges may
+    /// sort caps per-run memory and first-batch latency; curve ranges may
     /// overlap across runs, which only weakens per-file min/max pruning
     /// slightly — cold files advertise no ordering, so this is a
     /// clustering-quality trade-off, not a correctness change. The run cap is
@@ -20822,7 +20853,7 @@ impl CayenneTableProvider {
     /// measured on the augmented batches (key included — what `SortExec`
     /// actually buffers). Empty `clustering_indices` returns the stream
     /// unchanged.
-    fn zorder_sort_stream(
+    fn cluster_sort_stream(
         &self,
         stream: SendableRecordBatchStream,
         clustering_indices: Vec<usize>,
@@ -20832,10 +20863,15 @@ impl CayenneTableProvider {
             return stream;
         }
         let original_schema = stream.schema();
-        let augmented_schema = super::zorder::zorder_augmented_schema(&original_schema);
+        let augmented_schema = super::clustering::cluster_augmented_schema(&original_schema);
+        // Resolved once for the whole promotion: per-batch bounds would put each
+        // batch on its own coordinate scale, and keys from different scales do
+        // not order against each other.
+        let bounds = self.cluster_column_bounds(&clustering_indices);
         let idx = clustering_indices;
-        let augmented = stream
-            .map(move |res| res.and_then(|b| super::zorder::append_zorder_key_column(&b, &idx)));
+        let augmented = stream.map(move |res| {
+            res.and_then(|b| super::clustering::append_cluster_key_column(&b, &idx, &bounds))
+        });
         let augmented_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&augmented_schema),
             augmented,
@@ -20843,15 +20879,16 @@ impl CayenneTableProvider {
         let sorted = super::streaming::bounded_sort_stream(
             &self.table_metadata.table_name,
             augmented_stream,
-            vec![super::zorder::ZORDER_COLUMN_NAME.to_string()],
+            vec![super::clustering::CLUSTER_KEY_COLUMN_NAME.to_string()],
             task_ctx,
             self.table_metadata
                 .vortex_config
                 .cold_clustering_run_size_bytes(),
         );
         let orig = Arc::clone(&original_schema);
-        let stripped = sorted
-            .map(move |res| res.and_then(|b| super::zorder::strip_zorder_key_column(&b, &orig)));
+        let stripped = sorted.map(move |res| {
+            res.and_then(|b| super::clustering::strip_cluster_key_column(&b, &orig))
+        });
         Box::pin(RecordBatchStreamAdapter::new(original_schema, stripped))
     }
 
@@ -20889,7 +20926,7 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Write a (Z-ordered, deletes-applied) stream to the cold object store as
+    /// Write a (clustered, deletes-applied) stream to the cold object store as
     /// read-optimized Vortex files, returning one [`ColdTierFile`] per written
     /// file with accurate per-file footer statistics (for listing-time pruning).
     ///
@@ -20897,7 +20934,7 @@ impl CayenneTableProvider {
     /// it would lose rows — carrying the placeholder `row_count` of 0 that
     /// [`Self::promote_warm_to_cold_inner`] treats as an unknown count.
     ///
-    /// Single ordered run (`target_partitions = 1`) so the Z-order survives across
+    /// Single ordered run (`target_partitions = 1`) so the clustering survives across
     /// cold files — each file is a contiguous slice of the sorted order, giving
     /// tight, non-overlapping zone maps. Bloom-eligible tables split the stream
     /// into row-bounded chunks (sequential writes to the same dir) so every file
@@ -21206,7 +21243,7 @@ impl CayenneTableProvider {
     /// visible stream restricted to warm + dirty cold files (all deletes
     /// applied, single-version per key — the proven rewrite read with a
     /// [`super::cold_partition::ColdScanFiles`] session extension),
-    /// Z-order cluster it, write read-optimized Vortex to the cold store, then
+    /// cluster it along the curve, write read-optimized Vortex to the cold store, then
     /// atomically register the new files PLUS the carried-forward clean
     /// manifest rows + overwrite-clear the warm tier + flip to a fresh empty
     /// warm snapshot. Subsequent CDC writes accumulate in warm again until the
@@ -21479,10 +21516,10 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             source_tier = "warm",
             target_tier = "datalake",
-            clustering = "z_order",
+            clustering = "hilbert",
             warm_bytes,
             warm_files,
-            "Moving warm-tier data to the datalake (Z-order clustered)"
+            "Moving warm-tier data to the datalake (clustered)"
         );
 
         // Exclude writers for the whole graduation (mirrors begin_overwrite).
@@ -21581,11 +21618,11 @@ impl CayenneTableProvider {
             "Planned the cross-tier read stream for the data move"
         );
 
-        // Z-order cluster for a read-optimized cold layout.
+        // Cluster along the curve for a read-optimized cold layout.
         let clustering = self.resolve_cold_clustering_indices();
         let clustering_is_empty = clustering.is_empty();
         let task_ctx = ctx.task_ctx();
-        let stream = self.zorder_sort_stream(stream, clustering, &task_ctx);
+        let stream = self.cluster_sort_stream(stream, clustering, &task_ctx);
 
         // Write the clustered, deletes-applied rows to the cold object store.
         let (cold_files, total_rows) = self
@@ -21594,7 +21631,7 @@ impl CayenneTableProvider {
                 self.cold_object_store_config.as_ref(),
                 stream,
                 max_sequence,
-                // `zorder_sort_stream` returned the stream untouched when no
+                // `cluster_sort_stream` returned the stream untouched when no
                 // clustering key resolved; otherwise sharding would scatter the
                 // clustering this promotion exists to create.
                 if clustering_is_empty {

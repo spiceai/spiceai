@@ -72,10 +72,10 @@ pub mod metadata;
 pub mod metastore;
 pub mod metastore_layout;
 
-/// Z-order clustering kernel, re-exported for benchmarks only. Not a stable API.
+/// Cold-tier clustering kernel, re-exported for benchmarks only. Not a stable API.
 #[doc(hidden)]
-pub mod __bench_zorder {
-    pub use crate::provider::zorder::zorder_keys;
+pub mod __bench_clustering {
+    pub use crate::provider::clustering::cluster_keys;
 }
 pub mod optimizer_rules;
 #[cfg(feature = "partition-table-provider")]

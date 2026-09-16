@@ -159,7 +159,7 @@ async fn test_cold_tier_promotion_cross_tier_scan_and_delete_impl(
     let _ = table.checkpoint_inlined_data().await;
     let _ = table.checkpoint_mem_tier().await;
 
-    // Graduate the warm tier to the cold object store (Z-order clustered).
+    // Graduate the warm tier to the cold object store (curve-clustered).
     let promoted = table.promote_warm_to_cold().await?;
     assert!(
         promoted,
@@ -1645,16 +1645,16 @@ async fn test_cold_tier_promotion_racing_stage_b_finalize_impl(
     Ok(())
 }
 
-test_with_backends!(test_cold_tier_bounded_zorder_multi_run_promotion_impl);
+test_with_backends!(test_cold_tier_bounded_clustering_multi_run_promotion_impl);
 
 /// Promotion with `cold_clustering_run_size_mb: Some(1)` — small enough that
-/// the Z-order sort splits into several byte-bounded runs (the inserted raw
+/// the clustering sort splits into several byte-bounded runs (the inserted raw
 /// bytes alone exceed 3 run caps, and the sorted stream is the *augmented*
 /// batches, which are strictly larger). Verifies the bounded sort is invisible
 /// to correctness: the commit succeeds, every inserted row lands in the cold
 /// manifest exactly once (row conservation across runs), and cross-tier scans
 /// return the exact row set.
-async fn test_cold_tier_bounded_zorder_multi_run_promotion_impl(
+async fn test_cold_tier_bounded_clustering_multi_run_promotion_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
     let schema = Arc::new(Schema::new(vec![
