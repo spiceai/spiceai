@@ -21210,7 +21210,7 @@ impl CayenneTableProvider {
             // transpose and an interleave dimension on every row. The observed
             // branch above filters earlier because it must decide whether to
             // fall through to the primary key; this catches the explicit
-            // `cold_clustering_columns` and `sort_columns` branches, which
+            // `cluster_by` and `sort_columns` branches, which
             // would otherwise carry an unclusterable column all the way in.
             .filter(|&i| {
                 schema

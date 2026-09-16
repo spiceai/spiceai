@@ -6,7 +6,7 @@ name: postgres-cayenne[file]-cdc-tuned-memory-cold-sf1000
 # inherited verbatim (RAM mem-tier absorbs writes, flushes by size/age to the warm local-disk
 # Vortex tier); this variant adds the third, colder storage tier below the warm tier. The full
 # cascade is: RAM mem-tier -> warm local-disk Vortex -> COLD object store. A background promoter
-# graduates the warm tier to read-optimized, Z-order-clustered Vortex on the cold store once the
+# graduates the warm tier to read-optimized, Hilbert-clustered Vortex on the cold store once the
 # per-table warm-size trigger is crossed, and queries span all three tiers with per-tier
 # pushdown/pruning. See the datalake/cold knobs on &accel_high_volume below.
 #
