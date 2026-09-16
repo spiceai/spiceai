@@ -1181,18 +1181,10 @@ impl Runtime {
         // A reload can change what the dataset reads, so results read from its
         // previous contents must stop being served as fresh, and a query that
         // planned against the previous registration must not store its result.
-        // Both of those read the table-change clock this marks.
-        if let Err(e) = self
-            .df
-            .caching()
-            .invalidate_for_table(ds.name.clone())
-            .await
-        {
-            tracing::warn!(
-                "Dataset '{}' is updating, but the results cached from its previous contents could not be invalidated, so queries may be answered from them until they expire. Cause: {e}",
-                ds.name
-            );
-        }
+        // Both of those read the table-change clock this marks. The replacement
+        // below marks it again: this mark cannot reject a result whose read
+        // starts after it and still lands on the old registration.
+        self.invalidate_cached_results_for(&ds.name).await;
 
         match Arc::clone(&self)
             .load_dataset_connector(Arc::clone(&ds))
@@ -1207,6 +1199,13 @@ impl Runtime {
                         .await
                     {
                         Ok(()) => {
+                            // Mark again now the swap has happened. The mark above
+                            // stops results read before the reload from being served
+                            // as fresh, but a query that started after it and read the
+                            // previous registration finishes with a `read_started_at`
+                            // the clock would accept, so its result must be rejected by
+                            // a mark at the replacement itself.
+                            self.invalidate_cached_results_for(&ds.name).await;
                             self.status
                                 .update_dataset(&ds.name, status::ComponentStatus::Ready);
                             return;
@@ -1225,7 +1224,7 @@ impl Runtime {
                     .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
                     .await;
 
-                if let Err(e) = DatasetInitialization::plan_eager(
+                let initialized = DatasetInitialization::plan_eager(
                     Arc::clone(&ds),
                     Arc::clone(&self),
                     Arc::clone(&connector),
@@ -1235,8 +1234,16 @@ impl Runtime {
                 )
                 .initialize()
                 .await
-                .map(|_ready| ())
-                {
+                .map(|_ready| ());
+
+                // The registration this dataset reads through has just been
+                // replaced, so mark the table again: a query that began after
+                // the mark at the top of this reload, and read the registration
+                // being replaced, would otherwise store a result the clock
+                // accepts as fresh.
+                self.invalidate_cached_results_for(&ds.name).await;
+
+                if let Err(e) = initialized {
                     self.status.update_dataset(
                         &ds.name,
                         status::ComponentStatus::error_with_message(e.to_string()),
@@ -1248,6 +1255,27 @@ impl Runtime {
                 // Only the hot-reload context it cannot know is added here (#12365).
                 tracing::error!("Unable to update dataset {}: {e}", ds.name);
             }
+        }
+    }
+
+    /// Marks the results-cache table clock for `dataset`, so results read from
+    /// what it held before this point stop being served as fresh and a result
+    /// read before it cannot be stored as fresh afterwards.
+    ///
+    /// Degrade and continue, as the write paths that mark the same clock do: a
+    /// reload that could not mark it still has to finish, and the warning is how
+    /// an operator learns that queries may keep being answered from the previous
+    /// contents until `item_ttl` expires.
+    async fn invalidate_cached_results_for(&self, dataset: &TableReference) {
+        if let Err(e) = self
+            .df
+            .caching()
+            .invalidate_for_table(dataset.clone())
+            .await
+        {
+            tracing::warn!(
+                "Dataset '{dataset}' is updating, but the results cached from its previous contents could not be invalidated, so queries may be answered from them until they expire. Cause: {e}"
+            );
         }
     }
 
@@ -3803,6 +3831,116 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             provider.tables_changed_since(&tables, read_started_at),
             "a reload must mark the table, or results read from the dataset's previous contents \
              stay servable as fresh until item_ttl expires"
+        );
+    }
+
+    /// A connector whose construction blocks until the test releases it, so a
+    /// reload can be held open between the mark at its start and the replacement
+    /// at its end.
+    struct GatedConnectorFactory {
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl DataConnectorFactory for GatedConnectorFactory {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn create<'a>(
+            &'a self,
+            _params: ConnectorParams,
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
+            let gate = Arc::clone(&self.gate);
+            Box::pin(async move {
+                let _permit = gate
+                    .acquire()
+                    .await
+                    .expect("the test releases the gate before awaiting the reload");
+                Ok(Arc::new(SchemaOnlyConnector) as Arc<dyn DataConnector>)
+            })
+        }
+
+        fn prefix(&self) -> &'static str {
+            "gated_reload"
+        }
+
+        fn parameters(&self) -> &'static [ParameterSpec] {
+            &[]
+        }
+    }
+
+    /// The reload marks the table again once the registration has been replaced.
+    ///
+    /// The mark at the start of `update_dataset` cannot cover a query that begins
+    /// *after* it: that query reads the registration still being replaced and
+    /// finishes with a `read_started_at` later than the mark, so
+    /// `tables_changed_since` accepts its result and the cache serves the
+    /// dataset's previous contents as fresh until `item_ttl`.
+    ///
+    /// The instant this asserts from is therefore taken while the reload is
+    /// parked inside connector construction, after the first mark has already
+    /// landed — which is what makes it fail when only that first mark exists.
+    #[tokio::test]
+    async fn a_dataset_reload_marks_the_table_again_once_it_has_been_replaced() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        register_connector_factory(
+            "gated_reload",
+            Arc::new(GatedConnectorFactory {
+                gate: Arc::clone(&gate),
+            }),
+        )
+        .await;
+
+        let spec = spicepod::component::dataset::Dataset::new("gated_reload:any", "replaced");
+        let app = app::AppBuilder::new("reload_marks_at_replacement")
+            .with_dataset(spec.clone())
+            .build();
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let ds = Arc::new(
+            DatasetBuilder::try_from(spec)
+                .expect("valid dataset builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::clone(&runtime))
+                .build()
+                .expect("valid runtime dataset"),
+        );
+        let provider = runtime
+            .df
+            .results_cache_provider()
+            .expect("the results cache is enabled by default");
+        let tables = std::collections::HashSet::from([ds.name.clone()]);
+
+        let before_the_reload = std::time::Instant::now();
+        let reload = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            let ds = Arc::clone(&ds);
+            async move { runtime.update_dataset(ds).await }
+        });
+
+        // The reload is now parked in connector construction, with its first mark
+        // already recorded.
+        assert!(
+            test_framework::utils::wait_until_true(Duration::from_secs(30), || {
+                let provider = Arc::clone(&provider);
+                let tables = tables.clone();
+                async move { provider.tables_changed_since(&tables, before_the_reload) }
+            })
+            .await,
+            "the reload must mark the table before it builds the connector"
+        );
+
+        // Stands in for a query that starts here, reads the registration being
+        // replaced, and stores its result: only a mark from the replacement is
+        // later than this instant.
+        let read_started_mid_reload = std::time::Instant::now();
+        gate.add_permits(1);
+        reload.await.expect("the reload task should not panic");
+
+        assert!(
+            provider.tables_changed_since(&tables, read_started_mid_reload),
+            "the replacement must mark the table too, or a result read from the previous \
+             registration after the reload started is stored and served as fresh"
         );
     }
 
