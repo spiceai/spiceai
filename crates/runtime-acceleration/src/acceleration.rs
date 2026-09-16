@@ -423,13 +423,17 @@ impl StaleIfError {
     /// The window beyond `caching_ttl` that retention must keep an entry for, so a
     /// finite `stale-if-error` fallback is not evicted before it can be served.
     ///
-    /// `None` means no finite cutoff — `Enabled`'s unbounded retention. Otherwise
-    /// it is the larger of the stale-while-revalidate grace and the finite
-    /// `stale-if-error` window, so a single derived deadline honors both.
+    /// `None` means no finite cutoff at all — `Enabled`'s unbounded retention, the
+    /// one case with no deadline. Every other variant returns `Some`, a concrete
+    /// grace of at least zero: `Disabled` keeps only the stale-while-revalidate
+    /// grace (zero when unset), and `For(d)` keeps the larger of `d` and that
+    /// grace. The `Some`/`None` split is load-bearing — `expiry_cutoff` reads
+    /// `None` as "never expires", so `Disabled` must not collapse to it when SWR
+    /// is unset, or the default caching cache would stop evicting.
     #[must_use]
     pub fn error_retention_window(self, swr: Option<Duration>) -> Option<Duration> {
         match self {
-            StaleIfError::Disabled => swr,
+            StaleIfError::Disabled => Some(swr.unwrap_or_default()),
             StaleIfError::For(d) => Some(d.max(swr.unwrap_or_default())),
             StaleIfError::Enabled => None,
         }
@@ -1467,7 +1471,13 @@ mod tests {
             StaleIfError::Disabled.error_retention_window(Some(swr)),
             Some(swr)
         );
-        assert_eq!(StaleIfError::Disabled.error_retention_window(None), None);
+        // Disabled with no SWR is a zero grace, NOT "no cutoff" — else the
+        // default caching cache stops expiring (`expiry_cutoff` reads None as
+        // never-expires). Only Enabled is the None case.
+        assert_eq!(
+            StaleIfError::Disabled.error_retention_window(None),
+            Some(Duration::ZERO)
+        );
         assert_eq!(
             StaleIfError::Enabled.error_retention_window(Some(swr)),
             None

@@ -698,6 +698,24 @@ fn get_first_fetched_at_timestamp(batch: &RecordBatch) -> Option<i64> {
     Some(ts_array.value(0))
 }
 
+/// The first `_fetched_at` value as nanoseconds since the epoch, normalizing the
+/// column's stored precision first — an accelerator may store it at a coarser
+/// resolution (Cayenne keeps microseconds), which a bare nanosecond downcast
+/// would silently miss. `None` when the column is absent, empty, or null in row
+/// 0. Mirrors the normalization `check_cache_freshness` applies to the same
+/// column so the two read the same instant.
+fn first_fetched_at_nanos(batch: &RecordBatch) -> Option<i64> {
+    let (idx, _) = batch.schema().column_with_name(CACHE_REFRESHED_AT_COLUMN)?;
+    let ns_array = as_timestamp_nanosecond_array(batch.column(idx)).ok()?;
+    let ts_array = ns_array
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()?;
+    if ts_array.is_empty() || ts_array.is_null(0) {
+        return None;
+    }
+    Some(ts_array.value(0))
+}
+
 /// How stale a cached entry is *past the point it went stale* — `now -
 /// fetched_at - max_age`, saturating at zero — or `None` when the entry carries
 /// no usable fetch time (missing/null/empty `_fetched_at`).
@@ -707,7 +725,7 @@ fn get_first_fetched_at_timestamp(batch: &RecordBatch) -> Option<i64> {
 /// fetch. `None` makes a finite window fail closed and leaves `Enabled`
 /// unaffected, exactly the read-path decision the caller needs.
 fn staleness_past_max_age(batch: &RecordBatch, max_age: Duration) -> Option<Duration> {
-    let fetched_at = get_first_fetched_at_timestamp(batch)?;
+    let fetched_at = first_fetched_at_nanos(batch)?;
     let now_nanos = i64::try_from(
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -4348,6 +4366,54 @@ mod tests {
             transient_5xx_outcome(null_ts, StaleIfError::Enabled, Duration::ZERO).await,
             "cached response",
             "Enabled fails open on an unknown fetch time"
+        );
+    }
+
+    /// Cayenne stores `_fetched_at` in microseconds. The read path must
+    /// normalize its precision, or a finite window could never prove an entry is
+    /// inside `N` and would always fail closed on such an accelerator.
+    #[tokio::test]
+    async fn a_finite_window_reads_a_microsecond_fetched_at() {
+        use arrow::array::{StringArray, TimestampMicrosecondArray, UInt16Array};
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("content", DataType::Utf8, true),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+            Field::new(
+                CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]));
+
+        // 30s past a 10s stale point is inside a 60s window. Stored in micros,
+        // as Cayenne would.
+        let fetched_at_micros = (now_nanos() - secs_nanos(10 + 30)) / 1_000;
+        let stale = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/api"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["cached response"])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(
+                    fetched_at_micros,
+                )])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+
+        assert_eq!(
+            transient_5xx_outcome(
+                stale,
+                StaleIfError::For(Duration::from_secs(60)),
+                Duration::from_secs(10)
+            )
+            .await,
+            "cached response",
+            "a microsecond fetch time must be normalized and read as inside the window"
         );
     }
 
