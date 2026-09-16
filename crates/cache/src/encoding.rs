@@ -199,16 +199,16 @@ mod tests {
         let encoder = ZstdEncoder::default();
         let original = vec![create_test_batch()];
 
-        let encoded = encoder
+        let payload = encoder
             .encode(&original)
             .await
             .expect("encode should succeed");
-        (!encoded.bytes.is_empty())
+        (!payload.bytes.is_empty())
             .then_some(())
             .expect("encoded data should not be empty");
 
         let decoded = encoder
-            .decode(&encoded.bytes)
+            .decode(&payload.bytes)
             .await
             .expect("decode should succeed");
         (decoded.len() == original.len())
@@ -227,13 +227,13 @@ mod tests {
         let encoder = ZstdEncoder::default();
         let empty: Vec<RecordBatch> = vec![];
 
-        let encoded = encoder.encode(&empty).await.expect("encode should succeed");
-        (encoded.bytes.is_empty() && encoded.decoded_len == 0)
+        let payload = encoder.encode(&empty).await.expect("encode should succeed");
+        (payload.bytes.is_empty() && payload.decoded_len == 0)
             .then_some(())
             .expect("encoded empty data should be empty");
 
         let decoded = encoder
-            .decode(&encoded.bytes)
+            .decode(&payload.bytes)
             .await
             .expect("decode should succeed");
         decoded
