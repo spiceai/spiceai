@@ -21027,26 +21027,48 @@ impl CayenneTableProvider {
     /// the files they write stay mutually comparable. A column the aggregate
     /// cannot describe yields `None`, which the kernel reads as "use this type's
     /// full key domain".
+    ///
+    /// Goes through [`Self::maintained_column_bound`] rather than
+    /// [`Self::optimizer_table_statistics`]: the planner-facing view drops every
+    /// column's min/max once the table is wider than
+    /// [`TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT`], which would leave every
+    /// clustering dimension without a normalization range on a wide table.
     fn cluster_column_bounds(
         &self,
         clustering_indices: &[usize],
     ) -> Vec<super::clustering::ColumnBounds> {
         let schema = self.table_schema();
-        let Some(stats) = self.optimizer_table_statistics() else {
-            return vec![None; clustering_indices.len()];
-        };
         clustering_indices
             .iter()
             .map(|&i| {
                 let field = schema.fields().get(i)?;
-                let column = stats.column_statistics.get(i)?;
-                let lo =
-                    super::clustering::bound_key(column.min_value.get_value()?, field.data_type())?;
-                let hi =
-                    super::clustering::bound_key(column.max_value.get_value()?, field.data_type())?;
-                (lo <= hi).then_some((lo, hi))
+                self.maintained_column_bound(i, field.data_type())
             })
             .collect()
+    }
+
+    /// One clustering column's `[min, max]` in key space, including on tables
+    /// wider than [`TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT`].
+    ///
+    /// [`Self::optimizer_table_statistics`] is the planner-facing summary and
+    /// empties `column_statistics` past that limit so a clone of hundreds of
+    /// columns is not built only to be discarded. Clustering needs only the
+    /// few configured dimensions' bounds, so it reads those entries from the
+    /// cache directly.
+    fn maintained_column_bound(
+        &self,
+        column: usize,
+        data_type: &DataType,
+    ) -> super::clustering::ColumnBounds {
+        let cache = self.table_statistics.read();
+        let stats = cache
+            .optimizer
+            .as_ref()
+            .or(cache.optimizer_inexact.as_ref())?;
+        let column = stats.column_statistics.get(column)?;
+        let lo = super::clustering::bound_key(column.min_value.get_value()?, data_type)?;
+        let hi = super::clustering::bound_key(column.max_value.get_value()?, data_type)?;
+        (lo <= hi).then_some((lo, hi))
     }
 
     /// Cluster a stream along a Hilbert curve over `clustering_indices` by
@@ -21724,10 +21746,10 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             source_tier = "warm",
             target_tier = "datalake",
-            clustering = "hilbert",
+            clustering = "z_order",
             warm_bytes,
             warm_files,
-            "Moving warm-tier data to the datalake (clustered)"
+            "Moving warm-tier data to the datalake (Z-order clustered)"
         );
 
         // Exclude writers for the whole graduation (mirrors begin_overwrite).
@@ -39054,6 +39076,77 @@ mod tests {
         assert_eq!(
             stats.column_statistics[0].null_count,
             column_stats.null_count
+        );
+    }
+
+    /// Wide-table planner stats empty `column_statistics` past
+    /// [`TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT`]. Clustering still has to
+    /// read the maintained `[min, max]` for the few dimensions it normalizes
+    /// (regression test for the accessor that does not go through that summary).
+    #[tokio::test]
+    async fn cluster_column_bounds_keep_wide_table_normalization() {
+        let temp_dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = temp_dir.path().join("test.db");
+        let data_path = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_path).expect("data dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{}", db_path.to_string_lossy()))
+                .expect("catalog"),
+        );
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("ts", DataType::Int64, false),
+            arrow_schema::Field::new("tenant", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "wide_cluster_bounds".to_string(),
+            schema,
+            primary_key: vec!["ts".to_string()],
+            on_conflict: None,
+            base_path: data_path.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        };
+        let table = CayenneTableProvider::create_table(
+            catalog as Arc<dyn MetadataCatalog>,
+            options,
+            SessionContext::new().runtime_env(),
+        )
+        .await
+        .expect("create table");
+
+        let mut column_statistics =
+            vec![ColumnStatistics::new_unknown(); TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT + 1];
+        column_statistics[0].min_value =
+            DFPrecision::Exact(ScalarValue::Int64(Some(1_700_000_000_000_000)));
+        column_statistics[0].max_value =
+            DFPrecision::Exact(ScalarValue::Int64(Some(1_700_000_016_383_000)));
+        column_statistics[1].min_value = DFPrecision::Exact(ScalarValue::Int64(Some(0)));
+        column_statistics[1].max_value = DFPrecision::Exact(ScalarValue::Int64(Some(15)));
+
+        {
+            let mut cache = table.table_statistics.write();
+            cache.optimizer = Some(Statistics {
+                num_rows: DFPrecision::Exact(16_384),
+                total_byte_size: DFPrecision::Absent,
+                column_statistics,
+            });
+            cache.count_exact = true;
+        }
+
+        let planner = table
+            .optimizer_table_statistics()
+            .expect("planner-facing stats");
+        assert!(
+            planner.column_statistics.is_empty(),
+            "the wide-table planner summary must stay empty so this test is actually on that path"
+        );
+
+        let bounds = table.cluster_column_bounds(&[0, 1]);
+        assert!(
+            bounds.iter().all(Option::is_some),
+            "clustering must still see per-dimension bounds on a wide table: {bounds:?}"
         );
     }
 

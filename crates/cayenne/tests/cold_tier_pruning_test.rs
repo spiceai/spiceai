@@ -32,7 +32,7 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
+use arrow::array::{BinaryArray, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
@@ -201,6 +201,158 @@ async fn test_cold_tier_selective_query_prunes_files_impl(
         collect_ids(&ctx, "SELECT id FROM prune_t WHERE id BETWEEN 95 AND 105").await?,
         (95..=105).collect::<Vec<_>>(),
         "a range spanning two datalake files returns rows from both"
+    );
+    Ok(())
+}
+
+test_with_backends!(test_cold_tier_normalized_clustering_prunes_both_dimensions_impl);
+
+/// Rows and pad width sized so one promotion rolls several 1 MB cold files.
+/// Vortex rolls on estimated compressed size; the pad is a per-row 1 KiB of
+/// mixed bytes so that estimate stays near the Arrow footprint instead of
+/// collapsing under dictionary coding.
+const CLUSTER_ROWS: i64 = 16_384;
+const CLUSTER_TENANTS: i64 = 16;
+const CLUSTER_TS_BASE: i64 = 1_700_000_000_000_000;
+const CLUSTER_TS_STEP: i64 = 1_000;
+const CLUSTER_PAD_BYTES: usize = 1024;
+const CLUSTER_PAD_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
+fn cluster_pad(row: i64) -> Vec<u8> {
+    let mut buf = vec![0_u8; CLUSTER_PAD_BYTES];
+    let mut x = row
+        .cast_unsigned()
+        .wrapping_mul(CLUSTER_PAD_MIX)
+        .wrapping_add(1);
+    for slot in buf.chunks_exact_mut(8) {
+        x = x.wrapping_mul(CLUSTER_PAD_MIX).wrapping_add(1);
+        slot.copy_from_slice(&x.to_le_bytes());
+    }
+    buf
+}
+
+/// One promotion of the timestamp/tenant fixture. Predicates on *both*
+/// differently-scaled clustering columns must drop cold files — the defect the
+/// normalized `Hilbert` key exists to fix. Kernel tests can pass while statistics
+/// lookup, stream augmentation, sorting, or Vortex footers are unwired.
+async fn test_cold_tier_normalized_clustering_prunes_both_dimensions_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("tenant", DataType::Int64, false),
+        Field::new("pad", DataType::Binary, false),
+    ]));
+
+    let cold_dir = fixture.temp_dir.path().join("cold");
+    std::fs::create_dir_all(&cold_dir)?;
+
+    let table_options = CreateTableOptions {
+        table_name: "cluster_prune_t".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec!["id".to_string()],
+        on_conflict: None,
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: VortexConfig {
+            cold_tier_location: Some(format!("file://{}", cold_dir.to_string_lossy())),
+            cold_clustering_columns: vec!["ts".to_string(), "tenant".to_string()],
+            cold_tier_warm_max_files: 1,
+            cold_target_file_size_mb: 1,
+            deletion_mode: DeletionMode::Key,
+            ..VortexConfig::default()
+        },
+    };
+
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
+    ctx.register_table(
+        "cluster_prune_t",
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    )?;
+
+    let ids: Vec<i64> = (0..CLUSTER_ROWS).collect();
+    let timestamps: Vec<i64> = (0..CLUSTER_ROWS)
+        .map(|i| CLUSTER_TS_BASE + i * CLUSTER_TS_STEP)
+        .collect();
+    let tenants: Vec<i64> = (0..CLUSTER_ROWS)
+        .map(|i| (i * 7) % CLUSTER_TENANTS)
+        .collect();
+    let pads: Vec<Vec<u8>> = (0..CLUSTER_ROWS).map(cluster_pad).collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(Int64Array::from(timestamps)),
+            Arc::new(Int64Array::from(tenants)),
+            Arc::new(BinaryArray::from_iter_values(pads)),
+        ],
+    )?;
+    common::insert_batch(table.as_ref(), batch).await?;
+    table.flush_pending_maintenance().await?;
+    table.checkpoint_inlined_data().await?;
+    table.checkpoint_mem_tier().await?;
+    assert!(
+        table.promote_warm_to_cold().await?,
+        "promotion should fire with cold_tier_warm_max_files = 1"
+    );
+
+    let all_files = planned_files_for(&ctx, "SELECT id FROM cluster_prune_t").await?;
+    assert!(
+        all_files >= 4,
+        "one clustered promotion must roll several cold files so pruning is observable, got {all_files}"
+    );
+
+    let probe_row = CLUSTER_ROWS / 2;
+    let probe_ts = CLUSTER_TS_BASE + probe_row * CLUSTER_TS_STEP;
+    let probe_tenant = (probe_row * 7) % CLUSTER_TENANTS;
+
+    let ts_files = planned_files_for(
+        &ctx,
+        &format!("SELECT id FROM cluster_prune_t WHERE ts = {probe_ts}"),
+    )
+    .await?;
+    assert!(
+        ts_files < all_files,
+        "a timestamp point filter pruned nothing: {ts_files} of {all_files} files planned"
+    );
+
+    let tenant_files = planned_files_for(
+        &ctx,
+        &format!("SELECT id FROM cluster_prune_t WHERE tenant = {probe_tenant}"),
+    )
+    .await?;
+    assert!(
+        tenant_files < all_files,
+        "a tenant point filter pruned nothing: {tenant_files} of {all_files} files planned"
+    );
+
+    assert_eq!(
+        collect_ids(
+            &ctx,
+            &format!("SELECT id FROM cluster_prune_t WHERE ts = {probe_ts}")
+        )
+        .await?,
+        vec![probe_row],
+        "the timestamp-pruned plan still returns the matching row"
+    );
+
+    let tenant_ids = collect_ids(
+        &ctx,
+        &format!("SELECT id FROM cluster_prune_t WHERE tenant = {probe_tenant}"),
+    )
+    .await?;
+    let expected_tenant: Vec<i64> = (0..CLUSTER_ROWS)
+        .filter(|i| (*i * 7) % CLUSTER_TENANTS == probe_tenant)
+        .collect();
+    assert_eq!(
+        tenant_ids, expected_tenant,
+        "the tenant-pruned plan still returns every matching row"
     );
     Ok(())
 }
