@@ -50,8 +50,8 @@ use runtime_request_context::CacheNamespace;
 use runtime_status::{ComponentStatus, RuntimeStatus};
 use util::expr::combine_exprs_balanced;
 
-/// One entry per cache key with a fetch in flight, mapping the key to a
-/// [`watch`] channel carrying that fetch's outcome ([`FetchState`]).
+/// One entry per cache key with a fetch in flight, mapping the key to the
+/// [`InFlightFetch`] whose outcome ([`FetchState`]) followers wait on.
 ///
 /// The entry plays two coordinating roles at once. It is the write-ownership
 /// claim — one key, one writer, so two concurrent writers cannot each append
@@ -59,7 +59,8 @@ use util::expr::combine_exprs_balanced;
 /// is a wrong query result). It is also the single-flight rendezvous: the one
 /// caller that inserts the entry (the *leader*) fetches the origin, and every
 /// caller that finds an entry already present (a *follower*) replays the
-/// leader's published batches instead of asking the origin again. Claims are
+/// leader's published batches instead of asking the origin again — provided
+/// the leader's fetch can answer it (see [`InFlightFetch::serves`]). Claims are
 /// taken and released through [`CacheKeyClaim`] / [`ClaimOutcome`] rather than
 /// by touching this directly.
 ///
@@ -69,11 +70,40 @@ use util::expr::combine_exprs_balanced;
 /// coalesce onto the same entry already share one namespace.
 ///
 /// A synchronous lock: every critical section is one `HashMap` operation, never
-/// held across an `.await`. A follower clones the [`watch::Receiver`] while
+/// held across an `.await`. A follower clones the [`InFlightFetch`] while
 /// holding the guard, drops the guard, then awaits; [`CacheKeyClaim`]'s `Drop`
 /// must be able to release without one.
-pub type InFlightRevalidations =
-    Arc<parking_lot::Mutex<HashMap<String, watch::Receiver<FetchState>>>>;
+pub type InFlightRevalidations = Arc<parking_lot::Mutex<HashMap<String, InFlightFetch>>>;
+
+/// A fetch in flight for a cache key: what the leader asked the origin for, and
+/// the [`watch`] channel its outcome arrives on. Followers get a clone from
+/// [`CacheKeyClaim::acquire`].
+#[derive(Debug, Clone)]
+pub struct InFlightFetch {
+    /// The row limit the leader passed to the origin; `None` is unbounded.
+    limit: Option<usize>,
+    /// The leader's published [`FetchState`].
+    state: watch::Receiver<FetchState>,
+}
+
+impl InFlightFetch {
+    /// Whether this fetch can answer a request that asked the origin for `limit`
+    /// rows.
+    ///
+    /// The origin truncates a bounded fetch to its limit, so replaying a fetch
+    /// bounded *below* the request would hand it fewer rows than the origin
+    /// holds for the same filters — a wrong result, not a slower one. An
+    /// unbounded fetch answers any request; a bounded one only a request bounded
+    /// at or below it. Replaying *more* rows than requested is safe: `DataFusion`
+    /// keeps its own `Limit` above the scan and trims the surplus.
+    fn serves(&self, limit: Option<usize>) -> bool {
+        match (self.limit, limit) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(fetched), Some(wanted)) => wanted <= fetched,
+        }
+    }
+}
 
 /// The outcome of a leader's fetch, published to followers over a [`watch`]
 /// channel held in [`InFlightRevalidations`].
@@ -85,7 +115,8 @@ pub type InFlightRevalidations =
 pub enum FetchState {
     /// The leader is still fetching; no result yet.
     Pending,
-    /// The leader collected these batches from the origin. Followers replay them.
+    /// The leader collected these batches from the origin — none at all when
+    /// the origin had no rows for the key. Followers replay them.
     Ready(Arc<Vec<RecordBatch>>),
     /// The leader could not publish a result — it failed, was cancelled, or its
     /// response was not cacheable — so followers stop waiting and fetch the
@@ -97,9 +128,11 @@ pub enum FetchState {
 pub enum ClaimOutcome {
     /// No entry existed: this caller inserted it and owns the fetch and write.
     Leader(CacheKeyClaim),
-    /// An entry already existed: this caller waits on the leader's
-    /// [`FetchState`] rather than asking the origin again.
-    Follower(watch::Receiver<FetchState>),
+    /// An entry already existed: another caller owns the fetch and the write
+    /// for this key. This caller replays that fetch when it
+    /// [serves](InFlightFetch::serves) its request, and otherwise fetches for
+    /// itself without writing.
+    Follower(InFlightFetch),
 }
 
 /// A cache key claimed for single-flight fetching and writing, released when
@@ -140,22 +173,28 @@ pub struct CacheKeyClaim {
 }
 
 impl CacheKeyClaim {
-    /// Claims `key` for fetching and writing, or returns a follower handle when
-    /// a fetch for it is already in flight.
+    /// Claims `key` for fetching and writing, or returns the fetch already in
+    /// flight for it. `limit` is the row limit this caller will pass to the
+    /// origin; it is recorded on the entry so followers can tell whether the
+    /// leader's fetch serves them ([`InFlightFetch::serves`]).
     ///
     /// The map is locked for exactly one operation: the follower branch clones
-    /// the receiver and drops the guard before its caller awaits, so the lock is
+    /// the entry and drops the guard before its caller awaits, so the lock is
     /// never held across an `.await` (see [`InFlightRevalidations`]).
     #[must_use]
-    pub fn acquire(in_flight: &InFlightRevalidations, key: String) -> ClaimOutcome {
+    pub fn acquire(
+        in_flight: &InFlightRevalidations,
+        key: String,
+        limit: Option<usize>,
+    ) -> ClaimOutcome {
         let mut guard = in_flight.lock();
-        if let Some(receiver) = guard.get(&key) {
-            let receiver = receiver.clone();
+        if let Some(fetch) = guard.get(&key) {
+            let fetch = fetch.clone();
             drop(guard);
-            return ClaimOutcome::Follower(receiver);
+            return ClaimOutcome::Follower(fetch);
         }
-        let (sender, receiver) = watch::channel(FetchState::Pending);
-        guard.insert(key.clone(), receiver);
+        let (sender, state) = watch::channel(FetchState::Pending);
+        guard.insert(key.clone(), InFlightFetch { limit, state });
         drop(guard);
         ClaimOutcome::Leader(Self {
             key,
@@ -171,9 +210,10 @@ impl CacheKeyClaim {
         &self.key
     }
 
-    /// Publishes the leader's collected batches to any followers waiting on this
-    /// key. Call once the fetch has returned cacheable data, before the write is
-    /// enqueued, so followers can proceed without waiting for the write to land.
+    /// Publishes the leader's collected batches — possibly none — to any
+    /// followers waiting on this key. Call once the fetch has returned a result
+    /// followers may replay, before any write is enqueued, so they can proceed
+    /// without waiting for the write to land.
     fn publish_ready(&mut self, batches: Arc<Vec<RecordBatch>>) {
         // `send_replace` never fails on a closed channel and updates the value
         // that every receiver — including one cloned later — observes.
@@ -219,6 +259,94 @@ enum FollowerResult {
     Ready(Arc<Vec<RecordBatch>>),
     /// The leader published no usable result; the follower fetches for itself.
     Failed,
+}
+
+/// A cache miss served by its own origin fetch, outside the single-flight
+/// coalescing on its key: a follower whose leader published no usable result
+/// or did not answer in time, or a miss the in-flight fetch cannot serve
+/// because it asked the origin for fewer rows ([`InFlightFetch::serves`]).
+///
+/// It holds no claim, so it never writes — the leader owns the write — but it
+/// applies the same `caching_stale_if_error` / empty / error handling the
+/// leader path applies on the arms that do not write.
+struct UncoalescedFetch<'a> {
+    federated: Arc<dyn TableProvider>,
+    dataset_name: &'a str,
+    filters: &'a [Expr],
+    limit: Option<usize>,
+    /// The schema an empty or error stream is given.
+    schema: SchemaRef,
+    stale_if_error: bool,
+    expired_batches: Option<Vec<RecordBatch>>,
+}
+
+impl UncoalescedFetch<'_> {
+    /// Fetches the origin and streams the outcome to the caller.
+    async fn run(self) -> SendableRecordBatchStream {
+        let Self {
+            federated,
+            dataset_name,
+            filters,
+            limit,
+            schema,
+            stale_if_error,
+            expired_batches,
+        } = self;
+
+        match CacheRefreshHelper::fetch_from_source(&federated, dataset_name, filters, limit).await
+        {
+            Ok(batches) if !batches.is_empty() => {
+                let batch_schema = batches[0].schema();
+
+                // A failing origin arrives as a successful fetch whose rows
+                // carry a 429 or 5xx status; serve the expired cached response
+                // instead when `caching_stale_if_error` is enabled.
+                if !cache::batches_cacheable(&batches)
+                    && stale_if_error
+                    && let Some(stale) = expired_batches.filter(|b| !b.is_empty())
+                {
+                    tracing::warn!(
+                        "Origin for dataset '{dataset_name}' answered with a transient failure, so the expired cached response is being served instead because `caching_stale_if_error` is enabled."
+                    );
+                    let stale_schema = stale[0].schema();
+                    return Box::pin(RecordBatchStreamAdapter::new(
+                        stale_schema,
+                        futures::stream::iter(stale.into_iter().map(Ok)),
+                    ));
+                }
+
+                Box::pin(RecordBatchStreamAdapter::new(
+                    batch_schema,
+                    futures::stream::iter(batches.into_iter().map(Ok)),
+                ))
+            }
+            Ok(_) => Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::empty(),
+            )),
+            Err(e) => {
+                if stale_if_error
+                    && let Some(batches) = expired_batches
+                    && !batches.is_empty()
+                {
+                    tracing::warn!(
+                        "Cache miss fetch failed for dataset {dataset_name}, serving stale data due to stale_if_error: {e}"
+                    );
+                    let stale_schema = batches[0].schema();
+                    return Box::pin(RecordBatchStreamAdapter::new(
+                        stale_schema,
+                        futures::stream::iter(batches.into_iter().map(Ok)),
+                    ));
+                }
+
+                tracing::error!("Cache miss fetch failed for dataset {dataset_name}: {e}");
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    futures::stream::once(async move { Err(e) }),
+                ))
+            }
+        }
+    }
 }
 
 pub const CACHE_REFRESHED_AT_COLUMN: &str = "_fetched_at";
@@ -1078,6 +1206,7 @@ impl CacheRefreshHelper {
                 let ClaimOutcome::Leader(_claim) = CacheKeyClaim::acquire(
                     &in_flight_revalidations,
                     compute_cache_key_from_filters_and_namespace(&row_filters, namespace_id),
+                    None,
                 ) else {
                     tracing::debug!(
                         "Skipping stale refresh for dataset {dataset_name}: a write for this entry is already pending"
@@ -1941,24 +2070,34 @@ impl CacheRefreshHelper {
         // Claimed before the origin is asked, not after: see [`CacheKeyClaim`]
         // for why the window this covers has to include the fetch. A caller that
         // finds a fetch already in flight for this key becomes a follower and
-        // replays the leader's batches instead of asking the origin again.
+        // replays the leader's batches instead of asking the origin again —
+        // unless that fetch asked the origin for fewer rows than this caller
+        // needs, in which case it fetches for itself and, holding no claim,
+        // does not write.
         let mut claim = match CacheKeyClaim::acquire(
             &in_flight_revalidations,
             compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id()),
+            limit,
         ) {
             ClaimOutcome::Leader(claim) => claim,
-            ClaimOutcome::Follower(receiver) => {
-                return Self::follow_cache_miss(
-                    receiver,
+            ClaimOutcome::Follower(in_flight) => {
+                let own_fetch = UncoalescedFetch {
                     federated,
                     dataset_name,
                     filters,
                     limit,
-                    fallback_schema,
+                    schema: fallback_schema,
                     stale_if_error,
                     expired_batches,
-                )
-                .await;
+                };
+                if in_flight.serves(limit) {
+                    return Self::follow_cache_miss(in_flight.state, own_fetch).await;
+                }
+                tracing::debug!(
+                    "Cache miss for dataset {dataset_name} found an in-flight fetch for the same key bounded at {fetched:?} rows, below this request's limit {limit:?}; fetching for itself",
+                    fetched = in_flight.limit
+                );
+                return own_fetch.run().await;
             }
         };
 
@@ -2003,11 +2142,7 @@ impl CacheRefreshHelper {
                 // Each arm that does not enqueue drops the claim, which releases
                 // the key for the next writer and publishes `Failed` so any
                 // follower waiting on it falls through to its own fetch.
-                if !batches_cacheable {
-                    tracing::debug!(
-                        "Fetch returned transient HTTP error responses, skipping cache write for dataset={dataset_name}"
-                    );
-                } else {
+                if batches_cacheable {
                     // Share the collected batches with any followers before the
                     // write is enqueued, so they replay these rows without a
                     // second origin call or a re-scan of the accelerator.
@@ -2066,6 +2201,10 @@ impl CacheRefreshHelper {
                     tracing::debug!(
                         "Background cache update performed for dataset={dataset_name}, {cache_rows} rows"
                     );
+                } else {
+                    tracing::debug!(
+                        "Fetch returned transient HTTP error responses, skipping cache write for dataset={dataset_name}"
+                    );
                 }
 
                 // Return ALL data to user (including 5xx responses)
@@ -2074,11 +2213,15 @@ impl CacheRefreshHelper {
                 Box::pin(adapter)
             }
             Ok(_) => {
-                // Source returned empty data (no error, just no rows)
+                // Source returned empty data (no error, just no rows). Nothing
+                // is written, but the empty result is still what every follower
+                // would get from the origin, so publish it rather than letting
+                // the claim's drop send them to the origin one by one.
                 tracing::debug!(
                     "Cache miss - source also has no data for dataset {}",
                     dataset_name
                 );
+                claim.publish_ready(Arc::new(Vec::new()));
                 let empty_stream =
                     RecordBatchStreamAdapter::new(fallback_schema, futures::stream::empty());
                 Box::pin(empty_stream)
@@ -2122,20 +2265,13 @@ impl CacheRefreshHelper {
     /// origin call, and the follower never writes — the leader owns the write.
     /// On [`FetchState::Failed`] (the leader failed, was cancelled, or its
     /// response was not cacheable) or a wait that exceeds
-    /// [`FOLLOWER_WAIT_TIMEOUT`], the follower falls through to its own origin
-    /// fetch, degrading to the behaviour it would have had without coalescing
-    /// while still applying the same `stale_if_error` / empty / error handling
-    /// the leader path applies. It holds no claim, so it cannot double-append.
+    /// [`FOLLOWER_WAIT_TIMEOUT`], the follower runs `own_fetch` instead,
+    /// degrading to the behaviour it would have had without coalescing.
     async fn follow_cache_miss(
         mut receiver: watch::Receiver<FetchState>,
-        federated: Arc<dyn TableProvider>,
-        dataset_name: &str,
-        filters: &[Expr],
-        limit: Option<usize>,
-        fallback_schema: SchemaRef,
-        stale_if_error: bool,
-        expired_batches: Option<Vec<RecordBatch>>,
+        own_fetch: UncoalescedFetch<'_>,
     ) -> SendableRecordBatchStream {
+        let dataset_name = own_fetch.dataset_name;
         tracing::debug!(
             "Cache miss for dataset {dataset_name} is coalescing onto an in-flight fetch for the same key"
         );
@@ -2149,7 +2285,7 @@ impl CacheRefreshHelper {
             Ok(FollowerResult::Ready(batches)) => {
                 if batches.is_empty() {
                     return Box::pin(RecordBatchStreamAdapter::new(
-                        fallback_schema,
+                        own_fetch.schema,
                         futures::stream::empty(),
                     ));
                 }
@@ -2169,30 +2305,14 @@ impl CacheRefreshHelper {
                 tracing::debug!(
                     "The in-flight fetch for dataset {dataset_name} published no result; querying the origin directly"
                 );
-                let result =
-                    Self::fetch_from_source(&federated, dataset_name, filters, limit).await;
-                Self::stream_uncached_source_result(
-                    result,
-                    dataset_name,
-                    fallback_schema,
-                    stale_if_error,
-                    expired_batches,
-                )
+                own_fetch.run().await
             }
             Err(_elapsed) => {
-                tracing::warn!(
-                    "Cache miss for dataset '{dataset_name}' waited longer than {timeout}s on an in-flight fetch for the same key, so it is querying the origin itself.",
+                tracing::debug!(
+                    "Cache miss for dataset {dataset_name} waited longer than {timeout}s on an in-flight fetch for the same key; querying the origin directly",
                     timeout = FOLLOWER_WAIT_TIMEOUT.as_secs()
                 );
-                let result =
-                    Self::fetch_from_source(&federated, dataset_name, filters, limit).await;
-                Self::stream_uncached_source_result(
-                    result,
-                    dataset_name,
-                    fallback_schema,
-                    stale_if_error,
-                    expired_batches,
-                )
+                own_fetch.run().await
             }
         }
     }
@@ -2221,73 +2341,6 @@ impl CacheRefreshHelper {
                 // `Drop` publishes `Failed` before the sender goes away, so this
                 // is a belt-and-braces fall-through rather than an expected path.
                 return FollowerResult::Failed;
-            }
-        }
-    }
-
-    /// Streams the outcome of a source fetch to a caller that holds no claim, so
-    /// it never writes to the cache.
-    ///
-    /// Followers that fall through to their own fetch use this to get the same
-    /// `caching_stale_if_error` / empty / error handling the leader path applies
-    /// on the arms that do not write.
-    fn stream_uncached_source_result(
-        result: DataFusionResult<Vec<RecordBatch>>,
-        dataset_name: &str,
-        fallback_schema: SchemaRef,
-        stale_if_error: bool,
-        expired_batches: Option<Vec<RecordBatch>>,
-    ) -> SendableRecordBatchStream {
-        match result {
-            Ok(batches) if !batches.is_empty() => {
-                let batch_schema = batches[0].schema();
-
-                // A failing origin arrives as a successful fetch whose rows
-                // carry a 429 or 5xx status; serve the expired cached response
-                // instead when `caching_stale_if_error` is enabled.
-                if !cache::batches_cacheable(&batches)
-                    && stale_if_error
-                    && let Some(stale) = expired_batches.filter(|b| !b.is_empty())
-                {
-                    tracing::warn!(
-                        "Origin for dataset '{dataset_name}' answered with a transient failure, so the expired cached response is being served instead because `caching_stale_if_error` is enabled."
-                    );
-                    let stale_schema = stale[0].schema();
-                    return Box::pin(RecordBatchStreamAdapter::new(
-                        stale_schema,
-                        futures::stream::iter(stale.into_iter().map(Ok)),
-                    ));
-                }
-
-                Box::pin(RecordBatchStreamAdapter::new(
-                    batch_schema,
-                    futures::stream::iter(batches.into_iter().map(Ok)),
-                ))
-            }
-            Ok(_) => Box::pin(RecordBatchStreamAdapter::new(
-                fallback_schema,
-                futures::stream::empty(),
-            )),
-            Err(e) => {
-                if stale_if_error
-                    && let Some(batches) = expired_batches
-                    && !batches.is_empty()
-                {
-                    tracing::warn!(
-                        "Cache miss fetch failed for dataset {dataset_name}, serving stale data due to stale_if_error: {e}"
-                    );
-                    let stale_schema = batches[0].schema();
-                    return Box::pin(RecordBatchStreamAdapter::new(
-                        stale_schema,
-                        futures::stream::iter(batches.into_iter().map(Ok)),
-                    ));
-                }
-
-                tracing::error!("Cache miss fetch failed for dataset {dataset_name}: {e}");
-                Box::pin(RecordBatchStreamAdapter::new(
-                    fallback_schema,
-                    futures::stream::once(async move { Err(e) }),
-                ))
             }
         }
     }
@@ -2346,6 +2399,7 @@ impl CacheRefreshHelper {
                             filters,
                             namespace.storage_id(),
                         ),
+                        None,
                     ) {
                         ClaimOutcome::Leader(claim) => {
                             tracing::debug!(
@@ -3286,11 +3340,15 @@ mod tests {
     /// A source that counts every scan and can delay before answering, so a test
     /// can prove single-flight: N concurrent cache misses for one key must reach
     /// the origin exactly once, the rest replaying the leader's batches.
+    ///
+    /// Holds `rows` identical rows and, like the HTTP connector, truncates a
+    /// scan to its `limit`; with no rows it yields no batches at all.
     #[derive(Debug)]
     struct CountingHttpTableProvider {
         schema: SchemaRef,
         content: String,
         status_code: u16,
+        rows: usize,
         scans: Arc<std::sync::atomic::AtomicUsize>,
         delay: Duration,
     }
@@ -3312,9 +3370,16 @@ mod tests {
                 schema,
                 content: content.to_string(),
                 status_code,
+                rows: 1,
                 scans: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 delay,
             }
+        }
+
+        /// The number of rows the origin holds for any filters (default 1).
+        fn with_rows(mut self, rows: usize) -> Self {
+            self.rows = rows;
+            self
         }
 
         fn scan_count(&self) -> usize {
@@ -3337,12 +3402,21 @@ mod tests {
             _state: &dyn Session,
             _projection: Option<&Vec<usize>>,
             _filters: &[Expr],
-            _limit: Option<usize>,
+            limit: Option<usize>,
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
             self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
+            }
+
+            // The HTTP connector truncates its response to the scan's limit,
+            // so a bounded scan returns at most that many of the origin's rows.
+            let rows = limit.map_or(self.rows, |limit| limit.min(self.rows));
+            if rows == 0 {
+                return Ok(Arc::new(DataSourceExec::new(Arc::new(
+                    MemorySourceConfig::try_new(&[vec![]], Arc::clone(&self.schema), None)?,
+                ))));
             }
 
             #[expect(clippy::cast_possible_truncation)]
@@ -3354,11 +3428,11 @@ mod tests {
             let batch = RecordBatch::try_new(
                 Arc::clone(&self.schema),
                 vec![
-                    Arc::new(StringArray::from(vec!["/api/test"])) as ArrayRef,
-                    Arc::new(StringArray::from(vec!["q=test"])) as ArrayRef,
-                    Arc::new(StringArray::from(vec![self.content.as_str()])) as ArrayRef,
-                    Arc::new(UInt16Array::from(vec![self.status_code])) as ArrayRef,
-                    Arc::new(TimestampNanosecondArray::from(vec![Some(now)])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["/api/test"; rows])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["q=test"; rows])) as ArrayRef,
+                    Arc::new(StringArray::from(vec![self.content.as_str(); rows])) as ArrayRef,
+                    Arc::new(UInt16Array::from(vec![self.status_code; rows])) as ArrayRef,
+                    Arc::new(TimestampNanosecondArray::from(vec![Some(now); rows])) as ArrayRef,
                 ],
             )?;
 
@@ -3368,13 +3442,48 @@ mod tests {
         }
     }
 
-    /// Acquires a key as the leader, or panics if a fetch for it is already in
-    /// flight. Test-only convenience for the many claim/refresh tests.
+    /// Acquires a key as the leader of an unbounded fetch, or panics if a fetch
+    /// for it is already in flight. Test-only convenience for the many
+    /// claim/refresh tests.
     fn leader_claim(in_flight: &InFlightRevalidations, key: &str) -> CacheKeyClaim {
-        match CacheKeyClaim::acquire(in_flight, key.to_string()) {
+        match CacheKeyClaim::acquire(in_flight, key.to_string(), None) {
             ClaimOutcome::Leader(claim) => claim,
             ClaimOutcome::Follower(_) => panic!("expected to lead the claim for key {key}"),
         }
+    }
+
+    /// Counts the rows a stream yields.
+    async fn drain_rows(stream: SendableRecordBatchStream) -> usize {
+        drain(stream).await.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    /// An in-flight fetch serves a request only when it asked the origin for at
+    /// least as many rows: unbounded serves anything, bounded serves a request
+    /// bounded at or below it, and nothing bounded serves an unbounded request.
+    #[test]
+    fn an_in_flight_fetch_serves_requests_bounded_at_or_below_its_limit() {
+        let fetch = |limit| InFlightFetch {
+            limit,
+            state: watch::channel(FetchState::Pending).1,
+        };
+
+        assert!(fetch(None).serves(None));
+        assert!(fetch(None).serves(Some(3)));
+        assert!(fetch(Some(3)).serves(Some(3)));
+        assert!(fetch(Some(3)).serves(Some(1)));
+        assert!(
+            !fetch(Some(1)).serves(Some(3)),
+            "a fetch truncated to 1 row cannot answer a request for 3"
+        );
+        assert!(
+            !fetch(Some(3)).serves(None),
+            "a bounded fetch cannot answer an unbounded request"
+        );
+        assert!(
+            !fetch(Some(0)).serves(Some(1)),
+            "a fetch bounded at zero rows answers nothing but another zero-row request"
+        );
+        assert!(fetch(Some(0)).serves(Some(0)));
     }
 
     fn create_test_schema_with_refresh_timestamp() -> SchemaRef {
@@ -4640,8 +4749,6 @@ mod tests {
     /// callers rather than one.
     #[tokio::test]
     async fn concurrent_cache_misses_for_one_key_fetch_the_origin_once() {
-        use futures::StreamExt;
-
         // A delay long enough that the followers reach `acquire` and coalesce
         // while the leader is still inside its single scan.
         let origin = Arc::new(CountingHttpTableProvider::new(
@@ -4683,14 +4790,6 @@ mod tests {
         // so the other four find the claim present and become followers.
         let (s0, s1, s2, s3, s4) = tokio::join!(make(), make(), make(), make(), make());
 
-        async fn drain(mut s: SendableRecordBatchStream) -> Vec<RecordBatch> {
-            let mut out = Vec::new();
-            while let Some(b) = s.next().await {
-                out.push(b.expect("stream"));
-            }
-            out
-        }
-
         let all = [
             drain(s0).await,
             drain(s1).await,
@@ -4723,6 +4822,144 @@ mod tests {
         handle.abort();
     }
 
+    /// Single-flight applies to an empty origin too: N concurrent misses for a
+    /// key the origin has no rows for reach it exactly once, and every caller is
+    /// served the same empty result.
+    #[tokio::test]
+    async fn concurrent_cache_misses_for_an_empty_origin_fetch_it_once() {
+        let origin = Arc::new(
+            CountingHttpTableProvider::new(200, "unused", Duration::from_millis(200)).with_rows(0),
+        );
+        let schema = origin.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let filters = vec![col("content").eq(lit("test"))];
+        let io = tokio::runtime::Handle::current();
+
+        let make = || {
+            CacheRefreshHelper::handle_cache_miss(
+                Arc::clone(&origin) as Arc<dyn TableProvider>,
+                "test_dataset",
+                &filters,
+                None,
+                Arc::clone(&schema),
+                false,
+                false,
+                None,
+                &io,
+                Arc::new(vec![].into()),
+                batch_write_tx.clone(),
+                CacheNamespace::Public,
+                Arc::clone(&in_flight),
+            )
+        };
+
+        let (s0, s1, s2, s3, s4) = tokio::join!(make(), make(), make(), make(), make());
+
+        let served = [
+            drain_rows(s0).await,
+            drain_rows(s1).await,
+            drain_rows(s2).await,
+            drain_rows(s3).await,
+            drain_rows(s4).await,
+        ];
+
+        assert_eq!(
+            origin.scan_count(),
+            1,
+            "five concurrent misses for a key the origin is empty for must reach it exactly once"
+        );
+        assert_eq!(
+            served, [0; 5],
+            "every caller is served the shared empty result"
+        );
+
+        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
+        handle.abort();
+        assert!(
+            accelerator.get_data().is_empty(),
+            "an empty result is not written to the cache"
+        );
+    }
+
+    /// A miss that asks for more rows than the fetch already in flight for its
+    /// key must not replay that fetch. The origin truncates a bounded fetch to
+    /// its limit, so replaying a `LIMIT 1` fetch would hand a `LIMIT 3` caller
+    /// one row where the origin holds three — a wrong result, not a slower one.
+    /// The caller fetches for itself instead and, holding no claim, does not
+    /// write.
+    #[tokio::test]
+    async fn a_miss_bounded_above_the_in_flight_fetch_does_not_replay_it() {
+        let origin = Arc::new(
+            CountingHttpTableProvider::new(200, "row", Duration::from_millis(200)).with_rows(5),
+        );
+        let schema = origin.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let filters = vec![col("content").eq(lit("test"))];
+        let io = tokio::runtime::Handle::current();
+
+        let make = |limit| {
+            CacheRefreshHelper::handle_cache_miss(
+                Arc::clone(&origin) as Arc<dyn TableProvider>,
+                "test_dataset",
+                &filters,
+                limit,
+                Arc::clone(&schema),
+                false,
+                false,
+                None,
+                &io,
+                Arc::new(vec![].into()),
+                batch_write_tx.clone(),
+                CacheNamespace::Public,
+                Arc::clone(&in_flight),
+            )
+        };
+
+        // Polled first, the `LIMIT 1` miss leads and is inside its scan when the
+        // `LIMIT 3` miss reaches `acquire` for the same key.
+        let (leader, follower) = tokio::join!(make(Some(1)), make(Some(3)));
+
+        assert_eq!(
+            drain_rows(leader).await,
+            1,
+            "the leader gets the one row it asked for"
+        );
+        assert_eq!(
+            drain_rows(follower).await,
+            3,
+            "a miss asking for more rows than the in-flight fetch must fetch for itself"
+        );
+        assert_eq!(
+            origin.scan_count(),
+            2,
+            "the bounded-below fetch cannot be shared, so the origin is asked twice"
+        );
+
+        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
+        handle.abort();
+        let written: usize = accelerator
+            .get_data()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            written, 1,
+            "only the leader writes; the caller that fetched for itself holds no claim"
+        );
+    }
+
     /// A leader that drops before publishing a result (cancelled, failed, or
     /// holding a non-cacheable response) publishes `Failed`, so a follower
     /// waiting on it falls through to its own fetch instead of hanging forever.
@@ -4738,7 +4975,8 @@ mod tests {
         // A leader holds the claim; a follower clones its receiver before the
         // leader gives up.
         let leader = leader_claim(&in_flight, "k");
-        let ClaimOutcome::Follower(receiver) = CacheKeyClaim::acquire(&in_flight, "k".to_string())
+        let ClaimOutcome::Follower(in_flight_fetch) =
+            CacheKeyClaim::acquire(&in_flight, "k".to_string(), None)
         else {
             panic!("second caller must be a follower");
         };
@@ -4747,15 +4985,18 @@ mod tests {
         // `Failed`, which the follower's cloned receiver observes.
         drop(leader);
 
+        let filters = [col("content").eq(lit("test"))];
         let mut stream = CacheRefreshHelper::follow_cache_miss(
-            receiver,
-            Arc::clone(&origin) as Arc<dyn TableProvider>,
-            "test_dataset",
-            &[col("content").eq(lit("test"))],
-            None,
-            Arc::clone(&schema),
-            false,
-            None,
+            in_flight_fetch.state,
+            UncoalescedFetch {
+                federated: Arc::clone(&origin) as Arc<dyn TableProvider>,
+                dataset_name: "test_dataset",
+                filters: &filters,
+                limit: None,
+                schema: Arc::clone(&schema),
+                stale_if_error: false,
+                expired_batches: None,
+            },
         )
         .await;
 
@@ -4792,7 +5033,7 @@ mod tests {
             assert_eq!(claim.key(), "k");
             assert!(
                 matches!(
-                    CacheKeyClaim::acquire(&in_flight, "k".to_string()),
+                    CacheKeyClaim::acquire(&in_flight, "k".to_string(), None),
                     ClaimOutcome::Follower(_)
                 ),
                 "a claimed key must make the next caller a follower, not a second leader"
@@ -4805,7 +5046,7 @@ mod tests {
         );
         assert!(
             matches!(
-                CacheKeyClaim::acquire(&in_flight, "k".to_string()),
+                CacheKeyClaim::acquire(&in_flight, "k".to_string(), None),
                 ClaimOutcome::Leader(_)
             ),
             "the key is claimable again"
