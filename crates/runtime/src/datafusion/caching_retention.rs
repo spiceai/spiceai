@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn a_deadline_that_overflows_derives_no_policy() {
         let retention = caching_retention(
-            StaleIfError::For(Duration::MAX - Duration::from_secs(1)),
+            StaleIfError::For(Duration::MAX.saturating_sub(Duration::from_secs(1))),
             Some(Duration::from_secs(30)),
             None,
             false,

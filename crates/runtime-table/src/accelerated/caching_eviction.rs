@@ -1704,7 +1704,7 @@ mod tests {
     fn an_expiry_deadline_that_overflows_yields_no_cutoff() {
         let limits = CacheLimits {
             ttl: Some(Duration::from_secs(30)),
-            stale_if_error: StaleIfError::For(Duration::MAX - Duration::from_secs(1)),
+            stale_if_error: StaleIfError::For(Duration::MAX.saturating_sub(Duration::from_secs(1))),
             ..Default::default()
         };
         assert!(expiry_cutoff(&limits).is_none());

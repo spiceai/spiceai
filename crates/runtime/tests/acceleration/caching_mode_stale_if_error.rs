@@ -20,26 +20,31 @@ limitations under the License.
 //! through the wired path: Spicepod parsing, the accelerator's stored
 //! `_fetched_at`, and the read path's decision when the origin fails.
 //!
-//! One mock origin answers `/items` with a JSON array until it is switched to
-//! `503`. The dataset caches with a short `caching_ttl` and a finite
-//! `caching_stale_if_error`, and the same key is read at three points: while
-//! fresh (served from cache without asking the origin), past the TTL but inside
-//! the window (the origin is asked, answers 503, and the stale rows are served
-//! instead), and past the window (the origin's 503 reaches the client). The
-//! unbounded `enabled` form is pinned alongside as the behavior the window
+//! One mock origin answers `/items` with a JSON array until it is taken down,
+//! after which every fetch fails at connect. The dataset caches with a short
+//! `caching_ttl` and a finite `caching_stale_if_error`, and the same key is read
+//! at three points: while fresh (served from cache without asking the origin),
+//! past the TTL but inside the window (the fetch fails and the stale rows are
+//! served instead), and past the window (the fetch failure reaches the client).
+//! The unbounded `enabled` form is pinned alongside as the behavior the window
 //! replaces.
+//!
+//! The origin is taken down rather than switched to a 5xx because a failing
+//! fetch is the failure mode the window is specified against (#14126: the
+//! connector's timeouts propagate as errors), and because it does not depend on
+//! how the connector shapes an error response into rows.
 //!
 //! The sleeps are deliberate: the TTL and the window are what is under test,
 //! and both are kept to a few seconds.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use app::AppBuilder;
 use arrow::array::{Array, UInt16Array};
-use axum::{Router, http::StatusCode, routing::get};
+use axum::{Router, routing::get};
 use datafusion::error::DataFusionError;
 use datafusion::prelude::*;
 use runtime::Runtime;
@@ -72,47 +77,32 @@ const PAST_WINDOW: Duration = Duration::from_secs(10);
 /// over an entry rather than a single row.
 const ROWS: usize = 3;
 
-/// A mock origin serving `/items` as a JSON array of [`ROWS`] objects while its
-/// status is 200, and a same-shaped one-row array with the failing status once
-/// it is switched. The shape is kept the same so the connector decomposes the
-/// failure the way it decomposes a good response, with the status on the row.
+/// A mock origin serving `/items` as a JSON array of [`ROWS`] objects, counting
+/// the requests that reach it, until it is taken down.
 struct Origin {
     addr: SocketAddr,
-    status: Arc<AtomicU16>,
     fetches: Arc<AtomicUsize>,
-    _shutdown: oneshot::Sender<()>,
+    shutdown: oneshot::Sender<()>,
 }
 
 impl Origin {
     async fn start() -> Self {
-        let status = Arc::new(AtomicU16::new(200));
         let fetches = Arc::new(AtomicUsize::new(0));
-        let served_status = Arc::clone(&status);
         let counter = Arc::clone(&fetches);
         let (tx, rx) = oneshot::channel::<()>();
 
         let app = Router::new().route(
             "/items",
             get(move |uri: axum::http::Uri| {
-                let served_status = Arc::clone(&served_status);
                 let counter = Arc::clone(&counter);
                 async move {
                     counter.fetch_add(1, Ordering::SeqCst);
-                    let code = served_status.load(Ordering::SeqCst);
                     let query = uri.query().unwrap_or_default().to_string();
-                    let body = if code == 200 {
-                        (1..=ROWS)
-                            .map(|rank| format!(r#"{{"rank":{rank},"query":"{query}"}}"#))
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    } else {
-                        format!(r#"{{"rank":0,"query":"{query}"}}"#)
-                    };
-                    (
-                        StatusCode::from_u16(code).expect("a valid status code"),
-                        [("content-type", "application/json")],
-                        format!("[{body}]"),
-                    )
+                    let body = (1..=ROWS)
+                        .map(|rank| format!(r#"{{"rank":{rank},"query":"{query}"}}"#))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    ([("content-type", "application/json")], format!("[{body}]"))
                 }
             }),
         );
@@ -132,18 +122,27 @@ impl Origin {
 
         Self {
             addr,
-            status,
             fetches,
-            _shutdown: tx,
+            shutdown: tx,
         }
-    }
-
-    fn fail_with(&self, status: u16) {
-        self.status.store(status, Ordering::SeqCst);
     }
 
     fn fetches(&self) -> usize {
         self.fetches.load(Ordering::SeqCst)
+    }
+
+    /// Stops the origin and returns once new connections to it are refused, so
+    /// every later fetch fails at connect instead of racing the shutdown.
+    async fn take_down(self) {
+        self.shutdown.send(()).ok();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tokio::net::TcpStream::connect(self.addr).await.is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "the mock origin kept accepting connections after shutdown"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -160,9 +159,9 @@ fn caching_dataset(
             ("file_format", "json"),
             ("allowed_request_paths", "/items"),
             ("request_query_filters", "enabled"),
-            // The origin fails on purpose. The connector's default three retries
-            // with backoff would stretch each failing fetch by seconds and blur
-            // the window edges this test measures.
+            // The origin goes away on purpose. The connector's default three
+            // retries with backoff would stretch each failing fetch by seconds
+            // and blur the window edges this test measures.
             ("max_retries", "0"),
         ]
         .into_iter()
@@ -215,8 +214,8 @@ async fn build_runtime(dataset: Dataset, name: &str) -> Arc<Runtime> {
 }
 
 /// One cache lookup for `query`, as a client would issue it: the
-/// `response_status` of every served row. All 200 is the cached copy of the good
-/// response; 503 is the origin's failure passed through.
+/// `response_status` of every served row, all 200 for the cached copy of the
+/// good response — or the error, when the origin's failure reaches the client.
 async fn fetch_statuses(rt: &Runtime, query: &str) -> Result<Vec<u16>, DataFusionError> {
     let batches = rt
         .datafusion()
@@ -283,16 +282,18 @@ async fn wait_for_cached_rows(
     ))
 }
 
-/// Fills the cache from a healthy origin, fails the origin, and reads the same
-/// key inside and past the `stale-if-error` window. Returns the statuses served
-/// at those two reads.
+/// Fills the cache from a healthy origin, takes the origin down, and reads the
+/// same key inside and past the `stale-if-error` window. Returns what those two
+/// reads served: the inside read must be the stale rows for every form under
+/// test, so it is unwrapped here; the past read is what differs, so it is
+/// returned as is.
 async fn serve_inside_and_past_window(
     name: &str,
     stale_if_error: &str,
     engine: Option<&str>,
     mode: Mode,
     extra_acceleration_params: Vec<(String, String)>,
-) -> Result<(Vec<u16>, Vec<u16>), anyhow::Error> {
+) -> Result<(Vec<u16>, Result<Vec<u16>, DataFusionError>), anyhow::Error> {
     let origin = Origin::start().await;
     let dataset = caching_dataset(
         &origin,
@@ -325,24 +326,22 @@ async fn serve_inside_and_past_window(
         "a fresh entry is served without a fetch"
     );
 
-    origin.fail_with(503);
+    origin.take_down().await;
 
     tokio::time::sleep_until(tokio::time::Instant::from_std(cached_at + INSIDE_WINDOW)).await;
-    let inside = fetch_statuses(&rt, "key=a").await?;
-    assert!(
-        origin.fetches() > fetches_after_fill,
-        "an expired entry is revalidated against the origin before anything is served"
-    );
+    let inside = fetch_statuses(&rt, "key=a")
+        .await
+        .map_err(|e| anyhow::anyhow!("inside the window the read must not fail: {e}"))?;
 
     tokio::time::sleep_until(tokio::time::Instant::from_std(cached_at + PAST_WINDOW)).await;
-    let past = fetch_statuses(&rt, "key=a").await?;
+    let past = fetch_statuses(&rt, "key=a").await;
 
     Ok((inside, past))
 }
 
 /// A finite `caching_stale_if_error: 6s` is `stale-if-error=6`: past the TTL the
-/// stale rows stand in for a failing origin, and past the window the failure
-/// reaches the client.
+/// stale rows stand in for an unreachable origin, and past the window the fetch
+/// failure reaches the client.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_finite_window_serves_stale_inside_it_and_propagates_the_failure_past_it()
 -> Result<(), anyhow::Error> {
@@ -361,13 +360,10 @@ async fn a_finite_window_serves_stale_inside_it_and_propagates_the_failure_past_
     assert_eq!(
         inside,
         vec![200; ROWS],
-        "inside the window the stale rows are served in place of the origin's 503"
+        "inside the window the stale rows are served in place of the fetch failure"
     );
-    assert_eq!(
-        past,
-        vec![503],
-        "past the window the origin's 503 reaches the client instead of the stale rows"
-    );
+    let err = past.expect_err("past the window the fetch failure reaches the client");
+    eprintln!("past the window the client sees: {err}");
     Ok(())
 }
 
@@ -403,7 +399,8 @@ async fn a_finite_window_is_measured_from_a_microsecond_fetched_at_on_duckdb()
         vec![200; ROWS],
         "a microsecond `_fetched_at` is read as inside the window"
     );
-    assert_eq!(past, vec![503], "and as past it once it is");
+    let err = past.expect_err("and as past it once it is");
+    eprintln!("past the window the client sees: {err}");
     Ok(())
 }
 
@@ -425,7 +422,7 @@ async fn enabled_serves_stale_with_no_bound() -> Result<(), anyhow::Error> {
 
     assert_eq!(inside, vec![200; ROWS]);
     assert_eq!(
-        past,
+        past.expect("`enabled` never lets the fetch failure through while a copy is held"),
         vec![200; ROWS],
         "`enabled` keeps serving the stale rows where a finite window would have stopped"
     );
