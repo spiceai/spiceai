@@ -1178,6 +1178,22 @@ impl Runtime {
         // obsolete, so we remove them
         self.df.clear_cached_plans().await;
 
+        // A reload can change what the dataset reads, so results read from its
+        // previous contents must stop being served as fresh, and a query that
+        // planned against the previous registration must not store its result.
+        // Both of those read the table-change clock this marks.
+        if let Err(e) = self
+            .df
+            .caching()
+            .invalidate_for_table(ds.name.clone())
+            .await
+        {
+            tracing::warn!(
+                "Dataset '{}' is updating, but the results cached from its previous contents could not be invalidated, so queries may be answered from them until they expire. Cause: {e}",
+                ds.name
+            );
+        }
+
         match Arc::clone(&self)
             .load_dataset_connector(Arc::clone(&ds))
             .await
@@ -3751,6 +3767,42 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             runtime.df.get_table(&ds.name).await.is_some(),
             registered_before,
             "leaving whatever was registered exactly as it was"
+        );
+    }
+
+    /// A reload marks the results-cache table clock for the dataset it reloads.
+    ///
+    /// The reload replaces what the dataset reads, so a result read from its previous
+    /// contents must stop being served as fresh, and a query that planned against the
+    /// previous registration must not store the result it reads. Both of those are
+    /// decided by that mark: `entry_validity` reads it on every hit, and
+    /// `tables_changed_since` reads it before a result is stored. Clearing the cached
+    /// plans, which is all the reload used to do, changes neither.
+    #[tokio::test]
+    async fn updating_a_dataset_invalidates_the_results_cached_from_it() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let ds = unloadable_dataset(&runtime);
+        let provider = runtime
+            .df
+            .results_cache_provider()
+            .expect("the results cache is enabled by default");
+
+        let tables = std::collections::HashSet::from([ds.name.clone()]);
+        let read_started_at = std::time::Instant::now();
+        assert!(
+            !provider.tables_changed_since(&tables, read_started_at),
+            "nothing has changed this dataset yet"
+        );
+
+        // This dataset's connector cannot be built, so the reload fails after the
+        // point that must invalidate: what the assertion below pins is that the
+        // invalidation happens before the reload touches the registration at all.
+        Arc::clone(&runtime).update_dataset(Arc::clone(&ds)).await;
+
+        assert!(
+            provider.tables_changed_since(&tables, read_started_at),
+            "a reload must mark the table, or results read from the dataset's previous contents \
+             stay servable as fresh until item_ttl expires"
         );
     }
 

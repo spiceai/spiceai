@@ -19,7 +19,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used)] // Benchmarks can panic
 
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{BuildHasher, Hasher};
 use std::hint::black_box;
 use std::sync::Arc;
 
@@ -168,70 +168,9 @@ fn parameterized_plan(schema: &Schema, columns: usize) -> LogicalPlan {
         .expect("the plan")
 }
 
-/// A hasher dispatching on an enum instead of through `Box<dyn Hasher>`: what the plan key
-/// would hash through if the configured algorithm were matched on per write.
-enum EnumHasher {
-    XxHash3(twox_hash::XxHash3_64),
-    Ahash(ahash::AHasher),
-    Siphash(std::hash::DefaultHasher),
-}
-
-impl Hasher for EnumHasher {
-    fn finish(&self) -> u64 {
-        match self {
-            Self::XxHash3(hasher) => hasher.finish(),
-            Self::Ahash(hasher) => hasher.finish(),
-            Self::Siphash(hasher) => hasher.finish(),
-        }
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        match self {
-            Self::XxHash3(hasher) => hasher.write(bytes),
-            Self::Ahash(hasher) => hasher.write(bytes),
-            Self::Siphash(hasher) => hasher.write(bytes),
-        }
-    }
-
-    fn write_u64(&mut self, i: u64) {
-        match self {
-            Self::XxHash3(hasher) => hasher.write_u64(i),
-            Self::Ahash(hasher) => hasher.write_u64(i),
-            Self::Siphash(hasher) => hasher.write_u64(i),
-        }
-    }
-
-    fn write_usize(&mut self, i: usize) {
-        match self {
-            Self::XxHash3(hasher) => hasher.write_usize(i),
-            Self::Ahash(hasher) => hasher.write_usize(i),
-            Self::Siphash(hasher) => hasher.write_usize(i),
-        }
-    }
-
-    fn write_u8(&mut self, i: u8) {
-        match self {
-            Self::XxHash3(hasher) => hasher.write_u8(i),
-            Self::Ahash(hasher) => hasher.write_u8(i),
-            Self::Siphash(hasher) => hasher.write_u8(i),
-        }
-    }
-}
-
-fn enum_hasher(algorithm: HashingAlgorithm) -> Option<EnumHasher> {
-    match algorithm {
-        HashingAlgorithm::XXH3 => Some(EnumHasher::XxHash3(twox_hash::XxHash3_64::default())),
-        HashingAlgorithm::Ahash => Some(EnumHasher::Ahash(
-            ahash::RandomState::with_seeds(1, 2, 3, 4).build_hasher(),
-        )),
-        HashingAlgorithm::Siphash => Some(EnumHasher::Siphash(std::hash::DefaultHasher::new())),
-        _ => None,
-    }
-}
-
-/// A logical-plan results-cache key, computed three ways: the plan's bytes collected and
-/// handed to the boxed hasher in one write (what the key does), each write going through the
-/// boxed hasher, and each write dispatched on an enum.
+/// A logical-plan results-cache key, computed two ways: through the hasher the cache builds
+/// (`KeyHasher`, which matches on the configured algorithm per write), and through a boxed
+/// hasher, which is the virtual call per plan node, expression and field that the enum removes.
 fn bench_plan_key(c: &mut Criterion) {
     let schema = wide_schema(200);
     let mut group = c.benchmark_group("plan_key");
@@ -245,7 +184,7 @@ fn bench_plan_key(c: &mut Criterion) {
         ] {
             let builder = get_hash_builder(algorithm).expect("a supported algorithm");
             group.bench_with_input(
-                BenchmarkId::new(format!("{name}/collected_bytes"), columns),
+                BenchmarkId::new(format!("{name}/enum_dispatch"), columns),
                 &plan,
                 |b, plan| {
                     b.iter(|| {
@@ -262,29 +201,15 @@ fn bench_plan_key(c: &mut Criterion) {
                 &plan,
                 |b, plan| {
                     b.iter(|| {
-                        let mut hasher = builder.build_hasher();
-                        hasher.write_u8(1);
-                        hasher.write(b"principal");
-                        black_box(plan).hash(&mut hasher);
-                        black_box(hasher.finish())
+                        let boxed: Box<dyn Hasher> = Box::new(builder.build_hasher());
+                        black_box(
+                            CacheKey::LogicalPlan(black_box(plan))
+                                .as_raw_key_in_namespace(boxed, 1, b"principal")
+                                .as_u64(),
+                        )
                     });
                 },
             );
-            if enum_hasher(algorithm).is_some() {
-                group.bench_with_input(
-                    BenchmarkId::new(format!("{name}/enum_per_write"), columns),
-                    &plan,
-                    |b, plan| {
-                        b.iter(|| {
-                            let mut hasher = enum_hasher(algorithm).expect("an enum hasher");
-                            hasher.write_u8(1);
-                            hasher.write(b"principal");
-                            black_box(plan).hash(&mut hasher);
-                            black_box(hasher.finish())
-                        });
-                    },
-                );
-            }
         }
     }
     group.finish();
