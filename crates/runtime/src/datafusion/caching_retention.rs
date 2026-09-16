@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn a_finite_stale_if_error_derives_a_bounded_policy() {
         let retention = caching_retention(
-            StaleIfError::For(Duration::from_secs(60)),
+            StaleIfError::For(Duration::from_mins(1)),
             Some(Duration::from_secs(5)),
             None,
             false,
@@ -271,9 +271,9 @@ mod tests {
     #[test]
     fn a_finite_stale_if_error_takes_the_larger_of_it_and_stale_while_revalidate() {
         let CachingRetention::Derive { period, .. } = caching_retention(
-            StaleIfError::For(Duration::from_secs(60)),
+            StaleIfError::For(Duration::from_mins(1)),
             Some(Duration::from_secs(5)),
-            Some(Duration::from_secs(120)),
+            Some(Duration::from_mins(2)),
             false,
             false,
         ) else {

@@ -1425,11 +1425,11 @@ mod tests {
         // A duration is the new form.
         assert_eq!(
             parse_sie("600s").expect("parse"),
-            StaleIfError::For(Duration::from_secs(600))
+            StaleIfError::For(Duration::from_mins(10))
         );
         assert_eq!(
             parse_sie("10m").expect("parse"),
-            StaleIfError::For(Duration::from_secs(600))
+            StaleIfError::For(Duration::from_mins(10))
         );
 
         // Zero normalizes to `Disabled`, so no `staleness <= 0` boundary exists.
@@ -1455,7 +1455,7 @@ mod tests {
 
     #[test]
     fn stale_if_error_helpers_gate_the_read_and_retention_paths() {
-        let d = Duration::from_secs(60);
+        let d = Duration::from_mins(1);
 
         // Only `Disabled` refuses to keep expired batches to fall back to.
         assert!(!StaleIfError::Disabled.serves_stale_on_error());
@@ -1508,7 +1508,7 @@ mod tests {
         for value in [
             StaleIfError::Disabled,
             StaleIfError::Enabled,
-            StaleIfError::For(Duration::from_secs(600)),
+            StaleIfError::For(Duration::from_mins(10)),
             StaleIfError::For(Duration::from_millis(500)),
         ] {
             let rendered = value.to_string();

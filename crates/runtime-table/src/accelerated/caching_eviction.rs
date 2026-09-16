@@ -1659,7 +1659,7 @@ mod tests {
         // Unlike `Enabled`, a finite window leaves a deadline the expiry sweep
         // enforces, so a sweep is worth running even with no byte/item budget.
         let limits = CacheLimits {
-            stale_if_error: StaleIfError::For(Duration::from_secs(60)),
+            stale_if_error: StaleIfError::For(Duration::from_mins(1)),
             ..Default::default()
         };
         assert!(
@@ -1673,7 +1673,7 @@ mod tests {
         // The deadline is `caching_ttl + max(window, swr)` ago. With ttl=10s,
         // window=60s and no swr, the cutoff is ~70s in the past.
         let ttl = Duration::from_secs(10);
-        let window = Duration::from_secs(60);
+        let window = Duration::from_mins(1);
         let limits = CacheLimits {
             ttl: Some(ttl),
             stale_if_error: StaleIfError::For(window),
@@ -1714,7 +1714,7 @@ mod tests {
                 ..Default::default()
             },
             CacheLimits {
-                stale_if_error: StaleIfError::For(Duration::from_secs(60)),
+                stale_if_error: StaleIfError::For(Duration::from_mins(1)),
                 ttl: Some(Duration::from_secs(10)),
                 ..Default::default()
             },

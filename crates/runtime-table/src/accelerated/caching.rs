@@ -4294,7 +4294,7 @@ mod tests {
         let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
         let schema = http_source.schema();
         let max_age = Duration::from_secs(10);
-        let window = StaleIfError::For(Duration::from_secs(60));
+        let window = StaleIfError::For(Duration::from_mins(1));
 
         // Staleness = now - fetched_at - max_age. 30s past the stale point is
         // inside a 60s window: the cached copy is served.
@@ -4327,7 +4327,9 @@ mod tests {
     /// null `_fetched_at` — so it cannot serve a copy of unknown staleness.
     #[tokio::test]
     async fn a_finite_window_fails_closed_on_unknown_staleness() {
-        let window = StaleIfError::For(Duration::from_secs(60));
+        use arrow::array::{StringArray, UInt16Array};
+
+        let window = StaleIfError::For(Duration::from_mins(1));
         let max_age = Duration::from_secs(10);
 
         // A null `_fetched_at` value.
@@ -4341,7 +4343,6 @@ mod tests {
         );
 
         // A batch with no `_fetched_at` column at all.
-        use arrow::array::{StringArray, UInt16Array};
         let schema_no_ts: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("request_path", DataType::Utf8, true),
             Field::new("request_query", DataType::Utf8, true),
@@ -4418,7 +4419,7 @@ mod tests {
         assert_eq!(
             transient_5xx_outcome(
                 stale,
-                StaleIfError::For(Duration::from_secs(60)),
+                StaleIfError::For(Duration::from_mins(1)),
                 Duration::from_secs(10)
             )
             .await,
