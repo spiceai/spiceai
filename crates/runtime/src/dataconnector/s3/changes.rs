@@ -30,6 +30,7 @@ use crate::dataconnector::listing::ListingTableConnector;
 use crate::dataconnector::parameters::ConnectorContext;
 use crate::dataconnector::{ConnectorComponent, DataConnectorError, DataConnectorResult};
 use arrow::array::{ArrayRef, RecordBatch, StringArray, new_null_array};
+use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, SchemaRef};
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -1050,11 +1051,15 @@ async fn process_message(
 struct BackfillCreates {
     batches: Vec<RecordBatch>,
     keys: Vec<String>,
+    /// Prefix-matching keys from this listing, including those skipped as known
+    /// or left unread. Distinguishes an empty prefix from "listed objects but
+    /// none could be read".
+    listed_matching: usize,
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "snapshot and backfill share one listing apply; `pass` names the user-facing warn"
+    reason = "snapshot, backfill, and listing rebuild share one listing apply; `pass` names the user-facing warn"
 )]
 async fn apply_unapplied_objects(
     dataset: &DatasetSpec,
@@ -1065,10 +1070,12 @@ async fn apply_unapplied_objects(
     applied_keys: &Mutex<AppliedKeySet>,
     scope_prefix: &str,
     pass: &'static str,
+    skip_known: bool,
 ) -> std::result::Result<BackfillCreates, StreamError> {
     let listed = object_lister.list_keys().await?;
     let mut batches = Vec::new();
     let mut keys = Vec::new();
+    let mut listed_matching = 0;
     for key in listed {
         let event = S3ObjectEvent {
             event_name: pass.to_string(),
@@ -1079,7 +1086,8 @@ async fn apply_unapplied_objects(
         if !matches_dataset(&event, &config.bucket, scope_prefix) {
             continue;
         }
-        if applied_keys.lock().is_known(&key) {
+        listed_matching += 1;
+        if skip_known && applied_keys.lock().is_known(&key) {
             continue;
         }
         match object_reader.read_object(&config.bucket, &key).await {
@@ -1111,47 +1119,77 @@ async fn apply_unapplied_objects(
             }
         }
     }
-    Ok(BackfillCreates { batches, keys })
+    Ok(BackfillCreates {
+        batches,
+        keys,
+        listed_matching,
+    })
 }
 
-fn rebuild_envelope(
+fn concat_listing_batches(
     schema: &SchemaRef,
-    queue: &Arc<dyn MessageQueue>,
-    receipt_handle: String,
-    applied: &Arc<Mutex<AppliedKeySet>>,
-    keys: Option<Vec<String>>,
+    batches: Vec<RecordBatch>,
+) -> std::result::Result<RecordBatch, StreamError> {
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(Arc::clone(schema)));
+    }
+    if batches.len() == 1 {
+        let Some(batch) = batches.into_iter().next() else {
+            return Ok(RecordBatch::new_empty(Arc::clone(schema)));
+        };
+        return Ok(batch);
+    }
+    concat_batches(schema, &batches).map_err(|error| StreamError::Arrow(error.to_string()))
+}
+
+fn federated_history_unavailable_envelope(
+    schema: &SchemaRef,
+    inner: Box<dyn CommitChange + Send + Sync>,
 ) -> std::result::Result<ChangeEnvelope, StreamError> {
     let (_, batch, is_dataset_ready, _) =
         build_history_unavailable_envelope(schema)?.into_parts()?;
-    let sqs: Box<dyn CommitChange + Send + Sync> = Box::new(SqsDeleteCommitter {
-        queue: Arc::clone(queue),
-        receipt_handle,
-    });
-    let committer = match keys {
-        Some(keys) => applied_keys_committer(applied, keys, sqs),
-        None => sqs,
-    };
     Ok(ChangeEnvelope::from_parts(
-        committer,
+        inner,
         batch,
         is_dataset_ready,
         true,
     ))
 }
 
-fn history_unavailable_envelope(
+fn listing_rebuild_envelope(
     schema: &SchemaRef,
     applied: &Arc<Mutex<AppliedKeySet>>,
     keys: Vec<String>,
+    batches: Vec<RecordBatch>,
+    inner: Box<dyn CommitChange + Send + Sync>,
 ) -> std::result::Result<ChangeEnvelope, StreamError> {
-    let (_, batch, is_dataset_ready, _) =
-        build_history_unavailable_envelope(schema)?.into_parts()?;
+    let data = concat_listing_batches(schema, batches)?;
+    let batch = wrap_data_as_change_batch(schema, &data)?.with_rebuild_from_this_batch(true);
+    applied.lock().replace_in_flight(keys.clone());
     Ok(ChangeEnvelope::from_parts(
-        applied_keys_committer(applied, keys, Box::new(NoOpCommitter)),
+        applied_keys_committer(applied, keys, inner),
         batch,
-        is_dataset_ready,
+        false,
         true,
     ))
+}
+
+fn listing_rebuild_from_objects(
+    dataset: &DatasetSpec,
+    schema: &SchemaRef,
+    applied: &Arc<Mutex<AppliedKeySet>>,
+    listed: BackfillCreates,
+    inner: Box<dyn CommitChange + Send + Sync>,
+    pass: &'static str,
+) -> std::result::Result<ChangeEnvelope, StreamError> {
+    if listed.listed_matching > 0 && listed.keys.is_empty() {
+        tracing::warn!(
+            "Dataset '{}' listed objects during {pass} but could not read any of them, so the accelerator will be rebuilt from the federated table instead and those objects will be retried on the next `s3_changes_backfill_interval`. See: {S3_DOCS}",
+            dataset.name
+        );
+        return federated_history_unavailable_envelope(schema, inner);
+    }
+    listing_rebuild_envelope(schema, applied, listed.keys, listed.batches, inner)
 }
 
 fn create_envelopes(
@@ -1257,6 +1295,7 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                 applied_keys.as_ref(),
                 &config.dataset_prefix,
                 "the empty-accelerator snapshot",
+                true,
             )
             .await?;
             let envelopes = backfill_envelopes(
@@ -1275,18 +1314,35 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                 dataset.name,
                 prefix_display(&config.bucket, &config.key_prefix)
             );
-            // Seed before `history_unavailable`. A listing taken afterwards can
-            // include objects the replace scan never saw; those must stay
-            // eligible for the completeness backfill. Keys stay in-flight until
-            // the replace envelope commits.
-            match object_lister.list_keys().await {
-                Ok(keys) => {
-                    applied_keys.lock().replace_in_flight(keys.clone());
-                    yield history_unavailable_envelope(&schema, &applied_keys, keys)?;
+            // One listing is both the replacement rows and the applied-key
+            // manifest. A later federated scan can include objects this listing
+            // never read; those must stay eligible for the completeness backfill.
+            match apply_unapplied_objects(
+                &dataset,
+                &config,
+                &schema,
+                object_lister.as_ref(),
+                object_reader.as_ref(),
+                applied_keys.as_ref(),
+                &config.dataset_prefix,
+                "the non-empty restart replace",
+                false,
+            )
+            .await
+            {
+                Ok(listed) => {
+                    yield listing_rebuild_from_objects(
+                        &dataset,
+                        &schema,
+                        &applied_keys,
+                        listed,
+                        Box::new(NoOpCommitter),
+                        "the non-empty restart replace",
+                    )?;
                 }
                 Err(error) => {
                     tracing::warn!(
-                        "Dataset '{}' will replace the accelerator from the listing prefix but could not record object keys for backfill skip, so the next listing backfill may re-apply those objects. Cause: {error}. See: {S3_DOCS}",
+                        "Dataset '{}' could not list or read the S3 objects for the restart replace of the accelerator, so the accelerator will be rebuilt from the federated table instead and the next listing backfill may re-apply those objects. Cause: {error}. See: {S3_DOCS}",
                         dataset.name
                     );
                     yield build_history_unavailable_envelope(&schema)?;
@@ -1340,20 +1396,41 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                         }
                     }
                     ProcessOutcome::Rebuild { receipt_handle } => {
-                        let listing_keys = match object_lister.list_keys().await {
-                            Ok(keys) => {
-                                applied_keys.lock().replace_in_flight(keys.clone());
-                                Some(keys)
+                        let sqs: Box<dyn CommitChange + Send + Sync> = Box::new(SqsDeleteCommitter {
+                            queue: Arc::clone(&queue),
+                            receipt_handle,
+                        });
+                        match apply_unapplied_objects(
+                            &dataset,
+                            &config,
+                            &schema,
+                            object_lister.as_ref(),
+                            object_reader.as_ref(),
+                            applied_keys.as_ref(),
+                            &config.dataset_prefix,
+                            "an ObjectRemoved rebuild",
+                            false,
+                        )
+                        .await
+                        {
+                            Ok(listed) => {
+                                yield listing_rebuild_from_objects(
+                                    &dataset,
+                                    &schema,
+                                    &applied_keys,
+                                    listed,
+                                    sqs,
+                                    "an ObjectRemoved rebuild",
+                                )?;
                             }
                             Err(error) => {
                                 tracing::warn!(
-                                    "Dataset '{}' will rebuild the accelerator from the listing prefix but could not refresh the applied-object set, so the next listing backfill may re-apply current objects. Cause: {error}. See: {S3_DOCS}",
+                                    "Dataset '{}' could not list or read the S3 objects for an ObjectRemoved rebuild, so the accelerator will be rebuilt from the federated table instead and the next listing backfill may re-apply current objects. Cause: {error}. See: {S3_DOCS}",
                                     dataset.name
                                 );
-                                None
+                                yield federated_history_unavailable_envelope(&schema, sqs)?;
                             }
-                        };
-                        yield rebuild_envelope(&schema, &queue, receipt_handle, &applied_keys, listing_keys)?;
+                        }
                     }
                     ProcessOutcome::Ack { receipt_handle } => {
                         if let Err(error) = queue.delete(&receipt_handle).await {
@@ -1377,6 +1454,7 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                     applied_keys.as_ref(),
                     &config.key_prefix,
                     "a listing backfill",
+                    true,
                 )
                 .await
                 {
@@ -2085,6 +2163,7 @@ mod tests {
             &applied,
             "events/",
             "a listing backfill",
+            true,
         )
         .await
         .expect("backfill should succeed");
@@ -2414,8 +2493,96 @@ mod tests {
             envelopes.len()
         );
         assert!(envelopes[0].history_unavailable());
+        assert!(
+            envelopes[0].rebuild_from_this_batch(),
+            "non-empty rebuild must carry the listing snapshot, not ask for a later federated scan"
+        );
+        assert_eq!(names_in(&envelopes[0]), vec!["existing".to_string()]);
         assert!(envelopes[1].is_dataset_ready());
         assert_eq!(names_in(&envelopes[2]), vec!["arrived".to_string()]);
+        let arrived_count = envelopes
+            .iter()
+            .flat_map(names_in)
+            .filter(|name| name == "arrived")
+            .count();
+        assert_eq!(
+            arrived_count,
+            1,
+            "an object that arrived after the rebuild listing must be backfilled once, not duplicated by a later scan, got {arrived_count} from {} envelopes",
+            envelopes.len()
+        );
+        assert!(
+            !envelopes
+                .iter()
+                .flat_map(names_in)
+                .any(|name| name == "stale-federated"),
+            "federated-table rows must not substitute for the listing snapshot"
+        );
+    }
+
+    /// Copilot harness: `captured={'a'}; rebuild={'a','b'}; candidates=rebuild-captured`
+    /// must not mark `b` applied before its rows are emitted, and must not put
+    /// `b` on the rebuild envelope from a later listing or federated scan.
+    #[tokio::test]
+    async fn stream_nonempty_rebuild_snapshot_is_the_listing_not_a_later_federated_scan() {
+        let queue: Arc<dyn MessageQueue> = Arc::new(FailingQueue {
+            remaining_failures: Mutex::new(2),
+        });
+        let reader = Arc::new(MapObjectReader {
+            objects: HashMap::from([
+                (
+                    "my-bucket/events/existing.parquet".to_string(),
+                    vec![id_name_batch(&[1], &["existing"])],
+                ),
+                (
+                    "my-bucket/events/arrived_during_rebuild.parquet".to_string(),
+                    vec![id_name_batch(&[2], &["arrived"])],
+                ),
+            ]),
+            fail_keys: vec![],
+        });
+        let lister: Arc<dyn ObjectLister> = Arc::new(SequenceLister {
+            listings: Mutex::new(vec![
+                vec!["events/existing.parquet".into()],
+                vec![
+                    "events/existing.parquet".into(),
+                    "events/arrived_during_rebuild.parquet".into(),
+                ],
+            ]),
+        });
+        let mut config = default_config();
+        config.backfill_interval = Duration::from_millis(1);
+        let stream = stream_s3_changes(S3ChangesStreamParts {
+            dataset: events_dataset(),
+            federated_table: federated_table(id_name_batch(&[99], &["stale-federated"])),
+            acceleration: AccelerationContents::NonEmpty,
+            queue,
+            object_reader: reader,
+            object_lister: lister,
+            config,
+        });
+        let envelopes = collect_until_idle(stream, 3).await;
+        assert!(
+            envelopes.len() >= 3,
+            "expected listing rebuild + ready + backfill of the post-listing object, got {}",
+            envelopes.len()
+        );
+        assert!(envelopes[0].history_unavailable());
+        assert!(envelopes[0].rebuild_from_this_batch());
+        assert!(!envelopes[0].is_dataset_ready());
+        assert_eq!(names_in(&envelopes[0]), vec!["existing".to_string()]);
+        assert!(envelopes[1].is_dataset_ready());
+        assert_eq!(names_in(&envelopes[2]), vec!["arrived".to_string()]);
+        let all_names: Vec<String> = envelopes.iter().flat_map(names_in).collect();
+        assert_eq!(
+            all_names.iter().filter(|name| *name == "arrived").count(),
+            1,
+            "arrived must appear once (backfill only), got {all_names:?}"
+        );
+        assert!(
+            !all_names.contains(&"stale-federated".to_string()),
+            "replacement rows must be the first listing, not the federated table, got {all_names:?}"
+        );
     }
 
     #[tokio::test]
@@ -2447,7 +2614,12 @@ mod tests {
             envelopes.len()
         );
         assert!(envelopes[0].history_unavailable());
+        assert!(
+            envelopes[0].rebuild_from_this_batch(),
+            "non-empty rebuild must overwrite from the listing snapshot"
+        );
         assert!(!envelopes[0].is_dataset_ready());
+        assert_eq!(names_in(&envelopes[0]), vec!["missed".to_string()]);
         assert!(envelopes[1].is_dataset_ready());
         assert!(envelopes[1].is_empty());
     }
