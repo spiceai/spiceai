@@ -170,12 +170,27 @@ fn keys_with_nulls(n: usize, key: impl Fn(usize) -> Option<u128>) -> Vec<u128> {
     (0..n).map(|i| key(i).unwrap_or(0)).collect()
 }
 
-/// One column's order-preserving keys plus the top of the key space its arm
-/// maps into, which is the normalization range to use when no statistics bound
-/// is available.
-struct ColumnKeys {
-    keys: Vec<u128>,
-    domain_max: u128,
+/// Top of the key space [`column_order_keys`] maps `data_type` into, i.e. the
+/// normalization range to use when statistics carry no bound for the column.
+///
+/// Derived from the type alone, so a caller can resolve the range before
+/// touching a single row.
+fn key_domain_max(data_type: &DataType) -> u128 {
+    match data_type {
+        // 16-byte keys: the unscaled decimal, and the string/binary prefix.
+        DataType::Decimal128(_, _)
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView => U128_KEY_DOMAIN,
+        // Every other arm with a value encoding fits its key in 64 bits.
+        other if is_clusterable(other) => U64_KEY_DOMAIN,
+        // No arm: every key is the reserved zero, so the coordinate is constant
+        // too and a zero span is the honest range.
+        _ => 0,
+    }
 }
 
 /// Compute one order-preserving key per row of `array`.
@@ -185,16 +200,15 @@ struct ColumnKeys {
 /// integers, floats, booleans, dates, times, timestamps, durations,
 /// `Decimal128`, and the utf8/binary families (incl. their `View`/`Large`
 /// variants).
-fn column_order_keys(array: &dyn Array) -> DFResult<ColumnKeys> {
+fn column_order_keys(array: &dyn Array) -> DFResult<Vec<u128>> {
     let n = array.len();
 
-    let (keys, domain_max) = match array.data_type() {
+    let keys = match array.data_type() {
         DataType::Boolean => {
             let a = array.as_boolean();
-            let keys = keys_with_nulls(n, |i| {
+            keys_with_nulls(n, |i| {
                 (!a.is_null(i)).then(|| key_from_i64(i64::from(a.value(i))))
-            });
-            (keys, U64_KEY_DOMAIN)
+            })
         }
         DataType::Int8
         | DataType::Int16
@@ -208,75 +222,65 @@ fn column_order_keys(array: &dyn Array) -> DFResult<ColumnKeys> {
         | DataType::Duration(_) => {
             let arr = cast(array, &DataType::Int64)?;
             let a = arr.as_primitive::<Int64Type>();
-            let keys = keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_i64(a.value(i))));
-            (keys, U64_KEY_DOMAIN)
+            keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_i64(a.value(i))))
         }
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
             let arr = cast(array, &DataType::UInt64)?;
             let a = arr.as_primitive::<UInt64Type>();
-            let keys = keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_u64(a.value(i))));
-            (keys, U64_KEY_DOMAIN)
+            keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_u64(a.value(i))))
         }
         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
             let arr = cast(array, &DataType::Float64)?;
             let a = arr.as_primitive::<Float64Type>();
-            let keys = keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_f64(a.value(i))));
-            (keys, U64_KEY_DOMAIN)
+            keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_f64(a.value(i))))
         }
         // Read the unscaled `i128` directly: casting a decimal to `Int64` would
         // divide out the scale, collapsing every value that shares an integer
         // part onto one key.
         DataType::Decimal128(_, _) => {
             let a = array.as_primitive::<Decimal128Type>();
-            let keys = keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_i128(a.value(i))));
-            (keys, U128_KEY_DOMAIN)
+            keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_i128(a.value(i))))
         }
         // String/binary families read the value's byte prefix directly per
         // offset width — no cast to the `i32`-offset variant, which would fail
         // (or truncate) once a `Large`/`View` array's data exceeds `i32::MAX`.
         DataType::Utf8 => {
             let a = array.as_string::<i32>();
-            let keys = keys_with_nulls(n, |i| {
+            keys_with_nulls(n, |i| {
                 (!a.is_null(i)).then(|| key_from_bytes(a.value(i).as_bytes()))
-            });
-            (keys, U128_KEY_DOMAIN)
+            })
         }
         DataType::LargeUtf8 => {
             let a = array.as_string::<i64>();
-            let keys = keys_with_nulls(n, |i| {
+            keys_with_nulls(n, |i| {
                 (!a.is_null(i)).then(|| key_from_bytes(a.value(i).as_bytes()))
-            });
-            (keys, U128_KEY_DOMAIN)
+            })
         }
         DataType::Utf8View => {
             let a = array.as_string_view();
-            let keys = keys_with_nulls(n, |i| {
+            keys_with_nulls(n, |i| {
                 (!a.is_null(i)).then(|| key_from_bytes(a.value(i).as_bytes()))
-            });
-            (keys, U128_KEY_DOMAIN)
+            })
         }
         DataType::Binary => {
             let a = array.as_binary::<i32>();
-            let keys = keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_bytes(a.value(i))));
-            (keys, U128_KEY_DOMAIN)
+            keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_bytes(a.value(i))))
         }
         DataType::LargeBinary => {
             let a = array.as_binary::<i64>();
-            let keys = keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_bytes(a.value(i))));
-            (keys, U128_KEY_DOMAIN)
+            keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_bytes(a.value(i))))
         }
         DataType::BinaryView => {
             let a = array.as_binary_view();
-            let keys = keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_bytes(a.value(i))));
-            (keys, U128_KEY_DOMAIN)
+            keys_with_nulls(n, |i| (!a.is_null(i)).then(|| key_from_bytes(a.value(i))))
         }
         // Unsupported type: contribute nothing to the curve (all rows equal on
-        // this dimension) rather than failing the whole promotion. A zero domain
-        // makes the normalized coordinate constant too.
-        _ => (vec![0u128; n], 0),
+        // this dimension) rather than failing the whole promotion. Its
+        // [`key_domain_max`] is zero, so the coordinate is constant too.
+        _ => vec![0u128; n],
     };
 
-    Ok(ColumnKeys { keys, domain_max })
+    Ok(keys)
 }
 
 /// Whether `data_type` has a dedicated value-encoding arm in
@@ -331,15 +335,16 @@ pub(crate) fn bound_key(scalar: &ScalarValue, column_type: &DataType) -> Option<
         return None;
     }
     let array = scalar.to_array().ok()?;
-    column_order_keys(array.as_ref())
-        .ok()?
-        .keys
-        .first()
-        .copied()
+    column_order_keys(array.as_ref()).ok()?.first().copied()
 }
 
 /// Rescale an order-preserving key onto the dense `0..=MAX_CODE` coordinate
 /// space spanned by `[lo, hi]`, clamping values outside it.
+///
+/// Runs once per value per clustering column, so it is inlined: `lo`/`hi` are
+/// fixed for a whole promotion and the prologue below hoists out of the row
+/// loop once the call is inlined.
+#[inline]
 fn normalize(key: u128, lo: u128, hi: u128) -> u64 {
     let span = hi.saturating_sub(lo);
     if span == 0 {
@@ -456,19 +461,13 @@ pub fn cluster_keys(columns: &[ArrayRef], bounds: &[ColumnBounds]) -> DFResult<B
                 "cluster_keys columns must all have the same length".to_string(),
             ));
         }
-        let column = column_order_keys(c.as_ref())?;
+        let keys = column_order_keys(c.as_ref())?;
         let (lo, hi) = bounds
             .get(dim)
             .copied()
             .flatten()
-            .unwrap_or((0, column.domain_max));
-        coords.push(
-            column
-                .keys
-                .iter()
-                .map(|&key| normalize(key, lo, hi))
-                .collect(),
-        );
+            .unwrap_or((0, key_domain_max(c.data_type())));
+        coords.push(keys.iter().map(|&key| normalize(key, lo, hi)).collect());
     }
 
     let width = BYTES_PER_COLUMN * k;
@@ -861,7 +860,7 @@ mod tests {
         // would rescale against a range the values do not live in.
         let values = vec![-9i64, 0, 41];
         let col: ArrayRef = Arc::new(Int64Array::from(values.clone()));
-        let keys = column_order_keys(col.as_ref()).expect("column keys").keys;
+        let keys = column_order_keys(col.as_ref()).expect("column keys");
         for (value, key) in values.iter().zip(keys) {
             assert_eq!(
                 bound_key(&ScalarValue::Int64(Some(*value)), &DataType::Int64),
