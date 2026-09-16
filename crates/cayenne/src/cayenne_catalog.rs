@@ -1398,6 +1398,21 @@ impl CayenneCatalog {
             {
                 self.update_table_schema(&stored_metadata.table_id, &plan.evolved_schema)
                     .await?;
+                if plan.changes_decimal_scale() {
+                    // Vortex stats blobs store unscaled integers and decode them
+                    // with the current schema's scale. A scale change would
+                    // silently shift every persisted bound (123.45 at scale 2
+                    // becomes 1.2345 at scale 4). Drop them so they are rebuilt
+                    // from file footers against the evolved schema.
+                    self.clear_table_statistics(&stored_metadata.table_id)
+                        .await?;
+                    self.clear_snapshot_file_statistics(&stored_metadata.table_id)
+                        .await?;
+                    tracing::info!(
+                        table = table_name,
+                        "Cleared persisted column statistics for table '{table_name}' because a decimal column's scale changed, so file pruning and metadata aggregates will rebuild them from the data files"
+                    );
+                }
                 tracing::info!(
                     table = table_name,
                     "Cayenne table schema evolved in place: {}",

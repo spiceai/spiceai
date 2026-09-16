@@ -28,7 +28,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::TableReference;
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::{
-    ColumnOption, CreateTable, CreateTableOptions, SqlOption, Statement as SQLStatement,
+    ColumnOption, CreateTable, CreateTableOptions, Expr, SqlOption, Statement as SQLStatement,
     TableConstraint, WrappedCollection,
 };
 
@@ -115,17 +115,7 @@ fn extract_and_store_extensions(
     let cluster_by_exprs = create_table
         .cluster_by
         .clone()
-        .map_or_else(Vec::new, |wrapped| match wrapped {
-            WrappedCollection::Parentheses(exprs) => exprs,
-            WrappedCollection::NoWrapping(exprs) => match exprs.as_slice() {
-                // `GenericDialect` represents `CLUSTER BY (a, b)` as one tuple
-                // expression, while Snowflake's parser represents the same
-                // surface as a parenthesized collection. Normalize both ASTs
-                // before catalog-specific validation.
-                [datafusion::sql::sqlparser::ast::Expr::Tuple(items)] => items.clone(),
-                _ => exprs,
-            },
-        });
+        .map_or_else(Vec::new, normalize_cluster_by_exprs);
 
     // Build the extension from WITH options.
     let mut extension = if let Some(ref options) = with_options {
@@ -537,6 +527,33 @@ fn validate_partition_key_in_primary_key(
     Ok(())
 }
 
+/// Flatten a `CLUSTER BY` AST into the column expressions Cayenne validates.
+///
+/// `GenericDialect` represents `CLUSTER BY (a, b)` as one tuple and
+/// `CLUSTER BY (a)` as a nested identifier. Snowflake's parser uses a
+/// parenthesized collection. Unwrap all three before catalog-specific
+/// validation, matching [`extract_partition_column_names`].
+fn normalize_cluster_by_exprs(wrapped: WrappedCollection<Vec<Expr>>) -> Vec<Expr> {
+    let exprs = match wrapped {
+        WrappedCollection::Parentheses(exprs) | WrappedCollection::NoWrapping(exprs) => exprs,
+    };
+    flatten_cluster_by_exprs(exprs)
+}
+
+fn flatten_cluster_by_exprs(exprs: Vec<Expr>) -> Vec<Expr> {
+    match exprs.as_slice() {
+        [Expr::Tuple(items)] => flatten_cluster_by_exprs(items.clone()),
+        [Expr::Nested(inner)] => flatten_cluster_by_exprs(vec![inner.as_ref().clone()]),
+        _ => exprs
+            .into_iter()
+            .map(|expr| match expr {
+                Expr::Nested(inner) => *inner,
+                other => other,
+            })
+            .collect(),
+    }
+}
+
 /// Extract simple column names from a `PARTITION BY` expression.
 fn extract_partition_column_names(expr: &datafusion::sql::sqlparser::ast::Expr) -> Vec<String> {
     use datafusion::sql::sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
@@ -782,6 +799,27 @@ mod tests {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
             vec!["region", "id"]
+        );
+    }
+
+    #[test]
+    fn test_extract_cluster_by_single_parenthesized_column() {
+        let ct = parse_create_table("CREATE TABLE foo (id INT, region TEXT) CLUSTER BY (region)");
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+        let (_, store_key) = extract_and_store_extensions(ct, &store).expect("should succeed");
+        assert!(store_key.is_some());
+        let ext = store
+            .write()
+            .expect("store lock should not be poisoned")
+            .remove(&TableReference::parse_str("foo"))
+            .expect("should have entry");
+        assert_eq!(
+            ext.cluster_by
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["region"],
+            "CLUSTER BY (region) must unwrap to the identifier, not a nested expression"
         );
     }
 

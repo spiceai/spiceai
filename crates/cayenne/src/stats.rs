@@ -170,18 +170,29 @@ fn scalar_to_df(scalar: &Scalar) -> Option<ScalarValue> {
             // width. Restore then retags from the Arrow schema so an explicit
             // `Decimal32`/`Decimal64`/`Decimal256` column gets its own variant.
             let value = scalar.as_decimal().decimal_value()?;
-            if let Some(v128) = value.cast::<i128>() {
-                Some(ScalarValue::Decimal128(
-                    Some(v128),
-                    decimal_type.precision(),
-                    decimal_type.scale(),
-                ))
+            let precision = decimal_type.precision();
+            let scale = decimal_type.scale();
+            // Vortex `SUM` widens precision by 10, capped at 76. A small
+            // `Decimal128(38, 2)` sum is still an i128, but precision 48 is
+            // not a valid `Decimal128`. Keep values that fit in 38 digits as
+            // `Decimal128`; anything wider is `Decimal256`.
+            if precision <= 38 {
+                if let Some(v128) = value.cast::<i128>() {
+                    Some(ScalarValue::Decimal128(Some(v128), precision, scale))
+                } else {
+                    let v256 = value.cast::<VortexI256>()?;
+                    Some(ScalarValue::Decimal256(
+                        Some(ArrowI256::from_le_bytes(v256.to_le_bytes())),
+                        precision,
+                        scale,
+                    ))
+                }
             } else {
                 let v256 = value.cast::<VortexI256>()?;
                 Some(ScalarValue::Decimal256(
                     Some(ArrowI256::from_le_bytes(v256.to_le_bytes())),
-                    decimal_type.precision(),
-                    decimal_type.scale(),
+                    precision,
+                    scale,
                 ))
             }
         }
@@ -300,13 +311,43 @@ fn decimal_bound_as_i256(sv: &ScalarValue) -> Option<ArrowI256> {
     }
 }
 
+fn decimal_scale(sv: &ScalarValue) -> Option<i8> {
+    match sv {
+        ScalarValue::Decimal32(_, _, scale)
+        | ScalarValue::Decimal64(_, _, scale)
+        | ScalarValue::Decimal128(_, _, scale)
+        | ScalarValue::Decimal256(_, _, scale) => Some(*scale),
+        _ => None,
+    }
+}
+
+/// Multiply (or refuse to divide) an unscaled decimal so it represents the
+/// same value at `to_scale`. Schema evolution never shrinks scale, and a
+/// shrink would drop fractional digits, so that direction returns `None`.
+fn rescale_unscaled_decimal(value: ArrowI256, from_scale: i8, to_scale: i8) -> Option<ArrowI256> {
+    if from_scale == to_scale {
+        return Some(value);
+    }
+    let delta = i32::from(to_scale) - i32::from(from_scale);
+    if delta < 0 {
+        return None;
+    }
+    let times = u32::try_from(delta).ok()?;
+    let ten = ArrowI256::from_i128(10);
+    let mut scaled = value;
+    for _ in 0..times {
+        scaled = scaled.checked_mul(ten)?;
+    }
+    Some(scaled)
+}
+
 fn decimal_bound_as_width(
     sv: &ScalarValue,
     width: DecimalWidth,
     precision: u8,
     scale: i8,
 ) -> Option<ScalarValue> {
-    let value = decimal_bound_as_i256(sv)?;
+    let value = rescale_unscaled_decimal(decimal_bound_as_i256(sv)?, decimal_scale(sv)?, scale)?;
     match width {
         DecimalWidth::ThirtyTwo => Some(ScalarValue::Decimal32(
             Some(i32::try_from(value.to_i128()?).ok()?),
@@ -560,6 +601,7 @@ pub fn file_statistics_to_df(
 /// what rows written before those sizes were persisted look like. It is the
 /// serializing counterpart of the already-public `deserialize_file_statistics` and
 /// `file_statistics_to_df`.
+#[must_use]
 pub fn statistics_to_persisted_blob(stats: &Statistics, schema: &Schema) -> Option<Vec<u8>> {
     if stats.column_statistics.len() != schema.fields().len() {
         return None;
@@ -567,10 +609,34 @@ pub fn statistics_to_persisted_blob(stats: &Statistics, schema: &Schema) -> Opti
     let column_stats: Vec<StatsSet> = stats
         .column_statistics
         .iter()
-        .map(column_stats_to_stats_set)
+        .zip(schema.fields())
+        .map(|(cs, field)| {
+            column_stats_to_stats_set(&align_column_stats_to_schema(cs, field.data_type()))
+        })
         .collect();
     let file_stats = build_file_statistics(column_stats, schema);
     serialize_file_statistics(&file_stats).ok()
+}
+
+/// Copy min/max onto `column_type`, rescaling decimal unscaled values when
+/// the bound's scale is narrower. A bound that cannot be represented as
+/// `column_type` is dropped rather than persisted at the wrong scale.
+fn align_column_stats_to_schema(cs: &ColumnStatistics, column_type: &DataType) -> ColumnStatistics {
+    let align = |bound: &Precision<ScalarValue>| -> Precision<ScalarValue> {
+        let Some(value) = bound.get_value() else {
+            return bound.clone();
+        };
+        match retag_bound_to_column(value.clone(), column_type) {
+            Some(aligned) if bound.is_exact().is_some() => Precision::Exact(aligned),
+            Some(aligned) => Precision::Inexact(aligned),
+            None => Precision::Absent,
+        }
+    };
+    ColumnStatistics {
+        min_value: align(&cs.min_value),
+        max_value: align(&cs.max_value),
+        ..cs.clone()
+    }
 }
 
 /// Restore `DataFusion` scan statistics from a persisted Vortex blob.
@@ -973,6 +1039,50 @@ mod tests {
         let col = restored_column(DataType::Decimal256(40, 2), min.clone(), max.clone());
         assert_eq!(col.min_value, DfPrecision::Exact(min));
         assert_eq!(col.max_value, DfPrecision::Exact(max));
+    }
+
+    /// A bound computed at scale 2 and persisted against a scale-4 schema must
+    /// be rewritten so 123.45 stays 123.45, not 1.2345.
+    #[test]
+    fn persisting_decimal_bounds_against_a_wider_scale_rescales() {
+        let schema = Schema::new(vec![Field::new("c", DataType::Decimal128(14, 4), true)]);
+        let stats = Statistics {
+            num_rows: DfPrecision::Exact(2),
+            total_byte_size: DfPrecision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: DfPrecision::Exact(0),
+                min_value: DfPrecision::Exact(ScalarValue::Decimal128(Some(12_345), 10, 2)),
+                max_value: DfPrecision::Exact(ScalarValue::Decimal128(Some(67_890), 10, 2)),
+                sum_value: DfPrecision::Absent,
+                distinct_count: DfPrecision::Absent,
+                byte_size: DfPrecision::Absent,
+            }],
+        };
+        let blob = statistics_to_persisted_blob(&stats, &schema).expect("blob serializes");
+        let restored = statistics_from_persisted_blob(&blob, &schema, 2).expect("blob restores");
+        assert_eq!(
+            restored.column_statistics[0].min_value,
+            DfPrecision::Exact(ScalarValue::Decimal128(Some(1_234_500), 14, 4)),
+            "123.45 at scale 2 must become 123.4500 at scale 4"
+        );
+        assert_eq!(
+            restored.column_statistics[0].max_value,
+            DfPrecision::Exact(ScalarValue::Decimal128(Some(6_789_000), 14, 4))
+        );
+    }
+
+    #[test]
+    fn a_decimal_sum_wider_than_decimal128_restores_as_decimal256() {
+        let scalar = Scalar::decimal(
+            DecimalValue::I128(90),
+            DecimalDType::new(48, 2),
+            Nullability::Nullable,
+        );
+        assert_eq!(
+            scalar_to_df(&scalar),
+            Some(ScalarValue::Decimal256(Some(i256::from_i128(90)), 48, 2)),
+            "Vortex SUM precision 48 is not a valid Decimal128"
+        );
     }
 
     /// A `Binary` bound must survive the round-trip byte-for-byte, tagged with
