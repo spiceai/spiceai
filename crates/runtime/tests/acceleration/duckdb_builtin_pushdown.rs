@@ -558,10 +558,13 @@ async fn duckdb_accelerated_sha256_agrees_with_local() -> Result<(), anyhow::Err
 /// (regression test for #13809).
 ///
 /// The body covers the whole regexp deny-list decision, not `regexp_match`
-/// alone: `regexp_instr` and `regexp_count` are denied here too and are checked
-/// the same way, while `regexp_like` and `regexp_replace` are the controls that
-/// must *still* be pushed down -- `regexp_like` in particular is what keeps the
-/// negative assertions from being vacuous.
+/// alone: `regexp_instr` is denied here too and is checked the same way,
+/// `regexp_count` is pushed down again through its NULL-preserving rendering
+/// (#13870, pinned in detail by
+/// `duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local`),
+/// while `regexp_like` and `regexp_replace` are the controls that must *still*
+/// be pushed down -- `regexp_like` in particular is what keeps the negative
+/// assertions from being vacuous.
 #[tokio::test]
 async fn duckdb_accelerated_regexp_builtins_agree_with_local() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));

@@ -973,36 +973,25 @@ mod tests {
         }
     }
 
-    /// Build a no-arg scalar-function expression with the given name so we can
-    /// probe a `FunctionSupport` by name regardless of the real UDF impl.
-    fn make_named_expr(name: &str) -> Expr {
-        Expr::ScalarFunction(ScalarFunction::new_udf(
-            Arc::new(stub_scalar_udf(name)),
-            vec![],
-        ))
-    }
-
-    /// The same probe with one argument, for a name whose backend answers
-    /// per-call as well as per-name: a `FunctionSupport` carrying a
+    /// Build a scalar-function expression with the given name and arguments so
+    /// we can probe a `FunctionSupport` by name regardless of the real UDF impl.
+    ///
+    /// A name whose backend answers per-call as well as per-name — a
+    /// `FunctionSupport` carrying a
     /// [`ScalarCallSupport`](datafusion_table_providers::util::supported_functions::ScalarCallSupport)
-    /// asks its dialect to render the call, and the no-arg probe is a call the
-    /// planner cannot build and the dialect refuses on arity alone.
-    fn make_named_expr_of_one_arg(name: &str) -> Expr {
+    /// asks its dialect to render the call — needs a call shape the dialect can
+    /// render: the no-arg probe is a call the planner cannot build and the
+    /// dialect refuses on arity alone, so it says nothing about the name.
+    fn make_named_call(name: &str, args: Vec<Expr>) -> Expr {
         Expr::ScalarFunction(ScalarFunction::new_udf(
             Arc::new(stub_scalar_udf(name)),
-            vec![lit("  padded  ")],
+            args,
         ))
     }
 
-    /// `regexp_count(str, pattern)` with a literal pattern. The `DuckDB`
-    /// handler renders only a call whose pattern it can screen at unparse time
-    /// (#13870), so the no-arg probe is refused per call — for the shape, not
-    /// the name — and cannot tell whether the name is denied.
-    fn make_regexp_count_call() -> Expr {
-        Expr::ScalarFunction(ScalarFunction::new_udf(
-            Arc::new(stub_scalar_udf("regexp_count")),
-            vec![lit("ab"), lit("a")],
-        ))
+    /// The no-arg probe, for a name answered by name alone.
+    fn make_named_expr(name: &str) -> Expr {
+        make_named_call(name, vec![])
     }
 
     #[test]
@@ -1142,7 +1131,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                support.supports(&make_named_expr_of_one_arg("btrim"), None),
+                support.supports(&make_named_call("btrim", vec![lit("  padded  ")]), None),
                 !denied,
                 "btrim pushdown for {backend} is wrong: expected denied={denied}"
             );
@@ -1259,7 +1248,10 @@ mod tests {
                 );
             }
             assert!(
-                support.supports(&make_regexp_count_call(), None),
+                support.supports(
+                    &make_named_call("regexp_count", vec![lit("ab"), lit("a")]),
+                    None
+                ),
                 "regexp_count with a literal pattern is rendered by the DuckDB dialect and must be pushed down"
             );
         }

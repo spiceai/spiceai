@@ -156,10 +156,12 @@ fn duckdb_builtin_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)
 /// and the deny-list stay in sync automatically.
 ///
 /// A name in [`crate::function_support::DUCKDB_DENIED_BUILTINS`] is filtered out
-/// rather than trusted not to appear: a handler whose rendering turns out not
-/// to be value-preserving can stay in the dialect while it is fixed (#13870 is
-/// the precedent), and "has a handler" must not be read as "may be pushed
-/// down" while that is true.
+/// rather than trusted not to appear. The dialect carries no handler for a
+/// denied name (`the_constructed_duckdb_dialect_renders_no_denied_builtin`
+/// asserts it), and a handler whose rendering is unfaithful for some call
+/// shapes refuses those shapes per call instead (#13870 is the precedent); the
+/// filter is defence in depth, so "has a handler" can never be read as "may be
+/// pushed down".
 #[must_use]
 pub fn duckdb_native_function_names() -> Vec<&'static str> {
     duckdb_scalar_overrides()

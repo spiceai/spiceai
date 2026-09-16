@@ -66,7 +66,7 @@ pub(super) const RE2_MAX_REPETITION: u32 = 1000;
 
 /// Why a pattern is outside what both engines read alike — see the module
 /// doc for the reasoning behind each.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) enum EngineDependentSyntax {
     /// The kernel cannot parse it; local evaluation delivers the kernel's own
     /// error, which is the right one for the user to see.
@@ -202,25 +202,23 @@ impl EngineNeutralSyntax<'_> {
         }
         let bound = match repetition.op.kind {
             RepetitionKind::Range(ref range) => {
-                let canonical = match *range {
-                    RepetitionRange::Exactly(n) => format!("{{{n}}}"),
-                    RepetitionRange::AtLeast(n) => format!("{{{n},}}"),
-                    RepetitionRange::Bounded(n, m) => format!("{{{n},{m}}}"),
-                };
+                // The canonical print is the only spelling RE2 reads as a
+                // repetition; the parser also accepts `{01}` and `{1, 2}`.
                 let lazy = if repetition.greedy { "" } else { "?" };
+                let (canonical, bound) = match *range {
+                    RepetitionRange::Exactly(n) => (format!("{{{n}}}{lazy}"), n),
+                    RepetitionRange::AtLeast(n) => (format!("{{{n},}}{lazy}"), n),
+                    RepetitionRange::Bounded(n, m) => (format!("{{{n},{m}}}{lazy}"), m),
+                };
                 let span = &repetition.op.span;
                 let spelled = self
                     .pattern
                     .get(span.start.offset..span.end.offset)
                     .unwrap_or_default();
-                if spelled != format!("{canonical}{lazy}") {
+                if spelled != canonical {
                     return Err(EngineDependentSyntax::RepetitionSpelling);
                 }
-                match *range {
-                    RepetitionRange::Exactly(n)
-                    | RepetitionRange::AtLeast(n)
-                    | RepetitionRange::Bounded(_, n) => n,
-                }
+                bound
             }
             RepetitionKind::ZeroOrOne | RepetitionKind::ZeroOrMore | RepetitionKind::OneOrMore => 1,
         };
@@ -286,7 +284,8 @@ impl Visitor for EngineNeutralSyntax<'_> {
             ClassSetItem::Union(_) => Ok(()),
             ClassSetItem::Literal(literal) => Self::literal(literal),
             ClassSetItem::Range(range) => {
-                Self::literal(&range.start).and_then(|()| Self::literal(&range.end))
+                Self::literal(&range.start)?;
+                Self::literal(&range.end)
             }
             ClassSetItem::Empty(_) | ClassSetItem::Bracketed(_) => {
                 Err(EngineDependentSyntax::NestedOrEmptyClass)

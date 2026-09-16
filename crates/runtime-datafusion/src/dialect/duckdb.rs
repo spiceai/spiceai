@@ -183,8 +183,8 @@ fn wrap_in_call(inner: ast::Expr, function_name: &str) -> ast::Expr {
 }
 
 /// An unsigned integer literal.
-fn number_literal(digits: &str) -> ast::Expr {
-    ast::Expr::Value(sqlparser::ast::Value::Number(digits.to_string(), false).into())
+fn number_literal(digits: impl Into<String>) -> ast::Expr {
+    ast::Expr::Value(sqlparser::ast::Value::Number(digits.into(), false).into())
 }
 
 /// The text of a string-literal argument, or `None` for any other shape — a
@@ -215,7 +215,7 @@ enum PatternRefusal {
 impl std::fmt::Display for PatternRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Syntax(syntax) => write!(f, "{syntax}"),
+            Self::Syntax(syntax) => std::fmt::Display::fmt(syntax, f),
             Self::MayMatchEmpty => f.write_str(
                 "it can match the empty string, which DuckDB counts differently from DataFusion",
             ),
@@ -745,7 +745,7 @@ impl DuckDBRegexpFunction {
                 0,
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Substring {
                     expr: Box::new(input),
-                    substring_from: Some(Box::new(number_literal(&num_str))),
+                    substring_from: Some(Box::new(number_literal(num_str))),
                     substring_for: None,
                     special: true,
                     shorthand: false,
@@ -1218,11 +1218,12 @@ mod tests {
             "duckdb_native_function_names() missing rand; got {names:?}"
         );
         // Still derived from the override list, so the two cannot drift — but the
-        // relation is "overrides minus the denied built-ins" rather than 1:1. A
-        // handler whose rendering turns out unfaithful can be denied by name
-        // while it is fixed (#13870 is the precedent); asserting equal lengths
-        // would forbid that combination and force the handler to be deleted to
-        // express the deny.
+        // relation is "overrides minus the denied built-ins" rather than 1:1,
+        // because the filter is defence in depth: a denied name has no handler
+        // (`the_constructed_duckdb_dialect_renders_no_denied_builtin` asserts it)
+        // and a handler unfaithful for some call shapes refuses them per call
+        // (#13870); asserting equal lengths would tie this test to the deny-list's
+        // contents instead.
         let overrides: BTreeSet<&str> = crate::dialect::duckdb_scalar_overrides()
             .into_iter()
             .map(|(name, _)| name)
