@@ -93,6 +93,7 @@ fn keyed_reference_requested_rows(offset: usize, fetch_past_offset: usize) -> us
 /// query asked for. Uses [`keyed_reference_requested_rows`], then at least
 /// `fetched_rows` so a collected stream that already ended is treated as ended,
 /// but never above [`MAX_KEYED_REFERENCE_ROWS`].
+#[cfg(test)]
 fn keyed_reference_compare_requested_rows(
     offset: usize,
     fetch_past_offset: usize,
