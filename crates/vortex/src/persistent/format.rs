@@ -78,6 +78,7 @@ use super::segment_cache;
 use super::segment_cache::SharedSegmentCache;
 use super::sink::{ShardSpec, VortexSink};
 use super::source::VortexSource;
+use super::write_observer::VortexWriteObserver;
 use crate::PrecisionExt as _;
 use crate::convert::TryToDataFusion;
 
@@ -282,6 +283,7 @@ pub struct VortexFormat {
     session: VortexSession,
     opts: VortexTableOptions,
     access_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>>,
+    write_observer: Option<Arc<dyn VortexWriteObserver>>,
     segment_cache: Option<Arc<SharedSegmentCache>>,
     write_shard: Option<WriteShardConfig>,
 }
@@ -293,6 +295,10 @@ impl Debug for VortexFormat {
             .field(
                 "access_plan_provider",
                 &self.access_plan_provider.as_ref().map(|_| "configured"),
+            )
+            .field(
+                "write_observer",
+                &self.write_observer.as_ref().map(|_| "configured"),
             )
             .field("segment_cache", &self.segment_cache)
             .finish_non_exhaustive()
@@ -476,6 +482,7 @@ impl VortexFormat {
             session,
             opts,
             access_plan_provider: None,
+            write_observer: None,
             segment_cache,
             write_shard: None,
         }
@@ -605,6 +612,22 @@ impl VortexFormat {
             session: self.session.clone(),
             opts: self.opts.clone(),
             access_plan_provider: Some(access_plan_provider),
+            write_observer: self.write_observer.clone(),
+            segment_cache: self.segment_cache.clone(),
+            write_shard: self.write_shard.clone(),
+        }
+    }
+
+    /// Returns a format whose writes report the file and file-local row position
+    /// of every batch they emit, so a caller can build a row-address index during
+    /// the write rather than by reading the finished files back.
+    #[must_use]
+    pub fn with_write_observer(&self, write_observer: Arc<dyn VortexWriteObserver>) -> Self {
+        Self {
+            session: self.session.clone(),
+            opts: self.opts.clone(),
+            access_plan_provider: self.access_plan_provider.clone(),
+            write_observer: Some(write_observer),
             segment_cache: self.segment_cache.clone(),
             write_shard: self.write_shard.clone(),
         }
@@ -622,6 +645,7 @@ impl VortexFormat {
             session: self.session.clone(),
             opts: self.opts.clone(),
             access_plan_provider: self.access_plan_provider.clone(),
+            write_observer: self.write_observer.clone(),
             segment_cache: self.segment_cache.clone(),
             write_shard: Some(config),
         }
@@ -1129,6 +1153,7 @@ impl FileFormat for VortexFormat {
             self.session.clone(),
             target_file_size,
             shard_spec,
+            self.write_observer.clone(),
         ));
 
         Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)) as _)

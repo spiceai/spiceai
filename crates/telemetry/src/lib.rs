@@ -3169,6 +3169,104 @@ pub mod cayenne {
             })
             .record(shards, dimensions);
     }
+
+    static LOOKUP_INDEX_PROBE: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Counts point-lookup index probes by outcome, so an indexed
+    /// run can be told apart from one that silently fell back to the ordinary
+    /// scan. Outcomes (the `outcome` dimension): `selected` (row selection
+    /// attached), `empty` (complete index miss, no candidate rows), `unbuilt`
+    /// (no published index yet), `snapshot_mismatch` (the scan's file set does
+    /// not match the indexed snapshot), `deletions` (deletion state the
+    /// index does not combine with a row selection). `dimensions` carries
+    /// `table`, `shape` and `outcome`.
+    pub fn track_lookup_index_probe(dimensions: &[KeyValue]) {
+        LOOKUP_INDEX_PROBE
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_lookup_index_probe_total")
+                    .with_description(
+                        "Cayenne point-lookup index probes, labelled by table, lookup shape and outcome.",
+                    )
+                    .with_unit("probes")
+                    .build()
+            })
+            .add(1, dimensions);
+    }
+
+    static LOOKUP_INDEX_CANDIDATE_FILES: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Candidate FILES a selected probe left in the scan's file list. Divide by
+    /// `cayenne_lookup_index_probe_total{outcome="selected"}` for the mean; it is
+    /// an average over probes, not a per-query trace.
+    pub fn track_lookup_index_candidate_files(files: u64, dimensions: &[KeyValue]) {
+        LOOKUP_INDEX_CANDIDATE_FILES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_lookup_index_candidate_files_total")
+                    .with_description(
+                        "Candidate files retained by Cayenne point-lookup index probes.",
+                    )
+                    .with_unit("files")
+                    .build()
+            })
+            .add(files, dimensions);
+    }
+
+    static LOOKUP_INDEX_CANDIDATE_ROWS: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Candidate ROW POSITIONS handed to Vortex as an explicit selection. These
+    /// are row addresses, not decoded rows: Vortex still reads whole encoded
+    /// segments and dictionaries covering them.
+    pub fn track_lookup_index_candidate_rows(rows: u64, dimensions: &[KeyValue]) {
+        LOOKUP_INDEX_CANDIDATE_ROWS
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_lookup_index_candidate_rows_total")
+                    .with_description(
+                        "Candidate row positions selected by Cayenne point-lookup index probes.",
+                    )
+                    .with_unit("rows")
+                    .build()
+            })
+            .add(rows, dimensions);
+    }
+
+    static LOOKUP_INDEX_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Estimated resident size of a published point-lookup index. This is a
+    /// structural estimate (key bytes, table slots, posting lists), NOT a
+    /// measured allocator footprint; compare it with process RSS.
+    pub fn track_lookup_index_bytes(bytes: u64, dimensions: &[KeyValue]) {
+        LOOKUP_INDEX_BYTES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_lookup_index_bytes")
+                    .with_description("Estimated resident size of the Cayenne point-lookup index.")
+                    .with_unit("bytes")
+                    .build()
+            })
+            .record(bytes, dimensions);
+    }
+
+    static LOOKUP_INDEX_BUILD_DURATION_MS: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Wall-clock cost of building a point-lookup index, reported separately
+    /// from query execution.
+    pub fn track_lookup_index_build_duration(duration: Duration, dimensions: &[KeyValue]) {
+        LOOKUP_INDEX_BUILD_DURATION_MS
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_lookup_index_build_duration_ms")
+                    .with_description("Wall-clock time to build the Cayenne point-lookup index.")
+                    .with_unit("ms")
+                    .build()
+            })
+            .record(
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                dimensions,
+            );
+    }
 }
 
 #[cfg(test)]

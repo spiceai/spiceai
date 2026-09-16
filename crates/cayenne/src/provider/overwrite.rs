@@ -242,6 +242,13 @@ impl PreparedOverwrite {
         // catalog clear and insert already committed together, so the in-memory
         // inline counters must go from "old corpus" to "these rows" without a
         // window in which the new snapshot is paired with an empty inline view.
+        // Ahead of the visibility flip: an index keyed to a snapshot no scan can
+        // see yet is inert (the scan-time snapshot check refuses it), so
+        // publishing it early is safe, while publishing it late would leave a
+        // window in which every lookup falls back to a full scan.
+        self.table
+            .publish_lookup_index_for_snapshot(&self.new_snapshot_id)
+            .await;
         self.table
             .publish_overwrite_snapshot(
                 &self.new_snapshot_id,
@@ -347,6 +354,9 @@ impl PreparedOverwrite {
         // writer can't acquire the lock and start a new commit while the
         // staged snapshot directory is mid-deletion.
         let _write_guard = self.write_guard;
+
+        // The snapshot these postings address is about to be deleted.
+        self.table.discard_lookup_index_build();
 
         // Best-effort cleanup of the new snapshot directory. Object stores
         // (S3) don't have a single "remove dir" call; we leave object-store
@@ -578,14 +588,20 @@ impl CayenneTableProvider {
         // full write concurrency (no size cap on the fan-out). Deliberately NOT
         // sized from the bytes the probe buffered: that is only a lower bound, and
         // under-sharding a multi-GB refresh to one writer would serialize the encode.
+        // Build the point-lookup index from the rows this write is already
+        // touching. The sink reports each batch's file and file-local position,
+        // so the index is complete when the write is — no second pass over the
+        // finished files, and nothing to rebuild after the flip.
+        let lookup_index_observer = self.begin_lookup_index_build(&new_snapshot_id);
         let (row_count, _files_written, write_stats_acc) = self
-            .write_to_snapshot(
+            .write_to_snapshot_observed(
                 data,
                 target_size_bytes,
                 &new_snapshot_id,
                 target_partitions,
                 None,
                 write_policy,
+                lookup_index_observer,
             )
             .await?;
 

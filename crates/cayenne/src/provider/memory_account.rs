@@ -55,6 +55,7 @@ struct AccountState {
     keyset_bytes: usize,
     deletion_bytes: usize,
     cold_existence_bytes: usize,
+    lookup_index_bytes: usize,
 }
 
 impl AccountState {
@@ -62,7 +63,8 @@ impl AccountState {
         let total = self
             .keyset_bytes
             .saturating_add(self.deletion_bytes)
-            .saturating_add(self.cold_existence_bytes);
+            .saturating_add(self.cold_existence_bytes)
+            .saturating_add(self.lookup_index_bytes);
         // `resize` is infallible (over-commits the greedy pool). See the
         // `CayenneMemoryAccount` docstring for why deletions must never
         // fail-to-fit.
@@ -70,7 +72,7 @@ impl AccountState {
     }
 }
 
-/// A coherent read of one table's accounting: the three components Cayenne
+/// A coherent read of one table's accounting: the components Cayenne
 /// computed, and the total that reached the `DataFusion` pool. Every figure is
 /// bytes.
 pub(crate) struct MemoryAccountSnapshot {
@@ -80,8 +82,10 @@ pub(crate) struct MemoryAccountSnapshot {
     pub deletion_index: usize,
     /// The cold-tier PK existence view.
     pub cold_existence: usize,
+    /// The point-lookup index.
+    pub lookup_index: usize,
     /// What the `DataFusion` pool reservation actually holds — the sum of the
-    /// three above as of this same read.
+    /// components above as of this same read.
     pub reserved: usize,
 }
 
@@ -94,6 +98,7 @@ impl CayenneMemoryAccount {
                 keyset_bytes: 0,
                 deletion_bytes: 0,
                 cold_existence_bytes: 0,
+                lookup_index_bytes: 0,
             }),
         }
     }
@@ -152,8 +157,20 @@ impl CayenneMemoryAccount {
         state.resize_to_total();
     }
 
-    /// Current total reserved bytes (keyset + deletions + cold existence). For
-    /// observability and tests.
+    /// Account the resident bytes of the point-lookup index. Reset to 0 when the
+    /// index is dropped or replaced.
+    ///
+    /// Unlike the deletion index this one is always safe to drop — a query that
+    /// loses it falls back to an ordinary scan — so the reservation is both
+    /// visibility AND the signal its own cap is derived against.
+    pub(crate) fn set_lookup_index_bytes(&self, bytes: usize) {
+        let mut state = self.state.lock();
+        state.lookup_index_bytes = bytes;
+        state.resize_to_total();
+    }
+
+    /// Current total reserved bytes (keyset + deletions + cold existence +
+    /// lookup index). For observability and tests.
     #[must_use]
     pub(crate) fn reserved_bytes(&self) -> usize {
         self.state.lock().reservation.size()
@@ -176,6 +193,7 @@ impl CayenneMemoryAccount {
             keyset: state.keyset_bytes,
             deletion_index: state.deletion_bytes,
             cold_existence: state.cold_existence_bytes,
+            lookup_index: state.lookup_index_bytes,
             reserved: state.reservation.size(),
         }
     }

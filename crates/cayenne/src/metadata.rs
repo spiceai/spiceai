@@ -822,6 +822,25 @@ pub struct VortexConfig {
     /// sorted tables (`sort_columns` forces a single serial writer).
     #[serde(default)]
     pub shard_key_columns: Vec<String>,
+    /// Composite equality keys to maintain a point-lookup row-location index on,
+    /// each as `"ColA+ColB"` (from `cayenne_lookup_index_keys`). Empty = no
+    /// index, and the whole mechanism is inert.
+    ///
+    /// The index maps an exact composite key to the physical
+    /// `(file, file-local row position)` addresses holding it, so a lookup whose
+    /// predicate pins both columns reads those rows instead of scanning every
+    /// candidate file. It is a READ accelerator over one snapshot: it changes no
+    /// bytes on disk, so it is runtime-only and never compared by
+    /// `configuration_matches` — turning it on or off never recreates the table.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lookup_index_keys: Vec<String>,
+    /// Cap on the point-lookup index's estimated resident bytes
+    /// (`cayenne_lookup_index_max_bytes`). `None` derives the cap from
+    /// [`Self::pk_keyset_cache_mb`], since both are long-lived per-table resident
+    /// state outside query execution. A build that exceeds the cap is abandoned
+    /// and the table keeps scanning normally. Runtime-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup_index_max_bytes: Option<usize>,
     /// Compression strategy to use for Vortex files
     /// Defaults to Btrblocks
     pub compression_strategy: CompressionStrategy,
@@ -1503,6 +1522,8 @@ impl Default for VortexConfig {
     fn default() -> Self {
         Self {
             footer_cache_mb: None,
+            lookup_index_keys: Vec::new(),
+            lookup_index_max_bytes: None,
             segment_cache_mb: 256,
             // Derive intra-file decode concurrency from target partitions and the
             // planned file count.

@@ -1966,6 +1966,25 @@ impl CayenneAccelerator {
                 config.sort_columns_origin = cayenne::metadata::SortColumnsOrigin::Inferred;
             }
 
+            // Point-lookup index keys. Each entry is one composite equality key
+            // ('ColA+ColB'); an entry that is not a pair is dropped with a
+            // warning rather than failing the dataset.
+            if let Some(keys) = acceleration.params.get("cayenne_lookup_index_keys") {
+                config.lookup_index_keys = keys
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            if let Some(max_bytes) = acceleration.params.get("cayenne_lookup_index_max_bytes") {
+                match max_bytes.trim().parse::<usize>() {
+                    Ok(parsed) => config.lookup_index_max_bytes = Some(parsed),
+                    Err(e) => tracing::warn!(
+                        "Dataset '{table_name}': 'cayenne_lookup_index_max_bytes' is not a byte count ({e}); the index is sized from the table's memory configuration instead."
+                    ),
+                }
+            }
+
             // Parse shard key columns (the hash-clustering key for intra-write
             // sharding; the engine derives it from the primary key when unset)
             if let Some(shard_cols_str) = acceleration
@@ -3080,8 +3099,8 @@ fn retention_period_never_reclaimed_warning(table_name: &str) -> String {
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    64,
-    { S3_PARAMS_LEN + 64 },
+    66,
+    { S3_PARAMS_LEN + 66 },
 >(
     S3_PARAMETERS,
     [
@@ -3158,6 +3177,10 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("sort_columns_origin")
             .description("Provenance of 'sort_columns'. Normally set by schema inference rather than by hand: 'user' (the default when absent) means the sort order was configured explicitly and is authoritative, while 'inferred' means schema inference filled it from the source's declared order (the primary key, for most CDC tables), which is a guess and is outranked by the filter columns actually observed on scans, so the adaptive layout can cluster for the real workload. Setting it explicitly is supported and is useful for reproducing the inferred configuration in a benchmark or test.")
             .one_of(&["user", "inferred"]),
+        ParameterSpec::component("lookup_index_keys")
+            .description("Comma-separated composite equality keys to maintain a point-lookup row-location index on, each written 'ColA+ColB' (e.g. 'TenantId+ServiceId,TenantId+PoolId'). A query that pins BOTH columns of a key to equality literals reads only the matching rows instead of scanning every candidate file; every other query is unaffected. The index is in-memory and per-snapshot, rebuilt by each full refresh, and is reserved against the same memory budget as the primary-key keyset. Unset (the default) means no index is built."),
+        ParameterSpec::component("lookup_index_max_bytes")
+            .description("Cap in bytes on the point-lookup index's estimated resident size. When unset it derives from 'pk_keyset_cache_mb', since both hold long-lived per-table state outside query execution. A build that exceeds the cap is abandoned and the table keeps scanning normally — the index is always safe to drop."),
         ParameterSpec::component("shard_key_columns")
             .description("Comma-separated list of columns to hash-cluster rows by during intra-write sharding (the parallel encode fan-out), e.g. 'tenant_id'. When unset, the shard key derives from the primary key (PK-hash clustering); tables without a primary key shard round-robin. Schema inference fills this from the source's declared partition/shard key when the user leaves it unset. Ignored for sorted tables: sort_columns forces a single serial writer."),
         ParameterSpec::component("compression_strategy")
