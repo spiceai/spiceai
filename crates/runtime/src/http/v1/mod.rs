@@ -1037,6 +1037,7 @@ mod tests {
         use datafusion::error::DataFusionError;
         use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use http_body::Body as _;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, true),
@@ -1091,5 +1092,28 @@ mod tests {
                 "streamed JSON must match buffered arrow_to_json output"
             );
         }
+
+        // A complete small result is still a chunked body. Sending it whole with
+        // `Content-Length` is an HTTP framing change and needs an Enhancement.
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let data: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(std::iter::once(Ok::<_, DataFusionError>(make(
+                vec![Some(1)],
+                vec![Some("a")],
+            )))),
+        ));
+        let response = query_stream_to_http_response(
+            data,
+            CacheStatus::CacheMiss,
+            ResponseMimeType::Json,
+            pool,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.body().size_hint().exact().is_none(),
+            "JSON responses must stream; an exact size hint is a Content-Length body"
+        );
     }
 }
