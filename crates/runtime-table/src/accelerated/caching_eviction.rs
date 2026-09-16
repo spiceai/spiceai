@@ -57,9 +57,9 @@ limitations under the License.
 //! swept a 2,500,000-entry `DuckDB` acceleration every five minutes for 84
 //! minutes without failing, but the ranking materialises one record per entry
 //! while it runs. Each entry's key strings are deferred until a delete
-//! predicate actually names it — at most [`MAX_ENTRIES_PER_SWEEP`] of them, and
+//! predicate actually names it, at most [`MAX_ENTRIES_PER_SWEEP`] of them, and
 //! none at all for the doomed entries the range clears (see [`EntryKey`],
-//! [`DoomedSplit::delete_terms`]) — so ranking itself allocates nothing per
+//! [`DoomedSplit::delete_terms`]), so ranking itself avoids allocating per
 //! entry beyond the `EntryCost` record. Keeping a running tally beside the
 //! table instead is the alternative this module exists to avoid; see below.
 //!
@@ -605,35 +605,14 @@ fn unmeasurable_payload_columns(schema: &arrow::datatypes::Schema) -> Vec<String
 /// Where a ranked entry's key strings live.
 ///
 /// Ranking needs `rows`/`bytes`/`oldest`/`newest`/`matches_configured` for
-/// every entry the aggregate returns, but the key is only ever read by a
-/// per-entry delete predicate — and [`nameable`] caps how many of those a
-/// sweep ever names at [`MAX_ENTRIES_PER_SWEEP`], while the `bulk_range` path
-/// ([`partition_doomed`]) needs none at all. A measured run swept 2,500,000
-/// entries and materialised a key for every one of them though at most 512
-/// were ever named; `Deferred` instead keeps a pointer back into the ranking
-/// batches, so [`read_utf8`]'s allocation only happens for the entries a
+/// every entry the aggregate returns, but only for per-key delete predicates (
+/// generally a small fraction of entries). `EntryKey` instead keeps a pointer back
+/// to the [`RecordBatch`], so [`read_utf8`]'s allocation only happens for the entries a
 /// delete predicate actually names.
-enum EntryKey {
-    Deferred {
-        batch: usize,
-        row: usize,
-    },
-    /// A key held directly rather than by a `(batch, row)` pointer, for tests
-    /// that build an [`EntryCost`] without a `RecordBatch`.
-    #[cfg(test)]
-    Eager(Vec<(String, Option<String>)>),
-}
-
-impl std::fmt::Debug for EntryKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EntryKey::Deferred { batch, row } => {
-                write!(f, "EntryKey::Deferred {{ batch: {batch}, row: {row} }}")
-            }
-            #[cfg(test)]
-            EntryKey::Eager(key) => write!(f, "EntryKey::Eager({key:?})"),
-        }
-    }
+#[derive(Debug)]
+struct EntryKey {
+    batch: usize,
+    row: usize,
 }
 
 impl EntryKey {
@@ -644,27 +623,23 @@ impl EntryKey {
         batches: &[RecordBatch],
         key_columns: &[String],
     ) -> Vec<(String, Option<String>)> {
-        match self {
-            EntryKey::Deferred { batch, row } => {
-                #[cfg(test)]
-                tests::count_key_extraction();
-                key_columns
-                    .iter()
-                    .map(|name| (name.clone(), read_utf8(&batches[*batch], name, *row)))
-                    .collect()
-            }
-            #[cfg(test)]
-            EntryKey::Eager(key) => key.clone(),
-        }
+        #[cfg(test)]
+        tests::count_key_extraction();
+        key_columns
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    read_utf8(&batches[self.batch], name, self.row),
+                )
+            })
+            .collect()
     }
 }
 
 /// One cache entry as the ranking query sees it: its key values and what it
 /// costs against each budget.
 struct EntryCost {
-    /// Not read during ranking, selection or partitioning — only
-    /// [`DoomedSplit::delete_terms`] resolves it, and only for the entries a
-    /// per-key predicate ends up naming.
     key: EntryKey,
     rows: u64,
     bytes: u64,
@@ -1017,7 +992,7 @@ async fn rank_entries(
             // one the aggregate did not produce, so an absent aggregate needs
             // no flag of its own here.
             entries.push(EntryCost {
-                key: EntryKey::Deferred {
+                key: EntryKey {
                     batch: batch_index,
                     row,
                 },
@@ -1243,9 +1218,12 @@ mod tests {
         assert!(entry_key_columns(&schema).is_empty());
     }
 
+    /// An entry for tests that never resolve a key — only `partition_doomed`'s
+    /// range/name split, never `named_paths`/`doomed_paths`. The `(batch, row)`
+    /// pointer is never dereferenced by those tests.
     fn cost(oldest: Option<i64>, newest: Option<i64>) -> EntryCost {
         EntryCost {
-            key: EntryKey::Eager(vec![("request_path".to_string(), Some("/x".to_string()))]),
+            key: EntryKey { batch: 0, row: 0 },
             rows: 1,
             bytes: 1,
             oldest,
@@ -1381,11 +1359,51 @@ mod tests {
         );
     }
 
+    /// The key columns `named_cost`/`ranked` build their `RecordBatch` under.
+    fn key_columns() -> Vec<String> {
+        vec!["request_path".to_string()]
+    }
+
+    /// Builds the single-column `request_path` `RecordBatch` an `EntryKey`
+    /// resolves against, one row per path pushed onto it in order.
+    #[derive(Default)]
+    struct KeyBatchBuilder(Vec<String>);
+
+    impl KeyBatchBuilder {
+        /// Records `path` as the next row and returns its row index.
+        fn push(&mut self, path: &str) -> usize {
+            self.0.push(path.to_string());
+            self.0.len() - 1
+        }
+
+        fn build(&self) -> RecordBatch {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "request_path",
+                    DataType::Utf8,
+                    false,
+                )])),
+                vec![Arc::new(StringArray::from(self.0.clone())) as _],
+            )
+            .expect("build key batch")
+        }
+    }
+
     /// One entry costed at `(oldest, newest)` and named by its request path, so a
-    /// partition test can tell which entries the range covers from which it names.
-    fn named_cost(path: &str, oldest: Option<i64>, newest: Option<i64>) -> EntryCost {
+    /// partition test can tell which entries the range covers from which it
+    /// names. `b` must outlive the returned `EntryCost` — call `b.build()` only
+    /// once every entry has been pushed.
+    fn named_cost(
+        b: &mut KeyBatchBuilder,
+        path: &str,
+        oldest: Option<i64>,
+        newest: Option<i64>,
+    ) -> EntryCost {
         EntryCost {
-            key: EntryKey::Eager(vec![("request_path".to_string(), Some(path.to_string()))]),
+            key: EntryKey {
+                batch: 0,
+                row: b.push(path),
+            },
             rows: 1,
             bytes: 1,
             oldest,
@@ -1396,10 +1414,15 @@ mod tests {
 
     /// The request paths in a name-bucket, for asserting which entries a
     /// partition names rather than ranges.
-    fn named_paths(bucket: &[&EntryCost]) -> Vec<String> {
+    fn named_paths(bucket: &[&EntryCost], batches: &[RecordBatch]) -> Vec<String> {
         bucket
             .iter()
-            .filter_map(|e| e.key.resolve(&[], &[]).first().and_then(|(_, v)| v.clone()))
+            .filter_map(|e| {
+                e.key
+                    .resolve(batches, &key_columns())
+                    .first()
+                    .and_then(|(_, v)| v.clone())
+            })
             .collect()
     }
 
@@ -1410,12 +1433,14 @@ mod tests {
         // gate cannot fire. The cleanly-older doomed entries must still go in one
         // range, and only the boundary tie is named — otherwise the naming cap
         // ceilings eviction and a fast-filling cache never converges.
-        let survivors = [named_cost("/s1", Some(1000), Some(1000))];
+        let mut b = KeyBatchBuilder::default();
+        let survivors = [named_cost(&mut b, "/s1", Some(1000), Some(1000))];
         let doomed = [
-            named_cost("/d_tie", Some(1000), Some(1000)),
-            named_cost("/d_998", Some(998), Some(998)),
-            named_cost("/d_999", Some(999), Some(999)),
+            named_cost(&mut b, "/d_tie", Some(1000), Some(1000)),
+            named_cost(&mut b, "/d_998", Some(998), Some(998)),
+            named_cost(&mut b, "/d_999", Some(999), Some(999)),
         ];
+        let batches = [b.build()];
         let d: Vec<&EntryCost> = doomed.iter().collect();
         let s: Vec<&EntryCost> = survivors.iter().collect();
 
@@ -1427,7 +1452,7 @@ mod tests {
             "the two cleanly-older entries go in one range whose ceiling is below the tie"
         );
         assert_eq!(
-            named_paths(&split.named),
+            named_paths(&split.named, &batches),
             vec!["/d_tie".to_string()],
             "only the doomed entry tied with a survivor is named"
         );
@@ -1438,11 +1463,13 @@ mod tests {
         // A doomed entry whose rows span the survivor cutoff (a partially
         // refreshed or paginated response) must be named whole, never clipped by
         // the range — while a doomed entry lying wholly below it is still ranged.
-        let survivors = [named_cost("/s", Some(50), Some(50))];
+        let mut b = KeyBatchBuilder::default();
+        let survivors = [named_cost(&mut b, "/s", Some(50), Some(50))];
         let doomed = [
-            named_cost("/straddler", Some(5), Some(100)),
-            named_cost("/clean", Some(1), Some(2)),
+            named_cost(&mut b, "/straddler", Some(5), Some(100)),
+            named_cost(&mut b, "/clean", Some(1), Some(2)),
         ];
+        let batches = [b.build()];
         let d: Vec<&EntryCost> = doomed.iter().collect();
         let s: Vec<&EntryCost> = survivors.iter().collect();
 
@@ -1454,7 +1481,7 @@ mod tests {
             "the cleanly-older entry is ranged; the ceiling sits below the straddler's oldest row"
         );
         assert_eq!(
-            named_paths(&split.named),
+            named_paths(&split.named, &batches),
             vec!["/straddler".to_string()],
             "the straddler is named so its rows above the cutoff are not left behind"
         );
@@ -1465,11 +1492,13 @@ mod tests {
         // No survivors, so there is no cutoff to protect — but an entry with no
         // fetch time cannot be placed in a range and is named instead, deleting
         // it whole by key.
+        let mut b = KeyBatchBuilder::default();
         let doomed = [
-            named_cost("/a", Some(1), Some(2)),
-            named_cost("/b", Some(3), Some(4)),
-            named_cost("/no_time", None, None),
+            named_cost(&mut b, "/a", Some(1), Some(2)),
+            named_cost(&mut b, "/b", Some(3), Some(4)),
+            named_cost(&mut b, "/no_time", None, None),
         ];
+        let batches = [b.build()];
         let d: Vec<&EntryCost> = doomed.iter().collect();
 
         let split = partition_doomed(&d, &[]);
@@ -1480,7 +1509,7 @@ mod tests {
             "the timestamped entries are ranged"
         );
         assert_eq!(
-            named_paths(&split.named),
+            named_paths(&split.named, &batches),
             vec!["/no_time".to_string()],
             "the timestampless entry is named, not ranged"
         );
@@ -1490,18 +1519,20 @@ mod tests {
     fn a_survivor_without_a_fetch_time_forces_every_doomed_entry_to_be_named() {
         // The cutoff is unknowable, so nothing may be range-deleted: a range
         // could clip the survivor's untimed rows. Every doomed entry is named.
-        let survivors = [named_cost("/s", None, None)];
+        let mut b = KeyBatchBuilder::default();
+        let survivors = [named_cost(&mut b, "/s", None, None)];
         let doomed = [
-            named_cost("/a", Some(1), Some(2)),
-            named_cost("/b", Some(3), Some(4)),
+            named_cost(&mut b, "/a", Some(1), Some(2)),
+            named_cost(&mut b, "/b", Some(3), Some(4)),
         ];
+        let batches = [b.build()];
         let d: Vec<&EntryCost> = doomed.iter().collect();
         let s: Vec<&EntryCost> = survivors.iter().collect();
 
         let split = partition_doomed(&d, &s);
         assert_eq!(split.range_ceiling, None, "no safe boundary, so no range");
         assert_eq!(
-            named_paths(&split.named).len(),
+            named_paths(&split.named, &batches).len(),
             2,
             "every doomed entry named"
         );
@@ -1516,20 +1547,26 @@ mod tests {
         // ceiling only steps below entries crossing the survivor cutoff, leaving
         // entries that cross the *lowered* ceiling in the name bucket with rows
         // under it; the fixed-point ceiling pulls those out too.
-        let survivors = [named_cost("/s", Some(100), Some(100))];
+        let mut b = KeyBatchBuilder::default();
+        let survivors = [named_cost(&mut b, "/s", Some(100), Some(100))];
 
         let mut doomed_owned: Vec<EntryCost> = Vec::new();
         // Over the naming cap, so at least one is deferred. Each spans [10, 90]:
         // oldest below the ceiling a single pass would pick, newest below the
         // survivor cutoff so it does not lower that single-pass ceiling.
         for i in 0..=MAX_ENTRIES_PER_SWEEP {
-            doomed_owned.push(named_cost(&format!("/overlap{i}"), Some(10), Some(90)));
+            doomed_owned.push(named_cost(
+                &mut b,
+                &format!("/overlap{i}"),
+                Some(10),
+                Some(90),
+            ));
         }
         // A straddler above the cutoff, and a cleanly-older entry a single pass
         // would range with ceiling 40 — exactly the ceiling that split the
         // overlaps.
-        doomed_owned.push(named_cost("/straddler", Some(50), Some(120)));
-        doomed_owned.push(named_cost("/clean", Some(1), Some(40)));
+        doomed_owned.push(named_cost(&mut b, "/straddler", Some(50), Some(120)));
+        doomed_owned.push(named_cost(&mut b, "/clean", Some(1), Some(40)));
 
         let doomed: Vec<&EntryCost> = doomed_owned.iter().collect();
         let survivors_ref: Vec<&EntryCost> = survivors.iter().collect();
@@ -1557,10 +1594,12 @@ mod tests {
         // case: single-timestamp entries never straddle, so the older buckets are
         // still cleared by one range and only the boundary tie is named — the
         // convergence property #13994 restored.
+        let mut b = KeyBatchBuilder::default();
         let mut doomed_owned: Vec<EntryCost> = Vec::new();
         for bucket in [24_i64, 25, 26] {
             for i in 0..300 {
                 doomed_owned.push(named_cost(
+                    &mut b,
                     &format!("/b{bucket}_{i}"),
                     Some(bucket),
                     Some(bucket),
@@ -1570,9 +1609,14 @@ mod tests {
         // Over-budget overflow sharing the survivor's timestamp.
         let overflow = MAX_ENTRIES_PER_SWEEP + 50;
         for i in 0..overflow {
-            doomed_owned.push(named_cost(&format!("/b27d_{i}"), Some(27), Some(27)));
+            doomed_owned.push(named_cost(
+                &mut b,
+                &format!("/b27d_{i}"),
+                Some(27),
+                Some(27),
+            ));
         }
-        let survivors = [named_cost("/s", Some(27), Some(27))];
+        let survivors = [named_cost(&mut b, "/s", Some(27), Some(27))];
         let doomed: Vec<&EntryCost> = doomed_owned.iter().collect();
         let s: Vec<&EntryCost> = survivors.iter().collect();
         let split = partition_doomed(&doomed, &s);
@@ -1760,12 +1804,15 @@ mod tests {
     }
 
     /// Entries as `rank_entries` hands them over: most-recently-fetched first.
-    fn ranked(costs: &[(u64, u64)]) -> Vec<EntryCost> {
+    fn ranked(b: &mut KeyBatchBuilder, costs: &[(u64, u64)]) -> Vec<EntryCost> {
         costs
             .iter()
             .enumerate()
             .map(|(i, (rows, bytes))| EntryCost {
-                key: EntryKey::Eager(vec![("request_path".to_string(), Some(format!("/{i}")))]),
+                key: EntryKey {
+                    batch: 0,
+                    row: b.push(&format!("/{i}")),
+                },
                 rows: *rows,
                 bytes: *bytes,
                 // Newest-first ordering is the caller's contract, so the value
@@ -1777,12 +1824,17 @@ mod tests {
             .collect()
     }
 
-    fn doomed_paths(entries: &[EntryCost], budget: Budget) -> Vec<String> {
+    fn doomed_paths(entries: &[EntryCost], budget: Budget, batches: &[RecordBatch]) -> Vec<String> {
         let refs: Vec<&EntryCost> = entries.iter().collect();
         let keep = select_doomed_refs(&refs, budget);
         refs[keep..]
             .iter()
-            .filter_map(|e| e.key.resolve(&[], &[]).first().and_then(|(_, v)| v.clone()))
+            .filter_map(|e| {
+                e.key
+                    .resolve(batches, &key_columns())
+                    .first()
+                    .and_then(|(_, v)| v.clone())
+            })
             .collect()
     }
 
@@ -1790,21 +1842,24 @@ mod tests {
     fn selection_keeps_a_contiguous_most_recent_prefix() {
         // Entries are newest-first, so /0 is newest. A budget of 2 rows keeps
         // /0 and /1 and dooms the rest — not whichever happen to fit.
-        let entries = ranked(&[(1, 10), (1, 10), (1, 10), (1, 10)]);
-        let doomed = doomed_paths(&entries, Budget::Items(2));
+        let mut b = KeyBatchBuilder::default();
+        let entries = ranked(&mut b, &[(1, 10), (1, 10), (1, 10), (1, 10)]);
+        let doomed = doomed_paths(&entries, Budget::Items(2), &[b.build()]);
         assert_eq!(doomed, vec!["/2".to_string(), "/3".to_string()]);
     }
 
     #[test]
     fn selection_charges_bytes_against_a_byte_budget() {
-        let entries = ranked(&[(1, 100), (1, 100), (1, 100)]);
-        let doomed = doomed_paths(&entries, Budget::Bytes(250));
+        let mut b = KeyBatchBuilder::default();
+        let entries = ranked(&mut b, &[(1, 100), (1, 100), (1, 100)]);
+        let doomed = doomed_paths(&entries, Budget::Bytes(250), &[b.build()]);
         assert_eq!(doomed, vec!["/2".to_string()]);
     }
 
     #[test]
     fn selection_evicts_nothing_when_everything_fits() {
-        let entries = ranked(&[(1, 10), (1, 10)]);
+        let mut b = KeyBatchBuilder::default();
+        let entries = ranked(&mut b, &[(1, 10), (1, 10)]);
         let refs: Vec<&EntryCost> = entries.iter().collect();
         assert_eq!(select_doomed_refs(&refs, Budget::Items(10)), refs.len());
         assert_eq!(select_doomed_refs(&refs, Budget::Bytes(1024)), refs.len());
@@ -1814,8 +1869,9 @@ mod tests {
     fn a_single_entry_larger_than_the_whole_budget_is_evicted() {
         // Otherwise one oversized response would pin the cache over its budget
         // for good.
-        let entries = ranked(&[(1, 5_000)]);
-        let doomed = doomed_paths(&entries, Budget::Bytes(1_000));
+        let mut b = KeyBatchBuilder::default();
+        let entries = ranked(&mut b, &[(1, 5_000)]);
+        let doomed = doomed_paths(&entries, Budget::Bytes(1_000), &[b.build()]);
         assert_eq!(doomed, vec!["/0".to_string()]);
     }
 
@@ -1826,8 +1882,9 @@ mod tests {
         // where they overlapped the doomed in fetch time and forced the
         // per-entry path forever — so a large cache could never converge.
         let count = MAX_ENTRIES_PER_SWEEP + 10;
-        let entries = ranked(&vec![(1_u64, 10_u64); count]);
-        let doomed = doomed_paths(&entries, Budget::Items(0));
+        let mut b = KeyBatchBuilder::default();
+        let entries = ranked(&mut b, &vec![(1_u64, 10_u64); count]);
+        let doomed = doomed_paths(&entries, Budget::Items(0), &[b.build()]);
         assert_eq!(doomed.len(), count, "every over-budget entry is doomed");
     }
 
@@ -1838,13 +1895,20 @@ mod tests {
         // trimming the other end would keep the least valuable entries and
         // re-doom the same ones every sweep.
         let count = MAX_ENTRIES_PER_SWEEP + 10;
-        let entries = ranked(&vec![(1_u64, 10_u64); count]);
+        let mut b = KeyBatchBuilder::default();
+        let entries = ranked(&mut b, &vec![(1_u64, 10_u64); count]);
+        let batches = [b.build()];
         let refs: Vec<&EntryCost> = entries.iter().collect();
 
         let (naming, deferred) = nameable(&refs);
         assert_eq!(naming.len(), MAX_ENTRIES_PER_SWEEP);
         assert_eq!(deferred, 10);
-        let path = |e: &EntryCost| e.key.resolve(&[], &[])[0].1.clone().unwrap_or_default();
+        let path = |e: &EntryCost| {
+            e.key.resolve(&batches, &key_columns())[0]
+                .1
+                .clone()
+                .unwrap_or_default()
+        };
         assert_eq!(path(naming[naming.len() - 1]), format!("/{}", count - 1));
         assert_eq!(
             path(naming[0]),
