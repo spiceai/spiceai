@@ -97,7 +97,6 @@ limitations under the License.
 //! Expiry runs first because it is free capacity: evicting a live entry while
 //! an expired one still occupies the budget would be a straight loss.
 
-use std::ops::Not;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -120,6 +119,7 @@ use super::caching::{
 };
 use super::retention::create_timestamp_filter_converter;
 use super::{Retention, RetentionPredicate};
+use runtime_acceleration::acceleration::StaleIfError;
 use runtime_datafusion::session_config::get_df_default_config;
 use runtime_object_store::registry::default_runtime_env;
 use util::expr::combine_exprs_balanced;
@@ -211,24 +211,28 @@ pub struct CacheLimits {
     /// `caching_stale_while_revalidate_ttl`: how long past its TTL an entry
     /// may still be served, and so how long past it the entry must be kept.
     pub stale_while_revalidate: Option<Duration>,
-    /// `caching_stale_if_error`: whether an expired entry may still be served
-    /// when the origin is failing.
+    /// `caching_stale_if_error`: how long an expired entry may still be served
+    /// when the origin is failing (never, a finite window, or unbounded).
     ///
-    /// This is why expiry alone cannot bound the cache. An entry kept as
-    /// error-fallback material is one the expiry sweep must not delete, so with
-    /// this enabled the byte and item budgets are the only thing standing
-    /// between the cache and unbounded growth.
-    pub stale_if_error: bool,
+    /// This is why expiry alone cannot always bound the cache. Only
+    /// `StaleIfError::Enabled` keeps entries with no upper bound on their age, so
+    /// only then are the byte and item budgets the sole thing standing between
+    /// the cache and unbounded growth. A finite `For(d)` keeps an entry for at
+    /// most `caching_ttl + max(d, swr)`, which the expiry sweep still enforces.
+    pub stale_if_error: StaleIfError,
 }
 
 impl CacheLimits {
-    /// True when a sweep would do something. With `stale_if_error` disabled the
-    /// expiry sweep alone is worth running; with it enabled, only a configured
-    /// budget can remove anything — so a dataset for which this is false is one
-    /// nothing will ever evict from, the configuration #13525 describes.
+    /// True when a sweep would do something. With a finite `stale_if_error`
+    /// (`Disabled` or `For(d)`) the expiry sweep alone is worth running; only
+    /// `Enabled` keeps entries indefinitely, so there a configured budget is the
+    /// one thing that can remove anything — and a dataset for which this is false
+    /// is one nothing will ever evict from, the configuration #13525 describes.
     #[must_use]
     pub fn is_enforced(&self) -> bool {
-        self.max_size_bytes.is_some() || self.max_items.is_some() || !self.stale_if_error
+        self.max_size_bytes.is_some()
+            || self.max_items.is_some()
+            || !matches!(self.stale_if_error, StaleIfError::Enabled)
     }
 }
 
@@ -317,9 +321,13 @@ impl CacheEvictionPredicate {
             );
         }
 
+        // Only `stale_if_error: enabled` reaches here: `is_enforced()` is false
+        // solely for the unbounded case (a finite `For(d)` is enforced by the
+        // expiry sweep). The hint steers toward a finite duration, which bounds
+        // the acceleration on its own.
         if !self.limits.is_enforced() && !has_user_retention {
             tracing::warn!(
-                "Dataset '{dataset_name}' sets `caching_stale_if_error: enabled` with no `caching_max_size` or `caching_max_items`, so no cached entry is ever evicted and the acceleration will grow without bound — expired entries are deliberately kept as fallback for a failing origin. Set a budget to bound it. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#refresh-modes"
+                "Dataset '{dataset_name}' sets `caching_stale_if_error: enabled` with no `caching_max_size` or `caching_max_items`, so no cached entry is ever evicted and the acceleration will grow without bound — expired entries are deliberately kept as fallback for a failing origin. Prefer a finite `caching_stale_if_error: <duration>` (for example '10m') to keep the fallback for a bounded window and evict past it, or set a budget. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#refresh-modes"
             );
         }
     }
@@ -356,15 +364,11 @@ impl RetentionPredicate for CacheEvictionPredicate {
             None,
         );
 
-        // With `stale_if_error` an expired entry is deliberately kept as
-        // fallback for a failing origin, so there is no deadline to apply.
-        let cutoff = self
-            .limits
-            .stale_if_error
-            .not()
-            .then(|| expiry_cutoff(&self.limits))
-            .flatten()
-            .filter(|_| refreshed_at.is_some());
+        // With `stale_if_error: enabled` an expired entry is deliberately kept
+        // as fallback for a failing origin, with no upper bound on its age, so
+        // there is no deadline to apply — `expiry_cutoff` returns `None`. A
+        // finite `For(d)` still has a deadline (`caching_ttl + max(d, swr)`).
+        let cutoff = expiry_cutoff(&self.limits).filter(|_| refreshed_at.is_some());
 
         if key_columns.is_empty() {
             // Nothing identifies an entry, so nothing can be evicted as one.
@@ -488,9 +492,17 @@ fn fetched_at_between(
 }
 
 /// The instant before which an entry can no longer be served: `caching_ttl`
-/// plus the stale-while-revalidate grace, ago.
+/// plus the error-retention grace, ago.
+///
+/// The grace is the larger of the stale-while-revalidate window and a finite
+/// `stale_if_error` window (see [`StaleIfError::error_retention_window`]).
+/// Returns `None` for `stale_if_error: enabled`, whose fallback has no upper
+/// bound on age and so no deadline at which an entry becomes unservable.
 fn expiry_cutoff(limits: &CacheLimits) -> Option<i64> {
-    let window = effective_max_age(limits.ttl) + limits.stale_while_revalidate.unwrap_or_default();
+    let grace = limits
+        .stale_if_error
+        .error_retention_window(limits.stale_while_revalidate)?;
+    let window = effective_max_age(limits.ttl) + grace;
     nanos_since_epoch(SystemTime::now().checked_sub(window)?)
 }
 
@@ -1617,7 +1629,7 @@ mod tests {
         // Regression guard for #13525: `stale_if_error` keeps expired entries
         // servable, so with no budget nothing can ever remove one.
         let limits = CacheLimits {
-            stale_if_error: true,
+            stale_if_error: StaleIfError::Enabled,
             ..Default::default()
         };
         assert!(
@@ -1628,17 +1640,86 @@ mod tests {
         // A budget makes it bounded again — and enforced.
         for bounded in [
             CacheLimits {
-                stale_if_error: true,
+                stale_if_error: StaleIfError::Enabled,
                 max_items: Some(10),
                 ..Default::default()
             },
             CacheLimits {
-                stale_if_error: true,
+                stale_if_error: StaleIfError::Enabled,
                 max_size_bytes: Some(1024),
                 ..Default::default()
             },
         ] {
             assert!(bounded.is_enforced());
+        }
+    }
+
+    #[test]
+    fn a_finite_stale_if_error_is_enforced_without_a_budget() {
+        // Unlike `Enabled`, a finite window leaves a deadline the expiry sweep
+        // enforces, so a sweep is worth running even with no byte/item budget.
+        let limits = CacheLimits {
+            stale_if_error: StaleIfError::For(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        assert!(
+            limits.is_enforced(),
+            "a finite stale-if-error is bounded by expiry"
+        );
+    }
+
+    #[test]
+    fn a_finite_stale_if_error_extends_the_expiry_cutoff_by_the_error_window() {
+        // The deadline is `caching_ttl + max(window, swr)` ago. With ttl=10s,
+        // window=60s and no swr, the cutoff is ~70s in the past.
+        let ttl = Duration::from_secs(10);
+        let window = Duration::from_secs(60);
+        let limits = CacheLimits {
+            ttl: Some(ttl),
+            stale_if_error: StaleIfError::For(window),
+            ..Default::default()
+        };
+
+        let cutoff = expiry_cutoff(&limits).expect("a finite window has a cutoff");
+        let now = nanos_since_epoch(SystemTime::now()).expect("now");
+        let expected_age = (effective_max_age(Some(ttl)) + window).as_nanos();
+
+        // Allow a small slack for the time elapsed between the two `now` reads.
+        let observed_age = i128::from(now) - i128::from(cutoff);
+        let slack = Duration::from_secs(1).as_nanos();
+        assert!(
+            (observed_age - i128::try_from(expected_age).expect("fits")).unsigned_abs() < slack,
+            "cutoff should sit ~{expected_age}ns in the past, was {observed_age}ns"
+        );
+    }
+
+    #[test]
+    fn only_enabled_stale_if_error_has_no_expiry_cutoff() {
+        // `Enabled` keeps entries with no upper bound, so there is no deadline.
+        let enabled = CacheLimits {
+            stale_if_error: StaleIfError::Enabled,
+            ttl: Some(Duration::from_secs(10)),
+            ..Default::default()
+        };
+        assert!(
+            expiry_cutoff(&enabled).is_none(),
+            "an unbounded fallback has no deadline"
+        );
+
+        // `Disabled` and a finite window both have one.
+        for limits in [
+            CacheLimits {
+                stale_if_error: StaleIfError::Disabled,
+                ttl: Some(Duration::from_secs(10)),
+                ..Default::default()
+            },
+            CacheLimits {
+                stale_if_error: StaleIfError::For(Duration::from_secs(60)),
+                ttl: Some(Duration::from_secs(10)),
+                ..Default::default()
+            },
+        ] {
+            assert!(expiry_cutoff(&limits).is_some());
         }
     }
 
@@ -2510,7 +2591,7 @@ mod tests {
         let (accelerator, federated) = cache_table(&rows);
         let expired = CacheLimits {
             ttl: Some(Duration::from_mins(5)),
-            stale_if_error: true,
+            stale_if_error: StaleIfError::Enabled,
             ..Default::default()
         };
 

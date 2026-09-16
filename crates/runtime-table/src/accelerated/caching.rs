@@ -44,6 +44,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 
+use runtime_acceleration::acceleration::StaleIfError;
 use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_request_context::CacheNamespace;
@@ -695,6 +696,31 @@ fn get_first_fetched_at_timestamp(batch: &RecordBatch) -> Option<i64> {
         return None;
     }
     Some(ts_array.value(0))
+}
+
+/// How stale a cached entry is *past the point it went stale* — `now -
+/// fetched_at - max_age`, saturating at zero — or `None` when the entry carries
+/// no usable fetch time (missing/null/empty `_fetched_at`).
+///
+/// This is the staleness `StaleIfError::within_error_window` gates on: a `For(N)`
+/// window is measured from the stale point (past `caching_ttl`), not from the
+/// fetch. `None` makes a finite window fail closed and leaves `Enabled`
+/// unaffected, exactly the read-path decision the caller needs.
+fn staleness_past_max_age(batch: &RecordBatch, max_age: Duration) -> Option<Duration> {
+    let fetched_at = get_first_fetched_at_timestamp(batch)?;
+    let now_nanos = i64::try_from(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()?
+            .as_nanos(),
+    )
+    .ok()?;
+    let max_age_nanos = i64::try_from(max_age.as_nanos()).ok()?;
+    let past = now_nanos
+        .saturating_sub(fetched_at)
+        .saturating_sub(max_age_nanos)
+        .max(0);
+    Some(Duration::from_nanos(u64::try_from(past).ok()?))
 }
 
 /// Represents the freshness state of cached data
@@ -1830,7 +1856,8 @@ impl CacheRefreshHelper {
         limit: Option<usize>,
         fallback_schema: SchemaRef,
         is_expired: bool,
-        stale_if_error: bool,
+        stale_if_error: StaleIfError,
+        max_age: Duration,
         expired_batches: Option<Vec<RecordBatch>>,
         io_runtime: &Handle,
         synchronized_children: SynchronizedChildren,
@@ -1871,16 +1898,24 @@ impl CacheRefreshHelper {
                 // for `caching_stale_if_error` would get the origin's error
                 // body instead of the cached response they asked to fall back
                 // to.
-                if !batches_cacheable
-                    && stale_if_error
-                    && let Some(stale) = expired_batches.filter(|b| !b.is_empty())
+                if !batches_cacheable && let Some(stale) = expired_batches.filter(|b| !b.is_empty())
                 {
-                    tracing::warn!(
-                        "Origin for dataset '{dataset_name}' answered with a transient failure, so the expired cached response is being served instead because `caching_stale_if_error` is enabled."
+                    let staleness = staleness_past_max_age(&stale[0], max_age);
+                    if stale_if_error.within_error_window(staleness) {
+                        tracing::warn!(
+                            "Origin for dataset '{dataset_name}' answered with a transient failure, so the expired cached response is being served instead because `caching_stale_if_error` allows it."
+                        );
+                        let batch_schema = stale[0].schema();
+                        let batch_stream = futures::stream::iter(stale.into_iter().map(Ok));
+                        return Box::pin(RecordBatchStreamAdapter::new(batch_schema, batch_stream));
+                    }
+                    // Past the `caching_stale_if_error` window, or its age is
+                    // unknown and the window is finite (fail closed): hand the
+                    // caller the origin's transient response rather than a copy
+                    // too stale to promise.
+                    tracing::debug!(
+                        "Stale entry for dataset '{dataset_name}' is {staleness:?} past the stale-if-error window ({stale_if_error}), returning the origin's transient response."
                     );
-                    let batch_schema = stale[0].schema();
-                    let batch_stream = futures::stream::iter(stale.into_iter().map(Ok));
-                    return Box::pin(RecordBatchStreamAdapter::new(batch_schema, batch_stream));
                 }
 
                 // Each arm that does not enqueue drops the claim, releasing
@@ -1966,19 +2001,22 @@ impl CacheRefreshHelper {
             }
             Err(e) => {
                 // Check if we should serve stale (expired) data on error
-                if stale_if_error
-                    && let Some(batches) = expired_batches
-                    && !batches.is_empty()
-                {
-                    tracing::warn!(
-                        "Cache miss fetch failed for dataset {}, serving stale data due to stale_if_error: {}",
-                        dataset_name,
-                        e
+                if let Some(batches) = expired_batches.filter(|b| !b.is_empty()) {
+                    let staleness = staleness_past_max_age(&batches[0], max_age);
+                    if stale_if_error.within_error_window(staleness) {
+                        tracing::warn!(
+                            "Cache miss fetch failed for dataset {dataset_name}, serving stale data because `caching_stale_if_error` allows it: {e}"
+                        );
+                        let batch_schema = batches[0].schema();
+                        let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
+                        let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
+                        return Box::pin(adapter);
+                    }
+                    // Outside the finite window, or its age is unknown (fail
+                    // closed): fall through and propagate the origin error.
+                    tracing::debug!(
+                        "Stale entry for dataset '{dataset_name}' is {staleness:?} past the stale-if-error window ({stale_if_error}), propagating the origin error."
                     );
-                    let batch_schema = batches[0].schema();
-                    let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
-                    let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
-                    return Box::pin(adapter);
                 }
 
                 tracing::error!(
@@ -2142,8 +2180,9 @@ pub struct CachingAccelerationScanExec {
     max_age: Option<Duration>,
     /// Time window after `max_age` during which stale data can be served while revalidating
     stale_while_revalidate: Option<Duration>,
-    /// If true, serve expired cached data when upstream source returns an error
-    stale_if_error: bool,
+    /// How expired cached data is served when the upstream source fails: never,
+    /// always, or within a finite staleness window.
+    stale_if_error: StaleIfError,
     federated: Arc<dyn TableProvider>,
     accelerator: Arc<dyn TableProvider>,
     dataset_name: String,
@@ -2167,7 +2206,7 @@ impl CachingAccelerationScanExec {
         input: Arc<dyn ExecutionPlan>,
         max_age: Option<Duration>,
         stale_while_revalidate: Option<Duration>,
-        stale_if_error: bool,
+        stale_if_error: StaleIfError,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         dataset_name: String,
@@ -2377,8 +2416,12 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         tracing::debug!(
                             "Data is expired for dataset={dataset_name}, treating as cache miss (upsert)"
                         );
-                        // Pass the expired batches for stale_if_error fallback
-                        let expired_batches = if stale_if_error {
+                        // Keep the expired batches to fall back to unless the
+                        // fallback is off entirely. Whether the entry is still
+                        // *inside* the window is decided at error time, against
+                        // its `_fetched_at` — collecting them here does not
+                        // commit to serving them.
+                        let expired_batches = if stale_if_error.serves_stale_on_error() {
                             Some(cached_batches)
                         } else {
                             None
@@ -2391,6 +2434,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             Arc::clone(&schema_clone),
                             true, // is_expired = true, will upsert
                             stale_if_error,
+                            max_age,
                             expired_batches,
                             &io_runtime,
                             Arc::clone(&synchronized_children),
@@ -2427,9 +2471,10 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     &filters,
                     limit,
                     Arc::clone(&schema_clone),
-                    false, // is_expired = false, will insert (append)
-                    false, // stale_if_error = false, no expired data to fall back to
-                    None,  // no expired batches
+                    false,                  // is_expired = false, will insert (append)
+                    StaleIfError::Disabled, // no cached entry to fall back to
+                    max_age.unwrap_or_default(), // unused: no expired batches
+                    None,                   // no expired batches
                     &io_runtime,
                     synchronized_children,
                     batch_write_tx,
@@ -3929,7 +3974,8 @@ mod tests {
             None,
             Arc::clone(&schema),
             false,
-            false,
+            StaleIfError::Disabled,
+            Duration::ZERO,
             None,
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
@@ -3968,7 +4014,8 @@ mod tests {
             None,
             Arc::clone(&schema),
             false,
-            false,
+            StaleIfError::Disabled,
+            Duration::ZERO,
             None,
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
@@ -4056,9 +4103,10 @@ mod tests {
             &[col("content").eq(lit("test"))],
             None,
             Arc::clone(&schema),
-            true,              // is_expired
-            true,              // stale_if_error enabled
-            Some(vec![stale]), // the expired entry to fall back to
+            true,                  // is_expired
+            StaleIfError::Enabled, // stale_if_error enabled (∞)
+            Duration::ZERO,        // max_age (ignored by Enabled)
+            Some(vec![stale]),     // the expired entry to fall back to
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
             batch_write_tx,
@@ -4103,7 +4151,8 @@ mod tests {
             None,
             Arc::clone(&schema),
             true,
-            false, // stale_if_error disabled
+            StaleIfError::Disabled, // stale_if_error disabled
+            Duration::ZERO,         // max_age (ignored by Disabled)
             Some(vec![stale]),
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
@@ -4120,6 +4169,186 @@ mod tests {
             .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>())
             .expect("content column");
         assert_eq!(content.value(0), "upstream down");
+    }
+
+    /// Nanoseconds since the epoch, for placing a cached entry a known distance
+    /// in the past.
+    fn now_nanos() -> i64 {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos(),
+        )
+        .expect("nanoseconds fit i64")
+    }
+
+    /// A whole number of seconds as nanoseconds, as an `i64` timestamp offset.
+    fn secs_nanos(secs: u64) -> i64 {
+        i64::try_from(Duration::from_secs(secs).as_nanos()).expect("nanoseconds fit i64")
+    }
+
+    /// A stale cached response in the `MockHttpTableProvider` shape, with an
+    /// explicit `_fetched_at` (or a null one when `fetched_at` is `None`).
+    fn stale_batch_with_fetched_at(
+        schema: &SchemaRef,
+        content: &str,
+        fetched_at: Option<i64>,
+    ) -> RecordBatch {
+        use arrow::array::{StringArray, TimestampNanosecondArray, UInt16Array};
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/api"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+                Arc::new(StringArray::from(vec![content])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![fetched_at])) as ArrayRef,
+            ],
+        )
+        .expect("batch")
+    }
+
+    /// Read the single `content` cell of a served batch.
+    fn served_content(batch: &RecordBatch) -> String {
+        batch
+            .column_by_name("content")
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>())
+            .map(|c| c.value(0).to_string())
+            .expect("content column")
+    }
+
+    /// Drive `handle_cache_miss` through the transient-5xx arm: a 503 origin plus
+    /// the given expired entry and `stale_if_error`/`max_age`. Returns the one
+    /// served content cell — the stale copy when served, the origin body when not.
+    async fn transient_5xx_outcome(
+        stale: RecordBatch,
+        stale_if_error: StaleIfError,
+        max_age: Duration,
+    ) -> String {
+        let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = http_source.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+        let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        let stream = CacheRefreshHelper::handle_cache_miss(
+            Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            "test_dataset",
+            &[col("content").eq(lit("test"))],
+            None,
+            Arc::clone(&schema),
+            true,
+            stale_if_error,
+            max_age,
+            Some(vec![stale]),
+            &tokio::runtime::Handle::current(),
+            Arc::new(vec![].into()),
+            batch_write_tx,
+            CacheNamespace::Public,
+            Arc::clone(&in_flight),
+        )
+        .await;
+
+        let served = drain(stream).await;
+        assert_eq!(served.len(), 1, "exactly one batch is served");
+        served_content(&served[0])
+    }
+
+    /// A finite `caching_stale_if_error` window serves an entry whose staleness is
+    /// inside it and refuses one past it — the RFC 5861 `stale-if-error=N` core.
+    #[tokio::test]
+    async fn a_finite_window_serves_inside_and_propagates_outside() {
+        let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = http_source.schema();
+        let max_age = Duration::from_secs(10);
+        let window = StaleIfError::For(Duration::from_secs(60));
+
+        // Staleness = now - fetched_at - max_age. 30s past the stale point is
+        // inside a 60s window: the cached copy is served.
+        let inside = stale_batch_with_fetched_at(
+            &schema,
+            "cached response",
+            Some(now_nanos() - secs_nanos(10 + 30)),
+        );
+        assert_eq!(
+            transient_5xx_outcome(inside, window, max_age).await,
+            "cached response",
+            "an entry 30s past the stale point is inside a 60s window"
+        );
+
+        // 90s past the stale point is outside a 60s window: the origin's
+        // transient response is returned instead of a copy too stale to promise.
+        let outside = stale_batch_with_fetched_at(
+            &schema,
+            "cached response",
+            Some(now_nanos() - secs_nanos(10 + 90)),
+        );
+        assert_eq!(
+            transient_5xx_outcome(outside, window, max_age).await,
+            "upstream down",
+            "an entry 90s past the stale point is outside a 60s window"
+        );
+    }
+
+    /// `For(N)` fails closed when the entry's age cannot be proven — a missing or
+    /// null `_fetched_at` — so it cannot serve a copy of unknown staleness.
+    #[tokio::test]
+    async fn a_finite_window_fails_closed_on_unknown_staleness() {
+        let window = StaleIfError::For(Duration::from_secs(60));
+        let max_age = Duration::from_secs(10);
+
+        // A null `_fetched_at` value.
+        let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = http_source.schema();
+        let null_ts = stale_batch_with_fetched_at(&schema, "cached response", None);
+        assert_eq!(
+            transient_5xx_outcome(null_ts, window, max_age).await,
+            "upstream down",
+            "a null fetch time cannot prove the entry is inside the window"
+        );
+
+        // A batch with no `_fetched_at` column at all.
+        use arrow::array::{StringArray, UInt16Array};
+        let schema_no_ts: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("content", DataType::Utf8, true),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+        ]));
+        let no_column = RecordBatch::try_new(
+            Arc::clone(&schema_no_ts),
+            vec![
+                Arc::new(StringArray::from(vec!["/api"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["cached response"])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        assert_eq!(
+            transient_5xx_outcome(no_column, window, max_age).await,
+            "upstream down",
+            "a missing fetch-time column cannot prove the entry is inside the window"
+        );
+    }
+
+    /// `Enabled` has no bound to check, so it serves even when the entry's age is
+    /// unknown — the fail-open behavior a finite window deliberately drops.
+    #[tokio::test]
+    async fn enabled_serves_even_when_staleness_is_unknown() {
+        let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = http_source.schema();
+        let null_ts = stale_batch_with_fetched_at(&schema, "cached response", None);
+        assert_eq!(
+            transient_5xx_outcome(null_ts, StaleIfError::Enabled, Duration::ZERO).await,
+            "cached response",
+            "Enabled fails open on an unknown fetch time"
+        );
     }
 
     #[tokio::test]
@@ -4185,7 +4414,8 @@ mod tests {
             None,
             Arc::clone(&schema),
             false,
-            false,
+            StaleIfError::Disabled,
+            Duration::ZERO,
             None,
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
@@ -4358,7 +4588,8 @@ mod tests {
             None,
             Arc::clone(&schema),
             false,
-            false,
+            StaleIfError::Disabled,
+            Duration::ZERO,
             None,
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
@@ -4488,9 +4719,10 @@ mod tests {
             &[col("content").eq(lit("test"))], // filters
             None,                              // limit
             Arc::clone(&schema),
-            false, // is_expired
-            false, // stale_if_error
-            None,  // expired_batches
+            false,                  // is_expired
+            StaleIfError::Disabled, // stale_if_error
+            Duration::ZERO,         // max_age (ignored: no expired batches)
+            None,                   // expired_batches
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()), // synchronized_children
             batch_write_tx,
