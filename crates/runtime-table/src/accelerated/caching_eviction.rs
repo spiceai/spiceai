@@ -2082,7 +2082,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_clean_range_delete_resolves_no_entrys_key() {
+    async fn a_clean_range_delete_resolves_no_entry_keys() {
         // 2,000 entries fetched long ago and 50 fetched just now, kept under a
         // budget of 50: the 2,000 clear as a single `_fetched_at` range, with no
         // entry named individually.
