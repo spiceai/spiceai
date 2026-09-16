@@ -24,6 +24,8 @@ use datafusion::sql::sqlparser::ast::{
 };
 use itertools::Itertools;
 
+use super::re2;
+
 pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_matches";
 pub(crate) const REGEXP_REPLACE_NAME: &str = "regexp_replace";
 pub(crate) const REGEXP_COUNT_NAME: &str = "regexp_extract_all";
@@ -191,216 +193,64 @@ fn wrap_in_call(inner: ast::Expr, function_name: &str) -> ast::Expr {
 
 /// An unsigned integer literal.
 fn number_literal(digits: &str) -> ast::Expr {
-    ast::Expr::Value(ValueWithSpan {
-        value: sqlparser::ast::Value::Number(digits.to_string(), false),
-        span: sqlparser::tokenizer::Span::empty(),
-    })
+    ast::Expr::Value(sqlparser::ast::Value::Number(digits.to_string(), false).into())
+}
+
+/// The text of a string-literal argument, or `None` for any other shape — a
+/// column, a NULL, an expression — whose value cannot be inspected at unparse
+/// time.
+fn string_literal(arg: &FunctionArg) -> Option<&str> {
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(ValueWithSpan {
+            value:
+                sqlparser::ast::Value::SingleQuotedString(text)
+                | sqlparser::ast::Value::DoubleQuotedString(text),
+            ..
+        }))) => Some(text),
+        _ => None,
+    }
+}
+
+/// Why [`screen_regexp_count_pattern`] refuses a pattern.
+#[derive(Debug)]
+enum PatternRefusal {
+    /// Syntax the two engines read differently — see [`re2`].
+    Syntax(re2::EngineDependentSyntax),
+    /// The pattern can match the empty string (or never matches), which the
+    /// two engines count differently.
+    MayMatchEmpty,
+}
+
+impl std::fmt::Display for PatternRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Syntax(syntax) => write!(f, "{syntax}"),
+            Self::MayMatchEmpty => f.write_str(
+                "it can match the empty string, which DuckDB counts differently from DataFusion",
+            ),
+        }
+    }
 }
 
 /// Whether `DuckDB` counts the matches of the literal `pattern` exactly as the
-/// kernel does, judged on the pattern's syntax with the same crate the
-/// kernel's `regex` compiles it with — so what is judged is what the kernel
-/// would run. Two properties are required (issue #13870):
+/// kernel does. Two properties are required (issue #13870):
 ///
+/// - **Only syntax both engines read alike**, judged by [`re2::engine_neutral_ast`]
+///   on the syntax tree the kernel's own `regex-syntax` parses.
 /// - **Every match is at least one character long.** The kernel skips an
 ///   empty match that abuts the match before it, RE2's extraction loop keeps
 ///   it, so `'a*'` over `ab` counts 2 locally and 3 federated. A minimum match
 ///   length of one or more rules the case out; `None` (a pattern that can
 ///   never match, such as `[a&&b]`) is refused as unmeasured.
-/// - **Only syntax both engines read alike**, as an allow-list walked by
-///   [`EngineNeutralSyntax`]: literals (verbatim, `\.`-style escapes, `\xHH`,
-///   `\x{H..}`, `\n`-style specials), `.`, bracketed classes of literals and
-///   ranges (negated or not), `?`/`*`/`+`/`{m,n}` repetitions whose nested
-///   counted bounds multiply to at most RE2's 1000, greedy or lazy,
-///   alternation, indexed or non-capturing
-///   groups, the `^`/`$`/`\A`/`\z` anchors, and the `i` flag. Everything
-///   else is refused — Perl classes and word boundaries because they are
-///   Unicode-aware in the kernel and ASCII-only in RE2 (`'\d'` over `xy١`
-///   counts 1 locally and 0 federated); class-set operations and nested
-///   classes because RE2 has no such syntax and reads `[a&&a]` as a class of
-///   `a` and `&` (2 matches over `a&b` federated, 1 locally); the `x` flag and
-///   the `\u` escapes because RE2 rejects them; and Unicode properties, POSIX
-///   classes, named groups and the other flags because their agreement is
-///   unmeasured. `.`, `[^a]`, `[0-9]` and case-insensitive matching of
-///   non-ASCII letters were measured to agree.
-///
-/// An unparseable pattern is refused too: the kernel's own error is the right
-/// one for the user to see, and local evaluation delivers it.
-fn duckdb_counts_pattern_identically(pattern: &str) -> bool {
-    let Ok(ast) = regex_syntax::ast::parse::Parser::new().parse(pattern) else {
-        return false;
-    };
-    if regex_syntax::ast::visit(&ast, EngineNeutralSyntax::default()).is_err() {
-        return false;
-    }
-    regex_syntax::hir::translate::Translator::new()
+fn screen_regexp_count_pattern(pattern: &str) -> Result<(), PatternRefusal> {
+    let ast = re2::engine_neutral_ast(pattern).map_err(PatternRefusal::Syntax)?;
+    let minimum_len = regex_syntax::hir::translate::Translator::new()
         .translate(pattern, &ast)
         .ok()
-        .and_then(|hir| hir.properties().minimum_len())
-        .is_some_and(|min| min > 0)
-}
-
-/// RE2's cap on counted repetition: the product of the `{n}`/`{n,m}` bounds
-/// along a nesting path may not exceed it, so `(a{100}){11}` fails the query
-/// remotely with `invalid repetition size` where the kernel compiles it.
-const RE2_MAX_REPETITION: u32 = 1000;
-
-/// The syntax [`duckdb_counts_pattern_identically`] refuses — see there for
-/// why each is outside what both engines read alike.
-#[derive(Debug)]
-enum EngineDependentSyntax {
-    /// `\d`, `\w`, `\s` or a negation, bare or inside a bracketed class.
-    PerlClass,
-    /// `\b`, `\B` or one of the word-start/word-end assertions.
-    WordBoundary,
-    /// `\p{..}`, `\pL` or a negation, bare or inside a bracketed class.
-    UnicodeProperty,
-    /// `[[:alpha:]]` and the other POSIX classes.
-    AsciiClass,
-    /// `&&`, `--` or `~~` between class-set items.
-    ClassSetOperation,
-    /// A bracketed class inside a bracketed class, or an empty one.
-    NestedOrEmptyClass,
-    /// Any flag but `i`, or a negated flag.
-    Flag,
-    /// `(?P<name>..)` and `(?<name>..)`.
-    NamedGroup,
-    /// An escape outside the shared set: `\u..`, `\U..`, octal, or an
-    /// escaped ordinary character.
-    Escape,
-    /// Counted repetitions whose nested product exceeds
-    /// [`RE2_MAX_REPETITION`].
-    RepetitionBound,
-}
-
-/// Walks a pattern's syntax tree and fails on the first
-/// [`EngineDependentSyntax`] it meets.
-#[derive(Default)]
-struct EngineNeutralSyntax {
-    /// The product of the counted-repetition bounds enclosing the node being
-    /// visited, one entry per enclosing repetition so `visit_post` can unwind.
-    repetition_products: Vec<u32>,
-}
-
-impl EngineNeutralSyntax {
-    fn literal(literal: &regex_syntax::ast::Literal) -> Result<(), EngineDependentSyntax> {
-        use regex_syntax::ast::{HexLiteralKind, LiteralKind, SpecialLiteralKind};
-        match literal.kind {
-            LiteralKind::Verbatim
-            | LiteralKind::Meta
-            | LiteralKind::HexFixed(HexLiteralKind::X)
-            | LiteralKind::HexBrace(HexLiteralKind::X) => Ok(()),
-            LiteralKind::Special(ref special) if *special != SpecialLiteralKind::Space => Ok(()),
-            _ => Err(EngineDependentSyntax::Escape),
-        }
-    }
-
-    fn flags(flags: &regex_syntax::ast::Flags) -> Result<(), EngineDependentSyntax> {
-        use regex_syntax::ast::{Flag, FlagsItemKind};
-        if flags
-            .items
-            .iter()
-            .all(|item| matches!(item.kind, FlagsItemKind::Flag(Flag::CaseInsensitive)))
-        {
-            Ok(())
-        } else {
-            Err(EngineDependentSyntax::Flag)
-        }
-    }
-
-    /// Enters a repetition: multiplies the enclosing counted bounds by this
-    /// one's (`?`, `*` and `+` count as 1, as in RE2) and refuses the pattern
-    /// once the product passes [`RE2_MAX_REPETITION`].
-    fn enter_repetition(
-        &mut self,
-        repetition: &regex_syntax::ast::Repetition,
-    ) -> Result<(), EngineDependentSyntax> {
-        use regex_syntax::ast::{RepetitionKind, RepetitionRange};
-        let bound = match repetition.op.kind {
-            RepetitionKind::Range(RepetitionRange::Exactly(n) | RepetitionRange::AtLeast(n)) => n,
-            RepetitionKind::Range(RepetitionRange::Bounded(_, n)) => n,
-            RepetitionKind::ZeroOrOne | RepetitionKind::ZeroOrMore | RepetitionKind::OneOrMore => 1,
-        };
-        let enclosing = self.repetition_products.last().copied().unwrap_or(1);
-        let product = enclosing.saturating_mul(bound.max(1));
-        if product > RE2_MAX_REPETITION {
-            return Err(EngineDependentSyntax::RepetitionBound);
-        }
-        self.repetition_products.push(product);
-        Ok(())
-    }
-}
-
-impl regex_syntax::ast::Visitor for EngineNeutralSyntax {
-    type Output = ();
-    type Err = EngineDependentSyntax;
-
-    fn finish(self) -> Result<(), EngineDependentSyntax> {
-        Ok(())
-    }
-
-    fn visit_pre(&mut self, ast: &regex_syntax::ast::Ast) -> Result<(), EngineDependentSyntax> {
-        use regex_syntax::ast::{AssertionKind, Ast, GroupKind};
-        match ast {
-            Ast::Empty(_)
-            | Ast::Dot(_)
-            | Ast::Alternation(_)
-            | Ast::Concat(_)
-            | Ast::ClassBracketed(_) => Ok(()),
-            Ast::Literal(literal) => Self::literal(literal),
-            Ast::Repetition(repetition) => self.enter_repetition(repetition),
-            Ast::Flags(set) => Self::flags(&set.flags),
-            Ast::Group(group) => match &group.kind {
-                GroupKind::CaptureIndex(_) => Ok(()),
-                GroupKind::NonCapturing(flags) => Self::flags(flags),
-                GroupKind::CaptureName { .. } => Err(EngineDependentSyntax::NamedGroup),
-            },
-            // Anchors are the only assertions both engines read alike; every
-            // other kind is a word boundary, today's and any added later.
-            Ast::Assertion(assertion) => match assertion.kind {
-                AssertionKind::StartLine
-                | AssertionKind::EndLine
-                | AssertionKind::StartText
-                | AssertionKind::EndText => Ok(()),
-                _ => Err(EngineDependentSyntax::WordBoundary),
-            },
-            Ast::ClassUnicode(_) => Err(EngineDependentSyntax::UnicodeProperty),
-            Ast::ClassPerl(_) => Err(EngineDependentSyntax::PerlClass),
-        }
-    }
-
-    fn visit_post(&mut self, ast: &regex_syntax::ast::Ast) -> Result<(), EngineDependentSyntax> {
-        if matches!(ast, regex_syntax::ast::Ast::Repetition(_)) {
-            self.repetition_products.pop();
-        }
-        Ok(())
-    }
-
-    fn visit_class_set_item_pre(
-        &mut self,
-        item: &regex_syntax::ast::ClassSetItem,
-    ) -> Result<(), EngineDependentSyntax> {
-        use regex_syntax::ast::ClassSetItem;
-        match item {
-            ClassSetItem::Union(_) => Ok(()),
-            ClassSetItem::Literal(literal) => Self::literal(literal),
-            ClassSetItem::Range(range) => {
-                Self::literal(&range.start).and_then(|()| Self::literal(&range.end))
-            }
-            ClassSetItem::Empty(_) | ClassSetItem::Bracketed(_) => {
-                Err(EngineDependentSyntax::NestedOrEmptyClass)
-            }
-            ClassSetItem::Ascii(_) => Err(EngineDependentSyntax::AsciiClass),
-            ClassSetItem::Unicode(_) => Err(EngineDependentSyntax::UnicodeProperty),
-            ClassSetItem::Perl(_) => Err(EngineDependentSyntax::PerlClass),
-        }
-    }
-
-    fn visit_class_set_binary_op_pre(
-        &mut self,
-        _op: &regex_syntax::ast::ClassSetBinaryOp,
-    ) -> Result<(), EngineDependentSyntax> {
-        Err(EngineDependentSyntax::ClassSetOperation)
+        .and_then(|hir| hir.properties().minimum_len());
+    match minimum_len {
+        Some(min) if min > 0 => Ok(()),
+        _ => Err(PatternRefusal::MayMatchEmpty),
     }
 }
 
@@ -833,7 +683,7 @@ impl DuckDBRegexpFunction {
     /// turns it into "evaluate locally", so the call still answers (#13900).
     ///
     /// **Pattern.** Only a string literal is rendered, and only one
-    /// [`duckdb_counts_pattern_identically`] accepts: no empty match possible,
+    /// [`screen_regexp_count_pattern`] accepts: no empty match possible,
     /// and only syntax both engines read alike. Anything else — including a
     /// pattern read from a column, whose values cannot be inspected here —
     /// stays local.
@@ -856,24 +706,14 @@ impl DuckDBRegexpFunction {
         }
         let name = self.federated_function_name();
 
-        let pattern = match ast_args.get(1) {
-            Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(
-                ValueWithSpan {
-                    value:
-                        sqlparser::ast::Value::SingleQuotedString(pattern)
-                        | sqlparser::ast::Value::DoubleQuotedString(pattern),
-                    ..
-                },
-            )))) => pattern,
-            _ => {
-                return Err(DataFusionError::Plan(format!(
-                    "Only string literal patterns are supported for regular expression function {name} with DuckDB"
-                )));
-            }
-        };
-        if !duckdb_counts_pattern_identically(pattern) {
+        let Some(pattern) = ast_args.get(1).and_then(string_literal) else {
             return Err(DataFusionError::Plan(format!(
-                "Pattern `{pattern}` is not supported for regular expression function {name} with DuckDB: it can match the empty string, or uses a class or word boundary the two engines read differently"
+                "Only string literal patterns are supported for regular expression function {name} with DuckDB"
+            )));
+        };
+        if let Err(refusal) = screen_regexp_count_pattern(pattern) {
+            return Err(DataFusionError::Plan(format!(
+                "Pattern `{pattern}` is not supported for regular expression function {name} with DuckDB: {refusal}"
             )));
         }
 
@@ -899,38 +739,27 @@ impl DuckDBRegexpFunction {
                 )));
             }
 
-            let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(input))) = ast_args.first_mut()
-            else {
+            let FunctionArg::Unnamed(FunctionArgExpr::Expr(input)) = ast_args.remove(0) else {
                 return Err(DataFusionError::Plan(format!(
                     "Regular expression function {name} requires an input expression as its first argument"
                 )));
             };
-            let placeholder = ast::Expr::Value(ValueWithSpan {
-                value: sqlparser::ast::Value::Null,
-                span: sqlparser::tokenizer::Span::empty(),
-            });
-            *input = ast::Expr::Substring {
-                expr: Box::new(std::mem::replace(input, placeholder)),
-                substring_from: Some(Box::new(number_literal(&start.to_string()))),
-                substring_for: None,
-                special: true,
-                shorthand: false,
-            };
+            ast_args.insert(
+                0,
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Substring {
+                    expr: Box::new(input),
+                    substring_from: Some(Box::new(number_literal(&num_str))),
+                    substring_for: None,
+                    special: true,
+                    shorthand: false,
+                })),
+            );
         }
 
         if ast_args.len() == 3 {
             // The start has been folded into the input, so a remaining third
             // argument is the flags.
-            let is_case_insensitive_flag = matches!(
-                ast_args.get(2),
-                Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(ValueWithSpan {
-                    value:
-                        sqlparser::ast::Value::SingleQuotedString(flags)
-                        | sqlparser::ast::Value::DoubleQuotedString(flags),
-                    ..
-                })))) if flags == CASE_INSENSITIVE_FLAG
-            );
-            if !is_case_insensitive_flag {
+            if ast_args.get(2).and_then(string_literal) != Some(CASE_INSENSITIVE_FLAG) {
                 return Err(DataFusionError::Plan(format!(
                     "Only the literal `{CASE_INSENSITIVE_FLAG}` flag is supported for regular expression function {name} with DuckDB"
                 )));
@@ -990,22 +819,14 @@ impl DuckDBRegexpFunction {
                 })
                 .try_collect()?;
 
-            if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(
-                ValueWithSpan {
-                    value:
-                        sqlparser::ast::Value::SingleQuotedString(string)
-                        | sqlparser::ast::Value::DoubleQuotedString(string),
-                    ..
-                },
-            )))) = ast_args.get(flags_position)
+            // `U` and `R` are flags DuckDB has no equivalent of.
+            if let Some(flags) = ast_args.get(flags_position).and_then(string_literal)
+                && (flags.contains('U') || flags.contains('R'))
             {
-                // Check if `U` or `R` flags are set, which are not supported by DuckDB
-                if string.contains('U') || string.contains('R') {
-                    return Err(DataFusionError::Plan(format!(
-                        "Regular expression flags `U` or `R` are not supported by DuckDB for function {}.",
-                        self.federated_function_name()
-                    )));
-                }
+                return Err(DataFusionError::Plan(format!(
+                    "Regular expression flags `U` or `R` are not supported by DuckDB for function {}.",
+                    self.federated_function_name()
+                )));
             }
 
             self.process_args(&mut ast_args)?;
@@ -1536,13 +1357,13 @@ mod tests {
             "(a+){1000}",
         ] {
             assert!(
-                duckdb_counts_pattern_identically(pattern),
+                screen_regexp_count_pattern(pattern).is_ok(),
                 "`{pattern}` is counted identically and must render"
             );
         }
         for pattern in ["a*", "a?", "a{0,}", "", "^", "\\b", "a|\\b", "(", "[a&&b]"] {
             assert!(
-                !duckdb_counts_pattern_identically(pattern),
+                screen_regexp_count_pattern(pattern).is_err(),
                 "`{pattern}` can match the empty string, never matches, or does not compile"
             );
         }
@@ -1550,7 +1371,7 @@ mod tests {
             "\\d", "\\w", "\\s", "\\D", "[\\d]", "[a\\w]", "\\ba", "a\\B", "\\<a", "a\\>",
         ] {
             assert!(
-                !duckdb_counts_pattern_identically(pattern),
+                screen_regexp_count_pattern(pattern).is_err(),
                 "`{pattern}` is Unicode-aware in the kernel and ASCII-only in RE2, so it must stay local"
             );
         }
@@ -1580,7 +1401,7 @@ mod tests {
             "(a{100,}){11}",
         ] {
             assert!(
-                !duckdb_counts_pattern_identically(pattern),
+                screen_regexp_count_pattern(pattern).is_err(),
                 "`{pattern}` is syntax RE2 reads differently, rejects, or that is unmeasured, so it must stay local"
             );
         }

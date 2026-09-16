@@ -86,22 +86,15 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
 /// exist!` — the unknown-function failure the deny-list exists to prevent
 /// (issue #10703).
 ///
-/// `regexp_count` is not here, because its rendering is value-preserving on
-/// its own: `regexp_extract_all(NULL, p)` is NULL in `DuckDB` and so is
-/// `len(NULL)`, where `DataFusion` counts zero matches and answers `0`, so a
-/// bare `len(regexp_extract_all(x, p))` would answer NULL for a NULL input and
-/// gain or lose rows against local evaluation (issue #13870); the dialect
-/// coalesces that NULL to `0`. The handler refuses the call shapes `DuckDB`
-/// would count differently — a pattern that can match the empty string or uses
-/// a Perl class or word boundary, a non-literal pattern, a flag other than `i`
-/// — so those evaluate locally by the per-call check below rather than by
-/// name. A denied name is never advertised as native, which
-/// [`crate::dialect::duckdb_native_function_names`] enforces should one of the
-/// handled names ever join this list.
-///
 /// `regexp_like`, `regexp_replace` and `regexp_count` are the three
 /// `DataFusion` regexp built-ins the dialect renders, and all three agreed with
 /// local evaluation on every input measured, including a NULL one.
+/// `regexp_count` was here until its rendering was made NULL-preserving
+/// (issue #13870); the call shapes it still cannot render faithfully are
+/// refused by the handler and evaluated locally through the per-call check
+/// below, not by name. A denied name is never advertised as native, which
+/// [`crate::dialect::duckdb_native_function_names`] enforces should a handled
+/// name ever join this list.
 pub const DUCKDB_DENIED_BUILTINS: &[&str] = &[
     crate::dialect::REGEXP_MATCH_NAME,
     crate::dialect::REGEXP_INSTR_NAME,

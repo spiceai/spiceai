@@ -25,6 +25,7 @@ use runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME;
 
 mod bigquery;
 mod duckdb;
+mod re2;
 
 pub use bigquery::SpiceBigQueryDialect;
 

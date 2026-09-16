@@ -1311,6 +1311,12 @@ fn literal_utf8(expr: &Expr) -> Option<&str> {
 /// the pattern is emitted as a `BigQuery` **raw** string literal (see
 /// [`raw_string`]), which a `'` would terminate and a control character has no
 /// spelling in.
+///
+/// The `DuckDB` dialect answers the same RE2-versus-`regex` question for
+/// `regexp_count` with the syntax-tree walker in [`super::re2`], which admits a
+/// slightly different set (no POSIX classes or `m`/`s` flags, non-ASCII
+/// literals allowed); folding this scanner into that walker is the intended
+/// consolidation.
 fn pattern_is_engine_agnostic(pattern: &str) -> bool {
     let mut chars = pattern.chars().peekable();
     let mut in_character_class = false;
