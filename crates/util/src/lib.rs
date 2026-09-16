@@ -22,6 +22,7 @@ use std::{
 
 #[cfg(feature = "http")]
 pub mod cancel_guard_body;
+pub mod column_reference;
 pub mod fibonacci_backoff;
 pub mod home_dir;
 pub mod levenshtein;

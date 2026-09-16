@@ -2451,34 +2451,44 @@ mod function_support_tests {
     //! SQL sent to the remote database (e.g. `BigQuery`), which cannot
     //! evaluate them.
 
-    use std::collections::HashSet;
-    use std::sync::Arc;
+    mod bigquery_corpus;
+
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use adbc_core::error::{Error as AdbcError, Result as AdbcResult, Status};
     use adbc_core::options::{
         InfoCode, ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue,
     };
     use adbc_core::{Connection, Database, Optionable, PartitionedResult, Statement};
-    use arrow::array::{RecordBatch, RecordBatchReader};
+    use arrow::array::{ArrayRef, Int32Array, RecordBatch, RecordBatchReader, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatchIterator;
+    use arrow::util::pretty::pretty_format_batches;
     use datafusion::common::tree_node::TreeNode;
     use datafusion::config::ConfigOptions;
-    use datafusion::datasource::{TableProvider, provider_as_source};
+    use datafusion::datasource::{MemTable, TableProvider, provider_as_source};
+    use datafusion::execution::SessionStateBuilder;
     use datafusion::functions::expr_fn;
     use datafusion::logical_expr::{
-        ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder, TableSource, Volatility,
-        builder::LogicalTableSource, create_udf, expr::ScalarFunction,
+        ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown,
+        Volatility, create_udf, expr::ScalarFunction,
     };
     use datafusion::optimizer::AnalyzerRule;
-    use datafusion::prelude::{col, lit};
+    use datafusion::physical_plan::{collect, displayable};
+    use datafusion::prelude::{SessionContext, col, lit};
     use datafusion::sql::TableReference;
     use datafusion_federation::sql::federation_analyzer_rule;
     use datafusion_federation::{
-        FederatedPlanNode, FederatedTableProviderAdaptor, FederationAnalyzerForLogicalPlan,
+        FederatedPlanNode, FederatedPlanner, FederatedTableProviderAdaptor,
+        FederationAnalyzerForLogicalPlan,
     };
     use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
 
     use super::{AdbcTableFactoryWithPolicy, dialect_for_driver};
+    use runtime_datafusion::analyzer_rule::AnalyzerRulesBuilder;
+    use runtime_datafusion::extension::ExtensionPlanQueryPlanner;
 
     fn not_implemented(what: &str) -> AdbcError {
         AdbcError::with_message_and_status(
@@ -2491,18 +2501,63 @@ mod function_support_tests {
         Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("val", DataType::Utf8, true),
+            Field::new("pattern", DataType::Utf8, true),
         ])
     }
 
     /// Minimal in-process ADBC driver: enough for the connection pool to hand
-    /// out connections and for `AdbcTableFactory::table_provider` to resolve
-    /// the table schema. Everything else reports `NotImplemented`.
-    struct StubDatabase;
-    struct StubConnection;
+    /// out connections, resolve table schemas, and optionally return fixed
+    /// batches while recording executed SQL. Everything else reports
+    /// `NotImplemented`.
+    struct StubDatabase {
+        schemas: Arc<HashMap<TableReference, Schema>>,
+        statement_attempts: Arc<AtomicUsize>,
+        batches: Option<Arc<Vec<RecordBatch>>>,
+        submitted_sql: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Default for StubDatabase {
+        fn default() -> Self {
+            Self {
+                schemas: Arc::new([(TableReference::bare("t"), table_schema())].into()),
+                statement_attempts: Arc::default(),
+                batches: None,
+                submitted_sql: Arc::default(),
+            }
+        }
+    }
+
+    impl StubDatabase {
+        fn with_batches(batches: Vec<RecordBatch>) -> (Self, Arc<Mutex<Vec<String>>>) {
+            let submitted_sql = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    schemas: Arc::new([(TableReference::bare("t"), table_schema())].into()),
+                    statement_attempts: Arc::default(),
+                    batches: Some(Arc::new(batches)),
+                    submitted_sql: Arc::clone(&submitted_sql),
+                },
+                submitted_sql,
+            )
+        }
+    }
+
+    struct StubConnection {
+        schemas: Arc<HashMap<TableReference, Schema>>,
+        statement_attempts: Arc<AtomicUsize>,
+        batches: Option<Arc<Vec<RecordBatch>>>,
+        submitted_sql: Arc<Mutex<Vec<String>>>,
+    }
     // Clonable because cancelling a running query needs a second handle to the
     // same statement, which the ADBC table factory requires of every driver.
     #[derive(Clone)]
-    struct StubStatement;
+    struct StubStatement {
+        statement_attempts: Arc<AtomicUsize>,
+        schema: Schema,
+        batches: Option<Arc<Vec<RecordBatch>>>,
+        submitted_sql: Arc<Mutex<Vec<String>>>,
+        sql: String,
+    }
 
     impl Optionable for StubDatabase {
         type Option = OptionDatabase;
@@ -2527,14 +2582,19 @@ mod function_support_tests {
         type ConnectionType = StubConnection;
 
         fn new_connection(&self) -> AdbcResult<StubConnection> {
-            Ok(StubConnection)
+            Ok(StubConnection {
+                schemas: Arc::clone(&self.schemas),
+                statement_attempts: Arc::clone(&self.statement_attempts),
+                batches: self.batches.clone(),
+                submitted_sql: Arc::clone(&self.submitted_sql),
+            })
         }
 
         fn new_connection_with_opts(
             &self,
             _opts: impl IntoIterator<Item = (OptionConnection, OptionValue)>,
         ) -> AdbcResult<StubConnection> {
-            Ok(StubConnection)
+            self.new_connection()
         }
     }
 
@@ -2561,7 +2621,13 @@ mod function_support_tests {
         type StatementType = StubStatement;
 
         fn new_statement(&mut self) -> AdbcResult<StubStatement> {
-            Ok(StubStatement)
+            Ok(StubStatement {
+                statement_attempts: Arc::clone(&self.statement_attempts),
+                schema: table_schema(),
+                batches: self.batches.clone(),
+                submitted_sql: Arc::clone(&self.submitted_sql),
+                sql: String::new(),
+            })
         }
 
         fn cancel(&mut self) -> AdbcResult<()> {
@@ -2589,11 +2655,22 @@ mod function_support_tests {
 
         fn get_table_schema(
             &self,
-            _catalog: Option<&str>,
-            _db_schema: Option<&str>,
-            _table_name: &str,
+            catalog: Option<&str>,
+            db_schema: Option<&str>,
+            table_name: &str,
         ) -> AdbcResult<Schema> {
-            Ok(table_schema())
+            let table = match (catalog, db_schema) {
+                (Some(catalog), Some(schema)) => TableReference::full(catalog, schema, table_name),
+                (None, Some(schema)) => TableReference::partial(schema, table_name),
+                (None, None) => TableReference::bare(table_name),
+                (Some(_), None) => return Err(not_implemented("catalog without schema")),
+            };
+            self.schemas.get(&table).cloned().ok_or_else(|| {
+                AdbcError::with_message_and_status(
+                    format!("No saved schema for {table}"),
+                    Status::NotFound,
+                )
+            })
         }
 
         fn get_table_types(&self) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
@@ -2649,9 +2726,9 @@ mod function_support_tests {
         }
     }
 
-    // The stub never runs a query, so a handle to it cancels nothing; the trait
-    // is implemented because the ADBC table factory now requires statements to
-    // say how a cancellation handle is obtained.
+    // The stub completes fixed-batch queries synchronously, so a handle to it
+    // cancels nothing; the trait is implemented because the ADBC table factory
+    // requires statements to say how a cancellation handle is obtained.
     impl datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::StatementCancelHandle
         for StubStatement
     {
@@ -2680,7 +2757,29 @@ mod function_support_tests {
         }
 
         fn execute(&mut self) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
-            Err(not_implemented("execute"))
+            let Some(fixed_batches) = &self.batches else {
+                return Err(not_implemented("execute"));
+            };
+            self.submitted_sql
+                .lock()
+                .expect("stub SQL recorder lock")
+                .push(self.sql.clone());
+            let indices = projected_column_indices(&self.sql, &self.schema);
+            let schema = Arc::new(self.schema.project(&indices).map_err(|error| {
+                AdbcError::with_message_and_status(error.to_string(), Status::Internal)
+            })?);
+            let batches = fixed_batches
+                .iter()
+                .map(|batch| {
+                    batch.project(&indices).map_err(|error| {
+                        AdbcError::with_message_and_status(error.to_string(), Status::Internal)
+                    })
+                })
+                .collect::<AdbcResult<Vec<_>>>()?;
+            Ok(Box::new(RecordBatchIterator::new(
+                batches.into_iter().map(Ok),
+                schema,
+            )))
         }
 
         fn execute_update(&mut self) -> AdbcResult<Option<i64>> {
@@ -2688,7 +2787,10 @@ mod function_support_tests {
         }
 
         fn execute_schema(&mut self) -> AdbcResult<Schema> {
-            Err(not_implemented("execute_schema"))
+            let indices = projected_column_indices(&self.sql, &self.schema);
+            self.schema.project(&indices).map_err(|error| {
+                AdbcError::with_message_and_status(error.to_string(), Status::Internal)
+            })
         }
 
         fn execute_partitions(&mut self) -> AdbcResult<PartitionedResult> {
@@ -2703,8 +2805,14 @@ mod function_support_tests {
             Err(not_implemented("prepare"))
         }
 
-        fn set_sql_query(&mut self, _query: impl AsRef<str>) -> AdbcResult<()> {
-            Err(not_implemented("set_sql_query"))
+        fn set_sql_query(&mut self, query: impl AsRef<str>) -> AdbcResult<()> {
+            self.statement_attempts.fetch_add(1, Ordering::SeqCst);
+            self.sql = query.as_ref().to_string();
+            if self.batches.is_none() {
+                Err(not_implemented("offline fixture statement execution"))
+            } else {
+                Ok(())
+            }
         }
 
         fn set_substrait_plan(&mut self, _plan: impl AsRef<[u8]>) -> AdbcResult<()> {
@@ -2716,11 +2824,68 @@ mod function_support_tests {
         }
     }
 
+    fn projected_column_indices(sql: &str, schema: &Schema) -> Vec<usize> {
+        let upper = sql.to_ascii_uppercase();
+        let select_start = upper.find("SELECT ").map_or(0, |index| index + 7);
+        let select_end = upper[select_start..]
+            .find(" FROM ")
+            .map_or(sql.len(), |index| select_start + index);
+        let projection = &sql[select_start..select_end];
+        if projection.trim() == "*" {
+            return (0..schema.fields().len()).collect();
+        }
+
+        let selected = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| {
+                let name = field.name();
+                let quoted = [format!("`{name}`"), format!("\"{name}\"")];
+                (quoted
+                    .iter()
+                    .any(|candidate| projection.contains(candidate))
+                    || projection
+                        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                        .any(|token| token.eq_ignore_ascii_case(name)))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            (0..schema.fields().len()).collect()
+        } else {
+            selected
+        }
+    }
+
+    fn ilike_fixture() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(table_schema()),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("alpha"),
+                    Some("Upper"),
+                    Some("über"),
+                    None,
+                    Some("under_score"),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("a%"),
+                    Some("u%"),
+                    Some("Ü%"),
+                    Some("u%"),
+                    None,
+                ])),
+            ],
+        )
+        .expect("build the fixed ILIKE fixture")
+    }
+
     /// A projection over a scan of the stub table, so a plan can carry an
     /// arbitrary expression through the federation `can_execute_plan` check.
-    fn scan_project(expr: Expr) -> LogicalPlan {
-        let source =
-            Arc::new(LogicalTableSource::new(Arc::new(table_schema()))) as Arc<dyn TableSource>;
+    fn scan_project(provider: &Arc<dyn TableProvider>, expr: Expr) -> LogicalPlan {
+        let source = provider_as_source(Arc::clone(provider));
         LogicalPlanBuilder::scan("t", source, None)
             .expect("scan the stub table")
             .project(vec![expr])
@@ -2746,11 +2911,101 @@ mod function_support_tests {
         federation_enabled: bool,
         driver_name: &str,
     ) -> Arc<dyn TableProvider> {
-        let pool = Arc::new(ADBCPool::new(StubDatabase, None).expect("build the stub ADBC pool"));
+        let pool = Arc::new(
+            ADBCPool::new(StubDatabase::default(), None).expect("build the stub ADBC pool"),
+        );
         AdbcTableFactoryWithPolicy::new(pool, federation_enabled, driver_name)
             .table_provider(TableReference::bare("t"), dialect_for_driver(driver_name))
             .await
             .expect("build the ADBC table provider")
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RegistrationPath {
+        Dataset,
+        Catalog,
+    }
+
+    async fn fixed_bigquery_provider(
+        registration: RegistrationPath,
+        federation_enabled: bool,
+    ) -> (Arc<dyn TableProvider>, Arc<Mutex<Vec<String>>>, RecordBatch) {
+        let batch = ilike_fixture();
+        let (database, submitted_sql) = StubDatabase::with_batches(vec![batch.clone()]);
+        let pool = Arc::new(ADBCPool::new(database, None).expect("build the stub ADBC pool"));
+        let provider = match registration {
+            RegistrationPath::Dataset => {
+                AdbcTableFactoryWithPolicy::new(pool, federation_enabled, "bigquery")
+                    .table_provider(TableReference::bare("t"), dialect_for_driver("bigquery"))
+                    .await
+                    .expect("build the dataset-registered BigQuery provider")
+            }
+            RegistrationPath::Catalog => runtime::catalogconnector::adbc::build_table_factory(
+                pool,
+                federation_enabled,
+                "bigquery",
+            )
+            .table_provider(TableReference::bare("t"), dialect_for_driver("bigquery"))
+            .await
+            .expect("build the catalog-registered BigQuery provider"),
+        };
+        (provider, submitted_sql, batch)
+    }
+
+    fn federation_context() -> SessionContext {
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_query_planner(Arc::new(
+                ExtensionPlanQueryPlanner::from_extension_planners(vec![Arc::new(
+                    FederatedPlanner::new(),
+                )]),
+            ))
+            .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
+            .build();
+        SessionContext::new_with_state(state)
+    }
+
+    async fn local_result(batch: RecordBatch, sql: &str) -> String {
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "t",
+            Arc::new(
+                MemTable::try_new(batch.schema(), vec![vec![batch]])
+                    .expect("build the local comparison table"),
+            ),
+        )
+        .expect("register the local comparison table");
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("plan the local comparison query")
+            .collect()
+            .await
+            .expect("execute the local comparison query");
+        pretty_format_batches(&batches)
+            .expect("format the local comparison result")
+            .to_string()
+    }
+
+    async fn plan_and_execute(provider: Arc<dyn TableProvider>, sql: &str) -> (String, String) {
+        let ctx = federation_context();
+        ctx.register_table("t", provider)
+            .expect("register the stub BigQuery table");
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("plan the connector query")
+            .create_physical_plan()
+            .await
+            .expect("create the final physical plan");
+        let plan_text = displayable(plan.as_ref()).indent(true).to_string();
+        let batches = collect(plan, ctx.task_ctx())
+            .await
+            .expect("execute the connector query");
+        let result = pretty_format_batches(&batches)
+            .expect("format the connector result")
+            .to_string();
+        (plan_text, result)
     }
 
     #[tokio::test]
@@ -2761,7 +3016,7 @@ mod function_support_tests {
             .expect("a federation-enabled factory must produce a federated provider");
         let federation = adaptor.source.federation_provider();
 
-        let denied = scan_project(udf_expr("json_get_str"));
+        let denied = scan_project(&provider, udf_expr("json_get_str"));
         assert!(
             matches!(
                 federation.analyzer(&denied),
@@ -2770,7 +3025,7 @@ mod function_support_tests {
             "a plan using a Spice-only UDF must not federate to the remote ADBC database"
         );
 
-        let allowed = scan_project(col("id"));
+        let allowed = scan_project(&provider, col("id"));
         assert!(
             matches!(
                 federation.analyzer(&allowed),
@@ -2805,7 +3060,7 @@ mod function_support_tests {
             adaptor
                 .source
                 .federation_provider()
-                .analyzer(&scan_project(expr)),
+                .analyzer(&scan_project(&provider, expr)),
             Some(FederationAnalyzerForLogicalPlan::With(_))
         )
     }
@@ -2885,20 +3140,522 @@ mod function_support_tests {
     }
 
     #[tokio::test]
-    async fn bigquery_still_denies_the_json_functions_it_has_no_translation_for() {
+    async fn bigquery_refuses_case_insensitive_like_but_keeps_like() {
+        assert!(
+            !federates("bigquery", col("val").ilike(lit("u%"))).await,
+            "BigQuery has no ILIKE operator, so a projected expression must stay local"
+        );
+        assert!(
+            !federates("bigquery", col("val").not_ilike(lit("u%"))).await,
+            "the negated ILIKE form must stay local too"
+        );
+        assert!(
+            !federates(
+                "bigquery",
+                col("id").gt(lit(0)).or(col("val").ilike(lit("u%")))
+            )
+            .await,
+            "nesting ILIKE must not bypass the expression policy"
+        );
+        assert!(
+            federates("bigquery", col("val").like(lit("u%"))).await,
+            "ordinary LIKE is valid GoogleSQL and must keep federating"
+        );
+        assert!(
+            federates("postgresql", col("val").ilike(lit("u%"))).await,
+            "the BigQuery policy must not globally disable ILIKE"
+        );
+    }
+
+    #[tokio::test]
+    async fn bigquery_ilike_stays_local_before_limit_on_every_registration_path() {
+        let query = "SELECT id FROM t WHERE CAST(val AS VARCHAR) ILIKE 'u%' LIMIT 1";
+        for registration in [RegistrationPath::Dataset, RegistrationPath::Catalog] {
+            for federation_enabled in [false, true] {
+                let (provider, submitted_sql, batch) =
+                    fixed_bigquery_provider(registration, federation_enabled).await;
+                let case_insensitive_filter = col("val").ilike(lit("u%"));
+                let case_sensitive_filter = col("val").like(lit("u%"));
+                assert!(matches!(
+                    provider
+                        .supports_filters_pushdown(&[&case_insensitive_filter])
+                        .expect("probe ILIKE scan admission")
+                        .as_slice(),
+                    [TableProviderFilterPushDown::Unsupported]
+                ));
+                assert!(matches!(
+                    provider
+                        .supports_filters_pushdown(&[&case_sensitive_filter])
+                        .expect("probe LIKE scan admission")
+                        .as_slice(),
+                    [TableProviderFilterPushDown::Exact]
+                ));
+
+                let expected = local_result(batch, query).await;
+                let (plan, actual) = plan_and_execute(provider, query).await;
+                assert_eq!(
+                    actual, expected,
+                    "{registration:?}, federation={federation_enabled}: local fallback must preserve DataFusion results\n{plan}"
+                );
+
+                let limit = plan
+                    .find("GlobalLimitExec")
+                    // DataFusion can fuse a global LIMIT into the root
+                    // coalescer and annotate the residual filter with the same
+                    // fetch target. The first `fetch=1` is still the local
+                    // limiting node above that filter.
+                    .or_else(|| plan.find("fetch=1"))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "plan must keep LIMIT local for {registration:?}, federation={federation_enabled}\n{plan}"
+                        )
+                    });
+                let filter = plan.find("FilterExec").unwrap_or_else(|| {
+                    panic!("plan must keep ILIKE local for {registration:?}, federation={federation_enabled}\n{plan}")
+                });
+                let remote = plan
+                    .find("AdbcSqlExec")
+                    .or_else(|| plan.find("FederatedSqlExec"))
+                    .or_else(|| plan.find("VirtualExecutionPlan"))
+                    .unwrap_or_else(|| {
+                        panic!("plan must contain one remote scan for {registration:?}, federation={federation_enabled}\n{plan}")
+                    });
+                assert!(
+                    limit < filter && filter < remote,
+                    "{registration:?}, federation={federation_enabled}: local filter must execute before local limit\n{plan}"
+                );
+
+                let submitted = submitted_sql.lock().expect("stub SQL recorder lock");
+                assert_eq!(
+                    submitted.len(),
+                    1,
+                    "one remote statement should execute: {submitted:?}"
+                );
+                let remote_sql = submitted[0].to_ascii_uppercase();
+                assert!(
+                    !remote_sql.contains("ILIKE") && !remote_sql.contains("LIMIT"),
+                    "{registration:?}, federation={federation_enabled}: invalid ILIKE and premature LIMIT must stay out of remote SQL: {}",
+                    submitted[0]
+                );
+                assert!(
+                    remote_sql.contains("ID") && remote_sql.contains("VAL"),
+                    "the residual filter must fetch val even though only id is output: {}",
+                    submitted[0]
+                );
+                assert!(
+                    !remote_sql.contains("PATTERN"),
+                    "an unused fixture column should remain pruned: {}",
+                    submitted[0]
+                );
+            }
+        }
+    }
+
+    async fn assert_bigquery_local_result(sql: &str) -> (String, Vec<String>) {
+        let (provider, submitted_sql, batch) =
+            fixed_bigquery_provider(RegistrationPath::Dataset, true).await;
+        let expected = local_result(batch, sql).await;
+        let (plan, actual) = plan_and_execute(provider, sql).await;
+        assert_eq!(actual, expected, "connector/local result mismatch\n{plan}");
+        let submitted_sql = submitted_sql
+            .lock()
+            .expect("stub SQL recorder lock")
+            .clone();
+        for remote_sql in &submitted_sql {
+            assert!(
+                !remote_sql.to_ascii_uppercase().contains("ILIKE"),
+                "ILIKE must not reach the remote SQL: {remote_sql}"
+            );
+        }
+        (plan, submitted_sql)
+    }
+
+    #[tokio::test]
+    async fn bigquery_ilike_residuals_preserve_boolean_and_projection_boundaries() {
+        let (and_plan, and_sql) = assert_bigquery_local_result(
+            "SELECT id FROM t WHERE val ILIKE 'u%' AND id > 0 ORDER BY id",
+        )
+        .await;
+        assert!(
+            and_plan.contains("FilterExec"),
+            "the safe conjunct should push while ILIKE remains local\n{and_plan}"
+        );
+        assert!(
+            and_sql.iter().any(|sql| {
+                let sql = sql.to_ascii_uppercase();
+                sql.contains("WHERE") && sql.contains("> 0")
+            }),
+            "the safe conjunct should be present in remote SQL: {and_sql:?}"
+        );
+
+        let (or_plan, or_sql) = assert_bigquery_local_result(
+            "SELECT id FROM t WHERE val ILIKE 'u%' OR id = 1 ORDER BY id",
+        )
+        .await;
+        assert!(
+            or_plan.contains("FilterExec"),
+            "the disjunction must remain a local filter\n{or_plan}"
+        );
+        assert!(
+            or_sql.iter().all(|sql| !sql.contains(" = 1")),
+            "neither side of the disjunction may be pushed independently: {or_sql:?}"
+        );
+
+        let (projection_plan, projection_sql) = assert_bigquery_local_result(
+            "SELECT id, val ILIKE pattern AS matched FROM t ORDER BY id",
+        )
+        .await;
+        assert!(
+            projection_plan.contains("ProjectionExec")
+                && projection_plan.to_ascii_uppercase().contains("ILIKE"),
+            "a projected ILIKE must remain in a local projection\n{projection_plan}"
+        );
+        assert!(
+            projection_sql.iter().all(|sql| {
+                let sql = sql.to_ascii_uppercase();
+                sql.contains("VAL") && sql.contains("PATTERN")
+            }),
+            "the residual projection must fetch both operands: {projection_sql:?}"
+        );
+
+        for query in [
+            "SELECT id FROM t WHERE val NOT ILIKE 'u%' ORDER BY id",
+            "SELECT id FROM t WHERE val ILIKE '%' ORDER BY id",
+            "SELECT id FROM t WHERE val ILIKE '_____' ORDER BY id",
+            r"SELECT id FROM t WHERE val ILIKE '%\_%' ESCAPE '\' ORDER BY id",
+        ] {
+            let _ = assert_bigquery_local_result(query).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bigquery_supported_like_and_comparison_still_push_down() {
+        let (provider, _submitted_sql, _) =
+            fixed_bigquery_provider(RegistrationPath::Dataset, true).await;
+        let ctx = federation_context();
+        ctx.register_table("t", provider)
+            .expect("register the stub BigQuery table");
+        let plan = ctx
+            .sql("SELECT id FROM t WHERE val LIKE 'u%' AND id > 0")
+            .await
+            .expect("plan supported BigQuery predicates")
+            .create_physical_plan()
+            .await
+            .expect("create the final physical plan");
+        let plan = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            !plan.contains("FilterExec")
+                && plan.to_ascii_uppercase().contains("LIKE 'U%'")
+                && plan.contains("> 0"),
+            "supported predicates should remain in the remote node\n{plan}"
+        );
+    }
+
+    /// `scan_project`'s aggregate twin: an aggregate belongs in an `Aggregate`
+    /// node, not a projection.
+    fn scan_aggregate(provider: &Arc<dyn TableProvider>, expr: Expr) -> LogicalPlan {
+        let source = provider_as_source(Arc::clone(provider));
+        LogicalPlanBuilder::scan("t", source, None)
+            .expect("scan the stub table")
+            .aggregate(Vec::<Expr>::new(), vec![expr])
+            .expect("aggregate the expression")
+            .build()
+            .expect("build the plan")
+    }
+
+    async fn federates_aggregate(driver_name: &str, expr: Expr) -> bool {
+        let provider = stub_table_provider(true, driver_name).await;
+        let adaptor = (provider.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .expect("a federation-enabled factory must produce a federated provider");
+        matches!(
+            adaptor
+                .source
+                .federation_provider()
+                .analyzer(&scan_aggregate(&provider, expr)),
+            Some(FederationAnalyzerForLogicalPlan::With(_))
+        )
+    }
+
+    /// `BigQuery` refuses exactly the filtered-aggregate shapes its dialect cannot
+    /// rewrite, and keeps the rest.
+    ///
+    /// This tests the **boundary** rather than a fixed list, because the two
+    /// sides live in different repositories and the set has moved more than
+    /// once. The dialect (spiceai/datafusion#218) rewrites a `FILTER` into
+    /// `COUNTIF` or `CASE WHEN p THEN arg END`, which is exact only for an
+    /// aggregate that skips nulls and ignores input order — `count`, `sum`,
+    /// `min`, `max`, `avg`, `bit_and`, `bit_or` and `bit_xor` — and declines
+    /// anything else. A declined rendering is a *failed
+    /// query* unless federation refuses the same shape, since a federated
+    /// statement has no local-execution fallback. So:
+    ///
+    /// * just inside the allowlist still federates — refusing it would cost the
+    ///   pushdown for nothing;
+    /// * just outside it does not — federating it would reach `BigQuery` as SQL it
+    ///   cannot parse.
+    ///
+    /// This is the repo-side guard for `with_aggregate_call_support`, the hook
+    /// the `datafusion-table-providers` fork carries. Lose the hook and the
+    /// deny-list stops consulting the shape, the outside-the-list cases start
+    /// federating, and the statement fails at the remote.
+    #[tokio::test]
+    async fn bigquery_refuses_only_the_filtered_aggregate_shapes_it_cannot_rewrite() {
+        use datafusion::logical_expr::ExprFunctionExt as _;
+        let keeps_rows = col("val").is_not_null();
+
+        // Just inside the allowlist: every one of these still federates.
+        for (label, aggregate) in [
+            (
+                "count(1)",
+                datafusion::functions_aggregate::expr_fn::count(lit(1_i64)),
+            ),
+            (
+                "count(NULL)",
+                datafusion::functions_aggregate::expr_fn::count(lit(
+                    datafusion::scalar::ScalarValue::Null,
+                )),
+            ),
+            (
+                "sum",
+                datafusion::functions_aggregate::expr_fn::sum(col("id")),
+            ),
+            (
+                "min",
+                datafusion::functions_aggregate::expr_fn::min(col("id")),
+            ),
+            (
+                "max",
+                datafusion::functions_aggregate::expr_fn::max(col("id")),
+            ),
+            (
+                "avg",
+                datafusion::functions_aggregate::expr_fn::avg(col("id")),
+            ),
+            (
+                "bit_and",
+                datafusion::functions_aggregate::expr_fn::bit_and(col("id")),
+            ),
+            (
+                "bit_or",
+                datafusion::functions_aggregate::expr_fn::bit_or(col("id")),
+            ),
+            (
+                "bit_xor",
+                datafusion::functions_aggregate::expr_fn::bit_xor(col("id")),
+            ),
+        ] {
+            let filtered = aggregate
+                .filter(keeps_rows.clone())
+                .build()
+                .expect("filtered aggregate");
+            assert!(
+                federates_aggregate("bigquery", filtered).await,
+                "{label} FILTER is rewritten exactly, so refusing it would only \
+                 cost the pushdown"
+            );
+        }
+
+        // An ordering does not change that: every aggregate on the list ignores
+        // input order, so the dialect still rewrites an ordered one.
+        let ordered_sum = datafusion::functions_aggregate::expr_fn::sum(col("id"))
+            .filter(keeps_rows.clone())
+            .order_by(vec![col("id").sort(true, false)])
+            .build()
+            .expect("ordered filtered sum");
+        assert!(
+            federates_aggregate("bigquery", ordered_sum).await,
+            "a sum ignores its ordering, so an ordered filtered sum still federates"
+        );
+
+        // A *descending* ordering is refused only for the percentile rewrites,
+        // which are rendered by ordering the group. Everything on the FILTER
+        // allowlist ignores input order, so it keeps its pushdown either way.
+        // Measured against a real project before spiceai/datafusion#219 scoped
+        // the dialect's check, both of these federated as written and failed:
+        //   sum(id ORDER BY id DESC) FILTER (WHERE id > 1)
+        //     -> Syntax error: Expected ")" but got "("
+        //   median(id ORDER BY id DESC)
+        //     -> Function not found: median
+        let descending_filtered_sum = datafusion::functions_aggregate::expr_fn::sum(col("id"))
+            .filter(keeps_rows.clone())
+            .order_by(vec![col("id").sort(false, false)])
+            .build()
+            .expect("descending filtered sum");
+        assert!(
+            federates_aggregate("bigquery", descending_filtered_sum).await,
+            "a sum ignores its ordering in either direction, so the dialect \
+             still moves the predicate inside and the pushdown is kept"
+        );
+
+        let descending_median = datafusion::functions_aggregate::expr_fn::median(col("id"))
+            .order_by(vec![col("id").sort(false, false)])
+            .build()
+            .expect("descending median");
+        assert!(
+            !federates_aggregate("bigquery", descending_median).await,
+            "median has no BigQuery name of its own; a descending ordering \
+             declines the rewrite that supplies one"
+        );
+
+        // Ascending is the control: the allowlist ignores input order, so this
+        // one must keep federating.
+        let ascending_median = datafusion::functions_aggregate::expr_fn::median(col("id"))
+            .order_by(vec![col("id").sort(true, false)])
+            .build()
+            .expect("ascending median");
+        assert!(
+            federates_aggregate("bigquery", ascending_median).await,
+            "an ascending median still reaches the rewrite that renders it"
+        );
+
+        // Just outside the allowlist: the dialect declines, so federation must
+        // refuse, or the statement reaches BigQuery as SQL it cannot parse.
+        let array_agg = datafusion::functions_aggregate::expr_fn::array_agg(col("id"))
+            .filter(keeps_rows.clone())
+            .build()
+            .expect("filtered array_agg");
+        assert!(
+            !federates_aggregate("bigquery", array_agg).await,
+            "array_agg is off the allowlist — the CASE gives it a null element \
+             per rejected row, which BigQuery refuses to build"
+        );
+
+        // No filter at all is not this hook's business, whatever the aggregate.
+        let bare = datafusion::functions_aggregate::expr_fn::array_agg(col("id"));
+        assert!(
+            federates_aggregate("bigquery", bare).await,
+            "an unfiltered aggregate is unaffected"
+        );
+    }
+
+    /// A `FILTER` on a *window* call has no rewriting at all, so it has to be
+    /// refused too — otherwise the aggregate check above is trivially bypassed
+    /// by spelling the same thing `COUNT(x) FILTER (…) OVER (…)`.
+    ///
+    /// Measured against a real `BigQuery` project:
+    /// `SELECT COUNT(id) FILTER (WHERE id > 1) OVER () FROM advances` federated
+    /// as written and came back `Syntax error: Expected ")" but got "("`. This
+    /// is the repo-side guard for `with_window_call_support`.
+    #[tokio::test]
+    async fn bigquery_refuses_a_filtered_window_call() {
+        let windowed = |filter: Option<Expr>| {
+            Expr::from(datafusion::logical_expr::expr::WindowFunction {
+                fun: datafusion::logical_expr::WindowFunctionDefinition::AggregateUDF(
+                    datafusion::functions_aggregate::count::count_udaf(),
+                ),
+                params: datafusion::logical_expr::expr::WindowFunctionParams {
+                    args: vec![col("id")],
+                    partition_by: vec![col("val")],
+                    order_by: vec![],
+                    window_frame: datafusion::logical_expr::WindowFrame::new(None),
+                    null_treatment: None,
+                    filter: filter.map(Box::new),
+                    distinct: false,
+                },
+            })
+        };
+
+        assert!(
+            !federates_aggregate("bigquery", windowed(Some(col("val").is_not_null()))).await,
+            "a filtered window call renders FILTER verbatim, which BigQuery \
+             refuses, so it must stay local"
+        );
+        assert!(
+            federates_aggregate("bigquery", windowed(None)).await,
+            "an unfiltered window call is unaffected"
+        );
+    }
+
+    /// A percentile in *window* position reaches `BigQuery` under its
+    /// `DataFusion` name, because the rewrite that turns it into
+    /// `PERCENTILE_CONT` lives in the dialect's aggregate handling and a window
+    /// call never reaches it.
+    ///
+    /// Measured against a real `BigQuery` project, on the build before this
+    /// check existed:
+    ///
+    /// ```text
+    /// SELECT MEDIAN(requested_amount) OVER (PARTITION BY type) FROM payments_stream
+    ///   -> Function not found: median
+    /// SELECT APPROX_PERCENTILE_CONT(requested_amount, 0.5) OVER (PARTITION BY type) …
+    ///   -> Function not found: approx_percentile_cont
+    /// SELECT type, MEDIAN(requested_amount) FROM payments_stream GROUP BY type
+    ///   -> works; the aggregate form is rewritten
+    /// ```
+    ///
+    /// The aggregate form working is what makes this easy to miss, and why the
+    /// window slot needs its own refusal rather than inheriting the aggregate's.
+    #[tokio::test]
+    async fn bigquery_refuses_a_percentile_in_window_position() {
+        let windowed = |udaf: Arc<datafusion::logical_expr::AggregateUDF>, args: Vec<Expr>| {
+            Expr::from(datafusion::logical_expr::expr::WindowFunction {
+                fun: datafusion::logical_expr::WindowFunctionDefinition::AggregateUDF(udaf),
+                params: datafusion::logical_expr::expr::WindowFunctionParams {
+                    args,
+                    partition_by: vec![col("val")],
+                    order_by: vec![],
+                    window_frame: datafusion::logical_expr::WindowFrame::new(None),
+                    null_treatment: None,
+                    filter: None,
+                    distinct: false,
+                },
+            })
+        };
+
+        assert!(
+            !federates_aggregate(
+                "bigquery",
+                windowed(
+                    datafusion::functions_aggregate::median::median_udaf(),
+                    vec![col("id")]
+                )
+            )
+            .await,
+            "a windowed median renders as `median`, which BigQuery has no function for, \
+             so it must stay local"
+        );
+        assert!(
+            !federates_aggregate(
+                "bigquery",
+                windowed(
+                    datafusion::functions_aggregate::approx_percentile_cont::approx_percentile_cont_udaf(),
+                    vec![col("id"), datafusion::prelude::lit(0.5)]
+                )
+            )
+            .await,
+            "the approx_percentile_cont spelling reaches BigQuery under its own name too"
+        );
+        // The control: a window function BigQuery does have keeps its pushdown,
+        // so this refuses the percentiles rather than windows in general.
+        assert!(
+            federates_aggregate(
+                "bigquery",
+                windowed(
+                    datafusion::functions_aggregate::count::count_udaf(),
+                    vec![col("id")]
+                )
+            )
+            .await,
+            "an ordinary windowed aggregate is unaffected"
+        );
+    }
+
+    #[tokio::test]
+    async fn bigquery_keeps_json_calls_local_without_a_proven_translation() {
         for name in [
             // Returns a union of every JSON scalar type, which has no SQL type
             // to unparse into.
             "json_get",
             // Returns the matched node's own bytes; JSON_QUERY re-renders it.
             "json_as_text",
-            // A JSON `null` and a missing key are indistinguishable in
-            // BigQuery, and json_contains tells them apart.
+            // The stub's bare Utf8 field does not identify native JSON versus
+            // JSON-formatted STRING, which the presence check must distinguish.
             "json_contains",
         ] {
             assert!(
                 !federates("bigquery", json_call(name, vec![lit("a")])).await,
-                "{name} has no BigQuery translation and must stay denied"
+                "{name} has no proven translation for this input and must stay local"
             );
         }
     }
@@ -2942,6 +3699,45 @@ mod function_support_tests {
 
     async fn federated_plan(predicate: Expr) -> LogicalPlan {
         federated_plan_for_driver("bigquery", predicate).await
+    }
+
+    #[tokio::test]
+    async fn bigquery_federates_a_recursive_cte_and_its_remote_join() {
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("t", stub_table_provider(true, "bigquery").await)
+            .expect("register the BigQuery table");
+        let query = "WITH RECURSIVE steps AS (\
+                     SELECT 1 AS n UNION ALL SELECT n + 1 FROM steps WHERE n < 3) \
+                     SELECT steps.n, t.val FROM steps JOIN t ON steps.n = t.id";
+        for query in [
+            query.to_owned(),
+            query.replace("n < 3", "n < (SELECT MAX(id) FROM t)"),
+        ] {
+            let plan = ctx
+                .sql(&query)
+                .await
+                .expect("plan the recursive join")
+                .into_optimized_plan()
+                .expect("optimize the recursive join");
+            let analyzed = federation_analyzer_rule()
+                .analyze(plan, &ConfigOptions::default())
+                .expect("federate the recursive join");
+            let LogicalPlan::Extension(extension) = &analyzed else {
+                panic!("expected the entire recursive join to federate: {analyzed:?}");
+            };
+            let federated = extension
+                .node
+                .as_any()
+                .downcast_ref::<FederatedPlanNode>()
+                .expect("a federated root");
+            let dialect = dialect_for_driver("bigquery").expect("BigQuery dialect");
+            let sql = datafusion::sql::unparser::Unparser::new(dialect.as_ref())
+                .plan_to_sql(federated.plan())
+                .expect("render the whole recursive join")
+                .to_string();
+            assert!(sql.starts_with("WITH RECURSIVE"), "{sql}");
+            assert_eq!(sql.matches("WITH RECURSIVE").count(), 1, "{sql}");
+        }
     }
 
     #[tokio::test]
@@ -3141,23 +3937,28 @@ mod function_support_tests {
     /// The tests live here rather than in `runtime` because this is where the
     /// in-process stub ADBC driver above already lives; the code under test is
     /// `runtime::catalogconnector::adbc::build_table_factory`.
-    async fn stub_catalog_table_provider(federation_enabled: bool) -> Arc<dyn TableProvider> {
-        let pool = Arc::new(ADBCPool::new(StubDatabase, None).expect("build the stub ADBC pool"));
-        runtime::catalogconnector::adbc::build_table_factory(pool, federation_enabled)
-            .table_provider(TableReference::bare("t"), None)
+    async fn stub_catalog_table_provider(
+        federation_enabled: bool,
+        driver_name: &str,
+    ) -> Arc<dyn TableProvider> {
+        let pool = Arc::new(
+            ADBCPool::new(StubDatabase::default(), None).expect("build the stub ADBC pool"),
+        );
+        runtime::catalogconnector::adbc::build_table_factory(pool, federation_enabled, driver_name)
+            .table_provider(TableReference::bare("t"), dialect_for_driver(driver_name))
             .await
             .expect("build the ADBC catalog table provider")
     }
 
     #[tokio::test]
     async fn catalog_table_factory_denies_spice_functions_from_federation() {
-        let provider = stub_catalog_table_provider(true).await;
+        let provider = stub_catalog_table_provider(true, "sqlite").await;
         let adaptor = (provider.as_ref() as &dyn std::any::Any)
             .downcast_ref::<FederatedTableProviderAdaptor>()
             .expect("a federation-enabled factory must produce a federated provider");
         let federation = adaptor.source.federation_provider();
 
-        let denied = scan_project(udf_expr("json_get_str"));
+        let denied = scan_project(&provider, udf_expr("json_get_str"));
         assert!(
             matches!(
                 federation.analyzer(&denied),
@@ -3166,7 +3967,7 @@ mod function_support_tests {
             "a plan using a Spice-only UDF must not federate to a catalog-registered ADBC database"
         );
 
-        let allowed = scan_project(col("id"));
+        let allowed = scan_project(&provider, col("id"));
         assert!(
             matches!(
                 federation.analyzer(&allowed),
@@ -3176,9 +3977,43 @@ mod function_support_tests {
         );
     }
 
+    async fn catalog_federates(driver_name: &str, expr: Expr) -> bool {
+        let provider = stub_catalog_table_provider(true, driver_name).await;
+        let adaptor = (provider.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .expect("a federation-enabled factory must produce a federated provider");
+        matches!(
+            adaptor
+                .source
+                .federation_provider()
+                .analyzer(&scan_project(&provider, expr)),
+            Some(FederationAnalyzerForLogicalPlan::With(_))
+        )
+    }
+
+    #[tokio::test]
+    async fn bigquery_catalog_refuses_case_insensitive_like_but_keeps_like() {
+        assert!(
+            !catalog_federates("bigquery", col("val").ilike(lit("u%"))).await,
+            "the catalog route must install the same BigQuery ILIKE veto"
+        );
+        assert!(
+            !catalog_federates("bigquery", col("val").not_ilike(lit("u%"))).await,
+            "the catalog route must also refuse NOT ILIKE"
+        );
+        assert!(
+            catalog_federates("bigquery", col("val").like(lit("u%"))).await,
+            "the catalog route must preserve ordinary LIKE pushdown"
+        );
+        assert!(
+            catalog_federates("BigQuery", col("val").ilike(lit("u%"))).await,
+            "driver policy selection is deliberately the same exact lowercase match as dialect selection"
+        );
+    }
+
     #[tokio::test]
     async fn catalog_table_factory_disables_federation_when_configured() {
-        let provider = stub_catalog_table_provider(false).await;
+        let provider = stub_catalog_table_provider(false, "sqlite").await;
         assert!(
             (provider.as_ref() as &dyn std::any::Any)
                 .downcast_ref::<FederatedTableProviderAdaptor>()

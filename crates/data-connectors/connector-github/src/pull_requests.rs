@@ -244,14 +244,42 @@ impl PullRequestTableArgs {
 
     /// Default outer `first:` value for the pull request connection when
     /// `include_comments` is not enabled.
-    const DEFAULT_PAGE_SIZE: u32 = 100;
+    ///
+    /// GitHub enforces a per-request compute budget that is separate from, and
+    /// reached long before, the `GITHUB_NODE_LIMIT` above: a page of 100 pull
+    /// requests on a large repository is rejected outright with `Resource
+    /// limits for this query exceeded`, leaving every node in the page `null`.
+    /// `estimated_node_count` cannot see this — the same page is only ~26,000
+    /// nodes, about 5% of the node limit — so the page size has to be chosen
+    /// against the compute budget rather than validated against the node one.
+    ///
+    /// Measured against `spiceai/spiceai` (13,700+ pull requests): `first: 100`
+    /// fails on the very first page, deterministically, while `first: 25`
+    /// returns a full page. 25 also matches `COMMENTS_PAGE_SIZE`, so both
+    /// paths now request the same number of pull requests per page.
+    ///
+    /// The trade-off is the maximum scannable repository. `execute_paginated`
+    /// stops a scan at `MAX_PAGINATION_ITERATIONS` (1000) pages and returns an
+    /// error rather than truncating, so the ceiling is `page_size x 1001`:
+    /// 25,025 pull requests here, down from 100,100. That ceiling is only
+    /// reachable where the wider page worked at all — on a repository large
+    /// enough for this to matter, `first: 100` currently returns zero rows, so
+    /// the effective ceiling goes up rather than down. Sizing the page per
+    /// repository instead of by a constant is tracked in #13937.
+    ///
+    /// See: <https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api>
+    const DEFAULT_PAGE_SIZE: u32 = 25;
 
-    /// Reduced outer `first:` value when `include_comments` is enabled.
+    /// Outer `first:` value when `include_comments` is enabled.
     ///
     /// With comments enabled, each PR can expand to up to `20 * max_comments_fetched`
     /// review-thread comments plus `max_comments_fetched` discussion comments.
     /// Keeping the outer page at 25 keeps the total node count safely under
     /// GitHub's 500,000 node hard limit and within secondary rate limits.
+    ///
+    /// This equals `DEFAULT_PAGE_SIZE`: the comment-free page is bounded by the
+    /// per-request compute budget at the same width that the node limit bounds
+    /// the commented one, so the two arrive at 25 for different reasons.
     ///
     /// See: <https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#node-limit>
     const COMMENTS_PAGE_SIZE: u32 = 25;
@@ -301,9 +329,12 @@ impl PullRequestTableArgs {
 
     /// Returns the outer `first:` page size for the pull request connection.
     ///
-    /// When comments are included (review, discussion, or both), the page size
-    /// is reduced to keep total node count well under GitHub's 500,000 node
-    /// hard limit on a single GraphQL query.
+    /// Every comment mode requests the same number of pull requests per page:
+    /// `DEFAULT_PAGE_SIZE` and `COMMENTS_PAGE_SIZE` are both 25. They stay
+    /// separate constants because different limits hold them there — the
+    /// comment-free page is bounded by GitHub's per-request compute budget,
+    /// the commented one by the 500,000 node hard limit on a single GraphQL
+    /// query — so either may move without the other.
     fn outer_page_size(&self) -> u32 {
         match self.include_comments {
             PullRequestCommentType::None => Self::DEFAULT_PAGE_SIZE,
@@ -809,12 +840,17 @@ mod tests {
     #[test]
     fn outer_page_size_uses_default_when_no_comments() {
         let a = args(PullRequestCommentType::None, 25);
-        assert_eq!(a.outer_page_size(), 100);
+        assert_eq!(a.outer_page_size(), 25);
     }
 
     #[test]
-    fn outer_page_size_shrinks_when_comments_enabled() {
+    fn outer_page_size_stays_within_the_compute_budget() {
+        // Every comment mode requests the same number of pull requests per
+        // page. The bound is GitHub's per-request compute budget, which a page
+        // of 100 exceeds on a large repository regardless of whether comments
+        // are attached, so no mode may exceed DEFAULT_PAGE_SIZE.
         for include in [
+            PullRequestCommentType::None,
             PullRequestCommentType::Review,
             PullRequestCommentType::Discussion,
             PullRequestCommentType::All,

@@ -24,16 +24,16 @@ use datafusion::{
     logical_expr::{LogicalPlan, LogicalPlanBuilder},
 };
 use futures::future::try_join_all;
-use spice_table::{Index, WriteWindow};
+use spice_table::{GroupPruning, Index, WriteWindow};
 
 use crate::index::{SearchIndex, VectorIndex, primary_key_projection};
 
 use super::{
     COMPOUND_WRITE_COMPLETE_FAILURE_IS_FATAL, COMPOUND_WRITE_START_FAILURE_IS_FATAL,
     CompoundReadMode, Error, compound_delete_by_keys, compound_delete_by_predicate,
-    compound_on_write_complete, compound_on_write_start, compound_required_columns,
-    compound_resolve_delete_keys, compound_write, fallback::fallback_on_empty_plan,
-    validate_compatibility,
+    compound_delete_group_remainder, compound_group_pruning, compound_on_write_complete,
+    compound_on_write_start, compound_required_columns, compound_resolve_delete_keys,
+    compound_write, fallback::fallback_on_empty_plan, validate_compatibility,
 };
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::prelude::Expr;
@@ -193,6 +193,20 @@ impl Index for CompoundVectorIndex {
         compound_delete_by_keys(self.primary.as_ref(), self.secondary.as_ref(), keys).await
     }
 
+    async fn delete_group_remainder(
+        &self,
+        group_columns: &[String],
+        members: RecordBatch,
+    ) -> DataFusionResult<()> {
+        compound_delete_group_remainder(
+            self.primary.as_ref(),
+            self.secondary.as_ref(),
+            group_columns,
+            members,
+        )
+        .await
+    }
+
     async fn resolve_delete_keys(
         &self,
         table: &Arc<dyn TableProvider>,
@@ -222,6 +236,10 @@ impl Index for CompoundVectorIndex {
         // `delete_by_keys` fans out to both halves, so a partial key only clears this compound
         // index when *both* halves act on one.
         self.primary.deletes_by_partial_key() && self.secondary.deletes_by_partial_key()
+    }
+
+    fn group_pruning(&self) -> GroupPruning {
+        compound_group_pruning(self.primary.as_ref(), self.secondary.as_ref())
     }
 
     fn write_start_failure_is_fatal(&self) -> bool {

@@ -65,6 +65,7 @@ pub mod hll;
 #[cfg(feature = "partition-table-provider")]
 pub use ddl::CayenneDdlHandler;
 pub(crate) mod bounded_fifo;
+pub mod cte_materialization;
 pub mod logical_optimizer;
 pub mod maintained_aggregate;
 pub mod metadata;
@@ -93,6 +94,10 @@ pub use catalog_provider::{
     CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,
 };
 pub use cayenne_catalog::{CayenneCatalog, is_retryable_write_conflict};
+pub use cte_materialization::{
+    CTE_SCAN_NODE_NAME, CayenneCteMaterialization, CayenneCteMaterializationPlanner,
+    MATERIALIZED_CTE_NODE_NAME,
+};
 pub use metadata::{
     CdcDurability, DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
     ObjectStoreConfig, PartitionMetadata, StorageClass, TableMetadata, TableStatistics,
@@ -105,8 +110,8 @@ pub use provider::{
     CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneStagedUpsert,
     CayenneTableProvider, CayenneTableProviderBuilder, CayenneTransaction, EncodeBudgetSnapshot,
     LastSmallFileCompactPath, PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry,
-    PreparedOverwrite, PreparedStagedAppend, PreparedTxnCommit, QueryObservations, SlotAdvancer,
-    TimeRetentionFilterBuilder, TransactionCommit, TransactionWriteToken, TxnTable,
+    PreparedOverwrite, PreparedStagedAppend, PreparedTxnCommit, QueryObservations, ScanViewReuse,
+    SlotAdvancer, TimeRetentionFilterBuilder, TransactionCommit, TransactionWriteToken, TxnTable,
     begin_compaction_shutdown, cap_global_encode_concurrency, clear_global_mem_tier_pool_account,
     compaction_budget, compaction_budget_permits, deregister_query_observations,
     drain_compaction_tasks, encode_budget_snapshot, global_mem_tier_pool_account_bytes,

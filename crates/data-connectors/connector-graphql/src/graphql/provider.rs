@@ -123,12 +123,16 @@ impl GraphQLTableProviderBuilder {
                 .await?;
         }
 
+        // With a declared schema, one outer row is enough to validate the
+        // response and schema transform. Keep schema inference's sample size
+        // unchanged, and retain the full base query for subsequent scans.
+        let validation_limit = self.client.configured_schema().map(|_| 1);
         let result = self
             .client
             .execute(
                 &query,
                 None,
-                None,
+                validation_limit,
                 None,
                 self.context.clone().and_then(|o| o.error_checker()),
                 None,
@@ -608,6 +612,104 @@ mod tests {
             .expect("provider to build without validation");
 
         assert_eq!(TableProvider::schema(&provider), schema);
+    }
+
+    /// A declared schema needs only a small probe; an inferred schema still
+    /// samples a full page, including fields absent from its first record.
+    #[tokio::test]
+    async fn validation_limits_only_configured_schema_probes() {
+        use datafusion::prelude::SessionContext;
+        use serde_json::json;
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let rows = json!({"data": {"items": {
+            "nodes": [{"id": 1}, {"id": 2, "later_field": "present"}],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+        }}});
+        for page_size in [2, 100] {
+            Mock::given(method("POST"))
+                .and(body_string_contains(format!("first: {page_size})")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(rows.clone()))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(body_string_contains("first: 1)"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data": {"items": {
+                    "nodes": [{"id": 1}],
+                    "pageInfo": {"hasNextPage": true, "endCursor": "1"}
+                }}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let query =
+            "{ items(first: 100) { nodes { id later_field } pageInfo { hasNextPage endCursor } } }";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("later_field", DataType::Utf8, true),
+        ]));
+        let client = GraphQLClientBuilder::new(
+            Url::parse(&server.uri()).expect("fixture URL"),
+            UnnestBehavior::Depth(0),
+        )
+        .with_schema(Some(Arc::clone(&schema)))
+        .build(reqwest::Client::new())
+        .expect("configured client");
+        let provider = GraphQLTableProviderBuilder::new(client)
+            .build(query)
+            .await
+            .expect("bounded validation");
+        assert_eq!(provider.schema(), schema);
+
+        let ctx = SessionContext::new();
+        ctx.register_table("items", Arc::new(provider))
+            .expect("register table");
+        let rows = ctx
+            .sql("SELECT * FROM items LIMIT 2")
+            .await
+            .expect("query")
+            .collect()
+            .await
+            .expect("all rows beyond the validation probe");
+        assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+
+        let client = GraphQLClientBuilder::new(
+            Url::parse(&server.uri()).expect("fixture URL"),
+            UnnestBehavior::Depth(0),
+        )
+        .build(reqwest::Client::new())
+        .expect("inferred client");
+        let inferred = GraphQLTableProviderBuilder::new(client)
+            .build(query)
+            .await
+            .expect("inferred schema");
+        assert_eq!(
+            inferred
+                .schema()
+                .field_with_name("later_field")
+                .expect("later field")
+                .data_type(),
+            &DataType::Utf8
+        );
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests.len(), 3);
+        let query_for = |index: usize| {
+            requests[index]
+                .body_json::<serde_json::Value>()
+                .expect("GraphQL body")["query"]
+                .as_str()
+                .expect("query text")
+                .to_string()
+        };
+        assert!(query_for(0).contains("first: 1)"), "{}", query_for(0));
+        assert!(query_for(1).contains("first: 2)"), "{}", query_for(1));
+        assert!(query_for(2).contains("first: 100)"), "{}", query_for(2));
     }
 
     #[test]

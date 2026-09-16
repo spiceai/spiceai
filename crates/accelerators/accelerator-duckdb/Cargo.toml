@@ -49,6 +49,7 @@ duckdb.workspace = true
 itertools.workspace = true
 snafu.workspace = true
 tokio = { workspace = true, features = ["sync", "rt"] }
+util = { path = "../../util" }
 
 [dev-dependencies]
 # Test-only, and deliberately dev-only: these sit in the `runtime` tier, so a normal
@@ -61,6 +62,7 @@ tempfile.workspace = true
 runtime-acceleration = { path = "../../runtime-acceleration", features = ["duckdb", "test-support"] }
 datafusion-table-providers = { workspace = true, features = ["duckdb"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+datafusion-spark.workspace = true
 
 [lints]
 workspace = true
