@@ -994,6 +994,17 @@ mod tests {
         ))
     }
 
+    /// `regexp_count(str, pattern)` with a literal pattern. The `DuckDB`
+    /// handler renders only a call whose pattern it can screen at unparse time
+    /// (#13870), so the no-arg probe is refused per call — for the shape, not
+    /// the name — and cannot tell whether the name is denied.
+    fn make_regexp_count_call() -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(stub_scalar_udf("regexp_count")),
+            vec![lit("ab"), lit("a")],
+        ))
+    }
+
     #[test]
     fn table_providers_default_deny_list_denies_spice_functions() {
         // The default table-providers-typed deny-list (wired into the ADBC
@@ -1241,12 +1252,16 @@ mod tests {
                     "{name} has no value-preserving DuckDB rendering and must not be pushed down"
                 );
             }
-            for name in ["regexp_like", "regexp_replace", "regexp_count"] {
+            for name in ["regexp_like", "regexp_replace"] {
                 assert!(
                     support.supports(&make_named_expr(name), None),
                     "{name} is rendered natively by the DuckDB dialect and must be pushed down"
                 );
             }
+            assert!(
+                support.supports(&make_regexp_count_call(), None),
+                "regexp_count with a literal pattern is rendered by the DuckDB dialect and must be pushed down"
+            );
         }
     }
 
