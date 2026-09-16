@@ -382,7 +382,7 @@ impl Display for OnConflictBehavior {
 /// `Enabled` is `stale-if-error=∞` (always serve stale, unbounded retention),
 /// `Disabled` is `stale-if-error=0` (never serve stale), and `For(d)` is
 /// `stale-if-error=d` (serve stale only while its staleness is provably `≤ d`).
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StaleIfError {
     /// Do not serve stale data on error - propagate the error to the client.
     #[default]
