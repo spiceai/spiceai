@@ -89,6 +89,20 @@ fn keyed_reference_requested_rows(offset: usize, fetch_past_offset: usize) -> us
         .min(MAX_KEYED_REFERENCE_ROWS)
 }
 
+/// Rows to tell [`validation::decide_from_keyed_reference_batches`] the keyed
+/// query asked for. Uses [`keyed_reference_requested_rows`], then at least
+/// `fetched_rows` so a collected stream that already ended is treated as ended,
+/// but never above [`MAX_KEYED_REFERENCE_ROWS`].
+fn keyed_reference_compare_requested_rows(
+    offset: usize,
+    fetch_past_offset: usize,
+    fetched_rows: usize,
+) -> usize {
+    keyed_reference_requested_rows(offset, fetch_past_offset)
+        .max(fetched_rows)
+        .min(MAX_KEYED_REFERENCE_ROWS)
+}
+
 pub(crate) struct SpiceTestQueryWorker {
     id: usize,
     query_set: Vec<Query>,
@@ -1186,11 +1200,11 @@ fn apply_live_oracle_row_fallbacks(
         && let Some(keyed_reference) = keyed_reference
     {
         let fetched_rows: usize = keyed_reference.iter().map(RecordBatch::num_rows).sum();
-        let requested_rows = keyed_reference_requested_rows(
+        let requested_rows = keyed_reference_compare_requested_rows(
             sort_limit.offset,
             keyed_reference_fetch_rows(sort_limit.limit),
-        )
-        .max(fetched_rows);
+            fetched_rows,
+        );
         if let Some(result) = validation::decide_from_keyed_reference_batches(
             actual,
             keyed_reference.iter().cloned(),
@@ -1418,6 +1432,36 @@ mod tests {
         assert_eq!(
             keyed_reference_requested_rows(MAX_KEYED_REFERENCE_ROWS, fetch),
             MAX_KEYED_REFERENCE_ROWS
+        );
+    }
+
+    /// A collected keyed stream can be larger than the first window. Taking
+    /// `requested.max(fetched)` without clamping again would raise the count
+    /// past [`MAX_KEYED_REFERENCE_ROWS`].
+    #[test]
+    fn keyed_reference_compare_requested_rows_never_exceeds_the_cap() {
+        let fetch = keyed_reference_fetch_rows(10);
+        let requested = keyed_reference_requested_rows(0, fetch);
+        assert_eq!(requested, 20);
+        let fetched_past_cap = MAX_KEYED_REFERENCE_ROWS.saturating_add(100);
+        let unclamped = requested.max(fetched_past_cap);
+        assert!(
+            unclamped > MAX_KEYED_REFERENCE_ROWS,
+            "unclamped max(requested, fetched) {unclamped} must exceed the cap"
+        );
+        assert_eq!(
+            keyed_reference_compare_requested_rows(0, fetch, fetched_past_cap),
+            MAX_KEYED_REFERENCE_ROWS
+        );
+        assert_eq!(
+            keyed_reference_compare_requested_rows(100, fetch, 50),
+            120,
+            "when fetched is under the window, the request is the window"
+        );
+        assert_eq!(
+            keyed_reference_compare_requested_rows(0, fetch, 40),
+            40,
+            "when fetched is above the window but under the cap, the request is fetched"
         );
     }
 
