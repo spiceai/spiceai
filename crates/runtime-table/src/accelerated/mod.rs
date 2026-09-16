@@ -311,7 +311,7 @@ pub struct AcceleratedTable {
     /// Tracks in-flight revalidation requests to avoid duplicate upstream requests during SWR window
     in_flight_revalidations: caching::InFlightRevalidations,
     /// Bounds concurrent per-entry SWR background refreshes (caching mode only, spiceai/spiceai#14102)
-    swr_refresh_semaphore: caching::SwrRefreshSemaphore,
+    swr_refresh_semaphore: Arc<Semaphore>,
     /// Timestamp (milliseconds since epoch) of the last `insert_into` operation.
     /// `None` if no insert has occurred yet (and no bootstrap timestamp was provided).
     /// Shared with `RefreshTask`
@@ -973,9 +973,9 @@ impl Builder {
         // Shared across every scan of this dataset so the bound holds
         // regardless of how many distinct keys go stale concurrently
         // (spiceai/spiceai#14102).
-        let swr_refresh_semaphore: caching::SwrRefreshSemaphore = Arc::new(
-            tokio::sync::Semaphore::new(caching::MAX_CONCURRENT_SWR_REFRESHES),
-        );
+        let swr_refresh_semaphore: Arc<Semaphore> = Arc::new(tokio::sync::Semaphore::new(
+            caching::MAX_CONCURRENT_SWR_REFRESHES,
+        ));
         // Create last_updated_at atomic to track insert_into timestamps, shared with Refresher for snapshots.
         // Initialize from bootstrap metadata if available.
         let last_updated_at = Arc::new(

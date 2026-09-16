@@ -270,14 +270,10 @@ const MAX_CONCURRENT_REFRESHES: usize = 10;
 /// refreshes, mirroring `MAX_CONCURRENT_REFRESHES` for the periodic bulk-refresh
 /// path. Unlike that path, SWR refreshes are triggered one at a time by request
 /// traffic rather than batched up front, so the bound is enforced with a
-/// semaphore instead of `buffer_unordered` (see [`SwrRefreshSemaphore`]).
+/// semaphore (shared across every `CachingAccelerationScanExec` for a dataset,
+/// so it caps the total regardless of how many distinct keys go stale
+/// concurrently) instead of `buffer_unordered` (spiceai/spiceai#14102).
 pub(crate) const MAX_CONCURRENT_SWR_REFRESHES: usize = 10;
-
-/// Bounds how many per-entry SWR background refreshes (`handle_cache_hit`'s
-/// `Stale` branch) can be running at once. Shared across every
-/// `CachingAccelerationScanExec` for a dataset, so it caps the total regardless
-/// of how many distinct keys go stale concurrently (spiceai/spiceai#14102).
-pub type SwrRefreshSemaphore = Arc<Semaphore>;
 
 /// Channel capacity for batched cache writes. Allows buffering many concurrent requests.
 /// This value controls how many cache write requests can be buffered before
@@ -1836,8 +1832,8 @@ impl CacheRefreshHelper {
     ///   stale by a concurrent replacement cannot append beside it. See
     ///   [`CacheKeyClaim`].
     ///
-    /// Not bounded by [`SwrRefreshSemaphore`] (spiceai/spiceai#14102): unlike the
-    /// SWR path, this fetch runs inline on the request future rather than a
+    /// Not bounded by the SWR refresh semaphore (spiceai/spiceai#14102): unlike
+    /// the SWR path, this fetch runs inline on the request future rather than a
     /// spawned background task, so its concurrency is already whatever bounds
     /// concurrent client requests, and there is no cached row to fall back to
     /// while waiting for a permit.
@@ -2034,7 +2030,7 @@ impl CacheRefreshHelper {
         in_flight_revalidations: &InFlightRevalidations,
         batch_write_tx: CacheWriteSender,
         namespace: CacheNamespace,
-        swr_refresh_semaphore: &SwrRefreshSemaphore,
+        swr_refresh_semaphore: &Arc<Semaphore>,
     ) -> SendableRecordBatchStream {
         let total_cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
 
@@ -2069,21 +2065,7 @@ impl CacheRefreshHelper {
                         ),
                     );
 
-                    // A background refresh must never block the client-facing
-                    // request path, so this is a non-blocking `try_acquire`
-                    // rather than `.acquire().await`: when the bound is
-                    // already saturated we drop straight through to serving
-                    // the stale row, and the claim above releases the key so
-                    // the next hit on it can retry.
-                    let has_claim = claim.is_some();
-                    let permit = if has_claim {
-                        Arc::clone(swr_refresh_semaphore).try_acquire_owned().ok()
-                    } else {
-                        None
-                    };
-                    let permit_exhausted = has_claim && permit.is_none();
-
-                    if let (Some(claim), Some(permit)) = (claim, permit) {
+                    if let Some(claim) = claim {
                         tracing::debug!(
                             "Data is stale for dataset={dataset_name}, triggering background refresh"
                         );
@@ -2101,9 +2083,24 @@ impl CacheRefreshHelper {
                         let filters_for_refresh: Vec<Expr> = filters.to_vec();
                         let batch_write_tx_clone = batch_write_tx;
                         let namespace_clone = namespace;
+                        let swr_refresh_semaphore = Arc::clone(swr_refresh_semaphore);
 
+                        // The claim is held for the whole refresh (including
+                        // the wait below), so a duplicate hit on this key
+                        // sees should_revalidate=false rather than queuing a
+                        // second refresh behind the same permit. Spawning
+                        // unconditionally and queuing on the semaphore here,
+                        // instead of a non-blocking `try_acquire` before the
+                        // spawn, never blocks the client-facing request path
+                        // (this task already runs in the background) and
+                        // guarantees the entry is eventually revalidated
+                        // instead of only if some future stale hit happens to
+                        // land while a permit is free (spiceai/spiceai#14102).
                         io_runtime.spawn(async move {
-                            let _permit = permit;
+                            let Ok(_permit) = swr_refresh_semaphore.acquire_owned().await else {
+                                // Semaphore is never closed; unreachable in practice.
+                                return;
+                            };
                             tracing::debug!(
                                 "SWR: Background refresh for single entry started for dataset={dataset_name_clone}"
                             );
@@ -2140,10 +2137,6 @@ impl CacheRefreshHelper {
                                 }
                             }
                         });
-                    } else if permit_exhausted {
-                        tracing::debug!(
-                            "Skipping background refresh for dataset={dataset_name}: {MAX_CONCURRENT_SWR_REFRESHES} concurrent SWR refreshes already in flight, serving stale data as-is"
-                        );
                     } else {
                         tracing::debug!(
                             "Skipping background refresh for dataset={dataset_name} because should_revalidate=false (revalidation already in progress for this cache key)"
@@ -2200,7 +2193,7 @@ pub struct CachingAccelerationScanExec {
     batch_write_tx: CacheWriteSender,
     /// Bounds concurrent per-entry SWR background refreshes across every scan
     /// of this dataset (spiceai/spiceai#14102)
-    swr_refresh_semaphore: SwrRefreshSemaphore,
+    swr_refresh_semaphore: Arc<Semaphore>,
 }
 
 impl CachingAccelerationScanExec {
@@ -2221,7 +2214,7 @@ impl CachingAccelerationScanExec {
         in_flight_revalidations: InFlightRevalidations,
         synchronized_children: SynchronizedChildren,
         batch_write_tx: CacheWriteSender,
-        swr_refresh_semaphore: SwrRefreshSemaphore,
+        swr_refresh_semaphore: Arc<Semaphore>,
     ) -> Self {
         let max_age = Some(effective_max_age(max_age));
 
@@ -4002,7 +3995,7 @@ mod tests {
             Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
         let (batch_write_tx, _consumer_handle) =
             spawn_test_cache_write_consumer(&accelerator, &in_flight_revalidations);
-        let swr_refresh_semaphore: SwrRefreshSemaphore =
+        let swr_refresh_semaphore: Arc<Semaphore> =
             Arc::new(Semaphore::new(MAX_CONCURRENT_SWR_REFRESHES));
 
         let io_runtime = tokio::runtime::Handle::current();
