@@ -800,6 +800,7 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
                 ("regexp_count(s, '[Kkx]|a')", "an alternation over a three-character class (rows 9 and 10)"),
                 ("regexp_count(s, 'k|K')", "an alternation of plain literals (rows 9 and 10)"),
                 ("regexp_count(s, '([K-Lk]|a)')", "an alternation over a three-code-point class (rows 9 and 10)"),
+                ("regexp_count(s, '[^Kk]|a')", "an alternation over a negated class (rows 9 and 10)"),
             ];
             for (call, what) in shapes {
                 let sql = format!("SELECT id, {call} AS c FROM {{table}} ORDER BY id");
@@ -904,6 +905,7 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
                 "regexp_count(s, '([Ss]|a)')",
                 "regexp_count(s, '([KkK]|a)')",
                 "regexp_count(s, '([K-Kk]|a)')",
+                "regexp_count(s, '[^\\x00-\\x4A\\x4C-\\x6A\\x6C-\\x{10FFFF}]|a')",
                 "regexp_count(s, 'a', 4294967296)",
                 "regexp_count(s, 'a', 1, 'm')",
                 "regexp_count(s, 'a', 1, 'i')",

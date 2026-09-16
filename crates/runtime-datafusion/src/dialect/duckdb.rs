@@ -1389,6 +1389,7 @@ mod tests {
             "[KkK]",
             "([SsS]|a)",
             "[kk-kK]",
+            "[^\\x00-\\x4A\\x4C-\\x6A\\x6C-\\x{10FFFF}]|a",
             "(?P<n>a)",
             "(?<n>a)",
             "\\p{Nd}",

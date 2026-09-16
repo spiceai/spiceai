@@ -50,7 +50,9 @@ limitations under the License.
 //! `([Kk]|a)` counts the Kelvin sign `K` and `([Ss]|a)` the long s `ſ` remotely
 //! where the kernel counts neither (measured on the bundled `DuckDB`); the bare
 //! class agrees, but the rewrite is what RE2 does with the class, not with the
-//! alternation. `.`, `[^a]`, `[0-9]`, `[Kkx]|a` and `k|K` were measured to
+//! alternation. The pair is judged after the class is normalized, because RE2
+//! deduplicates, merges and negates first: `[KkK]`, `[K-Kk]` and the negated
+//! class whose complement is `Kk` were measured to diverge the same way. `.`, `[^a]`, `[0-9]`, `[Kkx]|a` and `k|K` were measured to
 //! agree.
 //!
 //! A caller with a stricter need layers its own predicate on the returned
@@ -58,15 +60,14 @@ limitations under the License.
 //! match length above zero, because the two engines count an empty match
 //! differently.
 
-use std::collections::BTreeSet;
 use std::fmt;
 
 use regex_syntax::ast::{
-    AssertionKind, Ast, ClassBracketed, ClassSet, ClassSetBinaryOp, ClassSetItem, Flags, GroupKind,
+    AssertionKind, Ast, ClassBracketed, ClassSetBinaryOp, ClassSetItem, Flags, GroupKind,
     HexLiteralKind, Literal, LiteralKind, Repetition, RepetitionKind, RepetitionRange,
     SpecialLiteralKind, Visitor, parse::Parser, visit,
 };
-use regex_syntax::hir::{ClassUnicode, ClassUnicodeRange};
+use regex_syntax::hir::{Class, ClassUnicode, ClassUnicodeRange, HirKind};
 
 /// RE2's cap on counted repetition (`kMaxRepeat` in `re2/parse.cc`): the
 /// product of the `{n}`/`{n,m}` bounds along a nesting path may not exceed
@@ -209,37 +210,34 @@ impl EngineNeutralSyntax<'_> {
         }
     }
 
-    /// Refuses a positive class whose distinct members are exactly two case
-    /// variants of one character (`[Kk]`, `[sS]`, `[KkK]`, `[K-Kk]`), the
-    /// shape RE2 rewrites into a case-folded literal once it has deduplicated
-    /// the class. Variants are judged with the kernel's own simple case
-    /// folding, which is a superset of the ASCII pairs RE2 rewrites — a class
-    /// it refuses that RE2 would keep only costs a pushdown.
-    fn class(class: &ClassBracketed) -> Result<(), EngineDependentSyntax> {
-        if class.negated {
-            return Ok(());
-        }
-        let ClassSet::Item(ClassSetItem::Union(union)) = &class.kind else {
+    /// Refuses a class whose effective members are exactly two case variants
+    /// of one character — `[Kk]`, `[sS]`, `[KkK]`, `[K-Kk]`, or a negated class
+    /// whose complement is that pair — the shape RE2 rewrites into a
+    /// case-folded literal once it has deduplicated, merged and negated the
+    /// class. The class text is translated on its own into the kernel's HIR,
+    /// which performs the same normalization, so the judgment is over the code
+    /// points the class denotes rather than over its spelling. Variants are
+    /// judged with the kernel's own simple case folding, which is a superset
+    /// of the ASCII pairs RE2 rewrites — a class it refuses that RE2 would
+    /// keep only costs a pushdown.
+    fn class(&self, class: &ClassBracketed) -> Result<(), EngineDependentSyntax> {
+        let span = &class.span;
+        let text = self
+            .pattern
+            .get(span.start.offset..span.end.offset)
+            .unwrap_or_default();
+        let hir = regex_syntax::parse(text).map_err(|_| EngineDependentSyntax::Unparseable)?;
+        let HirKind::Class(Class::Unicode(members)) = hir.kind() else {
+            // A one-code-point class becomes a literal and an empty one never
+            // matches; neither is a pair.
             return Ok(());
         };
-        let mut members = BTreeSet::new();
-        for item in &union.items {
-            let (start, end) = match item {
-                ClassSetItem::Literal(literal) => (literal.c, literal.c),
-                ClassSetItem::Range(range) => (range.start.c, range.end.c),
-                // Anything else is refused on its own account, or is not a
-                // set of code points RE2 would collapse into a pair.
-                _ => return Ok(()),
-            };
-            // A range of three or more code points already rules out a pair.
-            if u32::from(end).saturating_sub(u32::from(start)) >= 2 {
-                return Ok(());
-            }
-            members.insert(start);
-            members.insert(end);
-        }
-        let mut members = members.into_iter();
-        if let (Some(first), Some(second), None) = (members.next(), members.next(), members.next())
+        let mut code_points = members
+            .ranges()
+            .iter()
+            .flat_map(|range| range.start()..=range.end());
+        if let (Some(first), Some(second), None) =
+            (code_points.next(), code_points.next(), code_points.next())
             && Self::case_variants(first, second)
         {
             return Err(EngineDependentSyntax::CaseFoldPair);
@@ -309,7 +307,7 @@ impl Visitor for EngineNeutralSyntax<'_> {
     fn visit_pre(&mut self, ast: &Ast) -> Result<(), EngineDependentSyntax> {
         match ast {
             Ast::Empty(_) | Ast::Dot(_) | Ast::Alternation(_) | Ast::Concat(_) => Ok(()),
-            Ast::ClassBracketed(class) => Self::class(class),
+            Ast::ClassBracketed(class) => self.class(class),
             Ast::Literal(literal) => Self::literal(literal),
             Ast::Repetition(repetition) => self.enter_repetition(repetition),
             Ast::Flags(set) => Self::flags(&set.flags),
