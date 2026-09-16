@@ -21023,10 +21023,11 @@ impl CayenneTableProvider {
     ///
     /// Read from the maintained metastore aggregate — already warm, O(1), and
     /// covering the *whole* table rather than the rows this promotion happens to
-    /// carry, so every promotion maps values onto the same coordinate space and
-    /// the files they write stay mutually comparable. A column the aggregate
-    /// cannot describe yields `None`, which the kernel reads as "use this type's
-    /// full key domain".
+    /// carry, so every file this promotion writes shares one coordinate space.
+    /// The aggregate widens as later writes merge new extrema, and clean cold
+    /// files are carried forward without rewrite, so a later promotion may
+    /// normalize onto a different scale. A column the aggregate cannot describe
+    /// yields `None`, which the kernel reads as "use this type's full key domain".
     ///
     /// Goes through [`Self::maintained_column_bound`] rather than
     /// [`Self::optimizer_table_statistics`]: the planner-facing view drops every

@@ -46,12 +46,14 @@ limitations under the License.
 //!    varying bit at the top, which is what makes the interleave a genuine
 //!    multi-dimensional layout instead of a disguised single-column sort.
 //!
-//!    The bounds come from the whole-table aggregate rather than from the rows
-//!    being promoted, so every promotion maps values onto the *same* coordinate
-//!    space and files written by different promotions stay mutually comparable.
-//!    Values outside the bounds — statistics are allowed to lag — clamp to the
-//!    end cells. Clustering is a layout-quality property and never a correctness
-//!    one, so a stale or missing bound costs pruning, never rows.
+//!    The bounds come from the whole-table aggregate at promotion time rather
+//!    than from the rows being promoted, so every file written in that
+//!    promotion shares one coordinate space. The aggregate widens as later
+//!    writes merge new extrema, and clean cold files are carried forward
+//!    without rewrite, so a later promotion may normalize onto a different
+//!    scale. Values outside the current bounds clamp to the end cells.
+//!    Clustering is a layout-quality property and never a correctness one, so
+//!    a stale, widened, or missing bound costs pruning, never rows.
 //!
 //!    A column with *no* bound falls back to its type's full key domain, i.e.
 //!    its raw key. Be clear about what that costs: raw keys are precisely the
@@ -881,6 +883,21 @@ mod tests {
         assert_eq!(normalize(key_from_i64(5_000), lo, hi), MAX_CODE);
         // Monotone in between.
         assert!(normalize(key_from_i64(25), lo, hi) < normalize(key_from_i64(75), lo, hi));
+    }
+
+    #[test]
+    fn widening_bounds_move_the_same_value_on_the_curve() {
+        // The maintained aggregate widens as later writes merge new extrema,
+        // and clean cold files keep the layout they were written with. The
+        // same value therefore lands on a different coordinate once the
+        // bounds change — the space is shared within one promotion, not
+        // across them.
+        let value = key_from_i64(50);
+        let first = normalize(value, key_from_i64(0), key_from_i64(100));
+        let widened = normalize(value, key_from_i64(-100), key_from_i64(100));
+        assert_eq!(first, 0x7fff_ffff_ffff_ffff);
+        assert_eq!(widened, 0xbfff_ffff_ffff_ffff);
+        assert_ne!(first, widened);
     }
 
     #[test]
