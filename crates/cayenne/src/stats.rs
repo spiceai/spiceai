@@ -28,12 +28,13 @@ use datafusion_common::{ColumnStatistics, ScalarValue, Statistics};
 use vortex::VortexSessionDefault;
 use vortex::array::stats::StatsSet;
 use vortex::arrow::{FromArrowType, ToArrowDatum};
-use vortex::dtype::{DType, Nullability};
+use vortex::buffer::ByteBuffer;
+use vortex::dtype::{DType, DecimalDType, Nullability};
 use vortex::error::VortexResult;
 use vortex::expr::stats::{Precision as VortexPrecision, Stat};
 use vortex::file::FileStatistics;
 use vortex::flatbuffers::WriteFlatBufferExt;
-use vortex::scalar::Scalar;
+use vortex::scalar::{DecimalValue, Scalar};
 
 /// Convert a `DataFusion` [`ScalarValue`] to a Vortex [`vortex::scalar::ScalarValue`].
 ///
@@ -54,6 +55,23 @@ fn df_scalar_to_vortex(sv: &ScalarValue) -> Option<vortex::scalar::ScalarValue> 
         ScalarValue::Utf8(Some(v))
         | ScalarValue::LargeUtf8(Some(v))
         | ScalarValue::Utf8View(Some(v)) => v.as_str().into(),
+        // Carry the column's DECLARED precision/scale through rather than
+        // deriving one from the value: the reverse conversion rebuilds the
+        // DataFusion width from this dtype, and a width that disagrees with the
+        // column's would be rejected downstream as a different type.
+        ScalarValue::Decimal128(Some(v), precision, scale) => Scalar::decimal(
+            DecimalValue::I128(*v),
+            DecimalDType::new(*precision, *scale),
+            Nullability::Nullable,
+        ),
+        // Vortex has one binary dtype, so the offset width is not preserved;
+        // `bound_key` compares key spaces rather than type tags for exactly
+        // this reason.
+        ScalarValue::Binary(Some(v))
+        | ScalarValue::LargeBinary(Some(v))
+        | ScalarValue::BinaryView(Some(v)) => {
+            Scalar::binary(ByteBuffer::from(v.clone()), Nullability::Nullable)
+        }
         ScalarValue::Date32(Some(v)) => {
             let dtype = DType::from_arrow((&sv.data_type(), Nullability::Nullable));
             Scalar::try_new(dtype, Some(vortex::scalar::ScalarValue::from(*v))).ok()?
@@ -110,6 +128,26 @@ fn scalar_to_df(scalar: &Scalar) -> Option<ScalarValue> {
         DType::Utf8(_) => {
             let v: String = scalar.try_into().ok()?;
             Some(ScalarValue::Utf8(Some(v)))
+        }
+        DType::Decimal(decimal_type, _) => {
+            // Rebuild the 128-bit width specifically, NOT the narrowest width
+            // that fits the precision: `compute_column_stats` produces
+            // `Decimal128` for Cayenne's decimal columns, and a bound whose
+            // width disagrees with the column's declared type is discarded by
+            // the consumer. Going through Arrow instead would be worse still —
+            // `to_arrow_datum` flattens precision and scale to Arrow defaults.
+            let value = scalar.as_decimal().decimal_value()?;
+            Some(ScalarValue::Decimal128(
+                Some(value.cast::<i128>()?),
+                decimal_type.precision(),
+                decimal_type.scale(),
+            ))
+        }
+        DType::Binary(_) => {
+            let bytes = scalar.as_binary().value().cloned()?;
+            Some(ScalarValue::Binary(Some(Vec::<u8>::from(
+                bytes.into_inner(),
+            ))))
         }
         DType::Extension(_) => {
             // Temporal types (Date/Time/Timestamp) are represented as Vortex
@@ -670,6 +708,63 @@ mod tests {
         assert_eq!(
             col.max_value,
             DfPrecision::Exact(ScalarValue::Int64(Some(30)))
+        );
+    }
+
+    /// A `Decimal128` bound must survive the Vortex round-trip with its
+    /// precision and scale intact.
+    ///
+    /// Before this arm existed, `df_scalar_to_vortex` fell through to
+    /// `_ => return None` and the min/max never reached the stats blob at all —
+    /// so any consumer that normalizes against a decimal column's range got
+    /// nothing, silently. The reverse direction rebuilds `Decimal128`
+    /// specifically rather than the narrowest width that fits the precision: a
+    /// bound whose width disagrees with the column's declared type is discarded
+    /// as a type mismatch, which would reintroduce the same gap by another route.
+    #[test]
+    fn decimal128_bounds_survive_the_vortex_round_trip() {
+        let original = ScalarValue::Decimal128(Some(12_345), 10, 2);
+        assert!(
+            df_scalar_to_vortex(&original).is_some(),
+            "a Decimal128 bound must convert to a Vortex scalar value"
+        );
+
+        let scalar = Scalar::decimal(
+            DecimalValue::I128(12_345),
+            DecimalDType::new(10, 2),
+            Nullability::Nullable,
+        );
+        assert_eq!(
+            scalar_to_df(&scalar),
+            Some(original),
+            "precision and scale must come back unchanged, not flattened to Arrow defaults"
+        );
+    }
+
+    /// A `Binary` bound must survive the round-trip byte-for-byte.
+    ///
+    /// Vortex has a single binary dtype, so the offset width (`Binary` vs
+    /// `LargeBinary` vs `BinaryView`) is not preserved — consumers compare key
+    /// spaces rather than type tags for exactly this reason.
+    #[test]
+    fn binary_bounds_survive_the_vortex_round_trip() {
+        let bytes = vec![0xDE_u8, 0xAD, 0xBE, 0xEF];
+        for original in [
+            ScalarValue::Binary(Some(bytes.clone())),
+            ScalarValue::LargeBinary(Some(bytes.clone())),
+            ScalarValue::BinaryView(Some(bytes.clone())),
+        ] {
+            assert!(
+                df_scalar_to_vortex(&original).is_some(),
+                "a {original:?} bound must convert to a Vortex scalar value"
+            );
+        }
+
+        let scalar = Scalar::binary(ByteBuffer::from(bytes.clone()), Nullability::Nullable);
+        assert_eq!(
+            scalar_to_df(&scalar),
+            Some(ScalarValue::Binary(Some(bytes))),
+            "the bytes must come back unchanged"
         );
     }
 

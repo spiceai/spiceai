@@ -323,15 +323,52 @@ pub(crate) fn is_clusterable(data_type: &DataType) -> bool {
     )
 }
 
+/// Whether two types map into the same [`column_order_keys`] key space, so a
+/// bound of type `bound` can normalize a column of type `column`.
+///
+/// This is deliberately weaker than type equality. A bound reaches us through
+/// the Vortex statistics round-trip, which has ONE string dtype and one binary
+/// dtype — so a `LargeUtf8` or `Utf8View` column's bound comes back tagged
+/// `Utf8`, and rejecting it on the tag would leave those columns unnormalized
+/// (a floor, not a soft degradation — see the module docs). Every member of a
+/// family here routes through the same `key_from_*` function, so the bound and
+/// the data genuinely share a space.
+///
+/// The utf8 and binary families are kept apart even though both use
+/// [`key_from_bytes`]: nothing produces a string bound for a binary column, and
+/// keeping them distinct means a future encoding change to either cannot
+/// silently pair them.
+fn same_key_space(bound: &DataType, column: &DataType) -> bool {
+    fn is_utf8(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
+    }
+    fn is_binary(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+        )
+    }
+    bound == column
+        || (is_utf8(bound) && is_utf8(column))
+        || (is_binary(bound) && is_binary(column))
+}
+
 /// The order-preserving key for one statistics bound, in the same space
 /// [`column_order_keys`] maps `column_type` into.
 ///
 /// Going through the column kernel rather than re-deriving the transform is what
 /// guarantees the bound and the data land in the same space: there is one
 /// encoding, not two that must be kept in step. Returns `None` when the scalar
-/// is NULL, its type disagrees with the column's, or the type cannot cluster.
+/// is NULL, its type maps into a different key space than the column's, or the
+/// type cannot cluster.
 pub(crate) fn bound_key(scalar: &ScalarValue, column_type: &DataType) -> Option<u128> {
-    if scalar.is_null() || !is_clusterable(column_type) || scalar.data_type() != *column_type {
+    if scalar.is_null()
+        || !is_clusterable(column_type)
+        || !same_key_space(&scalar.data_type(), column_type)
+    {
         return None;
     }
     let array = scalar.to_array().ok()?;
