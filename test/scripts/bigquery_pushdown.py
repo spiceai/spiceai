@@ -248,6 +248,18 @@ JOIN union_values ON union_values.value = a.n
 WHERE a.n > 1 AND b.n < 3
 GROUP BY a.n
 ORDER BY a.n""",
+    # BigQuery has no ILIKE operator. The residual filter must run in spiced
+    # before LIMIT; pushing LIMIT into the scan would return id 1 (`alpha`),
+    # which the local filter removes, instead of the correct id 2 (`Upper`).
+    "ilike-before-limit-local": """SELECT id
+FROM ilike_values
+WHERE CAST(val AS VARCHAR) ILIKE 'u%'
+ORDER BY id
+LIMIT 1""",
+    "not-ilike-local": """SELECT id
+FROM ilike_values
+WHERE val NOT ILIKE 'u%'
+ORDER BY id""",
 }
 
 EXPECTED_ROWS = {
@@ -395,6 +407,9 @@ EXPECTED_ROWS = {
         {"n": 3, "matches": 1},
     ],
     "filtered-recursive-self-join": [{"n": 2, "matches": 2}],
+    "ilike-before-limit-local": [{"id": 2}],
+    "not-ilike-local": [{"id": 1}, {"id": 3}],
+    "ilike-catalog-before-limit-local": [{"id": 2}],
 }
 
 
@@ -520,6 +535,16 @@ FROM UNNEST([
   STRUCT(5, CAST(NULL AS STRING), CAST(NULL AS STRING)),
   STRUCT(6, 'zzR03', '42')
 ]);
+
+CREATE OR REPLACE TABLE {prefix}.ilike_values` AS
+SELECT *
+FROM UNNEST([
+  STRUCT(1 AS id, 'alpha' AS val),
+  STRUCT(2, 'Upper'),
+  STRUCT(3, 'über'),
+  STRUCT(4, CAST(NULL AS STRING)),
+  STRUCT(5, 'under_score')
+]);
 """
 
 
@@ -551,6 +576,16 @@ datasets:
     params: *bigquery_params
   - from: adbc:temporal_values
     name: temporal_values
+    params: *bigquery_params
+  - from: adbc:ilike_values
+    name: ilike_values
+    params: *bigquery_params
+
+catalogs:
+  - from: adbc
+    name: bigquery_catalog
+    include:
+      - '{dataset}.ilike_values'
     params: *bigquery_params
 """
 
@@ -600,7 +635,7 @@ def wait_until_ready(
     )
 
 
-def initial_physical_sql(explain_body: str) -> str:
+def initial_physical_plan(explain_body: str) -> str:
     plans = json.loads(explain_body)
     plan = next(
         (
@@ -610,7 +645,14 @@ def initial_physical_sql(explain_body: str) -> str:
         ),
         None,
     )
-    if plan is None or "base_sql=" not in plan:
+    if plan is None:
+        raise HarnessError("EXPLAIN VERBOSE did not contain an initial physical plan")
+    return plan
+
+
+def initial_physical_sql(explain_body: str) -> str:
+    plan = initial_physical_plan(explain_body)
+    if "base_sql=" not in plan:
         raise HarnessError(
             "EXPLAIN VERBOSE did not contain an initial physical base_sql plan"
         )
@@ -644,6 +686,25 @@ def pushed_statement_count(explain_body: str) -> int:
 
 
 def assert_generated_sql(name: str, sql: str) -> None:
+    if name in {
+        "ilike-before-limit-local",
+        "not-ilike-local",
+        "ilike-catalog-before-limit-local",
+    }:
+        upper = sql.upper()
+        if re.search(r"\b(?:NOT\s+)?ILIKE\b", upper):
+            raise HarnessError(f"ILIKE leaked into BigQuery SQL: {sql}")
+        if "`ID`" not in upper or "`VAL`" not in upper:
+            raise HarnessError(
+                f"the local ILIKE residual did not fetch both id and val: {sql}"
+            )
+        if name in {
+            "ilike-before-limit-local",
+            "ilike-catalog-before-limit-local",
+        } and "LIMIT" in upper:
+            raise HarnessError(
+                f"LIMIT ran remotely before the local ILIKE residual: {sql}"
+            )
     if name == "date-difference":
         if "DATE_DIFF(" not in sql or re.search(r"`d` - `e`|`e` - `d`", sql):
             raise HarnessError(
@@ -777,6 +838,35 @@ def assert_generated_sql(name: str, sql: str) -> None:
             )
 
 
+def assert_physical_plan(name: str, plan: str) -> None:
+    if name not in {
+        "ilike-before-limit-local",
+        "not-ilike-local",
+        "ilike-catalog-before-limit-local",
+    }:
+        return
+    upper = plan.upper()
+    filter_position = upper.find("FILTEREXEC")
+    remote_position = upper.find("BASE_SQL=")
+    if filter_position < 0 or remote_position < 0 or filter_position > remote_position:
+        raise HarnessError(
+            f"ILIKE must remain in a local filter above the BigQuery scan:\n{plan}"
+        )
+    if re.search(r"\b(?:NOT\s+)?ILIKE\b", upper) is None:
+        raise HarnessError(f"the local filter no longer contains ILIKE:\n{plan}")
+    if name in {
+        "ilike-before-limit-local",
+        "ilike-catalog-before-limit-local",
+    }:
+        limit_position = upper.find("GLOBALLIMITEXEC")
+        if limit_position < 0:
+            limit_position = upper.find("FETCH=1")
+        if limit_position < 0 or limit_position > filter_position:
+            raise HarnessError(
+                f"LIMIT must remain local above the ILIKE filter:\n{plan}"
+            )
+
+
 def write_json(path: Path, value: Any) -> None:
     path.write_text(
         json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -834,6 +924,7 @@ def main() -> int:
     dataset_ref = bigquery.Dataset(f"{project}.{dataset}")
     dataset_ref.location = location
     dataset_ref.labels = {"purpose": "spice-bigquery-pushdown"}
+    dataset_ref.default_table_expiration_ms = 86_400_000
     created_dataset = False
     succeeded = False
     process: subprocess.Popen[bytes] | None = None
@@ -899,9 +990,16 @@ def main() -> int:
         )
         wait_until_ready(process, http_port, timeout=180)
 
+        queries = dict(QUERIES)
+        queries["ilike-catalog-before-limit-local"] = f"""SELECT id
+FROM bigquery_catalog.{dataset}.ilike_values
+WHERE CAST(val AS VARCHAR) ILIKE 'u%'
+ORDER BY id
+LIMIT 1"""
+
         generated_sql: dict[str, str] = {}
         executions: dict[str, dict[str, str]] = {}
-        for name, query in QUERIES.items():
+        for name, query in queries.items():
             (output / f"{name}.sql").write_text(query + ";\n", encoding="utf-8")
             query_started = datetime.now(timezone.utc)
             status, headers, body = http_sql(http_port, query)
@@ -934,6 +1032,7 @@ def main() -> int:
                     f"{name} reaches BigQuery as {statements} statements, not one:\n"
                     f"{explain_body[:2000]}"
                 )
+            assert_physical_plan(name, initial_physical_plan(explain_body))
             pushed_sql = initial_physical_sql(explain_body)
             assert_generated_sql(name, pushed_sql)
             generated_sql[name] = pushed_sql

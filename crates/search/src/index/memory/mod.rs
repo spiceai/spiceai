@@ -41,7 +41,7 @@ use itertools::Itertools;
 use llms::embeddings::Embed;
 use parking_lot::RwLock;
 use snafu::{ResultExt, Snafu, ensure};
-use spice_table::{Index, WriteWindow};
+use spice_table::{GroupPruning, Index, WriteWindow};
 
 use crate::index::{
     SearchIndex, VectorIndex, embedding_col,
@@ -364,6 +364,25 @@ impl Index for MemoryVectorIndex {
         self.store.write().delete_by_keys(&key_strings)
     }
 
+    async fn delete_group_remainder(
+        &self,
+        group_columns: &[String],
+        members: RecordBatch,
+    ) -> Result<(), DataFusionError> {
+        let member_keys =
+            write_util::extract_and_format_primary_key(INDEX_NAME, &self.primary_key, &members)
+                .map_err(|e| DataFusionError::External(Box::new(*e)))?;
+        let member_keys: HashSet<&str> = member_keys.iter().flatten().map(String::as_str).collect();
+
+        self.store
+            .write()
+            .delete_group_remainder(group_columns, &members, &member_keys)
+    }
+
+    fn group_pruning(&self) -> GroupPruning {
+        GroupPruning::Complete
+    }
+
     /// Entries live in this index's own store, not in the accelerated table row, so a
     /// replacing write has to clear them: it removes a row by not re-sending it, which
     /// neither [`Index::compute_index`] nor [`Index::delete_by_keys`] can observe.
@@ -518,7 +537,8 @@ impl VectorIndex for MemoryVectorIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
+    use crate::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex, DelimChunker};
+    use arrow::array::{Int64Array, StringArray, UInt64Array};
     use datafusion_expr::{Volatility, create_udf};
     use llms::embeddings::EmbeddingInput;
 
@@ -1047,6 +1067,112 @@ mod tests {
             }
         }
         None
+    }
+
+    /// A memory index shaped as the inner index of a [`ChunkedSearchIndex`]: keyed by the
+    /// source row's `id` plus the chunk id, one stored row per chunk.
+    fn chunked_memory_index() -> Arc<MemoryVectorIndex> {
+        Arc::new(
+            MemoryVectorIndex::try_new(
+                "content".to_string(),
+                ChunkedSearchIndex::augment_primary_key(vec![Field::new(
+                    "id",
+                    DataType::Int64,
+                    false,
+                )]),
+                MetadataColumns::none(),
+                Arc::new(ByteEmbed),
+                embed_udf(),
+                "model_name".to_string(),
+                MemoryDistanceMetric::Cosine,
+            )
+            .expect("valid memory index"),
+        )
+    }
+
+    /// The chunk ids the store holds for source row `id`, ascending.
+    fn stored_chunk_ids(index: &MemoryVectorIndex, id: i64) -> Vec<u64> {
+        let store = index.store.read();
+        let mut chunk_ids = Vec::new();
+        for b in store.batches() {
+            let ids = b
+                .column_by_name("id")
+                .expect("the stored schema carries the base key")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+            let chunks = b
+                .column_by_name(CHUNKED_INDEX_CHUNK_KEY)
+                .expect("the stored schema carries the chunk id")
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("the chunk id is UInt64");
+            for row in 0..b.num_rows() {
+                if ids.value(row) == id {
+                    chunk_ids.push(chunks.value(row));
+                }
+            }
+        }
+        chunk_ids.sort_unstable();
+        chunk_ids
+    }
+
+    /// Source rows as the chunking layer receives them: the base key and the text to chunk.
+    fn content_rows(rows: &[(i64, &str)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("valid test batch")
+    }
+
+    /// A row rewritten to text that chunks into *fewer* pieces than before names only the chunk
+    /// ids it still produces, so the upsert in the store overwrites those and leaves every
+    /// higher chunk id from the superseded text in place — the row stays searchable by a word
+    /// its current text does not contain.
+    ///
+    /// Regression test for #13717, over the real memory index rather than a test double: the
+    /// chunking layer has to tell the store which chunks of the row survive, and the store has
+    /// to drop the rest of that row's group.
+    #[tokio::test]
+    async fn a_chunked_index_drops_the_chunks_a_shorter_text_no_longer_produces() {
+        let inner = chunked_memory_index();
+        let idx = ChunkedSearchIndex::new(
+            Arc::clone(&inner) as Arc<dyn SearchIndex>,
+            Arc::new(DelimChunker { delim: ' ' }),
+        );
+
+        idx.write(content_rows(&[(1, "aaa bbb"), (2, "ddd eee")]))
+            .await
+            .expect("the first write lands");
+        assert_eq!(stored_chunk_ids(&inner, 1), vec![0, 1]);
+        assert_eq!(stored_chunk_ids(&inner, 2), vec![0, 1]);
+
+        idx.write(content_rows(&[(1, "ccc")]))
+            .await
+            .expect("the rewrite lands");
+
+        assert_eq!(
+            stored_chunk_ids(&inner, 1),
+            vec![0],
+            "the chunk 'bbb' produced goes with the text that produced it"
+        );
+        assert_eq!(
+            stored_chunk_ids(&inner, 2),
+            vec![0, 1],
+            "a row the write did not touch keeps every chunk"
+        );
     }
 
     /// Regression test for #13872. One batch carries id=1 twice and the row that *decides*

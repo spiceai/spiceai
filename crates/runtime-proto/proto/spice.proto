@@ -289,6 +289,7 @@ message SpicePhysicalPlanNode {
         CayenneAccelerationExecNode cayenne_acceleration = 3;
         UdtfExecNode udtf = 4;
         IcebergTableScanExecNode iceberg_table_scan = 5;
+        HttpExecNode http_exec = 6;
     }
 }
 
@@ -299,6 +300,25 @@ message SchemaCastScanExecNode {
 message BytesProcessedExecNode {}
 
 message CayenneAccelerationExecNode {}
+
+// Execution plan node for distributed HTTP table scans.
+//
+// The executor resolves the already-registered HTTP provider by table reference,
+// keeping connector configuration, credentials, client and shared runtime state
+// local. Only the query-specific scan recipe crosses the cluster boundary.
+message HttpExecNode {
+    string table_ref = 1;
+    bytes projected_schema = 2;
+    repeated HttpPartition partitions = 3;
+    optional uint64 limit = 4;
+}
+
+message HttpPartition {
+    optional string path = 1;
+    optional string query = 2;
+    optional string body = 3;
+    optional string request_headers = 4;
+}
 
 // Execution plan node for distributed Iceberg table scans.
 //

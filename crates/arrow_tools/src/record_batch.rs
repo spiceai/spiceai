@@ -2138,6 +2138,52 @@ mod test {
         );
     }
 
+    /// Guard for spiceai/arrow-rs#26 / issue #13978: arrow's Decimal->Float
+    /// cast must round from exact digits. If the fork patch is dropped, this
+    /// returns 47.50000000000001.
+    ///
+    /// The upstream cast widened the coefficient to `f64` and then divided by
+    /// `10^scale`; a coefficient past 2^53 loses precision on the way in, so a
+    /// pushed-down Postgres `avg` read as `Decimal128(38, 20)` came back as
+    /// `47.50000000000001` instead of `47.5`. The patch rounds from the exact
+    /// decimal digits. This exercises arrow's kernel directly rather than
+    /// `try_cast_to`, which does not intercept decimal->float here.
+    #[test]
+    fn decimal_to_float_cast_is_correctly_rounded() {
+        use arrow::array::{Decimal128Array, Float64Array};
+
+        // 47.5 at scale 20: coefficient = 475 * 10^19, well past 2^53, so the
+        // widen-then-divide path cannot represent it exactly.
+        let coeff: i128 = 475 * 10_i128.pow(19);
+        let decimal = Decimal128Array::from(vec![coeff])
+            .with_precision_and_scale(38, 20)
+            .expect("a valid Decimal128(38, 20) array");
+
+        let cast = cast_with_options(
+            &decimal,
+            &DataType::Float64,
+            &CastOptions {
+                safe: false,
+                ..Default::default()
+            },
+        )
+        .expect("decimal to float cast should succeed");
+
+        let floats = cast
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("cast result is a Float64Array");
+
+        // 47.5 is exactly representable, so compare bit patterns to avoid the
+        // `clippy::float_cmp` lint and to reject any rounding drift exactly.
+        assert_eq!(
+            floats.value(0).to_bits(),
+            47.5_f64.to_bits(),
+            "Decimal128(38, 20) coefficient for 47.5 must cast to exactly 47.5, \
+             not 47.50000000000001 (spiceai/arrow-rs#26 / #13978)"
+        );
+    }
+
     /// The count is a property of the type, not of the rows — which is what
     /// makes charging per buffer meaningful rather than a proxy for size.
     ///
