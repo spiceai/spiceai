@@ -3882,6 +3882,40 @@ mod tests {
         );
     }
 
+    /// The periodic caching refresh fetches under the same process-wide `SessionState` as the
+    /// query path; a copy built per task would rebuild the default registry for every dataset.
+    #[tokio::test]
+    async fn refresh_task_reuses_the_shared_session_state() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("shared_session_state"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        assert!(
+            Arc::ptr_eq(
+                &task.session_state,
+                &crate::accelerated::caching::SHARED_SESSION_STATE
+            ),
+            "RefreshTaskBuilder::build must hand out the shared state, not build its own"
+        );
+    }
+
     #[derive(Debug)]
     struct AlwaysFailingScan {
         schema: SchemaRef,

@@ -4599,6 +4599,233 @@ mod tests {
         );
     }
 
+    /// Mock source that records the DataFusion session id each `scan()` is planned under, so a
+    /// test can tell one shared `SessionState` from a fresh one per fetch.
+    #[derive(Debug)]
+    struct SessionTrackingTableProvider {
+        schema: SchemaRef,
+        data: Vec<RecordBatch>,
+        session_ids: Arc<RwLock<Vec<String>>>,
+    }
+
+    impl SessionTrackingTableProvider {
+        fn new(schema: SchemaRef, data: Vec<RecordBatch>) -> Self {
+            Self {
+                schema,
+                data,
+                session_ids: Arc::new(RwLock::new(Vec::new())),
+            }
+        }
+
+        fn recorded_session_ids(&self) -> Vec<String> {
+            self.session_ids.read().clone()
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for SessionTrackingTableProvider {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.session_ids
+                .write()
+                .push(state.session_id().to_string());
+            Ok(Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(
+                    std::slice::from_ref(&self.data),
+                    Arc::clone(&self.schema),
+                    None,
+                )?,
+            ))))
+        }
+    }
+
+    /// The columns a cached HTTP response carries, `cache_refreshed_at` included.
+    fn http_cache_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("content", DataType::Utf8, true),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+            Field::new(
+                CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]))
+    }
+
+    /// One 200 response row whose `cache_refreshed_at` is `refreshed_at` (Unix nanoseconds).
+    fn http_row(schema: &SchemaRef, refreshed_at: i64, content: &str) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/api/test"])),
+                Arc::new(StringArray::from(vec!["q=test"])),
+                Arc::new(StringArray::from(vec![content])),
+                Arc::new(UInt16Array::from(vec![200_u16])),
+                Arc::new(TimestampNanosecondArray::from(vec![Some(refreshed_at)])),
+            ],
+        )
+        .expect("http response row")
+    }
+
+    /// Unix nanoseconds for `ago` before `now_nanos`.
+    fn nanos_ago(now_nanos: i64, ago: Duration) -> i64 {
+        now_nanos - i64::try_from(ago.as_nanos()).expect("duration fits in i64 nanoseconds")
+    }
+
+    /// Regression guard for the shared `SessionState`. Every query plans its own
+    /// `CachingAccelerationScanExec` (through `scan_plan`, and again through
+    /// `with_new_children` on a plan rewrite), and each source fetch that exec issues — a cache
+    /// miss, an expired entry re-fetched inline, and a stale-while-revalidate refresh in the
+    /// background — must plan under the one process-wide session. A fresh `SessionContext` per
+    /// fetch, or a fresh `SessionState` per exec, gives every `scan()` its own session id; this
+    /// asserts on the ids rather than on timings, so it holds on a loaded CI runner.
+    #[tokio::test]
+    async fn source_fetches_across_execs_and_paths_share_one_session_state() {
+        let schema = http_cache_schema();
+        let now_nanos = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos(),
+        )
+        .expect("now fits in i64 nanoseconds");
+        let max_age = Duration::from_mins(1);
+        let stale_while_revalidate = Duration::from_mins(5);
+
+        let source = Arc::new(SessionTrackingTableProvider::new(
+            Arc::clone(&schema),
+            vec![http_row(&schema, now_nanos, "from source")],
+        ));
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight_revalidations: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let (batch_write_tx, _consumer_handle) =
+            spawn_test_cache_write_consumer(&accelerator, &in_flight_revalidations);
+
+        let build_exec = |input: Arc<dyn ExecutionPlan>, filters: Vec<Expr>| {
+            Arc::new(CachingAccelerationScanExec::new(
+                input,
+                Some(max_age),
+                Some(stale_while_revalidate),
+                false,
+                Arc::clone(&source) as Arc<dyn TableProvider>,
+                Arc::clone(&accelerator) as Arc<dyn TableProvider>,
+                "test_dataset".to_string(),
+                Handle::current(),
+                filters,
+                None,
+                None,
+                Arc::new(Mutex::new(())),
+                Arc::clone(&in_flight_revalidations),
+                Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                batch_write_tx.clone(),
+            ))
+        };
+        let cached_input = |rows: Vec<RecordBatch>| -> Arc<dyn ExecutionPlan> {
+            Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&[rows], Arc::clone(&schema), None)
+                    .expect("cached rows as a memory source"),
+            )))
+        };
+
+        // What the accelerator holds for each query: nothing (miss, twice), a row past
+        // `max_age + stale_while_revalidate` (expired: re-fetched inline), and a row past
+        // `max_age` but inside the window (stale: served, refreshed in the background).
+        let expired_at = nanos_ago(
+            now_nanos,
+            max_age + stale_while_revalidate + Duration::from_mins(1),
+        );
+        let stale_at = nanos_ago(now_nanos, max_age + Duration::from_mins(1));
+        let cases: Vec<(&str, Vec<RecordBatch>)> = vec![
+            ("miss", vec![]),
+            ("second miss", vec![]),
+            ("expired", vec![http_row(&schema, expired_at, "expired")]),
+            ("stale", vec![http_row(&schema, stale_at, "stale")]),
+        ];
+
+        for (i, (case, cached_rows)) in cases.into_iter().enumerate() {
+            // One key per case, so no case is skipped for a write another case still has pending.
+            let filters = vec![col("request_path").eq(lit(format!("/api/{i}")))];
+            let exec = build_exec(cached_input(cached_rows), filters);
+            let rows: Vec<RecordBatch> = exec
+                .execute(0, Arc::new(TaskContext::default()))
+                .expect("execute")
+                .try_collect()
+                .await
+                .expect("collect");
+            assert!(!rows.is_empty(), "{case}: the scan must return rows");
+        }
+
+        // A plan rewrite rebuilds the exec through `with_new_children`; that copy fetches too.
+        let rewritten = build_exec(
+            cached_input(vec![]),
+            vec![col("request_path").eq(lit("/api/rewritten"))],
+        )
+        .with_new_children(vec![cached_input(vec![])])
+        .expect("with_new_children");
+        let rows: Vec<RecordBatch> = rewritten
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute rewritten exec")
+            .try_collect()
+            .await
+            .expect("collect rewritten exec");
+        assert!(
+            !rows.is_empty(),
+            "rewritten exec: the scan must return rows"
+        );
+
+        // Four fetches happen inline before their streams end; the stale case's refresh runs on
+        // the io runtime, so wait for it — bounded, and naming what was seen if it never lands.
+        let expected_fetches = 5;
+        let refresh_landed = tokio::time::timeout(Duration::from_secs(10), async {
+            while source.recorded_session_ids().len() < expected_fetches {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            refresh_landed.is_ok(),
+            "the stale-while-revalidate refresh never reached the source: saw {} of {expected_fetches} fetches",
+            source.recorded_session_ids().len()
+        );
+
+        let session_ids = source.recorded_session_ids();
+        assert_eq!(
+            session_ids.len(),
+            expected_fetches,
+            "one source fetch per case, got {session_ids:?}"
+        );
+        let distinct: HashSet<&str> = session_ids.iter().map(String::as_str).collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "every fetch must plan under one shared session state; saw {distinct:?}"
+        );
+        assert_eq!(
+            session_ids[0],
+            SHARED_SESSION_STATE.session_id(),
+            "fetches must use the process-wide state, not a copy built per exec"
+        );
+    }
+
     /// Helper to create a schema with `response_status` column for `filter_5xx` tests
     fn create_http_response_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
