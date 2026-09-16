@@ -794,7 +794,7 @@ impl SpiceTestQueryWorker {
                     && let Some(sort_limit) = live_oracle_keyed_sort_fallback_applies(
                         &validation_result,
                         &reference_query.sql,
-                        schema.as_ref(),
+                        &schema,
                     )
                 {
                     match sort_limit.key {
@@ -1134,7 +1134,7 @@ fn live_oracle_unordered_limit_fallback_applies(
 fn live_oracle_keyed_sort_fallback_applies(
     result: &QueryValidationResult,
     sql: &str,
-    schema: &arrow::datatypes::Schema,
+    schema: &arrow::datatypes::SchemaRef,
 ) -> Option<validation::KeyedSortLimit> {
     if !live_oracle_row_fallback_applies(result) {
         return None;
@@ -1148,6 +1148,7 @@ fn live_oracle_keyed_sort_fallback_applies(
 /// is the un-`LIMIT`ed stream of an unordered `LIMIT`; `keyed_reference` is the
 /// raised-`LIMIT` stream of an `ORDER BY … LIMIT`. A missing stream leaves that
 /// fallback's verdict unchanged.
+#[cfg(test)]
 fn apply_live_oracle_row_fallbacks(
     query: &Query,
     actual: &[RecordBatch],
@@ -1180,7 +1181,7 @@ fn apply_live_oracle_row_fallbacks(
 
     if let Some(schema) = actual.first().map(RecordBatch::schema)
         && let Some(sort_limit) =
-            live_oracle_keyed_sort_fallback_applies(&validation_result, &query.sql, schema.as_ref())
+            live_oracle_keyed_sort_fallback_applies(&validation_result, &query.sql, &schema)
         && keyed_reference_fetch_rows(sort_limit.limit) > 0
         && let Some(keyed_reference) = keyed_reference
     {

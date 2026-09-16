@@ -1187,9 +1187,9 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
     }
 }
 
-/// TPC-DS query ids the SQLite override drops before adding its FLOAT-cast
+/// TPC-DS query ids the `SQLite` override drops before adding its FLOAT-cast
 /// Q49, Q75 and Q90. Q14 uses `ROLLUP`, so it belongs with that group once —
-/// listing it again with EXCEPT / INTERSECT hid accidental additions.
+/// listing it again with `EXCEPT` / `INTERSECT` hid accidental additions.
 const SQLITE_TPCDS_REMOVED_QUERY_IDS: &[u32] = &[
     17, 29, 35, 74, // SQLite does not support `stddev`
     5, 14, 18, 22, 27, 36, 67, 70, 77, 80, 86, // ROLLUP and GROUPING
