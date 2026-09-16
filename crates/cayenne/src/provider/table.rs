@@ -10523,7 +10523,7 @@ impl CayenneTableProvider {
             })
             .ok()?;
 
-        let mut df_stats = crate::stats::file_statistics_to_df(&file_stats, stats.num_rows);
+        let mut df_stats = crate::stats::file_statistics_to_df(&file_stats, schema, stats.num_rows);
 
         // Overlay per-column NDV estimates from the HyperLogLog sketches as
         // `distinct_count`. The cluster reporter uses this to encode an
