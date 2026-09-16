@@ -348,7 +348,8 @@ struct QueryLifetimeGuards {
 /// `runtime.task_history` / Zipkin span for one query. It opens where the query is
 /// answered, once the results-cache probe has decided how: on the request's runtime
 /// for a hit served there, and on the query runtime for a query that hops there, so
-/// its duration never includes a wait for a query runtime worker.
+/// `execution_duration_ms` never includes a wait for a query runtime worker. That
+/// wait is in `query_duration_ms`, whose timer starts in [`QueryBuilder::build`].
 struct QuerySpans {
     span: Span,
     trace_span: Span,

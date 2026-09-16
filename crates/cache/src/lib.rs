@@ -17,6 +17,7 @@ limitations under the License.
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::hash::BuildHasher;
 use std::hash::Hasher;
 use std::sync::Arc;
 
@@ -262,18 +263,109 @@ pub enum HashBuilder {
 }
 
 impl std::hash::BuildHasher for HashBuilder {
-    type Hasher = Box<dyn Hasher + Send + Sync + 'static>;
+    type Hasher = KeyHasher;
 
     fn build_hasher(&self) -> Self::Hasher {
         match self {
-            HashBuilder::Ahash(builder) => Box::new(builder.build_hasher()),
-            HashBuilder::Siphash(builder) => Box::new(builder.build_hasher()),
-            HashBuilder::Blake3 => Box::new(blake3_compat::Blake3Wrapper::new()),
-            HashBuilder::XxHash3(builder) => Box::new(builder.build_hasher()),
-            HashBuilder::XxHash32(builder) => Box::new(builder.build_hasher()),
-            HashBuilder::XxHash64(builder) => Box::new(builder.build_hasher()),
-            HashBuilder::XxHash128 => Box::new(xxhash_compat::XxHash3_128Wrapper::new()),
+            HashBuilder::Ahash(builder) => KeyHasher::Ahash(builder.build_hasher()),
+            HashBuilder::Siphash(builder) => KeyHasher::Siphash(builder.build_hasher()),
+            HashBuilder::Blake3 => KeyHasher::Blake3(Box::new(blake3_compat::Blake3Wrapper::new())),
+            HashBuilder::XxHash3(builder) => KeyHasher::XxHash3(builder.build_hasher()),
+            HashBuilder::XxHash32(builder) => KeyHasher::XxHash32(builder.build_hasher()),
+            HashBuilder::XxHash64(builder) => KeyHasher::XxHash64(builder.build_hasher()),
+            HashBuilder::XxHash128 => {
+                KeyHasher::XxHash128(xxhash_compat::XxHash3_128Wrapper::new())
+            }
         }
+    }
+}
+
+/// Concrete hasher for [`HashBuilder`].
+///
+/// `HashBuilder` is already an enum; boxing the hasher it builds was what
+/// turned every plan-node write into a virtual call plus a heap allocation.
+/// Match dispatch keeps each algorithm's write path — including `ahash`'s
+/// integer folding — so a plan key is the same value as hashing the plan
+/// write by write.
+pub enum KeyHasher {
+    Ahash(ahash::AHasher),
+    Siphash(std::collections::hash_map::DefaultHasher),
+    Blake3(Box<blake3_compat::Blake3Wrapper>),
+    XxHash3(twox_hash::XxHash3_64),
+    XxHash32(twox_hash::XxHash32),
+    XxHash64(twox_hash::XxHash64),
+    XxHash128(xxhash_compat::XxHash3_128Wrapper),
+}
+
+macro_rules! dispatch_key_hasher {
+    ($self:expr, $method:ident $(, $arg:expr)* $(,)?) => {
+        match $self {
+            Self::Ahash(hasher) => hasher.$method($($arg),*),
+            Self::Siphash(hasher) => hasher.$method($($arg),*),
+            Self::Blake3(hasher) => hasher.$method($($arg),*),
+            Self::XxHash3(hasher) => hasher.$method($($arg),*),
+            Self::XxHash32(hasher) => hasher.$method($($arg),*),
+            Self::XxHash64(hasher) => hasher.$method($($arg),*),
+            Self::XxHash128(hasher) => hasher.$method($($arg),*),
+        }
+    };
+}
+
+impl Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        dispatch_key_hasher!(self, finish)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        dispatch_key_hasher!(self, write, bytes);
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        dispatch_key_hasher!(self, write_u8, i);
+    }
+
+    fn write_u16(&mut self, i: u16) {
+        dispatch_key_hasher!(self, write_u16, i);
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        dispatch_key_hasher!(self, write_u32, i);
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        dispatch_key_hasher!(self, write_u64, i);
+    }
+
+    fn write_u128(&mut self, i: u128) {
+        dispatch_key_hasher!(self, write_u128, i);
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        dispatch_key_hasher!(self, write_usize, i);
+    }
+
+    fn write_i8(&mut self, i: i8) {
+        dispatch_key_hasher!(self, write_i8, i);
+    }
+
+    fn write_i16(&mut self, i: i16) {
+        dispatch_key_hasher!(self, write_i16, i);
+    }
+
+    fn write_i32(&mut self, i: i32) {
+        dispatch_key_hasher!(self, write_i32, i);
+    }
+
+    fn write_i64(&mut self, i: i64) {
+        dispatch_key_hasher!(self, write_i64, i);
+    }
+
+    fn write_i128(&mut self, i: i128) {
+        dispatch_key_hasher!(self, write_i128, i);
+    }
+
+    fn write_isize(&mut self, i: isize) {
+        dispatch_key_hasher!(self, write_isize, i);
     }
 }
 
@@ -676,6 +768,11 @@ pub struct QueryResultsCacheProvider {
     encoder: Option<Arc<dyn encoding::Encoder>>,
     encoding: spicepod::component::caching::Encoding,
     hashing_algorithm: spicepod::component::caching::HashingAlgorithm,
+    /// The builder the results-cache keys are hashed with. Kept beside the
+    /// store so [`Self::hasher`] can return a [`KeyHasher`] without boxing
+    /// through [`HashProvider`] — `ahash` / siphash keys are keyed from this
+    /// instance, not a fresh [`get_hash_builder`] call.
+    hash_builder: HashBuilder,
     table_changes: TableChangeClock,
 }
 
@@ -733,7 +830,7 @@ impl QueryResultsCacheProvider {
         let cache = Arc::new(LruCache::new(
             cache_max_size,
             cache_ttl,
-            hash_builder,
+            hash_builder.clone(),
             config.caching_policy,
             config.engine,
         ));
@@ -749,6 +846,7 @@ impl QueryResultsCacheProvider {
             encoder,
             encoding: config.encoding,
             hashing_algorithm: config.hashing_algorithm,
+            hash_builder,
             table_changes: TableChangeClock::default(),
         };
 
@@ -759,7 +857,7 @@ impl QueryResultsCacheProvider {
     ///
     /// Will return `Err` if method fails to access the cache
     pub async fn get(&self, key: CacheKey<'_>) -> Result<Option<CachedQueryResult>> {
-        let raw_key = key.as_raw_key(self.cache.hasher());
+        let raw_key = key.as_raw_key(self.hasher());
         self.get_raw_key(&raw_key).await
     }
 
@@ -868,7 +966,7 @@ impl QueryResultsCacheProvider {
     ///
     /// Will return `Err` if method fails to access the cache
     pub async fn put(&self, key: CacheKey<'_>, result: CachedQueryResult) -> Result<()> {
-        let raw_key = key.as_raw_key(self.cache.hasher());
+        let raw_key = key.as_raw_key(self.hasher());
         self.put_raw_key(&raw_key, result).await
     }
 
@@ -1041,8 +1139,8 @@ impl QueryResultsCacheProvider {
     }
 
     #[must_use]
-    pub fn hasher(&self) -> Box<dyn Hasher> {
-        self.cache.hasher()
+    pub fn hasher(&self) -> KeyHasher {
+        self.hash_builder.build_hasher()
     }
 
     #[must_use]
