@@ -21,6 +21,7 @@ datafusion-catalog.workspace = true
 datafusion-datasource.workspace = true
 datafusion-expr.workspace = true
 datafusion-federation = { workspace = true }
+datafusion-functions-json.workspace = true
 datafusion-table-providers.workspace = true
 futures.workspace = true
 itertools.workspace = true
@@ -48,6 +49,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
+datafusion-spark.workspace = true
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-pruning.workspace = true
 insta.workspace = true

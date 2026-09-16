@@ -463,6 +463,7 @@ pub(crate) async fn build_elasticsearch_text_index(
         client.as_ref(),
         &fts_params.es_index,
         &search_fields,
+        &pk_fields,
         index_settings.as_ref(),
     )
     .await?;

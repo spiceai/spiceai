@@ -371,7 +371,7 @@ async fn huggingface(
     };
 
     let model_type = params.model_type.as_deref();
-    let hf_token = params.token.as_ref();
+    let hf_token = params.hf_token.as_ref();
 
     // For GGUF models, we require user specify via `.files[].path`
     let gguf_path = component

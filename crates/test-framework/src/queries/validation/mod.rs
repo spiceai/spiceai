@@ -43,6 +43,38 @@ use arrow_tools::schema::schema_difference;
 
 use super::Query;
 
+pub mod sort_order;
+
+pub use sort_order::{
+    SortKeyColumn, SortKeyResolution, SortOrderViolation, has_top_level_limit,
+    has_top_level_order_by, resolve_sort_key,
+};
+
+// Not re-exported: the outcome type is plumbing between this module and
+// `sort_order`. Callers consume the reasons via `SortCheckedComparison`.
+use sort_order::SortCheck;
+
+/// A content comparison plus what the row-order check could and could not cover.
+///
+/// `unchecked` exists so a coverage hole cannot masquerade as a pass. A skipped
+/// or partial sort check leaves `result` at whatever the content comparison said
+/// — the rows really were compared — while naming the part of the `ORDER BY`
+/// nobody verified, for the caller to count and report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortCheckedComparison {
+    pub result: QueryValidationResult,
+    /// One entry per side whose `ORDER BY` was not fully verified.
+    pub unchecked: Vec<String>,
+}
+
+impl SortCheckedComparison {
+    /// True when the content matched *and* the whole `ORDER BY` was verified.
+    #[must_use]
+    pub fn is_fully_verified_pass(&self) -> bool {
+        self.result == QueryValidationResult::Pass && self.unchecked.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryValidationFailReason {
     NoExpectedAnswer,
@@ -67,6 +99,13 @@ pub enum QueryValidationFailReason {
         column_name: String,
         left_len: usize,
         right_len: usize,
+    },
+    /// One engine returned rows that do not honor the query's own top-level
+    /// `ORDER BY`. Reported per side, because it is a property of that engine's
+    /// output rather than of the two results' relationship.
+    SortOrderViolation {
+        side: String,
+        violation: SortOrderViolation,
     },
 }
 
@@ -857,7 +896,10 @@ pub fn row_order_from_sql(sql: &str) -> RowOrder {
 ///
 /// When `row_order` is [`RowOrder::Multiset`], both sides are concatenated and
 /// sorted into a canonical order so differing physical scan orders do not
-/// produce false mismatches.
+/// produce false mismatches — which means this function says **nothing about the
+/// order an engine returned rows in**. Engine-parity callers want
+/// [`compare_query_result_batches_with_sort_check`], which adds that check; this
+/// one is the content half, kept separate so its own behavior stays testable.
 pub fn compare_query_result_batches(
     query_name: &str,
     left_batches: &[RecordBatch],
@@ -945,6 +987,300 @@ pub fn compare_query_result_batches(
         println!("Query '{query_name}' content mismatch: {reason:?}");
     }
     Ok(result)
+}
+
+/// Content equality **plus** a per-side check that each engine honored the
+/// query's own top-level `ORDER BY`.
+///
+/// [`compare_query_result_batches`] under [`RowOrder::Multiset`] canonically
+/// sorts both sides before comparing, so it establishes that the two engines
+/// returned the same rows and nothing about the order they returned them in.
+/// Most of the suite corpus sorts without a `LIMIT` and is compared that way, so
+/// without this check an engine whose sort is wrong compares equal.
+///
+/// A side that breaks its own `ORDER BY` is reported as that, in preference to
+/// the content difference it also causes. Under [`RowOrder::Preserved`] —
+/// `ORDER BY … LIMIT`, where the set of rows depends on the order — the same
+/// rows in the wrong order fail as a content mismatch, which says the two
+/// results differ without naming the side that is wrong on its own terms. A
+/// caller adjudicating a disagreement between engines needs that distinction:
+/// a content difference may come from dialect or arithmetic, a sort violation
+/// cannot. When no side violates, the content result stands.
+///
+/// A tie under the sort key is never a violation, so the check adds no
+/// sensitivity to the engine-dependent ordering of equal rows that
+/// [`RowOrder::Multiset`] exists to absorb.
+///
+/// **A sort check that could not run is returned, not swallowed.** Whatever the
+/// check could not cover lands in [`SortCheckedComparison::unchecked`], because
+/// a hole that reads as a pass is the failure this check exists to remove. A
+/// caller that ignores that field is back to reporting unverified order as
+/// verified. The field is populated even when the content comparison failed, for
+/// the caller that recovers from that failure and would otherwise pass an order
+/// nothing verified.
+///
+/// `sql` must be the statement that produced *both* result sets. Where the two
+/// engines run textually different SQL, pass the form whose projection matches
+/// the compared results.
+///
+/// # Errors
+/// Returns an error if the batches cannot be concatenated or compared.
+pub fn compare_query_result_batches_with_sort_check(
+    query_name: &str,
+    sql: &str,
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    row_order: RowOrder,
+) -> Result<SortCheckedComparison> {
+    let content = if row_order == RowOrder::Preserved {
+        compare_limit_results_allowing_cutoff_ties(query_name, sql, left_batches, right_batches)?
+    } else {
+        compare_query_result_batches(query_name, left_batches, right_batches, row_order)?
+    };
+    let content_passed = content == QueryValidationResult::Pass;
+
+    // Parsed once for both sides: the AST does not depend on which engine's rows
+    // are being checked, and the corpus carries multi-kilobyte statements.
+    let statement = sort_order::parse_one_statement(sql);
+    let mut unchecked = Vec::new();
+
+    for (side, batches) in [("left", left_batches), ("right", right_batches)] {
+        let Some(schema) = batches.first().map(RecordBatch::schema) else {
+            continue;
+        };
+        let batch = arrow::compute::concat_batches(&schema, batches)?;
+        match sort_order::check_sort_order_parsed(statement.as_ref(), &batch)? {
+            SortCheck::Ordered => {}
+            SortCheck::PartiallyOrdered { unchecked: reason } | SortCheck::Skipped { reason } => {
+                println!("Query '{query_name}' ({side}) sort order unchecked: {reason}");
+                unchecked.push(format!("{side}: {reason}"));
+            }
+            SortCheck::Violation(v) => {
+                println!(
+                    "Query '{query_name}' ({side}) violates its own ORDER BY on column '{}' at row {}: {} then {}",
+                    v.column, v.row_number, v.previous, v.current
+                );
+                return Ok(SortCheckedComparison {
+                    result: QueryValidationResult::Fail(
+                        QueryValidationFailReason::SortOrderViolation {
+                            side: side.to_string(),
+                            violation: v,
+                        },
+                    ),
+                    unchecked,
+                });
+            }
+        }
+    }
+
+    if !content_passed {
+        // The hole is carried even though the comparison failed, because not
+        // every caller treats that failure as final: one that recovers from it
+        // — the chDB lane retries a schema mismatch as string rows — would
+        // otherwise turn an order that was never verified into a clean pass.
+        return Ok(SortCheckedComparison {
+            result: content,
+            unchecked,
+        });
+    }
+
+    Ok(SortCheckedComparison {
+        result: QueryValidationResult::Pass,
+        unchecked,
+    })
+}
+
+/// Compare an under-test result to a live reference-schema result.
+///
+/// This is the `--validate` path for query sets that have no static answer
+/// files (TPC-DS, and TPC-H at scale factors other than 1): both sides are
+/// treated as engine answers for the same SQL on the same data. Row order
+/// follows the Cayenne correctness suite: positional equality only when the
+/// row set itself depends on order (top-level `ORDER BY` + `LIMIT`); otherwise
+/// a multiset compare so scan order cannot produce a false mismatch. A side
+/// that violates its own `ORDER BY` still fails.
+///
+/// An `ORDER BY` the sort check could not fully verify is not a failure here —
+/// the rows were still compared. Callers that need to count that hole should
+/// use [`compare_query_result_batches_with_sort_check`] directly.
+///
+/// # Errors
+/// Returns an error if the batches cannot be concatenated or compared.
+pub fn validate_against_reference_batches(
+    query: &Query,
+    actual: &[RecordBatch],
+    reference: &[RecordBatch],
+) -> Result<QueryValidationResult> {
+    let order = if has_top_level_order_by(&query.sql) && has_top_level_limit(&query.sql) {
+        RowOrder::Preserved
+    } else {
+        RowOrder::Multiset
+    };
+    let comparison = compare_query_result_batches_with_sort_check(
+        &query.name,
+        &query.sql,
+        actual,
+        reference,
+        order,
+    )?;
+    Ok(comparison.result)
+}
+
+/// Compare `ORDER BY … LIMIT` results when the sort key is not unique.
+///
+/// SQL does not define which tied rows a `LIMIT` keeps. TPC-DS Q65 orders by
+/// `s_store_name, i_item_desc`; many items share description `"A"`, so two
+/// correct engines may return different 100-row subsets. Requiring positional
+/// cell equality then fails even though both honor the `ORDER BY`.
+///
+/// Complete tie-groups (a run of equal sort keys followed by a greater key)
+/// must still match as a multiset. The last run is a cutoff only when the
+/// result filled the `LIMIT` *and* that run has more than one row — then a
+/// leftover tied row past the boundary may exist, so only the sort keys are
+/// required to match. A unique last row, or a result shorter than `LIMIT`,
+/// is compared in full: those groups were not truncated.
+fn compare_limit_results_allowing_cutoff_ties(
+    query_name: &str,
+    sql: &str,
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+) -> Result<QueryValidationResult> {
+    if left_batches.is_empty() && right_batches.is_empty() {
+        return Ok(QueryValidationResult::Pass);
+    }
+    if left_batches.is_empty() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
+    }
+    if right_batches.is_empty() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoExpectedAnswer,
+        ));
+    }
+
+    let left_schema = left_batches[0].schema();
+    let right_schema = right_batches[0].schema();
+    if left_schema.fields().len() != right_schema.fields().len() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::SchemaMismatch,
+        ));
+    }
+
+    let left = arrow::compute::concat_batches(&left_schema, left_batches)?;
+    let right = arrow::compute::concat_batches(&right_schema, right_batches)?;
+    if left.num_rows() != right.num_rows() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::RowCountMismatch {
+                expected: left.num_rows(),
+                actual: right.num_rows(),
+            },
+        ));
+    }
+
+    let statement = sort_order::parse_one_statement(sql);
+    let resolution = statement.as_ref().map_or_else(
+        || SortKeyResolution::Unresolved {
+            reason: "SQL did not parse as a single statement".to_string(),
+        },
+        |parsed| sort_order::resolve_statement_sort_key(parsed, &left.schema()),
+    );
+    let SortKeyResolution::Resolved { key, .. } = resolution else {
+        return compare_query_result_batches(
+            query_name,
+            left_batches,
+            right_batches,
+            RowOrder::Preserved,
+        );
+    };
+
+    let n = left.num_rows();
+    let mut run_start = 0_usize;
+    while run_start < n {
+        let run_key = row_sort_key(&left, run_start, &key)?;
+        if row_sort_key(&right, run_start, &key)? != run_key {
+            println!(
+                "Query '{query_name}' ORDER BY key mismatch at row {} (left vs right cutoff)",
+                run_start + 1
+            );
+            return Ok(QueryValidationResult::Fail(
+                QueryValidationFailReason::DataMismatch {
+                    column: key[0].name.clone(),
+                    row_number: run_start + 1,
+                    expected: run_key
+                        .first()
+                        .and_then(Option::as_deref)
+                        .unwrap_or("")
+                        .to_string(),
+                    actual: row_sort_key(&right, run_start, &key)?
+                        .first()
+                        .and_then(Option::as_deref)
+                        .unwrap_or("")
+                        .to_string(),
+                },
+            ));
+        }
+        let mut run_end = run_start + 1;
+        while run_end < n && row_sort_key(&left, run_end, &key)? == run_key {
+            if row_sort_key(&right, run_end, &key)? != run_key {
+                return Ok(QueryValidationResult::Fail(
+                    QueryValidationFailReason::DataMismatch {
+                        column: key[0].name.clone(),
+                        row_number: run_end + 1,
+                        expected: run_key
+                            .first()
+                            .and_then(Option::as_deref)
+                            .unwrap_or("")
+                            .to_string(),
+                        actual: row_sort_key(&right, run_end, &key)?
+                            .first()
+                            .and_then(Option::as_deref)
+                            .unwrap_or("")
+                            .to_string(),
+                    },
+                ));
+            }
+            run_end += 1;
+        }
+        let is_last_run = run_end == n;
+        // A multi-row last group is not itself proof of LIMIT truncation:
+        // `LIMIT 100` of two tied rows still has room for both, and skipping
+        // the non-key compare would let a wrong `revenue` pass. Only a result
+        // that filled the literal `LIMIT` can have cut a tie (TPC-DS Q65).
+        let truncated_cutoff = is_last_run
+            && (run_end - run_start) > 1
+            && sort_order::top_level_limit_count(sql).is_some_and(|limit| n == limit);
+        if !truncated_cutoff {
+            let left_run = left.slice(run_start, run_end - run_start);
+            let right_run = right.slice(run_start, run_end - run_start);
+            let run_result = compare_query_result_batches(
+                query_name,
+                &[left_run],
+                &[right_run],
+                RowOrder::Multiset,
+            )?;
+            if let QueryValidationResult::Fail(reason) = run_result {
+                return Ok(QueryValidationResult::Fail(reason));
+            }
+        }
+        run_start = run_end;
+    }
+    Ok(QueryValidationResult::Pass)
+}
+
+fn row_sort_key(
+    batch: &RecordBatch,
+    row: usize,
+    key: &[SortKeyColumn],
+) -> Result<Vec<Option<String>>> {
+    let mut out = Vec::with_capacity(key.len());
+    for column in key {
+        out.push(array_value_to_string(
+            batch.column(column.index).as_ref(),
+            row,
+        )?);
+    }
+    Ok(out)
 }
 
 /// Canonical row order for multiset equality: sort by stringified cell values
@@ -1573,6 +1909,193 @@ mod test {
                 QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
             ),
             "value mismatch must fail: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_against_reference_accepts_reordered_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", arrow::datatypes::DataType::Utf8, false),
+            Field::new("v", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let actual = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .expect("actual batch");
+        let reference = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["b", "a"])),
+                Arc::new(arrow::array::Int64Array::from(vec![2, 1])),
+            ],
+        )
+        .expect("reference batch");
+
+        let query = Query::new("tpcds_q1".into(), "SELECT k, v FROM t".into(), false);
+        let result = validate_against_reference_batches(
+            &query,
+            std::slice::from_ref(&actual),
+            std::slice::from_ref(&reference),
+        )
+        .expect("compare");
+        assert_eq!(
+            result,
+            QueryValidationResult::Pass,
+            "TPC-DS queries without ORDER BY + LIMIT must compare as a multiset: {result:?}"
+        );
+    }
+
+    fn q65_tied_batches(
+        left_revenue: [&str; 2],
+        right_revenue: [&str; 2],
+    ) -> (RecordBatch, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s_store_name", arrow::datatypes::DataType::Utf8, false),
+            Field::new("i_item_desc", arrow::datatypes::DataType::Utf8, false),
+            Field::new("revenue", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        let actual = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["able", "able"])),
+                Arc::new(arrow::array::StringArray::from(vec!["A", "A"])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    left_revenue[0],
+                    left_revenue[1],
+                ])),
+            ],
+        )
+        .expect("actual");
+        let reference = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["able", "able"])),
+                Arc::new(arrow::array::StringArray::from(vec!["A", "A"])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    right_revenue[0],
+                    right_revenue[1],
+                ])),
+            ],
+        )
+        .expect("reference");
+        (actual, reference)
+    }
+
+    #[test]
+    fn test_validate_against_reference_rejects_tied_rows_when_limit_is_not_filled() {
+        // LIMIT 100 of two rows cannot have truncated a tie group, so a
+        // different `revenue` is a real mismatch — not a legal LIMIT subset.
+        let (actual, reference) = q65_tied_batches(["4.63", "8.64"], ["4.40", "1.74"]);
+        let query = Query::new(
+            "tpcds_q65".into(),
+            "SELECT s_store_name, i_item_desc, revenue FROM t \
+             ORDER BY s_store_name, i_item_desc LIMIT 100"
+                .into(),
+            false,
+        );
+        let result =
+            validate_against_reference_batches(&query, &[actual], &[reference]).expect("compare");
+        assert!(
+            matches!(
+                result,
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            ),
+            "a short result under LIMIT 100 must still compare non-key cells: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_against_reference_accepts_tied_limit_subsets() {
+        // TPC-DS Q65: ORDER BY store name + item desc is not unique — many
+        // items share description "A". When the result fills LIMIT, the last
+        // tie group may be truncated and two engines may keep different
+        // members; both answers are SQL-correct.
+        let (actual, reference) = q65_tied_batches(["4.63", "8.64"], ["4.40", "1.74"]);
+        let query = Query::new(
+            "tpcds_q65".into(),
+            "SELECT s_store_name, i_item_desc, revenue FROM t \
+             ORDER BY s_store_name, i_item_desc LIMIT 2"
+                .into(),
+            false,
+        );
+        let result =
+            validate_against_reference_batches(&query, &[actual], &[reference]).expect("compare");
+        assert_eq!(
+            result,
+            QueryValidationResult::Pass,
+            "tied ORDER BY + filled LIMIT subsets must pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_against_reference_rejects_unique_limit_mismatch() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", arrow::datatypes::DataType::Utf8, false),
+            Field::new("v", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let actual = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .expect("actual");
+        let reference = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+                Arc::new(arrow::array::Int64Array::from(vec![1, 99])),
+            ],
+        )
+        .expect("reference");
+        let query = Query::new(
+            "tpcds_q1".into(),
+            "SELECT k, v FROM t ORDER BY k LIMIT 2".into(),
+            false,
+        );
+        let result =
+            validate_against_reference_batches(&query, &[actual], &[reference]).expect("compare");
+        assert!(
+            matches!(
+                result,
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            ),
+            "a unique ORDER BY key must still fail on a wrong cell: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_against_reference_detects_value_mismatch() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let actual = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("actual");
+        let reference = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 99]))],
+        )
+        .expect("reference");
+
+        let query = Query::new("tpcds_q64".into(), "SELECT v FROM t".into(), false);
+        let result =
+            validate_against_reference_batches(&query, &[actual], &[reference]).expect("compare");
+        assert!(
+            matches!(
+                result,
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            ),
+            "a wrong cell must fail TPC-DS reference validation: {result:?}"
         );
     }
 

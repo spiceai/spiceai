@@ -175,7 +175,6 @@ impl DataSink for CayenneDataSink {
         // interleaves with a concurrent append.
         if self.table.is_memory_resident_mode() {
             let overwrite = self.overwrite == InsertOp::Overwrite;
-            let mut data = normalized;
             let mut batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
             let mut incoming_bytes: u64 = 0;
             // Acquire the write lock BEFORE draining so memory-mode writes are
@@ -184,7 +183,35 @@ impl DataSink for CayenneDataSink {
             // resident bytes, letting their combined footprint blow the RAM bound (and
             // OOM) before either appends. Reads use `ArcSwap` (lock-free), so this only
             // serializes writers.
+            //
+            // Taken before the stream is prepared, too: preparation snapshots the
+            // primary-key index the validation below decides conflicts against, and
+            // memory-mode writers are serialized on exactly this lock, so taking it
+            // first is what makes that snapshot current rather than one write stale.
+            // Nothing under `prepare_stream_for_insert` takes `write_lock`.
             let _write_guard = self.table.write_lock().lock().await;
+
+            // An APPEND must run primary-key conflict detection, so `on_conflict`
+            // is honoured: the validation records which resident rows the incoming
+            // batch supersedes, and those become the appended segment's own
+            // tombstones — one pass over the data, superseding as it appends,
+            // rather than a separate delete. Without it a re-INSERT of an existing
+            // key left BOTH versions live under a declared primary key.
+            //
+            // An OVERWRITE (full refresh) replaces the tier wholesale, so there is
+            // nothing to supersede and no index to consult.
+            let (mut data, post_validation) = if overwrite {
+                (normalized as SendableRecordBatchStream, None)
+            } else {
+                let prepared = self
+                    .table
+                    .prepare_stream_for_insert(normalized)
+                    .await
+                    .map_err(datafusion_common::DataFusionError::from)?;
+                let post_validation = prepared.post_validation();
+                (prepared.stream, Some(post_validation))
+            };
+
             while let Some(batch) = data.next().await {
                 let batch = batch?;
                 incoming_bytes =
@@ -200,11 +227,32 @@ impl DataSink for CayenneDataSink {
                     .map_err(datafusion_common::DataFusionError::from)?;
                 batches.push(batch);
             }
-            return self
+            // Draining the prepared stream is what RAN the validation, so the
+            // conflict state is only complete now.
+            let (deletions, validated_keys) = post_validation
+                .map(|state| {
+                    let super::on_conflict::PostValidationState {
+                        on_conflict_deletions,
+                        validated_keys,
+                    } = super::mutation_writer::take_post_validation(&state);
+                    (on_conflict_deletions, Some(validated_keys))
+                })
+                .unwrap_or_default();
+
+            let rows = self
                 .table
-                .write_batches_memory_mode(batches, incoming_bytes, overwrite)
+                .write_batches_memory_mode(batches, incoming_bytes, overwrite, &deletions)
                 .await
-                .map_err(Into::into);
+                .map_err(datafusion_common::DataFusionError::from)?;
+
+            // Record this write's keys as resident so a LATER write to the same
+            // table sees them as present and supersedes them in turn — the same
+            // bookkeeping the in-memory CDC append does after its append.
+            if let Some(keys) = validated_keys {
+                let record_seq = self.table.sequence_high_water().await;
+                self.table.record_inlined_pk_keys(&keys, record_seq);
+            }
+            return Ok(rows);
         }
 
         if self.overwrite == InsertOp::Overwrite {

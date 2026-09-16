@@ -98,6 +98,7 @@ pub(crate) mod overwrite;
 pub mod partitioned_wal;
 pub(crate) mod pk_index;
 pub(crate) mod pk_keyset_budget;
+pub(crate) mod pk_validation;
 pub(crate) mod predicate_stats;
 pub(crate) mod query_admission;
 pub(crate) mod retention;
@@ -144,7 +145,7 @@ pub use staged_upsert::{CayenneStagedUpsert, PreparedTxnCommit, TransactionWrite
 pub use staging_wal::{CayenneStagedAppend, PartitionedWalObjectStore, PreparedStagedAppend};
 pub use table::{
     CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder, LastSmallFileCompactPath,
-    PreparedAppendSnapshotPublish,
+    PreparedAppendSnapshotPublish, ScanViewReuse,
 };
 pub use transaction::{CayenneTransaction, TransactionCommit, TxnTable};
 pub use tuning::{

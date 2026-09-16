@@ -463,6 +463,18 @@ async fn evaluate_query(
                                 None,
                             );
                         }
+                        // A sort-order violation names the row that sorts before
+                        // its predecessor and the key column it broke, so the same
+                        // windowed context reads the way a `DataMismatch` does.
+                        QueryValidationFailReason::SortOrderViolation { violation, .. } => {
+                            print_mismatch_context(
+                                query.name.as_ref(),
+                                &e0,
+                                &a0,
+                                violation.row_number.saturating_sub(1),
+                                Some(&violation.column),
+                            );
+                        }
                         QueryValidationFailReason::SchemaMismatch
                         | QueryValidationFailReason::ColumnLengthMismatch { .. } => {}
                     }

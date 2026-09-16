@@ -295,6 +295,31 @@ pass_or_fail "never walks a directory merely named target" \
 pass_or_fail "sweeps a nested target directory only through its ancestor" \
   "$([[ "$output" == *"build output directories swept: 1"* ]] && echo 1 || echo 0)" "got: $output"
 
+echo "repeated sweeps preserve Cargo discovery"
+
+repeated="$tmp/repeated"
+repeated_target="$repeated/spiceai/spiceai/target"
+make_cargo_target "$repeated_target"
+make_cargo_target "$repeated_target/package/inner/target"
+touch "$repeated_target/fresh.rlib"
+age_path "$repeated_target/CACHEDIR.TAG" 30
+age_path "$repeated_target/package/inner/target/CACHEDIR.TAG" 30
+
+output="$(env "RUNNER_WORKSPACE=$repeated/spiceai" bash "$subject" --root "$repeated" --dry-run --free-gib "$ALWAYS_PRUNE_FLOOR" 2>&1)"
+pass_or_fail "dry run excludes discovery markers from its prune count" \
+  "$([[ "$output" == *"would prune 0 file(s)"* ]] && echo 1 || echo 0)" "got: $output"
+
+env "RUNNER_WORKSPACE=$repeated/spiceai" bash "$subject" --root "$repeated" --free-gib "$ALWAYS_PRUNE_FLOOR" >/dev/null 2>&1
+pass_or_fail "keeps an aged Cargo marker while pruning build output" \
+  "$([[ -f "$repeated_target/CACHEDIR.TAG" ]] && echo 1 || echo 0)" "Cargo discovery marker was removed"
+pass_or_fail "keeps nested Cargo markers while pruning through their ancestor" \
+  "$([[ -f "$repeated_target/package/inner/target/CACHEDIR.TAG" ]] && echo 1 || echo 0)" "nested Cargo discovery marker was removed"
+
+age_path "$repeated_target/fresh.rlib" 30
+output="$(env "RUNNER_WORKSPACE=$repeated/spiceai" bash "$subject" --root "$repeated" --free-gib "$ALWAYS_PRUNE_FLOOR" 2>&1)"
+pass_or_fail "a later sweep discovers and prunes artifacts that have aged out" \
+  "$([[ ! -e "$repeated_target/fresh.rlib" && "$output" == *"build output directories swept: 1"* ]] && echo 1 || echo 0)" "got: $output"
+
 echo "free-space gate on build output"
 
 # A host with room to spare keeps its cache. The point of the gate: a pruned

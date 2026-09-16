@@ -916,6 +916,7 @@ impl CayenneDeletionSink {
         updated_map.extend(cache_updates);
         cached_deleted_row_ids.store(Arc::new(updated_map));
         self.refresh_deletion_memory_accounting();
+        self.notify_scan_input_change();
 
         // Return count of NEW deletions
         convert_to_u64_box(new_deletion_count, "new deletion count").map_err(|e| Error::Internal {
@@ -1011,12 +1012,11 @@ fn try_decompose_struct_in_list(
         value_expr.downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>()
     {
         sf
-    } else if let Some(cast_expr) = value_expr.downcast_ref::<phys_expr::CastExpr>() {
+    } else {
+        let cast_expr = value_expr.downcast_ref::<phys_expr::CastExpr>()?;
         cast_expr
             .expr()
             .downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>()?
-    } else {
-        return None;
     };
     if struct_fn.name() != "struct" {
         return None;
@@ -1107,12 +1107,11 @@ fn try_decompose_struct_eq(
     let struct_fn =
         if let Some(sf) = lhs.downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>() {
             sf
-        } else if let Some(cast_expr) = lhs.downcast_ref::<phys_expr::CastExpr>() {
+        } else {
+            let cast_expr = lhs.downcast_ref::<phys_expr::CastExpr>()?;
             cast_expr
                 .expr()
                 .downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>()?
-        } else {
-            return None;
         };
     if struct_fn.name() != "struct" {
         return None;

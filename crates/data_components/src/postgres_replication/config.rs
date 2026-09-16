@@ -99,15 +99,33 @@ pub struct ReplicationParams {
     pub ephemeral_accelerator: bool,
     /// What the dataset's accelerator held when this stream was built.
     ///
-    /// Only [`AccelerationContents::Empty`] carries weight, and only over the
-    /// single question of whether a *missing* watermark is evidence of a gap: an
-    /// acceleration holding no rows cannot be hiding a row the source deleted
-    /// while it was away, which is the divergence a rebuild exists to repair.
-    /// Anything else — including a probe that could not answer — leaves the
-    /// rebuild in place.
+    /// Emptiness is read in two opposite directions, and which one applies turns
+    /// on whether an initial snapshot is going to run — so which variants carry
+    /// weight differs between them, and a probe that could not answer
+    /// ([`AccelerationContents::Unknown`]) is inert in one and decisive in the
+    /// other. It is never proof of anything; it simply resolves toward the
+    /// rebuild in both, which is a different variant in each.
+    /// `super::rebuild_cause` owns both readings; this is the summary:
     ///
-    /// Even then it only applies when an initial snapshot is going to run, since
-    /// otherwise the rebuild is the only thing that would load the table at all.
+    /// - Against a *missing* watermark, with a snapshot running, only
+    ///   [`AccelerationContents::Empty`] carries weight, and it *suppresses* a
+    ///   rebuild: an acceleration holding no rows cannot be hiding a row the
+    ///   source deleted while it was away, which is the divergence a rebuild
+    ///   exists to repair, and the snapshot is what loads the table. Anything
+    ///   else, `Unknown` included, leaves the rebuild in place.
+    /// - Against a *present, usable* watermark, with no snapshot running, it
+    ///   *causes* one, and `Unknown` causes it too: the position says every
+    ///   change below it is applied, so resuming would leave every row that
+    ///   predates it missing for good, and nothing else is going to load them.
+    ///   Only a positive [`AccelerationContents::NonEmpty`] licenses the resume.
+    ///   The two rebuilding states report themselves apart —
+    ///   `RebuildCause::EmptyWithUsablePosition` when the table was observed
+    ///   empty, `RebuildCause::UnprovenContentsWithUsablePosition` when the probe
+    ///   failed and emptiness was never ruled out.
+    ///
+    /// Both gates are the same observation — a rebuild is needed exactly when
+    /// nothing else will populate the table — which is why the snapshot
+    /// condition is inverted between them rather than shared.
     ///
     /// Per-dataset, so it is deliberately not part of the shared-slot params
     /// compatibility check: two datasets legitimately share a slot while one is

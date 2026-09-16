@@ -116,12 +116,16 @@ impl SplitBlockBloomFilter {
 
     /// Selects the block for `hash` via multiply-shift range reduction over
     /// the high 32 bits, leaving the low 32 bits independent for the in-block
-    /// bit positions. The multiply widens to `u128` so block counts beyond
-    /// `2^32` (a >128 GiB filter) cannot overflow the product; the double
-    /// shift keeps the result within block range, so the cast cannot truncate.
+    /// bit positions.
+    ///
+    /// The reduction lives in [`crate::sbbf_layout::block_index`], where the
+    /// in-range result the subscript below depends on is a verified
+    /// postcondition rather than a property the reader has to re-derive.
+    /// [`Self::new`] always allocates at least one block, which is the
+    /// condition that postcondition carries.
     #[inline]
     fn block_index(&self, hash: u64) -> usize {
-        ((u128::from(hash >> 32) * self.blocks.len() as u128) >> 32) as usize
+        crate::sbbf_layout::block_index(self.blocks.len(), hash)
     }
 
     /// Computes the eight per-word bit masks for `hash` from its low 32 bits.
@@ -193,6 +197,35 @@ impl Clone for SplitBlockBloomFilter {
 mod tests {
     use super::*;
     use crate::hash_key;
+
+    /// `block_index` delegates to the verified reduction in
+    /// [`crate::sbbf_layout`]. Verus establishes the in-range postcondition for
+    /// every input; this pins the concrete value against the multiply-shift
+    /// expression, so the delegation cannot quietly relocate a key's block and
+    /// invalidate every filter already written to disk.
+    #[test]
+    fn block_index_matches_the_multiply_shift_reduction() {
+        for expected_items in [0_usize, 1, 100, 10_000] {
+            let filter = SplitBlockBloomFilter::new(expected_items);
+            let len = filter.blocks.len();
+            for hash in [
+                0_u64,
+                1,
+                u64::MAX,
+                u64::from(u32::MAX) << 32,
+                0xffff_ffff,
+                0x1234_5678_9abc_def0,
+            ] {
+                let reduction = ((u128::from(hash >> 32) * len as u128) >> 32) as usize;
+                assert_eq!(
+                    filter.block_index(hash),
+                    reduction,
+                    "block_index drifted from the reduction at len={len} hash={hash:#x}"
+                );
+                assert!(filter.block_index(hash) < len, "out of range at len={len}");
+            }
+        }
+    }
 
     #[test]
     fn insert_then_contains() {
