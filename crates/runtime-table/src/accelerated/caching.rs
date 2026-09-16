@@ -4599,7 +4599,7 @@ mod tests {
         );
     }
 
-    /// Mock source that records the DataFusion session id each `scan()` is planned under, so a
+    /// Mock source that records the `DataFusion` session id each `scan()` is planned under, so a
     /// test can tell one shared `SessionState` from a fresh one per fetch.
     #[derive(Debug)]
     struct SessionTrackingTableProvider {
