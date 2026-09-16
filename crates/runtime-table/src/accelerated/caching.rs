@@ -698,34 +698,44 @@ fn get_first_fetched_at_timestamp(batch: &RecordBatch) -> Option<i64> {
     Some(ts_array.value(0))
 }
 
-/// The first `_fetched_at` value as nanoseconds since the epoch, normalizing the
-/// column's stored precision first — an accelerator may store it at a coarser
-/// resolution (Cayenne keeps microseconds), which a bare nanosecond downcast
-/// would silently miss. `None` when the column is absent, empty, or null in row
-/// 0. Mirrors the normalization `check_cache_freshness` applies to the same
-/// column so the two read the same instant.
-fn first_fetched_at_nanos(batch: &RecordBatch) -> Option<i64> {
-    let (idx, _) = batch.schema().column_with_name(CACHE_REFRESHED_AT_COLUMN)?;
-    let ns_array = as_timestamp_nanosecond_array(batch.column(idx)).ok()?;
-    let ts_array = ns_array
-        .as_any()
-        .downcast_ref::<TimestampNanosecondArray>()?;
-    if ts_array.is_empty() || ts_array.is_null(0) {
-        return None;
+/// The oldest `_fetched_at` value across every row of every batch, as
+/// nanoseconds since the epoch, normalizing the column's stored precision
+/// first — an accelerator may store it at a coarser resolution (Cayenne keeps
+/// microseconds), which a bare nanosecond downcast would silently miss.
+/// `None` when any batch is missing the column or any row's value is null —
+/// the same fail-closed contract `check_cache_freshness` applies when scanning
+/// the same column, so the two agree on how stale the worst row is.
+fn oldest_fetched_at_nanos(batches: &[RecordBatch]) -> Option<i64> {
+    let mut oldest: Option<i64> = None;
+    for batch in batches {
+        let (idx, _) = batch.schema().column_with_name(CACHE_REFRESHED_AT_COLUMN)?;
+        let ns_array = as_timestamp_nanosecond_array(batch.column(idx)).ok()?;
+        let ts_array = ns_array
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()?;
+        for i in 0..ts_array.len() {
+            if ts_array.is_null(i) {
+                return None;
+            }
+            let ts = ts_array.value(i);
+            oldest = Some(oldest.map_or(ts, |o: i64| o.min(ts)));
+        }
     }
-    Some(ts_array.value(0))
+    oldest
 }
 
 /// How stale a cached entry is *past the point it went stale* — `now -
 /// fetched_at - max_age`, saturating at zero — or `None` when the entry carries
-/// no usable fetch time (missing/null/empty `_fetched_at`).
+/// no usable fetch time (missing/null `_fetched_at`), computed from the oldest
+/// row across every batch so a single stale row in a multi-batch response
+/// cannot be masked by fresher rows ahead of it.
 ///
 /// This is the staleness `StaleIfError::within_error_window` gates on: a `For(N)`
 /// window is measured from the stale point (past `caching_ttl`), not from the
 /// fetch. `None` makes a finite window fail closed and leaves `Enabled`
 /// unaffected, exactly the read-path decision the caller needs.
-fn staleness_past_max_age(batch: &RecordBatch, max_age: Duration) -> Option<Duration> {
-    let fetched_at = first_fetched_at_nanos(batch)?;
+fn staleness_past_max_age(batches: &[RecordBatch], max_age: Duration) -> Option<Duration> {
+    let fetched_at = oldest_fetched_at_nanos(batches)?;
     let now_nanos = i64::try_from(
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1918,7 +1928,7 @@ impl CacheRefreshHelper {
                 // to.
                 if !batches_cacheable && let Some(stale) = expired_batches.filter(|b| !b.is_empty())
                 {
-                    let staleness = staleness_past_max_age(&stale[0], max_age);
+                    let staleness = staleness_past_max_age(&stale, max_age);
                     if stale_if_error.within_error_window(staleness) {
                         tracing::warn!(
                             "Origin for dataset '{dataset_name}' answered with a transient failure, so the expired cached response is being served instead because `caching_stale_if_error` allows it."
@@ -2020,7 +2030,7 @@ impl CacheRefreshHelper {
             Err(e) => {
                 // Check if we should serve stale (expired) data on error
                 if let Some(batches) = expired_batches.filter(|b| !b.is_empty()) {
-                    let staleness = staleness_past_max_age(&batches[0], max_age);
+                    let staleness = staleness_past_max_age(&batches, max_age);
                     if stale_if_error.within_error_window(staleness) {
                         tracing::warn!(
                             "Cache miss fetch failed for dataset {dataset_name}, serving stale data because `caching_stale_if_error` allows it: {e}"
