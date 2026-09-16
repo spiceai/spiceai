@@ -618,8 +618,8 @@ enum EntryKey {
         batch: usize,
         row: usize,
     },
-    /// Lets a unit test build an [`EntryCost`] without a real `RecordBatch` to
-    /// point back into.
+    /// A key held directly rather than by a `(batch, row)` pointer, for tests
+    /// that build an [`EntryCost`] without a `RecordBatch`.
     #[cfg(test)]
     Eager(Vec<(String, Option<String>)>),
 }
@@ -1182,13 +1182,10 @@ mod tests {
     use crate::federated::FederatedTable;
     use arrow::datatypes::{Field, Schema, TimeUnit};
 
-    // A test-only tally of how many times `EntryKey::resolve` actually reads a
-    // key back off a `RecordBatch`, so a test can assert deferral happened
-    // instead of only asserting the entries it deleted. Thread-local because
-    // `#[tokio::test]`'s default current-thread runtime keeps a test's whole
-    // body — setup, sweep and assertion — on the one OS thread the harness gave
-    // it, so this cannot be corrupted by another test's sweep running
-    // concurrently on another thread.
+    // A count of how many times `EntryKey::resolve` has read a key off a
+    // `RecordBatch` in the current test. Thread-local because `#[tokio::test]`
+    // runs a test's whole body on one OS thread by default, so a concurrent
+    // test's sweep cannot add to this one's count.
     thread_local! {
         static KEY_EXTRACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
@@ -2022,11 +2019,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_clean_range_delete_resolves_no_entrys_key() {
-        // The doc's own cited case: 2,000 entries fetched over time separate
-        // cleanly from a small surviving set, so the whole doomed set clears by
-        // one `_fetched_at` range and `DoomedSplit::delete_terms` never needs a
-        // per-entry key — `self.named` is empty, so `EntryKey::resolve` is
-        // called zero times rather than once per doomed entry.
+        // 2,000 entries fetched long ago and 50 fetched just now, kept under a
+        // budget of 50: the 2,000 clear as a single `_fetched_at` range, with no
+        // entry named individually.
         reset_key_extractions();
         let now = nanos_since_epoch(SystemTime::now()).expect("clock");
         let second = 1_000_000_000_i64;
@@ -2060,9 +2055,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_named_delete_resolves_keys_only_for_the_entries_it_actually_names() {
-        // A boundary tie forces the per-key path, but only for the entries the
-        // tie leaves for naming — never for the much larger cleanly-older bulk
-        // the range clears, and never more than `nameable` lets through.
+        // 2,000 entries fetched a second ago and 100 sharing the survivor's
+        // exact timestamp, kept under a budget of 50: the tie at that timestamp
+        // cannot be covered by a range, so the 50 over budget are named
+        // individually while the 2,000 older entries clear as a range.
         reset_key_extractions();
         let now = nanos_since_epoch(SystemTime::now()).expect("clock");
         let second = 1_000_000_000_i64;
