@@ -41,7 +41,7 @@ use datafusion_expr::expr::ExprListDisplay;
 use futures::{StreamExt, TryStreamExt};
 use std::collections::HashSet;
 use tokio::runtime::Handle;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
@@ -265,6 +265,19 @@ pub const REQUEST_KEY_COLUMNS: [&str; 3] = ["request_path", "request_query", "re
 
 /// Maximum number of concurrent refresh requests
 const MAX_CONCURRENT_REFRESHES: usize = 10;
+
+/// Maximum number of concurrent per-entry stale-while-revalidate (SWR) background
+/// refreshes, mirroring `MAX_CONCURRENT_REFRESHES` for the periodic bulk-refresh
+/// path. Unlike that path, SWR refreshes are triggered one at a time by request
+/// traffic rather than batched up front, so the bound is enforced with a
+/// semaphore instead of `buffer_unordered` (see [`SwrRefreshSemaphore`]).
+pub(crate) const MAX_CONCURRENT_SWR_REFRESHES: usize = 10;
+
+/// Bounds how many per-entry SWR background refreshes (`handle_cache_hit`'s
+/// `Stale` branch) can be running at once. Shared across every
+/// `CachingAccelerationScanExec` for a dataset, so it caps the total regardless
+/// of how many distinct keys go stale concurrently (spiceai/spiceai#14102).
+pub type SwrRefreshSemaphore = Arc<Semaphore>;
 
 /// Channel capacity for batched cache writes. Allows buffering many concurrent requests.
 /// This value controls how many cache write requests can be buffered before
@@ -1822,6 +1835,12 @@ impl CacheRefreshHelper {
     ///   the write lands, so a reader whose observation of the cache is made
     ///   stale by a concurrent replacement cannot append beside it. See
     ///   [`CacheKeyClaim`].
+    ///
+    /// Not bounded by [`SwrRefreshSemaphore`] (spiceai/spiceai#14102): unlike the
+    /// SWR path, this fetch runs inline on the request future rather than a
+    /// spawned background task, so its concurrency is already whatever bounds
+    /// concurrent client requests, and there is no cached row to fall back to
+    /// while waiting for a permit.
     #[expect(clippy::too_many_arguments)]
     async fn handle_cache_miss(
         federated: Arc<dyn TableProvider>,
@@ -2015,6 +2034,7 @@ impl CacheRefreshHelper {
         in_flight_revalidations: &InFlightRevalidations,
         batch_write_tx: CacheWriteSender,
         namespace: CacheNamespace,
+        swr_refresh_semaphore: &SwrRefreshSemaphore,
     ) -> SendableRecordBatchStream {
         let total_cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
 
@@ -2049,7 +2069,21 @@ impl CacheRefreshHelper {
                         ),
                     );
 
-                    if let Some(claim) = claim {
+                    // A background refresh must never block the client-facing
+                    // request path, so this is a non-blocking `try_acquire`
+                    // rather than `.acquire().await`: when the bound is
+                    // already saturated we drop straight through to serving
+                    // the stale row, and the claim above releases the key so
+                    // the next hit on it can retry.
+                    let has_claim = claim.is_some();
+                    let permit = if has_claim {
+                        Arc::clone(swr_refresh_semaphore).try_acquire_owned().ok()
+                    } else {
+                        None
+                    };
+                    let permit_exhausted = has_claim && permit.is_none();
+
+                    if let (Some(claim), Some(permit)) = (claim, permit) {
                         tracing::debug!(
                             "Data is stale for dataset={dataset_name}, triggering background refresh"
                         );
@@ -2069,6 +2103,7 @@ impl CacheRefreshHelper {
                         let namespace_clone = namespace;
 
                         io_runtime.spawn(async move {
+                            let _permit = permit;
                             tracing::debug!(
                                 "SWR: Background refresh for single entry started for dataset={dataset_name_clone}"
                             );
@@ -2105,6 +2140,10 @@ impl CacheRefreshHelper {
                                 }
                             }
                         });
+                    } else if permit_exhausted {
+                        tracing::debug!(
+                            "Skipping background refresh for dataset={dataset_name}: {MAX_CONCURRENT_SWR_REFRESHES} concurrent SWR refreshes already in flight, serving stale data as-is"
+                        );
                     } else {
                         tracing::debug!(
                             "Skipping background refresh for dataset={dataset_name} because should_revalidate=false (revalidation already in progress for this cache key)"
@@ -2159,6 +2198,9 @@ pub struct CachingAccelerationScanExec {
     synchronized_children: SynchronizedChildren,
     /// Sender for batched cache writes
     batch_write_tx: CacheWriteSender,
+    /// Bounds concurrent per-entry SWR background refreshes across every scan
+    /// of this dataset (spiceai/spiceai#14102)
+    swr_refresh_semaphore: SwrRefreshSemaphore,
 }
 
 impl CachingAccelerationScanExec {
@@ -2179,6 +2221,7 @@ impl CachingAccelerationScanExec {
         in_flight_revalidations: InFlightRevalidations,
         synchronized_children: SynchronizedChildren,
         batch_write_tx: CacheWriteSender,
+        swr_refresh_semaphore: SwrRefreshSemaphore,
     ) -> Self {
         let max_age = Some(effective_max_age(max_age));
 
@@ -2208,6 +2251,7 @@ impl CachingAccelerationScanExec {
             in_flight_revalidations,
             synchronized_children,
             batch_write_tx,
+            swr_refresh_semaphore,
         }
     }
 }
@@ -2265,6 +2309,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             Arc::clone(&self.in_flight_revalidations),
             Arc::clone(&self.synchronized_children),
             self.batch_write_tx.clone(),
+            Arc::clone(&self.swr_refresh_semaphore),
         )))
     }
 
@@ -2317,6 +2362,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         let in_flight_revalidations = Arc::clone(&self.in_flight_revalidations);
         let synchronized_children = Arc::clone(&self.synchronized_children);
         let batch_write_tx = self.batch_write_tx.clone();
+        let swr_refresh_semaphore = Arc::clone(&self.swr_refresh_semaphore);
 
         tracing::debug!(
             "CacheAccelerationScanExec::execute about to spawn cache check for dataset={}",
@@ -2415,6 +2461,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     &in_flight_revalidations,
                     batch_write_tx.clone(),
                     namespace,
+                    &swr_refresh_semaphore,
                 )
             } else {
                 // Cache miss - no data in accelerator - retrieve from source and store in accelerator
@@ -2604,6 +2651,12 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     /// Mock `TableProvider` that records filters passed to `scan()` for verification.
+    ///
+    /// Optionally sleeps for `scan_delay` on every `scan()` call and tracks how many
+    /// calls were in that sleep at once, via `concurrent_scans`/`max_concurrent_scans`.
+    /// This is what lets `test_swr_refresh_concurrency_is_bounded` observe how many
+    /// SWR background refreshes were simultaneously in flight without needing a
+    /// separate mock.
     #[derive(Debug)]
     struct FilterTrackingTableProvider {
         schema: SchemaRef,
@@ -2611,6 +2664,9 @@ mod tests {
         data: Vec<RecordBatch>,
         /// Record of all filter sets passed to `scan()` calls
         recorded_filters: Arc<RwLock<Vec<Vec<String>>>>,
+        scan_delay: Duration,
+        concurrent_scans: Arc<std::sync::atomic::AtomicUsize>,
+        max_concurrent_scans: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl FilterTrackingTableProvider {
@@ -2619,11 +2675,30 @@ mod tests {
                 schema,
                 data,
                 recorded_filters: Arc::new(RwLock::new(Vec::new())),
+                scan_delay: Duration::ZERO,
+                concurrent_scans: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                max_concurrent_scans: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn new_with_scan_delay(
+            schema: SchemaRef,
+            data: Vec<RecordBatch>,
+            scan_delay: Duration,
+        ) -> Self {
+            Self {
+                scan_delay,
+                ..Self::new(schema, data)
             }
         }
 
         fn get_recorded_filters(&self) -> Vec<Vec<String>> {
             self.recorded_filters.read().clone()
+        }
+
+        fn max_concurrent_scans(&self) -> usize {
+            self.max_concurrent_scans
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -2650,6 +2725,18 @@ mod tests {
                 .map(|f| f.human_display().to_string())
                 .collect();
             self.recorded_filters.write().push(filter_strings);
+
+            if self.scan_delay > Duration::ZERO {
+                let now_concurrent = self
+                    .concurrent_scans
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                self.max_concurrent_scans
+                    .fetch_max(now_concurrent, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(self.scan_delay).await;
+                self.concurrent_scans
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
 
             // Return the configured data
             Ok(Arc::new(DataSourceExec::new(Arc::new(
@@ -3767,6 +3854,7 @@ mod tests {
             &in_flight_revalidations,
             batch_write_tx,
             CacheNamespace::Public,
+            &Arc::new(Semaphore::new(MAX_CONCURRENT_SWR_REFRESHES)),
         );
 
         // Wait for flush interval `CACHE_WRITE_FLUSH_INTERVAL_MS` + buffer 100ms
@@ -3850,6 +3938,133 @@ mod tests {
             found_fresh_data,
             "Accelerator should contain fresh data ('fresh_user_data') after background refresh. \
              Current data: {accelerator_data:?}"
+        );
+    }
+
+    /// Reproduces spiceai/spiceai#14102: before the `swr_refresh_semaphore` bound was
+    /// added, `handle_cache_hit`'s `Stale` branch spawned one unbounded background
+    /// refresh task per distinct stale key. Under many concurrent stale hits on
+    /// distinct keys (the Zipf-skewed, short-`caching_ttl` traffic pattern the issue
+    /// reproduced OOMs under) that meant an unbounded number of tasks alive at once.
+    ///
+    /// Drives more concurrent stale hits (on distinct keys, so the per-key
+    /// `in_flight_revalidations` dedupe cannot itself bound concurrency) than
+    /// `MAX_CONCURRENT_SWR_REFRESHES`, uses `FilterTrackingTableProvider`'s scan delay
+    /// to hold each refresh open long enough to observe overlap, and asserts the
+    /// federated source never sees more concurrent scans than the bound allows.
+    #[tokio::test]
+    async fn test_swr_refresh_concurrency_is_bounded() {
+        const NUM_STALE_KEYS: usize = MAX_CONCURRENT_SWR_REFRESHES * 3;
+        const SCAN_DELAY: Duration = Duration::from_millis(200);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("data", DataType::Utf8, true),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+            Field::new(
+                CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]));
+
+        let fresh_data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/api/entry"])),
+                Arc::new(StringArray::from(vec!["id=0"])),
+                Arc::new(StringArray::from(vec!["fresh"])),
+                Arc::new(UInt16Array::from(vec![200])),
+                Arc::new(TimestampNanosecondArray::from(vec![Some(0)])),
+            ],
+        )
+        .expect("Should create batch");
+
+        let federated = Arc::new(FilterTrackingTableProvider::new_with_scan_delay(
+            Arc::clone(&schema),
+            vec![fresh_data],
+            SCAN_DELAY,
+        ));
+
+        #[expect(clippy::cast_possible_truncation)]
+        let two_min_ago = (SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos()
+            - Duration::from_mins(2).as_nanos()) as i64;
+
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight_revalidations: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+        let (batch_write_tx, _consumer_handle) =
+            spawn_test_cache_write_consumer(&accelerator, &in_flight_revalidations);
+        let swr_refresh_semaphore: SwrRefreshSemaphore =
+            Arc::new(Semaphore::new(MAX_CONCURRENT_SWR_REFRESHES));
+
+        let io_runtime = tokio::runtime::Handle::current();
+        let max_age = Some(Duration::from_mins(1));
+        let stale_while_revalidate = Some(Duration::from_mins(5));
+
+        // Drive NUM_STALE_KEYS distinct stale cache hits "concurrently" (one per
+        // simulated request), each on its own key so the in-flight dedupe cannot
+        // itself be the thing bounding concurrency.
+        for i in 0..NUM_STALE_KEYS {
+            let path = format!("/api/entry/{i}");
+            let query = format!("id={i}");
+            let stale_batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec![path.clone()])),
+                    Arc::new(StringArray::from(vec![query.clone()])),
+                    Arc::new(StringArray::from(vec!["stale"])),
+                    Arc::new(UInt16Array::from(vec![200])),
+                    Arc::new(TimestampNanosecondArray::from(vec![Some(two_min_ago)])),
+                ],
+            )
+            .expect("Should create batch");
+
+            let access_filters = vec![
+                col("request_path").eq(lit(path)),
+                col("request_query").eq(lit(query)),
+            ];
+
+            let _stream = CacheRefreshHelper::handle_cache_hit(
+                vec![stale_batch],
+                &(Arc::clone(&federated) as Arc<dyn TableProvider>),
+                "test_dataset",
+                max_age,
+                stale_while_revalidate,
+                &io_runtime,
+                Arc::clone(&schema),
+                &access_filters,
+                &in_flight_revalidations,
+                batch_write_tx.clone(),
+                CacheNamespace::Public,
+                &swr_refresh_semaphore,
+            );
+        }
+
+        // Give every spawned refresh task time to reach (and hold) the scan
+        // delay, then time for the bound to drain and the rest to run.
+        tokio::time::sleep(SCAN_DELAY * 5 + Duration::from_millis(500)).await;
+
+        let observed_max_concurrency = federated.max_concurrent_scans();
+        assert!(
+            observed_max_concurrency <= MAX_CONCURRENT_SWR_REFRESHES,
+            "SWR background refreshes must never exceed MAX_CONCURRENT_SWR_REFRESHES \
+             ({MAX_CONCURRENT_SWR_REFRESHES}) concurrently in flight, observed \
+             {observed_max_concurrency} out of {NUM_STALE_KEYS} distinct stale keys \
+             hit at once. An unbounded observed value here is exactly \
+             spiceai/spiceai#14102."
+        );
+        assert!(
+            observed_max_concurrency > 0,
+            "test setup problem: no refresh ever ran, so this assertion cannot \
+             distinguish a bounded fix from a broken test"
         );
     }
 
