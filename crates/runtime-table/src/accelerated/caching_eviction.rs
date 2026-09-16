@@ -56,11 +56,12 @@ limitations under the License.
 //! That is the price of the trade below, and it is a real one: a measured run
 //! swept a 2,500,000-entry `DuckDB` acceleration every five minutes for 84
 //! minutes without failing, but the ranking materialises one record per entry
-//! while it runs. Deferring each entry's key strings until the delete actually
-//! names it — at most [`MAX_ENTRIES_PER_SWEEP`] of them, and none at all for the
-//! doomed entries a range clears — would remove most of that, and is the
-//! identified next step. Keeping a running tally beside the table instead is the alternative
-//! this module exists to avoid; see below.
+//! while it runs. Each entry's key strings are deferred until a delete
+//! predicate actually names it — at most [`MAX_ENTRIES_PER_SWEEP`] of them, and
+//! none at all for the doomed entries the range clears (see [`EntryKey`],
+//! [`DoomedSplit::delete_terms`]) — so ranking itself allocates nothing per
+//! entry beyond the `EntryCost` record. Keeping a running tally beside the
+//! table instead is the alternative this module exists to avoid; see below.
 //!
 //! ## How a sweep deletes
 //!
@@ -379,7 +380,7 @@ impl RetentionPredicate for CacheEvictionPredicate {
             ));
         }
 
-        let entries = rank_entries(
+        let (entries, batches) = rank_entries(
             accelerator,
             &self.io_runtime,
             &key_columns,
@@ -440,8 +441,12 @@ impl RetentionPredicate for CacheEvictionPredicate {
         // both into one `DELETE` predicate. Combining them is what lets a cache
         // ingesting faster than the naming cap can evict still converge: the
         // bounded range carries the bulk and naming only mops up the boundary.
-        let (terms, deferred) =
-            partition_doomed(&doomed, &survivors).delete_terms(refreshed_at.as_ref(), &doomed);
+        let (terms, deferred) = partition_doomed(&doomed, &survivors).delete_terms(
+            refreshed_at.as_ref(),
+            &doomed,
+            &batches,
+            &key_columns,
+        );
 
         if deferred > 0 {
             tracing::info!(
@@ -597,10 +602,67 @@ fn unmeasurable_payload_columns(schema: &arrow::datatypes::Schema) -> Vec<String
         .collect()
 }
 
+/// Where a ranked entry's key strings live.
+///
+/// Ranking needs `rows`/`bytes`/`oldest`/`newest`/`matches_configured` for
+/// every entry the aggregate returns, but the key is only ever read by a
+/// per-entry delete predicate — and [`nameable`] caps how many of those a
+/// sweep ever names at [`MAX_ENTRIES_PER_SWEEP`], while the `bulk_range` path
+/// ([`partition_doomed`]) needs none at all. A measured run swept 2,500,000
+/// entries and materialised a key for every one of them though at most 512
+/// were ever named; `Deferred` instead keeps a pointer back into the ranking
+/// batches, so [`read_utf8`]'s allocation only happens for the entries a
+/// delete predicate actually names.
+enum EntryKey {
+    Deferred { batch: usize, row: usize },
+    /// Lets a unit test build an [`EntryCost`] without a real `RecordBatch` to
+    /// point back into.
+    #[cfg(test)]
+    Eager(Vec<(String, Option<String>)>),
+}
+
+impl std::fmt::Debug for EntryKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EntryKey::Deferred { batch, row } => {
+                write!(f, "EntryKey::Deferred {{ batch: {batch}, row: {row} }}")
+            }
+            #[cfg(test)]
+            EntryKey::Eager(key) => write!(f, "EntryKey::Eager({key:?})"),
+        }
+    }
+}
+
+impl EntryKey {
+    /// Reads this entry's key columns out of `batches`, allocating a `String`
+    /// per column only now, at the one place the result is used.
+    fn resolve(
+        &self,
+        batches: &[RecordBatch],
+        key_columns: &[String],
+    ) -> Vec<(String, Option<String>)> {
+        match self {
+            EntryKey::Deferred { batch, row } => {
+                #[cfg(test)]
+                tests::count_key_extraction();
+                key_columns
+                    .iter()
+                    .map(|name| (name.clone(), read_utf8(&batches[*batch], name, *row)))
+                    .collect()
+            }
+            #[cfg(test)]
+            EntryKey::Eager(key) => key.clone(),
+        }
+    }
+}
+
 /// One cache entry as the ranking query sees it: its key values and what it
 /// costs against each budget.
 struct EntryCost {
-    key: Vec<(String, Option<String>)>,
+    /// Not read during ranking, selection or partitioning — only
+    /// [`DoomedSplit::delete_terms`] resolves it, and only for the entries a
+    /// per-key predicate ends up naming.
+    key: EntryKey,
     rows: u64,
     bytes: u64,
     /// `min(_fetched_at)` over the entry's rows, or `None` where they carry no
@@ -671,10 +733,17 @@ impl<'a> DoomedSplit<'a> {
     ///
     /// Returns the terms and how many named entries the per-sweep cap deferred to
     /// the next sweep; the caller logs the shortfall.
+    ///
+    /// `batches` and `key_columns` exist here only to resolve [`EntryKey`]: this
+    /// is the one place a key is ever read back, after `nameable` has already
+    /// capped how many entries need one, so a doomed set the range clears whole
+    /// (`self.named` empty) resolves none at all.
     fn delete_terms(
         mut self,
         refreshed_at: Option<&TimestampFilterConvert>,
         doomed: &[&'a EntryCost],
+        batches: &[RecordBatch],
+        key_columns: &[String],
     ) -> (Vec<Expr>, usize) {
         let mut terms: Vec<Expr> = Vec::new();
         if let Some((floor, ceiling)) = self.range_floor.zip(self.range_ceiling) {
@@ -688,11 +757,13 @@ impl<'a> DoomedSplit<'a> {
         // held when ranked. Oldest first, since the cap may not reach all of
         // them this sweep.
         let (naming, deferred) = nameable(&self.named);
-        terms.extend(
-            naming
-                .iter()
-                .filter_map(|entry| entry_predicate(&entry.key, entry.newest, refreshed_at)),
-        );
+        terms.extend(naming.iter().filter_map(|entry| {
+            entry_predicate(
+                &entry.key.resolve(batches, key_columns),
+                entry.newest,
+                refreshed_at,
+            )
+        }));
         (terms, deferred)
     }
 }
@@ -871,7 +942,11 @@ fn select_doomed_refs(entries: &[&EntryCost], budget: Budget) -> usize {
 ///
 /// This is the sweep's only pass over the accelerator, so it collects
 /// everything both budgets need at once: a row count, a payload-byte total, and
-/// the key to name the entry in a `DELETE`.
+/// where to find the key that would name the entry in a `DELETE` — the key
+/// itself is not read here, only recorded as a `(batch, row)` pointer, since
+/// almost nothing ranking returns is ever named individually. The batches are
+/// returned alongside the entries because that pointer is only good for as
+/// long as they stay alive.
 async fn rank_entries(
     accelerator: &Arc<dyn TableProvider>,
     io_runtime: &Handle,
@@ -879,7 +954,7 @@ async fn rank_entries(
     schema: &arrow::datatypes::Schema,
     configured: Option<Expr>,
     max_size_bytes: Option<u64>,
-) -> DataFusionResult<Vec<EntryCost>> {
+) -> DataFusionResult<(Vec<EntryCost>, Vec<RecordBatch>)> {
     // Only measured when something charges against it. Summing `octet_length`
     // over the payload means reading every cached response body off disk, and
     // for a dataset with a TTL and no byte budget the figure is discarded.
@@ -933,17 +1008,16 @@ async fn rank_entries(
     let batches = df.collect().await?;
 
     let mut entries = Vec::new();
-    for batch in &batches {
+    for (batch_index, batch) in batches.iter().enumerate() {
         for row in 0..batch.num_rows() {
-            let key = key_columns
-                .iter()
-                .map(|name| (name.clone(), read_utf8(batch, name, row)))
-                .collect();
             // Every reader resolves its column by name and answers `None` for
             // one the aggregate did not produce, so an absent aggregate needs
             // no flag of its own here.
             entries.push(EntryCost {
-                key,
+                key: EntryKey::Deferred {
+                    batch: batch_index,
+                    row,
+                },
                 rows: read_u64_at(batch, "rows", row).unwrap_or(0),
                 bytes: read_u64_at(batch, "bytes", row).unwrap_or(0),
                 oldest: read_timestamp_nanos(batch, "oldest", row),
@@ -953,7 +1027,7 @@ async fn rank_entries(
         }
     }
 
-    Ok(entries)
+    Ok((entries, batches))
 }
 
 /// Builds `col = value AND ...` identifying exactly one cache entry, bounded to
@@ -1105,6 +1179,29 @@ mod tests {
     use crate::federated::FederatedTable;
     use arrow::datatypes::{Field, Schema, TimeUnit};
 
+    // Proves the deferral rather than trusting the diff: a test-only tally of
+    // how many times `EntryKey::resolve` actually reads a key back off a
+    // `RecordBatch`. Thread-local because `#[tokio::test]`'s default
+    // current-thread runtime keeps a test's whole body — setup, sweep and
+    // assertion — on the one OS thread the harness gave it, so this cannot be
+    // corrupted by another test's sweep running concurrently on another
+    // thread.
+    thread_local! {
+        static KEY_EXTRACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn count_key_extraction() {
+        KEY_EXTRACTIONS.with(|c| c.set(c.get() + 1));
+    }
+
+    fn reset_key_extractions() {
+        KEY_EXTRACTIONS.with(|c| c.set(0));
+    }
+
+    fn key_extractions() -> usize {
+        KEY_EXTRACTIONS.with(std::cell::Cell::get)
+    }
+
     fn http_cache_schema() -> Schema {
         Schema::new(vec![
             Field::new("request_path", DataType::Utf8, false),
@@ -1148,7 +1245,7 @@ mod tests {
 
     fn cost(oldest: Option<i64>, newest: Option<i64>) -> EntryCost {
         EntryCost {
-            key: vec![("request_path".to_string(), Some("/x".to_string()))],
+            key: EntryKey::Eager(vec![("request_path".to_string(), Some("/x".to_string()))]),
             rows: 1,
             bytes: 1,
             oldest,
@@ -1288,7 +1385,7 @@ mod tests {
     /// partition test can tell which entries the range covers from which it names.
     fn named_cost(path: &str, oldest: Option<i64>, newest: Option<i64>) -> EntryCost {
         EntryCost {
-            key: vec![("request_path".to_string(), Some(path.to_string()))],
+            key: EntryKey::Eager(vec![("request_path".to_string(), Some(path.to_string()))]),
             rows: 1,
             bytes: 1,
             oldest,
@@ -1302,7 +1399,7 @@ mod tests {
     fn named_paths(bucket: &[&EntryCost]) -> Vec<String> {
         bucket
             .iter()
-            .filter_map(|e| e.key.first().and_then(|(_, v)| v.clone()))
+            .filter_map(|e| e.key.resolve(&[], &[]).first().and_then(|(_, v)| v.clone()))
             .collect()
     }
 
@@ -1668,7 +1765,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, (rows, bytes))| EntryCost {
-                key: vec![("request_path".to_string(), Some(format!("/{i}")))],
+                key: EntryKey::Eager(vec![("request_path".to_string(), Some(format!("/{i}")))]),
                 rows: *rows,
                 bytes: *bytes,
                 // Newest-first ordering is the caller's contract, so the value
@@ -1685,7 +1782,7 @@ mod tests {
         let keep = select_doomed_refs(&refs, budget);
         refs[keep..]
             .iter()
-            .filter_map(|e| e.key.first().and_then(|(_, v)| v.clone()))
+            .filter_map(|e| e.key.resolve(&[], &[]).first().and_then(|(_, v)| v.clone()))
             .collect()
     }
 
@@ -1747,7 +1844,7 @@ mod tests {
         let (naming, deferred) = nameable(&refs);
         assert_eq!(naming.len(), MAX_ENTRIES_PER_SWEEP);
         assert_eq!(deferred, 10);
-        let path = |e: &EntryCost| e.key[0].1.clone().unwrap_or_default();
+        let path = |e: &EntryCost| e.key.resolve(&[], &[])[0].1.clone().unwrap_or_default();
         assert_eq!(path(naming[naming.len() - 1]), format!("/{}", count - 1));
         assert_eq!(
             path(naming[0]),
@@ -1917,6 +2014,86 @@ mod tests {
             remaining(&accelerator).await.len(),
             100,
             "the cache is at its item budget after a single sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_range_delete_resolves_no_entrys_key() {
+        // The doc's own cited case: 2,000 entries fetched over time separate
+        // cleanly from a small surviving set, so the whole doomed set clears by
+        // one `_fetched_at` range and `DoomedSplit::delete_terms` never needs a
+        // per-entry key — `self.named` is empty, so `EntryKey::resolve` is
+        // called zero times rather than once per doomed entry.
+        reset_key_extractions();
+        let now = nanos_since_epoch(SystemTime::now()).expect("clock");
+        let second = 1_000_000_000_i64;
+
+        let mut entries: Vec<(String, i64)> = Vec::new();
+        for i in 0..2_000 {
+            entries.push((format!("/old{i}"), now - 10 * second));
+        }
+        for i in 0..50 {
+            entries.push((format!("/new{i}"), now));
+        }
+
+        let (accelerator, federated) = cache_table_at(&entries);
+        let deleted = sweep(
+            &accelerator,
+            &federated,
+            CacheLimits {
+                max_items: Some(50),
+                ..no_expiry()
+            },
+        )
+        .await;
+
+        assert_eq!(deleted, 2_000, "the whole doomed set clears by one range");
+        assert_eq!(
+            key_extractions(),
+            0,
+            "a clean range delete must resolve no entry's key at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_named_delete_resolves_keys_only_for_the_entries_it_actually_names() {
+        // A boundary tie forces the per-key path, but only for the entries the
+        // tie leaves for naming — never for the much larger cleanly-older bulk
+        // the range clears, and never more than `nameable` lets through.
+        reset_key_extractions();
+        let now = nanos_since_epoch(SystemTime::now()).expect("clock");
+        let second = 1_000_000_000_i64;
+
+        let mut entries: Vec<(String, i64)> = Vec::new();
+        for i in 0..2_000 {
+            entries.push((format!("/old{i}"), now - second));
+        }
+        // 100 entries sharing the survivor's exact timestamp: a clean range
+        // cannot cover them, so they must be named individually.
+        for i in 0..100 {
+            entries.push((format!("/boundary{i}"), now));
+        }
+
+        let (accelerator, federated) = cache_table_at(&entries);
+        let deleted = sweep(
+            &accelerator,
+            &federated,
+            CacheLimits {
+                max_items: Some(50), // keeps 50 of the 100 boundary entries
+                ..no_expiry()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            deleted, 2_050,
+            "the 2,000 cleanly-older by range plus the 50 over-budget of the tie by name"
+        );
+        assert_eq!(
+            key_extractions(),
+            50,
+            "only the 50 named boundary entries ever resolve a key — none of the \
+             2,000 the range cleared"
         );
     }
 
@@ -2094,7 +2271,7 @@ mod tests {
         let schema = accelerator.schema();
         let key_columns = entry_key_columns(&schema);
         let dataset_name = TableReference::bare("http_cache");
-        let entries = rank_entries(
+        let (entries, batches) = rank_entries(
             &accelerator,
             &Handle::current(),
             &key_columns,
@@ -2106,7 +2283,12 @@ mod tests {
         .expect("rank");
         let doomed: Vec<&EntryCost> = entries
             .iter()
-            .filter(|e| e.key.iter().any(|(_, v)| v.as_deref() == Some("/oldest")))
+            .filter(|e| {
+                e.key
+                    .resolve(&batches, &key_columns)
+                    .iter()
+                    .any(|(_, v)| v.as_deref() == Some("/oldest"))
+            })
             .collect();
         assert_eq!(doomed.len(), 1, "one entry should be chosen");
 
@@ -2126,7 +2308,11 @@ mod tests {
             doomed
                 .iter()
                 .filter_map(|entry| {
-                    entry_predicate(&entry.key, entry.newest, refreshed_at_converter().as_ref())
+                    entry_predicate(
+                        &entry.key.resolve(&batches, &key_columns),
+                        entry.newest,
+                        refreshed_at_converter().as_ref(),
+                    )
                 })
                 .collect(),
             Expr::or,
