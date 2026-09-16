@@ -221,6 +221,18 @@ impl CacheKeyClaim {
         self.published = true;
     }
 
+    /// Publishes an unbounded origin fetch to followers when it is a response
+    /// the cache would store — including an empty one — so every claim holder
+    /// that fetches the origin, not only a cache miss, serves the callers that
+    /// coalesced onto it. A transient-failure response (429 or 5xx) is left
+    /// unpublished: dropping the claim then publishes [`FetchState::Failed`] and
+    /// each follower applies its own `caching_stale_if_error`.
+    fn publish_if_cacheable(&mut self, batches: &[RecordBatch]) {
+        if cache::batches_cacheable(batches) {
+            self.publish_ready(Arc::new(batches.to_vec()));
+        }
+    }
+
     /// Hands the claim to a write that has been queued, which removes the map
     /// entry once the write has landed. Call only after the send has succeeded:
     /// a claim given to a request that never reaches the flush is never released.
@@ -1203,7 +1215,7 @@ impl CacheRefreshHelper {
                 let namespace_id = namespace
                     .as_deref()
                     .unwrap_or_else(|| CacheNamespace::Public.storage_id());
-                let ClaimOutcome::Leader(_claim) = CacheKeyClaim::acquire(
+                let ClaimOutcome::Leader(mut claim) = CacheKeyClaim::acquire(
                     &in_flight_revalidations,
                     compute_cache_key_from_filters_and_namespace(&row_filters, namespace_id),
                     None,
@@ -1222,6 +1234,12 @@ impl CacheRefreshHelper {
 
                 let batches =
                     Self::fetch_from_source(&federated, &dataset_name, &row_filters, None).await?;
+
+                // A miss for this entry that arrives while the claim is held
+                // follows it; hand it these rows now rather than after the
+                // write below, so it neither waits for the write nor asks the
+                // origin again.
+                claim.publish_if_cacheable(&batches);
 
                 if batches.is_empty() {
                     return Ok::<usize, datafusion::error::DataFusionError>(0);
@@ -1314,7 +1332,7 @@ impl CacheRefreshHelper {
         filters: &[Expr],
         namespace: CacheNamespace,
         batch_write_tx: CacheWriteSender,
-        claim: CacheKeyClaim,
+        mut claim: CacheKeyClaim,
     ) -> DataFusionResult<RevalidationOutcome> {
         tracing::trace!(
             "Refreshing single cache entry for dataset {dataset_name} with {} filters",
@@ -1323,6 +1341,11 @@ impl CacheRefreshHelper {
 
         // Fetch fresh data for this specific entry
         let batches = Self::fetch_from_source(&federated, dataset_name, filters, None).await?;
+
+        // A miss for this key that arrives while the claim is held follows it;
+        // hand it these rows now rather than after the write is queued, so it
+        // neither waits for the write nor asks the origin again.
+        claim.publish_if_cacheable(&batches);
 
         // Skip cache writes if the source response contains transient HTTP
         // errors. Returning here drops `claim`, releasing the key.
@@ -3457,6 +3480,20 @@ mod tests {
         drain(stream).await.iter().map(RecordBatch::num_rows).sum()
     }
 
+    /// Waits until `origin` has been scanned `scans` times, so a test can start a
+    /// second caller only once the first holds its claim and is inside its fetch.
+    async fn wait_for_scans(origin: &CountingHttpTableProvider, scans: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while origin.scan_count() < scans {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the origin was scanned {} time(s) within 5s, expected {scans}",
+                origin.scan_count()
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     /// An in-flight fetch serves a request only when it asked the origin for at
     /// least as many rows: unbounded serves anything, bounded serves a request
     /// bounded at or below it, and nothing bounded serves an unbounded request.
@@ -4958,6 +4995,198 @@ mod tests {
             written, 1,
             "only the leader writes; the caller that fetched for itself holds no claim"
         );
+    }
+
+    /// A stale-while-revalidate refresh holds the claim for its key across its
+    /// origin fetch, so a miss for the same key arriving meanwhile coalesces onto
+    /// it. The refresh must publish what it fetched: otherwise the miss waits out
+    /// the whole refresh and then asks the origin a second time.
+    #[tokio::test]
+    async fn a_miss_during_a_revalidation_replays_the_revalidations_fetch() {
+        let origin = Arc::new(CountingHttpTableProvider::new(
+            200,
+            "revalidated-body",
+            Duration::from_millis(200),
+        ));
+        let schema = origin.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let filters = vec![col("content").eq(lit("test"))];
+
+        // The revalidation claims the key the way `handle_cache_hit` does, then
+        // enters its fetch.
+        let claim = leader_claim(
+            &in_flight,
+            &compute_cache_key_from_filters_and_namespace(
+                &filters,
+                CacheNamespace::Public.storage_id(),
+            ),
+        );
+        let revalidation = tokio::spawn({
+            let origin = Arc::clone(&origin) as Arc<dyn TableProvider>;
+            let filters = filters.clone();
+            let batch_write_tx = batch_write_tx.clone();
+            async move {
+                CacheRefreshHelper::refresh_entry(
+                    origin,
+                    "test_dataset",
+                    &filters,
+                    CacheNamespace::Public,
+                    batch_write_tx,
+                    claim,
+                )
+                .await
+            }
+        });
+        wait_for_scans(&origin, 1).await;
+
+        // The entry has expired past its stale window, so this reader misses.
+        let served = drain(
+            CacheRefreshHelper::handle_cache_miss(
+                Arc::clone(&origin) as Arc<dyn TableProvider>,
+                "test_dataset",
+                &filters,
+                None,
+                Arc::clone(&schema),
+                true,
+                false,
+                None,
+                &tokio::runtime::Handle::current(),
+                Arc::new(vec![].into()),
+                batch_write_tx.clone(),
+                CacheNamespace::Public,
+                Arc::clone(&in_flight),
+            )
+            .await,
+        )
+        .await;
+
+        let outcome = revalidation
+            .await
+            .expect("revalidation task")
+            .expect("revalidation");
+        assert_eq!(outcome.rows(), 1, "the revalidation refreshed its one row");
+        assert_eq!(
+            origin.scan_count(),
+            1,
+            "a miss that coalesced onto a revalidation must not ask the origin again"
+        );
+        let rows: usize = served.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 1, "the miss is served the revalidation's row");
+        let content = served[0]
+            .column_by_name("content")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("content column");
+        assert_eq!(content.value(0), "revalidated-body");
+
+        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
+        handle.abort();
+    }
+
+    /// The periodic stale-row refresh holds the claim for each entry across its
+    /// origin fetch too, so a miss for that entry arriving meanwhile must replay
+    /// the refresh's fetch rather than wait for it and then ask the origin again.
+    #[tokio::test]
+    async fn a_miss_during_the_periodic_refresh_replays_the_refreshs_fetch() {
+        let origin = Arc::new(CountingHttpTableProvider::new(
+            200,
+            "refreshed-body",
+            Duration::from_millis(200),
+        ));
+        let schema = origin.schema();
+
+        #[expect(clippy::cast_possible_truncation)]
+        let fetched_long_ago = (SystemTime::now() - Duration::from_hours(1))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos() as i64;
+        let stale = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/a"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![""])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["old-body"])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![Some(fetched_long_ago)])) as ArrayRef,
+            ],
+        )
+        .expect("stale row");
+
+        // The miss asks for the entry under exactly the filters the refresh
+        // derives from the stale row, so both land on one key.
+        let entries =
+            CacheRefreshHelper::extract_unique_stale_entries(std::slice::from_ref(&stale))
+                .expect("stale entries");
+        let entry_filters = entries.first().expect("one stale entry").filters.clone();
+
+        let stored = Arc::new(
+            data_components::arrow::write::MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![stale]],
+            )
+            .expect("mem table"),
+        ) as Arc<dyn TableProvider>;
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+        let refresh = tokio::spawn({
+            let origin = Arc::clone(&origin) as Arc<dyn TableProvider>;
+            let stored = Arc::clone(&stored);
+            let in_flight = Arc::clone(&in_flight);
+            async move {
+                CacheRefreshHelper::refresh_all_stale_rows(
+                    origin,
+                    stored,
+                    "test_dataset",
+                    Duration::from_secs(1),
+                    Arc::new(Mutex::new(())),
+                    in_flight,
+                )
+                .await
+            }
+        });
+        wait_for_scans(&origin, 1).await;
+
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let served = drain_rows(
+            CacheRefreshHelper::handle_cache_miss(
+                Arc::clone(&origin) as Arc<dyn TableProvider>,
+                "test_dataset",
+                &entry_filters,
+                None,
+                Arc::clone(&schema),
+                true,
+                false,
+                None,
+                &tokio::runtime::Handle::current(),
+                Arc::new(vec![].into()),
+                batch_write_tx,
+                CacheNamespace::Public,
+                Arc::clone(&in_flight),
+            )
+            .await,
+        )
+        .await;
+
+        let refreshed = refresh.await.expect("refresh task").expect("refresh");
+        assert_eq!(refreshed, 1, "the periodic refresh refreshed its one row");
+        assert_eq!(
+            origin.scan_count(),
+            1,
+            "a miss that coalesced onto the periodic refresh must not ask the origin again"
+        );
+        assert_eq!(served, 1, "the miss is served the refresh's row");
+
+        handle.abort();
     }
 
     /// A leader that drops before publishing a result (cancelled, failed, or
