@@ -26,7 +26,7 @@ use crate::{Runtime, dataaccelerator::AccelerationSource};
 use super::{
     AcceleratedComponent,
     dataset::{
-        Dataset, ReadyState,
+        Dataset, ReadyState, TimeFormat,
         acceleration::{self, Acceleration},
     },
     deprecated_ready_state_warning, validate_identifier,
@@ -74,6 +74,8 @@ impl std::fmt::Debug for View {
             .field("sql", &self.sql)
             .field("metadata", &self.metadata)
             .field("columns", &self.columns)
+            .field("time_column", &self.time_column)
+            .field("time_format", &self.time_format)
             .field("acceleration", &self.acceleration)
             .field("ready_state", &self.ready_state)
             .field("vectors", &self.vectors)
@@ -114,6 +116,8 @@ pub struct ViewBuilder {
     pub sql: String,
     pub metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
+    pub time_column: Option<String>,
+    pub time_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
     pub ready_state: ReadyState,
     pub vectors: Option<VectorStore>,
@@ -164,13 +168,24 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
 
         // verify that the acceleration configuration is fully supported
         if let Some(acc) = &acceleration {
-            if acc.refresh_mode.is_some()
-                && acc.refresh_mode != Some(acceleration::RefreshMode::Full)
-            {
-                return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name,
-                    reason: "Only 'refresh_mode: full' is supported".to_string(),
-                });
+            match acc.refresh_mode {
+                None | Some(acceleration::RefreshMode::Full) => {}
+                Some(acceleration::RefreshMode::Append) => {
+                    if view.time_column.is_none() {
+                        return Err(crate::Error::AcceleratedViewInvalidConfiguration {
+                            view_name: view.name,
+                            reason: "'refresh_mode: append' requires 'time_column' to be set"
+                                .to_string(),
+                        });
+                    }
+                }
+                Some(_) => {
+                    return Err(crate::Error::AcceleratedViewInvalidConfiguration {
+                        view_name: view.name,
+                        reason: "Only 'refresh_mode: full' or 'refresh_mode: append' is supported"
+                            .to_string(),
+                    });
+                }
             }
 
             if acc.refresh_sql.is_some() {
@@ -186,6 +201,8 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
             sql,
             metadata,
             columns: view.columns,
+            time_column: view.time_column,
+            time_format: view.time_format.map(TimeFormat::from),
             acceleration,
             ready_state,
             vectors: view.vectors,
@@ -255,7 +272,7 @@ impl AccelerationSource for View {
     }
 
     fn time_column(&self) -> Option<&str> {
-        None
+        self.time_column.as_deref()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -317,6 +334,8 @@ impl ViewBuilder {
             sql,
             metadata: HashMap::default(),
             columns: vec![],
+            time_column: None,
+            time_format: None,
             acceleration: None,
             ready_state: ReadyState::default(),
             vectors: None,
@@ -332,6 +351,8 @@ impl ViewBuilder {
                 sql: Arc::from(self.sql),
                 metadata: self.metadata,
                 columns: self.columns,
+                time_column: self.time_column,
+                time_format: self.time_format,
                 acceleration: self.acceleration,
                 ready_state: self.ready_state,
                 vectors: self.vectors,
@@ -346,6 +367,9 @@ impl ViewBuilder {
 #[cfg(test)]
 mod tests {
     use super::{AcceleratedComponent, ReadyState, ViewBuilder, deprecated_ready_state_warning};
+    use spicepod::acceleration::{
+        Acceleration as SpicepodAcceleration, RefreshMode as SpicepodRefreshMode,
+    };
     use spicepod::component::view as spicepod_view;
 
     /// Resolves a view from its Spicepod YAML, so the test covers the same parse that a
@@ -491,5 +515,70 @@ sql: SELECT 1
             message.contains("WARN forged"),
             "the name is still reported in full, only escaped: {message:?}"
         );
+    }
+
+    fn view_with_acceleration(acceleration: SpicepodAcceleration) -> spicepod_view::View {
+        let mut view = spicepod_view::View::new("my_view".to_string());
+        view.sql = Some("SELECT id, created_at FROM my_dataset".to_string());
+        view.acceleration = Some(acceleration);
+        view
+    }
+
+    #[test]
+    fn append_refresh_mode_requires_time_column() {
+        let mut view = view_with_acceleration(SpicepodAcceleration {
+            enabled: true,
+            refresh_mode: Some(SpicepodRefreshMode::Append),
+            ..SpicepodAcceleration::default()
+        });
+        view.time_column = None;
+
+        let err = ViewBuilder::try_from(view)
+            .err()
+            .expect("append without time_column should fail");
+        assert!(
+            err.to_string().contains("time_column"),
+            "error should mention time_column, got: {err}"
+        );
+    }
+
+    #[test]
+    fn append_refresh_mode_with_time_column_succeeds() {
+        let mut view = view_with_acceleration(SpicepodAcceleration {
+            enabled: true,
+            refresh_mode: Some(SpicepodRefreshMode::Append),
+            ..SpicepodAcceleration::default()
+        });
+        view.time_column = Some("created_at".to_string());
+
+        ViewBuilder::try_from(view).expect("append with time_column should succeed");
+    }
+
+    #[test]
+    fn changes_refresh_mode_is_rejected() {
+        let view = view_with_acceleration(SpicepodAcceleration {
+            enabled: true,
+            refresh_mode: Some(SpicepodRefreshMode::Changes),
+            ..SpicepodAcceleration::default()
+        });
+
+        let err = ViewBuilder::try_from(view)
+            .err()
+            .expect("refresh_mode: changes should be rejected");
+        assert!(
+            err.to_string().contains("full") && err.to_string().contains("append"),
+            "error should name the supported modes, got: {err}"
+        );
+    }
+
+    #[test]
+    fn full_refresh_mode_succeeds_without_time_column() {
+        let view = view_with_acceleration(SpicepodAcceleration {
+            enabled: true,
+            refresh_mode: Some(SpicepodRefreshMode::Full),
+            ..SpicepodAcceleration::default()
+        });
+
+        ViewBuilder::try_from(view).expect("refresh_mode: full should succeed");
     }
 }
