@@ -774,15 +774,27 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
 
-            // Every shape the dialect renders: the plain call, an integer start,
-            // a start past the end of the input, and an anchored pattern. Each is measured federated against local, and each has a
-            // NULL row in the fixture that the bare `len(regexp_extract_all(..))`
-            // got wrong.
+            // Every shape the dialect renders, measured federated against local
+            // on a fixture whose NULL rows the bare `len(regexp_extract_all(..))`
+            // got wrong: the plain call, an integer start, a start past the end
+            // of the input, and one pattern per syntax family the RE2 screen
+            // admits — a unit test that the walker accepts a family says nothing
+            // about whether DuckDB counts it as the kernel does.
             let shapes = [
                 ("regexp_count(s, 'a')", "the plain call"),
                 ("regexp_count(s, 'a', 2)", "an integer start position"),
                 ("regexp_count(s, 'a', 9)", "a start position past the end of the input"),
                 ("regexp_count(s, '^a+$')", "an anchored pattern"),
+                ("regexp_count(s, '[a-c]{2,}')", "a bracketed range with an at-least bound"),
+                ("regexp_count(s, 'a+?')", "a lazy quantifier"),
+                ("regexp_count(s, '(a)(b)')", "capture groups"),
+                ("regexp_count(s, '(?:ab)+')", "a repeated non-capturing group"),
+                ("regexp_count(s, 'x.')", "a dot over a non-ASCII character (row 8)"),
+                ("regexp_count(s, '\\x61')", "a hex escape"),
+                ("regexp_count(s, 'x\\ny')", "a special escape"),
+                ("regexp_count(s, '\u{661}')", "a non-ASCII literal"),
+                ("regexp_count(s, '(a{1}){3}')", "nested counted repetitions"),
+                ("regexp_count(s, '(a{100}){10}')", "nested bounds at RE2's product limit of 1000"),
             ];
             for (call, what) in shapes {
                 let sql = format!("SELECT id, {call} AS c FROM {{table}} ORDER BY id");

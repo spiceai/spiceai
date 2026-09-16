@@ -87,8 +87,12 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
 /// (issue #10703).
 ///
 /// `regexp_like`, `regexp_replace` and `regexp_count` are the three
-/// `DataFusion` regexp built-ins the dialect renders, and all three agreed with
-/// local evaluation on every input measured, including a NULL one.
+/// `DataFusion` regexp built-ins the dialect renders. `regexp_like` and
+/// `regexp_replace` agreed with local evaluation on every input the #13809
+/// sweep measured, a NULL one included, for literal patterns; they still share
+/// the family's Perl-class divergence (`regexp_like('xy١', '\d')` is `false`
+/// federated and `true` locally, tracked as #14148), which the per-call screen
+/// below applies to `regexp_count` alone.
 /// `regexp_count` was here until its rendering was made NULL-preserving
 /// (issue #13870); the call shapes it still cannot render faithfully are
 /// refused by the handler and evaluated locally through the per-call check
