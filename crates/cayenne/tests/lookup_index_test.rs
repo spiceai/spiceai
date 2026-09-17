@@ -539,13 +539,52 @@ async fn lookup_index_plan_evidence() {
          AND \"ServiceId\" = '{application}' AND \"Active\" = 1 LIMIT 1"
     );
 
-    for (provider, table) in [(&indexed, INDEXED_EVIDENCE), (&plain, PLAIN_EVIDENCE)] {
-        let analyzed = query(provider, table, &sql.replace("{table}", table)).await;
-        let text = arrow::util::pretty::pretty_format_batches(&analyzed)
-            .expect("format plan")
-            .to_string();
-        println!("=== {table} ===\n{text}");
-    }
+    let analyzed = query(
+        &indexed,
+        INDEXED_EVIDENCE,
+        &sql.replace("{table}", INDEXED_EVIDENCE),
+    )
+    .await;
+    let indexed_text = arrow::util::pretty::pretty_format_batches(&analyzed)
+        .expect("format indexed plan")
+        .to_string();
+    assert!(
+        indexed_text.contains("lookup_index=(TenantId, ServiceId)")
+            && indexed_text.contains("lookup_index_outcome=selected")
+            && indexed_text.contains("candidate_files=")
+            && indexed_text.contains("candidate_rows="),
+        "indexed plan did not expose its lookup decision:\n{indexed_text}"
+    );
+
+    let analyzed = query(
+        &plain,
+        PLAIN_EVIDENCE,
+        &sql.replace("{table}", PLAIN_EVIDENCE),
+    )
+    .await;
+    let plain_text = arrow::util::pretty::pretty_format_batches(&analyzed)
+        .expect("format plain plan")
+        .to_string();
+    assert!(
+        !plain_text.contains("lookup_index="),
+        "an unindexed table claimed an index decision:\n{plain_text}"
+    );
+
+    let fallback =
+        format!("EXPLAIN SELECT * FROM {INDEXED_EVIDENCE} WHERE \"TenantId\" = '{account}'");
+    let fallback = query(&indexed, INDEXED_EVIDENCE, &fallback).await;
+    let fallback_text = arrow::util::pretty::pretty_format_batches(&fallback)
+        .expect("format fallback plan")
+        .to_string();
+    assert!(
+        fallback_text.contains("lookup_index=none")
+            && fallback_text.contains("lookup_index_outcome=not_applicable"),
+        "fallback plan did not explain why the index was skipped:\n{fallback_text}"
+    );
+
+    println!("=== {INDEXED_EVIDENCE} ===\n{indexed_text}");
+    println!("=== {PLAIN_EVIDENCE} ===\n{plain_text}");
+    println!("=== fallback ===\n{fallback_text}");
     println!("lookup-index counters: {:?}", counters_of(&indexed));
 }
 

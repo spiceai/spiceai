@@ -27,7 +27,7 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -144,14 +144,66 @@ fn scored_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("AutoId", DataType::Int64, false),
         Field::new("TenantId", DataType::Utf8, false),
-        Field::new("Score", DataType::Float64, false),
+        Field::new("Score", DataType::Int64, false),
     ]))
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn floating_point_index_columns_are_rejected_at_table_creation() {
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+
+    for (suffix, data_type) in [
+        ("f16", DataType::Float16),
+        ("f32", DataType::Float32),
+        ("f64", DataType::Float64),
+    ] {
+        let name = format!("float_index_{suffix}");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "Score",
+            data_type.clone(),
+            false,
+        )]));
+        let vortex_config = VortexConfig::default();
+        let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), &name);
+        let options = CreateTableOptions {
+            table_name: name.clone(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: fixture.data_path.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config,
+        };
+        let catalog = Arc::clone(&fixture.catalog);
+        let catalog: Arc<dyn MetadataCatalog> = catalog;
+        let Err(error) = CayenneTableProviderBuilder::new(catalog, Arc::clone(&runtime_env))
+            .with_context(context)
+            .with_secondary_indexes(vec![vec!["Score".to_string()]])
+            .create(options)
+            .await
+        else {
+            panic!("{data_type} lookup index was accepted");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("lookup index column 'Score'")
+                && message.contains("unsupported floating-point type")
+                && message.contains(&data_type.to_string()),
+            "unexpected error for {data_type}: {message}"
+        );
+        assert!(
+            fixture.catalog.get_table(&name).await.is_err(),
+            "an invalid index left table metadata behind"
+        );
+    }
+}
+
 /// A cast on the COLUMN side can map many stored values onto the literal:
-/// `CAST(Score AS BIGINT) = 5` holds for 5.0, 5.2 and 5.7. The index is keyed on
-/// the stored value, so it can only ever find 5.0 — answering such a predicate
-/// from the index would silently drop the other two rows. It must scan instead.
+/// adjacent integers above 2^53 become the same `DOUBLE`. The index is keyed on
+/// the stored integer, so answering the cast from it would silently drop one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_column_side_cast_is_never_answered_from_the_index() {
     const INDEXED: &str = "cast_indexed";
@@ -176,9 +228,12 @@ async fn a_column_side_cast_is_never_answered_from_the_index() {
     for i in 0..ROWS {
         auto_id.push(i64::try_from(i).expect("fits i64"));
         tenant.push(format!("T{:04}", i % 50));
-        score.push(f64::from(u32::try_from(i).expect("fits u32")) + 0.25);
+        score.push(i64::try_from(i).expect("fits i64"));
     }
-    for (offset, value) in [5.0, 5.2, 5.7].into_iter().enumerate() {
+    for (offset, value) in [9_007_199_254_740_992_i64, 9_007_199_254_740_993]
+        .into_iter()
+        .enumerate()
+    {
         auto_id.push(1_000_000 + i64::try_from(offset).expect("fits i64"));
         tenant.push("PLANTED".to_string());
         score.push(value);
@@ -188,7 +243,7 @@ async fn a_column_side_cast_is_never_answered_from_the_index() {
         vec![
             Arc::new(Int64Array::from(auto_id)),
             Arc::new(StringArray::from(tenant)),
-            Arc::new(Float64Array::from(score)),
+            Arc::new(Int64Array::from(score)),
         ],
     )
     .expect("batch");
@@ -197,7 +252,8 @@ async fn a_column_side_cast_is_never_answered_from_the_index() {
 
     // The index is in place: a bare equality on both key columns uses it.
     let before = counters(&indexed);
-    let bare = "SELECT \"AutoId\" FROM {t} WHERE \"TenantId\" = 'PLANTED' AND \"Score\" = 5.2";
+    let bare = "SELECT \"AutoId\" FROM {t} WHERE \"TenantId\" = 'PLANTED' \
+                AND \"Score\" = 9007199254740992";
     assert_eq!(
         rendered(&sql(&indexed, INDEXED, &bare.replace("{t}", INDEXED)).await),
         rendered(&sql(&plain, PLAIN, &bare.replace("{t}", PLAIN)).await)
@@ -209,12 +265,13 @@ async fn a_column_side_cast_is_never_answered_from_the_index() {
     );
 
     let casted = "SELECT \"AutoId\" FROM {t} WHERE \"TenantId\" = 'PLANTED' \
-                  AND CAST(\"Score\" AS BIGINT) = 5 ORDER BY \"AutoId\"";
+                  AND CAST(\"Score\" AS DOUBLE) = CAST(9007199254740992 AS DOUBLE) \
+                  ORDER BY \"AutoId\"";
     let expected = rendered(&sql(&plain, PLAIN, &casted.replace("{t}", PLAIN)).await);
     assert_eq!(
         expected.len(),
-        3,
-        "control table: all three planted rows cast to 5"
+        2,
+        "control table: both adjacent integers round to the same double"
     );
     let actual = rendered(&sql(&indexed, INDEXED, &casted.replace("{t}", INDEXED)).await);
     assert_eq!(

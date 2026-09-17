@@ -134,6 +134,74 @@ pub(crate) enum ProbeOutcome {
     SnapshotMismatch,
 }
 
+/// The lookup-index decision shown on `CayenneAccelerationExec` in `EXPLAIN`.
+///
+/// This is deliberately separate from [`ProbeOutcome`]: `NotApplicable` is a
+/// planning decision, not a probe, so it must not inflate the probe counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LookupIndexExplainOutcome {
+    NotApplicable,
+    Selected,
+    Empty,
+    Unbuilt,
+    SnapshotMismatch,
+}
+
+impl LookupIndexExplainOutcome {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Selected => "selected",
+            Self::Empty => "empty",
+            Self::Unbuilt => "unbuilt",
+            Self::SnapshotMismatch => "snapshot_mismatch",
+        }
+    }
+}
+
+/// Stable, scan-local lookup-index evidence carried into `EXPLAIN`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LookupIndexExplain {
+    pub(crate) shape: Option<String>,
+    pub(crate) outcome: LookupIndexExplainOutcome,
+    pub(crate) candidate_files: Option<usize>,
+    pub(crate) candidate_rows: Option<u64>,
+}
+
+impl LookupIndexExplain {
+    pub(crate) fn not_applicable(shape: Option<String>) -> Self {
+        Self {
+            shape,
+            outcome: LookupIndexExplainOutcome::NotApplicable,
+            candidate_files: None,
+            candidate_rows: None,
+        }
+    }
+
+    pub(crate) fn fallback(shape: String, outcome: LookupIndexExplainOutcome) -> Self {
+        Self {
+            shape: Some(shape),
+            outcome,
+            candidate_files: None,
+            candidate_rows: None,
+        }
+    }
+
+    pub(crate) fn selection(
+        shape: String,
+        outcome: LookupIndexExplainOutcome,
+        candidate_files: Option<usize>,
+        candidate_rows: u64,
+    ) -> Self {
+        Self {
+            shape: Some(shape),
+            outcome,
+            candidate_files,
+            candidate_rows: Some(candidate_rows),
+        }
+    }
+}
+
 impl ProbeOutcome {
     fn as_str(self) -> &'static str {
         match self {
@@ -240,6 +308,16 @@ impl KeyColumn {
             }
             field.as_ref()
         };
+        if matches!(
+            field.data_type(),
+            DataType::Float16 | DataType::Float32 | DataType::Float64
+        ) {
+            return Err(format!(
+                "lookup index column '{}' has unsupported floating-point type {}; use an integer, decimal, string, or other exact-equality type",
+                field.name(),
+                field.data_type()
+            ));
+        }
         Ok(Self {
             name: field.name().clone(),
             data_type: field.data_type().clone(),
@@ -611,6 +689,12 @@ pub(crate) struct LookupSelection {
     rows: usize,
 }
 
+/// The result of probing a fully pinned lookup-index key.
+pub(crate) enum LookupProbe {
+    Selection(LookupSelection),
+    Fallback(LookupIndexExplain),
+}
+
 impl LookupSelection {
     /// Narrows a scan's file groups to the files that hold a candidate row, and
     /// returns the access-plan provider that carries their positions into the
@@ -635,14 +719,25 @@ impl LookupSelection {
         file_groups: Vec<FileGroup>,
         table_plans: Arc<dyn VortexAccessPlanProvider>,
         current: FileSetVersion,
-    ) -> (Vec<FileGroup>, Option<Arc<dyn VortexAccessPlanProvider>>) {
+    ) -> (
+        Vec<FileGroup>,
+        Option<Arc<dyn VortexAccessPlanProvider>>,
+        LookupIndexExplain,
+    ) {
         if !self.validate(snapshot_id, file_groups.iter().flat_map(FileGroup::iter)) {
             self.state
                 .record_probe(&self.shape, ProbeOutcome::SnapshotMismatch);
             if self.index.snapshot_id == snapshot_id && self.index.file_set != current {
                 self.state.discard_stale(&self.index);
             }
-            return (file_groups, None);
+            return (
+                file_groups,
+                None,
+                LookupIndexExplain::fallback(
+                    self.shape,
+                    LookupIndexExplainOutcome::SnapshotMismatch,
+                ),
+            );
         }
         let file_groups: Vec<FileGroup> = file_groups
             .into_iter()
@@ -661,7 +756,16 @@ impl LookupSelection {
         let candidate_files: usize = file_groups.iter().map(FileGroup::len).sum();
         if candidate_files == 0 {
             self.state.record_probe(&self.shape, ProbeOutcome::Empty);
-            return (file_groups, None);
+            return (
+                file_groups,
+                None,
+                LookupIndexExplain::selection(
+                    self.shape,
+                    LookupIndexExplainOutcome::Empty,
+                    Some(0),
+                    0,
+                ),
+            );
         }
         self.state
             .record_selection(&self.shape, candidate_files as u64, self.rows as u64);
@@ -670,7 +774,16 @@ impl LookupSelection {
             selections: self.per_file,
             table: table_plans,
         };
-        (file_groups, Some(Arc::new(provider)))
+        (
+            file_groups,
+            Some(Arc::new(provider)),
+            LookupIndexExplain::selection(
+                self.shape,
+                LookupIndexExplainOutcome::Selected,
+                Some(candidate_files),
+                u64::try_from(self.rows).unwrap_or(u64::MAX),
+            ),
+        )
     }
 
     /// Accepts this selection only for the exact snapshot and files it was built
@@ -1230,9 +1343,9 @@ impl LookupIndexState {
     }
 
     /// Resolves a candidate row selection for `scalar_for` on a table whose
-    /// visible snapshot is `visible_snapshot`. Returns `None` whenever the
-    /// ordinary scan must be used; the caller records the final outcome once it
-    /// has validated the selection against its own file list.
+    /// visible snapshot is `visible_snapshot`. A fallback carries the reason for
+    /// `EXPLAIN`; the caller records the final outcome once it has validated a
+    /// selection against its own file list.
     ///
     /// `scalar_for` must only answer for predicates that compare the bare column
     /// with a value: see the module's note on column-side casts.
@@ -1240,20 +1353,32 @@ impl LookupIndexState {
         self: &Arc<Self>,
         visible_snapshot: &str,
         scalar_for: &dyn Fn(&str) -> Option<ScalarValue>,
-    ) -> Option<LookupSelection> {
-        let shape = self.matched_shape(scalar_for)?;
+    ) -> LookupProbe {
+        let Some(shape) = self.matched_shape(scalar_for) else {
+            return LookupProbe::Fallback(LookupIndexExplain::not_applicable(None));
+        };
         let Some(index) = self.published() else {
             self.record_probe(shape, ProbeOutcome::Unbuilt);
-            return None;
+            return LookupProbe::Fallback(LookupIndexExplain::fallback(
+                shape.to_string(),
+                LookupIndexExplainOutcome::Unbuilt,
+            ));
         };
         if index.snapshot_id != visible_snapshot {
             self.record_probe(shape, ProbeOutcome::SnapshotMismatch);
             self.discard_stale(&index);
-            return None;
+            return LookupProbe::Fallback(LookupIndexExplain::fallback(
+                shape.to_string(),
+                LookupIndexExplainOutcome::SnapshotMismatch,
+            ));
         }
 
-        let hit = index.probe(scalar_for)?;
-        Some(LookupSelection {
+        let Some(hit) = index.probe(scalar_for) else {
+            return LookupProbe::Fallback(LookupIndexExplain::not_applicable(Some(
+                shape.to_string(),
+            )));
+        };
+        LookupProbe::Selection(LookupSelection {
             state: Arc::clone(self),
             index,
             shape: hit.shape,
@@ -2439,6 +2564,20 @@ mod tests {
         let service = KeyColumn::resolve(&schema, "service").expect("unique by case");
         assert_eq!(service.name, "Service");
         assert!(service.nullable);
+    }
+
+    #[test]
+    fn floating_point_key_columns_are_refused() {
+        for data_type in [DataType::Float16, DataType::Float32, DataType::Float64] {
+            let schema =
+                arrow_schema::Schema::new(vec![Field::new("score", data_type.clone(), false)]);
+            let error = KeyColumn::resolve(&schema, "score").expect_err("float index rejected");
+            assert!(
+                error.contains("unsupported floating-point type")
+                    && error.contains(&data_type.to_string()),
+                "unexpected error for {data_type}: {error}"
+            );
+        }
     }
 
     fn keyed_schema() -> Arc<arrow_schema::Schema> {

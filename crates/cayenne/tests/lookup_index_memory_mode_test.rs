@@ -298,6 +298,34 @@ async fn memory_mode_lookups_match_an_unindexed_table() {
         "the index read nearly as much as a scan: {after_refresh:?}"
     );
 
+    let explain = query(
+        &indexed,
+        "indexed",
+        &format!("EXPLAIN {}", unique_lookup(997).replace("{t}", "indexed")),
+    )
+    .await
+    .join("\n");
+    assert!(
+        explain.contains("lookup_index=(TenantId, ServiceId)")
+            && explain.contains("lookup_index_outcome=selected")
+            && explain.contains("candidate_rows=")
+            && !explain.contains("candidate_files="),
+        "memory-mode plan did not expose its lookup decision:\n{explain}"
+    );
+
+    let fallback = query(
+        &indexed,
+        "indexed",
+        "EXPLAIN SELECT * FROM indexed WHERE \"TenantId\" = 5",
+    )
+    .await
+    .join("\n");
+    assert!(
+        fallback.contains("lookup_index=none")
+            && fallback.contains("lookup_index_outcome=not_applicable"),
+        "memory-mode fallback did not explain why the index was skipped:\n{fallback}"
+    );
+
     // A key no row holds, and a NULL literal no row can equal.
     for sql in [
         "SELECT * FROM {t} WHERE \"TenantId\" = 5 AND \"ServiceId\" = 'absent'",

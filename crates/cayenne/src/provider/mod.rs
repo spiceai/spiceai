@@ -208,6 +208,10 @@ pub enum Error {
     #[snafu(display("Data validation failed for table '{table}': {message}"))]
     DataValidation { table: String, message: String },
 
+    /// An accelerator option is incompatible with the table schema.
+    #[snafu(display("Invalid configuration for table '{table}': {message}"))]
+    InvalidConfiguration { table: String, message: String },
+
     /// A `mode: memory` (in-RAM) table reached its configured memory limit. Memory
     /// mode never spills to disk, so the write is rejected rather than silently
     /// dropped or grown unbounded.

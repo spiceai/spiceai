@@ -2684,6 +2684,28 @@ pub struct CayenneTableProviderBuilder {
     secondary_indexes: Vec<Vec<String>>,
 }
 
+/// Resolves every configured lookup-index column before table creation/open.
+/// Returning the resolved specs lets `create` fail before it mutates the
+/// catalog, while `open` repeats the check against the persisted schema.
+fn validated_lookup_index_keys(
+    table_name: &str,
+    schema: &arrow_schema::Schema,
+    indexes: &[Vec<String>],
+) -> CatalogResult<Vec<super::lookup_index::KeySpec>> {
+    let keys = super::lookup_index::KeySpec::from_indexes(indexes);
+    for key in &keys {
+        for column in key.columns() {
+            super::lookup_index::KeyColumn::resolve(schema, column).map_err(|message| {
+                Error::InvalidConfiguration {
+                    table: table_name.to_string(),
+                    message,
+                }
+            })?;
+        }
+    }
+    Ok(keys)
+}
+
 struct PendingMaintainedAggregateInsert {
     epoch: u64,
     batches: Arc<Vec<RecordBatch>>,
@@ -2897,8 +2919,8 @@ impl CayenneTableProviderBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the table cannot be found in the catalog or if the listing
-    /// table cannot be created.
+    /// Returns an error if the table cannot be found in the catalog, its lookup
+    /// indexes are invalid, or the listing table cannot be created.
     pub async fn open(self, table_name: &str) -> Result<CayenneTableProvider> {
         let options = CayenneTableProviderOpenOptions {
             retention_filters: self.retention_filters,
@@ -2921,9 +2943,11 @@ impl CayenneTableProviderBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the table cannot be created in the catalog.
+    /// Returns an error if its lookup indexes are invalid or the table cannot be
+    /// created in the catalog.
     pub async fn create(self, options: CreateTableOptions) -> CatalogResult<CayenneTableProvider> {
         let table_name = options.table_name.clone();
+        validated_lookup_index_keys(&table_name, &options.schema, &self.secondary_indexes)?;
         let _table_id = self.catalog.create_table(options).await?;
         let options = CayenneTableProviderOpenOptions {
             retention_filters: self.retention_filters,
@@ -8247,7 +8271,8 @@ impl CayenneTableProvider {
         ));
         // Secondary indexes over the table's Vortex files, or — for a memory-mode
         // table, which writes no files — over its rows where they live.
-        let index_keys = super::lookup_index::KeySpec::from_indexes(&secondary_indexes);
+        let index_keys =
+            validated_lookup_index_keys(table_name, &table_metadata.schema, &secondary_indexes)?;
         let (lookup_index, mem_tier_index) = if table_metadata.vortex_config.memory_mode {
             (
                 None,
@@ -24277,6 +24302,7 @@ impl CayenneTableProvider {
         plan: Arc<dyn ExecutionPlan>,
         scan_guard: Arc<SnapshotScanRef>,
         maintained_aggregate_epoch: Option<u64>,
+        lookup_index: Option<super::lookup_index::LookupIndexExplain>,
     ) -> Arc<dyn ExecutionPlan> {
         let overlay = self.optimizer_stats_overlay_for_schema(&plan.schema());
         let table_name = self.table_metadata.table_name.as_str();
@@ -24289,13 +24315,15 @@ impl CayenneTableProvider {
                     epoch,
                 )
                 .with_optimizer_column_overlay(overlay)
-                .with_table_name(table_name),
+                .with_table_name(table_name)
+                .with_lookup_index(lookup_index),
             )
         } else {
             Arc::new(
                 CayenneAccelerationExec::with_guard(plan, scan_guard)
                     .with_optimizer_column_overlay(overlay)
-                    .with_table_name(table_name),
+                    .with_table_name(table_name)
+                    .with_lookup_index(lookup_index),
             )
         }
     }
@@ -32066,6 +32094,7 @@ impl CayenneTableProvider {
                     Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
                     None,
                     None,
+                    None,
                 )
                 .await?;
 
@@ -32236,6 +32265,7 @@ impl CayenneTableProvider {
             Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
             None,
             None,
+            None,
         )
         .await
     }
@@ -32277,6 +32307,9 @@ impl CayenneTableProvider {
         // validated against the file list resolved below. Only the main `scan()`
         // path ever supplies one.
         lookup_selection: Option<super::lookup_index::LookupSelection>,
+        // Scan-local lookup-index evidence. The file listing below finalizes a
+        // provisional selection as selected, empty, or snapshot_mismatch.
+        lookup_index_explain: Option<&mut super::lookup_index::LookupIndexExplain>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         // The reference schema the Vortex decode targets. Internal reads
         // (compaction, keyset, stats) pass `None` -> stored `Utf8`/`Binary`,
@@ -32369,12 +32402,17 @@ impl CayenneTableProvider {
         // never resurrected.
         let mut lookup_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>> = None;
         if let Some(selection) = lookup_selection {
-            (partitioned_file_lists, lookup_plan_provider) = selection.restrict(
+            let (restricted_files, provider, explain) = selection.restrict(
                 snapshot_id,
                 partitioned_file_lists,
                 Self::position_deletion_plans(&self.pk_deletion_strategy),
                 self.file_set_version(),
             );
+            partitioned_file_lists = restricted_files;
+            lookup_plan_provider = provider;
+            if let Some(slot) = lookup_index_explain {
+                *slot = explain;
+            }
             if lookup_plan_provider.is_some() {
                 // A row selection makes the footer row count an upper bound,
                 // so exact-aggregate optimizations must not read it as live.
@@ -33573,14 +33611,19 @@ impl CayenneTableProvider {
 
     /// The memory-tier rows a lookup on an indexed key must read, taken from the
     /// scan's captured tier: each segment's candidate rows, with the tier's
-    /// tombstones applied exactly as the view applies them. `None` when the table
-    /// keeps no in-memory index or `filters` pin no indexed key; the scan then
-    /// reads the view's visible segments.
+    /// tombstones applied exactly as the view applies them. The outer `None`
+    /// means the table keeps no in-memory index; an indexed table whose filters
+    /// pin no key returns an explained fallback with no candidate override.
     fn mem_tier_index_candidates(
         &self,
         shards: &[Arc<crate::provider::mem_tier::MemTier>],
         filters: &[Expr],
-    ) -> datafusion_common::Result<Option<Vec<VisibleMemTierSegment>>> {
+    ) -> datafusion_common::Result<
+        Option<(
+            Option<Vec<VisibleMemTierSegment>>,
+            super::lookup_index::LookupIndexExplain,
+        )>,
+    > {
         let Some(indexer) = &self.mem_tier_index else {
             return Ok(None);
         };
@@ -33590,7 +33633,10 @@ impl CayenneTableProvider {
                 .find_map(|filter| bare_column_scalar_for(filter, column))
         };
         let Some(probe) = indexer.probe_key(&scalar_for) else {
-            return Ok(None);
+            return Ok(Some((
+                None,
+                super::lookup_index::LookupIndexExplain::not_applicable(None),
+            )));
         };
         let mut segments = Vec::new();
         let mut read_whole = false;
@@ -33641,7 +33687,29 @@ impl CayenneTableProvider {
             super::lookup_index::ProbeOutcome::Selected
         };
         indexer.record(probe.label, outcome, candidate_rows);
-        Ok(Some(segments))
+        let explain_outcome = match outcome {
+            super::lookup_index::ProbeOutcome::Selected => {
+                super::lookup_index::LookupIndexExplainOutcome::Selected
+            }
+            super::lookup_index::ProbeOutcome::Empty => {
+                super::lookup_index::LookupIndexExplainOutcome::Empty
+            }
+            super::lookup_index::ProbeOutcome::Unbuilt => {
+                super::lookup_index::LookupIndexExplainOutcome::Unbuilt
+            }
+            super::lookup_index::ProbeOutcome::SnapshotMismatch => {
+                super::lookup_index::LookupIndexExplainOutcome::SnapshotMismatch
+            }
+        };
+        Ok(Some((
+            Some(segments),
+            super::lookup_index::LookupIndexExplain::selection(
+                probe.label.to_string(),
+                explain_outcome,
+                None,
+                candidate_rows,
+            ),
+        )))
     }
 
     /// The table's file-set version, sampled before a listing it describes.
@@ -33708,29 +33776,52 @@ impl CayenneTableProvider {
     /// and, when there is none for the visible snapshot, may start the one
     /// background build that replaces it — as the build schedule allows, so a
     /// build that cannot fit or keeps failing is not retried on every lookup.
-    /// The returned candidate row addresses are still unvalidated against the
-    /// file list the plan resolves; `None` keeps the ordinary scan.
+    /// Returned candidate row addresses are still unvalidated against the file
+    /// list the plan resolves. The outer `None` means the table declares no
+    /// file-mode index; an indexed table always returns an explain decision.
     async fn resolve_lookup_index_selection(
         &self,
         state: &dyn Session,
         filters: &[Expr],
         read_schema: &SchemaRef,
-    ) -> Option<super::lookup_index::LookupSelection> {
+    ) -> Option<(
+        Option<super::lookup_index::LookupSelection>,
+        super::lookup_index::LookupIndexExplain,
+    )> {
         let index_state = self.lookup_index.as_ref()?;
         let scalar_for = |column: &str| {
             filters
                 .iter()
                 .find_map(|filter| bare_column_scalar_for(filter, column))
         };
-        index_state.matched_shape(&scalar_for)?;
+        let Some(shape) = index_state.matched_shape(&scalar_for) else {
+            return Some((
+                None,
+                super::lookup_index::LookupIndexExplain::not_applicable(None),
+            ));
+        };
 
         let visible_snapshot = self.get_current_snapshot_id();
         // Probe first: a stale index is dropped here, so a build claimed below
         // replaces nothing rather than an index that is already gone.
-        let selection = index_state.probe(&visible_snapshot, &scalar_for);
-        if selection.is_none()
-            && let Some(claim) = index_state.claim_build(&visible_snapshot)
+        let (selection, explain, should_build) = match index_state
+            .probe(&visible_snapshot, &scalar_for)
         {
+            super::lookup_index::LookupProbe::Selection(selection) => (
+                Some(selection),
+                super::lookup_index::LookupIndexExplain::not_applicable(Some(shape.to_string())),
+                false,
+            ),
+            super::lookup_index::LookupProbe::Fallback(explain) => {
+                let should_build = matches!(
+                    explain.outcome,
+                    super::lookup_index::LookupIndexExplainOutcome::Unbuilt
+                        | super::lookup_index::LookupIndexExplainOutcome::SnapshotMismatch
+                );
+                (None, explain, should_build)
+            }
+        };
+        if should_build && let Some(claim) = index_state.claim_build(&visible_snapshot) {
             // The claim frees its slot if this scan is dropped while listing.
             let file_set = self.file_set_version();
             match self
@@ -33748,7 +33839,7 @@ impl CayenneTableProvider {
                 None => claim.unpublished(),
             }
         }
-        selection
+        Some((selection, explain))
     }
 
     /// The WHOLE snapshot's data files, as the scan itself lists them. Filters
@@ -34495,7 +34586,7 @@ impl TableProvider for CayenneTableProvider {
         // Secondary index: candidate row addresses for an exact equality key
         // over indexed columns. `None` keeps the ordinary scan, which is what a
         // table without `indexes` and every other predicate shape resolve to.
-        let lookup_selection = self
+        let lookup_resolution = self
             .resolve_lookup_index_selection(state, scan_filters, &read_schema)
             .await;
 
@@ -34505,8 +34596,14 @@ impl TableProvider for CayenneTableProvider {
         // pays per-group Vortex footer-open cost (~50 µs each) without speeding
         // up the lookup because only one chunk in one file_group actually
         // contains K. See `pk_lookup_file_group_fanout` bench.
-        let is_pk_selective_scan =
-            self.is_pk_selective_scan(scan_filters) || lookup_selection.is_some();
+        let index_selected = lookup_resolution
+            .as_ref()
+            .is_some_and(|(selection, _)| selection.is_some());
+        let is_pk_selective_scan = self.is_pk_selective_scan(scan_filters) || index_selected;
+        let (lookup_selection, mut lookup_index_explain) = lookup_resolution
+            .map_or((None, None), |(selection, explain)| {
+                (selection, Some(explain))
+            });
         let scan_listing_config_override;
         let scan_listing_config = if is_pk_selective_scan {
             scan_listing_config_override = state.config().clone().with_target_partitions(1);
@@ -34563,6 +34660,7 @@ impl TableProvider for CayenneTableProvider {
                 0,
                 Some(&warm_files),
                 lookup_selection,
+                lookup_index_explain.as_mut(),
             )
             .await;
         self.record_listing_scan_duration(listing_scan_start.elapsed());
@@ -34691,13 +34789,16 @@ impl TableProvider for CayenneTableProvider {
         // visible segments, applying the tier's tombstones merge-on-read (already
         // baked into the segments) plus the per-query pruning predicate. `None` (and
         // skipped) in file mode, where the tier is empty.
-        let indexed_segments = match &mem_tier_shards {
+        let mem_index_resolution = match &mem_tier_shards {
             Some(shards) => self.mem_tier_index_candidates(shards, scan_filters)?,
             None => None,
         };
+        let indexed_segments = mem_index_resolution
+            .as_ref()
+            .and_then(|(segments, _)| segments.as_deref());
         let mem_plan: Option<Arc<dyn ExecutionPlan>> = self
             .build_mem_tier_scan_plan_from_segments(
-                indexed_segments.as_deref().unwrap_or(&visible_segments[..]),
+                indexed_segments.unwrap_or(&visible_segments[..]),
                 effective_projection.as_ref(),
                 mem_tier_pruning_predicate.as_ref(),
                 // Scan-resolved (1 for PK point lookups) — see the inline branch.
@@ -34705,6 +34806,9 @@ impl TableProvider for CayenneTableProvider {
                 &read_schema,
             )?
             .map(|mem_exec| self.wrap_memory_branch_with_scan_filters(mem_exec, filters));
+        if lookup_index_explain.is_none() {
+            lookup_index_explain = mem_index_resolution.map(|(_, explain)| explain);
+        }
 
         // Build the final plan:
         // - If protected snapshots exist: deletion filter on main, UNION with snapshots
@@ -34787,10 +34891,16 @@ impl TableProvider for CayenneTableProvider {
                 plan,
                 scan_guard,
                 maintained_aggregate_epoch,
+                lookup_index_explain,
             ));
         }
 
-        Ok(self.wrap_scan_plan_with_cayenne_metadata(plan, scan_guard, maintained_aggregate_epoch))
+        Ok(self.wrap_scan_plan_with_cayenne_metadata(
+            plan,
+            scan_guard,
+            maintained_aggregate_epoch,
+            lookup_index_explain,
+        ))
     }
 
     // Filter-pushdown exactness contract (read before changing the arms below):
