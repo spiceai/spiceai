@@ -72,6 +72,18 @@ guard. A patch with no guard is a patch the next re-cut can drop for free.
 A guard is a test **in this repo** that fails when the patch is missing. Not a
 comment, not a test in the fork.
 
+**And one the gate runs.** A test nothing runs makes this table claim coverage
+that does not exist, which is worse than a **GAP** — a gap is at least on the list
+below. `kind(=lib)` sweeps up every unit test, so the exposure is the
+integration-test targets, which `NEXTEST_FILTER` has to name one at a time;
+`--all --tests` compiles them either way, so an unnamed binary is built and then
+skipped. `scripts/check_fork_patches.py` fails when a guard named here is not
+selected there, and a guard that genuinely belongs elsewhere — one needing
+credentials or a live service — is recorded in that script's
+`GUARDS_RUN_OUTSIDE_THE_UNIT_GATE` with the runner that does run it. Three rows'
+guards were found this way, running nowhere: the `datafusion-functions-json`
+trio, `arrow-adbc` fork PR #4, and vortex's `set_available_parallelism`.
+
 The **Loss** column says how a missing patch would surface:
 
 - **silent** — it compiles and runs, and returns different results, hangs, crashes
