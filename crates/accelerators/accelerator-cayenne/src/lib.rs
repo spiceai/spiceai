@@ -426,6 +426,7 @@ pub fn register_cayenne_telemetry() {
     // installed, because the cache must exist before any table is registered —
     // well before the real meter provider replaces the startup noop one.
     vortex_datafusion::register_segment_cache_metrics();
+    vortex_datafusion::register_scan_metrics();
 
     // --- Process-global encode-concurrency budget ---
     let _ = meter
