@@ -3854,6 +3854,23 @@ fn range_bounds_from_statistics(
     (!bounds.is_empty()).then_some(bounds)
 }
 
+/// A sample taken from a string or binary view column, holding only the bytes
+/// of the values it picked.
+///
+/// `take` on a view array shares the source batch's data buffers, so every
+/// sampled batch would otherwise keep all of its key bytes alive until the
+/// sample is complete — the whole key column, for a sample of a few thousand
+/// values.
+fn compact_sampled_views(picked: ArrayRef) -> ArrayRef {
+    use arrow::array::AsArray;
+
+    match picked.data_type() {
+        DataType::Utf8View => Arc::new(picked.as_string_view().gc()),
+        DataType::BinaryView => Arc::new(picked.as_binary_view().gc()),
+        _ => picked,
+    }
+}
+
 /// Up to `shards - 1` strictly ascending split points cutting the non-NULL
 /// values of `sample` into equal-count slices, for any type the range router can
 /// compare (see [`is_range_routable_type`]). NULLs are skipped; the router keeps
@@ -17169,7 +17186,8 @@ impl CayenneTableProvider {
                     // A misreported row count: stop rather than hold the column.
                     return Ok(None);
                 }
-                sampled.push(arrow::compute::take(column.as_ref(), &picks, None)?);
+                let picked = arrow::compute::take(column.as_ref(), &picks, None)?;
+                sampled.push(compact_sampled_views(picked));
             }
             position = position.saturating_add(rows);
         }
@@ -45368,6 +45386,33 @@ mod tests {
         let mut sorted = narrow.clone();
         sorted.dedup();
         assert_eq!(sorted, narrow, "bounds must be strictly ascending");
+    }
+
+    /// A view sample must not pin the data buffers of the batch it was taken
+    /// from.
+    #[test]
+    fn compact_sampled_views_drops_unpicked_bytes() {
+        use arrow::array::{AsArray, StringViewArray, UInt32Array};
+
+        let long = |i: usize| format!("{i:064}");
+        let source: ArrayRef = Arc::new(StringViewArray::from_iter_values((0..4096).map(long)));
+        let picks = UInt32Array::from_iter_values((0..4096).step_by(64));
+        let picked = arrow::compute::take(source.as_ref(), &picks, None).expect("take views");
+        assert!(
+            picked.get_array_memory_size() > source.get_array_memory_size() / 2,
+            "take shares the source's data buffers, which is what compaction exists for"
+        );
+
+        let compacted = compact_sampled_views(picked);
+        assert!(
+            compacted.get_array_memory_size() < source.get_array_memory_size() / 16,
+            "a 1-in-64 sample keeps {} of the source's {} bytes",
+            compacted.get_array_memory_size(),
+            source.get_array_memory_size()
+        );
+        let values: Vec<&str> = compacted.as_string_view().iter().flatten().collect();
+        let expected: Vec<String> = (0..4096).step_by(64).map(long).collect();
+        assert_eq!(values, expected);
     }
 
     #[test]

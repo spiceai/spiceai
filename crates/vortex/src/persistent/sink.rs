@@ -20,6 +20,8 @@ use datafusion_common::arrow::compute::interleave_record_batch;
 use datafusion_common::arrow::compute::kernels::cmp::gt;
 use datafusion_common::arrow::compute::sort_to_indices;
 use datafusion_common::arrow::compute::take;
+use datafusion_common::arrow::datatypes::DataType;
+use datafusion_common::arrow::datatypes::i256;
 use datafusion_common::exec_datafusion_err;
 use datafusion_common::utils::memory::get_record_batch_memory_size;
 use datafusion_common_runtime::{JoinSet, SpawnedTask};
@@ -611,7 +613,16 @@ async fn write_record_batch_stream_to_files(
             expr,
             run_sort_bytes: Some(bytes),
             ..
-        } if num_shards > 1 && *bytes > 0 => Some((Arc::clone(expr), *bytes)),
+        } if num_shards > 1
+            && *bytes > 0
+            && data
+                .schema()
+                .fields()
+                .iter()
+                .all(|field| run_sort_supports(field.data_type())) =>
+        {
+            Some((Arc::clone(expr), *bytes))
+        }
         _ => None,
     };
     for shard_id in 0..num_shards {
@@ -740,9 +751,79 @@ async fn write_record_batch_stream_to_files(
 /// for an unsorted shard.
 const RUN_SORT_OUTPUT_ROWS: usize = 8192;
 
-/// Upper bound on what `sort_to_indices` allocates per row beside the key: a
-/// `(row index, value or value reference)` pair, and the output index.
-const RUN_SORT_SCRATCH_BYTES_PER_ROW: usize = 32;
+/// Whether a column of this type can be emitted from a sorted run, which
+/// interleaves rows from every batch the run buffered.
+///
+/// Types the kernel copies value by value qualify, and containers of them.
+/// Dictionaries do not: interleaving merges the batches' dictionaries, which
+/// fails once a narrow key type cannot address the merged values and otherwise
+/// rescans every buffered dictionary for each emitted batch. Nor do run-end
+/// encoded, union and list-view columns, or any type not named here. A write
+/// carrying one still routes rows by range; it just writes each range unsorted.
+fn run_sort_supports(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Null
+        | DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Timestamp(..)
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Duration(_)
+        | DataType::Interval(_)
+        | DataType::Binary
+        | DataType::FixedSizeBinary(_)
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Decimal32(..)
+        | DataType::Decimal64(..)
+        | DataType::Decimal128(..)
+        | DataType::Decimal256(..) => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => run_sort_supports(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .all(|field| run_sort_supports(field.data_type())),
+        _ => false,
+    }
+}
+
+/// What `sort_to_indices` allocates per row of a key of `data_type`, beside the
+/// key itself: its `(row index, sort value)` pair, and the row-index vectors it
+/// partitions the rows into and emits, which overlap the pairs.
+fn sort_scratch_bytes_per_row(data_type: &DataType) -> usize {
+    use std::mem::size_of;
+
+    let pair = match data_type {
+        DataType::Decimal256(..) => size_of::<(u32, i256)>(),
+        DataType::Decimal128(..) | DataType::Utf8View | DataType::BinaryView => {
+            size_of::<(u32, u128)>()
+        }
+        DataType::FixedSizeBinary(_) => size_of::<(u32, &[u8])>(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+            size_of::<(u32, u32, u64)>()
+        }
+        // Every other key a range can be split on is a native of at most 8 bytes.
+        _ => size_of::<(u32, u64)>(),
+    };
+    pair + 2 * size_of::<u32>()
+}
 
 /// Buffers one shard's rows up to a byte budget, then emits them sorted by the
 /// shard key. See [`ShardSpec::Range`].
@@ -835,7 +916,7 @@ impl RunSorter {
         // Sorting concatenates the keys, so each one is copied once.
         let scratch = key
             .get_array_memory_size()
-            .saturating_add(rows.saturating_mul(RUN_SORT_SCRATCH_BYTES_PER_ROW));
+            .saturating_add(rows.saturating_mul(sort_scratch_bytes_per_row(key.data_type())));
         if self
             .reservation
             .try_grow(bytes.saturating_add(scratch))
@@ -1345,6 +1426,8 @@ mod tests {
     use crate::persistent::sink::finish_file_writer;
     use crate::persistent::sink::get_record_batch_memory_size;
     use crate::persistent::sink::range_partition;
+    use crate::persistent::sink::run_sort_supports;
+    use crate::persistent::sink::sort_scratch_bytes_per_row;
     use crate::persistent::sink::write_record_batch_stream_to_files;
 
     fn split_path(
@@ -3304,6 +3387,104 @@ mod tests {
             .collect()
             .await?;
         assert_eq!(int64_values(&got), (0..1000).map(Some).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[test]
+    fn run_sort_supports_value_types_and_containers_of_them() {
+        let utf8 = Arc::new(Field::new("item", DataType::Utf8, true));
+        let dictionary = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        assert!(run_sort_supports(&DataType::Decimal256(76, 10)));
+        assert!(run_sort_supports(&DataType::List(Arc::clone(&utf8))));
+        assert!(run_sort_supports(&DataType::Struct(
+            vec![Field::new("s", DataType::Utf8View, true)].into()
+        )));
+        assert!(!run_sort_supports(&dictionary));
+        assert!(!run_sort_supports(&DataType::List(Arc::new(Field::new(
+            "item", dictionary, true
+        )))));
+        assert!(!run_sort_supports(&DataType::ListView(utf8)));
+    }
+
+    /// The scratch charged per row must cover the widest pair the sort builds
+    /// for each key type, including `Decimal256`'s 32-byte native.
+    #[test]
+    fn sort_scratch_covers_the_pair_for_each_key_type() {
+        use std::mem::size_of;
+
+        use datafusion::arrow::datatypes::i256;
+
+        let index = size_of::<u32>();
+        for (data_type, pair) in [
+            (DataType::Int64, size_of::<(u32, i64)>()),
+            (DataType::Float64, size_of::<(u32, f64)>()),
+            (DataType::Decimal128(38, 2), size_of::<(u32, i128)>()),
+            (DataType::Decimal256(76, 2), size_of::<(u32, i256)>()),
+            (DataType::Utf8, size_of::<(u32, u32, u64)>()),
+            (DataType::Utf8View, size_of::<(u32, u128)>()),
+            (DataType::FixedSizeBinary(16), size_of::<(u32, &[u8])>()),
+        ] {
+            assert!(
+                sort_scratch_bytes_per_row(&data_type) >= pair + index,
+                "{data_type}: {} bytes per row does not cover a {pair}-byte pair and its index",
+                sort_scratch_bytes_per_row(&data_type)
+            );
+        }
+    }
+
+    /// A dictionary payload column must not fail a range-routed write. Emitting
+    /// a sorted run interleaves its batches, which merges their dictionaries, and
+    /// four batches whose `Int8` dictionaries hold 100 distinct values each put
+    /// about 200 in each range: more than an `Int8` key can address. Such a
+    /// write routes by range and leaves each range unsorted.
+    #[tokio::test]
+    async fn test_range_sharding_with_run_sort_writes_dictionary_payloads() -> anyhow::Result<()> {
+        use datafusion::arrow::array::DictionaryArray;
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::datatypes::Int8Type;
+
+        let ctx = TestSessionContext::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new(
+                "label",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]));
+        let batch = |offset: i64| -> anyhow::Result<RecordBatch> {
+            let keys = Int8Array::from_iter_values((0..100).map(|i| i8::try_from(i).unwrap_or(0)));
+            let values =
+                StringArray::from_iter_values((0..100).map(|i| format!("v{}", offset + i)));
+            let labels = DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values))?;
+            Ok(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(
+                        (0..100).map(|i| (i * 7) % 200),
+                    )),
+                    Arc::new(labels),
+                ],
+            )?)
+        };
+        let batches = vec![batch(0)?, batch(100)?, batch(200)?, batch(300)?];
+
+        let results = run_sharded_write(
+            ctx.store.clone(),
+            Arc::clone(&schema),
+            batches_to_stream(Arc::clone(&schema), batches),
+            None,
+            ShardSpec::Range {
+                expr: Arc::new(Column::new("a", 0)),
+                bounds: vec![ScalarValue::Int64(Some(99))],
+                partitions: 2,
+                run_sort_bytes: Some(1024 * 1024),
+            },
+        )
+        .await?;
+
+        let total_rows: u64 = results.iter().map(|(_, s)| s.row_count()).sum();
+        assert_eq!(total_rows, 400, "no row may be dropped or duplicated");
         Ok(())
     }
 
