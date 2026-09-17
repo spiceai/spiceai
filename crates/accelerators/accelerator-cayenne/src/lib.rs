@@ -4103,17 +4103,18 @@ impl DataAccelerator for CayenneAccelerator {
             // the Cayenne-specific cross-partition insert strategy so that
             // overwrite-mode writes batch every partition's catalog mutation
             // into a single MetastoreTransaction (#10125).
-            let insert_strategy = Arc::new(
-                partitioned_insert_strategy::CayennePartitionedInsertStrategy::new(
-                    Arc::clone(&catalog_concrete),
-                    PathBuf::from(&dir_path),
-                ),
-            );
             let partition_provider =
                 PartitionTableProvider::new(creator, partition_by, Arc::clone(&arrow_schema))
                     .await
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?;
+            let insert_strategy = Arc::new(
+                partitioned_insert_strategy::CayennePartitionedInsertStrategy::new(
+                    Arc::clone(&catalog_concrete),
+                    PathBuf::from(&dir_path),
+                    partition_provider.write_coordinator(),
+                ),
+            );
             let partition_table_providers = partition_provider.partition_table_providers().await;
             insert_strategy
                 .recover_partitioned_wals(&partition_table_providers)
