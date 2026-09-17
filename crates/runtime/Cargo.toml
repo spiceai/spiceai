@@ -234,9 +234,6 @@ aws-credential-types = { workspace = true, features = [
 # SDK). A dev-dependency, so it stays out of the shipped runtime and is exempt from
 # the `restricted_deps` driver-confinement guard.
 aws-sdk-dynamodb.workspace = true
-azure_core = "0.31.0"
-azure_storage = "0.21.0"
-azure_storage_blobs = "0.21.0"
 ballista-core.workspace = true
 bcder = "0.7.4"
 bollard = "0.18.1"

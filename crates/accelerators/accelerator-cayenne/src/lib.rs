@@ -2710,7 +2710,8 @@ impl CayenneAccelerator {
             .with_retention_filters(retention_filters)
             .with_maintained_aggregates(maintained_aggregate_specs)
             .with_durable_write_back(durable_write_back)
-            .with_scan_view_reuse(scan_view_reuse);
+            .with_scan_view_reuse(scan_view_reuse)
+            .with_secondary_indexes(secondary_index_columns(source));
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }
@@ -2874,18 +2875,18 @@ fn validate_datalake_table_options(
         && vc.sort_columns_origin == cayenne::metadata::SortColumnsOrigin::User
     {
         return Err(format!(
-            "Failed to register dataset '{table_name}' (cayenne): `cayenne_cluster_by` cannot be combined with `cayenne_sort_columns`. Remove one of these parameters. Sorting within clusters is not supported yet."
+            "Failed to register dataset '{table_name}' (cayenne): `cayenne_cluster_by` cannot be combined with `cayenne_sort_columns`. Remove one of these parameters. Sorting within clusters is not supported yet. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
         ));
     }
     for column in &vc.cluster_by {
         let Some((_, field)) = options.schema.column_with_name(column) else {
             return Err(format!(
-                "Failed to register dataset '{table_name}' (cayenne): clustering column '{column}' configured in `cayenne_cluster_by` does not exist. Update `cayenne_cluster_by` to use an existing column."
+                "Failed to register dataset '{table_name}' (cayenne): clustering column '{column}' configured in `cayenne_cluster_by` does not exist. Update `cayenne_cluster_by` to use an existing column. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
             ));
         };
         if !cayenne::is_clusterable_type(field.data_type()) {
             return Err(format!(
-                "Failed to register dataset '{table_name}' (cayenne): clustering column '{column}' configured in `cayenne_cluster_by` has unsupported type '{}'. Use a Boolean, numeric (except Decimal256), temporal, string, or binary column, or remove '{column}' from `cayenne_cluster_by`.",
+                "Failed to register dataset '{table_name}' (cayenne): clustering column '{column}' configured in `cayenne_cluster_by` has unsupported type '{}'. Use a Boolean, numeric (except Decimal256), temporal, string, or binary column, or remove '{column}' from `cayenne_cluster_by`. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
                 field.data_type()
             ));
         }
@@ -3040,17 +3041,45 @@ fn memory_mode_retention_warning(table_name: &str) -> String {
     )
 }
 
-/// The warning an acceleration gets when it configures `indexes`.
+/// The column sets of the acceleration's `indexes`, one per entry, in a stable
+/// order: the entries arrive as a map, and a lookup is answered by the first
+/// index whose columns it pins.
+fn secondary_index_columns(source: &dyn AccelerationSource) -> Vec<Vec<String>> {
+    let mut indexes: Vec<Vec<String>> = source
+        .acceleration()
+        .map(|acceleration| {
+            acceleration
+                .indexes
+                .keys()
+                .map(|columns| columns.iter().map(str::to_string).collect())
+                .collect()
+        })
+        .unwrap_or_default();
+    indexes.sort();
+    indexes
+}
+
+/// Whether the acceleration declares an index as `unique`.
+fn declares_unique_index(source: &dyn AccelerationSource) -> bool {
+    source.acceleration().is_some_and(|acceleration| {
+        acceleration.indexes.values().any(|index_type| {
+            matches!(
+                index_type,
+                runtime_acceleration::acceleration::IndexType::Unique
+            )
+        })
+    })
+}
+
+/// The warning an acceleration gets when it declares a `unique` index.
 ///
-/// Every other accelerator turns `indexes` into a real secondary index; Cayenne has
-/// none to create — it prunes from the zone maps and primary-key index it derives from
-/// the data — so the setting reaches the engine and does nothing. A `unique` entry is
-/// the half that matters: on the other engines it constrains writes, and here it does
-/// not, which is the kind of difference an operator has to be told about rather than
-/// discover from duplicate rows.
-fn ignored_indexes_warning(table_name: &str) -> String {
+/// Cayenne builds the index and uses it for lookups, but on the other engines a
+/// `unique` entry also constrains writes, and here it does not — the kind of
+/// difference an operator has to be told about rather than discover from
+/// duplicate rows.
+fn unique_index_warning(table_name: &str) -> String {
     format!(
-        "Dataset '{table_name}' (cayenne): `indexes` is not applied to a Cayenne acceleration, which prunes with the zone maps and primary-key index it builds from the data itself, so a `unique` entry here does not constrain writes and duplicate rows are not rejected. Remove `indexes`, or set `primary_key` with `on_conflict` to deduplicate on a column set. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        "Dataset '{table_name}' (cayenne): a `unique` entry in `indexes` speeds up lookups but does not constrain writes, so duplicate rows are not rejected. Set `primary_key` with `on_conflict` to deduplicate on a column set. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
 }
 
@@ -3879,11 +3908,8 @@ impl DataAccelerator for CayenneAccelerator {
             tracing::warn!("{}", memory_mode_retention_warning(&table_name));
         }
 
-        if source
-            .acceleration()
-            .is_some_and(|acceleration| !acceleration.indexes.is_empty())
-        {
-            tracing::warn!("{}", ignored_indexes_warning(&table_name));
+        if declares_unique_index(source) {
+            tracing::warn!("{}", unique_index_warning(&table_name));
         }
 
         if source.acceleration().is_some_and(|acceleration| {
@@ -4096,24 +4122,26 @@ impl DataAccelerator for CayenneAccelerator {
                 // the dual-write path.
                 .with_background_compaction(Arc::clone(&self.compaction_semaphore))
                 .with_direct_partition_writes()
-                .with_scan_view_reuse(scan_view_reuse_for(source)),
+                .with_scan_view_reuse(scan_view_reuse_for(source))
+                .with_secondary_indexes(secondary_index_columns(source)),
             );
 
             // Wrap the base table provider with partitioning logic, installing
             // the Cayenne-specific cross-partition insert strategy so that
             // overwrite-mode writes batch every partition's catalog mutation
             // into a single MetastoreTransaction (#10125).
-            let insert_strategy = Arc::new(
-                partitioned_insert_strategy::CayennePartitionedInsertStrategy::new(
-                    Arc::clone(&catalog_concrete),
-                    PathBuf::from(&dir_path),
-                ),
-            );
             let partition_provider =
                 PartitionTableProvider::new(creator, partition_by, Arc::clone(&arrow_schema))
                     .await
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?;
+            let insert_strategy = Arc::new(
+                partitioned_insert_strategy::CayennePartitionedInsertStrategy::new(
+                    Arc::clone(&catalog_concrete),
+                    PathBuf::from(&dir_path),
+                    partition_provider.write_coordinator(),
+                ),
+            );
             let partition_table_providers = partition_provider.partition_table_providers().await;
             insert_strategy
                 .recover_partitioned_wals(&partition_table_providers)
@@ -4376,10 +4404,17 @@ impl DataAccelerator for CayenneAccelerator {
             }
         }
 
-        catalog
-            .update_table_schema(&table.table_id, &evolved)
-            .await
-            .boxed()?;
+        if plan.changes_decimal_scale() {
+            catalog
+                .update_table_schema_dropping_statistics(&table.table_id, &evolved)
+                .await
+                .boxed()?;
+        } else {
+            catalog
+                .update_table_schema(&table.table_id, &evolved)
+                .await
+                .boxed()?;
+        }
         tracing::info!(
             dataset = %source.name(),
             "Evolved Cayenne table schema: {}",
@@ -4930,7 +4965,7 @@ mod tests {
     fn ignored_setting_warnings_name_the_dataset_and_link_the_docs() {
         for warning in [
             memory_mode_retention_warning("events"),
-            ignored_indexes_warning("events"),
+            unique_index_warning("events"),
             retention_period_never_reclaimed_warning("events"),
         ] {
             assert!(
@@ -5047,8 +5082,8 @@ mod tests {
     }
 
     #[test]
-    fn ignored_indexes_warning_states_the_impact_and_the_alternative() {
-        let warning = ignored_indexes_warning("events");
+    fn unique_index_warning_states_the_impact_and_the_alternative() {
+        let warning = unique_index_warning("events");
 
         assert!(
             warning.contains("does not constrain writes"),

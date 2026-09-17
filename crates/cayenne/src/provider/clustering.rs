@@ -503,21 +503,33 @@ pub fn cluster_keys(columns: &[ArrayRef], bounds: &[ColumnBounds]) -> DFResult<B
     ))
 }
 
-/// The schema produced by [`append_cluster_key_column`] for `base`: `base` plus
-/// a trailing `Binary` [`CLUSTER_KEY_COLUMN_NAME`] column.
+/// The name for the transient clustering key column of `base`:
+/// [`CLUSTER_KEY_COLUMN_NAME`], numbered when a table column already has that
+/// name. The sort that follows resolves its key by name, so a shared name
+/// would sort by the table's column instead of the key.
 #[must_use]
-pub fn cluster_augmented_schema(base: &Schema) -> SchemaRef {
+pub fn cluster_key_column_name(base: &Schema) -> String {
+    let mut name = CLUSTER_KEY_COLUMN_NAME.to_string();
+    let mut suffix = 0_usize;
+    while base.column_with_name(&name).is_some() {
+        suffix += 1;
+        name = format!("{CLUSTER_KEY_COLUMN_NAME}_{suffix}");
+    }
+    name
+}
+
+/// The schema produced by [`append_cluster_key_column`] for `base`: `base` plus
+/// a trailing `Binary` column named `key_name` (see
+/// [`cluster_key_column_name`]).
+#[must_use]
+pub fn cluster_augmented_schema(base: &Schema, key_name: &str) -> SchemaRef {
     let mut fields: Vec<Arc<Field>> = base.fields().iter().map(Arc::clone).collect();
-    fields.push(Arc::new(Field::new(
-        CLUSTER_KEY_COLUMN_NAME,
-        DataType::Binary,
-        false,
-    )));
+    fields.push(Arc::new(Field::new(key_name, DataType::Binary, false)));
     Arc::new(Schema::new(Fields::from(fields)))
 }
 
-/// Append the clustering key as a trailing `Binary` column
-/// ([`CLUSTER_KEY_COLUMN_NAME`]). Sorting the resulting batches ascending by
+/// Append the clustering key as a trailing `Binary` column named `key_name`
+/// (see [`cluster_key_column_name`]). Sorting the resulting batches ascending by
 /// that column clusters rows along the Hilbert curve over `clustering_indices`
 /// (the proven `SortExec` path is reused via `util::stream_utils::sort_stream`);
 /// the column is stripped right after the sort with
@@ -533,13 +545,14 @@ pub fn append_cluster_key_column(
     batch: &RecordBatch,
     clustering_indices: &[usize],
     bounds: &[ColumnBounds],
+    key_name: &str,
 ) -> DFResult<RecordBatch> {
     let cols: Vec<ArrayRef> = clustering_indices
         .iter()
         .map(|&i| Arc::clone(batch.column(i)))
         .collect();
     let key = Arc::new(cluster_keys(&cols, bounds)?) as ArrayRef;
-    let schema = cluster_augmented_schema(batch.schema_ref());
+    let schema = cluster_augmented_schema(batch.schema_ref(), key_name);
     let mut arrays = batch.columns().to_vec();
     arrays.push(key);
     RecordBatch::try_new(schema, arrays).map_err(DataFusionError::from)
@@ -818,8 +831,9 @@ mod tests {
     /// it silently produced no clustering at all.
     #[test]
     fn decimal_values_cluster() {
-        // Unscaled cents, i.e. Decimal128(10, 2) values 0.00 … 40.95.
-        let unscaled: Vec<i128> = (0..4096i128).collect();
+        // Unscaled cents, i.e. Decimal128(10, 2) values -20.48 … 20.47, in a
+        // scrambled order so an ordering the input already had proves nothing.
+        let unscaled: Vec<i128> = (0..4096i128).map(|i| (i * 1237) % 4096 - 2048).collect();
         let col: ArrayRef = Arc::new(
             Decimal128Array::from(unscaled.clone())
                 .with_precision_and_scale(10, 2)
@@ -830,12 +844,18 @@ mod tests {
             "Decimal128 must be reported as clusterable"
         );
         let bounds = Some((
-            key_from_i128(*unscaled.first().expect("non-empty")),
-            key_from_i128(*unscaled.last().expect("non-empty")),
+            key_from_i128(*unscaled.iter().min().expect("non-empty")),
+            key_from_i128(*unscaled.iter().max().expect("non-empty")),
         ));
         let keys = cluster_keys(&[col], &[bounds]).expect("keys");
-        // Single column: the key must reproduce the decimal ordering exactly.
-        assert_eq!(argsort(&keys), (0..unscaled.len()).collect::<Vec<_>>());
+        // Single column: the key must reproduce the decimal ordering exactly, and
+        // tell every distinct value apart.
+        let mut expected: Vec<usize> = (0..unscaled.len()).collect();
+        expected.sort_by_key(|&row| unscaled[row]);
+        assert_eq!(argsort(&keys), expected);
+        let distinct: std::collections::HashSet<&[u8]> =
+            (0..keys.len()).map(|row| keys.value(row)).collect();
+        assert_eq!(distinct.len(), unscaled.len());
     }
 
     #[test]
@@ -947,7 +967,9 @@ mod tests {
         .expect("batch");
 
         let bounds = vec![i64_bounds(&xs), i64_bounds(&ys)];
-        let augmented = append_cluster_key_column(&batch, &[0, 1], &bounds).expect("append");
+        let augmented =
+            append_cluster_key_column(&batch, &[0, 1], &bounds, &cluster_key_column_name(&schema))
+                .expect("append");
         assert_eq!(augmented.num_columns(), 3);
         assert_eq!(
             augmented.schema().field(2).name(),

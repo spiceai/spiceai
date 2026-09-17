@@ -32,6 +32,7 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::ExprSchemable;
 use datafusion::prelude::{Expr, SessionContext};
 use datafusion::sql::TableReference;
+use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::util::column_reference::ColumnReference;
@@ -89,21 +90,35 @@ pub struct CreateTableParams {
     pub ctx: Option<Arc<SessionContext>>,
 }
 
-/// Validate a Cayenne `CLUSTER BY` clause and return its column names.
+/// Validate a Cayenne `CLUSTER BY` clause and return its column names,
+/// normalized by `normalizer` the way the statement's column definitions were.
+///
+/// A parenthesized column, `CLUSTER BY (id)`, parses as a nested expression and
+/// names that column.
 ///
 /// # Errors
 ///
 /// Returns a planning error when an expression is not a simple column
 /// identifier. Column existence and data-type support are validated against
 /// the transformed table schema during creation.
-pub fn cluster_by_column_names(table_name: &str, expressions: &[SqlExpr]) -> DFResult<Vec<String>> {
+pub fn cluster_by_column_names(
+    table_name: &str,
+    expressions: &[SqlExpr],
+    normalizer: &IdentNormalizer,
+) -> DFResult<Vec<String>> {
     expressions
         .iter()
-        .map(|expression| match expression {
-            SqlExpr::Identifier(identifier) => Ok(identifier.value.clone()),
-            _ => Err(DataFusionError::Plan(format!(
-                "Failed to create table '{table_name}' (cayenne): unsupported clustering expression '{expression}'. `CLUSTER BY` accepts column names only."
-            ))),
+        .map(|expression| {
+            let mut column = expression;
+            while let SqlExpr::Nested(inner) = column {
+                column = inner;
+            }
+            match column {
+                SqlExpr::Identifier(identifier) => Ok(normalizer.normalize(identifier.clone())),
+                _ => Err(DataFusionError::Plan(format!(
+                    "Failed to create table '{table_name}' (cayenne): unsupported clustering expression '{expression}'. `CLUSTER BY` accepts column names only. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+                ))),
+            }
         })
         .collect()
 }

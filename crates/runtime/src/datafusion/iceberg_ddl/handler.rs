@@ -85,7 +85,7 @@ impl CatalogDdlHandler for IcebergDdlHandler {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         if !params.extension.cluster_by.is_empty() {
             return Err(DataFusionError::Plan(format!(
-                "Failed to create table '{}.{}.{}' (iceberg): `CLUSTER BY` is supported only for Cayenne catalogs.",
+                "Failed to create table '{}.{}.{}' (iceberg): `CLUSTER BY` is supported only for Cayenne catalogs. Remove `CLUSTER BY`, or create the table in a Cayenne catalog. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
                 params.catalog_name, params.schema_name, params.table_name
             )));
         }
