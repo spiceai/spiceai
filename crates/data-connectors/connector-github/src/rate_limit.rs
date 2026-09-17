@@ -17,20 +17,75 @@ limitations under the License.
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use data_components::rate_limit::RateLimiter;
+use governor::{
+    Quota, RateLimiter as GovernorRateLimiter,
+    clock::DefaultClock,
+    middleware::NoOpMiddleware,
+    state::{InMemoryState, NotKeyed},
+};
 use reqwest::header::HeaderMap;
-use std::{sync::Arc, time::Duration};
+use std::num::NonZeroU32;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 use tokio::sync::RwLock;
 
-const GITHUB_RATE_LIMIT_BUFFER: i32 = 100;
+/// Fraction of each GitHub rate limit we are willing to consume. The remaining
+/// 10% is buffer against header lag, retries, and other users of the same token.
+pub(crate) const GITHUB_RATE_LIMIT_FILL_NUM: u32 = 9;
+pub(crate) const GITHUB_RATE_LIMIT_FILL_DEN: u32 = 10;
 
-fn primary_rate_limit_buffer(limit: i32) -> i32 {
-    (limit / 20).clamp(1, GITHUB_RATE_LIMIT_BUFFER)
+/// GitHub GraphQL secondary rate limit: 2,000 points per minute. A
+/// non-mutation GraphQL request costs 1 point.
+///
+/// <https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits>
+pub(crate) const GITHUB_GRAPHQL_SECONDARY_POINTS_PER_MINUTE: u32 = 2000;
+pub(crate) const GITHUB_GRAPHQL_SECONDARY_QUERY_POINTS: u32 = 1;
+
+/// GitHub GraphQL secondary CPU budget: 60s of response time per 60s of wall
+/// time. Estimated as the sum of HTTP durations.
+pub(crate) const GITHUB_GRAPHQL_CPU_MS_PER_MINUTE: u32 = 60_000;
+
+const DEFAULT_CPU_RESERVATION_MS: u32 = 1_000;
+
+/// 90% of `limit`, at least 1.
+#[must_use]
+pub(crate) fn fill_limited(limit: u32) -> u32 {
+    let filled = u64::from(limit) * u64::from(GITHUB_RATE_LIMIT_FILL_NUM)
+        / u64::from(GITHUB_RATE_LIMIT_FILL_DEN);
+    u32::try_from(filled).unwrap_or(u32::MAX).max(1)
 }
 
-#[derive(Debug)]
+/// Remaining primary units at which we stop issuing requests (10% of `limit`).
+fn primary_rate_limit_buffer(limit: i32) -> i32 {
+    let limit = u32::try_from(limit.max(0)).unwrap_or(0);
+    let reserved = limit.saturating_sub(fill_limited(limit)).max(1);
+    i32::try_from(reserved).unwrap_or(i32::MAX)
+}
+
+/// GitHub GraphQL secondary points charged for a non-mutation query.
+#[must_use]
+pub(crate) const fn graphql_secondary_query_cost() -> u32 {
+    GITHUB_GRAPHQL_SECONDARY_QUERY_POINTS
+}
+
 pub struct GitHubRateLimiter {
     // Track API response headers rate limits
     api_limit: Arc<RwLock<Option<RateLimitInfo>>>,
+    /// Shared GraphQL CPU-time bucket (90% of GitHub's 60s/min cap).
+    cpu_limiter: Arc<GovernorRateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>,
+    last_cpu_ms: AtomicU32,
+    cpu_burst: u32,
+}
+
+impl std::fmt::Debug for GitHubRateLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitHubRateLimiter")
+            .field("api_limit", &self.api_limit)
+            .field("last_cpu_ms", &self.last_cpu_ms.load(Ordering::Relaxed))
+            .field("cpu_burst", &self.cpu_burst)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -119,9 +174,24 @@ impl RateLimitInfo {
 
 impl GitHubRateLimiter {
     pub fn new() -> Self {
+        let cpu_burst = fill_limited(GITHUB_GRAPHQL_CPU_MS_PER_MINUTE);
+        let cpu_quota = Quota::per_minute(NonZeroU32::new(cpu_burst).unwrap_or(NonZeroU32::MIN));
         Self {
             api_limit: Arc::new(RwLock::new(None)),
+            cpu_limiter: Arc::new(GovernorRateLimiter::direct(cpu_quota)),
+            last_cpu_ms: AtomicU32::new(DEFAULT_CPU_RESERVATION_MS),
+            cpu_burst,
         }
+    }
+
+    async fn acquire_cpu_ms(&self, requested_ms: u32) {
+        let cpu_ms = requested_ms.clamp(1, self.cpu_burst);
+        let Some(weight) = NonZeroU32::new(cpu_ms) else {
+            return;
+        };
+        // Weight is clamped to the burst, so this only fails if the limiter
+        // cannot represent the reservation — skip rather than stall forever.
+        let _ = self.cpu_limiter.until_n_ready(weight).await;
     }
 }
 
@@ -201,7 +271,17 @@ impl RateLimiter for GitHubRateLimiter {
             }
         }
 
+        // Pre-pay the last observed HTTP duration against GitHub's GraphQL CPU
+        // budget so concurrent scans share one 90%-fill token bucket.
+        let reserved_ms = self.last_cpu_ms.load(Ordering::Relaxed);
+        self.acquire_cpu_ms(reserved_ms).await;
+
         Ok(())
+    }
+
+    async fn record_request_duration(&self, elapsed: Duration) {
+        let ms = u32::try_from(elapsed.as_millis().min(u128::from(u32::MAX))).unwrap_or(u32::MAX);
+        self.last_cpu_ms.store(ms.max(1), Ordering::Relaxed);
     }
 }
 
@@ -353,6 +433,64 @@ mod tests {
             }
             _ => panic!("Expected Secondary rate limit info"),
         }
+    }
+
+    #[test]
+    fn fill_limited_is_ninety_percent() {
+        assert_eq!(fill_limited(2000), 1800);
+        assert_eq!(fill_limited(60_000), 54_000);
+        assert_eq!(fill_limited(5000), 4500);
+        assert_eq!(fill_limited(1), 1);
+    }
+
+    #[test]
+    fn primary_buffer_is_ten_percent() {
+        assert_eq!(primary_rate_limit_buffer(5000), 500);
+        assert_eq!(primary_rate_limit_buffer(60), 6);
+    }
+
+    #[tokio::test]
+    async fn primary_limit_waits_at_ten_percent_remaining() {
+        let rate_limiter = GitHubRateLimiter::new();
+        let headers = create_test_headers(HashMap::from([
+            ("x-ratelimit-limit", s("5000")),
+            ("x-ratelimit-remaining", s("500")),
+            ("x-ratelimit-used", s("4500")),
+            (
+                "x-ratelimit-reset",
+                (Utc::now() + Duration::hours(1)).timestamp().to_string(),
+            ),
+            ("x-ratelimit-resource", s("graphql")),
+        ]));
+        rate_limiter.update_from_headers(&headers).await;
+
+        let mut wait = std::pin::pin!(rate_limiter.check_rate_limit());
+        assert!(
+            poll!(&mut wait).is_pending(),
+            "a 10% remaining primary quota must wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_limit_does_not_wait_above_ten_percent_remaining() {
+        let rate_limiter = GitHubRateLimiter::new();
+        let headers = create_test_headers(HashMap::from([
+            ("x-ratelimit-limit", s("5000")),
+            ("x-ratelimit-remaining", s("501")),
+            ("x-ratelimit-used", s("4499")),
+            (
+                "x-ratelimit-reset",
+                (Utc::now() + Duration::hours(1)).timestamp().to_string(),
+            ),
+            ("x-ratelimit-resource", s("graphql")),
+        ]));
+        rate_limiter.update_from_headers(&headers).await;
+
+        rate_limiter
+            .check_rate_limit()
+            .now_or_never()
+            .expect("remaining above the 10% buffer must not wait")
+            .expect("rate limit check failed");
     }
 
     #[test]

@@ -21,13 +21,18 @@ limitations under the License.
 //! table therefore pages over the parent and fans the parent's nested connection
 //! out into one row per child node.
 //!
-//! GitHub caps a connection page at 100 nodes and a query cannot paginate a
-//! nested connection, so a parent with more children than the page size would
-//! be truncated. Truncation would drop whole rows, and a dropped row is
+//! GitHub caps a nested connection page at 100 nodes. The parent list query
+//! cannot page that inner connection, so a parent with more children than 100
+//! would be truncated. Truncation would drop whole rows, and a dropped row is
 //! invisible: `COUNT(*)` comes back short with nothing to say it is short, and
-//! an accelerated refresh persists that answer. Every fan-out therefore reads
-//! the connection's `totalCount` and fails the scan by name rather than
-//! returning a partial set.
+//! an accelerated refresh persists that answer.
+//!
+//! When the inner page carries `pageInfo.hasNextPage` and an `endCursor`, the
+//! GraphQL client fetches the rest via `node(id:)` follow-up pages. A follow-up
+//! page's `totalCount` is still the full connection, so a last page with fewer
+//! nodes than `totalCount` is complete when `hasNextPage` is false. When there
+//! is no way to continue, fan-out fails the scan by name rather than returning
+//! a partial set.
 
 use crate::identity::insert_identity;
 use connector_graphql::graphql::{Error, Result};
@@ -85,9 +90,9 @@ pub(crate) fn flatten_member(object: &mut Map<String, Value>, key: &str, field: 
 ///
 /// # Errors
 ///
-/// Returns an error when GitHub reports more children than the single
-/// un-paginated page returned. The alternative is emitting a partial row set,
-/// which no query could tell apart from a complete one.
+/// Returns an error when GitHub reported more children than this page returned
+/// and there is no cursor to fetch the rest. The alternative is emitting a
+/// partial row set, which no query could tell apart from a complete one.
 pub(crate) fn fan_out<F>(
     parent: &Value,
     spec: &NestedConnection<'_>,
@@ -122,7 +127,7 @@ where
         });
 
     ensure_complete(
-        connection.get("totalCount").and_then(Value::as_i64),
+        connection,
         nodes.len(),
         spec,
         owner,
@@ -151,25 +156,65 @@ where
     Ok(rows)
 }
 
-/// Fails, naming the parent, when GitHub reported more children than the single
-/// un-paginated page returned. Emitting the partial set instead would make every
-/// aggregate over it quietly wrong.
+/// Fails, naming the parent, when this page is truncated and cannot continue.
+///
+/// `totalCount` is the full connection, not this page. A follow-up last page
+/// therefore has `returned < totalCount` even when it is complete — GitHub's
+/// `pageInfo.hasNextPage` is the signal that more pages exist. When `pageInfo`
+/// is absent, fall back to comparing `totalCount` against this page's nodes.
 fn ensure_complete(
-    total_count: Option<i64>,
+    connection: &Value,
     returned: usize,
     spec: &NestedConnection<'_>,
     owner: &str,
     repo: &str,
     parent_id: Option<&Value>,
 ) -> Result<()> {
-    let Some(total_count) = total_count else {
-        return Ok(());
-    };
+    let has_next = connection
+        .pointer("/pageInfo/hasNextPage")
+        .and_then(Value::as_bool);
+    let has_cursor = connection
+        .pointer("/pageInfo/endCursor")
+        .and_then(Value::as_str)
+        .is_some_and(|cursor| !cursor.is_empty());
 
-    let returned_count = i64::try_from(returned).unwrap_or(i64::MAX);
-    if total_count <= returned_count {
+    // `totalCount` is the full connection. A last follow-up page is complete
+    // when GitHub says there is no next page, even if this page is short.
+    if has_next == Some(false) || (has_next == Some(true) && has_cursor) {
         return Ok(());
     }
+
+    if has_next.is_none() {
+        let Some(total_count) = connection.get("totalCount").and_then(Value::as_i64) else {
+            return Ok(());
+        };
+        let returned_count = i64::try_from(returned).unwrap_or(i64::MAX);
+        if total_count <= returned_count {
+            return Ok(());
+        }
+    }
+
+    Err(truncated_connection_error(
+        connection, returned, spec, owner, repo, parent_id,
+    ))
+}
+
+fn truncated_connection_error(
+    connection: &Value,
+    returned: usize,
+    spec: &NestedConnection<'_>,
+    owner: &str,
+    repo: &str,
+    parent_id: Option<&Value>,
+) -> Error {
+    let returned_count = i64::try_from(returned).unwrap_or(i64::MAX);
+    let count_clause = connection
+        .get("totalCount")
+        .and_then(Value::as_i64)
+        .map_or_else(
+            || format!("GitHub returned {returned_count} and reported another page"),
+            |total_count| format!("GitHub returned {returned_count} of {total_count}"),
+        );
 
     let parent_id = parent_id.map_or_else(
         || "unknown".to_string(),
@@ -181,11 +226,11 @@ fn ensure_complete(
 
     let parent_label = spec.parent_label;
     let child_label = spec.child_label;
-    Err(Error::InvalidObjectAccess {
+    Error::InvalidObjectAccess {
         message: format!(
-            "Failed to read the {child_label} of {parent_label} '{parent_id}' ({owner}/{repo}): GitHub returned {returned_count} of {total_count} and caps a nested connection at one page, so the rest are unreachable. Returning the {returned_count} would leave every count over that {parent_label} short with no way to tell. This is a limit of GitHub's API, not of the dataset's configuration; follow https://github.com/spiceai/spiceai/issues/13458 for nested pagination. See: https://spiceai.org/docs/components/data-connectors/github"
+            "Failed to read the {child_label} of {parent_label} '{parent_id}' ({owner}/{repo}): {count_clause} and caps a nested connection at one page, so the rest are unreachable. Returning the {returned_count} would leave every count over that {parent_label} short with no way to tell. This is a limit of GitHub's API, not of the dataset's configuration; follow https://github.com/spiceai/spiceai/issues/13458 for nested pagination. See: https://spiceai.org/docs/components/data-connectors/github"
         ),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -268,9 +313,9 @@ mod tests {
 
     #[test]
     fn fan_out_fails_rather_than_emitting_a_truncated_page() {
-        // A dropped row is invisible: `COUNT(*)` comes back short with nothing to
-        // say it is short, and an accelerated refresh persists that answer. The
-        // scan has to fail instead.
+        // Without a cursor the rest of the connection is unreachable. A dropped
+        // row is invisible: `COUNT(*)` comes back short with nothing to say it
+        // is short. The scan has to fail instead.
         let truncated = json!({
             "pull_request_id": "PR_1",
             "pull_request_number": 42,
@@ -288,6 +333,86 @@ mod tests {
         assert!(
             message.contains("42") && message.contains("spiceai/spiceai"),
             "the error must name the pull request it came from, got: {message}"
+        );
+    }
+
+    #[test]
+    fn fan_out_emits_the_first_page_when_a_cursor_can_continue_it() {
+        let truncated = json!({
+            "pull_request_id": "PR_1",
+            "pull_request_number": 42,
+            "reviews": {
+                "totalCount": 110,
+                "pageInfo": {"hasNextPage": true, "endCursor": "cursor-1"},
+                "nodes": [{"id": "R_1"}]
+            }
+        });
+
+        let rows = fan_out(&truncated, &REVIEWS, "spiceai", "spiceai", |_| {})
+            .expect("a continuable page must not fail the scan");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], json!("R_1"));
+    }
+
+    #[test]
+    fn fan_out_emits_a_last_page_whose_total_count_covers_prior_pages() {
+        // Follow-up pages still carry the connection's totalCount (110), not
+        // the remaining count. hasNextPage false means this cursor is done.
+        let last_page = json!({
+            "pull_request_id": "PR_1",
+            "pull_request_number": 10473,
+            "reviews": {
+                "totalCount": 110,
+                "pageInfo": {"hasNextPage": false, "endCursor": "cursor-2"},
+                "nodes": [{"id": "R_101"}]
+            }
+        });
+
+        let rows = fan_out(&last_page, &REVIEWS, "spiceai", "spiceai", |_| {})
+            .expect("a last follow-up page must not fail the scan");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], json!("R_101"));
+        assert_eq!(rows[0]["pull_request_number"], json!(10473));
+    }
+
+    #[test]
+    fn fan_out_emits_a_full_last_page_when_total_count_spans_prior_pages() {
+        // 200 reviews in two 100-node pages: the last page is full and
+        // hasNextPage is false. Failing that page would retry the whole scan.
+        let nodes: Vec<Value> = (0..100).map(|i| json!({"id": format!("R_{i}")})).collect();
+        let last_page = json!({
+            "pull_request_id": "PR_1",
+            "pull_request_number": 42,
+            "reviews": {
+                "totalCount": 200,
+                "pageInfo": {"hasNextPage": false, "endCursor": "cursor-2"},
+                "nodes": nodes
+            }
+        });
+
+        let rows = fan_out(&last_page, &REVIEWS, "spiceai", "spiceai", |_| {})
+            .expect("a full last page is complete");
+        assert_eq!(rows.len(), 100);
+    }
+
+    #[test]
+    fn fan_out_fails_when_another_page_has_no_cursor() {
+        let truncated = json!({
+            "pull_request_id": "PR_1",
+            "pull_request_number": 42,
+            "reviews": {
+                "totalCount": 110,
+                "pageInfo": {"hasNextPage": true, "endCursor": null},
+                "nodes": [{"id": "R_1"}]
+            }
+        });
+
+        let error = fan_out(&truncated, &REVIEWS, "spiceai", "spiceai", |_| {})
+            .expect_err("a truncated page without a cursor must fail the scan");
+        let message = error.to_string();
+        assert!(
+            message.contains("110") && message.contains("reviews"),
+            "the error must say how many were unreachable, got: {message}"
         );
     }
 

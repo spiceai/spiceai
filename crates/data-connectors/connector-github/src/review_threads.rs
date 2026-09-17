@@ -26,7 +26,10 @@ limitations under the License.
 use crate::identity::push_identity_fields;
 use crate::nested_connection::{NestedConnection, fan_out, flatten_login, flatten_member};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use connector_graphql::graphql::{ErrorChecker, GraphQLContext, Result, client::UnnestBehavior};
+use connector_graphql::graphql::{
+    ErrorChecker, GraphQLContext, Result,
+    client::{NestedConnectionPager, UnnestBehavior},
+};
 use data_connector_api::ConnectorComponent;
 use serde_json::Value;
 use std::sync::Arc;
@@ -55,10 +58,21 @@ const REVIEW_THREADS_CONNECTION: NestedConnection<'static> = NestedConnection {
 const PULL_REQUESTS_PAGE_SIZE: u32 = 50;
 
 /// Review threads fetched per pull request. 100 is GitHub's per-connection
-/// maximum and a nested connection cannot be paginated, so a pull request with
-/// more threads than this has threads the scan cannot reach, so the fan-out
-/// fails by name rather than returning a partial set.
+/// maximum. Remaining threads are loaded via `node(id:)` follow-up pages.
 const THREADS_PER_PULL_REQUEST: u32 = 100;
+
+const REVIEW_THREAD_NODE_SELECTION: &str = r"
+    id
+    path
+    line
+    is_resolved: isResolved
+    is_outdated: isOutdated
+    is_collapsed: isCollapsed
+    start_line: startLine
+    diff_side: diffSide
+    resolved_by: resolvedBy { login }
+    comments { totalCount }
+";
 
 // https://docs.github.com/en/graphql/reference/objects#pullrequestreviewthread
 #[derive(Debug)]
@@ -80,10 +94,7 @@ impl GraphQLContext for ReviewThreadsTableArgs {
     }
 
     fn query_cost(&self) -> Option<u32> {
-        // 1 (pullRequests) + 100 (reviewThreads per pull request) + the count-only
-        // `comments` connection, which opens once per thread.
-        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
-        Some(1 + THREADS_PER_PULL_REQUEST + THREADS_PER_PULL_REQUEST)
+        Some(crate::rate_limit::graphql_secondary_query_cost())
     }
 }
 
@@ -110,17 +121,12 @@ impl GitHubTableArgs for ReviewThreadsTableArgs {
                             {pull_request_number}: number
                             reviewThreads(first: {threads_per_pull_request}) {{
                                 totalCount
+                                pageInfo {{
+                                    hasNextPage
+                                    endCursor
+                                }}
                                 nodes {{
-                                    id
-                                    path
-                                    line
-                                    is_resolved: isResolved
-                                    is_outdated: isOutdated
-                                    is_collapsed: isCollapsed
-                                    start_line: startLine
-                                    diff_side: diffSide
-                                    resolved_by: resolvedBy {{ login }}
-                                    comments {{ totalCount }}
+                                    {thread_node_selection}
                                 }}
                             }}
                         }}
@@ -133,6 +139,7 @@ impl GitHubTableArgs for ReviewThreadsTableArgs {
             threads_per_pull_request = THREADS_PER_PULL_REQUEST,
             pull_request_id = PULL_REQUEST_ID_KEY,
             pull_request_number = PULL_REQUEST_NUMBER_KEY,
+            thread_node_selection = REVIEW_THREAD_NODE_SELECTION,
         );
 
         let owner = self.owner.clone();
@@ -155,6 +162,13 @@ impl GitHubTableArgs for ReviewThreadsTableArgs {
             })),
             Some(gql_schema()),
         )
+        .with_nested_pager(NestedConnectionPager {
+            connection_key: "reviewThreads".to_string(),
+            parent_id_key: PULL_REQUEST_ID_KEY.to_string(),
+            type_condition: "PullRequest".to_string(),
+            node_selection: REVIEW_THREAD_NODE_SELECTION.to_string(),
+            page_size: THREADS_PER_PULL_REQUEST,
+        })
     }
 }
 
@@ -181,7 +195,7 @@ fn gql_schema() -> SchemaRef {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReviewThreadsTableArgs, THREADS_PER_PULL_REQUEST, gql_schema};
+    use super::{ReviewThreadsTableArgs, gql_schema};
     use crate::GitHubTableArgs;
     use crate::test_util::shared_component;
     use connector_graphql::graphql::GraphQLContext;
@@ -230,6 +244,25 @@ mod tests {
                 ]
             }
         })
+    }
+
+    #[test]
+    fn query_requests_page_info_so_overflow_threads_can_be_paginated() {
+        let params = args().get_graphql_values();
+        let query = params.query.to_string();
+        let threads = query
+            .split("reviewThreads(first:")
+            .nth(1)
+            .expect("reviewThreads connection");
+
+        assert!(
+            threads.contains("hasNextPage") && threads.contains("endCursor"),
+            "reviewThreads connection must request pageInfo, got:\n{query}"
+        );
+        assert!(
+            params.nested_pager.is_some(),
+            "review_threads must page overflow via node(id:)"
+        );
     }
 
     #[test]
@@ -298,15 +331,9 @@ mod tests {
         let cost = args()
             .query_cost()
             .expect("review_threads to declare a query cost");
-        // 1 pullRequests + 100 reviewThreads + one count-only `comments`
-        // connection per thread.
         assert_eq!(
             cost,
-            1 + THREADS_PER_PULL_REQUEST + THREADS_PER_PULL_REQUEST
-        );
-        assert!(
-            cost <= 2000,
-            "review_threads query cost {cost} exceeds the burst"
+            crate::rate_limit::GITHUB_GRAPHQL_SECONDARY_QUERY_POINTS
         );
     }
 }

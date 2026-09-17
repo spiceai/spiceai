@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use app::AppBuilder;
 
@@ -25,7 +25,9 @@ use arrow::array::{Array, BooleanArray, Int64Array, ListArray, RecordBatch, Stri
 use datafusion::common::test_util::batches_to_string;
 use futures::TryStreamExt;
 use runtime::Runtime;
-use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
+use spicepod::{
+    acceleration::Acceleration, component::dataset::Dataset, param::Params as DatasetParams,
+};
 
 use crate::{
     configure_test_datafusion, init_tracing,
@@ -36,6 +38,11 @@ use crate::{
 };
 
 const GITHUB_OPERATION_TIMEOUT: Duration = Duration::from_mins(3);
+
+/// Deadline for a full `spiceai/spiceai` pull-request history scan. GitHub's
+/// GraphQL secondary rate limit (~2 comment-heavy pages per minute) makes an
+/// unbounded load a multi-hour operation.
+const GITHUB_FULL_HISTORY_TIMEOUT: Duration = Duration::from_hours(8);
 
 /// A deadline bounds an unavailable external service without asserting its speed.
 async fn run_query_and_check_results<F>(
@@ -57,26 +64,71 @@ where
 }
 
 async fn load_github_datasets(rt: &Runtime) -> Result<(), String> {
-    tokio::time::timeout(
-        GITHUB_OPERATION_TIMEOUT,
-        Arc::new(rt.clone()).load_components(),
-    )
-    .await
-    .map_err(|_| {
-        let mut statuses = rt
-            .status()
-            .get_dataset_statuses()
-            .into_iter()
-            .map(|(dataset, status)| format!("{dataset}={status:?}"))
-            .collect::<Vec<_>>();
-        statuses.sort();
-        format!(
-            "GitHub datasets did not load within {GITHUB_OPERATION_TIMEOUT:?}: {}",
-            statuses.join(", ")
-        )
-    })?;
-    runtime_ready_check_with_timeout(rt, GITHUB_OPERATION_TIMEOUT).await;
+    load_github_datasets_with_timeout(rt, GITHUB_OPERATION_TIMEOUT).await
+}
+
+async fn load_github_datasets_with_timeout(rt: &Runtime, timeout: Duration) -> Result<(), String> {
+    tokio::time::timeout(timeout, Arc::new(rt.clone()).load_components())
+        .await
+        .map_err(|_| {
+            let mut statuses = rt
+                .status()
+                .get_dataset_statuses()
+                .into_iter()
+                .map(|(dataset, status)| format!("{dataset}={status:?}"))
+                .collect::<Vec<_>>();
+            statuses.sort();
+            format!(
+                "GitHub datasets did not load within {timeout:?}: {}",
+                statuses.join(", ")
+            )
+        })?;
+    runtime_ready_check_with_timeout(rt, timeout).await;
     Ok(())
+}
+
+/// Runs `query` and collects the record batches, without an `EXPLAIN` preflight.
+async fn collect_github_query(rt: &Runtime, query: &str) -> Result<Vec<RecordBatch>, String> {
+    tokio::time::timeout(GITHUB_OPERATION_TIMEOUT, async {
+        rt.datafusion()
+            .query_builder(query)
+            .build()
+            .run()
+            .await
+            .map_err(|e| format!("query `{query}` failed to run: {e}"))?
+            .data
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .map_err(|e| format!("query `{query}` to results: {e}"))
+    })
+    .await
+    .map_err(|_| format!("GitHub query exceeded {GITHUB_OPERATION_TIMEOUT:?}: {query}"))?
+}
+
+fn row_count(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+fn count_star(batches: &[RecordBatch]) -> i64 {
+    assert_eq!(row_count(batches), 1, "COUNT(*) should return one row");
+    let counts = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("COUNT(*) should be Int64");
+    assert!(!counts.is_null(0), "COUNT(*) should not be null");
+    counts.value(0)
+}
+
+/// Materialize the full GitHub table in `Arrow` so the scan runs once at
+/// dataset load, in parallel with every other accelerated GitHub table.
+fn with_arrow_acceleration(mut dataset: Dataset) -> Dataset {
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("arrow".to_string()),
+        ..Acceleration::default()
+    });
+    dataset
 }
 
 enum GithubDatasetType {
@@ -2341,6 +2393,426 @@ async fn test_github_app_issues() -> Result<(), String> {
                     }
                     assert!(row_count > 0, "expected at least 1 row, got {row_count}");
                 })),
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+fn spiceai_full_history_concurrency() -> HashMap<String, String> {
+    HashMap::from([("max_concurrent_requests".to_string(), "10".to_string())])
+}
+
+/// Every pull request, with discussion and review comments attached.
+fn spiceai_pulls_with_comments_dataset() -> Dataset {
+    let mut params = spiceai_full_history_concurrency();
+    params.insert("github_include_comments".to_string(), "all".to_string());
+    params.insert("github_max_comments_fetched".to_string(), "25".to_string());
+    with_arrow_acceleration(make_github_dataset(
+        &repo_dataset("pulls"),
+        "auto",
+        Some(params),
+    ))
+}
+
+fn spiceai_reviews_dataset() -> Dataset {
+    with_arrow_acceleration(make_github_dataset(
+        &repo_dataset("reviews"),
+        "auto",
+        Some(spiceai_full_history_concurrency()),
+    ))
+}
+
+fn spiceai_issues_dataset() -> Dataset {
+    with_arrow_acceleration(make_github_dataset(
+        &repo_dataset("issues"),
+        "auto",
+        Some(spiceai_full_history_concurrency()),
+    ))
+}
+
+struct SpiceaiGitHubTotals {
+    pull_requests: i64,
+    issues: i64,
+}
+
+/// Live `totalCount` from GitHub GraphQL. A hardcoded floor (10_000 pulls,
+/// 1_000 issues) is wrong in both directions: spiceai/spiceai currently has
+/// fewer than 10_000 pull requests, so a complete load would fail that floor,
+/// and a floor below the real total would pass a truncated scan.
+async fn spiceai_github_totals() -> Result<SpiceaiGitHubTotals, String> {
+    let token = std::env::var("GITHUB_TOKEN")
+        .map_err(|err| format!("GITHUB_TOKEN is required for a full-history load: {err}"))?;
+    let client = reqwest::Client::builder()
+        .user_agent("spice-github-integration-test")
+        .build()
+        .map_err(|err| format!("GitHub totals client: {err}"))?;
+    let response = client
+        .post("https://api.github.com/graphql")
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "query": "{ repository(owner: \"spiceai\", name: \"spiceai\") { pullRequests { totalCount } issues { totalCount } } }"
+        }))
+        .send()
+        .await
+        .map_err(|err| format!("GitHub totals query failed: {err}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|err| format!("GitHub totals response: {err}"))?;
+    if !status.is_success() {
+        return Err(format!("GitHub totals query HTTP {status}: {body}"));
+    }
+    let pull_requests = body
+        .pointer("/data/repository/pullRequests/totalCount")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| format!("missing pullRequests.totalCount in {body}"))?;
+    let issues = body
+        .pointer("/data/repository/issues/totalCount")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| format!("missing issues.totalCount in {body}"))?;
+    Ok(SpiceaiGitHubTotals {
+        pull_requests,
+        issues,
+    })
+}
+
+/// GitHub's `totalCount` can move during a multi-hour scan: pull requests and
+/// issues are opened, closed, transferred, or deleted. A complete scan's row
+/// count must sit between the totals observed just before load and just after,
+/// in either order, so a create or a delete does not fail a full history.
+fn github_count_in_scan_window(loaded: i64, before: i64, after: i64) -> bool {
+    let lo = before.min(after);
+    let hi = before.max(after);
+    loaded >= lo && loaded <= hi
+}
+
+fn assert_count_matches_github(loaded: i64, before: i64, after: i64, resource: &str) {
+    assert!(
+        github_count_in_scan_window(loaded, before, after),
+        "expected the spiceai/spiceai {resource} count to sit between GitHub's totals at start ({before}) and end ({after}); got {loaded}"
+    );
+}
+
+#[test]
+fn github_count_window_allows_creates_and_deletes_during_the_scan() {
+    assert!(github_count_in_scan_window(9818, 9818, 9818));
+    assert!(github_count_in_scan_window(9818, 9818, 9820));
+    assert!(github_count_in_scan_window(9820, 9818, 9820));
+    assert!(github_count_in_scan_window(9818, 9818, 9816));
+    assert!(github_count_in_scan_window(9816, 9818, 9816));
+    assert!(!github_count_in_scan_window(5000, 9818, 9820));
+    assert!(!github_count_in_scan_window(10_000, 9818, 9820));
+}
+
+async fn assert_all_pulls_reviews_and_comments(
+    rt: &Runtime,
+    pulls_before: i64,
+    pulls_after: i64,
+) -> Result<(), String> {
+    let (
+        pulls_count_batches,
+        reviews_count_batches,
+        reviews_sum_batches,
+        pulls_schema,
+        pulls_comment_sample,
+        pulls_batches,
+        reviews_batches,
+    ) = tokio::try_join!(
+        collect_github_query(rt, "SELECT COUNT(*) FROM spiceai_pulls_auto"),
+        collect_github_query(rt, "SELECT COUNT(*) FROM spiceai_reviews_auto"),
+        collect_github_query(
+            rt,
+            "SELECT CAST(SUM(reviews_count) AS BIGINT) FROM spiceai_pulls_auto",
+        ),
+        collect_github_query(rt, "DESCRIBE spiceai_pulls_auto"),
+        collect_github_query(
+            rt,
+            "SELECT discussion, review_comments FROM spiceai_pulls_auto LIMIT 1"
+        ),
+        collect_github_query(
+            rt,
+            "SELECT number, comments_count, reviews_count, owner, repo FROM spiceai_pulls_auto"
+        ),
+        collect_github_query(
+            rt,
+            "SELECT author, state, pull_request_number, owner, repo FROM spiceai_reviews_auto"
+        ),
+    )?;
+
+    let pulls_count = count_star(&pulls_count_batches);
+    let reviews_count = count_star(&reviews_count_batches);
+    let reviews_on_pulls = count_star(&reviews_sum_batches);
+    eprintln!(
+        "spiceai/spiceai pulls={pulls_count} (GitHub {pulls_before}..{pulls_after}) reviews={reviews_count} sum(pulls.reviews_count)={reviews_on_pulls}"
+    );
+
+    assert_count_matches_github(pulls_count, pulls_before, pulls_after, "pull request");
+    assert_eq!(
+        i64::try_from(row_count(&pulls_batches)).expect("pull row count fits i64"),
+        pulls_count,
+        "pull rows should match COUNT(*)"
+    );
+    assert_column_is_constant(&pulls_batches, "owner", "spiceai");
+    assert_column_is_constant(&pulls_batches, "repo", "spiceai");
+
+    let schema_text = batches_to_string(&pulls_schema);
+    assert!(
+        schema_text.contains("discussion"),
+        "pulls schema should include discussion comments: {schema_text}"
+    );
+    assert!(
+        schema_text.contains("review_comments"),
+        "pulls schema should include review comments: {schema_text}"
+    );
+    for batch in &pulls_comment_sample {
+        let discussion = batch
+            .schema()
+            .index_of("discussion")
+            .expect("pulls should carry a 'discussion' column when comments=all");
+        let review_comments = batch
+            .schema()
+            .index_of("review_comments")
+            .expect("pulls should carry a 'review_comments' column when comments=all");
+        assert!(
+            batch
+                .column(discussion)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .is_some(),
+            "'discussion' should be a ListArray of comment structs"
+        );
+        assert!(
+            batch
+                .column(review_comments)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .is_some(),
+            "'review_comments' should be a ListArray of comment structs"
+        );
+    }
+
+    assert!(
+        reviews_count > 0,
+        "expected review rows on spiceai/spiceai, got {reviews_count}"
+    );
+    assert_eq!(
+        reviews_count, reviews_on_pulls,
+        "reviews table must contain every review counted on the pulls table; got {reviews_count} rows vs SUM(reviews_count)={reviews_on_pulls}"
+    );
+    assert_eq!(
+        i64::try_from(row_count(&reviews_batches)).expect("review row count fits i64"),
+        reviews_count,
+        "review rows should match COUNT(*)"
+    );
+    for batch in &reviews_batches {
+        let index = batch
+            .schema()
+            .index_of("state")
+            .expect("reviews should carry a 'state' column");
+        let states = batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("'state' should be a StringArray");
+        for row in 0..states.len() {
+            assert!(
+                matches!(
+                    states.value(row),
+                    "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED" | "DISMISSED" | "PENDING"
+                ),
+                "unexpected review state {:?}",
+                states.value(row)
+            );
+        }
+    }
+    assert_column_is_constant(&reviews_batches, "owner", "spiceai");
+    assert_column_is_constant(&reviews_batches, "repo", "spiceai");
+    Ok(())
+}
+
+/// Loads every `github.com/spiceai/spiceai` pull request with comments, and
+/// every review, in parallel. There is no row limit: `Arrow` acceleration
+/// scans the GitHub history until GitHub reports no further pages.
+///
+/// Ignored in CI: the GitHub connector job's deadline cannot cover an
+/// unbounded GraphQL history scan. Run with `--ignored`.
+#[ignore = "scans every spiceai/spiceai pull request, comment, and review from GitHub; run with --ignored"]
+#[tokio::test]
+async fn test_github_spiceai_pulls_with_comments_and_reviews() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    if !repo_github_secret_available("test_github_spiceai_pulls_with_comments_and_reviews").await {
+        return Ok(());
+    }
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let totals_before = spiceai_github_totals().await?;
+            let app = AppBuilder::new("github_spiceai_pulls_comments_reviews")
+                .with_dataset(spiceai_pulls_with_comments_dataset())
+                .with_dataset(spiceai_reviews_dataset())
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let started = Instant::now();
+            load_github_datasets_with_timeout(&rt, GITHUB_FULL_HISTORY_TIMEOUT).await?;
+            let load_elapsed = started.elapsed();
+            let totals_after = spiceai_github_totals().await?;
+
+            let task_history = collect_github_query(
+                &rt,
+                r#"SELECT "task", execution_duration_ms, error_message FROM runtime.task_history ORDER BY start_time"#,
+            )
+            .await?;
+            eprintln!("loaded spiceai/spiceai pulls+reviews in {load_elapsed:?}");
+            eprintln!("task_history:\n{}", batches_to_string(&task_history));
+
+            assert_all_pulls_reviews_and_comments(
+                &rt,
+                totals_before.pull_requests,
+                totals_after.pull_requests,
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+/// Loads every `github.com/spiceai/spiceai` issue with comments, and every
+/// pull request, review, and pull-request comment, in parallel. There is no
+/// row limit: `Arrow` acceleration scans the GitHub history until GitHub
+/// reports no further pages.
+///
+/// Ignored in CI: the GitHub connector job's deadline cannot cover an
+/// unbounded GraphQL history scan. Run with `--ignored`.
+#[ignore = "scans every spiceai/spiceai issue, pull request, comment, and review from GitHub; run with --ignored"]
+#[tokio::test]
+async fn test_github_spiceai_issues() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    if !repo_github_secret_available("test_github_spiceai_issues").await {
+        return Ok(());
+    }
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let totals_before = spiceai_github_totals().await?;
+            let app = AppBuilder::new("github_spiceai_issues")
+                .with_dataset(spiceai_pulls_with_comments_dataset())
+                .with_dataset(spiceai_reviews_dataset())
+                .with_dataset(spiceai_issues_dataset())
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let started = Instant::now();
+            load_github_datasets_with_timeout(&rt, GITHUB_FULL_HISTORY_TIMEOUT).await?;
+            let load_elapsed = started.elapsed();
+            let totals_after = spiceai_github_totals().await?;
+
+            let (
+                count_batches,
+                schema_batches,
+                comment_sample,
+                issue_batches,
+                task_history,
+            ) = tokio::try_join!(
+                collect_github_query(&rt, "SELECT COUNT(*) FROM spiceai_issues_auto"),
+                collect_github_query(&rt, "DESCRIBE spiceai_issues_auto"),
+                collect_github_query(
+                    &rt,
+                    "SELECT comments, comments_count FROM spiceai_issues_auto LIMIT 1"
+                ),
+                collect_github_query(
+                    &rt,
+                    "SELECT number, state, comments_count, owner, repo FROM spiceai_issues_auto"
+                ),
+                collect_github_query(
+                    &rt,
+                    r#"SELECT "task", execution_duration_ms, error_message FROM runtime.task_history ORDER BY start_time"#
+                ),
+            )?;
+
+            let issues_count = count_star(&count_batches);
+            eprintln!(
+                "loaded spiceai/spiceai issues={issues_count} (GitHub {}..{}) in {load_elapsed:?}",
+                totals_before.issues, totals_after.issues
+            );
+            eprintln!("task_history:\n{}", batches_to_string(&task_history));
+
+            assert_count_matches_github(
+                issues_count,
+                totals_before.issues,
+                totals_after.issues,
+                "issue",
+            );
+
+            let schema_text = batches_to_string(&schema_batches);
+            assert!(
+                schema_text.contains("comments"),
+                "issues schema should include comments: {schema_text}"
+            );
+            assert!(
+                schema_text.contains("comments_count"),
+                "issues schema should include comments_count: {schema_text}"
+            );
+            for batch in &comment_sample {
+                let comments = batch
+                    .schema()
+                    .index_of("comments")
+                    .expect("issues should carry a 'comments' column");
+                assert!(
+                    batch
+                        .column(comments)
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .is_some(),
+                    "'comments' should be a ListArray of comment structs"
+                );
+            }
+
+            let issue_rows = row_count(&issue_batches);
+            assert_eq!(
+                i64::try_from(issue_rows).expect("issue row count fits i64"),
+                issues_count,
+                "issue rows should match COUNT(*)"
+            );
+            for batch in &issue_batches {
+                let index = batch
+                    .schema()
+                    .index_of("state")
+                    .expect("issues should carry a 'state' column");
+                let states = batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("'state' should be a StringArray");
+                for row in 0..states.len() {
+                    if states.is_null(row) {
+                        continue;
+                    }
+                    assert!(
+                        matches!(states.value(row), "OPEN" | "CLOSED"),
+                        "unexpected issue state {:?}",
+                        states.value(row)
+                    );
+                }
+            }
+            assert_column_is_constant(&issue_batches, "owner", "spiceai");
+            assert_column_is_constant(&issue_batches, "repo", "spiceai");
+
+            assert_all_pulls_reviews_and_comments(
+                &rt,
+                totals_before.pull_requests,
+                totals_after.pull_requests,
             )
             .await?;
 
