@@ -62,7 +62,9 @@ use crate::metrics::PARTITION_LABEL;
 use crate::metrics::PATH_LABEL;
 use crate::persistent::cache::CachedVortexMetadata;
 use crate::persistent::deferred_projection::DeferredProjectionReader;
+use crate::persistent::reader::ScanReadAt;
 use crate::persistent::reader::VortexReaderFactory;
+use crate::persistent::scan_metrics::ScanOperation;
 use crate::persistent::segment_cache::SharedSegmentCache;
 use crate::persistent::stream::PrunableStream;
 
@@ -130,8 +132,11 @@ impl FileOpener for VortexOpener {
             .vortex_reader_factory
             .create_reader(file.path().as_ref(), &session)?;
 
-        let reader =
-            InstrumentedReadAt::new_with_labels(reader, metrics_registry.as_ref(), labels.clone());
+        let reader = InstrumentedReadAt::new_with_labels(
+            ScanReadAt(reader),
+            metrics_registry.as_ref(),
+            labels.clone(),
+        );
 
         let file_pruning_predicate = self.file_pruning_predicate.as_ref().map(Arc::clone);
         let expr_adapter_factory = Arc::clone(&self.expr_adapter_factory);
@@ -222,6 +227,7 @@ impl FileOpener for VortexOpener {
                 open_opts = open_opts.with_footer(vortex_metadata.footer().clone());
             }
 
+            ScanOperation::FileOpen.record();
             let vxf = open_opts
                 .open_read(reader)
                 .await
@@ -237,6 +243,7 @@ impl FileOpener for VortexOpener {
 
             let projected_physical_schema = projection.project_schema(&unified_file_schema)?;
 
+            ScanOperation::SchemaAdaptation.record();
             let expr_adapter = expr_adapter_factory.create(
                 Arc::clone(&unified_file_schema),
                 Arc::clone(&this_file_schema),
@@ -305,6 +312,7 @@ impl FileOpener for VortexOpener {
                         reader
                     } else {
                         tracing::trace!("creating layout reader for {}", occupied_entry.key());
+                        ScanOperation::LayoutReaderRoot.record();
                         let reader = vxf.layout_reader().map_err(|e| {
                             DataFusionError::Execution(format!(
                                 "Failed to create layout reader: {e}"
@@ -316,6 +324,7 @@ impl FileOpener for VortexOpener {
                 }
                 Entry::Vacant(vacant_entry) => {
                     tracing::trace!("creating layout reader for {}", vacant_entry.key());
+                    ScanOperation::LayoutReaderRoot.record();
                     let reader = vxf.layout_reader().map_err(|e| {
                         DataFusionError::Execution(format!("Failed to create layout reader: {e}"))
                     })?;
@@ -484,6 +493,7 @@ impl FileOpener for VortexOpener {
             }
 
             let stream_target_field = Field::new_struct("", stream_schema.fields().clone(), false);
+            ScanOperation::ScanStream.record();
             let stream = scan_builder
                 .with_metrics_registry(metrics_registry)
                 .with_projection(scan_projection)
@@ -635,6 +645,7 @@ fn natural_split_ranges_for_file(
 }
 
 fn compute_natural_split_ranges(layout_reader: &dyn LayoutReader) -> DFResult<Arc<[Range<u64>]>> {
+    ScanOperation::NaturalSplits.record();
     let row_count = layout_reader.row_count();
     let row_range = 0..row_count;
     let split_points: Vec<_> = SplitBy::Layout
