@@ -3854,6 +3854,46 @@ fn range_bounds_from_statistics(
     (!bounds.is_empty()).then_some(bounds)
 }
 
+/// Up to `shards - 1` strictly ascending split points cutting the non-NULL
+/// values of `sample` into equal-count slices, for any type the range router can
+/// compare (see [`is_range_routable_type`]). NULLs are skipped; the router keeps
+/// NULL keys on the first shard.
+///
+/// Unlike [`range_bounds_from_histogram`] this needs no numeric interpolation,
+/// so it cuts string and binary keys too — the keys lookups on a full-refresh
+/// table most often use. A row whose key equals a split point lands on the lower
+/// shard, so repeated values never straddle two files. `None` when the sample is
+/// too small to cut or every cut collapses onto one value.
+fn equal_count_bounds(sample: &ArrayRef, shards: usize) -> Option<Vec<ScalarValue>> {
+    const MIN_ROWS_PER_SHARD: usize = 64;
+
+    let nulls = sample.null_count();
+    let values = sample.len().saturating_sub(nulls);
+    if shards < 2 || values < shards.saturating_mul(MIN_ROWS_PER_SHARD) {
+        return None;
+    }
+    let order = arrow::compute::sort_to_indices(
+        sample.as_ref(),
+        Some(arrow::compute::SortOptions {
+            descending: false,
+            nulls_first: true,
+        }),
+        None,
+    )
+    .ok()?;
+    let mut bounds: Vec<ScalarValue> = Vec::with_capacity(shards - 1);
+    for cut in 1..shards {
+        let position = nulls + values * cut / shards;
+        let row = usize::try_from(order.value(position)).ok()?;
+        let bound = ScalarValue::try_from_array(sample.as_ref(), row).ok()?;
+        if bound.is_null() || bounds.last().is_some_and(|last| last >= &bound) {
+            continue;
+        }
+        bounds.push(bound);
+    }
+    (!bounds.is_empty()).then_some(bounds)
+}
+
 /// Whether a range split is worth taking over hashing.
 ///
 /// A partial split — fewer cuts than shards, because the domain could not be
@@ -4415,6 +4455,92 @@ pub(crate) enum ClusterSortSpan {
     /// so the result is not globally ordered — only safe where the files
     /// advertise no ordering, as cold-tier files do.
     BoundedRuns,
+}
+
+/// In-memory bytes of rows each range shard of a whole-table replace sorts by the
+/// routing key at a time (see `WriteShardConfig::range_run_sort_bytes`).
+///
+/// A range file then holds a few key-sorted runs instead of arrival order, so an
+/// equality lookup reads about one zone per run rather than every zone of the
+/// key. One run per shard is resident at a time, charged to the query memory
+/// pool; a refused charge seals the run early rather than failing the write.
+const OVERWRITE_RUN_SORT_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Most-filtered columns considered when choosing a routing key, so a hot
+/// column of a type the router cannot split does not rule the others out.
+const DEFAULT_ROUTING_CANDIDATES: usize = 4;
+
+/// A range-partitioned write: split points on one key column.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RangePartitioning<'a> {
+    /// The column `bounds` describe. `None` means the leading column of the
+    /// table's shard key, which is what a rewrite merge splits on.
+    pub(crate) column: Option<&'a str>,
+    /// Ascending split points; see `WriteShardConfig::range_bounds`.
+    pub(crate) bounds: &'a [ScalarValue],
+    /// Sort each range's rows by the key in runs of this many bytes.
+    pub(crate) run_sort_bytes: Option<u64>,
+}
+
+/// How a whole-table replace routes rows into key-range files; see
+/// [`CayenneTableProvider::overwrite_range_plan`].
+#[derive(Debug)]
+pub(crate) struct OverwriteRangePlan {
+    column: String,
+    bounds: Vec<ScalarValue>,
+}
+
+impl OverwriteRangePlan {
+    pub(crate) fn partitioning(&self) -> RangePartitioning<'_> {
+        RangePartitioning {
+            column: Some(&self.column),
+            bounds: &self.bounds,
+            run_sort_bytes: Some(OVERWRITE_RUN_SORT_BYTES),
+        }
+    }
+}
+
+/// Where a range-routed replace takes its key from, for the debug log.
+#[derive(Debug, Clone, Copy)]
+enum RangeKeySource {
+    PrimaryKey,
+    ShardKey,
+    ObservedFilters,
+}
+
+/// Whether the range router can split a column of this type: `sort_to_indices`
+/// orders it and the `gt` comparison kernel compares it against a scalar bound
+/// of the same type. Booleans have nothing worth splitting; dictionary-encoded
+/// columns are left to hashing because a bound is a plain scalar.
+const fn is_range_routable_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(..)
+            | DataType::Decimal256(..)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(..)
+            | DataType::Duration(_)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_)
+    )
 }
 
 const fn rewrite_write_policy(is_sorted: bool) -> super::delta_encoding::WritePolicy {
@@ -8913,13 +9039,14 @@ impl CayenneTableProvider {
         .await
     }
 
-    /// [`Self::write_to_snapshot`], with ascending split points that
-    /// range-partition the shard key instead of hashing it.
+    /// [`Self::write_to_snapshot`], range-partitioning the rows on a key instead
+    /// of hashing it.
     ///
     /// Only a caller that knows the key range of the rows it is about to write
-    /// can supply these — a rewrite reads them off the statistics of the plan it
-    /// is merging. A streaming write has no such view, passes `None`, and hashes
-    /// as before.
+    /// can supply the split points — a rewrite reads them off the statistics of
+    /// the plan it is merging, a whole-table replace off the table it replaces
+    /// (see [`Self::overwrite_range_plan`]). A streaming write has no such view,
+    /// passes `None`, and hashes as before.
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn write_to_snapshot_range_partitioned(
         &self,
@@ -8929,7 +9056,7 @@ impl CayenneTableProvider {
         target_partitions: usize,
         estimated_bytes: Option<u64>,
         policy: super::delta_encoding::WritePolicy,
-        range_bounds: Option<&[ScalarValue]>,
+        range: Option<RangePartitioning<'_>>,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
@@ -9030,24 +9157,36 @@ impl CayenneTableProvider {
         // full default strategy. See `provider::delta_encoding`.
         let encoding_level =
             super::delta_encoding::effective_level(self.context.delta_encoding(), write_class);
-        let write_format = match super::delta_encoding::strategy_builder_for_level(encoding_level) {
-            Some(strategy) => self.context.write_format_with_strategy(
-                strategy,
-                self.write_shard_config(
-                    target_partitions,
-                    target_size_bytes,
-                    estimated_bytes,
-                    fan_out,
-                    range_bounds,
-                ),
-            ),
-            None => self.write_shard_format(
+        let shard_config = self
+            .write_shard_config(
                 target_partitions,
                 target_size_bytes,
                 estimated_bytes,
                 fan_out,
-                range_bounds,
-            ),
+                range.as_ref().map(|range| range.bounds),
+            )
+            .map(|mut config| {
+                if let Some(range) = range.as_ref()
+                    && config.range_bounds.is_some()
+                {
+                    // The bounds describe `range.column` when the caller named
+                    // one (a table without a primary key routes on a column that
+                    // is not its shard key), so the router must split that column.
+                    if let Some(column) = range.column {
+                        config.shard_key_columns = vec![column.to_string()];
+                    }
+                    config.range_run_sort_bytes = range.run_sort_bytes;
+                }
+                config
+            });
+        let write_format = match super::delta_encoding::strategy_builder_for_level(encoding_level) {
+            Some(strategy) => self
+                .context
+                .write_format_with_strategy(strategy, shard_config),
+            None => match shard_config {
+                Some(config) => Arc::new(self.context.file_format().with_write_shard(config)),
+                None => Arc::clone(self.context.file_format()),
+            },
         };
 
         // Create a new ListingTable pointing to the snapshot directory
@@ -10057,6 +10196,7 @@ impl CayenneTableProvider {
     /// `target_size_bytes` / `estimated_bytes` decide how many writers a write
     /// of this size earns, so the same values must be passed here and to the
     /// `writer_ops` heuristic in [`Self::write_to_snapshot`].
+    #[cfg(test)]
     fn write_shard_format(
         &self,
         session_target_partitions: usize,
@@ -10171,6 +10311,9 @@ impl CayenneTableProvider {
             // hashes the key instead, which is what every write did before range
             // partitioning existed.
             range_bounds: range_bounds.map(<[ScalarValue]>::to_vec),
+            // Run sorting is the caller's opt-in (see
+            // `write_to_snapshot_range_partitioned`).
+            range_run_sort_bytes: None,
         })
     }
 
@@ -16842,6 +16985,207 @@ impl CayenneTableProvider {
         Ok((sorted, 1, rewrite_write_policy(true)))
     }
 
+    /// How a whole-table replace routes its rows into key-range files instead of
+    /// hashing them, or `None` to hash as before.
+    ///
+    /// A hash (or round-robin) split gives every output file the whole key
+    /// domain, so an equality lookup on the key opens every file and, unless the
+    /// source happens to return rows in key order, every zone of the key column
+    /// in each of them. Routing on the key instead gives each file one contiguous
+    /// slice of the domain, so file statistics prune a lookup to one file, and the
+    /// bounded run sort the sink applies inside each range lets zone maps prune
+    /// within it. The shard count — and so the number of concurrent encoders — is
+    /// unchanged; nothing is globally sorted, and an overwrite never attests an
+    /// order (`current_sorted_snapshot`).
+    ///
+    /// The split points are equal-count quantiles of the key in the table being
+    /// REPLACED, which a full refresh is about to rewrite with rows drawn from
+    /// the same distribution. Skewed or drifted bounds only unbalance file sizes;
+    /// they cannot place a row wrongly, because every row still reaches exactly
+    /// one file and the files' statistics are computed from what they contain.
+    ///
+    /// The key comes from [`Self::range_routing_candidates`], taking the first
+    /// whose values spread across every shard. Tables with an explicit order
+    /// (`cayenne_sort_columns`, `cayenne_cluster_by`) keep their single sorted
+    /// writer. The first load has nothing to sample and hashes, as does a table
+    /// too small to cut.
+    pub(crate) async fn overwrite_range_plan(
+        &self,
+        target_partitions: usize,
+    ) -> Option<OverwriteRangePlan> {
+        // Places equal-count cuts within a fraction of a percent of their target
+        // for any shard count a write uses.
+        const MAX_SAMPLE_ROWS: usize = 65_536;
+
+        if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
+            return None;
+        }
+        let shards = self.snapshot_write_concurrency(target_partitions);
+        if shards < 2 {
+            return None;
+        }
+        let schema = self.table_schema();
+        for (column, source) in self.range_routing_candidates(&schema) {
+            let Ok(index) = schema.index_of(&column) else {
+                continue;
+            };
+            let key_type = schema.field(index).data_type().clone();
+            let started = Instant::now();
+            let sample = match self.sample_column(index, &key_type, MAX_SAMPLE_ROWS).await {
+                Ok(Some(sample)) => sample,
+                // Nothing to sample, or no trustworthy row count: the same for
+                // every column.
+                Ok(None) => return None,
+                Err(error) => {
+                    // Placement only: hashing keeps the replace correct, just unclustered.
+                    tracing::debug!(
+                        table = self.table_name(),
+                        column = column.as_str(),
+                        %error,
+                        "Could not sample the routing key of a whole-table replace; hashing it instead"
+                    );
+                    return None;
+                }
+            };
+            // NULL keys all route to the first shard; past one shard's share of
+            // the rows they would pile the write onto one encoder.
+            if sample.null_count().saturating_mul(shards) > sample.len() {
+                continue;
+            }
+            let Some(bounds) = equal_count_bounds(&sample, shards) else {
+                continue;
+            };
+            if bounds.len() + 1 < shards {
+                // Too few distinct values to fill every shard: routing would pile
+                // the rows onto fewer encoders than hashing uses.
+                continue;
+            }
+            tracing::debug!(
+                table = self.table_name(),
+                column = column.as_str(),
+                key_source = ?source,
+                shards,
+                bounds = bounds.len(),
+                sample_rows = sample.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "Routing whole-table replace into key-range files"
+            );
+            return Some(OverwriteRangePlan { column, bounds });
+        }
+        None
+    }
+
+    /// Columns a whole-table replace may be range-routed on, most preferred
+    /// first, limited to types the router can split.
+    ///
+    /// A configured `cayenne_shard_key_columns` is the only candidate: the
+    /// operator named the key. Otherwise the leading primary-key column comes
+    /// first, unless scans filter on another column more than twice as often —
+    /// schema inference can supply a primary key the workload never looks rows up
+    /// by (an auto-increment surrogate), and a layout routed on it prunes
+    /// nothing. Join keys arrive as runtime filters, which are not observed, so
+    /// the primary key yields only to a column filtered on distinctly more often.
+    /// Whichever of the two is not preferred follows as the fallback.
+    fn range_routing_candidates(&self, schema: &SchemaRef) -> Vec<(String, RangeKeySource)> {
+        let routable = |column: &str| {
+            schema
+                .field_with_name(column)
+                .is_ok_and(|field| is_range_routable_type(field.data_type()))
+        };
+        let leading_key = self
+            .resolved_shard_key_columns()
+            .into_iter()
+            .next()
+            .filter(|column| routable(column));
+        if !self.context.shard_key_columns().is_empty() {
+            return leading_key
+                .map(|column| (column, RangeKeySource::ShardKey))
+                .into_iter()
+                .collect();
+        }
+        let observations = &self.filter_column_observations;
+        let hottest = observations
+            .top_columns(DEFAULT_ROUTING_CANDIDATES, schema.as_ref())
+            .into_iter()
+            .find(|column| routable(column));
+        match (leading_key, hottest) {
+            (Some(key), Some(hottest)) if hottest != key => {
+                let hottest_leads =
+                    observations.hits(&hottest) > observations.hits(&key).saturating_mul(2);
+                let key = (key, RangeKeySource::PrimaryKey);
+                let hottest = (hottest, RangeKeySource::ObservedFilters);
+                if hottest_leads {
+                    vec![hottest, key]
+                } else {
+                    vec![key, hottest]
+                }
+            }
+            (Some(key), _) => vec![(key, RangeKeySource::PrimaryKey)],
+            (None, Some(hottest)) => vec![(hottest, RangeKeySource::ObservedFilters)],
+            (None, None) => Vec::new(),
+        }
+    }
+
+    /// Every `stride`-th value of one column of the current table, cast to
+    /// `data_type`, where the stride keeps the sample near `max_rows`. `None`
+    /// for an empty table, or when the table reports no row count and the
+    /// sample would grow past a bounded size.
+    ///
+    /// Reads the whole key column of the table being replaced. A full refresh
+    /// re-reads every row of its source anyway, so one projected column of the
+    /// old snapshot is small beside the refresh itself.
+    async fn sample_column(
+        &self,
+        index: usize,
+        data_type: &DataType,
+        max_rows: usize,
+    ) -> DataFusionResult<Option<ArrayRef>> {
+        use arrow::array::UInt32Array;
+
+        let ctx = self.create_session_context();
+        let state = ctx.state();
+        let plan = TableProvider::scan(self, &state, Some(&vec![index]), &[], None).await?;
+        let total_rows = plan
+            .partition_statistics(None)
+            .ok()
+            .and_then(|stats| stats.num_rows.get_value().copied());
+        // Without a row count, sample sparsely rather than hold the column.
+        let stride = total_rows.map_or(16, |rows| rows.div_ceil(max_rows).max(1));
+        let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
+        let mut sampled: Vec<ArrayRef> = Vec::new();
+        let mut sampled_rows = 0_usize;
+        let mut position = 0_usize;
+        while let Some(batch) = stream.next().await.transpose()? {
+            let rows = batch.num_rows();
+            let column = batch.column(0);
+            let first = (stride - position % stride) % stride;
+            let picks: UInt32Array = (first..rows)
+                .step_by(stride)
+                .filter_map(|row| u32::try_from(row).ok())
+                .collect();
+            if !picks.is_empty() {
+                sampled_rows = sampled_rows.saturating_add(picks.len());
+                if sampled_rows > max_rows.saturating_mul(4) {
+                    // A misreported row count: stop rather than hold the column.
+                    return Ok(None);
+                }
+                sampled.push(arrow::compute::take(column.as_ref(), &picks, None)?);
+            }
+            position = position.saturating_add(rows);
+        }
+        if sampled.is_empty() {
+            return Ok(None);
+        }
+        let parts: Vec<&dyn Array> = sampled.iter().map(AsRef::as_ref).collect();
+        let sample = arrow::compute::concat(&parts)?;
+        let sample = if sample.data_type() == data_type {
+            sample
+        } else {
+            arrow::compute::cast(&sample, data_type)?
+        };
+        Ok(Some(sample))
+    }
+
     /// Effective sort columns for a snapshot rewrite under default settings.
     ///
     /// Precedence: operator-configured `sort_columns` > hottest observed filter
@@ -22853,7 +23197,11 @@ impl CayenneTableProvider {
                 // bounds cannot be cut for a different number of encoders than
                 // this write creates.
                 write_policy,
-                range_bounds.as_deref(),
+                range_bounds.as_deref().map(|bounds| RangePartitioning {
+                    column: None,
+                    bounds,
+                    run_sort_bytes: None,
+                }),
             )
             .await;
 
@@ -45020,6 +45368,288 @@ mod tests {
         let mut sorted = narrow.clone();
         sorted.dedup();
         assert_eq!(sorted, narrow, "bounds must be strictly ascending");
+    }
+
+    #[test]
+    fn equal_count_bounds_cut_strings_at_quantiles() {
+        use arrow::array::StringArray;
+
+        // 1000 distinct keys in a scrambled order, plus NULLs the cut must skip.
+        let mut keys: Vec<Option<String>> =
+            (0..1000).map(|i| Some(format!("k{:04}", (i * 7919) % 1000))).collect();
+        keys.extend([None, None, None]);
+        let sample: ArrayRef = Arc::new(StringArray::from(keys));
+
+        let bounds = equal_count_bounds(&sample, 4).expect("1000 keys split into 4");
+        assert_eq!(
+            bounds,
+            vec![
+                ScalarValue::Utf8(Some("k0250".to_string())),
+                ScalarValue::Utf8(Some("k0500".to_string())),
+                ScalarValue::Utf8(Some("k0750".to_string())),
+            ]
+        );
+
+        // Heavy repeats collapse to strictly ascending cuts.
+        let repeated: ArrayRef = Arc::new(StringArray::from(
+            (0..1000)
+                .map(|i| if i < 900 { "a" } else { "b" })
+                .collect::<Vec<_>>(),
+        ));
+        let bounds = equal_count_bounds(&repeated, 4).expect("two values still cut once");
+        assert_eq!(bounds, vec![ScalarValue::Utf8(Some("a".to_string()))]);
+
+        // Too few rows to be worth cutting.
+        let tiny: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        assert!(equal_count_bounds(&tiny, 4).is_none());
+        assert!(equal_count_bounds(&sample, 1).is_none());
+    }
+
+    /// The routing key of a whole-table replace: a configured shard key alone;
+    /// otherwise the primary key, yielding the lead only to a column filtered on
+    /// more than twice as often, with the other kept as the fallback; never a
+    /// column the router cannot split.
+    #[tokio::test]
+    async fn test_range_routing_candidates_order() {
+        use datafusion_expr::{col, lit};
+
+        fn names(provider: &CayenneTableProvider) -> Vec<String> {
+            provider
+                .range_routing_candidates(&provider.table_schema())
+                .into_iter()
+                .map(|(column, _)| column)
+                .collect()
+        }
+        fn filter_on(provider: &CayenneTableProvider, column: &str, times: usize) {
+            for _ in 0..times {
+                provider
+                    .filter_column_observations
+                    .record_filters(&[col(column).eq(lit(1_i64))]);
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("sid", DataType::Utf8, true),
+            Field::new("flag", DataType::Boolean, true),
+        ]));
+        let ctx = SessionContext::new();
+
+        let (keyed, _keyed_dir) = create_cayenne_table_with_config(
+            "routing_candidates_keyed",
+            Arc::clone(&schema),
+            VortexConfig::default(),
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert_eq!(names(&keyed), vec!["id"], "nothing observed: the primary key");
+        filter_on(&keyed, "id", 2);
+        filter_on(&keyed, "sid", 4);
+        assert_eq!(
+            names(&keyed),
+            vec!["id", "sid"],
+            "twice the key's filters is not enough to take the lead"
+        );
+        filter_on(&keyed, "sid", 1);
+        assert_eq!(
+            names(&keyed),
+            vec!["sid", "id"],
+            "more than twice the key's filters takes the lead"
+        );
+        filter_on(&keyed, "flag", 100);
+        assert_eq!(
+            names(&keyed),
+            vec!["sid", "id"],
+            "a boolean cannot be split into ranges, however hot"
+        );
+
+        let (unkeyed, _unkeyed_dir) = create_cayenne_table_with_config(
+            "routing_candidates_unkeyed",
+            Arc::clone(&schema),
+            VortexConfig::default(),
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(names(&unkeyed).is_empty(), "no key and nothing observed");
+        filter_on(&unkeyed, "sid", 1);
+        assert_eq!(names(&unkeyed), vec!["sid"]);
+
+        let (configured, _configured_dir) = create_cayenne_table_with_config(
+            "routing_candidates_configured",
+            Arc::clone(&schema),
+            VortexConfig {
+                shard_key_columns: vec!["sid".to_string()],
+                ..VortexConfig::default()
+            },
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        filter_on(&configured, "id", 100);
+        assert_eq!(
+            names(&configured),
+            vec!["sid"],
+            "a configured shard key is the only candidate"
+        );
+    }
+
+    /// A whole-table replace of a keyed table routes its rows into key-range
+    /// files once a previous snapshot exists to sample: each file holds its own
+    /// slice of the key domain in key order, the slices do not overlap, and no
+    /// row is lost or duplicated. The first load has nothing to sample and
+    /// hashes.
+    #[tokio::test]
+    async fn test_overwrite_routes_rows_into_disjoint_sorted_key_range_files() {
+        use arrow::array::StringArray;
+
+        const ROWS: usize = 20_000;
+        const SHARDS: usize = 4;
+
+        async fn replace(provider: &CayenneTableProvider, data: SendableRecordBatchStream) {
+            let prepared = provider
+                .begin_overwrite(data, SHARDS)
+                .await
+                .expect("begin_overwrite");
+            prepared.apply_owned_txn().await.expect("apply_owned_txn");
+            prepared.finish().await.expect("finish");
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sid", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "range_routed_overwrite",
+            Arc::clone(&schema),
+            VortexConfig {
+                // Keep the refresh out of the metastore so it writes files.
+                inline_max_rows: 0,
+                write_concurrency: Some(SHARDS),
+                ..VortexConfig::default()
+            },
+            vec!["sid".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        // Keys in a scrambled order, which neither the source nor a hash split
+        // clusters; `offset` changes the order between refreshes.
+        let refresh = |offset: usize| -> SendableRecordBatchStream {
+            let order: Vec<usize> = (0..ROWS).map(|i| (i * 7919 + offset) % ROWS).collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from_iter_values(
+                        order.iter().map(|i| format!("sid-{i:08}")),
+                    )),
+                    Arc::new(Int64Array::from_iter_values(
+                        order.iter().map(|&i| i64::try_from(i).expect("row fits i64")),
+                    )),
+                ],
+            )
+            .expect("refresh batch");
+            let batches: Vec<DataFusionResult<RecordBatch>> = (0..ROWS)
+                .step_by(1024)
+                .map(|start| Ok(batch.slice(start, 1024.min(ROWS - start))))
+                .collect();
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                stream::iter(batches),
+            ))
+        };
+
+        assert!(
+            provider.overwrite_range_plan(SHARDS).await.is_none(),
+            "an empty table has nothing to sample"
+        );
+        replace(&provider, refresh(0)).await;
+
+        let plan = provider
+            .overwrite_range_plan(SHARDS)
+            .await
+            .expect("a loaded keyed table is split into ranges");
+        assert_eq!(plan.column, "sid");
+        assert_eq!(plan.bounds.len(), SHARDS - 1);
+
+        replace(&provider, refresh(13)).await;
+
+        ctx.register_table("t", Arc::new(provider.clone_for_write()))
+            .expect("register table");
+        let totals = ctx
+            .sql("SELECT count(*) AS n, count(DISTINCT sid) AS d FROM t")
+            .await
+            .expect("count query")
+            .collect()
+            .await
+            .expect("count rows");
+        let column = |index: usize| {
+            totals[0]
+                .column(index)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count is Int64")
+                .value(0)
+        };
+        let expected = i64::try_from(ROWS).expect("rows fit i64");
+        assert_eq!(column(0), expected, "every row survives the refresh");
+        assert_eq!(column(1), expected, "no row is duplicated");
+
+        // Read each file on its own, in file order.
+        let snapshot_id = provider.current_snapshot_id();
+        let files = provider
+            .list_snapshot_files_with_sizes(&snapshot_id)
+            .await
+            .expect("list snapshot files");
+        assert_eq!(files.len(), SHARDS, "one file per key range: {files:?}");
+        let file_ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let mut ranges = Vec::with_capacity(files.len());
+        for (name, _) in &files {
+            let path = provider.snapshot_dir_path_for(&snapshot_id).join(name);
+            let table = CayenneTableProvider::create_listing_table(
+                &path.to_string_lossy(),
+                Arc::clone(&schema),
+                provider.context.file_format(),
+                &provider.pk_deletion_strategy,
+            )
+            .expect("single-file listing table");
+            let keys: Vec<String> = file_ctx
+                .read_table(table)
+                .expect("read file")
+                .collect()
+                .await
+                .expect("scan file")
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("sid is Utf8")
+                        .iter()
+                        .map(|key| key.expect("sid is not null").to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert!(
+                keys.is_sorted(),
+                "{name}: a range file's rows are written in key order"
+            );
+            let (Some(first), Some(last)) = (keys.first(), keys.last()) else {
+                panic!("{name}: every range of a scrambled full key domain receives rows");
+            };
+            ranges.push((first.clone(), last.clone()));
+        }
+        ranges.sort();
+        for pair in ranges.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].0,
+                "files must cover disjoint key ranges: {ranges:?}"
+            );
+        }
     }
 
     /// Build one merge input's statistics: the key range it covers and its rows.

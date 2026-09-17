@@ -275,6 +275,10 @@ pub struct WriteShardConfig {
     /// key column is set: ordering a composite key needs a lexicographic
     /// comparison this does not implement, so a multi-column key hashes.
     pub range_bounds: Option<Vec<ScalarValue>>,
+    /// Sort each range shard's rows by the shard key in runs of at most this
+    /// many uncompressed bytes before encoding them. Ignored unless the write is
+    /// range-partitioned. `None` ⇒ rows keep their arrival order within a shard.
+    pub range_run_sort_bytes: Option<u64>,
 }
 
 /// Vortex implementation of a `DataFusion` [`FileFormat`].
@@ -740,6 +744,7 @@ impl VortexFormat {
                 expr: Arc::clone(expr),
                 bounds: bounds.clone(),
                 partitions,
+                run_sort_bytes: write_shard.range_run_sort_bytes,
             };
         }
         ShardSpec::Hash { exprs, partitions }
@@ -1445,6 +1450,7 @@ mod tests {
             write_concurrency,
             shard_key_columns: keys.iter().map(|s| (*s).to_string()).collect(),
             range_bounds,
+            range_run_sort_bytes: None,
         })
     }
 
