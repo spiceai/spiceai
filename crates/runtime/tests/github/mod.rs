@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1005,6 +1005,30 @@ fn assert_column_is_constant(batches: &[RecordBatch], column: &str, expected: &s
     }
 
     assert!(checked > 0, "expected at least one row to check '{column}'");
+}
+
+fn assert_unique_string_column(batches: &[RecordBatch], column: &str) {
+    let mut seen = HashSet::new();
+    for batch in batches {
+        let index = batch
+            .schema()
+            .index_of(column)
+            .unwrap_or_else(|_| panic!("result should carry a '{column}' column"));
+        let values = batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap_or_else(|| panic!("'{column}' should be a StringArray"));
+        for row in 0..values.len() {
+            assert!(!values.is_null(row), "'{column}' must never be null");
+            assert!(
+                seen.insert(values.value(row).to_string()),
+                "duplicate '{column}' {}",
+                values.value(row)
+            );
+        }
+    }
+    assert!(!seen.is_empty(), "expected at least one '{column}'");
 }
 
 #[tokio::test]
@@ -2430,9 +2454,15 @@ fn spiceai_issues_dataset() -> Dataset {
     spiceai_accelerated("issues", HashMap::new())
 }
 
+fn spiceai_commits_dataset() -> Dataset {
+    spiceai_accelerated("commits", HashMap::new())
+}
+
 struct SpiceaiGitHubTotals {
     pull_requests: i64,
     issues: i64,
+    commits: i64,
+    default_branch: String,
 }
 
 /// Live `totalCount` from GitHub GraphQL. A hardcoded floor (10_000 pulls,
@@ -2450,7 +2480,7 @@ async fn spiceai_github_totals() -> Result<SpiceaiGitHubTotals, String> {
         .post("https://api.github.com/graphql")
         .bearer_auth(token)
         .json(&serde_json::json!({
-            "query": "{ repository(owner: \"spiceai\", name: \"spiceai\") { pullRequests { totalCount } issues { totalCount } } }"
+            "query": "{ repository(owner: \"spiceai\", name: \"spiceai\") { pullRequests { totalCount } issues { totalCount } defaultBranchRef { name target { ... on Commit { history { totalCount } } } } } }"
         }))
         .send()
         .await
@@ -2471,16 +2501,28 @@ async fn spiceai_github_totals() -> Result<SpiceaiGitHubTotals, String> {
         .pointer("/data/repository/issues/totalCount")
         .and_then(serde_json::Value::as_i64)
         .ok_or_else(|| format!("missing issues.totalCount in {body}"))?;
+    let commits = body
+        .pointer("/data/repository/defaultBranchRef/target/history/totalCount")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| format!("missing defaultBranchRef history.totalCount in {body}"))?;
+    let default_branch = body
+        .pointer("/data/repository/defaultBranchRef/name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("missing defaultBranchRef.name in {body}"))?
+        .to_string();
     Ok(SpiceaiGitHubTotals {
         pull_requests,
         issues,
+        commits,
+        default_branch,
     })
 }
 
-/// GitHub's `totalCount` can move during a multi-hour scan: pull requests and
-/// issues are opened, closed, transferred, or deleted. A complete scan's row
-/// count must sit between the totals observed just before load and just after,
-/// in either order, so a create or a delete does not fail a full history.
+/// GitHub's `totalCount` can move during a multi-hour scan: pull requests,
+/// issues, and commits are opened, closed, transferred, or deleted. A complete
+/// scan's row count must sit between the totals observed just before load and
+/// just after, in either order, so a create or a delete does not fail a full
+/// history.
 fn github_count_in_scan_window(loaded: i64, before: i64, after: i64) -> bool {
     let lo = before.min(after);
     let hi = before.max(after);
@@ -2792,6 +2834,76 @@ async fn test_github_spiceai_issues() -> Result<(), String> {
                 totals_after.pull_requests,
             )
             .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+/// Loads every commit on `github.com/spiceai/spiceai`'s default branch. There
+/// is no row limit: `Arrow` acceleration scans GitHub history until GitHub
+/// reports no further pages.
+///
+/// Ignored in CI: the GitHub connector job's deadline cannot cover an
+/// unbounded GraphQL history scan. Run with `--ignored`.
+#[ignore = "scans every spiceai/spiceai default-branch commit from GitHub; run with --ignored"]
+#[tokio::test]
+async fn test_github_spiceai_commits() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    if !repo_github_secret_available("test_github_spiceai_commits").await {
+        return Ok(());
+    }
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let totals_before = spiceai_github_totals().await?;
+            let app = AppBuilder::new("github_spiceai_commits")
+                .with_dataset(spiceai_commits_dataset())
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let started = Instant::now();
+            load_github_datasets_with_timeout(&rt, GITHUB_FULL_HISTORY_TIMEOUT).await?;
+            let load_elapsed = started.elapsed();
+            let totals_after = spiceai_github_totals().await?;
+
+            let (count_batches, commit_batches, task_history) = tokio::try_join!(
+                collect_github_query(&rt, "SELECT COUNT(*) FROM spiceai_commits_auto"),
+                collect_github_query(
+                    &rt,
+                    "SELECT sha, ref, message_head_line, owner, repo FROM spiceai_commits_auto"
+                ),
+                collect_github_query(
+                    &rt,
+                    r#"SELECT "task", execution_duration_ms, error_message FROM runtime.task_history ORDER BY start_time"#
+                ),
+            )?;
+
+            let commits_count = count_star(&count_batches);
+            eprintln!(
+                "loaded spiceai/spiceai commits={commits_count} (GitHub {}..{} on '{}') in {load_elapsed:?}",
+                totals_before.commits, totals_after.commits, totals_after.default_branch
+            );
+            eprintln!("task_history:\n{}", batches_to_string(&task_history));
+
+            assert_count_matches_github(
+                commits_count,
+                totals_before.commits,
+                totals_after.commits,
+                "commit",
+            );
+            assert_eq!(
+                i64::try_from(row_count(&commit_batches)).expect("commit row count fits i64"),
+                commits_count,
+                "commit rows should match COUNT(*)"
+            );
+            assert_column_is_constant(&commit_batches, "owner", "spiceai");
+            assert_column_is_constant(&commit_batches, "repo", "spiceai");
+            assert_column_is_constant(&commit_batches, "ref", &totals_after.default_branch);
+            assert_unique_string_column(&commit_batches, "sha");
 
             Ok(())
         })
