@@ -33768,9 +33768,8 @@ impl CayenneTableProvider {
         );
         let table_url = ListingTableUrl::parse(&snapshot_dir_url).ok()?;
         // The index needs only each file's path, size and modification time.
-        // Collecting statistics here reads and re-caches every file's footer, and
-        // doing so left every later scan of a freshly refreshed table reading
-        // those footers again — twice the CPU per scan.
+        // Collecting per-file statistics here doubled the CPU of every later scan
+        // of a freshly refreshed table, so this listing skips them.
         let options = Self::create_listing_options(
             self.context.file_format(),
             &self.pk_deletion_strategy,
