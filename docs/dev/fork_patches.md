@@ -406,7 +406,8 @@ Upstream [apache/iceberg-rust](https://github.com/apache/iceberg-rust), branch
 | Limit push-down for `IcebergTableProvider` (fork PR #19) | `SELECT … LIMIT n` scans the whole table | silent (perf) | `crates/data_components/src/iceberg/provider.rs::a_scan_given_a_limit_reads_no_more_rows_than_it_asked_for` for the single-node scan, counted at the provider because a `GlobalLimitExec` above it returns the right rows either way; the distributed path is covered by `crates/runtime/src/cluster/datafusion/codec/spice_physical_codec.rs`, which refuses to serialise a scan whose limit it cannot carry |
 | Pinned snapshot reads in `IcebergTableProvider` (fork PR #45) | A scan reads the current snapshot instead of the pinned one — time-travel and repeatable reads silently return live data | silent (wrong data) | `crates/data_components/src/iceberg/provider.rs::a_scan_pinned_to_a_snapshot_reads_that_snapshot_not_the_current_one` |
 | Parallel file scanning with eager task bucketing (fork PR #43) | Iceberg scans lose file-level parallelism | silent (perf) | **GAP** |
-| `IcebergTableProvider::try_new` made public; extended file metadata | No construction path from Spice | build | compile-guarded |
+| `IcebergTableProvider::try_new` made public | No construction path from Spice | build | compile-guarded by `crates/data_components/src/iceberg/provider.rs`, which calls it |
+| Extended file metadata (`FileIO::lister`, `FileMetadata::mode`) — **carries no code** | Nothing. Recorded so the next audit does not go looking: upstream moved opendal out of the core crate, and re-adding a `Lister` and an `EntryMode` there would put the dependency back and break every `Storage` impl. Spice reaches neither — its Hadoop catalog uses its own opendal `Operator::lister()` — so the commit on the branch is a README whitespace change kept for provenance | none | not applicable |
 
 ## async-openai
 
