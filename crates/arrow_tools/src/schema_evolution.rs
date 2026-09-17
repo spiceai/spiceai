@@ -93,6 +93,22 @@ impl WideningPlan {
         self.widened_columns.is_empty() && self.relaxed_nullability.is_empty()
     }
 
+    /// `true` when any widened column is a decimal whose scale grew.
+    ///
+    /// Unscaled min/max integers in a Vortex stats blob are interpreted with
+    /// the *current* schema's scale, so a scale change without rewriting those
+    /// blobs silently shifts every bound (e.g. 123.45 at scale 2 becomes 1.2345
+    /// at scale 4). Callers that persist statistics must drop or rebuild them.
+    #[must_use]
+    pub fn changes_decimal_scale(&self) -> bool {
+        self.widened_columns.iter().any(|widening| {
+            match (decimal_parts(&widening.from), decimal_parts(&widening.to)) {
+                (Some((_, _, from_scale)), Some((_, _, to_scale))) => from_scale != to_scale,
+                _ => false,
+            }
+        })
+    }
+
     /// Short human summary for logs, e.g.
     /// `2 added columns (c, d), 1 widened (a: Int32 -> Int64)`.
     #[must_use]
@@ -781,6 +797,36 @@ mod tests {
                 (DataType::Int64, DataType::Float32),
                 (DataType::Int8, DataType::Float16),
             ]);
+        }
+
+        #[test]
+        fn decimal_scale_change_is_flagged_on_the_widening_plan() {
+            let current = Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(10, 2),
+                true,
+            )]);
+            let wider_scale = Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(14, 4),
+                true,
+            )]);
+            let plan = expect_widening(classify(&current, &wider_scale, &NO_CONSTRAINTS));
+            assert!(
+                plan.changes_decimal_scale(),
+                "Decimal128(10,2) -> Decimal128(14,4) must be reported as a scale change"
+            );
+
+            let wider_precision = Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(12, 2),
+                true,
+            )]);
+            let plan = expect_widening(classify(&current, &wider_precision, &NO_CONSTRAINTS));
+            assert!(
+                !plan.changes_decimal_scale(),
+                "precision-only widening keeps the unscaled integer's meaning"
+            );
         }
 
         #[test]

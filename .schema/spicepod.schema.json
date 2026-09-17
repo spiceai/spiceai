@@ -9051,11 +9051,11 @@
           ]
         },
         "cayenne_datalake_location": {
-          "description": "Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background tiering loop moves warm local-disk data to read-optimized, Z-order-clustered Vortex files on this store, and queries span warm + datalake with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported.",
+          "description": "Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background tiering loop moves warm local-disk data to read-optimized, Hilbert-clustered Vortex files on this store, and queries span warm + datalake with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported.",
           "type": "string"
         },
-        "cayenne_datalake_clustering_columns": {
-          "description": "Comma-separated liquid-clustering key columns for datalake files (multi-column Z-order), e.g. 'tenant_id,ts'. When unset, falls back to cayenne_sort_columns, then the primary key. Clustering tightens each cold file's per-column zone maps so selective queries on any clustering dimension prune at the storage layer.",
+        "cayenne_cluster_by": {
+          "description": "Comma-separated columns used to Hilbert-cluster both warm and datalake files, e.g. 'tenant_id,ts'. Every column must exist and have a supported scalar type. Cannot be combined with cayenne_sort_columns. When set, automatic and inferred sort columns are not applied.",
           "type": "string"
         },
         "cayenne_datalake_s3_auth": {
