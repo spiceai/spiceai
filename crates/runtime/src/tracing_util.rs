@@ -121,6 +121,48 @@ fn acceleration_info(
     info
 }
 
+/// Every line `tracing` writes at `WARN` or above while `f` runs on this thread.
+///
+/// A thread-local subscriber: enough for synchronous code, and it keeps the capture from
+/// seeing other tests' output. Returns the lines rather than a joined string so a caller can
+/// *count* an emission — a duplicate-log regression is exactly what a presence check passes.
+#[cfg(test)]
+pub(crate) fn warn_lines_emitted_by(f: impl FnOnce()) -> Vec<String> {
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let sink = Capture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+
+    let captured = sink.0.lock();
+    String::from_utf8_lossy(&captured)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
