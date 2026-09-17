@@ -20,6 +20,7 @@ limitations under the License.
 
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+pub mod first_record_probe;
 pub mod flightsql;
 pub mod hash_join_optimization;
 pub mod http_subquery_pushdown;

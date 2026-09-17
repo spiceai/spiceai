@@ -29,24 +29,35 @@ limitations under the License.
 //! This rule detects an [`AggregateExec`] that computes a pure grouping (no
 //! aggregate expressions — i.e. `GROUP BY`/`DISTINCT`) over a partition-only
 //! file scan reachable through multiplicity-agnostic operators, and replaces
-//! that scan with an in-memory source of one row per file carrying the file's
-//! partition values. The aggregate above collapses the duplicates, so the
-//! result is identical while no file contents are touched.
+//! that scan with a source of one row per file carrying the file's partition
+//! values. The aggregate above collapses the duplicates, so the result is
+//! identical while file contents are (almost) untouched.
 //!
-//! Safety rests on three conditions, all required:
+//! Two conditions are always required:
 //! - the aggregate has **no** aggregate expressions, so its result depends only
 //!   on the *set* of partition-column tuples, never on how many rows carry each
 //!   tuple (`count(*)`, `sum`, ... would need the real row counts and are left
-//!   untouched);
+//!   untouched); and
 //! - the scan's projected schema contains **only** partition columns, so no
-//!   file-content column is needed to answer the query; and
-//! - every file has an **exact, non-zero** row count in its statistics. An empty
-//!   file (zero rows) contributes no partition tuple to a `DISTINCT`, so emitting
-//!   one row per file unconditionally would wrongly surface an empty partition's
-//!   value. Files with `Exact(0)` rows are dropped; if any file's row count is
-//!   not exactly known (e.g. JSON/CSV without collected statistics), the scan is
-//!   left untouched. In practice this fires for formats that carry exact row
-//!   counts, such as Parquet.
+//!   file-content column is needed to answer the query.
+//!
+//! An empty file (zero rows) contributes no partition tuple to a `DISTINCT`, so
+//! a partition whose file is empty must not surface its value. How the rule
+//! learns whether a file is empty depends on what the format records, giving two
+//! replacements:
+//!
+//! - **Statistics fast path (no I/O).** When every file has an **exact** row
+//!   count in its statistics, the rule reads no file at all: it builds an
+//!   in-memory source of one row per non-empty file directly from the cached
+//!   partition values, dropping any file with `Exact(0)` rows. This fires for
+//!   formats that carry exact row counts, such as Parquet.
+//! - **First-record probe.** When any file's row count is not exactly known
+//!   (e.g. JSON/CSV without collected statistics — formats with no footer to
+//!   read a count from), the rule instead replaces the scan with a
+//!   [`FirstRecordProbeSource`], which reads at most the first record of each
+//!   file. A file that yields a record contributes one row; an empty file
+//!   yields none and its partition drops out. This decodes one record per file
+//!   instead of every row of every file.
 //!
 //! Because a partition value is constant across every row of its (non-empty)
 //! file, collapsing that file to a single row cannot change the set of partition
@@ -70,9 +81,12 @@ use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::scalar::ScalarValue;
 use datafusion_datasource::PartitionedFile;
-use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_datasource::file::FileSource;
+use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
+
+use crate::physical_plan::first_record_probe::FirstRecordProbeSource;
 
 /// A [`PhysicalOptimizerRule`] that answers a `GROUP BY`/`DISTINCT` over only
 /// partition columns from the directory listing instead of scanning file
@@ -124,13 +138,13 @@ impl PhysicalOptimizerRule for PartitionOnlyScanRewrite {
 }
 
 /// Walk down from an aggregate's input through multiplicity-agnostic operators,
-/// replacing a partition-only file scan with an in-memory source of one row per
-/// file. Returns `None` (leaving the plan unchanged) if no such scan is
-/// reachable, so the rewrite only ever fires when it is provably safe.
+/// replacing a partition-only file scan with a source of one row per file.
+/// Returns `None` (leaving the plan unchanged) if no such scan is reachable, so
+/// the rewrite only ever fires when it is provably safe.
 fn rewrite_partition_only_scan(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    if let Some(replacement) = try_partition_values_source(plan)? {
+    if let Some(replacement) = try_rewrite_partition_only_leaf(plan)? {
         return Ok(Some(replacement));
     }
 
@@ -179,41 +193,81 @@ fn is_set_preserving(plan: &Arc<dyn ExecutionPlan>) -> bool {
     false
 }
 
-/// If `plan` is a file scan whose projected schema contains only partition
-/// columns, build an in-memory source of one row per file holding that file's
-/// partition values, preserving the scan's partition count. Otherwise `None`.
-fn try_partition_values_source(
+/// If `plan` is a partition-only file scan under a pure grouping, replace it
+/// with a source of one row per file. Prefers the statistics fast path (no
+/// I/O); otherwise falls back to the first-record probe. Returns `None` if
+/// `plan` is not such a scan, leaving it unchanged.
+fn try_rewrite_partition_only_leaf(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    let Some(scan) = plan.as_ref().downcast_ref::<DataSourceExec>() else {
-        return Ok(None);
-    };
-    let Some(config) = scan.data_source().as_ref().downcast_ref::<FileScanConfig>() else {
+    let Some(config) = partition_only_file_scan(plan) else {
         return Ok(None);
     };
 
-    let partition_cols = config.table_partition_cols();
-    if partition_cols.is_empty() {
-        return Ok(None);
+    // Fast path: exact row-count statistics let us answer from the cached
+    // partition values without opening any file.
+    if let Some(source) = try_partition_values_memory_source(config)? {
+        return Ok(Some(source));
+    }
+
+    // Fallback: no exact row counts (e.g. JSON/CSV). Read at most the first
+    // record of each file to learn whether its partition contributes a tuple.
+    Ok(Some(build_first_record_probe_scan(config)))
+}
+
+/// Returns the [`FileScanConfig`] of `plan` when it is a file scan whose
+/// projected schema contains **only** partition columns and which is safe to
+/// rewrite. Otherwise `None`.
+fn partition_only_file_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&FileScanConfig> {
+    let scan = plan.as_ref().downcast_ref::<DataSourceExec>()?;
+    let config = scan
+        .data_source()
+        .as_ref()
+        .downcast_ref::<FileScanConfig>()?;
+
+    if config.table_partition_cols().is_empty() {
+        return None;
     }
 
     // When the scan is organized by partition value it advertises hash
     // partitioning on the partition columns, which a downstream aggregate may
-    // rely on for its input distribution (so no repartition was inserted). The
-    // in-memory replacement cannot advertise that partitioning, so leave such a
+    // rely on for its input distribution (so no repartition was inserted). A
+    // replacement cannot always advertise that partitioning, so leave such a
     // scan untouched rather than risk an unsatisfied distribution requirement.
     if config.partitioned_by_file_group {
-        return Ok(None);
+        return None;
     }
 
-    let projected_schema: SchemaRef = config.projected_schema()?;
+    let projected_schema = config.projected_schema().ok()?;
     if projected_schema.fields().is_empty() {
-        return Ok(None);
+        return None;
     }
+
+    // Every projected column must be a partition column; otherwise file contents
+    // are required and the scan must not be skipped.
+    let partition_cols = config.table_partition_cols();
+    let all_partition_cols = projected_schema
+        .fields()
+        .iter()
+        .all(|field| partition_cols.iter().any(|c| c.name() == field.name()));
+    if !all_partition_cols {
+        return None;
+    }
+
+    Some(config)
+}
+
+/// Statistics fast path: when every file has an **exact** row count, build an
+/// in-memory source of one row per non-empty file from the cached partition
+/// values, touching no file. Returns `None` when any file's row count is not
+/// exactly known, so the caller falls back to the first-record probe.
+fn try_partition_values_memory_source(
+    config: &FileScanConfig,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let projected_schema: SchemaRef = config.projected_schema()?;
+    let partition_cols = config.table_partition_cols();
 
     // Map each projected column to its position in the partition-value vector.
-    // Bail out the moment a projected column is not a partition column: the file
-    // contents are required and the scan must not be skipped.
     let mut partition_value_index = Vec::with_capacity(projected_schema.fields().len());
     for field in projected_schema.fields() {
         match partition_cols.iter().position(|c| c.name() == field.name()) {
@@ -231,9 +285,8 @@ fn try_partition_values_source(
         // is empty (zero rows), so emitting one row per file unconditionally
         // would wrongly surface an empty partition's value. We therefore require
         // an *exact* per-file row count: a file with `Exact(0)` is dropped, and
-        // any file whose count is not exactly known (e.g. JSON/CSV without
-        // collected statistics) forces us to leave the whole scan untouched
-        // rather than risk a wrong answer.
+        // any file whose count is not exactly known forces the fast path to bail
+        // so the first-record probe handles the scan instead.
         let mut included: Vec<&PartitionedFile> = Vec::with_capacity(group.files().len());
         for file in group.files() {
             match file.statistics.as_ref().map(|stats| &stats.num_rows) {
@@ -255,7 +308,7 @@ fn try_partition_values_source(
                 for file in &included {
                     let Some(value) = file.partition_values.get(value_idx) else {
                         // A file without the expected partition value would make
-                        // the synthesized row wrong; leave the scan untouched.
+                        // the synthesized row wrong; bail to the probe.
                         return Ok(None);
                     };
                     scalars.push(value.clone());
@@ -282,6 +335,31 @@ fn try_partition_values_source(
 
     let source = MemorySourceConfig::try_new_exec(&partitions, projected_schema, None)?;
     Ok(Some(source as Arc<dyn ExecutionPlan>))
+}
+
+/// First-record probe fallback: rebuild the scan with a [`FirstRecordProbeSource`]
+/// so each file yields at most its first record. Reuses the scan's own file
+/// groups, projection, compression, and object store; only the file source (and
+/// the batch size that bounds each read to one record) changes.
+fn build_first_record_probe_scan(config: &FileScanConfig) -> Arc<dyn ExecutionPlan> {
+    let probe: Arc<dyn FileSource> = Arc::new(FirstRecordProbeSource::new(Arc::clone(
+        config.file_source(),
+    )));
+
+    let new_config = FileScanConfigBuilder::from(config.clone())
+        .with_source(probe)
+        .with_batch_size(Some(1))
+        // A scan `limit` is applied per output partition *across* that
+        // partition's files, so it would stop the probe after the first file(s)
+        // and miss later partitions' values. A pure aggregate never pushes a
+        // limit into its input, so this only guards against surprises.
+        .with_limit(None)
+        // One row per file is not the scan's original ordering; drop the claim
+        // rather than assert an ordering the probe does not produce.
+        .with_output_ordering(vec![])
+        .build();
+
+    DataSourceExec::from_data_source(new_config)
 }
 
 #[cfg(test)]
