@@ -235,6 +235,12 @@ impl PreparedOverwrite {
     ///
     /// Returns an error if swapping the listing table fails. Other steps are best-effort.
     pub async fn finish(self) -> Result<u64> {
+        // Finish the secondary index before the visibility flip, which publishes
+        // it together with the snapshot. Finishing it after the flip would leave
+        // a window in which every lookup falls back to a full scan.
+        self.table
+            .stage_lookup_index_for_snapshot(&self.new_snapshot_id)
+            .await;
         // Publish the new snapshot as a single atomic visibility flip under the listing
         // fence (snapshot id + deletion caches + inline cache + listing swap), so a
         // concurrent scan never observes a torn state. Full rationale on
@@ -349,6 +355,9 @@ impl PreparedOverwrite {
         // writer can't acquire the lock and start a new commit while the
         // staged snapshot directory is mid-deletion.
         let _write_guard = self.write_guard;
+
+        // The snapshot these postings address is about to be deleted.
+        self.table.discard_lookup_index_build();
 
         // Best-effort cleanup of the new snapshot directory. Object stores
         // (S3) don't have a single "remove dir" call; we leave object-store
@@ -580,6 +589,11 @@ impl CayenneTableProvider {
             self.sort_overwrite_input(data, target_partitions)?;
 
         let target_size_bytes = self.target_file_size_bytes();
+        // Build the point-lookup index from the rows this write is already
+        // touching. The sink reports each batch's file and file-local position,
+        // so the index is complete when the write is — no second pass over the
+        // finished files, and nothing to rebuild after the flip.
+        let lookup_index_observer = self.begin_lookup_index_build(&new_snapshot_id);
         // Overwrite replaces the entire table, and anything that reached here did
         // not fit the inline caps, so it is large by definition; shard across the
         // full write concurrency (no size cap on the fan-out). Deliberately NOT
@@ -589,22 +603,36 @@ impl CayenneTableProvider {
         // The shards cover the key ranges `overwrite_range_plan` chose, when it
         // found a key to split; it declines for the sorted and clustered replaces
         // above, which keep their single serial writer.
-        let (row_count, _files_written, write_stats_acc) = self
-            .write_to_snapshot_range_partitioned(
-                data,
-                target_size_bytes,
-                &new_snapshot_id,
-                target_partitions,
-                None,
-                write_policy,
-                range_plan.as_ref().map(OverwriteRangePlan::partitioning),
-            )
-            .await?;
-
-        if !is_s3 {
-            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
-            Self::sync_snapshot_dir(&snapshot_dir).await?;
+        let written: Result<_> = async {
+            let written = self
+                .write_to_snapshot_range_partitioned(
+                    data,
+                    target_size_bytes,
+                    &new_snapshot_id,
+                    target_partitions,
+                    None,
+                    write_policy,
+                    range_plan.as_ref().map(OverwriteRangePlan::partitioning),
+                    lookup_index_observer,
+                )
+                .await?;
+            if !is_s3 {
+                let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+                Self::sync_snapshot_dir(&snapshot_dir).await?;
+            }
+            Ok(written)
         }
+        .await;
+        // A write that fails before it is prepared never reaches `rollback`, so
+        // its partial index build is dropped here rather than held until the
+        // next refresh.
+        let (row_count, _files_written, write_stats_acc) = match written {
+            Ok(written) => written,
+            Err(error) => {
+                self.discard_lookup_index_build();
+                return Err(error);
+            }
+        };
 
         // Manifest snapshot model: reserve ONE sequence `S` for this overwrite
         // and AUTHOR the new snapshot's manifest with `[S, S]` — every file was
