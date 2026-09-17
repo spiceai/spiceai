@@ -334,7 +334,7 @@ silently disabled optimization rather than a build failure:
 | Analyzer: table rewrites resolve existing output names and preserve aliases and field metadata, including UNNEST projections (federation PR #84) | Computed output references stop resolving or explicit user aliases and metadata change | silent (query failure / output schema) | Real-engine grouped-expression cards in `test/scripts/bigquery_pushdown.py`; in the fork, `test_rewrite_table_scans_moves_a_pinned_name_with_its_table`, quoted user-alias controls, and `test_rewrite_unnest_preserves_alias_metadata` |
 | Schema cast is strict, so a value that will not fit its declared type errors instead of becoming NULL (federation PR #67) | `SchemaCastScanExec` brings every batch a remote returns to the schema the plan declared. Arrow's default cast is the *safe* one: a value the target type cannot hold becomes NULL rather than an error. So a federated column read one width too narrow — a remote `BIGINT` the plan typed `INT`, which is what a schema inferred from one source and used against another gives — answers with NULLs where the remote sent numbers, on a query that reports success | silent (wrong data) | `crates/data_components/src/federation.rs::a_federated_value_too_wide_for_its_declared_type_is_an_error_not_a_null`, which casts one past `i32::MAX` and requires the error, with an in-range value as the control so a cast that refused everything could not pass |
 | DML plans are returned unwrapped rather than federated (federation PR #73) | The analyzer wraps the largest federable sub-tree in a `FederatedPlanNode`, and a `Dml` node over a federated table qualifies. Wrapped, it cannot be rendered — the unparser has no `dml_to_sql` — and `DataFusion`'s physical planner dispatches `delete_from`/`update` by matching `LogicalPlan::Dml`, which it cannot do through a `LogicalPlan::Extension`, so `INSERT`/`UPDATE`/`DELETE` against a federated table stops working. The fork gives a third reason, that a wrapped `Dml` is invisible to a write-permission validator that walks for it; that is the fork's rationale rather than a claim reproduced here, because `validate_sql_query_operations` runs on the plan `create_logical_plan` returns and analyzer rules have not run at that point | silent (query failure) | `crates/data_components/src/federation.rs::nothing_under_a_dml_plan_is_federated_by_the_analyzer`, which asserts on the `Dml`'s *input* rather than its root: losing the patch federates what sits under the node rather than replacing it, so the root is a `Dml` either way. Its control establishes that the input is a shape the analyzer really does federate, without which the assertion would hold for the wrong reason — and a `Limit` is used rather than a filter because a filter is pushed into the scan before federation runs, collapsing the plan to a bare `TableScan` that the adaptor serves itself and the analyzer leaves alone. The fork's own `dml_plan_is_returned_unchanged` builds its DML over a plain table, where the early return is not what makes it pass |
-| `EXISTS`/`NOT EXISTS` subqueries are seen and federated by the analyzer (federation PR #74) | `Expr::Exists` fell through the expression walk, so the tables inside an `EXISTS` subquery were invisible to the provider verdict and the subquery was never federated: it executes locally, one scan per table reference, while the statement around it federates — the shape the scanless-correlation row above was measured at, 24 statements where one was correct. The patch also wraps a federated subquery in a no-op `Projection`, because `DecorrelatePredicateSubquery` will not take a `LogicalPlan::Extension` as a subquery and leaves the correlation undecorrelated otherwise | silent (perf, badly) | **GAP** — in the fork, seven `sql/mod.rs` snapshots across same-provider, cross-provider and mixed-provider shapes, which leave with the patch |
+| `EXISTS`/`NOT EXISTS` subqueries are seen and federated by the analyzer (federation PR #74) | `Expr::Exists` fell through the expression walk, so the tables inside an `EXISTS` subquery were invisible to the provider verdict and the subquery was never federated: it executes locally, one scan per table reference, while the statement around it federates — the shape the scanless-correlation row above was measured at, 24 statements where one was correct. The patch also wraps a federated subquery in a no-op `Projection`, because `DecorrelatePredicateSubquery` will not take a `LogicalPlan::Extension` as a subquery and leaves the correlation undecorrelated otherwise | silent (perf, badly) | `crates/data_components/src/federation.rs::an_exists_subquery_over_a_federated_table_is_federated`, whose outer table is deliberately *not* federated so the statement cannot federate as one unit — it asserts nothing outside the subquery is wrapped, and then that the subquery is, so the second assertion cannot be met by the wrong node. In the fork, seven `sql/mod.rs` snapshots across same-provider, cross-provider and mixed-provider shapes, which leave with the patch |
 | ADBC schema fetch leaves a query's own `WITH` at the top level (table-providers PR #71) | A driver using the query-based schema fallback nests `WITH RECURSIVE` inside the schema-probe CTE, which BigQuery rejects | silent (query failure) | `test/scripts/bigquery_pushdown.py::recursive-cte-joined-to-a-table`, which executes through the real driver; EXPLAIN alone does not exercise schema discovery |
 | Analyzer: federate a statement whose only tables are inside a subquery — `contains_federated_table` descends into subquery expressions, and a correlated reference to a relation that scans nothing is neutral rather than ambiguous | A query whose outer `FROM` is a constant relation and whose federated tables are all inside a scalar/`IN`/`EXISTS` subquery is not federated *at all, in any part*: the analyzer returns before doing anything, or the unresolved correlation reads as a second engine and that verdict propagates through every enclosing node. The statement reaches the engine as one scan per table reference — each re-executed for every place the plan mentions it — with every join and aggregate evaluated locally. A dashboard card of this shape was measured at 24 statements where one was correct | silent (perf, badly) | `datafusion-federation/src/sql/mod.rs::tests::a_correlation_against_a_scanless_relation_federates_as_one_statement` (in the fork, with `::a_correlation_against_a_scanning_relation_still_federates_as_one_statement` as the control); real-engine guard: `test/scripts/bigquery-pushdown.sh::correlated-subquery-over-constant-relation`. The neutral verdict is deliberately narrow — it needs a unique relation of that name that scans nothing — because binding a correlation to the wrong relation of the same name would return wrong rows rather than fail |
 
@@ -581,7 +581,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**20 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**19 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -600,22 +600,14 @@ They are not equal in consequence; this is the order to close them in.
 
 3. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
    resilience (fork PRs #61–#63).
-**Pushdown that silently stops happening.** No wrong rows, but the work moves off
-the remote and onto us:
-
-4. `datafusion-federation` `EXISTS`/`NOT EXISTS` subqueries seen by the analyzer
-   (federation PR #74) — the subquery's tables are invisible to the provider
-   verdict, so it runs locally, one scan per table reference, while the statement
-   around it federates.
-
 **Blocked, not merely undone.** These have been looked at and cannot be closed by
 writing a test; each says what would unblock it:
 
-5. `snowflake-rs` (five rows) — no host override, private response types. Needs a
+4. `snowflake-rs` (five rows) — no host override, private response types. Needs a
    live account, or an upstream change letting the base URL be set.
-6. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
+5. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
    race, so any test of it is a timing test.
-7. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
+6. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
    there is no behaviour of ours to assert on.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
@@ -624,7 +616,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-8. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+7. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
    `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
    `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
    `snowflake-rs` streaming batches (memory, not latency — but see the
