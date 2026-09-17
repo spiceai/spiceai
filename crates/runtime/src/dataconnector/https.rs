@@ -1617,16 +1617,19 @@ fn parse_http_json_nesting(dataset: &DatasetSpec) -> DataConnectorResult<Option<
         metadata_fields.insert("_fetched_at".to_string());
     }
 
-    // `caching_stale_if_error` tells a transient origin failure from real
-    // data by the row's `response_status` (see `cache::batches_cacheable`).
-    // Force it into the schema the same way as `_fetched_at` above, so the
-    // fallback actually engages for a JSON-decomposed dataset instead of
-    // silently never detecting the failure because the column never existed.
-    let stale_if_error_enabled = dataset
+    // `cache::batches_cacheable` tells a transient origin failure from real
+    // data by the row's `response_status`. `refresh_mode: caching` calls it on
+    // every fetch regardless of `caching_stale_if_error` — an unrecognized 5xx
+    // gets cached as if it were good data either way, only the fallback
+    // behavior on top of that differs. Force the column into the schema the
+    // same way as `_fetched_at` above, for every caching-mode dataset, so
+    // detection actually works for a JSON-decomposed one instead of silently
+    // never engaging because the column never existed.
+    let is_caching_mode = dataset
         .acceleration
         .as_ref()
-        .is_some_and(|acceleration| acceleration.caching_stale_if_error.serves_stale_on_error());
-    if stale_if_error_enabled && !column_order.iter().any(|n| n == "response_status") {
+        .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Caching));
+    if is_caching_mode && !column_order.iter().any(|n| n == "response_status") {
         column_order.push("response_status".to_string());
         metadata_fields.insert("response_status".to_string());
     }
@@ -3740,12 +3743,15 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         assert!(nesting.static_fields().contains("id"));
     }
 
-    /// Regression test for #14157: without this, a `refresh_mode: caching`
-    /// dataset with `caching_stale_if_error: enabled` that decomposes JSON
-    /// into named columns never carries `response_status` unless the user
-    /// happens to declare it, so `cache::batches_cacheable` can never see a
-    /// transient origin failure and the stale-if-error fallback silently
-    /// never engages.
+    /// Regression test for #14156/#14157: without this, a `refresh_mode:
+    /// caching` dataset that decomposes JSON into named columns never carries
+    /// `response_status` unless the user happens to declare it, so
+    /// `cache::batches_cacheable` can never see a transient origin failure —
+    /// not just for the stale-if-error fallback, but for the unconditional
+    /// "don't cache a 5xx as if it were data" check every caching-mode fetch
+    /// goes through. Forced regardless of `caching_stale_if_error`: leaving it
+    /// out when stale-if-error happens to be disabled would still let a 5xx
+    /// silently overwrite the last good cached entry.
     #[tokio::test]
     async fn parse_http_json_nesting_force_includes_response_status_when_stale_if_error_enabled() {
         let mut dataset = test_dataset("http://example.com/api", RefreshMode::Caching, None).await;
@@ -3773,7 +3779,8 @@ uGgYIHbi/F+GaiUPzDyqe5p9
     }
 
     #[tokio::test]
-    async fn parse_http_json_nesting_leaves_response_status_out_when_stale_if_error_disabled() {
+    async fn parse_http_json_nesting_force_includes_response_status_even_when_stale_if_error_disabled()
+     {
         let mut dataset = test_dataset("http://example.com/api", RefreshMode::Caching, None).await;
         dataset.acceleration = Some(Acceleration {
             enabled: true,
@@ -3792,8 +3799,34 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             .expect("expected Some(nesting) when marker is present");
 
         assert!(
+            nesting.column_order.iter().any(|n| n == "response_status"),
+            "batches_cacheable's unconditional 'don't cache a 5xx as data' check needs \
+            response_status regardless of caching_stale_if_error"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_leaves_response_status_out_when_not_caching_mode() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            refresh_mode: Some(RefreshMode::Append),
+            ..Default::default()
+        });
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("version"),
+            column_with_marker("extra", Value::String("*".to_string())),
+        ];
+
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting) when marker is present");
+
+        assert!(
             !nesting.column_order.iter().any(|n| n == "response_status"),
-            "response_status should not appear unless stale-if-error needs it"
+            "response_status is only meaningful for refresh_mode: caching, which \
+            is the only mode that ever calls cache::batches_cacheable"
         );
     }
 

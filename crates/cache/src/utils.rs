@@ -19,6 +19,7 @@ use std::{collections::HashSet, sync::Arc};
 use arrow::array::{RecordBatch, UInt16Array};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::DataType;
+use arrow_tools::metadata_keys::HTTP_RESPONSE_STATUS_METADATA_KEY;
 use datafusion::{
     common::tree_node::TreeNodeRecursion, execution::SendableRecordBatchStream,
     logical_expr::LogicalPlan, physical_plan::stream::RecordBatchStreamAdapter,
@@ -32,14 +33,6 @@ use async_stream::stream;
 use futures::StreamExt;
 
 pub const RESPONSE_STATUS_COLUMN: &str = "response_status";
-
-/// The HTTP connector's fetch-timestamp column, always present on a
-/// `refresh_mode: caching` HTTP dataset — unconditionally on the default
-/// schema, and force-included by `parse_http_json_nesting` even when the
-/// user decomposes the response into named `columns:`. Checked alongside
-/// [`RESPONSE_STATUS_COLUMN`] in [`is_http_result_batch`] as a two-column
-/// fingerprint of a genuine HTTP connector response.
-const FETCHED_AT_COLUMN: &str = "_fetched_at";
 
 /// Filter out transient HTTP error responses (5xx server errors and 429 Too Many Requests)
 /// from record batches before caching.
@@ -104,28 +97,33 @@ pub fn filter_transient_error_responses(batches: &[RecordBatch]) -> Vec<RecordBa
     result
 }
 
-/// Whether `batch`'s schema looks like a genuine HTTP connector response
-/// rather than an unrelated dataset that happens to name a column
-/// `response_status`.
+/// Whether `batch`'s `response_status` column was produced by the HTTP
+/// connector, rather than an unrelated dataset that happens to have a
+/// same-named, same-typed column of its own.
 ///
-/// Requiring every column to be a known HTTP metadata field (the original
-/// check) rejects any batch that mixes metadata with other columns — which
-/// is exactly what a JSON-decomposed HTTP dataset (`columns:` +
+/// The original check required every column in the batch to be a known HTTP
+/// metadata field, which rejects any batch that mixes metadata with other
+/// columns — exactly what a JSON-decomposed HTTP dataset (`columns:` +
 /// `json_object: "*"`) does by design, so it never matched and
 /// `caching_stale_if_error` silently never detected a transient failure for
-/// one (#14157). Matching on `response_status` being `UInt16` together with
-/// `_fetched_at` being present is a two-column fingerprint instead: both are
-/// always populated together on a real HTTP connector response (see
-/// `FETCHED_AT_COLUMN`), and an unrelated dataset would need to coincide on
-/// both a `UInt16` `response_status` and a same-named `_fetched_at` column to
-/// false-positive.
+/// one (#14157). But inferring HTTP provenance from column names and types
+/// alone is not sound either way: `refresh_mode: caching` also applies to
+/// non-HTTP connectors (e.g. `localpod`), and a business dataset can
+/// legitimately have its own `response_status: UInt16` and `_fetched_at`
+/// columns, where a value of `503` is real data, not an origin failure.
+/// Checking [`HTTP_RESPONSE_STATUS_METADATA_KEY`] on the field itself is an
+/// authoritative signal instead of a heuristic: only the HTTP connector's own
+/// `base_table_schema` sets it, and `build_json_nest_schema` carries it
+/// through by cloning that same `Field` when the column is force-included
+/// (see `parse_http_json_nesting` in `runtime::dataconnector::https`).
 fn is_http_result_batch(batch: &RecordBatch) -> bool {
-    let schema = batch.schema();
-
-    schema
+    batch
+        .schema()
         .field_with_name(RESPONSE_STATUS_COLUMN)
-        .is_ok_and(|field| field.data_type() == &DataType::UInt16)
-        && schema.column_with_name(FETCHED_AT_COLUMN).is_some()
+        .is_ok_and(|field| {
+            field.data_type() == &DataType::UInt16
+                && field.metadata().get(HTTP_RESPONSE_STATUS_METADATA_KEY) == Some(&"1".to_string())
+        })
 }
 
 fn has_transient_http_error_responses(batches: &[RecordBatch]) -> bool {
@@ -973,17 +971,29 @@ pub(crate) mod tests {
         ]))
     }
 
-    /// Like [`create_http_response_schema`], plus `_fetched_at` — the second
-    /// half of the [`is_http_result_batch`] fingerprint. Tests exercising
-    /// `batches_cacheable`/`has_transient_http_error_responses` need this one;
-    /// `filter_transient_error_responses` tests don't check the fingerprint at
-    /// all, so they stay on the two-column schema above.
+    /// Tags a `response_status` field the way the real HTTP connector's
+    /// `base_table_schema` does, so it is recognized by
+    /// [`is_http_result_batch`]. See [`HTTP_RESPONSE_STATUS_METADATA_KEY`].
+    fn http_response_status_field() -> Field {
+        Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false).with_metadata(
+            std::collections::HashMap::from([(
+                HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+                "1".to_string(),
+            )]),
+        )
+    }
+
+    /// Like [`create_http_response_schema`], plus a tagged `response_status`
+    /// and `_fetched_at` — what [`is_http_result_batch`] actually checks.
+    /// Tests exercising `batches_cacheable`/`has_transient_http_error_responses`
+    /// need this one; `filter_transient_error_responses` tests don't check
+    /// provenance at all, so they stay on the untagged schema above.
     fn create_http_response_schema_with_fetched_at() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("content", DataType::Utf8, false),
-            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+            http_response_status_field(),
             Field::new(
-                FETCHED_AT_COLUMN,
+                "_fetched_at",
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
                 true,
             ),
@@ -1217,7 +1227,7 @@ pub(crate) mod tests {
             Field::new("request_body", DataType::Utf8, true),
             Field::new("request_headers", DataType::Utf8, true),
             Field::new("content", DataType::Utf8, false),
-            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+            http_response_status_field(),
             Field::new("response_headers", DataType::Utf8, true),
             Field::new(
                 "_fetched_at",

@@ -1111,7 +1111,12 @@ impl HttpTableProvider {
             Field::new("request_body", DataType::Utf8, true),
             Field::new("request_headers", DataType::Utf8, true),
             Field::new("content", DataType::Utf8, false),
-            Field::new("response_status", DataType::UInt16, false),
+            Field::new("response_status", DataType::UInt16, false).with_metadata(
+                std::collections::HashMap::from([(
+                    crate::HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+                    "1".to_string(),
+                )]),
+            ),
             Field::new(
                 "response_headers",
                 DataType::Map(
@@ -2239,6 +2244,22 @@ impl HttpExec {
         content_rows: &[String],
         fetch_result: &HttpFetchResult,
     ) -> DataFusionResult<RecordBatch> {
+        // A body that decomposes to zero rows is ambiguous on its own: for a 2xx
+        // response it is a legitimate empty result, but for a retryable failure
+        // (5xx/429, e.g. an empty or `[]` error body) it must still surface as one
+        // metadata-carrying row. Dropping it to a genuinely empty batch here
+        // discards `response_status` entirely, leaving `cache::batches_cacheable`
+        // nothing to see — the failure becomes indistinguishable from a real empty
+        // result, which is the empty-result shape #14157 was reported against.
+        let placeholder_row = [String::new()];
+        let content_rows: &[String] = if content_rows.is_empty()
+            && HttpTableProvider::is_retryable_status(fetch_result.response_status)
+        {
+            &placeholder_row
+        } else {
+            content_rows
+        };
+
         let num_rows = content_rows.len();
 
         if num_rows == 0 {

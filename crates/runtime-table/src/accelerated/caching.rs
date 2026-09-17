@@ -2666,6 +2666,7 @@ mod tests {
         Int32Array, RecordBatch, StringArray, TimestampNanosecondArray, UInt16Array,
     };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow_tools::metadata_keys::HTTP_RESPONSE_STATUS_METADATA_KEY;
     use async_trait::async_trait;
     use cache::utils::RESPONSE_STATUS_COLUMN;
     use datafusion::catalog::Session;
@@ -2996,7 +2997,15 @@ mod tests {
                 Field::new("request_path", DataType::Utf8, true),
                 Field::new("request_query", DataType::Utf8, true),
                 Field::new("content", DataType::Utf8, true),
-                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+                // Tagged the way the real HTTP connector's `base_table_schema`
+                // tags it, so `cache::is_http_result_batch` recognizes it —
+                // see `HTTP_RESPONSE_STATUS_METADATA_KEY`.
+                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false).with_metadata(
+                    std::collections::HashMap::from([(
+                        HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+                        "1".to_string(),
+                    )]),
+                ),
                 Field::new(
                     CACHE_REFRESHED_AT_COLUMN,
                     DataType::Timestamp(TimeUnit::Nanosecond, None),
