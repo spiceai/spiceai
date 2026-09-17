@@ -3804,7 +3804,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         dataset.acceleration = Some(Acceleration {
             enabled: true,
             refresh_mode: Some(RefreshMode::Caching),
-            caching_stale_if_error: StaleIfError::For(std::time::Duration::from_secs(60)),
+            caching_stale_if_error: StaleIfError::For(std::time::Duration::from_mins(1)),
             ..Default::default()
         });
         dataset.columns = vec![
