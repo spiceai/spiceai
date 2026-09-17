@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use super::write_observer::VortexWriteObserver;
 use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -258,6 +259,7 @@ struct WriteOutputOptions<'a> {
     partition_column_names: &'a [String],
     keep_partition_by_columns: bool,
     shard_spec: &'a ShardSpec,
+    write_observer: Option<&'a Arc<dyn VortexWriteObserver>>,
 }
 
 #[derive(Clone, Copy)]
@@ -323,6 +325,7 @@ pub struct VortexSink {
     session: VortexSession,
     target_file_size: Option<u64>,
     shard_spec: ShardSpec,
+    write_observer: Option<Arc<dyn VortexWriteObserver>>,
 }
 
 impl VortexSink {
@@ -332,6 +335,7 @@ impl VortexSink {
         session: VortexSession,
         target_file_size: Option<u64>,
         shard_spec: ShardSpec,
+        write_observer: Option<Arc<dyn VortexWriteObserver>>,
     ) -> Self {
         Self {
             config,
@@ -339,6 +343,7 @@ impl VortexSink {
             session,
             target_file_size,
             shard_spec,
+            write_observer,
         }
     }
 
@@ -499,6 +504,7 @@ impl DataSink for VortexSink {
                 partition_column_names: &partition_column_names,
                 keep_partition_by_columns: self.config.keep_partition_by_columns,
                 shard_spec: &self.shard_spec,
+                write_observer: self.write_observer.as_ref(),
             },
         )
         .await?;
@@ -553,6 +559,7 @@ async fn write_record_batch_stream_to_files(
     mut data: SendableRecordBatchStream,
     output_options: &WriteOutputOptions<'_>,
 ) -> DFResult<Vec<(Path, WriteSummary)>> {
+    let write_observer = output_options.write_observer.map(Arc::clone);
     let target = output_options.target_file_size.map(|t| t.max(1));
     let single_file_output = !output_options.base_output_path.is_collection()
         && output_options.base_output_path.file_extension().is_some();
@@ -591,6 +598,7 @@ async fn write_record_batch_stream_to_files(
             shard_id,
             num_shards,
             Arc::clone(&started_paths),
+            write_observer.clone(),
         )));
     }
 
@@ -705,10 +713,14 @@ async fn run_shard_writer(
     shard_id: usize,
     num_shards: usize,
     started_paths: Arc<Mutex<HashSet<Path>>>,
+    write_observer: Option<Arc<dyn VortexWriteObserver>>,
 ) -> DFResult<Vec<(Path, WriteSummary)>> {
     let mut results: Vec<(Path, WriteSummary)> = Vec::new();
     let mut active_writer: Option<ActiveFileWriter> = None;
     let mut uncompressed_bytes_in_file = 0_u64;
+    // Physical rows already appended to the ACTIVE file. Reset with the file, so
+    // it is the file-local position of the next batch's first row.
+    let mut rows_in_file = 0_u64;
     let mut file_index = 0_usize;
     let mut compression_estimate = CompressionEstimate::identity();
 
@@ -734,6 +746,19 @@ async fn run_shard_writer(
             }
 
             let batch_bytes = batch_uncompressed_bytes(&batch)?;
+            // Report placement BEFORE the append: the position is decided by
+            // arrival order, and a failed send fails the whole write, so an
+            // observer can never be left holding positions for rows that were
+            // not written.
+            if let Some(observer) = write_observer.as_ref() {
+                let writer = active_writer.as_ref().ok_or_else(|| {
+                    exec_datafusion_err!("Missing active file writer while observing a batch")
+                })?;
+                observer.batch_written(&writer.path, rows_in_file, &batch);
+            }
+            rows_in_file = rows_in_file
+                .checked_add(batch.num_rows() as u64)
+                .ok_or_else(|| exec_datafusion_err!("Row counter overflow for sink output file"))?;
             send_batch_to_active_writer(&mut active_writer, batch).await?;
             let active_path = active_writer
                 .as_ref()
@@ -772,6 +797,8 @@ async fn run_shard_writer(
 
                     results.push((file_path, summary));
                     uncompressed_bytes_in_file = 0;
+                    // Positions are file-local, so the counter resets with the file.
+                    rows_in_file = 0;
                     file_index += 1;
                 }
             }
@@ -2474,6 +2501,7 @@ mod tests {
                 partition_column_names: &[],
                 keep_partition_by_columns: false,
                 shard_spec: &shard_spec,
+                write_observer: None,
             },
         )
         .await

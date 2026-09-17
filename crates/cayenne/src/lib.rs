@@ -83,6 +83,13 @@ pub(crate) mod partition_creator;
 pub(crate) mod partition_naming;
 pub mod provider;
 pub(crate) mod resource_starvation;
+/// Probe and build accounting for a table's secondary indexes (the
+/// acceleration's `indexes`), so a check can prove a query used row selection
+/// rather than silently falling back to an ordinary scan.
+pub mod lookup_index {
+    pub use crate::provider::lookup_index::{LookupIndexCounters, LookupIndexVerification};
+}
+
 pub mod row_converter;
 pub(crate) mod schema;
 pub mod stats;
