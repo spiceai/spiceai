@@ -110,13 +110,13 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// - Connection/timeout errors from reqwest
 /// - JSON decode errors (often due to truncated responses from timeouts)
 ///
-/// Note: `Error::RateLimited` is NOT retriable here because rate limiting is handled
-/// proactively by the `RateLimiter` trait via `check_rate_limit()`, which sleeps until
-/// the rate limit reset time. Any `RateLimited` error reaching this point indicates
-/// an unexpected issue that shouldn't be retried with additional backoff delays.
+/// `Error::RateLimited` is retriable: GitHub's secondary/CPU cap is reported on
+/// the response (`retry-after` + HTTP 403), after `check_rate_limit()` already
+/// ran. The next attempt waits on those headers instead of failing the scan.
 #[must_use]
 pub fn is_retriable_error(error: &Error) -> bool {
     match error {
+        Error::RateLimited { .. } => true,
         Error::InvalidReqwestStatus { status, .. } => {
             status.is_server_error() || *status == StatusCode::REQUEST_TIMEOUT
         }
@@ -317,6 +317,17 @@ mod tests {
                 "JsonDecodeError with client status {status} should NOT be retriable"
             );
         }
+    }
+
+    #[test]
+    fn rate_limited_is_retriable() {
+        let error = Error::RateLimited {
+            message: "GitHub API rate limit exceeded".to_string(),
+        };
+        assert!(
+            is_retriable_error(&error),
+            "a 403 secondary rate limit must retry the same page after retry-after"
+        );
     }
 
     #[test]

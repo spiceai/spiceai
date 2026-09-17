@@ -96,11 +96,11 @@ pub struct SecondaryRateLimitInfo {
 // See https://docs.github.com/en/graphql/overview/rate-limits-and-node-limits-for-the-graphql-api#checking-the-status-of-your-primary-rate-limit
 impl RateLimitInfo {
     pub fn from_headers(headers: &HeaderMap) -> Option<Self> {
-        let primary = Self::primary_rate_limit_from_headers(headers).map(RateLimitInfo::Primary);
-
-        primary.or_else(|| {
-            Self::secondary_rate_limit_from_headers(headers).map(RateLimitInfo::Secondary)
-        })
+        // `retry-after` means stop now, even if primary remaining is still high.
+        // GitHub's secondary/CPU cap returns 403 with both header families set.
+        Self::secondary_rate_limit_from_headers(headers)
+            .map(RateLimitInfo::Secondary)
+            .or_else(|| Self::primary_rate_limit_from_headers(headers).map(RateLimitInfo::Primary))
     }
 
     fn secondary_rate_limit_from_headers(headers: &HeaderMap) -> Option<SecondaryRateLimitInfo> {
@@ -173,70 +173,104 @@ impl RateLimiter for GitHubRateLimiter {
     }
 
     async fn check_rate_limit(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Check if we're rate limited based on the previous API response headers
-        let api_limit_guard = self.api_limit.read().await;
-        if let Some(api_limit) = &*api_limit_guard {
-            match api_limit {
-                RateLimitInfo::Secondary(secondary) => {
-                    let now = Utc::now();
-                    let wait_duration = (secondary.retry_after - now)
-                        .to_std()
-                        .unwrap_or(Duration::from_secs(1));
-                    let wait_duration_secs = wait_duration.as_secs();
-                    tracing::warn!(
-                        "GitHub API secondary rate limit exceeded. Waiting for {} second{} until {} before sending another request.",
-                        wait_duration_secs,
-                        if wait_duration_secs == 1 { "" } else { "s" },
-                        secondary.retry_after
-                    );
-                    tokio::time::sleep(wait_duration).await;
+        enum Wait {
+            Secondary {
+                until: DateTime<Utc>,
+            },
+            Primary {
+                until: DateTime<Utc>,
+                resource: String,
+                remaining: i32,
+                limit: i32,
+                used: i32,
+            },
+        }
+
+        let wait = {
+            let api_limit_guard = self.api_limit.read().await;
+            match &*api_limit_guard {
+                Some(RateLimitInfo::Secondary(secondary)) if Utc::now() < secondary.retry_after => {
+                    Some(Wait::Secondary {
+                        until: secondary.retry_after,
+                    })
                 }
-                RateLimitInfo::Primary(primary) => {
-                    // GitHub GraphQL requests can consume more than 1 rate-limit unit, so keep a
-                    // small percentage-based buffer without stalling low-limit unauthenticated REST traffic.
-                    if primary.remaining <= primary_rate_limit_buffer(primary.limit) {
-                        let now = Utc::now();
-                        if now < primary.reset_time {
-                            let wait_duration = (primary.reset_time - now)
-                                .to_std()
-                                .unwrap_or(Duration::from_secs(1));
-                            let wait_duration_secs = wait_duration.as_secs();
-                            tracing::warn!(
-                                "GitHub API primary rate limit is nearly exhausted for {}. Waiting for {} second{} until {}. Remaining: {}, Limit: {}, Used: {}",
-                                primary.resource,
-                                wait_duration_secs,
-                                if wait_duration_secs == 1 { "" } else { "s" },
-                                primary.reset_time,
-                                primary.remaining,
-                                primary.limit,
-                                primary.used,
-                            );
-                            tokio::time::sleep(wait_duration).await;
-                        }
+                Some(RateLimitInfo::Primary(primary))
+                    if primary.remaining <= primary_rate_limit_buffer(primary.limit)
+                        && Utc::now() < primary.reset_time =>
+                {
+                    Some(Wait::Primary {
+                        until: primary.reset_time,
+                        resource: primary.resource.clone(),
+                        remaining: primary.remaining,
+                        limit: primary.limit,
+                        used: primary.used,
+                    })
+                }
+                Some(RateLimitInfo::Primary(primary)) => {
+                    let usage_percent =
+                        (f64::from(primary.used) / f64::from(primary.limit)) * 100.0;
+                    if usage_percent >= 80.0 {
+                        tracing::warn!(
+                            "GitHub API rate limit is getting low for {}: {}/{} remaining ({:.1}% used). Reset at {}",
+                            primary.resource,
+                            primary.remaining,
+                            primary.limit,
+                            usage_percent,
+                            primary.reset_time
+                        );
                     } else {
-                        let usage_percent =
-                            (f64::from(primary.used) / f64::from(primary.limit)) * 100.0;
-                        if usage_percent >= 80.0 {
-                            tracing::warn!(
-                                "GitHub API rate limit is getting low for {}: {}/{} remaining ({:.1}% used). Reset at {}",
-                                primary.resource,
-                                primary.remaining,
-                                primary.limit,
-                                usage_percent,
-                                primary.reset_time
-                            );
-                        } else {
-                            tracing::trace!(
-                                "GitHub API rate limit status for {}: {}/{} remaining. Reset at {}",
-                                primary.resource,
-                                primary.remaining,
-                                primary.limit,
-                                primary.reset_time
-                            );
-                        }
+                        tracing::trace!(
+                            "GitHub API rate limit status for {}: {}/{} remaining. Reset at {}",
+                            primary.resource,
+                            primary.remaining,
+                            primary.limit,
+                            primary.reset_time
+                        );
                     }
+                    None
                 }
+                _ => None,
             }
+        };
+
+        match wait {
+            Some(Wait::Secondary { until }) => {
+                let wait_duration = (until - Utc::now())
+                    .to_std()
+                    .unwrap_or(Duration::from_secs(1));
+                let wait_duration_secs = wait_duration.as_secs();
+                tracing::warn!(
+                    "GitHub API secondary rate limit exceeded. Waiting for {} second{} until {} before sending another request.",
+                    wait_duration_secs,
+                    if wait_duration_secs == 1 { "" } else { "s" },
+                    until
+                );
+                tokio::time::sleep(wait_duration).await;
+            }
+            Some(Wait::Primary {
+                until,
+                resource,
+                remaining,
+                limit,
+                used,
+            }) => {
+                let wait_duration = (until - Utc::now())
+                    .to_std()
+                    .unwrap_or(Duration::from_secs(1));
+                let wait_duration_secs = wait_duration.as_secs();
+                tracing::warn!(
+                    "GitHub API primary rate limit is nearly exhausted for {}. Waiting for {} second{} until {}. Remaining: {}, Limit: {}, Used: {}",
+                    resource,
+                    wait_duration_secs,
+                    if wait_duration_secs == 1 { "" } else { "s" },
+                    until,
+                    remaining,
+                    limit,
+                    used,
+                );
+                tokio::time::sleep(wait_duration).await;
+            }
+            None => {}
         }
 
         Ok(())
@@ -453,23 +487,22 @@ mod tests {
 
     #[test]
     fn test_rate_limit_header_precedence() {
-        // Test that primary rate limit is preferred when both types of headers are present
         let headers = create_test_headers(HashMap::from([
             ("x-ratelimit-limit", s("5000")),
-            ("x-ratelimit-remaining", s("4999")),
-            ("x-ratelimit-used", s("1")),
+            ("x-ratelimit-remaining", s("1766")),
+            ("x-ratelimit-used", s("3234")),
             (
                 "x-ratelimit-reset",
                 (Utc::now() + Duration::hours(1)).timestamp().to_string(),
             ),
             ("x-ratelimit-resource", s("graphql")),
-            ("retry-after", s("30")), // This should be ignored when primary headers are present
+            ("retry-after", s("30")),
         ]));
 
         let rate_limit = RateLimitInfo::from_headers(&headers);
         match rate_limit {
-            Some(RateLimitInfo::Primary(_)) => (),
-            _ => panic!("Expected Primary rate limit info when both header types are present"),
+            Some(RateLimitInfo::Secondary(_)) => (),
+            _ => panic!("retry-after must win over primary remaining"),
         }
     }
 
