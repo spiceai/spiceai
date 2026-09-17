@@ -888,7 +888,7 @@
           "default": "none"
         },
         "warmup": {
-          "description": "Replay recorded query plans into the results cache after the first full/append refresh. Requires `enabled`. Default: `disabled`.",
+          "description": "Replay recorded query plans into the results cache after the first full/append refresh. Datasets stay not ready until warmup completes. Requires `enabled`. Default: `disabled`.",
           "allOf": [
             {
               "$ref": "#/$defs/ResultsCacheWarmup"
@@ -912,7 +912,7 @@
           "const": "disabled"
         },
         {
-          "description": "After the first full/append refresh, replay the first 10 distinct query plans (equality-filter values taken from distinct keys in the dataset) until the cache is full. Later refreshes do not re-warm.",
+          "description": "After the first full/append refresh, replay the first 10 distinct query plans (equality-filter values taken from distinct keys in the dataset) until the cache is full. Datasets stay not ready until that warmup completes. Later refreshes do not re-warm.",
           "type": "string",
           "const": "on_first_refresh"
         }

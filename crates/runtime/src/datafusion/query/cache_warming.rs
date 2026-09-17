@@ -23,7 +23,8 @@ limitations under the License.
 //! under `.spice/data`, or to `runtime.state.location` when that is set. After
 //! a process restart, once accelerated full/append datasets finish their first
 //! refresh, those shapes are replayed with `SELECT DISTINCT` of the bound
-//! columns until the cache is full.
+//! columns until the cache is full. Datasets stay not ready until that warmup
+//! completes, so `/v1/ready` does not succeed on a cold cache.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -376,25 +377,24 @@ impl DataFusion {
         self.results_cache_warmer.observe_plan(plan);
     }
 
-    /// After this process becomes ready, replay persisted plan shapes with
-    /// distinct dataset keys. Once-only for this process; later refreshes
-    /// do not re-warm.
+    /// Whether warmup will replay stored plans this process, so dataset
+    /// `Ready` must wait until that replay finishes.
+    pub(crate) fn results_cache_warmup_holds_ready(&self) -> bool {
+        self.results_cache_warmer.enabled
+            && self.results_cache_provider().is_some()
+            && !self.results_cache_warmer.templates_snapshot().is_empty()
+    }
+
+    /// Replay persisted plan shapes after the first full/append refresh, then
+    /// release held dataset `Ready`. Once-only for this process.
     pub(crate) fn spawn_results_cache_warmup(
         self: &Arc<Self>,
         status: Arc<status::RuntimeStatus>,
         app: Option<Arc<App>>,
     ) {
-        if !self.results_cache_warmer.enabled {
-            return;
-        }
-        if self.results_cache_provider().is_none() {
-            return;
-        }
-        if !self.results_cache_warmer.claim_warmup() {
-            return;
-        }
         let templates = self.results_cache_warmer.templates_snapshot();
-        if templates.is_empty() {
+        if templates.is_empty() || !self.results_cache_warmer.claim_warmup() {
+            status.release_dataset_ready();
             return;
         }
 
@@ -406,7 +406,11 @@ impl DataFusion {
             }
             let run = {
                 let df = Arc::clone(&df);
-                async move { df.run_warmup_templates(&templates, app.as_ref()).await }
+                let status = Arc::clone(&status);
+                async move {
+                    df.run_warmup_templates(&templates, app.as_ref()).await;
+                    status.release_dataset_ready();
+                }
             };
             if let Some(runtime) = refresh_runtime {
                 runtime.spawn(run);

@@ -1926,6 +1926,14 @@ impl Runtime {
 
         self.secrets_preflight().await;
 
+        let hold_ready_for_warmup = self.df.results_cache_warmup_holds_ready();
+        if hold_ready_for_warmup {
+            tracing::info!(
+                "SQL results cache warmup will run after the first full or append refresh, so datasets stay not ready until warmup completes"
+            );
+            self.status.hold_dataset_ready();
+        }
+
         Arc::clone(&self).set_components_initializing().await;
 
         Arc::clone(&self).start_extensions().await;
@@ -2044,9 +2052,15 @@ impl Runtime {
             if !matches!(err, Error::ComponentsInitializationCancelled) {
                 tracing::error!("Could not start the Spice runtime: {err}");
             }
+            self.status.release_dataset_ready();
         } else {
-            // Create a background task to report once all components are marked as `Ready`
             let status = self.status();
+            if hold_ready_for_warmup {
+                let app = self.read_app().await;
+                self.df.spawn_results_cache_warmup(Arc::clone(&status), app);
+            }
+
+            // Create a background task to report once all components are marked as `Ready`
             tokio::spawn({
                 async move {
                     loop {
@@ -2068,8 +2082,6 @@ impl Runtime {
                                 }
                             }
                             tracing::info!("All components are loaded. Spice runtime is ready!");
-                            let app = self.read_app().await;
-                            self.df.spawn_results_cache_warmup(Arc::clone(&status), app);
                             break;
                         }
                     }

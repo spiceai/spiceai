@@ -90,6 +90,11 @@ pub struct RuntimeStatus {
     /// Cancellation token that is cancelled when the runtime is shutting down.
     /// Used to make background retry loops promptly exit on shutdown.
     shutdown_token: CancellationToken,
+    /// `Some` while dataset `Ready` is held (SQL results-cache warmup). The set
+    /// is the datasets that requested `Ready` and have not since moved to
+    /// another status. [`Self::release_dataset_ready`] applies those and
+    /// returns to `None`.
+    dataset_ready_hold: Arc<RwLock<Option<HashSet<TableReference>>>>,
 }
 
 impl Default for RuntimeStatus {
@@ -100,6 +105,7 @@ impl Default for RuntimeStatus {
             is_shutdown: Arc::new(AtomicBool::new(false)),
             ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
             shutdown_token: CancellationToken::new(),
+            dataset_ready_hold: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -107,13 +113,7 @@ impl Default for RuntimeStatus {
 impl RuntimeStatus {
     #[must_use]
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            statuses: Arc::new(RwLock::new(HashMap::new())),
-            ever_ready_components: Arc::new(RwLock::new(HashSet::new())),
-            is_shutdown: Arc::new(AtomicBool::new(false)),
-            ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
-            shutdown_token: CancellationToken::new(),
-        })
+        Arc::new(Self::default())
     }
 
     pub fn set_ready_state(&self, ready_state: RuntimeReadyState) {
@@ -174,11 +174,53 @@ impl RuntimeStatus {
     }
 
     pub fn update_dataset(&self, dataset: &TableReference, status: ComponentStatus) {
+        {
+            let mut hold = self
+                .dataset_ready_hold
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(pending) = hold.as_mut() {
+                if status == ComponentStatus::Ready {
+                    pending.insert(dataset.clone());
+                    return;
+                }
+                pending.remove(dataset);
+            }
+        }
+
         let ds_name = dataset.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("dataset:{ds_name}"), status);
         runtime_metrics::datasets::STATUS
             .record(metric_value, &[KeyValue::new("dataset", ds_name)]);
+    }
+
+    /// Hold dataset `Ready` until [`Self::release_dataset_ready`].
+    ///
+    /// Call before any dataset can become ready. `Ready` updates are remembered
+    /// and applied on release; other statuses still apply immediately.
+    pub fn hold_dataset_ready(&self) {
+        *self
+            .dataset_ready_hold
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HashSet::new());
+    }
+
+    /// Apply every held dataset `Ready` and stop holding. No-op if not holding.
+    ///
+    /// A dataset whose last update was not `Ready` (error, disabled, …) is not
+    /// in the pending set and is left as-is.
+    pub fn release_dataset_ready(&self) {
+        let pending = self
+            .dataset_ready_hold
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(pending) = pending {
+            for dataset in pending {
+                self.update_dataset(&dataset, ComponentStatus::Ready);
+            }
+        }
     }
 
     pub fn update_model(&self, model_name: &str, status: ComponentStatus) {
@@ -997,5 +1039,100 @@ mod tests {
         status.update_dataset(&dataset, ComponentStatus::Ready);
         receiver.changed().await.expect("should receive change");
         assert_eq!(*receiver.borrow(), ComponentStatus::Ready);
+    }
+
+    #[test]
+    fn test_deferred_dataset_ready_is_not_applied_until_release() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("orders");
+
+        status.update_dataset(&dataset, ComponentStatus::Refreshing);
+        status.hold_dataset_ready();
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+
+        assert_eq!(
+            status.get_dataset_status(&dataset),
+            Some(ComponentStatus::Refreshing),
+            "Ready must not apply while dataset ready is held"
+        );
+        assert!(
+            !status.is_ready(),
+            "runtime ready must wait for the held dataset Ready"
+        );
+
+        status.release_dataset_ready();
+
+        assert_eq!(
+            status.get_dataset_status(&dataset),
+            Some(ComponentStatus::Ready)
+        );
+        assert!(status.is_ready());
+    }
+
+    #[test]
+    fn test_deferred_dataset_ready_skips_a_dataset_that_errored() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("orders");
+
+        status.update_dataset(&dataset, ComponentStatus::Refreshing);
+        status.hold_dataset_ready();
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        status.update_dataset(
+            &dataset,
+            ComponentStatus::error_with_message("refresh failed"),
+        );
+
+        status.release_dataset_ready();
+
+        assert!(
+            status
+                .get_dataset_status(&dataset)
+                .is_some_and(|s| s.is_error()),
+            "an error after a deferred Ready must not be overwritten with Ready"
+        );
+        assert!(!status.is_ready());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_dataset_ready_waits_for_deferred_release() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("orders");
+        status.update_dataset(&dataset, ComponentStatus::Refreshing);
+        status.hold_dataset_ready();
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+
+        let waiter = {
+            let status = Arc::clone(&status);
+            let dataset = dataset.clone();
+            tokio::spawn(async move { status.wait_for_dataset_ready(&dataset).await })
+        };
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "wait_for_dataset_ready must not observe a held Ready"
+        );
+
+        status.release_dataset_ready();
+        assert_eq!(
+            waiter.await.expect("waiter task should not panic"),
+            WaitOutcome::Reached
+        );
+    }
+
+    #[test]
+    fn test_dataset_ready_applies_immediately_after_release() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("orders");
+
+        status.hold_dataset_ready();
+        status.release_dataset_ready();
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+
+        assert_eq!(
+            status.get_dataset_status(&dataset),
+            Some(ComponentStatus::Ready)
+        );
+        assert!(status.is_ready());
     }
 }

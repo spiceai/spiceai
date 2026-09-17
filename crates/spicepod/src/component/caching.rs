@@ -91,7 +91,8 @@ pub enum ResultsCacheWarmup {
     Disabled,
     /// After the first full/append refresh, replay the first 10 distinct query
     /// plans (equality-filter values taken from distinct keys in the dataset)
-    /// until the cache is full. Later refreshes do not re-warm.
+    /// until the cache is full. Datasets stay not ready until that warmup
+    /// completes. Later refreshes do not re-warm.
     OnFirstRefresh,
 }
 
@@ -208,8 +209,8 @@ pub struct SQLResultsCacheConfig {
     #[serde(default)]
     pub encoding: Encoding,
     /// Replay recorded query plans into the results cache after the first
-    /// full/append refresh. Has no effect unless [`Self::enabled`] is `true`.
-    /// Default: `disabled`.
+    /// full/append refresh. Datasets stay not ready until warmup completes.
+    /// Has no effect unless [`Self::enabled`] is `true`. Default: `disabled`.
     #[serde(default, skip_serializing_if = "is_default")]
     pub warmup: ResultsCacheWarmup,
 }
