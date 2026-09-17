@@ -1235,7 +1235,8 @@ impl Https {
             message: format!("Invalid health_probe configuration: {e}"),
             connector_component: ConnectorComponent::from(dataset),
             source: e.into(),
-        })?;
+        })?
+        .with_synthesize_transient_placeholder_rows(is_caching_mode(dataset));
 
         if let Some(nesting) = parse_http_json_nesting(dataset)? {
             let schema = build_json_nest_schema(dataset, &nesting).map_err(|e| {
@@ -1541,6 +1542,19 @@ fn static_schema_for_https_dataset(
     }
 }
 
+/// Whether `dataset` uses `refresh_mode: caching` — the only mode that ever
+/// calls `cache::batches_cacheable`, so it is the only one that needs
+/// `response_status` force-included in a JSON-decomposed schema
+/// ([`parse_http_json_nesting`]) or a placeholder row synthesized for a
+/// zero-row transient failure (`HttpTableProvider::
+/// with_synthesize_transient_placeholder_rows`).
+fn is_caching_mode(dataset: &DatasetSpec) -> bool {
+    dataset
+        .acceleration
+        .as_ref()
+        .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Caching))
+}
+
 /// Parse `dataset.columns` looking for the `metadata.json_object: "*"`
 /// marker that enables JSON schema decomposition. Returns `None` when
 /// no column is marked, otherwise the full nesting configuration.
@@ -1625,11 +1639,7 @@ fn parse_http_json_nesting(dataset: &DatasetSpec) -> DataConnectorResult<Option<
     // same way as `_fetched_at` above, for every caching-mode dataset, so
     // detection actually works for a JSON-decomposed one instead of silently
     // never engaging because the column never existed.
-    let is_caching_mode = dataset
-        .acceleration
-        .as_ref()
-        .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Caching));
-    if is_caching_mode && !column_order.iter().any(|n| n == "response_status") {
+    if is_caching_mode(dataset) && !column_order.iter().any(|n| n == "response_status") {
         column_order.push("response_status".to_string());
         metadata_fields.insert("response_status".to_string());
     }
