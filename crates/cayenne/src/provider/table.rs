@@ -21652,20 +21652,25 @@ impl CayenneTableProvider {
             return Ok(stream);
         }
         let original_schema = stream.schema();
-        let augmented_schema = super::clustering::cluster_augmented_schema(&original_schema);
+        let key_name = super::clustering::cluster_key_column_name(&original_schema);
+        let augmented_schema =
+            super::clustering::cluster_augmented_schema(&original_schema, &key_name);
         // Resolved once for the whole rewrite: per-batch bounds would put each
         // batch on its own coordinate scale, and keys from different scales do
         // not order against each other.
         let bounds = self.cluster_column_bounds(&clustering_indices);
         let idx = clustering_indices;
+        let appended_key_name = key_name.clone();
         let augmented = stream.map(move |res| {
-            res.and_then(|b| super::clustering::append_cluster_key_column(&b, &idx, &bounds))
+            res.and_then(|b| {
+                super::clustering::append_cluster_key_column(&b, &idx, &bounds, &appended_key_name)
+            })
         });
         let augmented_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&augmented_schema),
             augmented,
         ));
-        let key_column = vec![super::clustering::CLUSTER_KEY_COLUMN_NAME.to_string()];
+        let key_column = vec![key_name];
         let sorted = match span {
             ClusterSortSpan::Global => {
                 util::stream_utils::sort_stream(augmented_stream, &key_column, task_ctx)?
@@ -51606,8 +51611,80 @@ mod tests {
     /// column lists. Schema inference fills `cayenne_sort_columns` on every
     /// catalog-visible CDC table, so the observed-filter key the curve is
     /// applied to can be *equal* to the configured list while meaning something
-    /// different. Here `sort_columns` is left empty and the key comes from
-    /// observations, which is the shape that must decline to attest.
+    /// different. Here the inferred sort columns equal the observed key exactly,
+    /// so only the curve flag stands between the rewrite and a false attestation.
+    /// A table column that happens to share the transient clustering key's name
+    /// must not be sorted in its place: the rows must come out in the same curve
+    /// order as for a table without that column.
+    #[tokio::test]
+    async fn test_cluster_sort_stream_ignores_a_column_named_like_the_key() {
+        use arrow::array::{AsArray, Int64Array};
+        use arrow::datatypes::Int64Type;
+
+        async fn cluster_order(rows: &[(i64, i64)], decoy: bool) -> Vec<(i64, i64)> {
+            let mut fields = vec![
+                Field::new("x", DataType::Int64, false),
+                Field::new("y", DataType::Int64, false),
+            ];
+            let mut columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.1))),
+            ];
+            if decoy {
+                fields.push(Field::new(
+                    super::super::clustering::CLUSTER_KEY_COLUMN_NAME,
+                    DataType::Int64,
+                    false,
+                ));
+                columns.push(Arc::new(Int64Array::from(vec![0_i64; rows.len()])));
+            }
+            let schema = Arc::new(Schema::new(fields));
+            let ctx = SessionContext::new();
+            let (provider, _dir) = create_cayenne_table_with_config(
+                if decoy {
+                    "cluster_key_decoy"
+                } else {
+                    "cluster_key_plain"
+                },
+                Arc::clone(&schema),
+                VortexConfig::default(),
+                vec![],
+                ctx.runtime_env(),
+            )
+            .await;
+            let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("batch");
+            let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                stream::iter(vec![Ok(batch)]),
+            ));
+            let sorted = provider
+                .cluster_sort_stream(input, vec![0, 1], &ctx.task_ctx(), ClusterSortSpan::Global)
+                .expect("cluster sort");
+            let batches: Vec<RecordBatch> = sorted.try_collect().await.expect("sorted rows");
+            batches
+                .iter()
+                .flat_map(|batch| {
+                    let x = batch.column(0).as_primitive::<Int64Type>();
+                    let y = batch.column(1).as_primitive::<Int64Type>();
+                    (0..batch.num_rows())
+                        .map(|row| (x.value(row), y.value(row)))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        }
+
+        // 256 points of a 16x16 grid in a scrambled order.
+        let rows: Vec<(i64, i64)> = (0..256_i64)
+            .map(|i| ((i * 37) % 16, (i * 11) % 16))
+            .collect();
+        let plain = cluster_order(&rows, false).await;
+        assert_ne!(
+            plain, rows,
+            "the fixture must actually be reordered by clustering"
+        );
+        assert_eq!(cluster_order(&rows, true).await, plain);
+    }
+
     #[tokio::test]
     async fn test_curve_ordered_rewrite_does_not_advertise_output_ordering() {
         use arrow::array::Int64Array;
@@ -51622,14 +51699,16 @@ mod tests {
             .execution
             .split_file_groups_by_statistics = true;
         let ctx = SessionContext::new_with_config(config);
-        // Empty `sort_columns` so the key is NOT authoritative and the observed
-        // filter columns win; `inline_max_rows: 0` forces writes to files so the
-        // rewrite actually sorts them.
+        // Inferred (not authoritative) sort columns, so the observed filter
+        // columns win, and equal to the key observation will produce, so a column
+        // comparison alone would attest; `inline_max_rows: 0` forces writes to
+        // files so the rewrite actually sorts them.
         let (provider, _tmp) = create_cayenne_table_with_config(
             "curve_ordering_lifecycle",
             Arc::clone(&schema),
             VortexConfig {
-                sort_columns: vec![],
+                sort_columns: vec!["tenant".to_string(), "ts".to_string()],
+                sort_columns_origin: crate::metadata::SortColumnsOrigin::Inferred,
                 inline_max_rows: 0,
                 ..VortexConfig::default()
             },
@@ -51671,9 +51750,10 @@ mod tests {
         }
         let observed = provider.effective_sort_columns_for_rewrite();
         assert_eq!(
-            observed.len(),
-            2,
-            "fixture must observe two filter columns for the curve to engage, got {observed:?}"
+            observed.as_slice(),
+            provider.context.sort_columns(),
+            "fixture must observe exactly the inferred sort columns, two of them for the curve \
+             to engage, got {observed:?}"
         );
 
         provider

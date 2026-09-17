@@ -28,6 +28,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::execution::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
+use datafusion::sql::planner::IdentNormalizer;
 use datafusion_ddl::{CatalogDdlHandler, CreateSchemaParams, CreateTableParams, DropTableParams};
 
 use crate::ddl::get_cayenne_provider;
@@ -65,8 +66,17 @@ impl CatalogDdlHandler for CayenneDdlHandler {
             "{}.{}.{}",
             params.catalog_name, params.schema_name, params.table_name
         );
-        let cluster_by =
-            operations::cluster_by_column_names(&table_ref, &params.extension.cluster_by)?;
+        let cluster_by = operations::cluster_by_column_names(
+            &table_ref,
+            &params.extension.cluster_by,
+            &IdentNormalizer::new(
+                session_state
+                    .config()
+                    .options()
+                    .sql_parser
+                    .enable_ident_normalization,
+            ),
+        )?;
         Ok(Arc::new(CayenneCreateTableExec::new(
             operations::CreateTableParams {
                 table_name: params.table_name,

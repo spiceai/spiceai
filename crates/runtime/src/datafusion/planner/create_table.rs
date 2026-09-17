@@ -785,6 +785,47 @@ mod tests {
         );
     }
 
+    /// Extract a statement's `CLUSTER BY` clause and resolve it to column names
+    /// the way the Cayenne DDL handler does.
+    fn extracted_cluster_by_names(sql: &str) -> DFResult<Vec<String>> {
+        let ct = parse_create_table(sql);
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+        let (_, store_key) = extract_and_store_extensions(ct, &store).expect("should succeed");
+        assert!(store_key.is_some(), "CLUSTER BY is an extension");
+        let ext = store
+            .write()
+            .expect("store lock should not be poisoned")
+            .remove(&TableReference::parse_str("foo"))
+            .expect("should have entry");
+        cayenne::ddl::operations::cluster_by_column_names(
+            "foo",
+            &ext.cluster_by,
+            &datafusion::sql::planner::IdentNormalizer::default(),
+        )
+    }
+
+    /// One parenthesized column parses as a nested expression, not a tuple, and
+    /// must still name that column: it is also the form the distributed handler
+    /// forwards to executors.
+    #[test]
+    fn test_extract_single_parenthesized_cluster_by() {
+        let names =
+            extracted_cluster_by_names("CREATE TABLE foo (id INT, region TEXT) CLUSTER BY (id)")
+                .expect("a parenthesized column is a column name");
+        assert_eq!(names, vec!["id"]);
+    }
+
+    /// Unquoted `CLUSTER BY` identifiers are normalized the way the column names
+    /// they refer to were; quoted ones keep their case.
+    #[test]
+    fn test_cluster_by_identifiers_are_normalized_like_columns() {
+        let names = extracted_cluster_by_names(
+            r#"CREATE TABLE foo (id INT, "Region" TEXT) CLUSTER BY (ID, "Region")"#,
+        )
+        .expect("column names");
+        assert_eq!(names, vec!["id", "Region"]);
+    }
+
     #[test]
     fn test_extract_with_and_partition_by() {
         let ct = parse_create_table(

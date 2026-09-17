@@ -2874,18 +2874,18 @@ fn validate_datalake_table_options(
         && vc.sort_columns_origin == cayenne::metadata::SortColumnsOrigin::User
     {
         return Err(format!(
-            "Failed to register dataset '{table_name}' (cayenne): `cayenne_cluster_by` cannot be combined with `cayenne_sort_columns`. Remove one of these parameters. Sorting within clusters is not supported yet."
+            "Failed to register dataset '{table_name}' (cayenne): `cayenne_cluster_by` cannot be combined with `cayenne_sort_columns`. Remove one of these parameters. Sorting within clusters is not supported yet. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
         ));
     }
     for column in &vc.cluster_by {
         let Some((_, field)) = options.schema.column_with_name(column) else {
             return Err(format!(
-                "Failed to register dataset '{table_name}' (cayenne): clustering column '{column}' configured in `cayenne_cluster_by` does not exist. Update `cayenne_cluster_by` to use an existing column."
+                "Failed to register dataset '{table_name}' (cayenne): clustering column '{column}' configured in `cayenne_cluster_by` does not exist. Update `cayenne_cluster_by` to use an existing column. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
             ));
         };
         if !cayenne::is_clusterable_type(field.data_type()) {
             return Err(format!(
-                "Failed to register dataset '{table_name}' (cayenne): clustering column '{column}' configured in `cayenne_cluster_by` has unsupported type '{}'. Use a Boolean, numeric (except Decimal256), temporal, string, or binary column, or remove '{column}' from `cayenne_cluster_by`.",
+                "Failed to register dataset '{table_name}' (cayenne): clustering column '{column}' configured in `cayenne_cluster_by` has unsupported type '{}'. Use a Boolean, numeric (except Decimal256), temporal, string, or binary column, or remove '{column}' from `cayenne_cluster_by`. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
                 field.data_type()
             ));
         }
