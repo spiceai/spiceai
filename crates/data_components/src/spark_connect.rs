@@ -895,6 +895,100 @@ mod tests {
         );
     }
 
+    /// What a TLS Spark Connect endpoint receives when Spice dials it: a TLS
+    /// `ClientHello`, not a plaintext HTTP/2 preface.
+    ///
+    /// The counterpart to the guard above, and the other half of the fork's TLS
+    /// handling (fork PR #7). `Endpoint::connect` attaches no TLS configuration of
+    /// its own, so the fork attaches one —
+    /// `ClientTlsConfig::new().with_native_roots()` — whenever the connection
+    /// string asks for `use_ssl=true`. Lose it and a Databricks endpoint is either
+    /// dialled in the clear, which the server rejects, or refused by `tonic` for
+    /// having no TLS configuration; either way every dataset on that endpoint
+    /// fails to load.
+    ///
+    /// The listener speaks no TLS, so the handshake never completes and the first
+    /// bytes it reads are the assertion. This pins that TLS is configured at all,
+    /// which is what the patch provides. It does not distinguish *which* root
+    /// store was chosen — the roots a client trusts are not observable from its
+    /// `ClientHello` — so the `with_native_roots` half is guarded only by the
+    /// accessor the same patch added, which
+    /// `a_non_tls_connection_string_resolves_to_an_http_endpoint` calls and the
+    /// compiler therefore requires.
+    #[tokio::test]
+    async fn a_tls_spark_endpoint_is_dialled_with_a_tls_handshake() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        /// A TLS record begins with the content type — `0x16` for handshake — and
+        /// then the two-byte legacy protocol version, `0x03 0x01` for every version
+        /// a `ClientHello` may announce (RFC 8446 §5.1).
+        const TLS_HANDSHAKE: u8 = 0x16;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds a plaintext listener");
+        let port = listener
+            .local_addr()
+            .expect("the listener has a local address")
+            .port();
+
+        let accepted = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.ok()?;
+            // Three bytes is the record header's type and version, which is all
+            // that is under assertion; accumulated for the same reason as the
+            // plaintext guard — what arrived is itself the diagnostic.
+            let mut first = Vec::with_capacity(3);
+            while first.len() < 3 {
+                let mut chunk = [0_u8; 3];
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => first.extend_from_slice(&chunk[..read]),
+                }
+            }
+            Some(first)
+        });
+
+        // As in the plaintext guard, the dial is what is under assertion: nothing
+        // on the other end speaks TLS, so the handshake never completes and
+        // `build` would wait forever.
+        let connection = format!("sc://127.0.0.1:{port}/;use_ssl=true;user_id=spice.ai");
+        drop(tokio::spawn(async move {
+            let _ = SparkSessionBuilder::remote(&connection)
+                .expect("a connection string with use_ssl=true should parse")
+                .build()
+                .await;
+        }));
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), accepted)
+            .await
+            .expect(
+                "no TLS record header within 10s: either nothing was dialled, because tonic \
+                 refuses an https endpoint it has no TLS configuration for, or the peer opened \
+                 the connection and stopped part-way through the record header",
+            )
+            .expect("the accept task panicked")
+            .expect("the accept task saw no connection");
+
+        assert!(
+            !first.is_empty(),
+            "the connection was opened and then abandoned without a byte sent, which is what \
+             tonic does with an https endpoint it has no TLS configuration for"
+        );
+        assert_eq!(
+            first.first(),
+            Some(&TLS_HANDSHAKE),
+            "a Spark Connect endpoint asked for over TLS must receive a TLS handshake record, \
+             not {first:02x?} — a plaintext dial is rejected by the server and every dataset \
+             on that endpoint fails to load"
+        );
+        assert_eq!(
+            first.get(1),
+            Some(&0x03),
+            "the record announced a protocol version no TLS ClientHello uses: {first:02x?}"
+        );
+    }
+
     /// Extracts the value of a `;key=value;` option from a rendered Spark
     /// Connect connection string.
     fn extract_option(connection: &str, key: &str) -> Option<String> {
