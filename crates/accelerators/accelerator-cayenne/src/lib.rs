@@ -1990,11 +1990,8 @@ impl CayenneAccelerator {
                     config.cold_tier_location = Some(loc.to_string());
                 }
             }
-            if let Some(cols) = acceleration
-                .params
-                .get("cayenne_datalake_clustering_columns")
-            {
-                config.cold_clustering_columns = cols
+            if let Some(cols) = acceleration.params.get("cayenne_cluster_by") {
+                config.cluster_by = cols
                     .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
@@ -2871,10 +2868,33 @@ fn validate_datalake_table_options(
     options: &cayenne::metadata::CreateTableOptions,
 ) -> Result<Vec<String>, String> {
     let vc = &options.vortex_config;
-    if !vc.cold_tier_enabled() {
-        return Ok(Vec::new());
-    }
     let mut warnings = Vec::new();
+
+    if !vc.cluster_by.is_empty()
+        && !vc.sort_columns.is_empty()
+        && vc.sort_columns_origin == cayenne::metadata::SortColumnsOrigin::User
+    {
+        return Err(format!(
+            "Failed to register dataset '{table_name}' (cayenne): `cayenne_cluster_by` cannot be combined with `cayenne_sort_columns`. Remove one of these parameters. Sorting within clusters is not supported yet. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        ));
+    }
+    for column in &vc.cluster_by {
+        let Some((_, field)) = options.schema.column_with_name(column) else {
+            return Err(format!(
+                "Failed to register dataset '{table_name}' (cayenne): clustering column '{column}' configured in `cayenne_cluster_by` does not exist. Update `cayenne_cluster_by` to use an existing column. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            ));
+        };
+        if !cayenne::is_clusterable_type(field.data_type()) {
+            return Err(format!(
+                "Failed to register dataset '{table_name}' (cayenne): clustering column '{column}' configured in `cayenne_cluster_by` has unsupported type '{}'. Use a Boolean, numeric (except Decimal256), temporal, string, or binary column, or remove '{column}' from `cayenne_cluster_by`. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+                field.data_type()
+            ));
+        }
+    }
+
+    if !vc.cold_tier_enabled() {
+        return Ok(warnings);
+    }
     if options.primary_key.is_empty() {
         // Promotion classifies and rewrites cold files by primary key, and
         // deletes against cold-resident rows are key-based, so the promoter
@@ -2914,16 +2934,6 @@ fn validate_datalake_table_options(
             Set a positive interval (default {}), or remove 'cayenne_datalake_location'.",
             defaults.cold_tier_gc_interval_ms
         ));
-    }
-    // Unknown clustering columns are dropped by the engine at promotion time
-    // (falling back to sort columns, then the primary key) — surface the
-    // misconfiguration instead of silently clustering by something else.
-    for column in &vc.cold_clustering_columns {
-        if options.schema.column_with_name(column).is_none() {
-            warnings.push(format!(
-                "Dataset '{table_name}': 'cayenne_datalake_clustering_columns' entry '{column}' does not exist in the schema and is ignored; datalake clustering falls back to cayenne_sort_columns, then the primary key."
-            ));
-        }
     }
     Ok(warnings)
 }
@@ -3142,9 +3152,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["true", "false"])
             .default("true"),
         ParameterSpec::component("datalake_location")
-            .description("Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background tiering loop moves warm local-disk data to read-optimized, Z-order-clustered Vortex files on this store, and queries span warm + datalake with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported."),
-        ParameterSpec::component("datalake_clustering_columns")
-            .description("Comma-separated liquid-clustering key columns for datalake files (multi-column Z-order), e.g. 'tenant_id,ts'. When unset, falls back to cayenne_sort_columns, then the primary key. Clustering tightens each cold file's per-column zone maps so selective queries on any clustering dimension prune at the storage layer."),
+            .description("Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background tiering loop moves warm local-disk data to read-optimized, Hilbert-clustered Vortex files on this store, and queries span warm + datalake with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported."),
+        ParameterSpec::component("cluster_by")
+            .description("Comma-separated columns used to Hilbert-cluster both warm and datalake files, e.g. 'tenant_id,ts'. Every column must exist and have a supported scalar type. Cannot be combined with cayenne_sort_columns. When set, automatic and inferred sort columns are not applied."),
         ParameterSpec::component("datalake_s3_auth")
             .description("Authentication method for the datalake S3 store. 'iam_role' (default) uses environment/SDK credentials; 'key' uses cayenne_datalake_s3_key/_secret.")
             .one_of(&["iam_role", "key"])
@@ -4120,17 +4130,18 @@ impl DataAccelerator for CayenneAccelerator {
             // the Cayenne-specific cross-partition insert strategy so that
             // overwrite-mode writes batch every partition's catalog mutation
             // into a single MetastoreTransaction (#10125).
-            let insert_strategy = Arc::new(
-                partitioned_insert_strategy::CayennePartitionedInsertStrategy::new(
-                    Arc::clone(&catalog_concrete),
-                    PathBuf::from(&dir_path),
-                ),
-            );
             let partition_provider =
                 PartitionTableProvider::new(creator, partition_by, Arc::clone(&arrow_schema))
                     .await
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?;
+            let insert_strategy = Arc::new(
+                partitioned_insert_strategy::CayennePartitionedInsertStrategy::new(
+                    Arc::clone(&catalog_concrete),
+                    PathBuf::from(&dir_path),
+                    partition_provider.write_coordinator(),
+                ),
+            );
             let partition_table_providers = partition_provider.partition_table_providers().await;
             insert_strategy
                 .recover_partitioned_wals(&partition_table_providers)
@@ -7697,19 +7708,78 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_datalake_warns_on_unknown_clustering_column() {
+    fn test_validate_cluster_by_rejects_unknown_column() {
         let config = cayenne::metadata::VortexConfig {
-            cold_clustering_columns: vec!["id".to_string(), "no_such_column".to_string()],
+            cluster_by: vec!["id".to_string(), "no_such_column".to_string()],
             ..datalake_enabled_config()
         };
         let options = datalake_test_options(vec!["id".to_string()], config);
-        let warnings = validate_datalake_table_options("dl_t", &options)
-            .expect("unknown clustering column is a warning, not an error");
-        assert_eq!(warnings.len(), 1, "exactly the unknown column is flagged");
+        let error = validate_datalake_table_options("dl_t", &options)
+            .expect_err("unknown clustering column must fail registration");
         assert!(
-            warnings[0].contains("no_such_column"),
-            "unexpected warning: {}",
-            warnings[0]
+            error.contains("no_such_column") && error.contains("does not exist"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_cluster_by_rejects_explicit_sort_columns() {
+        let config = cayenne::metadata::VortexConfig {
+            cluster_by: vec!["id".to_string()],
+            sort_columns: vec!["value".to_string()],
+            ..Default::default()
+        };
+        let options = datalake_test_options(vec!["id".to_string()], config);
+        let error = validate_datalake_table_options("dl_t", &options)
+            .expect_err("cluster_by and explicit sort columns must conflict");
+        assert!(
+            error.contains("cayenne_cluster_by") && error.contains("cayenne_sort_columns"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_cluster_by_ignores_inferred_sort_columns() {
+        let config = cayenne::metadata::VortexConfig {
+            cluster_by: vec!["id".to_string()],
+            sort_columns: vec!["value".to_string()],
+            sort_columns_origin: cayenne::metadata::SortColumnsOrigin::Inferred,
+            ..Default::default()
+        };
+        let options = datalake_test_options(vec!["id".to_string()], config);
+        let warnings = validate_datalake_table_options("dl_t", &options)
+            .expect("inferred sort columns must not conflict with explicit clustering");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_validate_cluster_by_rejects_unsupported_type() {
+        let config = cayenne::metadata::VortexConfig {
+            cluster_by: vec!["items".to_string()],
+            ..Default::default()
+        };
+        let options = cayenne::metadata::CreateTableOptions {
+            table_name: "dl_t".to_string(),
+            schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "items",
+                arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    arrow_schema::DataType::Int64,
+                    true,
+                ))),
+                true,
+            )])),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/dl_t".to_string(),
+            partition_column: None,
+            vortex_config: config,
+        };
+        let error = validate_datalake_table_options("dl_t", &options)
+            .expect_err("unsupported clustering type must fail registration");
+        assert!(
+            error.contains("items") && error.contains("unsupported type"),
+            "unexpected error: {error}"
         );
     }
 

@@ -71,10 +71,21 @@ pub mod metadata;
 pub mod metastore;
 pub mod metastore_layout;
 
-/// Z-order clustering kernel, re-exported for benchmarks only. Not a stable API.
+/// Cold-tier clustering kernel, re-exported for benchmarks only. Not a stable API.
 #[doc(hidden)]
-pub mod __bench_zorder {
-    pub use crate::provider::zorder::zorder_keys;
+pub mod __bench_clustering {
+    pub use crate::provider::clustering::cluster_keys;
+}
+
+/// Returns whether Cayenne can encode `data_type` as a clustering dimension.
+///
+/// This is exposed for accelerator configuration validation so unsupported
+/// columns fail dataset registration instead of silently producing a constant
+/// clustering key.
+#[doc(hidden)]
+#[must_use]
+pub fn is_clusterable_type(data_type: &arrow_schema::DataType) -> bool {
+    provider::clustering::is_clusterable(data_type)
 }
 pub mod optimizer_rules;
 #[cfg(feature = "partition-table-provider")]

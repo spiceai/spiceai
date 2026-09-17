@@ -74,7 +74,9 @@ use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit};
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
 use super::mutation_writer::InlineBatchBuffer;
-use super::table::{CayenneTableProvider, InlinedOverwritePublish, serialize_batches_to_ipc};
+use super::table::{
+    CayenneTableProvider, InlinedOverwritePublish, OverwriteRangePlan, serialize_batches_to_ipc,
+};
 use crate::CayenneCatalog;
 use crate::catalog::CatalogResult;
 use crate::metadata::InlinedData;
@@ -532,6 +534,11 @@ impl CayenneTableProvider {
         data: SendableRecordBatchStream,
         target_partitions: usize,
     ) -> Result<PreparedOverwrite> {
+        // Read the split points off the table being replaced before taking the
+        // write lock, so the sampling scan never holds it. A replace that lands
+        // in the inline tier below ignores the plan.
+        let range_plan = self.overwrite_range_plan(target_partitions).await;
+
         let write_guard = self.write_lock_arc().lock_owned().await;
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
@@ -592,6 +599,10 @@ impl CayenneTableProvider {
         // full write concurrency (no size cap on the fan-out). Deliberately NOT
         // sized from the bytes the probe buffered: that is only a lower bound, and
         // under-sharding a multi-GB refresh to one writer would serialize the encode.
+        //
+        // The shards cover the key ranges `overwrite_range_plan` chose, when it
+        // found a key to split; it declines for the sorted and clustered replaces
+        // above, which keep their single serial writer.
         let written: Result<_> = async {
             let written = self
                 .write_to_snapshot_range_partitioned(
@@ -601,7 +612,7 @@ impl CayenneTableProvider {
                     target_partitions,
                     None,
                     write_policy,
-                    None,
+                    range_plan.as_ref().map(OverwriteRangePlan::partitioning),
                     lookup_index_observer,
                 )
                 .await?;
