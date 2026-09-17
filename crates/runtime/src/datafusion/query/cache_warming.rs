@@ -14,328 +14,575 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! SQL results-cache warming after the first full/append refresh.
+//! SQL results-cache warmup, enabled with
+//! `runtime.caching.sql_results.warmup: on_first_refresh` (and
+//! `sql_results.enabled: true`).
 //!
-//! Queries that populated the results cache before a dataset's first
-//! full or append refresh (for example under `ready_state: on_registration`)
-//! are recorded here. When that refresh completes, the accelerator is
-//! rewritten and the results cache is invalidated; this module replays
-//! the recorded queries on the refresh runtime until the cache is full,
-//! then stops. Subsequent refreshes do not re-warm.
+//! The first [`MAX_WARMUP_PLANS`] distinct query *shapes* (logical plans with
+//! equality-filter values replaced by placeholders) are remembered and written
+//! under `.spice/data`, or to `runtime.state.location` when that is set. After
+//! a process restart, once accelerated full/append datasets finish their first
+//! refresh, those shapes are replayed with `SELECT DISTINCT` of the bound
+//! columns until the cache is full.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use cache::key::RawCacheKey;
-use cache::resolved_table_match;
-use datafusion::common::ParamValues;
-use datafusion::sql::TableReference;
-use runtime_request_context::CacheNamespace;
+use app::App;
+use datafusion::common::{ParamValues, ScalarValue};
+use datafusion::logical_expr::LogicalPlan;
+use futures::TryStreamExt;
+use runtime_request_context::{
+    CacheControl, CacheKeyType, CacheNamespace, Protocol, RequestContext,
+};
+use runtime_status as status;
 
-use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
+use object_store::ObjectStore;
+use object_store_occ::{InsertResult, ObjectState, UpdateResult};
+use runtime_secrets::Secrets;
+use spicepod::component::runtime::RuntimeState;
+use tokio::runtime::Handle;
+use tokio::sync::RwLock;
 
-/// Upper bound on recorded warming queries. Each entry holds the SQL text
-/// and bound parameters of a cacheable query, so the catalog cannot grow
-/// with all-time query history.
-const MAX_WARMING_QUERIES: usize = 8192;
+use crate::accelerated::AcceleratedTable;
+use crate::component::dataset::acceleration::RefreshMode;
+use crate::datafusion::DataFusion;
 
-/// A cacheable query that can be replayed to re-fill the SQL results cache.
-#[derive(Clone)]
-pub(crate) struct WarmingQuery {
-    pub(super) raw_key: RawCacheKey,
-    pub(super) sql: Arc<str>,
-    pub(super) parameters: Option<ParamValues>,
-    pub(super) namespace: CacheNamespace,
-    pub(super) input_tables: Arc<HashSet<TableReference>>,
+use super::QueryBuilder;
+use super::ResultsCacheMode;
+use super::warmup_plan::{WarmupTemplate, distinct_keys_sql, template_from_plan, template_id};
+
+/// Distinct plan shapes kept for the next cold start. First N, not hottest N.
+const MAX_WARMUP_PLANS: usize = 10;
+
+const WARMUP_STORE_RELATIVE: &str = ".spice/data/results_cache_warmup.json";
+
+/// Object-store key; [`ObjectState`] writes `{prefix}{key}.json`.
+const WARMUP_STATE_KEY: &str = "results_cache_warmup";
+
+const MAX_REMOTE_PERSIST_ATTEMPTS: usize = 8;
+
+struct WarmupCatalog {
+    templates: Vec<WarmupTemplate>,
+    ids: HashSet<u64>,
 }
 
-struct WarmingCatalog {
-    by_key: HashMap<u64, WarmingQuery>,
-    /// Least-recent first. [`Self::record`] moves a key to the back on every
-    /// insert so a refresh warms the queries that ran most recently.
-    lru: VecDeque<u64>,
+enum WarmupPersist {
+    Local(PathBuf),
+    Remote(Arc<ObjectState<Vec<WarmupTemplate>>>),
 }
 
-impl WarmingCatalog {
-    fn new() -> Self {
-        Self {
-            by_key: HashMap::new(),
-            lru: VecDeque::new(),
-        }
-    }
-
-    fn record(&mut self, query: WarmingQuery) {
-        let key = query.raw_key.as_u64();
-        if self.by_key.insert(key, query).is_some() {
-            if let Some(pos) = self.lru.iter().position(|k| *k == key) {
-                self.lru.remove(pos);
-            }
-        }
-        self.lru.push_back(key);
-
-        while self.lru.len() > MAX_WARMING_QUERIES {
-            if let Some(evicted) = self.lru.pop_front() {
-                self.by_key.remove(&evicted);
-            }
-        }
-    }
-
-    /// Matching queries, most recently recorded first.
-    fn for_tables(&self, tables: &[TableReference]) -> Vec<WarmingQuery> {
-        self.lru
-            .iter()
-            .rev()
-            .filter_map(|key| {
-                let query = self.by_key.get(key)?;
-                tables
-                    .iter()
-                    .any(|table| resolved_table_match(query.input_tables.as_ref(), table))
-                    .then(|| query.clone())
-            })
-            .collect()
-    }
-}
-
-/// Records cacheable queries and serializes warming runs so two datasets
-/// finishing their first refresh cannot overshoot `max_size` by filling
-/// in parallel.
 pub(crate) struct ResultsCacheWarmer {
-    catalog: parking_lot::Mutex<WarmingCatalog>,
-    run: tokio::sync::Mutex<()>,
+    enabled: bool,
+    catalog: Arc<parking_lot::Mutex<WarmupCatalog>>,
+    persist_lock: Arc<parking_lot::Mutex<()>>,
+    count: Arc<AtomicUsize>,
+    started: AtomicBool,
+    persist: WarmupPersist,
 }
 
 impl ResultsCacheWarmer {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(store_path: PathBuf, enabled: bool) -> Self {
+        let loaded = if enabled {
+            load_templates(&store_path)
+        } else {
+            Vec::new()
+        };
+        Self::from_loaded(loaded, enabled, WarmupPersist::Local(store_path))
+    }
+
+    async fn from_object_store(
+        store: Arc<dyn ObjectStore>,
+        base_prefix: &str,
+        enabled: bool,
+    ) -> Self {
+        let prefix = object_state_prefix(base_prefix);
+        let state = Arc::new(ObjectState::new(store).with_prefix(prefix));
+        let loaded = if enabled {
+            match state.get(WARMUP_STATE_KEY).await {
+                Ok(Some(templates)) => templates,
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    tracing::debug!("Failed to load SQL results cache warmup catalog: {e}");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        Self::from_loaded(loaded, enabled, WarmupPersist::Remote(state))
+    }
+
+    fn from_loaded(loaded: Vec<WarmupTemplate>, enabled: bool, persist: WarmupPersist) -> Self {
+        if enabled {
+            tracing::info!(
+                "SQL results cache warmup is enabled: the first {MAX_WARMUP_PLANS} distinct query plans will be recorded and replayed after the first full or append refresh until the cache is full"
+            );
+        }
+        let ids = loaded.iter().map(template_id).collect::<HashSet<_>>();
+        let count = loaded.len();
         Self {
-            catalog: parking_lot::Mutex::new(WarmingCatalog::new()),
-            run: tokio::sync::Mutex::new(()),
+            enabled,
+            catalog: Arc::new(parking_lot::Mutex::new(WarmupCatalog {
+                templates: loaded,
+                ids,
+            })),
+            persist_lock: Arc::new(parking_lot::Mutex::new(())),
+            count: Arc::new(AtomicUsize::new(count)),
+            started: AtomicBool::new(false),
+            persist,
         }
     }
 
-    fn record(&self, query: WarmingQuery) {
-        self.catalog.lock().record(query);
+    fn claim_warmup(&self) -> bool {
+        !self.started.swap(true, Ordering::Relaxed)
     }
 
-    fn queries_for_tables(&self, tables: &[TableReference]) -> Vec<WarmingQuery> {
-        self.catalog.lock().for_tables(tables)
+    fn templates_snapshot(&self) -> Vec<WarmupTemplate> {
+        self.catalog.lock().templates.clone()
+    }
+
+    /// Remember this plan if we do not yet have [`MAX_WARMUP_PLANS`] distinct
+    /// shapes. Cheap no-op once the set is full. Must not run on the warmup
+    /// path itself (those queries use `CurrentRuntimeUngated`).
+    pub(crate) fn observe_plan(&self, plan: &LogicalPlan) {
+        if !self.enabled {
+            return;
+        }
+        if self.count.load(Ordering::Relaxed) >= MAX_WARMUP_PLANS {
+            return;
+        }
+        if matches!(
+            plan,
+            LogicalPlan::Dml(_) | LogicalPlan::Ddl(_) | LogicalPlan::Statement(_)
+        ) {
+            return;
+        }
+        if cache::get_logical_plan_input_tables(plan)
+            .iter()
+            .any(|table| {
+                matches!(
+                    table.schema(),
+                    Some(crate::datafusion::SPICE_RUNTIME_SCHEMA)
+                )
+            })
+        {
+            return;
+        }
+        let Some(template) = template_from_plan(plan) else {
+            return;
+        };
+        let id = template_id(&template);
+        {
+            let mut catalog = self.catalog.lock();
+            if catalog.ids.contains(&id) || catalog.ids.len() >= MAX_WARMUP_PLANS {
+                return;
+            }
+            catalog.ids.insert(id);
+            catalog.templates.push(template);
+            self.count.store(catalog.templates.len(), Ordering::Relaxed);
+        }
+        self.schedule_persist();
+    }
+
+    fn schedule_persist(&self) {
+        match &self.persist {
+            WarmupPersist::Local(path) => {
+                let catalog = Arc::clone(&self.catalog);
+                let persist_lock = Arc::clone(&self.persist_lock);
+                let path = path.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let _persist = persist_lock.lock();
+                        let snapshot = catalog.lock().templates.clone();
+                        save_templates(&path, &snapshot)
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            tracing::debug!(
+                                "Failed to persist SQL results cache warmup catalog: {e}"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "Failed to persist SQL results cache warmup catalog: {e}"
+                            );
+                        }
+                    }
+                });
+            }
+            WarmupPersist::Remote(state) => {
+                let catalog = Arc::clone(&self.catalog);
+                let count = Arc::clone(&self.count);
+                let state = Arc::clone(state);
+                tokio::spawn(async move {
+                    persist_remote(state, catalog, count).await;
+                });
+            }
+        }
+    }
+}
+
+fn load_templates(path: &Path) -> Vec<WarmupTemplate> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+fn save_templates(path: &Path, templates: &[WarmupTemplate]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(templates).map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+fn object_state_prefix(base_prefix: &str) -> String {
+    if base_prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", base_prefix.trim_end_matches('/'))
+    }
+}
+
+fn merge_templates(base: &[WarmupTemplate], extra: &[WarmupTemplate]) -> Vec<WarmupTemplate> {
+    let mut out = base.to_vec();
+    let mut ids: HashSet<u64> = out.iter().map(template_id).collect();
+    for template in extra {
+        if out.len() >= MAX_WARMUP_PLANS {
+            break;
+        }
+        let id = template_id(template);
+        if ids.insert(id) {
+            out.push(template.clone());
+        }
+    }
+    out
+}
+
+fn apply_catalog(
+    catalog: &parking_lot::Mutex<WarmupCatalog>,
+    count: &AtomicUsize,
+    templates: Vec<WarmupTemplate>,
+) {
+    let mut catalog = catalog.lock();
+    catalog.ids = templates.iter().map(template_id).collect();
+    count.store(templates.len(), Ordering::Relaxed);
+    catalog.templates = templates;
+}
+
+async fn persist_remote(
+    state: Arc<ObjectState<Vec<WarmupTemplate>>>,
+    catalog: Arc<parking_lot::Mutex<WarmupCatalog>>,
+    count: Arc<AtomicUsize>,
+) {
+    let mut local = catalog.lock().templates.clone();
+    for _ in 0..MAX_REMOTE_PERSIST_ATTEMPTS {
+        let remote = match state.get(WARMUP_STATE_KEY).await {
+            Ok(templates) => templates.unwrap_or_default(),
+            Err(e) => {
+                tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
+                return;
+            }
+        };
+        let merged = merge_templates(&remote, &local);
+        if merged == remote {
+            apply_catalog(catalog.as_ref(), count.as_ref(), merged);
+            return;
+        }
+        if remote.is_empty() {
+            match state.insert(WARMUP_STATE_KEY, &merged).await {
+                Ok(InsertResult::Ok) => {
+                    apply_catalog(catalog.as_ref(), count.as_ref(), merged);
+                    return;
+                }
+                Ok(InsertResult::AlreadyExists) => {
+                    local = merged;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
+                    return;
+                }
+            }
+        }
+        match state.update(WARMUP_STATE_KEY, &merged).await {
+            Ok(UpdateResult::Ok) => {
+                apply_catalog(catalog.as_ref(), count.as_ref(), merged);
+                return;
+            }
+            Ok(UpdateResult::NotFound) => {
+                local = merged;
+            }
+            Ok(UpdateResult::Conflict { current }) => {
+                local = merge_templates(&current, &merged);
+            }
+            Err(e) => {
+                tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
+                return;
+            }
+        }
+    }
+    tracing::debug!("Failed to persist SQL results cache warmup catalog after retries");
+}
+
+/// Build the warmer, loading from `runtime.state` when that is set.
+pub(crate) async fn build_results_cache_warmer(
+    enabled: bool,
+    runtime_state: Option<&RuntimeState>,
+    secrets: Arc<RwLock<Secrets>>,
+    io_runtime: Handle,
+) -> ResultsCacheWarmer {
+    let Some(state) = runtime_state.filter(|_| enabled) else {
+        return ResultsCacheWarmer::new(default_warmup_store_path(), enabled);
+    };
+
+    match crate::object_store_state::build_object_store(
+        secrets,
+        io_runtime,
+        &state.location,
+        state.params.as_ref(),
+        "SQL results cache warmup state",
+    )
+    .await
+    {
+        Ok((store, prefix)) => {
+            tracing::info!(
+                "SQL results cache warmup will store query plans at '{}'",
+                state.location
+            );
+            ResultsCacheWarmer::from_object_store(store, &prefix, true).await
+        }
+        Err(error) => {
+            tracing::warn!(
+                "Failed to initialize SQL results cache warmup state at '{}', so plan shapes will be stored on the local disk instead. Cause: {error}",
+                state.location
+            );
+            ResultsCacheWarmer::new(default_warmup_store_path(), true)
+        }
     }
 }
 
 impl DataFusion {
-    /// Remember a query that was stored in the SQL results cache, so the first
-    /// full/append refresh of a table it reads can replay it.
-    pub(crate) fn record_results_cache_warming_query(
-        &self,
-        raw_key: RawCacheKey,
-        sql: Arc<str>,
-        parameters: Option<ParamValues>,
-        namespace: CacheNamespace,
-        input_tables: Arc<HashSet<TableReference>>,
+    /// Record a cacheable user query's plan shape for the next cold start.
+    pub(crate) fn observe_results_cache_warmup_plan(&self, plan: &LogicalPlan) {
+        self.results_cache_warmer.observe_plan(plan);
+    }
+
+    /// After this process becomes ready, replay persisted plan shapes with
+    /// distinct dataset keys. Once-only for this process; later refreshes
+    /// do not re-warm.
+    pub(crate) fn spawn_results_cache_warmup(
+        self: &Arc<Self>,
+        status: Arc<status::RuntimeStatus>,
+        app: Option<Arc<App>>,
     ) {
-        if sql.as_ref() == "<logical plan>" || sql.is_empty() {
+        if !self.results_cache_warmer.enabled {
             return;
         }
-        if input_tables.is_empty() {
+        if self.results_cache_provider().is_none() {
             return;
         }
-        if input_tables
-            .iter()
-            .any(|table| matches!(table.schema(), Some(SPICE_RUNTIME_SCHEMA)))
-        {
+        if !self.results_cache_warmer.claim_warmup() {
+            return;
+        }
+        let templates = self.results_cache_warmer.templates_snapshot();
+        if templates.is_empty() {
             return;
         }
 
-        self.results_cache_warmer.record(WarmingQuery {
-            raw_key,
-            sql,
-            parameters,
-            namespace,
-            input_tables,
+        let df = Arc::clone(self);
+        let refresh_runtime = self.refresh_runtime().cloned();
+        tokio::spawn(async move {
+            if !df.wait_for_first_full_append_refresh(&status).await {
+                return;
+            }
+            let run = {
+                let df = Arc::clone(&df);
+                async move { df.run_warmup_templates(&templates, app.as_ref()).await }
+            };
+            if let Some(runtime) = refresh_runtime {
+                runtime.spawn(run);
+            } else {
+                run.await;
+            }
         });
     }
 
-    /// Callback the refresher invokes after the first successful full/append
-    /// refresh. Returns `None` when this `DataFusion` has not been wrapped in
-    /// an `Arc` yet (`set_self_ref` has not run), so tests that never start
-    /// the refresher are unaffected.
-    pub(crate) fn results_cache_warm_callback(
-        &self,
-    ) -> Option<crate::accelerated::refresh::ResultsCacheWarmCallback> {
-        let weak = self.datafusion_ref().get()?.clone();
-        Some(Arc::new(move |tables: Vec<TableReference>| {
-            let Some(df) = weak.upgrade() else {
-                return;
-            };
-            df.spawn_results_cache_warming(tables);
-        }))
-    }
-
-    /// Spawn warming on the dedicated refresh runtime so it cannot take query
-    /// runtime workers or admission permits. Falls back to the current runtime
-    /// when no refresh runtime is configured (tests, single-runtime processes).
-    fn spawn_results_cache_warming(self: &Arc<Self>, tables: Vec<TableReference>) {
-        let df = Arc::clone(self);
-        let task = async move {
-            df.warm_results_cache(&tables).await;
-        };
-        if let Some(runtime) = self.refresh_runtime() {
-            runtime.spawn(task);
-        } else {
-            tokio::spawn(task);
+    async fn wait_for_first_full_append_refresh(&self, status: &status::RuntimeStatus) -> bool {
+        loop {
+            if status.is_shutdown() {
+                return false;
+            }
+            if self.accelerated_initial_loads_done().await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
 
-    /// Replay recorded queries that read `tables` until the results cache is
-    /// full, then stop. Safe to call more than once: a second call finds the
-    /// cache already full (or the same queries already resident) and exits.
-    /// The refresher is what guarantees "first refresh only".
-    pub(crate) async fn warm_results_cache(self: &Arc<Self>, tables: &[TableReference]) {
+    async fn accelerated_initial_loads_done(&self) -> bool {
+        let names = self.accelerated_table_names().await;
+        for name in names {
+            let Ok(provider) = self.get_accelerated_table_provider(&name.to_string()).await else {
+                return false;
+            };
+            let Some(table) = spice_table::find_layer::<AcceleratedTable>(
+                provider.as_ref(),
+                spice_table::LayerWalk::Read,
+            ) else {
+                continue;
+            };
+            let mode = table.refresher().refresh_mode().await;
+            if matches!(mode, RefreshMode::Full | RefreshMode::Append)
+                && !table.refresher().initial_load_completed()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn run_warmup_templates(
+        self: &Arc<Self>,
+        templates: &[WarmupTemplate],
+        app: Option<&Arc<App>>,
+    ) {
         let Some(cache_provider) = self.results_cache_provider() else {
             return;
         };
 
-        let queries = self.results_cache_warmer.queries_for_tables(tables);
-        if queries.is_empty() {
-            tracing::debug!(
-                "SQL results cache warming skipped: no recorded queries read the refreshed dataset(s)"
-            );
-            return;
-        }
-
-        let _run = self.results_cache_warmer.run.lock().await;
-
-        cache_provider.run_pending_tasks().await;
-        let size = cache_provider.size().await;
-        let max_size = cache_provider.max_size();
-        if size >= max_size {
-            tracing::debug!(
-                "SQL results cache warming skipped: the cache is already full ({:.2} of {:.2})",
-                byte_unit::Byte::from_u64(size).get_adjusted_unit(byte_unit::Unit::MiB),
-                byte_unit::Byte::from_u64(max_size).get_adjusted_unit(byte_unit::Unit::MiB),
-            );
-            return;
-        }
-
-        let names = tables
-            .iter()
-            .map(|table| format!("'{table}'"))
-            .collect::<Vec<_>>()
-            .join(", ");
         tracing::info!(
-            "Warming SQL results cache for dataset {names} after its first refresh; this runs on the refresh runtime and stops once the cache is full"
+            "Warming SQL results cache from {} stored query plan{}, using distinct dataset keys, until the cache is full",
+            templates.len(),
+            if templates.len() == 1 { "" } else { "s" },
+        );
+
+        let cache_key_type = CacheKeyType::from_app_runtime(app);
+        let request_context = Arc::new(
+            RequestContext::builder(Protocol::Internal)
+                .with_cache_control(CacheControl::Cache(cache_key_type))
+                .with_cache_namespace(CacheNamespace::Public)
+                .build(),
         );
 
         let mut stored = 0_u64;
-        let mut attempted = 0_u64;
-        for query in queries {
+        for template in templates {
             cache_provider.run_pending_tasks().await;
             if cache_provider.size().await >= cache_provider.max_size() {
-                tracing::info!(
-                    "Finished warming SQL results cache for dataset {names}: the cache is full after {stored} queries ({:.2}). Further refreshes will not re-warm",
-                    byte_unit::Byte::from_u64(cache_provider.size().await)
-                        .get_adjusted_unit(byte_unit::Unit::MiB),
-                );
-                return;
+                break;
             }
-
-            attempted += 1;
-            if super::Query::warm_one_cached_query(self, &query).await {
-                stored += 1;
-            }
+            stored += self
+                .warm_one_template(template, &request_context, cache_provider.as_ref())
+                .await;
         }
 
         cache_provider.run_pending_tasks().await;
         tracing::info!(
-            "Finished warming SQL results cache for dataset {names}: stored {stored} of {attempted} queries ({:.2}). Further refreshes will not re-warm",
+            "Finished warming SQL results cache: stored {stored} results ({:.2}). Later refreshes will not re-warm",
             byte_unit::Byte::from_u64(cache_provider.size().await)
                 .get_adjusted_unit(byte_unit::Unit::MiB),
         );
     }
+
+    async fn warm_one_template(
+        self: &Arc<Self>,
+        template: &WarmupTemplate,
+        request_context: &Arc<RequestContext>,
+        cache_provider: &cache::QueryResultsCacheProvider,
+    ) -> u64 {
+        let Some(distinct_sql) = distinct_keys_sql(template) else {
+            return u64::from(execute_warmup_sql(self, &template.sql, None, request_context).await);
+        };
+
+        let keys = match collect_distinct_keys(self, &distinct_sql, request_context).await {
+            Some(keys) if !keys.is_empty() => keys,
+            _ => {
+                return u64::from(
+                    execute_warmup_sql(self, &template.sql, None, request_context).await,
+                );
+            }
+        };
+
+        let mut stored = 0_u64;
+        for row in keys {
+            cache_provider.run_pending_tasks().await;
+            if cache_provider.size().await >= cache_provider.max_size() {
+                break;
+            }
+            if execute_warmup_sql(self, &template.sql, Some(row), request_context).await {
+                stored += 1;
+            }
+        }
+        stored
+    }
+}
+
+async fn collect_distinct_keys(
+    df: &Arc<DataFusion>,
+    sql: &str,
+    request_context: &Arc<RequestContext>,
+) -> Option<Vec<Vec<ScalarValue>>> {
+    let query = QueryBuilder::new(sql, Arc::clone(df))
+        .for_results_cache_warming()
+        .results_cache_mode(ResultsCacheMode::Bypass)
+        .build();
+    let result = Arc::clone(request_context)
+        .scope(async move { query.run().await })
+        .await
+        .ok()?;
+    let batches = result.data.try_collect::<Vec<_>>().await.ok()?;
+    let mut rows = Vec::new();
+    for batch in batches {
+        for row_idx in 0..batch.num_rows() {
+            let mut values = Vec::with_capacity(batch.num_columns());
+            for col_idx in 0..batch.num_columns() {
+                values.push(ScalarValue::try_from_array(batch.column(col_idx), row_idx).ok()?);
+            }
+            rows.push(values);
+        }
+    }
+    Some(rows)
+}
+
+async fn execute_warmup_sql(
+    df: &Arc<DataFusion>,
+    sql: &str,
+    parameters: Option<Vec<ScalarValue>>,
+    request_context: &Arc<RequestContext>,
+) -> bool {
+    let mut builder = QueryBuilder::new(sql, Arc::clone(df)).for_results_cache_warming();
+    if let Some(values) = parameters {
+        builder = builder.parameters(Some(ParamValues::from(values)));
+    }
+    let query = builder.build();
+    let result = Arc::clone(request_context)
+        .scope(async move { query.run().await })
+        .await;
+    match result {
+        Ok(query_result) => query_result.data.try_collect::<Vec<_>>().await.is_ok(),
+        Err(e) => {
+            tracing::debug!("SQL results cache warmup query failed: {e}");
+            false
+        }
+    }
+}
+
+#[must_use]
+pub(crate) fn default_warmup_store_path() -> PathBuf {
+    PathBuf::from(WARMUP_STORE_RELATIVE)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cache::key::CacheKey;
-    use std::hash::Hasher;
-
-    fn key(sql: &str) -> RawCacheKey {
-        CacheKey::Query(sql, None).as_raw_key(Box::new(std::hash::DefaultHasher::new()))
-    }
-
-    fn query(sql: &str, tables: &[&str]) -> WarmingQuery {
-        WarmingQuery {
-            raw_key: key(sql),
-            sql: Arc::from(sql),
-            parameters: None,
-            namespace: CacheNamespace::Public,
-            input_tables: Arc::new(tables.iter().map(|t| TableReference::bare(*t)).collect()),
-        }
-    }
-
-    #[test]
-    fn catalog_returns_matching_queries_most_recent_first() {
-        let mut catalog = WarmingCatalog::new();
-        catalog.record(query("SELECT 1 FROM a", &["a"]));
-        catalog.record(query("SELECT 2 FROM a", &["a"]));
-        catalog.record(query("SELECT 3 FROM b", &["b"]));
-
-        let warmed = catalog.for_tables(&[TableReference::bare("a")]);
-        assert_eq!(warmed.len(), 2);
-        assert_eq!(warmed[0].sql.as_ref(), "SELECT 2 FROM a");
-        assert_eq!(warmed[1].sql.as_ref(), "SELECT 1 FROM a");
-    }
-
-    #[test]
-    fn catalog_matches_qualified_and_bare_table_names() {
-        let mut catalog = WarmingCatalog::new();
-        catalog.record(query("SELECT 1 FROM customer", &["customer"]));
-
-        let warmed = catalog.for_tables(&[TableReference::full("spice", "public", "customer")]);
-        assert_eq!(warmed.len(), 1);
-        assert_eq!(warmed[0].sql.as_ref(), "SELECT 1 FROM customer");
-    }
-
-    #[test]
-    fn catalog_re_recording_moves_a_query_to_most_recent() {
-        let mut catalog = WarmingCatalog::new();
-        catalog.record(query("SELECT 1 FROM a", &["a"]));
-        catalog.record(query("SELECT 2 FROM a", &["a"]));
-        catalog.record(query("SELECT 1 FROM a", &["a"]));
-
-        let warmed = catalog.for_tables(&[TableReference::bare("a")]);
-        assert_eq!(warmed.len(), 2, "re-recording must not duplicate the key");
-        assert_eq!(warmed[0].sql.as_ref(), "SELECT 1 FROM a");
-        assert_eq!(warmed[1].sql.as_ref(), "SELECT 2 FROM a");
-    }
-
-    #[test]
-    fn catalog_evicts_the_least_recent_query_past_the_bound() {
-        let mut catalog = WarmingCatalog::new();
-        for i in 0..=MAX_WARMING_QUERIES {
-            catalog.record(query(&format!("SELECT {i} FROM t"), &["t"]));
-        }
-
-        assert_eq!(catalog.by_key.len(), MAX_WARMING_QUERIES);
-        assert_eq!(catalog.lru.len(), MAX_WARMING_QUERIES);
-
-        let warmed = catalog.for_tables(&[TableReference::bare("t")]);
-        assert_eq!(warmed.len(), MAX_WARMING_QUERIES);
-        assert_eq!(
-            warmed[0].sql.as_ref(),
-            format!("SELECT {MAX_WARMING_QUERIES} FROM t")
-        );
-        assert!(
-            warmed.iter().all(|q| q.sql.as_ref() != "SELECT 0 FROM t"),
-            "the least-recent query must have been evicted"
-        );
-    }
-}
-
-#[cfg(test)]
-mod warming_runtime_tests {
-    use super::*;
-    use std::sync::Arc;
     use std::time::Duration;
 
     use arrow::array::Int64Array;
@@ -344,29 +591,31 @@ mod warming_runtime_tests {
     use cache::result::CacheStatus;
     use cache::{Caching, QueryResultsCacheProvider, SimpleCache};
     use datafusion::datasource::{MemTable, TableProvider};
-    use futures::TryStreamExt;
-    use runtime_request_context::{CacheControl, CacheKeyType, Protocol, RequestContext};
+    use datafusion::sql::TableReference;
     use spicepod::component::caching::SQLResultsCacheConfig;
     use tokio::runtime::Handle;
 
+    use super::super::warmup_plan::{WarmupBinding, WarmupTemplate};
+    use super::MAX_WARMUP_PLANS;
     use crate::{
         builder::RuntimeBuilder,
-        datafusion::{
-            DataFusion,
-            query::{QueryBuilder, ResultsCacheMode},
-        },
+        datafusion::query::{QueryBuilder as QBuilder, ResultsCacheMode},
         status,
+    };
+    use runtime_request_context::{
+        CacheControl, CacheKeyType, CacheNamespace, Protocol, RequestContext,
     };
 
     fn request_context() -> Arc<RequestContext> {
         Arc::new(
             RequestContext::builder(Protocol::Internal)
-                .with_cache_control(CacheControl::Cache(CacheKeyType::Raw))
+                .with_cache_control(CacheControl::Cache(CacheKeyType::Default))
+                .with_cache_namespace(CacheNamespace::Public)
                 .build(),
         )
     }
 
-    async fn prepare_runtime(max_size: Option<&str>) -> Arc<DataFusion> {
+    async fn prepare_runtime(max_size: Option<&str>, store: PathBuf) -> Arc<DataFusion> {
         let plans_cache = Arc::new(SimpleCache::new(
             512,
             Duration::from_hours(1),
@@ -374,7 +623,6 @@ mod warming_runtime_tests {
         ));
         let results_cache_config = SQLResultsCacheConfig {
             item_ttl: Some("10m".to_string()),
-            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
             max_size: max_size.map(ToString::to_string),
             ..Default::default()
         };
@@ -393,109 +641,385 @@ mod warming_runtime_tests {
                     .with_results_cache(Arc::new(cache_provider))
                     .with_plans_cache(plans_cache),
             ))
+            .with_results_cache_warmup_store(store)
+            .with_results_cache_warmup_enabled(true)
             .build(),
         )
     }
 
-    async fn register_table(df: &Arc<DataFusion>, name: &str, value: i64) {
-        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+    async fn prepare_runtime_disabled(store: PathBuf) -> Arc<DataFusion> {
+        let runtime = RuntimeBuilder::new().build().await;
+        Arc::new(
+            DataFusion::builder(
+                status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+                Handle::current(),
+            )
+            .with_results_cache_warmup_store(store)
+            .with_results_cache_warmup_enabled(false)
+            .build(),
+        )
+    }
+
+    async fn register_table(df: &Arc<DataFusion>, name: &str, values: Vec<i64>) {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(vec![value]))],
+            vec![Arc::new(Int64Array::from(values))],
         )
         .expect("batch");
-        let table = Arc::new(
-            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table"),
-        );
+        let table = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("mem table"));
         df.ctx
-            .register_table(
-                TableReference::bare(name),
-                table as Arc<dyn TableProvider>,
-            )
+            .register_table(TableReference::bare(name), table as Arc<dyn TableProvider>)
             .expect("register table");
     }
 
     async fn run_sql(df: &Arc<DataFusion>, sql: &str) -> CacheStatus {
-        let result = QueryBuilder::new(sql, Arc::clone(df))
+        let result = QBuilder::new(sql, Arc::clone(df))
             .results_cache_mode(ResultsCacheMode::Default)
             .build()
             .run()
             .await
             .expect("query should succeed");
         let status = result.cache_status;
-        result
-            .data
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("collect");
+        result.data.try_collect::<Vec<_>>().await.expect("collect");
         status
     }
 
     #[tokio::test]
-    async fn warming_replays_recorded_queries_after_invalidation() {
-        let df = prepare_runtime(None).await;
-        register_table(&df, "orders", 1).await;
-        let ctx = request_context();
+    async fn first_ten_plan_shapes_are_kept_not_literal_variants() {
+        let store =
+            std::env::temp_dir().join(format!("spice-warmup-shapes-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&store);
+        let df = prepare_runtime(None, store.clone()).await;
+        register_table(&df, "orders", vec![1, 2, 3]).await;
 
-        let miss = ctx.scope(run_sql(&df, "SELECT n FROM orders")).await;
-        assert_eq!(miss, CacheStatus::CacheMiss);
-
-        let hit = ctx.scope(run_sql(&df, "SELECT n FROM orders")).await;
-        assert_eq!(hit, CacheStatus::CacheHit);
-
-        df.caching()
-            .invalidate_for_table(TableReference::bare("orders"))
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE orders (id INT)")
             .await
-            .expect("invalidate");
-        let provider = df.results_cache_provider().expect("results cache");
-        provider.run_pending_tasks().await;
-
-        df.warm_results_cache(&[TableReference::bare("orders")])
-            .await;
-
-        let hit_after_warm = ctx.scope(run_sql(&df, "SELECT n FROM orders")).await;
+            .expect("create")
+            .collect()
+            .await
+            .expect("collect");
+        for id in 1..=5 {
+            let plan = ctx
+                .sql(&format!("SELECT id FROM orders WHERE id = {id}"))
+                .await
+                .expect("sql")
+                .logical_plan()
+                .clone();
+            df.observe_results_cache_warmup_plan(&plan);
+        }
         assert_eq!(
-            hit_after_warm,
+            df.results_cache_warmer.templates_snapshot().len(),
+            1,
+            "five literal variants of one plan must count as one template"
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[tokio::test]
+    async fn warmup_replays_a_stored_plan_across_distinct_keys() {
+        let store =
+            std::env::temp_dir().join(format!("spice-warmup-keys-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&store);
+        let df = prepare_runtime(None, store.clone()).await;
+        register_table(&df, "orders", vec![1, 2, 3]).await;
+
+        let template = WarmupTemplate {
+            sql: "SELECT id FROM orders WHERE id = $1".to_string(),
+            bindings: vec![WarmupBinding {
+                table: "orders".to_string(),
+                column: "id".to_string(),
+            }],
+        };
+        df.run_warmup_templates(&[template], None).await;
+
+        let hit = request_context()
+            .scope(run_sql(&df, "SELECT id FROM orders WHERE id = 2"))
+            .await;
+        assert_eq!(
+            hit,
             CacheStatus::CacheHit,
-            "warming must put the recorded query back in the results cache"
+            "warmup must fill the cache for a distinct key that was never queried in this process"
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[tokio::test]
+    async fn disabled_warmup_does_not_record_plans() {
+        let store =
+            std::env::temp_dir().join(format!("spice-warmup-disabled-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&store);
+        let df = prepare_runtime_disabled(store.clone()).await;
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE orders (id INT)")
+            .await
+            .expect("create")
+            .collect()
+            .await
+            .expect("collect");
+        let plan = ctx
+            .sql("SELECT id FROM orders WHERE id = 1")
+            .await
+            .expect("sql")
+            .logical_plan()
+            .clone();
+        df.observe_results_cache_warmup_plan(&plan);
+        assert!(
+            df.results_cache_warmer.templates_snapshot().is_empty(),
+            "warmup: disabled must not record plans"
+        );
+        assert!(
+            !store.exists(),
+            "warmup: disabled must not write a warmup catalog"
+        );
+    }
+
+    async fn wait_for_catalog(path: &std::path::Path) {
+        let start = std::time::Instant::now();
+        loop {
+            if path.exists() {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "warmup catalog was not written to {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_warmup_persists_and_reloads_plan_shapes() {
+        let store =
+            std::env::temp_dir().join(format!("spice-warmup-persist-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_file(store.with_extension("json.tmp"));
+        let df = prepare_runtime(None, store.clone()).await;
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE orders (id INT)")
+            .await
+            .expect("create")
+            .collect()
+            .await
+            .expect("collect");
+        let plan = ctx
+            .sql("SELECT id FROM orders WHERE id = 1")
+            .await
+            .expect("sql")
+            .logical_plan()
+            .clone();
+        df.observe_results_cache_warmup_plan(&plan);
+        wait_for_catalog(&store).await;
+
+        let reloaded = ResultsCacheWarmer::new(store.clone(), true);
+        assert_eq!(
+            reloaded.templates_snapshot().len(),
+            1,
+            "a new process must load the persisted plan shape"
+        );
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_file(store.with_extension("json.tmp"));
+    }
+
+    #[tokio::test]
+    async fn only_the_first_ten_distinct_plan_shapes_are_kept() {
+        let store =
+            std::env::temp_dir().join(format!("spice-warmup-cap-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&store);
+        let df = prepare_runtime(None, store.clone()).await;
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE orders (id INT, status VARCHAR)")
+            .await
+            .expect("create")
+            .collect()
+            .await
+            .expect("collect");
+        let sqls = [
+            "SELECT id FROM orders",
+            "SELECT status FROM orders",
+            "SELECT id, status FROM orders",
+            "SELECT count(*) FROM orders",
+            "SELECT id FROM orders ORDER BY id",
+            "SELECT id FROM orders LIMIT 1",
+            "SELECT DISTINCT id FROM orders",
+            "SELECT id FROM orders WHERE id > 0",
+            "SELECT id FROM orders WHERE id < 0",
+            "SELECT id FROM orders WHERE id >= 0",
+            "SELECT id FROM orders WHERE id <= 0",
+        ];
+        for sql in sqls {
+            let plan = ctx.sql(sql).await.expect("sql").logical_plan().clone();
+            df.observe_results_cache_warmup_plan(&plan);
+        }
+        assert_eq!(
+            df.results_cache_warmer.templates_snapshot().len(),
+            MAX_WARMUP_PLANS,
+            "the 11th distinct plan shape must not be recorded"
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn merge_templates_keeps_base_order_and_caps_at_ten() {
+        let base = vec![WarmupTemplate {
+            sql: "SELECT 1".to_string(),
+            bindings: vec![],
+        }];
+        let extra = vec![
+            WarmupTemplate {
+                sql: "SELECT 1".to_string(),
+                bindings: vec![],
+            },
+            WarmupTemplate {
+                sql: "SELECT 2".to_string(),
+                bindings: vec![],
+            },
+        ];
+        let merged = merge_templates(&base, &extra);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].sql, "SELECT 1");
+        assert_eq!(merged[1].sql, "SELECT 2");
+
+        let full: Vec<WarmupTemplate> = (0..MAX_WARMUP_PLANS)
+            .map(|i| WarmupTemplate {
+                sql: format!("SELECT {i}"),
+                bindings: vec![],
+            })
+            .collect();
+        let overflow = vec![WarmupTemplate {
+            sql: "SELECT overflow".to_string(),
+            bindings: vec![],
+        }];
+        let capped = merge_templates(&full, &overflow);
+        assert_eq!(capped.len(), MAX_WARMUP_PLANS);
+        assert_eq!(capped[0].sql, "SELECT 0");
+        assert_eq!(
+            capped[MAX_WARMUP_PLANS - 1].sql,
+            format!("SELECT {}", MAX_WARMUP_PLANS - 1)
         );
     }
 
     #[tokio::test]
-    async fn warming_stops_once_the_cache_is_full() {
-        // Small enough that a handful of distinct results fill it; large
-        // enough that a single tiny SELECT still fits.
-        let df = prepare_runtime(Some("2KiB")).await;
-        register_table(&df, "orders", 1).await;
-        let ctx = request_context();
+    async fn object_store_warmup_persists_and_reloads_plan_shapes() {
+        let dir = std::env::temp_dir().join(format!("spice-warmup-remote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store_occ::LocalConditionalPut::new(&dir).expect("local store"));
 
-        for i in 0..32 {
-            let sql = format!("SELECT n, {i} FROM orders");
-            let _ = ctx.scope(run_sql(&df, &sql)).await;
+        let warmer = ResultsCacheWarmer::from_object_store(Arc::clone(&store), "", true).await;
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE orders (id INT)")
+            .await
+            .expect("create")
+            .collect()
+            .await
+            .expect("collect");
+        let plan = ctx
+            .sql("SELECT id FROM orders WHERE id = 1")
+            .await
+            .expect("sql")
+            .logical_plan()
+            .clone();
+        warmer.observe_plan(&plan);
+
+        let state = ObjectState::<Vec<WarmupTemplate>>::new(Arc::clone(&store));
+        let start = std::time::Instant::now();
+        loop {
+            if state
+                .get(WARMUP_STATE_KEY)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|templates| !templates.is_empty())
+            {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "warmup catalog was not written to object storage"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        let provider = df.results_cache_provider().expect("results cache");
-        provider.run_pending_tasks().await;
-        assert!(
-            provider.item_count().await > 1,
-            "the test must have cached more than one query"
+        let reloaded = ResultsCacheWarmer::from_object_store(store, "", true).await;
+        assert_eq!(
+            reloaded.templates_snapshot().len(),
+            1,
+            "a new process must load the persisted plan shape from object storage"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        df.caching()
-            .invalidate_for_table(TableReference::bare("orders"))
+    #[tokio::test]
+    async fn build_results_cache_warmer_uses_runtime_state_location() {
+        let dir =
+            std::env::temp_dir().join(format!("spice-warmup-runtime-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let runtime_state = RuntimeState {
+            location: format!("file://{}", dir.display()),
+            params: None,
+        };
+        let secrets = Arc::new(RwLock::new(Secrets::new()));
+        let warmer = build_results_cache_warmer(
+            true,
+            Some(&runtime_state),
+            Arc::clone(&secrets),
+            Handle::current(),
+        )
+        .await;
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE orders (id INT)")
             .await
-            .expect("invalidate");
-        provider.run_pending_tasks().await;
+            .expect("create")
+            .collect()
+            .await
+            .expect("collect");
+        let plan = ctx
+            .sql("SELECT id FROM orders WHERE id = 1")
+            .await
+            .expect("sql")
+            .logical_plan()
+            .clone();
+        warmer.observe_plan(&plan);
 
-        df.warm_results_cache(&[TableReference::bare("orders")])
-            .await;
-        provider.run_pending_tasks().await;
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store_occ::LocalConditionalPut::new(&dir).expect("local store"));
+        let state = ObjectState::<Vec<WarmupTemplate>>::new(store);
+        let start = std::time::Instant::now();
+        loop {
+            if state
+                .get(WARMUP_STATE_KEY)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|templates| !templates.is_empty())
+            {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "warmup catalog was not written to runtime.state location"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
-        let after = provider.item_count().await;
-        assert!(after > 0, "warming must store at least one query");
-        assert!(
-            after < 32,
-            "warming must stop once the cache is full rather than replaying all 32 recorded queries, stored {after}"
+        let reloaded =
+            build_results_cache_warmer(true, Some(&runtime_state), secrets, Handle::current())
+                .await;
+        assert_eq!(
+            reloaded.templates_snapshot().len(),
+            1,
+            "a new process must load plan shapes from runtime.state"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

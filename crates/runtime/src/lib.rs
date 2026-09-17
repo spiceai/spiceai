@@ -2068,6 +2068,8 @@ impl Runtime {
                                 }
                             }
                             tracing::info!("All components are loaded. Spice runtime is ready!");
+                            let app = self.read_app().await;
+                            self.df.spawn_results_cache_warmup(Arc::clone(&status), app);
                             break;
                         }
                     }

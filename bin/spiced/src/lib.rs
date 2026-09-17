@@ -801,13 +801,12 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
             if resolved_cluster_config.effective_role() == Some(ClusterRole::Scheduler) {
                 let has_state_location = app
                     .as_ref()
-                    .and_then(|a| a.runtime.scheduler.as_ref())
-                    .is_some();
+                    .is_some_and(|a| a.runtime.resolved_scheduler().is_some());
                 if !has_state_location {
                     return Err(Error::InvalidClusterConfig {
                         source: std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
-                            "Scheduler mode requires `runtime.scheduler.state_location` to be configured in the spicepod. See: https://spiceai.org/docs/features/distributed-query",
+                            "Scheduler mode requires `runtime.scheduler.state_location` or `runtime.state.location` to be configured in the spicepod. See: https://spiceai.org/docs/features/distributed-query",
                         ),
                     });
                 }

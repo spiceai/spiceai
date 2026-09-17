@@ -57,7 +57,10 @@ pub mod builder;
 pub use builder::QueryBuilder;
 mod cache;
 mod cache_warming;
-pub(crate) use cache_warming::ResultsCacheWarmer;
+mod warmup_plan;
+pub(crate) use cache_warming::{
+    ResultsCacheWarmer, build_results_cache_warmer, default_warmup_store_path,
+};
 pub mod transaction;
 pub use transaction::{
     TransactionError, TransactionOutcome, run_transaction, schema_statement, transaction_statements,
@@ -1230,23 +1233,10 @@ impl Query {
             QueryMethod::Text { sql, .. } => Arc::clone(sql),
             QueryMethod::Plan(_) => Arc::from("<logical plan>"),
         };
-        let warming_parameters = match &self.sql {
-            QueryMethod::Text {
-                parameters,
-                table_allowlist: None,
-                ..
-            } => parameters.clone(),
-            _ => None,
-        };
-        let record_warming_query = matches!(
-            &self.sql,
-            QueryMethod::Text {
-                table_allowlist: None,
-                ..
-            }
+        let skip_query_admission = matches!(
+            self.runtime_binding,
+            QueryRuntimeBinding::CurrentRuntimeUngated
         );
-        let skip_query_admission =
-            matches!(self.runtime_binding, QueryRuntimeBinding::CurrentRuntimeUngated);
         let query_id_str: Arc<str> = Arc::from(self.query_id.to_string());
 
         // Cancellation can fire after the probe, while this query is waiting
@@ -1789,14 +1779,8 @@ impl Query {
                     };
 
                 let final_stream = if cache_manager.should_cache_results() {
-                    if record_warming_query {
-                        ctx.df.record_results_cache_warming_query(
-                            cache_manager.raw_cache_key,
-                            Arc::clone(&sql_preview),
-                            warming_parameters,
-                            request_context.cache_namespace(),
-                            Arc::clone(&datasets),
-                        );
+                    if ctx.runtime_binding == QueryRuntimeBinding::QueryRuntime {
+                        ctx.df.observe_results_cache_warmup_plan(&plan);
                     }
                     Self::wrap_stream_with_cache(
                         &ctx.df,

@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::fmt::Display;
 
-use super::{default_true, is_default_or_none};
+use super::{default_true, is_default, is_default_or_none};
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -78,6 +78,28 @@ pub enum Encoding {
     #[default]
     None,
     Zstd,
+}
+
+/// Whether the SQL results cache records query plans and replays them after
+/// the first full/append refresh.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ResultsCacheWarmup {
+    /// Do not record query plans or replay them after a refresh.
+    #[default]
+    Disabled,
+    /// After the first full/append refresh, replay the first 10 distinct query
+    /// plans (equality-filter values taken from distinct keys in the dataset)
+    /// until the cache is full. Later refreshes do not re-warm.
+    OnFirstRefresh,
+}
+
+impl ResultsCacheWarmup {
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::OnFirstRefresh)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -185,6 +207,11 @@ pub struct SQLResultsCacheConfig {
     /// Encoding algorithm for compressing cached results.
     #[serde(default)]
     pub encoding: Encoding,
+    /// Replay recorded query plans into the results cache after the first
+    /// full/append refresh. Has no effect unless [`Self::enabled`] is `true`.
+    /// Default: `disabled`.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub warmup: ResultsCacheWarmup,
 }
 
 // serde(default) only applies when deserializing, so to return enabled: true from ::default() calls
@@ -201,6 +228,7 @@ impl Default for SQLResultsCacheConfig {
             engine: CacheEngine::default(),
             stale_while_revalidate_ttl: None,
             encoding: Encoding::default(),
+            warmup: ResultsCacheWarmup::default(),
         }
     }
 }
@@ -252,6 +280,7 @@ impl From<ResultsCache> for SQLResultsCacheConfig {
             engine: val.engine,
             stale_while_revalidate_ttl: None,
             encoding: Encoding::default(),
+            warmup: ResultsCacheWarmup::default(),
         }
     }
 }
@@ -274,6 +303,7 @@ mod tests {
         assert!(sql_results.max_size.is_none());
         assert!(sql_results.item_ttl.is_none());
         assert_eq!(sql_results.caching_policy, CachingPolicy::Lru);
+        assert_eq!(sql_results.warmup, ResultsCacheWarmup::Disabled);
         assert_eq!(sql_results, SQLResultsCacheConfig::default());
 
         let search_results = caching.search_results.expect("Should have cache config");
@@ -294,5 +324,57 @@ mod tests {
         assert!(embeddings.item_ttl.is_none());
         assert_eq!(embeddings.caching_policy, CachingPolicy::Lru);
         assert_eq!(embeddings, CacheConfig::default());
+    }
+
+    #[test]
+    fn test_sql_results_warmup_default_is_disabled() {
+        assert_eq!(
+            SQLResultsCacheConfig::default().warmup,
+            ResultsCacheWarmup::Disabled
+        );
+        let parsed: SQLResultsCacheConfig = yaml::from_str("enabled: true").expect("parse");
+        assert_eq!(parsed.warmup, ResultsCacheWarmup::Disabled);
+    }
+
+    #[test]
+    fn test_sql_results_warmup_on_first_refresh() {
+        let parsed: SQLResultsCacheConfig = yaml::from_str(
+            "
+            enabled: true
+            warmup: on_first_refresh
+            ",
+        )
+        .expect("parse");
+        assert!(parsed.warmup.is_enabled());
+        assert_eq!(parsed.warmup, ResultsCacheWarmup::OnFirstRefresh);
+    }
+
+    #[test]
+    fn test_sql_results_warmup_rejects_a_boolean() {
+        let err = yaml::from_str::<SQLResultsCacheConfig>(
+            "
+            enabled: true
+            warmup: true
+            ",
+        )
+        .expect_err("boolean warmup values are not accepted");
+        let message = err.to_string();
+        assert!(
+            message.contains("enum") || message.contains("Bool"),
+            "boolean warmup values must be rejected, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_sql_results_warmup_parses_when_cache_is_disabled() {
+        let parsed: SQLResultsCacheConfig = yaml::from_str(
+            "
+            enabled: false
+            warmup: on_first_refresh
+            ",
+        )
+        .expect("parse");
+        assert!(!parsed.enabled);
+        assert!(parsed.warmup.is_enabled());
     }
 }

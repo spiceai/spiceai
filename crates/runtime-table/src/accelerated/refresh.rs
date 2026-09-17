@@ -59,15 +59,6 @@ use tokio::time::sleep;
 // parser produces them, and it sits below `runtime` so connectors can call it.
 pub use runtime_datafusion::refresh_sql::{RefreshSQL, RefreshSQLColumns};
 
-/// Invoked after the first successful full or append refresh that changed the
-/// accelerator, so the SQL results cache can be pre-loaded from queries that
-/// ran against this dataset before that refresh.
-///
-/// The callback must return quickly — spawn any work it starts — because it
-/// runs on the refresh-completion task. Warming itself belongs on the refresh
-/// runtime so it cannot stall user queries.
-pub type ResultsCacheWarmCallback = Arc<dyn Fn(Vec<TableReference>) + Send + Sync>;
-
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
@@ -589,10 +580,6 @@ pub struct Refresher {
     engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
-    /// Fired once after the first successful full/append refresh. Subsequent
-    /// refreshes do not re-warm.
-    results_cache_warm_callback: Option<ResultsCacheWarmCallback>,
-    results_cache_warmed: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -652,17 +639,7 @@ impl Refresher {
             is_s3_express_acceleration: false,
             engine_type_rewrites: &[],
             cdc_param_overrides: None,
-            results_cache_warm_callback: None,
-            results_cache_warmed: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    pub fn results_cache_warm_callback(
-        &mut self,
-        callback: Option<ResultsCacheWarmCallback>,
-    ) -> &mut Self {
-        self.results_cache_warm_callback = callback;
-        self
     }
 
     pub fn in_flight_revalidations(
@@ -773,6 +750,11 @@ impl Refresher {
     #[must_use]
     pub fn initial_load_completed(&self) -> bool {
         self.initial_load_completed.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub async fn refresh_mode(&self) -> RefreshMode {
+        self.refresh.read().await.mode
     }
 
     pub fn with_resource_monitor(
@@ -996,8 +978,6 @@ impl Refresher {
         let refresh = Arc::clone(&self.refresh);
 
         let caching = self.caching.clone();
-        let results_cache_warm_callback = self.results_cache_warm_callback.clone();
-        let results_cache_warmed = Arc::clone(&self.results_cache_warmed);
         let refresh_check_interval = self.refresh.read().await.check_interval;
         let max_jitter = self.refresh.read().await.max_jitter;
         let snapshot_mutex = Arc::clone(&self.accelerator_write_mutex);
@@ -1173,27 +1153,10 @@ impl Refresher {
                                 // children are exactly as stale as the parent's (#12887). Children
                                 // attach after their own initial load completes, so the set is
                                 // resolved live rather than captured when this loop started.
-                                let table_names = refresh_task.get_dataset_names().await;
-                                for table_name in &table_names {
+                                for table_name in refresh_task.get_dataset_names().await {
                                     if let Err(e) = cache_provider.invalidate_for_table(table_name.clone()).await {
                                         tracing::warn!("Failed to invalidate cached results for dataset {table_name}: {e}");
                                     }
-                                }
-
-                                // First successful full/append refresh only: replay
-                                // recorded queries into the now-empty results cache
-                                // until it is full. Subsequent refreshes leave
-                                // population to live traffic (and SWR, when set).
-                                let refresh_mode = refresh.read().await.mode;
-                                if refresh_succeeded
-                                    && matches!(
-                                        refresh_mode,
-                                        RefreshMode::Full | RefreshMode::Append
-                                    )
-                                    && !results_cache_warmed.swap(true, Ordering::Relaxed)
-                                    && let Some(callback) = &results_cache_warm_callback
-                                {
-                                    callback(table_names);
                                 }
                             }
                         }
@@ -1388,7 +1351,6 @@ mod tests {
         physical_plan::collect, prelude::SessionContext,
     };
     use prometheus::proto::MetricType;
-    use std::sync::atomic::Ordering;
     use tokio::{
         sync::{mpsc, watch},
         time::timeout,
@@ -1847,88 +1809,6 @@ mod tests {
         assert!(
             refresher.initial_load_completed(),
             "a caller woken by the completion must observe the initial load as done"
-        );
-
-        drop(refresh_handle);
-    }
-
-    /// The SQL results cache is warmed on the first successful full refresh
-    /// only. A later refresh must not fire the callback again.
-    #[tokio::test]
-    async fn test_results_cache_warm_callback_fires_only_on_the_first_refresh() {
-        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
-            "time_in_string",
-            DataType::Utf8,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(StringArray::from(vec!["1970-01-01"]))],
-        )
-        .expect("source batch builds");
-        let federated = Arc::new(FederatedTable::new_unchecked(Arc::new(
-            MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).expect("source table builds"),
-        )));
-        let accelerator =
-            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("accelerator table builds"))
-                as Arc<dyn TableProvider>;
-
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let calls_for_callback = Arc::clone(&calls);
-        let refresh_completion = RefreshCompletion::new();
-        let mut refresher = Refresher::new(
-            status::RuntimeStatus::new(),
-            TableReference::bare("test"),
-            federated,
-            Some("mem_table".to_string()),
-            Arc::new(RwLock::new(Refresh::new(RefreshMode::Full))),
-            accelerator,
-            None,
-            None,
-            Handle::current(),
-            Arc::new(Mutex::new(())),
-        );
-        refresher.with_refresh_completion(refresh_completion.clone());
-        refresher.results_cache_warm_callback(Some(Arc::new(move |_tables| {
-            calls_for_callback.fetch_add(1, Ordering::SeqCst);
-        })));
-        // The callback is gated on a live `Caching` (the same condition as
-        // invalidation). A dummy cache is enough for the first-only latch.
-        let caching = Arc::new(cache::Caching::new());
-        refresher.caching(&Some(caching));
-
-        let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
-        let refresh_handle = refresher
-            .start(AccelerationRefreshMode::Full(receiver))
-            .await
-            .expect("refresh task starts");
-
-        trigger.send(None).await.expect("trigger is accepted");
-        timeout(Duration::from_secs(5), async {
-            while calls.load(Ordering::SeqCst) < 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the first refresh fires the warm callback");
-
-        let second = refresh_completion.next();
-        trigger.send(None).await.expect("trigger is accepted");
-        timeout(Duration::from_secs(5), second.wait())
-            .await
-            .expect("the second refresh completes");
-
-        timeout(Duration::from_millis(200), async {
-            while calls.load(Ordering::SeqCst) < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect_err("a later refresh must not fire the warm callback again");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "warming is first-refresh only"
         );
 
         drop(refresh_handle);

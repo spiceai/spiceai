@@ -462,7 +462,6 @@ pub struct Builder {
     /// Per-dataset `cdc_*` overrides drawn from `dataset.acceleration.params`.
     /// Layered over the process-global CDC config.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
-    results_cache_warm_callback: Option<refresh::ResultsCacheWarmCallback>,
 }
 
 impl Builder {
@@ -518,7 +517,6 @@ impl Builder {
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
             cdc_param_overrides: None,
-            results_cache_warm_callback: None,
         }
     }
 
@@ -565,14 +563,6 @@ impl Builder {
 
     pub fn caching(&mut self, caching: Option<Arc<Caching>>) -> &mut Self {
         self.caching = caching;
-        self
-    }
-
-    pub fn results_cache_warm_callback(
-        &mut self,
-        callback: Option<refresh::ResultsCacheWarmCallback>,
-    ) -> &mut Self {
-        self.results_cache_warm_callback = callback;
         self
     }
 
@@ -1002,7 +992,6 @@ impl Builder {
         refresher.with_refresh_completion(refresh_completion.clone());
         refresher.with_last_updated_at(Arc::clone(&last_updated_at));
         refresher.caching(&self.caching);
-        refresher.results_cache_warm_callback(self.results_cache_warm_callback.clone());
         refresher.in_flight_revalidations(Arc::clone(&in_flight_revalidations));
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
