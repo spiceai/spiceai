@@ -62,6 +62,10 @@ name = "cache_throughput"
 harness = false
 name = "hash_algorithms"
 
+[[bench]]
+harness = false
+name = "cache_hit_costs"
+
 [lints]
 workspace = true
 
