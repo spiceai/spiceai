@@ -17,7 +17,7 @@ limitations under the License.
 //! S3 event notifications → SQS → listing backfill → `ChangesStream`.
 //!
 //! `try_stream!` keeps the snapshot, long-poll, backfill, and per-message apply
-//! path in one backpressured generator (the same shape as MongoDB / Kafka
+//! path in one backpressured generator (the same shape as `MongoDB` / Kafka
 //! change streams). A manual `Stream` impl would split that state machine
 //! across poll/yield points without changing behavior.
 
@@ -26,7 +26,7 @@ use super::event::{
 };
 use super::{S3, S3_DOCS};
 use crate::dataconnector::federated::FederatedTableProvider;
-use crate::dataconnector::listing::ListingTableConnector;
+use crate::dataconnector::listing::{ListingTableConnector, file_matches_extension};
 use crate::dataconnector::parameters::ConnectorContext;
 use crate::dataconnector::{ConnectorComponent, DataConnectorError, DataConnectorResult};
 use arrow::array::{ArrayRef, RecordBatch, StringArray, new_null_array};
@@ -57,7 +57,7 @@ const SQS_VISIBILITY_TIMEOUT_SECONDS: i32 = 300;
 const RECEIVE_ERROR_BACKOFF_CAP: Duration = Duration::from_secs(30);
 const LISTING_RETRY_BACKOFF: Duration = Duration::from_millis(200);
 const LISTING_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(30);
-const DEFAULT_BACKFILL_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const DEFAULT_BACKFILL_INTERVAL: Duration = Duration::from_hours(1);
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -484,6 +484,23 @@ fn align_object_batches(
         .collect()
 }
 
+/// The objects under the dataset prefix that its listing table reads, selected
+/// with the same [`file_matches_extension`] filter. Any other object, such as a
+/// `_SUCCESS` job marker or a `.crc` checksum sidecar, holds none of the
+/// dataset's rows and fails to read as one: a snapshot or rebuild that counted
+/// it as unread would never complete, and a notification naming it would be
+/// retried until the queue's retention period expires.
+#[derive(Debug, Clone)]
+struct ListingFileFilter {
+    extension: String,
+}
+
+impl ListingFileFilter {
+    fn matches(&self, key: &str) -> bool {
+        file_matches_extension(&ObjectPath::from(key), &self.extension)
+    }
+}
+
 struct ListingPrefixScanner {
     connector: S3,
     dataset: DatasetSpec,
@@ -591,9 +608,9 @@ impl S3ChangesConfig {
                         ensure!(
                             prefix_is_nested_under(&normalized, &dataset_prefix),
                             KeyPrefixOutsideDatasetSnafu {
-                                dataset_name: dataset_name.clone(),
+                                dataset_name,
                                 configured: configured.to_string(),
-                                dataset_prefix: dataset_prefix.clone(),
+                                dataset_prefix,
                             }
                         );
                         normalized
@@ -839,7 +856,7 @@ async fn build_sqs_client(
     }
 }
 
-fn error_stream(error: Error) -> ChangesStream {
+fn error_stream(error: impl std::error::Error + Send + Sync + 'static) -> ChangesStream {
     Box::pin(futures::stream::once(async move {
         Err(StreamError::Connector {
             connector: "S3",
@@ -858,6 +875,10 @@ pub async fn s3_changes_stream(
     let config = match S3ChangesConfig::try_from_params(&connector.params, dataset) {
         Ok(Some(config)) => config,
         Ok(None) => return None,
+        Err(error) => return Some(error_stream(error)),
+    };
+    let listing_files = match connector.get_file_format_and_extension(dataset).await {
+        Ok((_, extension)) => ListingFileFilter { extension },
         Err(error) => return Some(error_stream(error)),
     };
     let client = match build_sqs_client(
@@ -891,6 +912,7 @@ pub async fn s3_changes_stream(
         object_reader,
         object_lister,
         config,
+        listing_files,
     }))
 }
 
@@ -902,6 +924,7 @@ struct S3ChangesStreamParts {
     object_reader: Arc<dyn ObjectReader>,
     object_lister: Arc<dyn ObjectLister>,
     config: S3ChangesConfig,
+    listing_files: ListingFileFilter,
 }
 
 #[derive(Debug)]
@@ -924,6 +947,7 @@ enum ProcessOutcome {
 async fn process_message(
     dataset: &DatasetSpec,
     config: &S3ChangesConfig,
+    listing_files: &ListingFileFilter,
     table_schema: &SchemaRef,
     object_reader: &dyn ObjectReader,
     applied_keys: &Mutex<AppliedKeySet>,
@@ -965,6 +989,21 @@ async fn process_message(
         return ProcessOutcome::Leave;
     }
 
+    // An object the listing table does not read holds none of the dataset's
+    // rows, so creating or removing it changes nothing.
+    let matching: Vec<&S3ObjectEvent> = matching
+        .into_iter()
+        .filter(|event| listing_files.matches(&event.key))
+        .collect();
+    if matching.is_empty() {
+        tracing::debug!(
+            "Dataset '{}' acknowledged an S3 notification that names only objects its listing table does not read (file extension '{}').",
+            dataset.name,
+            listing_files.extension
+        );
+        return ProcessOutcome::Ack { receipt_handle };
+    }
+
     let removed: Vec<&&S3ObjectEvent> = matching
         .iter()
         .filter(|event| event.kind == ObjectEventKind::Removed)
@@ -987,12 +1026,17 @@ async fn process_message(
         );
     }
 
+    // A key can appear in more than one record of a notification, and the
+    // applied-key set learns of it only once its envelope is yielded, so each
+    // key is read at most once here.
+    let mut seen_keys = HashSet::new();
     let created: Vec<&S3ObjectEvent> = matching
         .iter()
         .copied()
         .filter(|event| {
             event.kind == ObjectEventKind::Created && !applied_keys.lock().is_known(&event.key)
         })
+        .filter(|&event| seen_keys.insert(event.key.as_str()))
         .collect();
     if created.is_empty() {
         let in_flight = matching.iter().any(|event| {
@@ -1114,6 +1158,7 @@ fn unread_object_warning(
 async fn apply_unapplied_objects(
     dataset: &DatasetSpec,
     config: &S3ChangesConfig,
+    listing_files: &ListingFileFilter,
     table_schema: &SchemaRef,
     object_lister: &dyn ObjectLister,
     object_reader: &dyn ObjectReader,
@@ -1134,7 +1179,7 @@ async fn apply_unapplied_objects(
             bucket: config.bucket.clone(),
             key: key.clone(),
         };
-        if !matches_dataset(&event, &config.bucket, scope_prefix) {
+        if !matches_dataset(&event, &config.bucket, scope_prefix) || !listing_files.matches(&key) {
             continue;
         }
         if skip_known && applied_keys.lock().is_known(&key) {
@@ -1245,6 +1290,7 @@ fn listing_rebuild_from_objects(
 async fn retry_until_complete_listing(
     dataset: &DatasetSpec,
     config: &S3ChangesConfig,
+    listing_files: &ListingFileFilter,
     table_schema: &SchemaRef,
     object_lister: &dyn ObjectLister,
     object_reader: &dyn ObjectReader,
@@ -1262,6 +1308,7 @@ async fn retry_until_complete_listing(
         match apply_unapplied_objects(
             dataset,
             config,
+            listing_files,
             table_schema,
             object_lister,
             object_reader,
@@ -1303,7 +1350,7 @@ fn create_envelopes(
     applied: &Arc<Mutex<AppliedKeySet>>,
     keys: Vec<String>,
     queue: &Arc<dyn MessageQueue>,
-    receipt_handle: String,
+    receipt_handle: &str,
 ) -> std::result::Result<Vec<ChangeEnvelope>, StreamError> {
     let last = batches.len().saturating_sub(1);
     let envelopes = batches
@@ -1314,7 +1361,7 @@ fn create_envelopes(
             let inner: Box<dyn CommitChange + Send + Sync> = if i == last {
                 Box::new(SqsDeleteCommitter {
                     queue: Arc::clone(queue),
-                    receipt_handle: receipt_handle.clone(),
+                    receipt_handle: receipt_handle.to_string(),
                 })
             } else {
                 Box::new(NoOpCommitter)
@@ -1377,6 +1424,7 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
             object_reader,
             object_lister,
             config,
+            listing_files,
         } = parts;
         let epoch = shutdown_epoch();
         let schema = federated_table.table_provider().await.schema();
@@ -1395,6 +1443,7 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
             if let Some(snapshot) = retry_until_complete_listing(
                 &dataset,
                 &config,
+                &listing_files,
                 &schema,
                 object_lister.as_ref(),
                 object_reader.as_ref(),
@@ -1431,6 +1480,7 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
             if let Some(listed) = retry_until_complete_listing(
                 &dataset,
                 &config,
+                &listing_files,
                 &schema,
                 object_lister.as_ref(),
                 object_reader.as_ref(),
@@ -1481,9 +1531,9 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                 if shutdown_epoch() != epoch {
                     break;
                 }
-                match process_message(&dataset, &config, &schema, object_reader.as_ref(), applied_keys.as_ref(), &message).await {
+                match process_message(&dataset, &config, &listing_files, &schema, object_reader.as_ref(), applied_keys.as_ref(), &message).await {
                     ProcessOutcome::Creates { batches, keys, receipt_handle } => {
-                        match create_envelopes(&schema, batches, &applied_keys, keys, &queue, receipt_handle) {
+                        match create_envelopes(&schema, batches, &applied_keys, keys, &queue, &receipt_handle) {
                             Ok(envelopes) => {
                                 for envelope in envelopes {
                                     yield envelope;
@@ -1505,6 +1555,7 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                         match apply_unapplied_objects(
                             &dataset,
                             &config,
+                            &listing_files,
                             &schema,
                             object_lister.as_ref(),
                             object_reader.as_ref(),
@@ -1561,6 +1612,7 @@ fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
                 match apply_unapplied_objects(
                     &dataset,
                     &config,
+                    &listing_files,
                     &schema,
                     object_lister.as_ref(),
                     object_reader.as_ref(),
@@ -1844,7 +1896,13 @@ mod tests {
             bucket: "my-bucket".to_string(),
             dataset_prefix: "events/".to_string(),
             key_prefix: "events/".to_string(),
-            backfill_interval: Duration::from_secs(60 * 60),
+            backfill_interval: Duration::from_hours(1),
+        }
+    }
+
+    fn parquet_files() -> ListingFileFilter {
+        ListingFileFilter {
+            extension: ".parquet".to_string(),
         }
     }
 
@@ -1877,6 +1935,7 @@ mod tests {
             object_reader: reader,
             object_lister: lister,
             config,
+            listing_files: parquet_files(),
         })
     }
 
@@ -1887,8 +1946,7 @@ mod tests {
             match tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
                 Ok(Some(Ok(envelope))) => envelopes.push(envelope),
                 Ok(Some(Err(error))) => panic!("change stream error: {error}"),
-                Ok(None) => break,
-                Err(_) => break,
+                Ok(None) | Err(_) => break,
             }
         }
         envelopes
@@ -1925,7 +1983,7 @@ mod tests {
         assert_eq!(config.key_prefix, "events/");
         assert_eq!(config.region, "us-east-1");
         assert_eq!(config.on_object_removed, OnObjectRemoved::Ignore);
-        assert_eq!(config.backfill_interval, Duration::from_secs(60 * 60));
+        assert_eq!(config.backfill_interval, Duration::from_hours(1));
     }
 
     #[tokio::test]
@@ -2052,7 +2110,7 @@ mod tests {
         assert_eq!(config.dataset_prefix, "events/");
         assert_eq!(config.key_prefix, "events/year=2026/");
         assert_eq!(config.on_object_removed, OnObjectRemoved::Rebuild);
-        assert_eq!(config.backfill_interval, Duration::from_secs(30 * 60));
+        assert_eq!(config.backfill_interval, Duration::from_mins(30));
     }
 
     #[tokio::test]
@@ -2077,6 +2135,7 @@ mod tests {
         let outcome = process_message(
             &events_dataset(),
             &default_config(),
+            &parquet_files(),
             &id_name_schema(),
             &reader,
             &applied_mutex([]),
@@ -2114,6 +2173,7 @@ mod tests {
         let outcome = process_message(
             &events_dataset(),
             &default_config(),
+            &parquet_files(),
             &id_name_schema(),
             &reader,
             &applied,
@@ -2145,6 +2205,7 @@ mod tests {
         let outcome = process_message(
             &events_dataset(),
             &default_config(),
+            &parquet_files(),
             &id_name_schema(),
             &reader,
             &applied,
@@ -2160,6 +2221,44 @@ mod tests {
         );
     }
 
+    /// One notification whose records name the same key twice must append that
+    /// object's rows once. The applied-key set only learns of a key once its
+    /// envelope is yielded, so it cannot catch a repeat within the message.
+    #[tokio::test]
+    async fn process_created_reads_a_key_named_twice_in_one_notification_once() {
+        let reader = MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/a.parquet".to_string(),
+                vec![id_name_batch(&[1], &["a"])],
+            )]),
+            fail_keys: vec![],
+        };
+        let outcome = process_message(
+            &events_dataset(),
+            &default_config(),
+            &parquet_files(),
+            &id_name_schema(),
+            &reader,
+            &applied_mutex([]),
+            &QueueMessage {
+                body: r#"{"Records":[{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/a.parquet"}}},{"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"my-bucket"},"object":{"key":"events/a.parquet"}}}]}"#.into(),
+                receipt_handle: "rh-twice".into(),
+            },
+        )
+        .await;
+        match outcome {
+            ProcessOutcome::Creates { batches, keys, .. } => {
+                assert_eq!(keys, vec!["events/a.parquet".to_string()]);
+                let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                assert_eq!(
+                    rows, 1,
+                    "a key named twice in one notification must be appended once, got {rows} rows"
+                );
+            }
+            other => panic!("expected Creates, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn process_removed_is_acked_by_default_and_rebuilds_when_configured() {
         let reader = MapObjectReader {
@@ -2169,6 +2268,7 @@ mod tests {
         let outcome = process_message(
             &events_dataset(),
             &default_config(),
+            &parquet_files(),
             &id_name_schema(),
             &reader,
             &applied_mutex([]),
@@ -2185,6 +2285,7 @@ mod tests {
         let outcome = process_message(
             &events_dataset(),
             &config,
+            &parquet_files(),
             &id_name_schema(),
             &reader,
             &applied_mutex([]),
@@ -2206,6 +2307,7 @@ mod tests {
         let unmatched = process_message(
             &events_dataset(),
             &default_config(),
+            &parquet_files(),
             &id_name_schema(),
             &reader,
             &applied_mutex([]),
@@ -2223,6 +2325,7 @@ mod tests {
         let other_bucket = process_message(
             &events_dataset(),
             &default_config(),
+            &parquet_files(),
             &id_name_schema(),
             &reader,
             &applied_mutex([]),
@@ -2240,6 +2343,7 @@ mod tests {
         let poison = process_message(
             &events_dataset(),
             &default_config(),
+            &parquet_files(),
             &id_name_schema(),
             &reader,
             &applied_mutex([]),
@@ -2252,6 +2356,55 @@ mod tests {
         assert!(matches!(poison, ProcessOutcome::Ack { .. }));
     }
 
+    /// A job marker such as `_SUCCESS` is under the dataset prefix but is not an
+    /// object the listing table reads: its notification is acknowledged rather
+    /// than read (which fails and retries the message), and removing it does not
+    /// rebuild the accelerator.
+    #[tokio::test]
+    async fn process_acks_notifications_for_objects_the_listing_table_does_not_read() {
+        let reader = MapObjectReader {
+            objects: HashMap::new(),
+            fail_keys: vec![],
+        };
+        let created = process_message(
+            &events_dataset(),
+            &default_config(),
+            &parquet_files(),
+            &id_name_schema(),
+            &reader,
+            &applied_mutex([]),
+            &QueueMessage {
+                body: created_put_body("events/_SUCCESS"),
+                receipt_handle: "rh-marker".into(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(created, ProcessOutcome::Ack { .. }),
+            "an ObjectCreated for a job marker must be acknowledged, not read and retried, got {created:?}"
+        );
+
+        let mut config = default_config();
+        config.on_object_removed = OnObjectRemoved::Rebuild;
+        let removed = process_message(
+            &events_dataset(),
+            &config,
+            &parquet_files(),
+            &id_name_schema(),
+            &reader,
+            &applied_mutex([]),
+            &QueueMessage {
+                body: removed_body("events/_SUCCESS"),
+                receipt_handle: "rh-marker-removed".into(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(removed, ProcessOutcome::Ack { .. }),
+            "removing an object the dataset never read must not rebuild the accelerator, got {removed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn process_read_failure_retries() {
         let reader = MapObjectReader {
@@ -2261,6 +2414,7 @@ mod tests {
         let outcome = process_message(
             &events_dataset(),
             &default_config(),
+            &parquet_files(),
             &id_name_schema(),
             &reader,
             &applied_mutex([]),
@@ -2299,6 +2453,7 @@ mod tests {
         let result = apply_unapplied_objects(
             &events_dataset(),
             &default_config(),
+            &parquet_files(),
             &id_name_schema(),
             &lister,
             &reader,
@@ -2332,6 +2487,7 @@ mod tests {
         let result = apply_unapplied_objects(
             &events_dataset(),
             &default_config(),
+            &parquet_files(),
             &id_name_schema(),
             &lister,
             &reader,
@@ -2368,6 +2524,7 @@ mod tests {
         let result = apply_unapplied_objects(
             &events_dataset(),
             &default_config(),
+            &parquet_files(),
             &id_name_schema(),
             &lister,
             &reader,
@@ -2601,6 +2758,46 @@ mod tests {
         );
     }
 
+    /// Objects under the prefix that the listing table does not read (job
+    /// markers, checksum sidecars) have no fixture here, so reading one fails as
+    /// it does against S3. The snapshot must skip them rather than count them as
+    /// unread and never mark the dataset ready.
+    #[tokio::test]
+    async fn stream_empty_snapshot_skips_objects_the_listing_table_does_not_read() {
+        let queue = Arc::new(MockQueue::with_messages(vec![]));
+        let reader = Arc::new(MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/part-00000.parquet".to_string(),
+                vec![id_name_batch(&[1], &["part"])],
+            )]),
+            fail_keys: vec![],
+        });
+        let lister = Arc::new(MockLister {
+            keys: vec![
+                "events/part-00000.parquet".into(),
+                "events/_SUCCESS".into(),
+                "events/part-00000.parquet.crc".into(),
+            ],
+        });
+        let stream = start_stream(
+            AccelerationContents::Empty,
+            queue,
+            reader,
+            lister,
+            default_config(),
+            id_name_batch(&[99], &["stale-federated"]),
+        );
+        let envelopes = collect_until_idle(stream, 2).await;
+        assert_eq!(
+            envelopes.len(),
+            2,
+            "objects the listing table does not read must not hold back the snapshot, got {} envelopes",
+            envelopes.len()
+        );
+        assert_eq!(names_in(&envelopes[0]), vec!["part".to_string()]);
+        assert!(envelopes[1].is_dataset_ready());
+    }
+
     #[tokio::test]
     async fn stream_empty_snapshot_retries_until_every_listed_object_is_read() {
         let queue: Arc<dyn MessageQueue> = Arc::new(MockQueue::with_messages(vec![]));
@@ -2634,6 +2831,7 @@ mod tests {
             object_reader: reader,
             object_lister: lister,
             config: default_config(),
+            listing_files: parquet_files(),
         });
         let envelopes = collect_until_idle(stream, 3).await;
         assert!(
@@ -2766,6 +2964,7 @@ mod tests {
             object_reader: reader,
             object_lister: lister,
             config,
+            listing_files: parquet_files(),
         });
         let envelopes = collect_until_idle(stream, 3).await;
         let snapshot_names: Vec<String> = envelopes
@@ -2822,6 +3021,7 @@ mod tests {
             object_reader: reader,
             object_lister: lister,
             config,
+            listing_files: parquet_files(),
         });
         let envelopes = collect_until_idle(stream, 3).await;
         assert!(
@@ -2874,6 +3074,7 @@ mod tests {
             object_reader: reader,
             object_lister: lister,
             config,
+            listing_files: parquet_files(),
         });
         let envelopes = collect_until_idle(stream, 3).await;
         assert!(
@@ -2949,6 +3150,7 @@ mod tests {
             object_reader: reader,
             object_lister: lister,
             config,
+            listing_files: parquet_files(),
         });
         let envelopes = collect_until_idle(stream, 3).await;
         assert!(
@@ -3025,6 +3227,7 @@ mod tests {
         let mixed = process_message(
             &events_dataset(),
             &default_config(),
+            &parquet_files(),
             &id_name_schema(),
             &reader,
             &applied_mutex([]),
@@ -3226,6 +3429,7 @@ mod tests {
             object_reader: reader,
             object_lister: lister,
             config,
+            listing_files: parquet_files(),
         });
         let envelopes = collect_until_idle(stream, 3).await;
         assert!(

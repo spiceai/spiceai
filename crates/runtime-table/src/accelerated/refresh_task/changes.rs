@@ -8008,6 +8008,10 @@ mod tests {
     /// Listing-driven overwrite must use the envelope rows, not the federated table.
     #[tokio::test]
     async fn listing_rebuild_overwrites_from_envelope_not_federated_scan() {
+        // Before anything records: the acceleration meter binds whichever global
+        // provider is installed the first time one of its metrics is touched, so
+        // a sample taken before this call never reaches this registry.
+        let registry = crate::accelerated::refresh_task::test_prometheus_registry().clone();
         let dataset = "listing_rebuild_same_snapshot";
         let schema = Arc::new(create_test_data_schema());
         let federated = Arc::new(
@@ -8057,6 +8061,12 @@ mod tests {
             deferred_commits: None,
         };
 
+        assert_eq!(
+            refresh_duration_samples(&registry, dataset, "full"),
+            0,
+            "control: nothing has replaced the acceleration yet"
+        );
+
         let listing = id_name_batch(&[1], &["existing"]);
         let signal = cdc::ChangeEnvelope::from_parts(
             Box::new(cdc::NoOpCommitter),
@@ -8078,11 +8088,7 @@ mod tests {
             "overwrite must use the listing snapshot, not the federated table or prior accelerator rows, got {names:?}"
         );
         assert_eq!(
-            refresh_duration_samples(
-                &crate::accelerated::refresh_task::test_prometheus_registry().clone(),
-                dataset,
-                "full",
-            ),
+            refresh_duration_samples(&registry, dataset, "full"),
             1,
             "a listing-driven replace is still one full refresh of '{dataset}'"
         );

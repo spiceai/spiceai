@@ -1282,6 +1282,13 @@ pub trait ListingTableConnector: DataConnector {
     ///
     /// Called from the blanket [`DataConnector::read_provider`] before the
     /// listing table is built. Defaults to `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the connector's own configuration error when `dataset` names a
+    /// combination it cannot serve, so registration fails with that message
+    /// instead of a generic one. The default implementation accepts every
+    /// dataset.
     fn validate_dataset(&self, _dataset: &DatasetSpec) -> DataConnectorResult<()> {
         Ok(())
     }
@@ -2202,7 +2209,15 @@ fn listing_object_matches_format_selected(location: &Path, format_ext: &str) -> 
     file_name_has_extension(name, format_ext.trim_start_matches('.')) || !name.contains('.')
 }
 
-fn file_matches_extension(location: &Path, extension: &str) -> bool {
+/// Whether the listing table reads the object at `location`, for an `extension`
+/// from [`ListingTableConnector::get_file_format_and_extension`].
+///
+/// A plain extension (`.parquet`, `.csv.gz`) is `DataFusion`'s suffix match. A
+/// format-selected one (`*.orc`, `*.parquet`) also accepts extensionless Hive
+/// data objects and skips job markers (`_SUCCESS`, `_committed_*`, `.crc`) and
+/// `_temporary` staging paths.
+#[must_use]
+pub fn file_matches_extension(location: &Path, extension: &str) -> bool {
     if let Some(format_ext) = format_selected_data_suffix(extension) {
         return listing_object_matches_format_selected(location, format_ext);
     }

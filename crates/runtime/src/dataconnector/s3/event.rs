@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! Supports the three bodies operators actually see on a queue:
 //! direct S3 → SQS (`Records`), S3 → SNS → SQS (SNS envelope with a nested
-//! `Message`), and EventBridge S3 events (`detail.bucket` / `detail.object`).
+//! `Message`), and `EventBridge` S3 events (`detail.bucket` / `detail.object`).
 //! An S3 `s3:TestEvent` used when a notification is first attached has no
 //! object and yields an empty list so the consumer can drop it.
 
@@ -71,7 +71,7 @@ impl std::error::Error for ParseError {}
 ///
 /// Returns [`ParseError::InvalidJson`] when the body is not JSON, and
 /// [`ParseError::Unrecognized`] when it is JSON but not an S3 / SNS /
-/// EventBridge notification (so a poison payload is visible rather than
+/// `EventBridge` notification (so a poison payload is visible rather than
 /// silently treated as a test event).
 pub fn parse_notification_body(body: &str) -> Result<Vec<S3ObjectEvent>, ParseError> {
     let value: Value = serde_json::from_str(body).map_err(|e| ParseError::InvalidJson {
