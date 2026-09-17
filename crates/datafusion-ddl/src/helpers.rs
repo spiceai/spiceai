@@ -95,11 +95,10 @@ pub fn is_ddl_enabled<S: ::std::hash::BuildHasher>(
 /// Returns `true` if the `CREATE TABLE` AST node contains extensions that Spice
 /// intercepts before handing to `DataFusion`:
 /// - A `PARTITION BY` clause, or
-/// - A `CLUSTER BY` clause, or
 /// - `WITH (...)` options whose keys start with `acceleration.` or `dataset.`
 #[must_use]
 pub fn has_ddl_extensions(ct: &CreateTable) -> bool {
-    if ct.partition_by.is_some() || ct.cluster_by.is_some() {
+    if ct.partition_by.is_some() {
         return true;
     }
     if let CreateTableOptions::With(options) = &ct.table_options {
@@ -120,8 +119,6 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field};
     use datafusion::common::{Constraint, Constraints};
-    use datafusion::sql::sqlparser::dialect::GenericDialect;
-    use datafusion::sql::sqlparser::parser::Parser;
 
     use super::*;
 
@@ -144,20 +141,6 @@ mod tests {
         let (cat, sch) = parse_qualified_schema_name("myschema", "spice");
         assert_eq!(cat, "spice");
         assert_eq!(sch, "myschema");
-    }
-
-    #[test]
-    fn has_ddl_extensions_detects_cluster_by() {
-        let mut statements = Parser::parse_sql(
-            &GenericDialect {},
-            "CREATE TABLE events (id BIGINT, region TEXT) CLUSTER BY (region, id)",
-        )
-        .expect("CLUSTER BY statement should parse");
-        let statement = statements.pop().expect("one statement");
-        let datafusion::sql::sqlparser::ast::Statement::CreateTable(create) = statement else {
-            panic!("expected CREATE TABLE");
-        };
-        assert!(has_ddl_extensions(&create));
     }
 
     #[test]

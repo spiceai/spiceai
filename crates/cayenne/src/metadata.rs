@@ -1186,20 +1186,16 @@ pub struct VortexConfig {
     /// `configuration_matches`, so toggling it never recreates the table (the
     /// cold tier is a strict superset of behavior over an unchanged warm tier).
     pub cold_tier_location: Option<String>,
-    /// Hilbert-clustering key columns for warm and datalake files.
-    /// Empty leaves layout selection to the existing automatic policy. Set from
-    /// `cayenne_cluster_by` or a Cayenne DDL `CLUSTER BY` clause.
-    ///
-    /// The alias preserves metadata written by preview builds that stored the
-    /// cold-tier-only field name. New metadata is always written as `cluster_by`.
-    #[serde(alias = "cold_clustering_columns")]
-    pub cluster_by: Vec<String>,
+    /// Liquid-clustering key columns for cold files (multi-column Z-order).
+    /// Empty = fall back to `sort_columns`, then the primary key. Set from
+    /// `cayenne_datalake_clustering_columns`.
+    pub cold_clustering_columns: Vec<String>,
     /// Target size for cold Vortex files in MB. Larger than the warm
     /// `target_vortex_file_size_mb` because object stores favor fewer, larger
     /// objects and cold scans are range reads. Set from
     /// `cayenne_datalake_target_file_size_mb`. Defaults to 512.
     pub cold_target_file_size_mb: usize,
-    /// Max input bytes (in MB) fed to one bounded clustering sort run during a
+    /// Max input bytes (in MB) fed to one bounded Z-order sort run during a
     /// warm-to-datalake move. `None` (the default) derives
     /// [`Self::cold_clustering_run_size_bytes`] as `cold_target_file_size_mb *
     /// 16` — 16 target files' worth of input gives enough locality for good
@@ -1237,7 +1233,7 @@ impl VortexConfig {
             .is_some_and(|s| !s.trim().is_empty())
     }
 
-    /// Effective byte cap for one bounded clustering sort run during cold
+    /// Effective byte cap for one bounded Z-order sort run during cold
     /// promotion: an explicit [`Self::cold_clustering_run_size_mb`], else
     /// derived as `cold_target_file_size_mb * 16`. The single derivation rule
     /// for standalone and runtime paths — never returns 0.
@@ -1570,7 +1566,7 @@ impl Default for VortexConfig {
             force_view_read_schema: false,
             integrity_checksums: false,
             cold_tier_location: None,
-            cluster_by: Vec::new(),
+            cold_clustering_columns: Vec::new(),
             cold_target_file_size_mb: 512,
             cold_clustering_run_size_mb: None,
             cold_tier_warm_max_bytes: 0,
@@ -1991,7 +1987,7 @@ pub struct SnapshotFile {
 ///
 /// The cold tier is the bottom of the storage cascade (RAM mem-tier →
 /// local-disk warm Vortex snapshot → object-store cold). A background promotion
-/// stage rewrites settled/aged warm files as read-optimized (curve-clustered)
+/// stage rewrites settled/aged warm files as read-optimized (Z-order clustered)
 /// Vortex files on the cold object store and records one row here per file.
 ///
 /// Unlike [`SnapshotFile`], cold files are **table-scoped** (not a member of any

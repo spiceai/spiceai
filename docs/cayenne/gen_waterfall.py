@@ -88,14 +88,14 @@ svg.append(box(*n1,"Changes stream",["ordered change events","from the CDC conne
 svg.append(box(*n2,"Level-0 / tier-0",["inline blobs / mem-tier (RAM)"],"seq 12,501–12,600"))
 svg.append(box(*n3,"Published snapshots",["one current + protected tail","(all visible to scans)"],"seq 10,001–12,500"))
 svg.append(box(*n4,"Compacted base",["merged target-sized files"],"seq 2,001–10,000"))
-svg.append(box(*n5,"Cold object-store tier",["Hilbert-clustered Vortex,","read-optimized (optional)"],"seq ≤ 2,000"))
+svg.append(box(*n5,"Cold object-store tier",["Z-order-clustered Vortex,","read-optimized (optional)"],"seq ≤ 2,000"))
 
 # transition arrows (down-left)
 svg.append(arrow(1000,DBy+DBh,975,152,"CDC connector emits ordered changes",1072,172,wrap=18))
 svg.append(arrow(838,222,812,262,"apply loop: coalesce a burst; small burst → inline / mem-tier",690,245,wrap=30))
 svg.append(arrow(665,332,640,374,"checkpoint / flush: tier → Vortex file, Stage B pointer flip (visible)",505,350,wrap=30))
 svg.append(arrow(480,454,455,494,"maintenance compaction + seq-prefix bake (COW background)",355,472,wrap=34))
-svg.append(arrow(306,564,282,604,"BackgroundColdTierPromoter: re-materialize + Hilbert cluster, overwrite to object store",470,584,wrap=44))
+svg.append(arrow(306,564,282,604,"BackgroundColdTierPromoter: re-materialize + Z-order cluster, overwrite to object store",470,584,wrap=44))
 
 # large-burst bypass (dashed): changes stream -> published (lands on the box's left edge), skipping tier-0
 svg.append(f'<path d="M788,175 C450,200 360,340 430,410" fill="none" stroke="{DARK}" stroke-width="1.8" stroke-dasharray="6 5" marker-end="url(#ah)"/>')

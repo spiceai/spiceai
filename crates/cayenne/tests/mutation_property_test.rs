@@ -243,7 +243,7 @@ fn config(
             // `MoveToColdTier` op in the same serialization order production uses.
             cold_tier_background_interval_ms: 0,
             cold_tier_gc_interval_ms: COLD_GC_GRACE_MS,
-            cluster_by: vec!["id".to_string()],
+            cold_clustering_columns: vec!["id".to_string()],
             cold_target_file_size_mb: 1,
             ..base
         },

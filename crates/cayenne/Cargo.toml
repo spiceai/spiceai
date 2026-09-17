@@ -160,7 +160,7 @@ name = "in_list_query_e2e"
 
 [[bench]]
 harness = false
-name = "cold_clustering"
+name = "zorder_clustering"
 
 [[bench]]
 harness = false

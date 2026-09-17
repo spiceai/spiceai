@@ -3330,7 +3330,7 @@ enum WriteShapeDecision {
     /// columns — the structural case.
     SerialSortColumns = 0,
     /// The write must produce one sequence of files for another reason (position
-    /// deletes, a curve-clustered promotion).
+    /// deletes, a Z-order-clustered promotion).
     SerialRequired = 1,
     /// The byte estimate produced fewer shards than the concurrency cap.
     SizeBounded = 2,
@@ -3746,7 +3746,7 @@ pub(crate) enum EncodeFanOut {
     /// One encoder, whatever the configuration says. Required where the output
     /// must be a single sequence of files: a position-delete table's merge
     /// (its tombstones are file-path scoped and the rewrite's position bake-in
-    /// assumes one output sequence), a curve-clustered cold promotion
+    /// assumes one output sequence), a Z-order-clustered cold promotion
     /// (sharding scatters the clustering the promotion exists to create), and a
     /// globally sorted rewrite (splitting the sorted stream across shard files
     /// would give each file the whole key range, forfeiting the pruning the
@@ -4356,67 +4356,6 @@ fn scalars_share_a_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
 /// An unsorted consolidation carries nothing a reader depends on and is free to
 /// fan its encode out across cores.
 #[must_use]
-/// Which rung of the precedence chain produced a rewrite's clustering key.
-///
-/// Kept alongside the columns because the rungs are not distinguishable from the
-/// column list alone: schema inference fills `cayenne_sort_columns` on every
-/// catalog-visible CDC table, so an inference-derived key can equal an
-/// operator-configured one while carrying none of its authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RewriteKeySource {
-    /// Operator-configured `cayenne_sort_columns` — a stated intent, and the
-    /// order a sorted-snapshot scan may advertise as `output_ordering`.
-    Configured,
-    /// The hottest columns observed in scan pushdown filters (default-on
-    /// adaptive layout). A guess the engine made, never advertised.
-    ObservedFilters,
-    /// Inference-derived `cayenne_sort_columns`, or the primary key.
-    Inferred,
-}
-
-/// A rewrite's clustering key plus [`RewriteKeySource`].
-pub(crate) struct RewriteLayout {
-    pub(crate) columns: Vec<String>,
-    pub(crate) source: RewriteKeySource,
-}
-
-impl RewriteLayout {
-    fn configured(columns: Vec<String>) -> Self {
-        Self {
-            columns,
-            source: RewriteKeySource::Configured,
-        }
-    }
-
-    fn observed(columns: Vec<String>) -> Self {
-        Self {
-            columns,
-            source: RewriteKeySource::ObservedFilters,
-        }
-    }
-
-    fn inferred(columns: Vec<String>) -> Self {
-        Self {
-            columns,
-            source: RewriteKeySource::Inferred,
-        }
-    }
-}
-
-/// How a clustering sort consumes its input.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ClusterSortSpan {
-    /// Sort the whole stream as one run, so the output is globally ordered by
-    /// the curve key. Required wherever the resulting files are read back
-    /// through the ordinary scan path.
-    Global,
-    /// Split into byte-capped runs, each sorted independently. Caps per-run
-    /// memory and first-batch latency, but curve key ranges overlap ACROSS runs,
-    /// so the result is not globally ordered — only safe where the files
-    /// advertise no ordering, as cold-tier files do.
-    BoundedRuns,
-}
-
 const fn rewrite_write_policy(is_sorted: bool) -> super::delta_encoding::WritePolicy {
     if is_sorted {
         super::delta_encoding::WritePolicy::MAINTENANCE_SERIAL
@@ -9478,7 +9417,7 @@ impl CayenneTableProvider {
         // is scattered across shard files and each file's zone maps span the
         // whole range — forfeiting exactly the pruning the sort was for. Every
         // stream that goes through `sort_stream_by_columns` or
-        // `cluster_sort_stream` states that with [`EncodeFanOut::Serial`], which
+        // `zorder_sort_stream` states that with [`EncodeFanOut::Serial`], which
         // is handled above. A low `session_target_partitions` is NOT a
         // substitute: it bounds only the unset default, while a configured
         // `cayenne_write_concurrency` is honored above it (see
@@ -16841,16 +16780,6 @@ impl CayenneTableProvider {
         usize,
         super::delta_encoding::WritePolicy,
     )> {
-        if self.context.has_cluster_by() {
-            let ctx = self.create_session_context();
-            let clustered = self.cluster_sort_stream(
-                data,
-                self.configured_clustering_indices(),
-                &ctx.task_ctx(),
-                ClusterSortSpan::Global,
-            )?;
-            return Ok((clustered, 1, rewrite_write_policy(true)));
-        }
         if !self.context.sort_columns_are_authoritative() {
             return Ok((data, target_partitions, rewrite_write_policy(false)));
         }
@@ -16884,26 +16813,6 @@ impl CayenneTableProvider {
     /// reaching private compaction internals.
     #[must_use]
     pub fn effective_sort_columns_for_rewrite(&self) -> Vec<String> {
-        // An explicit multi-dimensional cluster key is the complete layout
-        // instruction. Do not layer inferred, observed, or configured
-        // lexicographic sorting on top of it; hierarchical clustering is a
-        // separate future contract.
-        if self.context.has_cluster_by() {
-            return Vec::new();
-        }
-
-        self.effective_rewrite_layout().columns
-    }
-
-    /// The rewrite's clustering key *and which rung produced it*.
-    ///
-    /// The rung is what decides whether the rewrite may lay its rows out along a
-    /// multi-dimensional curve instead of sorting them lexicographically, so it
-    /// cannot be re-derived by comparing the column list afterwards: schema
-    /// inference fills `cayenne_sort_columns` on every catalog-visible CDC
-    /// table, so an inference-derived key can be *equal* to
-    /// `context.sort_columns()` while meaning something entirely different.
-    fn effective_rewrite_layout(&self) -> RewriteLayout {
         // Auto-observed columns feed a `SortExec` row-format merge whose
         // `RowConverter` rejects `Map`/`Union`/nested types (e.g. a `Map` recorded
         // from an `attrs['k'] = ...` filter). Restrict inferred layouts to scalar
@@ -16945,7 +16854,7 @@ impl CayenneTableProvider {
 
         // Rung 1: an explicit operator sort order wins outright.
         if self.context.sort_columns_are_authoritative() {
-            return RewriteLayout::configured(self.context.sort_columns().to_vec());
+            return self.context.sort_columns().to_vec();
         }
         let schema = self.table_schema();
         let observed = self.filter_column_observations.top_columns(
@@ -16958,7 +16867,7 @@ impl CayenneTableProvider {
             // but a deterministic one, and it keeps pre-observation behavior
             // identical to what inference produced before the adaptive layout
             // existed. Falls through to no clustering when inference gave none.
-            return RewriteLayout::inferred(self.context.inferred_sort_columns().to_vec());
+            return self.context.inferred_sort_columns().to_vec();
         }
         let sortable: Vec<String> = observed
             .into_iter()
@@ -16976,11 +16885,11 @@ impl CayenneTableProvider {
             // cold-tier fallback in `resolve_cold_clustering_indices`).
             let inferred = self.context.inferred_sort_columns();
             if !inferred.is_empty() {
-                return RewriteLayout::inferred(inferred.to_vec());
+                return inferred.to_vec();
             }
-            return RewriteLayout::inferred(self.table_metadata.primary_key.clone());
+            return self.table_metadata.primary_key.clone();
         }
-        RewriteLayout::observed(sortable)
+        sortable
     }
 
     /// Sort and rewrite data by reading from the current listing table, writing
@@ -17025,7 +16934,6 @@ impl CayenneTableProvider {
             return Ok(());
         }
 
-        let clustering = self.configured_clustering_indices();
         let rewrite_sort_columns = self.effective_sort_columns_for_rewrite();
         tracing::debug!(
             "Sorting and rewriting data for table {} by columns {:?} (auto_from_filters={})",
@@ -17044,12 +16952,9 @@ impl CayenneTableProvider {
         // An empty list resolves to no key at all, and `sort_stream_by_columns`
         // then hands the stream back untouched — so whether this rewrite is
         // sorted is a property of the resolved list, not of the entry point.
-        let rewrite_is_sorted = !clustering.is_empty() || !rewrite_sort_columns.is_empty();
-        let sorted_stream = if clustering.is_empty() {
-            self.sort_stream_by_columns(stream, &rewrite_sort_columns, &ctx.task_ctx())?
-        } else {
-            self.cluster_sort_stream(stream, clustering, &ctx.task_ctx(), ClusterSortSpan::Global)?
-        };
+        let rewrite_is_sorted = !rewrite_sort_columns.is_empty();
+        let sorted_stream =
+            self.sort_stream_by_columns(stream, &rewrite_sort_columns, &ctx.task_ctx())?;
 
         // Write sorted data to a new snapshot directory. Because SortExec lazily
         // reads input files via DataSourceExec, writing to a separate directory
@@ -17564,7 +17469,7 @@ impl CayenneTableProvider {
     ) -> bool {
         subset_rewrite_eligibility(
             self.should_capture_positions() || self.pk_deletion_strategy.is_position_based(),
-            self.context.has_sort_columns() || self.context.has_cluster_by(),
+            self.context.has_sort_columns(),
             self.protected_snapshots.load().len(),
             candidate.paths.len(),
             files.len(),
@@ -20651,80 +20556,9 @@ impl CayenneTableProvider {
         // Configured sort_columns win; otherwise (default empty) sort by the
         // hottest observed filter columns so selective scans prune zone maps
         // without spicepod setup (F4 adaptive cold layout).
-        let rewrite_layout = self.effective_rewrite_layout();
-        let rewrite_source = rewrite_layout.source;
-        let explicit_curve_indices = self.configured_clustering_indices();
-        let rewrite_sort_columns = if explicit_curve_indices.is_empty() {
-            rewrite_layout.columns
-        } else {
-            // Explicit clustering is the complete layout instruction. Inferred
-            // and observed sort keys are ignored, and an explicit sort key is
-            // rejected during registration.
-            Vec::new()
-        };
-
-        // A multi-dimensional curve replaces the lexicographic sort ONLY for an
-        // explicit cluster key, or for an observed-filter key of two or more
-        // clusterable columns. Every part of the adaptive case is load-bearing:
-        //
-        //   * Observed-filter only. The adaptive layout picks the hottest
-        //     columns and then throws the second one's pruning away by sorting
-        //     lexicographically; a curve is what collects it. The other rungs
-        //     stay lexicographic — an operator's explicit order is a stated
-        //     intent whose ordering the scan may advertise, and an
-        //     inference-derived key still attests today.
-        //   * Two or more columns. A one-column curve is just an ascending
-        //     sort, but it places NULLs first where a bare sort column is
-        //     NULLS LAST, and it discards ASC/DESC — so it would change the
-        //     physical order for no gain.
-        //   * All clusterable. `is_row_sortable_type` admits `Decimal256`,
-        //     `Dictionary` and `FixedSizeBinary`, which the curve kernel maps
-        //     to the reserved zero key; such a dimension would cost a transpose
-        //     and an interleave per row to encode a constant.
-        let rewrite_schema = self.table_schema();
-        let adaptive_curve_indices: Vec<usize> = if explicit_curve_indices.is_empty()
-            && rewrite_source == RewriteKeySource::ObservedFilters
-        {
-            // Filter to clusterable columns first, then require two or more:
-            // two observed names of which only one is clusterable must keep
-            // the lexicographic fallback, not a one-dimensional curve.
-            super::clustering::observed_filter_curve_indices(
-                &rewrite_sort_columns,
-                rewrite_schema.as_ref(),
-            )
-        } else {
-            Vec::new()
-        };
-        let curve_indices = if explicit_curve_indices.is_empty() {
-            adaptive_curve_indices
-        } else {
-            explicit_curve_indices
-        };
-        let rewrite_is_curve_ordered = !curve_indices.is_empty();
-        let rewrite_is_sorted = rewrite_is_curve_ordered || !rewrite_sort_columns.is_empty();
-
-        if rewrite_is_curve_ordered {
-            let clustering_columns = if self.context.has_cluster_by() {
-                self.context.cluster_by()
-            } else {
-                &rewrite_sort_columns
-            };
-            tracing::debug!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                clustering_columns = ?clustering_columns,
-                "Clustering compaction rewrite along a curve before writing consolidated output files"
-            );
-            // Global span, NOT byte-bounded runs: this snapshot's files are read
-            // back through the ordinary scan path, and `bounded_sort_stream`
-            // only orders within a run.
-            stream = self.cluster_sort_stream(
-                stream,
-                curve_indices,
-                &ctx.task_ctx(),
-                ClusterSortSpan::Global,
-            )?;
-        } else if rewrite_is_sorted {
+        let rewrite_sort_columns = self.effective_sort_columns_for_rewrite();
+        let rewrite_is_sorted = !rewrite_sort_columns.is_empty();
+        if rewrite_is_sorted {
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -21032,17 +20866,7 @@ impl CayenneTableProvider {
             // optimization on such snapshots; claiming a wrong order is a
             // correctness bug. Recovering the optimization means storing the
             // attested key alongside the id and advertising from it (follow-up).
-            //
-            // A curve-ordered rewrite must NEVER attest, and the suppression is
-            // an explicit flag rather than a column comparison on purpose: the
-            // curve is applied to an observed-filter key, and schema inference
-            // fills `cayenne_sort_columns` on every catalog-visible CDC table,
-            // so that key can be EQUAL to `context.sort_columns()` while the
-            // physical order is a Hilbert curve rather than the lexicographic
-            // order the scan would advertise. Comparing the lists would pass and
-            // claim an ordering the files do not have.
             if !rewrite_sort_columns.is_empty()
-                && !rewrite_is_curve_ordered
                 && rewrite_sort_columns == self.context.sort_columns()
             {
                 self.current_sorted_snapshot
@@ -21151,28 +20975,16 @@ impl CayenneTableProvider {
         Ok((stream, generation_before))
     }
 
-    /// Resolve the explicitly configured clustering columns to schema indices.
-    /// Registration validates every name, so an empty result means no explicit
-    /// cluster key rather than a partially accepted configuration.
-    fn configured_clustering_indices(&self) -> Vec<usize> {
-        let schema = self.table_schema();
-        self.context
-            .cluster_by()
-            .iter()
-            .filter_map(|name| schema.index_of(name).ok())
-            .collect()
-    }
-
     /// Resolve the cold-tier clustering columns to schema indices:
-    /// `cayenne_cluster_by` → else `cayenne_sort_columns` →
+    /// `cayenne_datalake_clustering_columns` → else `cayenne_sort_columns` →
     /// else hottest observed filter columns (F4 default-on) → else the primary
     /// key. Returns the indices that exist in the schema (empty = no
     /// clustering, promotion writes unsorted).
     fn resolve_cold_clustering_indices(&self) -> Vec<usize> {
         let schema = self.table_schema();
         let vc = &self.table_metadata.vortex_config;
-        let names: Vec<String> = if !vc.cluster_by.is_empty() {
-            vc.cluster_by.clone()
+        let names: Vec<String> = if !vc.cold_clustering_columns.is_empty() {
+            vc.cold_clustering_columns.clone()
         } else if self.context.sort_columns_are_authoritative() {
             // Only an EXPLICIT sort order outranks observed filters here. An
             // inference-derived one (the primary key, for most CDC tables) drops
@@ -21181,11 +20993,11 @@ impl CayenneTableProvider {
             // workload instead of for a guess.
             self.context.sort_columns().to_vec()
         } else {
-            // Auto-observed columns only cluster if the curve encoder can key on
-            // them; `Decimal256`, `Map`, and other types unsupported by
-            // `column_order_keys` collapse to the reserved zero key (no
-            // clustering), so drop them and keep the primary-key fallback rather
-            // than writing an effectively unclustered cold run.
+            // Auto-observed columns only cluster if the Z-order encoder can key on
+            // them; `Decimal`, `Map`, and other types unsupported by
+            // `column_order_keys` collapse to the all-zero key (no clustering), so
+            // drop them and keep the primary-key fallback rather than writing an
+            // effectively unclustered cold run.
             let observed: Vec<String> = self
                 .filter_column_observations
                 .top_columns(
@@ -21196,7 +21008,7 @@ impl CayenneTableProvider {
                 .filter(|n| {
                     schema
                         .field_with_name(n)
-                        .is_ok_and(|f| super::clustering::is_clusterable(f.data_type()))
+                        .is_ok_and(|f| super::zorder::is_zorder_clusterable(f.data_type()))
                 })
                 .collect();
             if observed.is_empty() {
@@ -21219,7 +21031,7 @@ impl CayenneTableProvider {
             .filter_map(|n| {
                 // Resolve an exact field name first; else parse the extended
                 // `col [ASC|DESC] [NULLS ...]` syntax that `sort_columns` accepts
-                // (direction is irrelevant to the clustering curve) so a configured
+                // (direction is irrelevant to the Z-order curve) so a configured
                 // `sort_columns: ["amount DESC"]` still clusters cold files rather
                 // than being silently dropped by a literal-name lookup.
                 schema.index_of(n.trim()).ok().or_else(|| {
@@ -21227,127 +21039,52 @@ impl CayenneTableProvider {
                         .and_then(|(col, _)| schema.index_of(col).ok())
                 })
             })
-            // A type the curve cannot key on maps every value to the reserved
-            // zero key: it contributes no clustering while still costing a
-            // transpose and an interleave dimension on every row. The observed
-            // branch above filters earlier because it must decide whether to
-            // fall through to the primary key; this catches the explicit
-            // `cluster_by` and `sort_columns` branches, which
-            // would otherwise carry an unclusterable column all the way in.
-            .filter(|&i| {
-                schema
-                    .fields()
-                    .get(i)
-                    .is_some_and(|f| super::clustering::is_clusterable(f.data_type()))
-            })
             .collect()
     }
 
-    /// The `[min, max]` each clustering column's curve coordinate is normalized
-    /// against, positionally matching `clustering_indices`.
-    ///
-    /// Read from the maintained metastore aggregate — already warm, O(1), and
-    /// covering the *whole* table rather than the rows this promotion happens to
-    /// carry, so every file this promotion writes shares one coordinate space.
-    /// The aggregate widens as later writes merge new extrema, and clean cold
-    /// files are carried forward without rewrite, so a later promotion may
-    /// normalize onto a different scale. A column the aggregate cannot describe
-    /// yields `None`, which the kernel reads as "use this type's full key domain".
-    ///
-    /// Reads the maintained cache directly rather than through
-    /// [`Self::optimizer_table_statistics`]: that planner-facing view empties
-    /// `column_statistics` once the table is wider than
-    /// [`TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT`] — a costing shortcut that
-    /// would otherwise leave every clustering dimension unnormalized on exactly
-    /// the widest tables. Clustering reads only the few configured dimensions,
-    /// so it never pays the cost that limit exists to avoid.
-    ///
-    /// The lock is taken ONCE for all dimensions. A per-column acquisition could
-    /// straddle a cache clear and return a bound for one dimension and `None`
-    /// for the next, and a missing bound is a floor rather than a soft
-    /// degradation (see the `super::clustering` module docs), so a torn read
-    /// would cost the whole multi-dimensional layout for that promotion.
-    fn cluster_column_bounds(
-        &self,
-        clustering_indices: &[usize],
-    ) -> Vec<super::clustering::ColumnBounds> {
-        let schema = self.table_schema();
-        let cache = self.table_statistics.read();
-        let Some(stats) = cache
-            .optimizer
-            .as_ref()
-            .or(cache.optimizer_inexact.as_ref())
-        else {
-            return vec![None; clustering_indices.len()];
-        };
-        clustering_indices
-            .iter()
-            .map(|&i| {
-                let data_type = schema.fields().get(i)?.data_type();
-                let column = stats.column_statistics.get(i)?;
-                let lo = super::clustering::bound_key(column.min_value.get_value()?, data_type)?;
-                let hi = super::clustering::bound_key(column.max_value.get_value()?, data_type)?;
-                (lo <= hi).then_some((lo, hi))
-            })
-            .collect()
-    }
-
-    /// Cluster a stream along a Hilbert curve over `clustering_indices` by
-    /// appending a transient key column, sorting on it with a pool-accounted,
-    /// disk-spilling `SortExec`, then stripping the key. `span` picks how the
-    /// sort consumes the stream; see [`ClusterSortSpan`].
-    /// Empty `clustering_indices` returns the stream unchanged.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a [`ClusterSortSpan::Global`] sort fails to execute.
-    fn cluster_sort_stream(
+    /// Z-order (Morton) cluster a stream by appending a transient interleaved-bits
+    /// key column, sorting on it in byte-bounded runs via
+    /// [`super::streaming::bounded_sort_stream`] (per-run `SortExec`:
+    /// pool-accounted, disk-spilling), then stripping the key. Bounding the
+    /// sort caps per-run memory and first-batch latency; Z-order ranges may
+    /// overlap across runs, which only weakens per-file min/max pruning
+    /// slightly — cold files advertise no ordering, so this is a
+    /// clustering-quality trade-off, not a correctness change. The run cap is
+    /// [`crate::metadata::VortexConfig::cold_clustering_run_size_bytes`],
+    /// measured on the augmented batches (key included — what `SortExec`
+    /// actually buffers). Empty `clustering_indices` returns the stream
+    /// unchanged.
+    fn zorder_sort_stream(
         &self,
         stream: SendableRecordBatchStream,
         clustering_indices: Vec<usize>,
         task_ctx: &Arc<datafusion_execution::TaskContext>,
-        span: ClusterSortSpan,
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> SendableRecordBatchStream {
         if clustering_indices.is_empty() {
-            return Ok(stream);
+            return stream;
         }
         let original_schema = stream.schema();
-        let augmented_schema = super::clustering::cluster_augmented_schema(&original_schema);
-        // Resolved once for the whole rewrite: per-batch bounds would put each
-        // batch on its own coordinate scale, and keys from different scales do
-        // not order against each other.
-        let bounds = self.cluster_column_bounds(&clustering_indices);
+        let augmented_schema = super::zorder::zorder_augmented_schema(&original_schema);
         let idx = clustering_indices;
-        let augmented = stream.map(move |res| {
-            res.and_then(|b| super::clustering::append_cluster_key_column(&b, &idx, &bounds))
-        });
+        let augmented = stream
+            .map(move |res| res.and_then(|b| super::zorder::append_zorder_key_column(&b, &idx)));
         let augmented_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&augmented_schema),
             augmented,
         ));
-        let key_column = vec![super::clustering::CLUSTER_KEY_COLUMN_NAME.to_string()];
-        let sorted = match span {
-            ClusterSortSpan::Global => {
-                util::stream_utils::sort_stream(augmented_stream, &key_column, task_ctx)?
-            }
-            ClusterSortSpan::BoundedRuns => super::streaming::bounded_sort_stream(
-                &self.table_metadata.table_name,
-                augmented_stream,
-                key_column,
-                task_ctx,
-                self.table_metadata
-                    .vortex_config
-                    .cold_clustering_run_size_bytes(),
-            ),
-        };
+        let sorted = super::streaming::bounded_sort_stream(
+            &self.table_metadata.table_name,
+            augmented_stream,
+            vec![super::zorder::ZORDER_COLUMN_NAME.to_string()],
+            task_ctx,
+            self.table_metadata
+                .vortex_config
+                .cold_clustering_run_size_bytes(),
+        );
         let orig = Arc::clone(&original_schema);
-        let stripped = sorted.map(move |res| {
-            res.and_then(|b| super::clustering::strip_cluster_key_column(&b, &orig))
-        });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            original_schema,
-            stripped,
-        )))
+        let stripped = sorted
+            .map(move |res| res.and_then(|b| super::zorder::strip_zorder_key_column(&b, &orig)));
+        Box::pin(RecordBatchStreamAdapter::new(original_schema, stripped))
     }
 
     /// Per-file row cap so a file's PK bloom (~10 bits/key) stays within
@@ -21384,7 +21121,7 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Write a (clustered, deletes-applied) stream to the cold object store as
+    /// Write a (Z-ordered, deletes-applied) stream to the cold object store as
     /// read-optimized Vortex files, returning one [`ColdTierFile`] per written
     /// file with accurate per-file footer statistics (for listing-time pruning).
     ///
@@ -21392,7 +21129,7 @@ impl CayenneTableProvider {
     /// it would lose rows — carrying the placeholder `row_count` of 0 that
     /// [`Self::promote_warm_to_cold_inner`] treats as an unknown count.
     ///
-    /// Single ordered run (`target_partitions = 1`) so the clustering survives across
+    /// Single ordered run (`target_partitions = 1`) so the Z-order survives across
     /// cold files — each file is a contiguous slice of the sorted order, giving
     /// tight, non-overlapping zone maps. Bloom-eligible tables split the stream
     /// into row-bounded chunks (sequential writes to the same dir) so every file
@@ -21701,7 +21438,7 @@ impl CayenneTableProvider {
     /// visible stream restricted to warm + dirty cold files (all deletes
     /// applied, single-version per key — the proven rewrite read with a
     /// [`super::cold_partition::ColdScanFiles`] session extension),
-    /// cluster it along the curve, write read-optimized Vortex to the cold store, then
+    /// Z-order cluster it, write read-optimized Vortex to the cold store, then
     /// atomically register the new files PLUS the carried-forward clean
     /// manifest rows + overwrite-clear the warm tier + flip to a fresh empty
     /// warm snapshot. Subsequent CDC writes accumulate in warm again until the
@@ -21974,10 +21711,10 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             source_tier = "warm",
             target_tier = "datalake",
-            clustering = "hilbert",
+            clustering = "z_order",
             warm_bytes,
             warm_files,
-            "Moving warm-tier data to the datalake (Hilbert clustered)"
+            "Moving warm-tier data to the datalake (Z-order clustered)"
         );
 
         // Exclude writers for the whole graduation (mirrors begin_overwrite).
@@ -22076,14 +21813,11 @@ impl CayenneTableProvider {
             "Planned the cross-tier read stream for the data move"
         );
 
-        // Cluster along the curve for a read-optimized cold layout.
+        // Z-order cluster for a read-optimized cold layout.
         let clustering = self.resolve_cold_clustering_indices();
         let clustering_is_empty = clustering.is_empty();
         let task_ctx = ctx.task_ctx();
-        // Bounded runs: cold files advertise no ordering, so trading a global
-        // order for capped per-run memory is a clustering-quality choice only.
-        let stream =
-            self.cluster_sort_stream(stream, clustering, &task_ctx, ClusterSortSpan::BoundedRuns)?;
+        let stream = self.zorder_sort_stream(stream, clustering, &task_ctx);
 
         // Write the clustered, deletes-applied rows to the cold object store.
         let (cold_files, total_rows) = self
@@ -22092,7 +21826,7 @@ impl CayenneTableProvider {
                 self.cold_object_store_config.as_ref(),
                 stream,
                 max_sequence,
-                // `cluster_sort_stream` returned the stream untouched when no
+                // `zorder_sort_stream` returned the stream untouched when no
                 // clustering key resolved; otherwise sharding would scatter the
                 // clustering this promotion exists to create.
                 if clustering_is_empty {
@@ -34070,7 +33804,7 @@ impl TableProvider for CayenneTableProvider {
         // collected. Gating this on `has_sort_columns()` instead is what made the
         // adaptive layout inert on every catalog-visible CDC deployment, since
         // inference fills `cayenne_sort_columns` on all of them.
-        if !self.context.has_cluster_by() && !self.context.sort_columns_are_authoritative() {
+        if !self.context.sort_columns_are_authoritative() {
             self.filter_column_observations.record_filters(filters);
         }
 
@@ -39307,77 +39041,6 @@ mod tests {
         assert_eq!(
             stats.column_statistics[0].null_count,
             column_stats.null_count
-        );
-    }
-
-    /// Wide-table planner stats empty `column_statistics` past
-    /// [`TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT`]. Clustering still has to
-    /// read the maintained `[min, max]` for the few dimensions it normalizes
-    /// (regression test for the accessor that does not go through that summary).
-    #[tokio::test]
-    async fn cluster_column_bounds_keep_wide_table_normalization() {
-        let temp_dir = tempfile::TempDir::new().expect("tempdir");
-        let db_path = temp_dir.path().join("test.db");
-        let data_path = temp_dir.path().join("data");
-        std::fs::create_dir_all(&data_path).expect("data dir");
-        let catalog = Arc::new(
-            CayenneCatalog::new(format!("sqlite://{}", db_path.to_string_lossy()))
-                .expect("catalog"),
-        );
-        catalog.init().await.expect("init catalog");
-
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("ts", DataType::Int64, false),
-            arrow_schema::Field::new("tenant", DataType::Int64, false),
-        ]));
-        let options = CreateTableOptions {
-            table_name: "wide_cluster_bounds".to_string(),
-            schema,
-            primary_key: vec!["ts".to_string()],
-            on_conflict: None,
-            base_path: data_path.to_string_lossy().to_string(),
-            partition_column: None,
-            vortex_config: VortexConfig::default(),
-        };
-        let table = CayenneTableProvider::create_table(
-            catalog as Arc<dyn MetadataCatalog>,
-            options,
-            SessionContext::new().runtime_env(),
-        )
-        .await
-        .expect("create table");
-
-        let mut column_statistics =
-            vec![ColumnStatistics::new_unknown(); TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT + 1];
-        column_statistics[0].min_value =
-            DFPrecision::Exact(ScalarValue::Int64(Some(1_700_000_000_000_000)));
-        column_statistics[0].max_value =
-            DFPrecision::Exact(ScalarValue::Int64(Some(1_700_000_016_383_000)));
-        column_statistics[1].min_value = DFPrecision::Exact(ScalarValue::Int64(Some(0)));
-        column_statistics[1].max_value = DFPrecision::Exact(ScalarValue::Int64(Some(15)));
-
-        {
-            let mut cache = table.table_statistics.write();
-            cache.optimizer = Some(Statistics {
-                num_rows: DFPrecision::Exact(16_384),
-                total_byte_size: DFPrecision::Absent,
-                column_statistics,
-            });
-            cache.count_exact = true;
-        }
-
-        let planner = table
-            .optimizer_table_statistics()
-            .expect("planner-facing stats");
-        assert!(
-            planner.column_statistics.is_empty(),
-            "the wide-table planner summary must stay empty so this test is actually on that path"
-        );
-
-        let bounds = table.cluster_column_bounds(&[0, 1]);
-        assert!(
-            bounds.iter().all(Option::is_some),
-            "clustering must still see per-dimension bounds on a wide table: {bounds:?}"
         );
     }
 
@@ -50930,106 +50593,6 @@ mod tests {
 
         // (6) empty sort_columns → nothing.
         assert!(CayenneTableProvider::sort_columns_to_file_sort_order(&[], &schema2).is_none());
-    }
-
-    /// [sound `output_ordering`] A rewrite that laid its rows out along a curve
-    /// must NOT attest the snapshot as sorted.
-    ///
-    /// The scan advertises `output_ordering` from `context.sort_columns()`. A
-    /// curve is not a lexicographic order — it interleaves the columns, puts
-    /// NULLs first, and discards ASC/DESC — so attesting would tell `DataFusion`
-    /// the files carry an order they do not, and it would elide a sort the data
-    /// needs or open a merge join on unordered input: wrong rows, not a slow
-    /// plan.
-    ///
-    /// The trap this pins is that the attestation cannot be guarded by comparing
-    /// column lists. Schema inference fills `cayenne_sort_columns` on every
-    /// catalog-visible CDC table, so the observed-filter key the curve is
-    /// applied to can be *equal* to the configured list while meaning something
-    /// different. Here `sort_columns` is left empty and the key comes from
-    /// observations, which is the shape that must decline to attest.
-    #[tokio::test]
-    async fn test_curve_ordered_rewrite_does_not_advertise_output_ordering() {
-        use arrow::array::Int64Array;
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("ts", DataType::Int64, false),
-            Field::new("tenant", DataType::Int64, false),
-        ]));
-        let mut config = datafusion::prelude::SessionConfig::new();
-        config
-            .options_mut()
-            .execution
-            .split_file_groups_by_statistics = true;
-        let ctx = SessionContext::new_with_config(config);
-        // Empty `sort_columns` so the key is NOT authoritative and the observed
-        // filter columns win; `inline_max_rows: 0` forces writes to files so the
-        // rewrite actually sorts them.
-        let (provider, _tmp) = create_cayenne_table_with_config(
-            "curve_ordering_lifecycle",
-            Arc::clone(&schema),
-            VortexConfig {
-                sort_columns: vec![],
-                inline_max_rows: 0,
-                ..VortexConfig::default()
-            },
-            vec![],
-            ctx.runtime_env(),
-        )
-        .await;
-
-        let rows: Vec<i64> = (0..64).collect();
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(rows.clone())) as ArrayRef,
-                Arc::new(Int64Array::from(
-                    rows.iter()
-                        .map(|i| 1_700_000_000_000_000 + i * 1_000)
-                        .collect::<Vec<_>>(),
-                )) as ArrayRef,
-                Arc::new(Int64Array::from(
-                    rows.iter().map(|i| (i * 7) % 16).collect::<Vec<_>>(),
-                )) as ArrayRef,
-            ],
-        )
-        .expect("batch");
-        insert_batch(&provider, batch).await;
-
-        // Seed the observation histogram through the real pushdown path, on TWO
-        // differently-scaled columns — the shape a curve exists for.
-        let state = ctx.state();
-        for _ in 0..4 {
-            let filters = vec![
-                datafusion_expr::col("ts").gt(datafusion_expr::lit(1_700_000_000_000_000_i64)),
-                datafusion_expr::col("tenant").eq(datafusion_expr::lit(3_i64)),
-            ];
-            let _plan = provider
-                .scan(&state, None, &filters, None)
-                .await
-                .expect("scan with ts/tenant filters");
-        }
-        let observed = provider.effective_sort_columns_for_rewrite();
-        assert_eq!(
-            observed.len(),
-            2,
-            "fixture must observe two filter columns for the curve to engage, got {observed:?}"
-        );
-
-        provider
-            .rewrite_current_snapshot_for_compaction()
-            .await
-            .expect("curve-ordered rewrite");
-
-        let plan = provider
-            .scan(&ctx.state(), None, &[], None)
-            .await
-            .expect("scan plan");
-        assert!(
-            plan.properties().output_ordering().is_none(),
-            "a curve-ordered rewrite must NOT advertise output_ordering: the files are \
-             interleaved across the key columns, not lexicographically sorted by them"
-        );
     }
 
     /// [sound `output_ordering`] A snapshot freshly produced by the sorted compaction

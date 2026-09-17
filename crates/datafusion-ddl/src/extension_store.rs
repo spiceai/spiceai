@@ -21,7 +21,6 @@ limitations under the License.
 //!   - `acceleration.*` — acceleration engine, mode, refresh settings, etc.
 //!   - `dataset.*` — dataset-level settings like `time_column` and `time_format`.
 //! - `PARTITION BY` clauses (stored as the raw sqlparser `Expr`).
-//! - `CLUSTER BY` clauses (stored as raw sqlparser expressions).
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -54,9 +53,6 @@ pub struct CreateTableStatementExtension {
     /// Partitioning expression from a `PARTITION BY` clause.
     /// The raw SQL expression as parsed by sqlparser.
     pub partition_by: Option<Box<SqlParserExpr>>,
-    /// Clustering columns from a `CLUSTER BY` clause.
-    /// Catalog handlers validate which expression forms they support.
-    pub cluster_by: Vec<SqlParserExpr>,
 }
 
 /// Stores DDL extensions extracted from `CREATE TABLE` statements.
@@ -148,7 +144,6 @@ pub fn parse_ddl_table_options(
         acceleration,
         dataset,
         partition_by: None,
-        cluster_by: Vec::new(),
     })
 }
 

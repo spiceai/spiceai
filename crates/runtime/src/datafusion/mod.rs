@@ -3313,7 +3313,7 @@ impl DataFusion {
             // accelerator is bounded by a retention policy, a cache budget, or
             // nothing at all.
             match caching_retention::caching_retention(
-                acceleration_settings.caching_stale_if_error.is_enabled(),
+                acceleration_settings.caching_stale_if_error,
                 acceleration_settings.caching_ttl,
                 acceleration_settings.caching_stale_while_revalidate_ttl,
                 declared_retention_runs,
@@ -3362,7 +3362,7 @@ impl DataFusion {
                 acceleration_settings.caching_stale_while_revalidate_ttl,
             );
             accelerated_table_builder
-                .caching_stale_if_error(acceleration_settings.caching_stale_if_error.is_enabled());
+                .caching_stale_if_error(acceleration_settings.caching_stale_if_error);
             accelerated_table_builder
                 .caching_max_size_bytes(acceleration_settings.caching_max_size);
             accelerated_table_builder.caching_max_items(acceleration_settings.caching_max_items);
@@ -5141,7 +5141,8 @@ impl DataFusion {
         session: &SessionState,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        let statement = planner::parse_sql_statement(sql, session)?;
+        let dialect = session.config().options().sql_parser.dialect;
+        let statement = session.sql_to_statement(sql, &dialect)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
 

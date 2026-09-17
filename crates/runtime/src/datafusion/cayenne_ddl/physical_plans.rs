@@ -36,7 +36,6 @@ use arrow::array::{RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::ddl::operations::{self, create_schema, create_table, drop_table};
 use datafusion::catalog::CatalogProviderList;
-use datafusion::common::utils::quote_identifier;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
@@ -259,7 +258,6 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
         let arrow_schema = Arc::clone(&self.params.arrow_schema);
         let primary_key = self.params.primary_key.clone();
         let partition_expr_sql = self.params.partition_expr_sql.clone();
-        let cluster_by = self.params.cluster_by.clone();
         let if_not_exists = self.params.if_not_exists;
         let like_source_table = self.params.like_source_table.clone();
         let ctx_opt = self.params.ctx.clone();
@@ -298,7 +296,6 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
                     arrow_schema,
                     primary_key,
                     partition_expr_sql: partition_expr_sql.clone(),
-                    cluster_by: cluster_by.clone(),
                     if_not_exists,
                     like_source_table: like_source_table.clone(),
                     ctx: ctx_opt,
@@ -350,21 +347,9 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
                         .join(", ");
                     table_elements.push(format!("PRIMARY KEY ({pk_cols})"));
                 }
-                let cluster_by_sql = if cluster_by.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        " CLUSTER BY ({})",
-                        cluster_by
-                            .iter()
-                            .map(|column| quote_identifier(column).to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                };
                 let ddl_sql = format!(
                     "CREATE TABLE IF NOT EXISTS \
-                     \"{catalog_name}\".\"{schema_name}\".\"{table_name}\" ({}){cluster_by_sql}",
+                     \"{catalog_name}\".\"{schema_name}\".\"{table_name}\" ({})",
                     table_elements.join(", ")
                 );
 

@@ -20,7 +20,7 @@ limitations under the License.
 //! planner, for two purposes:
 //!
 //! 1. **DDL extensions** — `CREATE TABLE` with `WITH (...)` options
-//!    (`acceleration.*`, `dataset.*`), `PARTITION BY`, and `CLUSTER BY` clauses that
+//!    (`acceleration.*`, `dataset.*`) and `PARTITION BY` clauses that
 //!    `DataFusion`'s `SqlToRel` does not support. Extensions are extracted from
 //!    the AST, stored in the [`DdlExtensionStore`], and stripped before
 //!    delegating to `DataFusion`.
@@ -47,7 +47,6 @@ mod update;
 use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
-use datafusion::common::config::Dialect;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
@@ -137,38 +136,9 @@ pub async fn create_logical_plan(
     session: &SessionState,
     ctx: &PlannerContext,
 ) -> DFResult<LogicalPlan> {
-    let statement = parse_sql_statement(sql, session)?;
-    create_logical_plan_from_statement(sql, statement, session, ctx).await
-}
-
-/// Parse SQL using the configured dialect, with the generic dialect limited to
-/// Cayenne's `CREATE TABLE ... CLUSTER BY` extension.
-///
-/// `sqlparser` does not currently recognize the `CLUSTER BY` create-table
-/// clause under its `PostgreSqlDialect`, which is the runtime default. The
-/// generic dialect does recognize it. Only accept the fallback when the
-/// resulting statement is precisely a create-table statement with that clause,
-/// so unrelated SQL retains the configured dialect's behavior and error.
-pub(crate) fn parse_sql_statement(sql: &str, session: &SessionState) -> DFResult<Statement> {
     let dialect = session.config().options().sql_parser.dialect;
-    match session.sql_to_statement(sql, &dialect) {
-        Ok(statement) => Ok(statement),
-        Err(configured_dialect_error) => {
-            let fallback = session.sql_to_statement(sql, &Dialect::Generic);
-            match fallback {
-                Ok(statement) if is_create_table_with_cluster_by(&statement) => Ok(statement),
-                _ => Err(configured_dialect_error),
-            }
-        }
-    }
-}
-
-fn is_create_table_with_cluster_by(statement: &Statement) -> bool {
-    matches!(
-        statement,
-        Statement::Statement(sql_statement)
-            if matches!(sql_statement.as_ref(), SQLStatement::CreateTable(table) if table.cluster_by.is_some())
-    )
+    let statement = session.sql_to_statement(sql, &dialect)?;
+    create_logical_plan_from_statement(sql, statement, session, ctx).await
 }
 
 pub async fn create_logical_plan_from_statement(
@@ -185,7 +155,7 @@ pub async fn create_logical_plan_from_statement(
                 let has_with = !matches!(ct.table_options, CreateTableOptions::None);
                 if has_columns || has_partition_by || has_with || has_ddl_extensions(ct) {
                     return Err(DataFusionError::Plan(
-                        "CREATE TABLE ... (LIKE ...) cannot be combined with PARTITION BY, CLUSTER BY, WITH \
+                        "CREATE TABLE ... (LIKE ...) cannot be combined with PARTITION BY, WITH \
                          options, or additional column definitions. The new table inherits all \
                          properties \
                          from the source table."
@@ -332,30 +302,9 @@ mod tests {
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::catalog::TableProvider;
-    use datafusion::common::config::Dialect;
     use datafusion::datasource::MemTable;
-    use datafusion::execution::SessionStateBuilder;
-    use datafusion::prelude::SessionConfig;
 
     use data_components::MetadataEnrichedTableProvider;
-
-    #[test]
-    fn runtime_postgresql_dialect_accepts_create_table_cluster_by() {
-        let mut config = SessionConfig::new();
-        config.options_mut().sql_parser.dialect = Dialect::PostgreSQL;
-        let session = SessionStateBuilder::new()
-            .with_config(config)
-            .with_default_features()
-            .build();
-
-        let statement = super::parse_sql_statement(
-            "CREATE TABLE events (id BIGINT, region TEXT) CLUSTER BY (region, id)",
-            &session,
-        )
-        .expect("runtime dialect should accept CLUSTER BY");
-
-        assert!(super::is_create_table_with_cluster_by(&statement));
-    }
 
     fn mem_table() -> Arc<dyn TableProvider> {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));

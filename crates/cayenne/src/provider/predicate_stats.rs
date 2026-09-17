@@ -17,7 +17,7 @@ limitations under the License.
 //! Per-table filter-column hit histogram for default-on adaptive cold layout (F4).
 //!
 //! Scans record which columns appear in pushdown filters. When operators leave
-//! `sort_columns` / `cluster_by` empty, compaction consults
+//! `sort_columns` / `cold_clustering_columns` empty, compaction consults
 //! [`FilterColumnObservations::top_columns`] and sorts the rewrite by the hottest
 //! columns so zone maps prune selective queries without any spicepod setup.
 
@@ -32,7 +32,7 @@ use parking_lot::Mutex;
 /// Maximum distinct filter columns retained in the histogram.
 const MAX_TRACKED_COLUMNS: usize = 32;
 
-/// Default number of hot columns to feed into compaction sort / clustering.
+/// Default number of hot columns to feed into compaction sort / Z-order.
 pub(crate) const DEFAULT_AUTO_CLUSTER_TOP_K: usize = 2;
 
 /// Bounded per-table filter-column hit counts shared across provider clones.

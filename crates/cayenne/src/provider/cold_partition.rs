@@ -23,7 +23,7 @@ limitations under the License.
 //! entirely from in-memory manifest data: each cold file's persisted
 //! statistics blob yields a per-PK-column min/max hyper-rectangle, and a file
 //! is dirty iff any tombstoned key falls inside its rectangle. Cold files are
-//! curve-clustered on the PK by default, so rectangles are tight and a
+//! Z-order clustered on the PK by default, so rectangles are tight and a
 //! tombstone hits few files.
 //!
 //! When a file carries a per-file PK bloom (`ColdTierFile::pk_bloom`), a
@@ -416,7 +416,7 @@ mod composite_key_tests {
 
     /// A cold manifest row whose stats blob (built with the PRODUCTION
     /// serializer) covers the given per-PK-column `[min, max]` ranges —
-    /// the clustered shape of real promoted orderline files: a tight `ol_o_id`
+    /// the Z-order shape of real promoted orderline files: a tight `ol_o_id`
     /// band while `w_id`/`d_id`/`number` span their full domains.
     fn cold_file(url: &str, o_id_range: (i64, i64)) -> ColdTierFile {
         let schema = orderline_schema();
@@ -515,7 +515,7 @@ mod composite_key_tests {
     #[test]
     fn orderline_delivery_tombstones_dirty_only_their_o_id_band() {
         // Three cold generations of orderline data, banded by ol_o_id (the
-        // realistic clustering outcome for this key shape).
+        // realistic Z-order outcome for this key shape).
         let files = vec![
             cold_file("f1", (1, 1000)),
             cold_file("f2", (1001, 2000)),
