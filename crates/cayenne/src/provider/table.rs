@@ -50937,7 +50937,7 @@ mod tests {
     ///
     /// The scan advertises `output_ordering` from `context.sort_columns()`. A
     /// curve is not a lexicographic order — it interleaves the columns, puts
-    /// NULLs first, and discards ASC/DESC — so attesting would tell DataFusion
+    /// NULLs first, and discards ASC/DESC — so attesting would tell `DataFusion`
     /// the files carry an order they do not, and it would elide a sort the data
     /// needs or open a merge join on unordered input: wrong rows, not a slow
     /// plan.

@@ -209,7 +209,7 @@ async fn test_cold_tier_selective_query_prunes_files_impl(
 test_with_backends!(test_cold_tier_normalized_clustering_prunes_both_dimensions_impl);
 test_with_backends!(test_warm_tier_normalized_clustering_prunes_both_dimensions_impl);
 
-/// DataFusion's default write batch is 8192 rows. The Vortex sink checks the
+/// `DataFusion`'s default write batch is 8192 rows. The Vortex sink checks the
 /// 1 MB cold target at batch boundaries, so a pad just over 128 B makes each
 /// batch its own file. Sixteen files is the coarsest layout that can still
 /// show a tenant point probe skipping files: in arrival/timestamp order every
