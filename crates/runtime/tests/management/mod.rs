@@ -27,7 +27,10 @@ use rand::RngExt;
 use runtime::{Runtime, datafusion::query::QueryBuilder};
 use runtime::{auth::EndpointAuth, config::Config};
 use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
-use spicepod::component::{management::Management, runtime::ApiKey};
+use spicepod::component::{
+    management::Management,
+    runtime::{ApiKey, Runtime as SpicepodRuntime, TaskHistory},
+};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -40,6 +43,19 @@ use crate::{
 };
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+/// The query stream only serializes a result preview when `captured_output` is
+/// not `none`. This test asserts that preview is exported, so both the source
+/// app and the sink must record it.
+fn runtime_recording_query_previews() -> SpicepodRuntime {
+    SpicepodRuntime {
+        task_history: TaskHistory {
+            captured_output: "truncated".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
 
 /// This test verifies that when management is enabled,
 /// events (such as query executions) are exported from the source app
@@ -68,6 +84,7 @@ async fn management_data_export() -> Result<(), anyhow::Error> {
             };
 
             let app = AppBuilder::new("management_test_app")
+                .with_runtime(runtime_recording_query_previews())
                 .with_management(management)
                 .build();
 
@@ -166,7 +183,9 @@ async fn create_data_export_endpoint() -> Result<DataExportEndpoint, anyhow::Err
         .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
         .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
 
-    let app = AppBuilder::new("management_sink_app").build();
+    let app = AppBuilder::new("management_sink_app")
+        .with_runtime(runtime_recording_query_previews())
+        .build();
 
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
