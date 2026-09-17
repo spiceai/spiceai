@@ -163,10 +163,10 @@ impl GitHubTableArgs for ReviewThreadsTableArgs {
             Some(gql_schema()),
         )
         .with_nested_pager(NestedConnectionPager {
-            connection_key: "reviewThreads".to_string(),
-            parent_id_key: PULL_REQUEST_ID_KEY.to_string(),
-            type_condition: "PullRequest".to_string(),
-            node_selection: REVIEW_THREAD_NODE_SELECTION.to_string(),
+            connection_key: "reviewThreads",
+            parent_id_key: PULL_REQUEST_ID_KEY,
+            type_condition: "PullRequest",
+            node_selection: REVIEW_THREAD_NODE_SELECTION,
             page_size: THREADS_PER_PULL_REQUEST,
         })
     }
@@ -248,20 +248,9 @@ mod tests {
 
     #[test]
     fn query_requests_page_info_so_overflow_threads_can_be_paginated() {
-        let params = args().get_graphql_values();
-        let query = params.query.to_string();
-        let threads = query
-            .split("reviewThreads(first:")
-            .nth(1)
-            .expect("reviewThreads connection");
-
-        assert!(
-            threads.contains("hasNextPage") && threads.contains("endCursor"),
-            "reviewThreads connection must request pageInfo, got:\n{query}"
-        );
-        assert!(
-            params.nested_pager.is_some(),
-            "review_threads must page overflow via node(id:)"
+        crate::test_util::assert_nested_pager_wired(
+            &args().get_graphql_values(),
+            "reviewThreads(first:",
         );
     }
 

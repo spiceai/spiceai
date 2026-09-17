@@ -145,10 +145,10 @@ impl GitHubTableArgs for ReleaseAssetsTableArgs {
             Some(gql_schema()),
         )
         .with_nested_pager(NestedConnectionPager {
-            connection_key: "releaseAssets".to_string(),
-            parent_id_key: RELEASE_ID_KEY.to_string(),
-            type_condition: "Release".to_string(),
-            node_selection: ASSET_NODE_SELECTION.to_string(),
+            connection_key: "releaseAssets",
+            parent_id_key: RELEASE_ID_KEY,
+            type_condition: "Release",
+            node_selection: ASSET_NODE_SELECTION,
             page_size: ASSETS_PER_RELEASE,
         })
     }
@@ -231,20 +231,9 @@ mod tests {
 
     #[test]
     fn query_requests_page_info_so_overflow_assets_can_be_paginated() {
-        let params = args().get_graphql_values();
-        let query = params.query.to_string();
-        let assets = query
-            .split("releaseAssets(first:")
-            .nth(1)
-            .expect("releaseAssets connection");
-
-        assert!(
-            assets.contains("hasNextPage") && assets.contains("endCursor"),
-            "releaseAssets connection must request pageInfo, got:\n{query}"
-        );
-        assert!(
-            params.nested_pager.is_some(),
-            "release_assets must page overflow via node(id:)"
+        crate::test_util::assert_nested_pager_wired(
+            &args().get_graphql_values(),
+            "releaseAssets(first:",
         );
     }
 

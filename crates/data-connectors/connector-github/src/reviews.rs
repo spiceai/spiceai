@@ -154,10 +154,10 @@ impl GitHubTableArgs for ReviewsTableArgs {
             Some(gql_schema()),
         )
         .with_nested_pager(NestedConnectionPager {
-            connection_key: "reviews".to_string(),
-            parent_id_key: PULL_REQUEST_ID_KEY.to_string(),
-            type_condition: "PullRequest".to_string(),
-            node_selection: REVIEW_NODE_SELECTION.to_string(),
+            connection_key: "reviews",
+            parent_id_key: PULL_REQUEST_ID_KEY,
+            type_condition: "PullRequest",
+            node_selection: REVIEW_NODE_SELECTION,
             page_size: REVIEWS_PER_PULL_REQUEST,
         })
     }
@@ -234,21 +234,7 @@ mod tests {
 
     #[test]
     fn query_requests_page_info_so_overflow_reviews_can_be_paginated() {
-        let params = args().get_graphql_values();
-        let query = params.query.to_string();
-        let reviews = query
-            .split("reviews(first:")
-            .nth(1)
-            .expect("reviews connection");
-
-        assert!(
-            reviews.contains("hasNextPage") && reviews.contains("endCursor"),
-            "reviews connection must request pageInfo, got:\n{query}"
-        );
-        assert!(
-            params.nested_pager.is_some(),
-            "reviews must page overflow via node(id:)"
-        );
+        crate::test_util::assert_nested_pager_wired(&args().get_graphql_values(), "reviews(first:");
     }
 
     #[test]

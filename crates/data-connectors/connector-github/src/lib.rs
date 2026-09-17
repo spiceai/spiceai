@@ -27,7 +27,7 @@ use connector_graphql::graphql::client::UnnestBehavior;
 use connector_graphql::graphql::{
     self, FilterPushdownResult, GraphQLContext,
     builder::GraphQLClientBuilder,
-    client::{GraphQLClient, GraphQLQuery, PaginationParameters},
+    client::{GraphQLClient, GraphQLQuery, NestedConnectionPager, PaginationParameters},
     provider::{GraphQLTableProvider, GraphQLTableProviderBuilder},
 };
 use data_components::rate_limit::RateLimiter;
@@ -194,7 +194,7 @@ pub struct GitHubTableGraphQLParams {
     /// The GraphQL schema of the response data, if available
     schema: Option<SchemaRef>,
     /// When set, truncated nested connections are completed via `node(id:)` follow-up pages.
-    nested_pager: Option<connector_graphql::graphql::client::NestedConnectionPager>,
+    nested_pager: Option<NestedConnectionPager>,
 }
 
 impl GitHubTableGraphQLParams {
@@ -215,10 +215,7 @@ impl GitHubTableGraphQLParams {
     }
 
     #[must_use]
-    pub fn with_nested_pager(
-        mut self,
-        pager: connector_graphql::graphql::client::NestedConnectionPager,
-    ) -> Self {
+    pub fn with_nested_pager(mut self, pager: NestedConnectionPager) -> Self {
         self.nested_pager = Some(pager);
         self
     }

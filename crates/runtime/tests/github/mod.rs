@@ -2401,36 +2401,33 @@ async fn test_github_app_issues() -> Result<(), String> {
         .await
 }
 
-fn spiceai_full_history_concurrency() -> HashMap<String, String> {
-    HashMap::from([("max_concurrent_requests".to_string(), "10".to_string())])
-}
-
-/// Every pull request, with discussion and review comments attached.
-fn spiceai_pulls_with_comments_dataset() -> Dataset {
-    let mut params = spiceai_full_history_concurrency();
-    params.insert("github_include_comments".to_string(), "all".to_string());
-    params.insert("github_max_comments_fetched".to_string(), "25".to_string());
+fn spiceai_accelerated(resource: &str, extra: HashMap<String, String>) -> Dataset {
+    let mut params = HashMap::from([("max_concurrent_requests".to_string(), "10".to_string())]);
+    params.extend(extra);
     with_arrow_acceleration(make_github_dataset(
-        &repo_dataset("pulls"),
+        &repo_dataset(resource),
         "auto",
         Some(params),
     ))
 }
 
+/// Every pull request, with discussion and review comments attached.
+fn spiceai_pulls_with_comments_dataset() -> Dataset {
+    spiceai_accelerated(
+        "pulls",
+        HashMap::from([
+            ("github_include_comments".to_string(), "all".to_string()),
+            ("github_max_comments_fetched".to_string(), "25".to_string()),
+        ]),
+    )
+}
+
 fn spiceai_reviews_dataset() -> Dataset {
-    with_arrow_acceleration(make_github_dataset(
-        &repo_dataset("reviews"),
-        "auto",
-        Some(spiceai_full_history_concurrency()),
-    ))
+    spiceai_accelerated("reviews", HashMap::new())
 }
 
 fn spiceai_issues_dataset() -> Dataset {
-    with_arrow_acceleration(make_github_dataset(
-        &repo_dataset("issues"),
-        "auto",
-        Some(spiceai_full_history_concurrency()),
-    ))
+    spiceai_accelerated("issues", HashMap::new())
 }
 
 struct SpiceaiGitHubTotals {
@@ -2495,6 +2492,23 @@ fn assert_count_matches_github(loaded: i64, before: i64, after: i64, resource: &
         github_count_in_scan_window(loaded, before, after),
         "expected the spiceai/spiceai {resource} count to sit between GitHub's totals at start ({before}) and end ({after}); got {loaded}"
     );
+}
+
+fn assert_list_column(batches: &[RecordBatch], name: &str) {
+    for batch in batches {
+        let index = batch
+            .schema()
+            .index_of(name)
+            .unwrap_or_else(|_| panic!("expected a `{name}` column"));
+        assert!(
+            batch
+                .column(index)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .is_some(),
+            "'{name}' should be a ListArray"
+        );
+    }
 }
 
 #[test]
@@ -2568,32 +2582,8 @@ async fn assert_all_pulls_reviews_and_comments(
         schema_text.contains("review_comments"),
         "pulls schema should include review comments: {schema_text}"
     );
-    for batch in &pulls_comment_sample {
-        let discussion = batch
-            .schema()
-            .index_of("discussion")
-            .expect("pulls should carry a 'discussion' column when comments=all");
-        let review_comments = batch
-            .schema()
-            .index_of("review_comments")
-            .expect("pulls should carry a 'review_comments' column when comments=all");
-        assert!(
-            batch
-                .column(discussion)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .is_some(),
-            "'discussion' should be a ListArray of comment structs"
-        );
-        assert!(
-            batch
-                .column(review_comments)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .is_some(),
-            "'review_comments' should be a ListArray of comment structs"
-        );
-    }
+    assert_list_column(&pulls_comment_sample, "discussion");
+    assert_list_column(&pulls_comment_sample, "review_comments");
 
     assert!(
         reviews_count > 0,
@@ -2764,20 +2754,7 @@ async fn test_github_spiceai_issues() -> Result<(), String> {
                 schema_text.contains("comments_count"),
                 "issues schema should include comments_count: {schema_text}"
             );
-            for batch in &comment_sample {
-                let comments = batch
-                    .schema()
-                    .index_of("comments")
-                    .expect("issues should carry a 'comments' column");
-                assert!(
-                    batch
-                        .column(comments)
-                        .as_any()
-                        .downcast_ref::<ListArray>()
-                        .is_some(),
-                    "'comments' should be a ListArray of comment structs"
-                );
-            }
+            assert_list_column(&comment_sample, "comments");
 
             let issue_rows = row_count(&issue_batches);
             assert_eq!(

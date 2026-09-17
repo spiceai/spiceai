@@ -107,13 +107,13 @@ pub enum UnnestBehavior {
 #[derive(Debug, Clone)]
 pub struct NestedConnectionPager {
     /// Response key of the nested connection, e.g. `reviews`.
-    pub connection_key: String,
+    pub connection_key: &'static str,
     /// Parent field holding the GraphQL node id, e.g. `pull_request_id`.
-    pub parent_id_key: String,
+    pub parent_id_key: &'static str,
     /// GraphQL type used in `... on Type`.
-    pub type_condition: String,
+    pub type_condition: &'static str,
     /// Selection set inside `nodes { ... }` of a follow-up page.
-    pub node_selection: String,
+    pub node_selection: &'static str,
     /// `first:` of each follow-up page. Must be the API's nested-connection max.
     pub page_size: u32,
 }
@@ -154,7 +154,7 @@ fn graphql_string_literal(value: &str) -> String {
 const MAX_NESTED_PAGES: usize = 1000;
 
 fn nested_connection<'a>(parent: &'a Value, pager: &NestedConnectionPager) -> Option<&'a Value> {
-    parent.get(&pager.connection_key)
+    parent.get(pager.connection_key)
 }
 
 fn nested_has_next(connection: &Value) -> bool {
@@ -1359,25 +1359,18 @@ impl GraphQLClient {
         error_checker: Option<ErrorChecker>,
         query_cost: Option<u32>,
     ) -> Result<Vec<Value>> {
-        let mut fetches = Vec::new();
-        for parent in parents {
-            let Some(connection) = nested_connection(parent, pager) else {
-                continue;
-            };
-            if !nested_has_next(connection) {
-                continue;
-            }
-            fetches.push(self.fetch_remaining_nested_pages(
-                parent,
-                pager,
-                error_checker.clone(),
-                query_cost,
-            ));
-        }
-
-        if fetches.is_empty() {
-            return Ok(Vec::new());
-        }
+        let fetches = parents.iter().filter_map(|parent| {
+            nested_connection(parent, pager)
+                .filter(|connection| nested_has_next(connection))
+                .map(|_| {
+                    self.fetch_remaining_nested_pages(
+                        parent,
+                        pager,
+                        error_checker.clone(),
+                        query_cost,
+                    )
+                })
+        });
 
         let extra_parents = try_join_all(fetches).await?;
         Ok(extra_parents.into_iter().flatten().collect())
@@ -1401,7 +1394,7 @@ impl GraphQLClient {
                 ),
             });
         };
-        let Some(parent_id) = parent.get(&pager.parent_id_key).and_then(Value::as_str) else {
+        let Some(parent_id) = parent.get(pager.parent_id_key).and_then(Value::as_str) else {
             return Err(Error::InvalidObjectAccess {
                 message: format!(
                     "Nested connection '{}' needs parent id field '{}'.",
@@ -1442,23 +1435,24 @@ impl GraphQLClient {
                 });
             };
 
+            let has_next = nested_has_next(&next_connection);
+            let next_cursor = nested_end_cursor(&next_connection).map(str::to_string);
+
             let mut synthetic = parent.clone();
             if let Value::Object(ref mut object) = synthetic {
-                object.insert(pager.connection_key.clone(), next_connection.clone());
+                object.insert(pager.connection_key.to_string(), next_connection);
             }
             extras.push(synthetic);
 
-            if !nested_has_next(&next_connection) {
+            if !has_next {
                 return Ok(extras);
             }
-            cursor = nested_end_cursor(&next_connection)
-                .ok_or_else(|| Error::InvalidObjectAccess {
-                    message: format!(
-                        "Follow-up page for '{}' was truncated without an endCursor.",
-                        pager.connection_key
-                    ),
-                })?
-                .to_string();
+            cursor = next_cursor.ok_or_else(|| Error::InvalidObjectAccess {
+                message: format!(
+                    "Follow-up page for '{}' was truncated without an endCursor.",
+                    pager.connection_key
+                ),
+            })?;
         }
 
         Err(Error::InvalidObjectAccess {
@@ -2397,10 +2391,10 @@ mod tests {
 
         fn pager() -> NestedConnectionPager {
             NestedConnectionPager {
-                connection_key: "reviews".to_string(),
-                parent_id_key: "pull_request_id".to_string(),
-                type_condition: "PullRequest".to_string(),
-                node_selection: "id\nstate".to_string(),
+                connection_key: "reviews",
+                parent_id_key: "pull_request_id",
+                type_condition: "PullRequest",
+                node_selection: "id\nstate",
                 page_size: 100,
             }
         }
