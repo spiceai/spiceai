@@ -1003,3 +1003,119 @@ async fn test_refresh_sql_with_bucket_function() -> Result<(), anyhow::Error> {
         })
         .await
 }
+
+/// A full refresh replaces the whole partitioned table: rows the source no longer
+/// returns must disappear from every bucket, including buckets the new data never
+/// reaches and every bucket when the source returns nothing.
+///
+/// Before the fix, the partitioned overwrite only staged the buckets that received
+/// rows, so shrinking the source to one row left the other buckets' rows visible,
+/// and an empty refresh changed nothing at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(not(target_os = "windows"))]
+async fn test_cayenne_partition_by_full_refresh_removes_rows_missing_from_source()
+-> Result<(), anyhow::Error> {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use datafusion::sql::TableReference;
+    use runtime::accelerated::refresh::RefreshOverrides;
+    use runtime::component::dataset::acceleration::RefreshMode as OverrideRefreshMode;
+
+    use crate::acceleration::row_count;
+    use crate::utils::wait_until_true;
+
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let test_file = std::env::current_dir()
+                .map_err(|e| anyhow::anyhow!("Failed to get current directory: {e}"))?
+                .join("tests/acceleration/data/partition_test.csv");
+            let temp_dir = tempfile::tempdir()
+                .map_err(|e| anyhow::anyhow!("Failed to create temp directory: {e}"))?;
+            let metadata_dir = temp_dir.path().join("metadata");
+
+            crate::configure_test_datafusion();
+
+            const TABLE: &str = "bucket_shrink_test";
+            let mut dataset = Dataset::new(format!("file://{}", test_file.display()), TABLE);
+            let mut params = HashMap::new();
+            params.insert(
+                "cayenne_file_path".to_string(),
+                temp_dir.path().display().to_string(),
+            );
+            params.insert(
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
+            );
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("cayenne".to_string()),
+                mode: Mode::File,
+                refresh_mode: Some(RefreshMode::Full),
+                params: Some(Params::from_string_map(params)),
+                partition_by: vec![PartitionedBy {
+                    name: "expr0".to_string(),
+                    expression: "bucket(3, id)".to_string(),
+                }],
+                ..Acceleration::default()
+            });
+
+            let app = AppBuilder::new("test_partition_by_full_refresh_shrink")
+                .with_dataset(dataset)
+                .build();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::Error::msg("Timeout waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+            assert_eq!(row_count(&rt, TABLE).await?, 10, "initial load");
+
+            for (refresh_sql, expected) in [
+                // One row: at most one of the three buckets receives data.
+                (format!("SELECT * FROM {TABLE} WHERE id = 1"), 1),
+                // No rows: every bucket must be emptied.
+                (format!("SELECT * FROM {TABLE} WHERE id > 1000"), 0),
+            ] {
+                rt.datafusion()
+                    .refresh_table(
+                        &TableReference::from(TABLE),
+                        Some(RefreshOverrides {
+                            sql: Some(refresh_sql.clone()),
+                            mode: Some(OverrideRefreshMode::Full),
+                            max_jitter: None,
+                        }),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("refresh_table failed: {e}"))?;
+
+                let last = Arc::new(AtomicI64::new(i64::MIN));
+                let converged = wait_until_true(Duration::from_secs(30), || {
+                    let rt = Arc::clone(&rt);
+                    let last = Arc::clone(&last);
+                    async move {
+                        match row_count(&rt, TABLE).await {
+                            Ok(observed) => {
+                                last.store(observed, Ordering::Relaxed);
+                                observed == expected
+                            }
+                            Err(_) => false,
+                        }
+                    }
+                })
+                .await;
+                assert!(
+                    converged,
+                    "after refreshing with `{refresh_sql}` the table should hold {expected} rows, \
+                     last observed {}",
+                    last.load(Ordering::Relaxed)
+                );
+            }
+
+            Ok(())
+        })
+        .await
+}
