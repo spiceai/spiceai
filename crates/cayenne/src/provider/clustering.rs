@@ -283,6 +283,30 @@ fn column_order_keys(array: &dyn Array) -> DFResult<Vec<u128>> {
     Ok(keys)
 }
 
+/// Observed-filter clustering uses a Hilbert curve only when two or more of
+/// the observed columns are clusterable. Filtering by [`is_clusterable`]
+/// first, then requiring `len() > 1`, keeps a mixed key (one clusterable
+/// column and one not) on the lexicographic fallback. A one-dimensional
+/// curve would change NULLS FIRST / ASC-DESC for no pruning gain.
+pub(crate) fn observed_filter_curve_indices(
+    observed_columns: &[String],
+    schema: &Schema,
+) -> Vec<usize> {
+    let indices: Vec<usize> = observed_columns
+        .iter()
+        .filter_map(|name| {
+            let idx = schema.index_of(name.trim()).ok()?;
+            let field = schema.fields().get(idx)?;
+            is_clusterable(field.data_type()).then_some(idx)
+        })
+        .collect();
+    if indices.len() > 1 {
+        indices
+    } else {
+        Vec::new()
+    }
+}
+
 /// Whether `data_type` has a dedicated value-encoding arm in
 /// [`column_order_keys`], so its clustering keys vary with the column's values
 /// and the curve can cluster on it. A type without an arm falls to the catch-all
@@ -853,6 +877,29 @@ mod tests {
     /// A `Decimal128` column used to fall through to the catch-all arm and map
     /// every value to the reserved zero key: configured as a clustering column
     /// it silently produced no clustering at all.
+    #[test]
+    fn observed_filter_curve_requires_two_clusterable_columns_after_filtering() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal256(40, 2), true),
+            Field::new("ts", DataType::Int64, false),
+        ]);
+        assert!(
+            observed_filter_curve_indices(&["id".to_string(), "amount".to_string()], &schema)
+                .is_empty(),
+            "two observed names with only one clusterable column must keep the lexicographic fallback"
+        );
+        assert_eq!(
+            observed_filter_curve_indices(&["id".to_string(), "ts".to_string()], &schema),
+            vec![0, 2],
+            "two clusterable observed columns must select a multi-dimensional curve"
+        );
+        assert!(
+            observed_filter_curve_indices(&["id".to_string()], &schema).is_empty(),
+            "a single observed column must not select a one-dimensional curve"
+        );
+    }
+
     #[test]
     fn decimal_values_cluster() {
         // Unscaled cents, i.e. Decimal128(10, 2) values 0.00 … 40.95.

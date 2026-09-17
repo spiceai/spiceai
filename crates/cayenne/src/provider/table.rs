@@ -4568,12 +4568,15 @@ impl CayenneTableProvider {
     ///    adapts them to the evolved schema (missing-column null-fill +
     ///    widened-type cast in the Vortex opener).
     /// 4. Under one held `listing_fence.write()`: persist the evolved schema
-    ///    to the metastore (`update_table_schema`), swap the in-memory
-    ///    [`Self::table_schema`], re-derive the cached optimizer statistics at
-    ///    the new width, clear stale per-file statistics, and rebuild the
-    ///    listing table — so a scan observes either the old schema entirely
-    ///    or the new one entirely. In-flight scans keep the `SchemaRef` they
-    ///    already loaded (old files under the old schema stay valid).
+    ///    to the metastore (`update_table_schema`, or
+    ///    `update_table_schema_dropping_statistics` when a decimal scale
+    ///    change would mis-decode leftover unscaled min/max), swap the
+    ///    in-memory [`Self::table_schema`], re-derive the cached optimizer
+    ///    statistics at the new width (or drop them on a scale change),
+    ///    clear stale per-file statistics, and rebuild the listing table —
+    ///    so a scan observes either the old schema entirely or the new one
+    ///    entirely. In-flight scans keep the `SchemaRef` they already loaded
+    ///    (old files under the old schema stay valid).
     ///
     /// Idempotent: re-applying a plan whose evolved schema is already live is
     /// a no-op; a crash between the metastore UPDATE and the swap is healed by
@@ -4655,10 +4658,21 @@ impl CayenneTableProvider {
         // Step 4: publish.
         {
             let _fence = self.listing_fence.write().await;
-            self.catalog
-                .update_table_schema(&self.table_metadata.table_id, &plan.evolved_schema)
-                .await
-                .map_err(|source| Error::Catalog { source })?;
+            let drop_decimal_stats = plan.changes_decimal_scale();
+            if drop_decimal_stats {
+                self.catalog
+                    .update_table_schema_dropping_statistics(
+                        &self.table_metadata.table_id,
+                        &plan.evolved_schema,
+                    )
+                    .await
+                    .map_err(|source| Error::Catalog { source })?;
+            } else {
+                self.catalog
+                    .update_table_schema(&self.table_metadata.table_id, &plan.evolved_schema)
+                    .await
+                    .map_err(|source| Error::Catalog { source })?;
+            }
             self.table_schema.store(Arc::clone(&plan.evolved_schema));
             {
                 // Cached optimizer statistics are column-indexed against the
@@ -4666,24 +4680,34 @@ impl CayenneTableProvider {
                 // == schema width); re-derive from the raw blob at the evolved
                 // width. A blob that no longer deserializes (widened column
                 // stat dtypes) degrades to None — unknown stats, never wrong.
+                // A decimal *scale* change cannot re-derive: the blob's
+                // unscaled integers would decode at the new scale (123.45 at
+                // scale 2 becomes 1.2345 at scale 4) and prune matching rows.
                 let mut stats_cache = self.table_statistics.write();
-                let df_stats = stats_cache
-                    .raw
-                    .as_ref()
-                    .and_then(|raw| Self::table_statistics_to_df(&plan.evolved_schema, raw));
-                stats_cache.optimizer_inexact = df_stats
-                    .as_ref()
-                    .map(|s| Self::statistics_to_inexact(s.clone()));
-                stats_cache.optimizer = df_stats;
-                // Preserve the exactness of the (unchanged) count across the
-                // schema-width re-derivation. Conservative when `raw` is cold
-                // (pre-first-persist): treat the count as NOT exact rather than
-                // trusting it — `optimizer` is `None` in that case too, so nothing
-                // is served, but this never leaves a stale-Exact flag behind.
-                stats_cache.count_exact = stats_cache
-                    .raw
-                    .as_ref()
-                    .is_some_and(|raw| raw.num_rows_exact);
+                if drop_decimal_stats {
+                    stats_cache.raw = None;
+                    stats_cache.optimizer = None;
+                    stats_cache.optimizer_inexact = None;
+                    stats_cache.count_exact = false;
+                } else {
+                    let df_stats = stats_cache
+                        .raw
+                        .as_ref()
+                        .and_then(|raw| Self::table_statistics_to_df(&plan.evolved_schema, raw));
+                    stats_cache.optimizer_inexact = df_stats
+                        .as_ref()
+                        .map(|s| Self::statistics_to_inexact(s.clone()));
+                    stats_cache.optimizer = df_stats;
+                    // Preserve the exactness of the (unchanged) count across the
+                    // schema-width re-derivation. Conservative when `raw` is cold
+                    // (pre-first-persist): treat the count as NOT exact rather than
+                    // trusting it — `optimizer` is `None` in that case too, so nothing
+                    // is served, but this never leaves a stale-Exact flag behind.
+                    stats_cache.count_exact = stats_cache
+                        .raw
+                        .as_ref()
+                        .is_some_and(|raw| raw.num_rows_exact);
+                }
             }
             // Per-file statistics were inferred against the old logical schema
             // width; drop them so the next scan re-infers at the evolved width.
@@ -20659,17 +20683,15 @@ impl CayenneTableProvider {
         //     and an interleave per row to encode a constant.
         let rewrite_schema = self.table_schema();
         let adaptive_curve_indices: Vec<usize> = if explicit_curve_indices.is_empty()
-            && rewrite_sort_columns.len() > 1
             && rewrite_source == RewriteKeySource::ObservedFilters
         {
-            rewrite_sort_columns
-                .iter()
-                .filter_map(|n| {
-                    let idx = rewrite_schema.index_of(n.trim()).ok()?;
-                    let field = rewrite_schema.fields().get(idx)?;
-                    super::clustering::is_clusterable(field.data_type()).then_some(idx)
-                })
-                .collect()
+            // Filter to clusterable columns first, then require two or more:
+            // two observed names of which only one is clusterable must keep
+            // the lexicographic fallback, not a one-dimensional curve.
+            super::clustering::observed_filter_curve_indices(
+                &rewrite_sort_columns,
+                rewrite_schema.as_ref(),
+            )
         } else {
             Vec::new()
         };

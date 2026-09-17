@@ -1179,6 +1179,39 @@ mod tests {
         assert_eq!(col.max_value, DfPrecision::Exact(max));
     }
 
+    /// The write path produces `Decimal128` mins via `compute_column_stats`;
+    /// those must persist, not only hand-built `ScalarValue`s.
+    #[test]
+    fn decimal128_array_min_survives_the_blob() {
+        use crate::provider::column_stats::ColumnStatsAccumulator;
+        use arrow::array::Decimal128Array;
+
+        let col = Decimal128Array::from(vec![Some(12_345), Some(67_890)])
+            .with_precision_and_scale(10, 2)
+            .expect("decimal array");
+        let cs = ColumnStatsAccumulator::compute_column_stats(&col);
+        let schema = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(10, 2),
+            true,
+        )]);
+        let stats = Statistics {
+            num_rows: DfPrecision::Exact(2),
+            total_byte_size: DfPrecision::Absent,
+            column_statistics: vec![cs],
+        };
+        let blob = statistics_to_persisted_blob(&stats, &schema).expect("blob serializes");
+        let restored = statistics_from_persisted_blob(&blob, &schema, 2).expect("blob restores");
+        assert_eq!(
+            restored.column_statistics[0].min_value,
+            DfPrecision::Exact(ScalarValue::Decimal128(Some(12_345), 10, 2))
+        );
+        assert_eq!(
+            restored.column_statistics[0].max_value,
+            DfPrecision::Exact(ScalarValue::Decimal128(Some(67_890), 10, 2))
+        );
+    }
+
     /// The write path produces `Time32` mins via `compute_column_stats`; those
     /// must persist, not only hand-built `ScalarValue`s.
     #[test]

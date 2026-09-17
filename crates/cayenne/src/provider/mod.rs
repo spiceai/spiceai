@@ -314,7 +314,7 @@ mod tests {
     use crate::catalog::MetadataCatalog;
     use crate::cayenne_catalog::CayenneCatalog;
     use crate::metadata::CreateTableOptions;
-    use arrow::array::{Int32Array, Int64Array, StringArray};
+    use arrow::array::{Decimal128Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use arrow::util::pretty::pretty_format_batches;
@@ -2268,6 +2268,127 @@ mod tests {
         assert!(
             provider.evolve_schema_live(&pk_plan).await.is_err(),
             "widening a PK column must be rejected by the live path"
+        );
+    }
+
+    /// Live scale widening must drop persisted min/max so a leftover unscaled
+    /// bound cannot prune the matching row (123.45 at scale 2 becoming 1.2345
+    /// at scale 4).
+    #[tokio::test]
+    async fn schema_evolution_live_decimal_scale_change_drops_statistics() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_evolution_decimal_scale.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let stored_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(10, 2), true),
+        ]));
+        let table_name = "evolution_decimal_scale";
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&stored_schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::DoNothingAll),
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("to create table");
+        let table_metadata = catalog.get_table(table_name).await.expect("to get table");
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("to open provider"),
+        );
+
+        let amount = Decimal128Array::from(vec![12_345_i128])
+            .with_precision_and_scale(10, 2)
+            .expect("decimal array");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&stored_schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64])), Arc::new(amount)],
+        )
+        .expect("to build batch");
+        insert_batch(&provider, batch).await;
+
+        catalog
+            .upsert_table_statistics(&crate::metadata::TableStatistics {
+                table_id: table_metadata.table_id.clone(),
+                statistics_blob: vec![1, 2, 3],
+                num_rows: 1,
+                ndv_sketches: None,
+                num_rows_exact: true,
+            })
+            .await
+            .expect("seed table stats");
+        catalog
+            .upsert_snapshot_file_statistics(&crate::metadata::SnapshotFileStatistics {
+                table_id: table_metadata.table_id.clone(),
+                snapshot_id: table_metadata.current_snapshot_id.clone(),
+                file_path: "f.vortex".to_string(),
+                file_size_bytes: 100,
+                num_rows: 1,
+                statistics_blob: vec![4, 5, 6],
+            })
+            .await
+            .expect("seed snapshot file stats");
+
+        let incoming_schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(14, 4), true),
+        ]);
+        let plan = widening_plan(&stored_schema, &incoming_schema, &["id".to_string()]);
+        assert!(
+            plan.changes_decimal_scale(),
+            "Decimal128(10,2) -> Decimal128(14,4) must be a scale change"
+        );
+
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("live schema evolution");
+
+        assert!(
+            catalog
+                .get_table_statistics(&table_metadata.table_id)
+                .await
+                .expect("read table stats")
+                .is_none(),
+            "live scale change must drop the table aggregate blob"
+        );
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(
+                    &table_metadata.table_id,
+                    &table_metadata.current_snapshot_id,
+                    "f.vortex"
+                )
+                .await
+                .expect("read snapshot file stats")
+                .is_none(),
+            "live scale change must drop snapshot-file stats"
+        );
+
+        ctx.register_table(table_name, Arc::<CayenneTableProvider>::clone(&provider))
+            .expect("to register table");
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_decimal_scale WHERE amount = CAST(123.45 AS DECIMAL(14, 4))"
+            )
+            .await,
+            1,
+            "a matching decimal predicate must not be pruned after the scale change"
         );
     }
 }
