@@ -5135,28 +5135,33 @@ mod tests {
     /// smaller one, and the oversized build then trips the memory gate above and
     /// rewrites the join into a sort-merge that sorts a whole input to produce a
     /// handful of rows.
+    /// Guard for the fork patch that estimates an `IN` list or an
+    /// OR-of-equalities from NDV (`docs/dev/fork_patches.md`).
+    ///
+    /// Without it neither spelling is analyzable by interval arithmetic, so both
+    /// take `FilterExec`'s flat 20% default and a key lookup on a large
+    /// accelerated table advertises a fifth of the table. The harm that does is
+    /// local to this crate: the oversized-join memory gate reads that row count,
+    /// concludes the build side cannot fit, and rewrites the hash join into a
+    /// sort-merge that sorts a whole input to produce a handful of rows. So the
+    /// guard is aimed at the gate, not at the arithmetic — a re-cut that changes
+    /// the estimate's exact value but keeps it useful should not fail, and one
+    /// that drops the patch must.
     mod in_list_row_estimate {
         use super::*;
-        use datafusion_physical_expr::expressions::in_list;
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_optimizer::join_selection::JoinSelection;
+        use datafusion_physical_expr::expressions::{binary, in_list};
+        use datafusion_physical_plan::filter::FilterExec;
 
         const ROWS: usize = 150_000_000;
-        /// 20% of `ROWS` — what the estimate falls back to without the patch.
+        /// 20% of `ROWS` — where the estimate lands without the fork patch.
         const DEFAULT_SELECTIVITY_ROWS: usize = ROWS / 5;
-
         fn key_schema() -> Arc<Schema> {
             Arc::new(Schema::new(vec![
                 Field::new("o_orderkey", DataType::Int64, false),
                 Field::new("o_custkey", DataType::Int64, false),
             ]))
-        }
-
-        /// A scan of `ROWS` rows whose key column holds `ndv` distinct values.
-        fn scan_with_key_ndv(schema: &Arc<Schema>, ndv: usize) -> Arc<dyn ExecutionPlan> {
-            let mut statistics =
-                Statistics::new_unknown(schema).with_num_rows(Precision::Exact(ROWS));
-            statistics.total_byte_size = Precision::Exact(ROWS * 16);
-            statistics.column_statistics[0].distinct_count = Precision::Inexact(ndv);
-            file_exec_with_statistics(schema, "orders.vortex", None, statistics)
         }
 
         fn keys(n: usize) -> Vec<Arc<dyn PhysicalExpr>> {
@@ -5165,117 +5170,197 @@ mod tests {
                 .collect()
         }
 
-        fn rows_under(
-            predicate: Arc<dyn PhysicalExpr>,
-            scan: Arc<dyn ExecutionPlan>,
-        ) -> Precision<usize> {
-            let filter = datafusion_physical_plan::filter::FilterExec::try_new(predicate, scan)
-                .expect("filter over a key predicate should build");
-            filter
-                .partition_statistics(None)
-                .expect("filter statistics should be available")
-                .num_rows
-        }
-
-        #[test]
-        fn an_in_list_over_a_unique_key_estimates_the_list_length() {
+        /// `o_orderkey IN (0, .., n-1)`, the spelling the planner builds for
+        /// n >= 4.
+        fn key_in_list(n: usize) -> Arc<dyn PhysicalExpr> {
             let schema = key_schema();
-            let predicate = in_list(
+            in_list(
                 col("o_orderkey", schema.as_ref()).expect("key column"),
-                keys(128),
+                keys(n),
                 &false,
                 schema.as_ref(),
             )
-            .expect("IN list should build");
-            let rows = rows_under(predicate, scan_with_key_ndv(&schema, ROWS));
-            assert_eq!(
-                rows,
-                Precision::Inexact(128),
-                "128 keys over a unique column reach at most 128 rows; \
-                 {DEFAULT_SELECTIVITY_ROWS} means the fork patch is missing"
-            );
+            .expect("IN list should build")
         }
 
-        #[test]
-        fn an_or_chain_estimates_the_same_as_the_in_list_it_rewrites_to() {
-            // The optimizer rewrites between the two spellings around a list
-            // length of three, so a patch covering only one of them would leave
-            // the other at the default on the far side of that threshold.
+        /// `o_orderkey = 0 OR .. OR o_orderkey = n-1`, the spelling the
+        /// optimizer rewrites to below a list length of three.
+        fn key_or_chain(n: usize) -> Arc<dyn PhysicalExpr> {
             let schema = key_schema();
-            let or_chain = keys(2)
+            keys(n)
                 .into_iter()
                 .map(|key| {
-                    datafusion_physical_expr::expressions::binary(
+                    binary(
                         col("o_orderkey", schema.as_ref()).expect("key column"),
-                        datafusion::logical_expr::Operator::Eq,
+                        Operator::Eq,
                         key,
                         schema.as_ref(),
                     )
                     .expect("equality should build")
                 })
                 .reduce(|left, right| {
-                    datafusion_physical_expr::expressions::binary(
-                        left,
-                        datafusion::logical_expr::Operator::Or,
-                        right,
-                        schema.as_ref(),
-                    )
-                    .expect("disjunction should build")
+                    binary(left, Operator::Or, right, schema.as_ref())
+                        .expect("disjunction should build")
                 })
-                .expect("at least one key");
-            let in_list_of_two = in_list(
-                col("o_orderkey", schema.as_ref()).expect("key column"),
-                keys(2),
-                &false,
-                schema.as_ref(),
-            )
-            .expect("IN list should build");
+                .expect("at least one key")
+        }
 
+        /// A scan of `ROWS` rows whose key column reports `ndv` distinct values.
+        fn scan_with_key_ndv(ndv: Precision<usize>) -> Arc<dyn ExecutionPlan> {
+            let schema = key_schema();
+            let mut statistics =
+                Statistics::new_unknown(&schema).with_num_rows(Precision::Exact(ROWS));
+            statistics.total_byte_size = Precision::Exact(ROWS * 16);
+            statistics.column_statistics[0].distinct_count = ndv;
+            // Wrapped, because the gate declines any join that does not touch
+            // Cayenne — an unwrapped scan would make the rewrite tests below
+            // pass without ever reaching the code they exist to guard.
+            Arc::new(CayenneAccelerationExec::new(file_exec_with_statistics(
+                &schema,
+                "orders.vortex",
+                None,
+                statistics,
+            )))
+        }
+
+        fn rows_under(predicate: Arc<dyn PhysicalExpr>, ndv: Precision<usize>) -> Precision<usize> {
+            FilterExec::try_new(predicate, scan_with_key_ndv(ndv))
+                .expect("filter over a key predicate should build")
+                .partition_statistics(None)
+                .expect("filter statistics should be available")
+                .num_rows
+        }
+
+        /// A smaller unfiltered table to join the key lookup against — the role
+        /// `customer` plays opposite a filtered `orders`.
+        fn other_side(rows: usize) -> Arc<dyn ExecutionPlan> {
+            let schema = key_schema();
+            let mut statistics =
+                Statistics::new_unknown(&schema).with_num_rows(Precision::Exact(rows));
+            statistics.total_byte_size = Precision::Exact(rows * 16);
+            Arc::new(CayenneAccelerationExec::new(file_exec_with_statistics(
+                &schema,
+                "customer.vortex",
+                None,
+                statistics,
+            )))
+        }
+
+        /// The smaller table on the build side and the key lookup on the probe
+        /// side — the arrangement the row estimate has to overturn.
+        fn lookup_join(ndv: Precision<usize>, other_rows: usize) -> Arc<dyn ExecutionPlan> {
+            let lookup = Arc::new(
+                FilterExec::try_new(key_in_list(128), scan_with_key_ndv(ndv))
+                    .expect("filter over a key predicate should build"),
+            ) as Arc<dyn ExecutionPlan>;
+            Arc::new(hash_join_with_join_type(
+                other_side(other_rows),
+                lookup,
+                "o_custkey",
+                "o_custkey",
+                JoinType::Inner,
+                NullEquality::NullEqualsNothing,
+            ))
+        }
+
+        /// The rows reported by the build side of the first hash join in `plan`.
+        fn hash_join_build_rows(plan: &Arc<dyn ExecutionPlan>) -> Option<Precision<usize>> {
+            if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
+                return join
+                    .left()
+                    .partition_statistics(None)
+                    .ok()
+                    .map(|statistics| statistics.num_rows);
+            }
+            plan.children().into_iter().find_map(hash_join_build_rows)
+        }
+
+        /// The number of rows the chosen build side of `plan` reports, after
+        /// `JoinSelection` has had its say.
+        fn build_side_rows(plan: Arc<dyn ExecutionPlan>) -> Precision<usize> {
+            let optimized = JoinSelection::new()
+                .optimize(plan, &ConfigOptions::default())
+                .expect("join selection should succeed");
+            // A swap re-orders the join's output, so `JoinSelection` puts a
+            // projection over it to restore the original column order — the
+            // hash join is no longer the root once the swap it exists to make
+            // has happened.
+            hash_join_build_rows(&optimized).expect("the plan contains a hash join")
+        }
+
+        // The seam. `JoinSelection` sizes the two inputs from their statistics,
+        // and the key lookup only reads as the smaller one if the estimate
+        // narrows it — otherwise a fifth of a 150M-row table looks bigger than
+        // the 15M-row table opposite it, and the wrong side is collected.
+        #[test]
+        fn the_key_lookup_is_chosen_as_the_build_side() {
             assert_eq!(
-                rows_under(or_chain, scan_with_key_ndv(&schema, ROWS)),
+                build_side_rows(lookup_join(Precision::Inexact(ROWS), 15_000_000)),
+                Precision::Inexact(128),
+                "the 128-row lookup is the smaller input and must be collected"
+            );
+        }
+
+        // The control. Same plan, same rule, no NDV to estimate from — the
+        // lookup reads as {DEFAULT_SELECTIVITY_ROWS} rows, the 15M-row table
+        // looks smaller, and it is collected instead. Without this the test
+        // above could pass because `JoinSelection` never swapped anything.
+        #[test]
+        fn without_the_estimate_the_larger_side_is_chosen_instead() {
+            assert_eq!(
+                build_side_rows(lookup_join(Precision::Absent, 15_000_000)),
+                Precision::Exact(15_000_000),
+                "with no NDV the lookup reads as a fifth of the table, so the \
+                 unfiltered 15M-row side is mistaken for the smaller one"
+            );
+        }
+
+        // A fast diagnostic for the two tests above: when one of them goes red,
+        // this says whether the estimate or the gate moved.
+        #[test]
+        fn an_in_list_over_a_unique_key_estimates_the_list_length() {
+            assert_eq!(
+                rows_under(key_in_list(128), Precision::Inexact(ROWS)),
+                Precision::Inexact(128),
+                "128 keys over a unique column reach at most 128 rows; \
+                 {DEFAULT_SELECTIVITY_ROWS} means the fork patch is missing"
+            );
+        }
+
+        // Both spellings, separately: the optimizer rewrites between them around
+        // a list length of three, so a re-cut carrying only one would leave the
+        // other estimated at the default.
+        #[test]
+        fn an_or_chain_estimates_the_same_as_the_in_list_it_rewrites_to() {
+            assert_eq!(
+                rows_under(key_or_chain(2), Precision::Inexact(ROWS)),
                 Precision::Inexact(2),
                 "an OR chain of two equalities reaches at most two rows"
             );
             assert_eq!(
-                rows_under(in_list_of_two, scan_with_key_ndv(&schema, ROWS)),
+                rows_under(key_in_list(2), Precision::Inexact(ROWS)),
                 Precision::Inexact(2),
                 "and the IN list it rewrites to must agree"
             );
         }
 
+        // The estimate is distinctness-driven, not a claim that the column is
+        // unique: 150M rows over 1.5M values is 100 rows per value.
         #[test]
         fn a_non_unique_key_scales_by_rows_per_value() {
-            // The estimate is distinctness-driven, not a claim that the column
-            // is unique: 150M rows over 1.5M values is 100 rows per value.
-            let schema = key_schema();
-            let predicate = in_list(
-                col("o_orderkey", schema.as_ref()).expect("key column"),
-                keys(4),
-                &false,
-                schema.as_ref(),
-            )
-            .expect("IN list should build");
-            let rows = rows_under(predicate, scan_with_key_ndv(&schema, 1_500_000));
-            assert_eq!(rows, Precision::Inexact(400));
+            assert_eq!(
+                rows_under(key_in_list(4), Precision::Inexact(1_500_000)),
+                Precision::Inexact(400)
+            );
         }
 
+        // The control against a re-cut that over-applies the estimate rather
+        // than losing it: with no distinct count there is nothing to estimate
+        // from, and the default has to stand.
         #[test]
         fn without_an_ndv_the_estimate_stays_at_the_default() {
-            // The control: the patch must not invent selectivity where the scan
-            // reports no distinct count, or every such filter would be
-            // under-estimated instead.
-            let schema = key_schema();
-            let statistics = Statistics::new_unknown(&schema).with_num_rows(Precision::Exact(ROWS));
-            let scan = file_exec_with_statistics(&schema, "orders.vortex", None, statistics);
-            let predicate = in_list(
-                col("o_orderkey", schema.as_ref()).expect("key column"),
-                keys(128),
-                &false,
-                schema.as_ref(),
-            )
-            .expect("IN list should build");
             assert_eq!(
-                rows_under(predicate, scan),
+                rows_under(key_in_list(128), Precision::Absent),
                 Precision::Inexact(DEFAULT_SELECTIVITY_ROWS)
             );
         }
