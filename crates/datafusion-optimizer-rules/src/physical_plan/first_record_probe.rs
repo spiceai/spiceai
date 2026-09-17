@@ -55,7 +55,6 @@ use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
-use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use datafusion_datasource::table_schema::TableSchema;
 use futures::{FutureExt, StreamExt};
 use object_store::ObjectStore;
@@ -140,19 +139,6 @@ impl FileSource for FirstRecordProbeSource {
         // byte-range partitions would read the same file's first record more
         // than once. One file, one probe.
         false
-    }
-
-    fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
-        self.inner.schema_adapter_factory()
-    }
-
-    fn with_schema_adapter_factory(
-        &self,
-        factory: Arc<dyn SchemaAdapterFactory>,
-    ) -> Result<Arc<dyn FileSource>> {
-        Ok(Arc::new(Self {
-            inner: self.inner.with_schema_adapter_factory(factory)?,
-        }))
     }
 }
 

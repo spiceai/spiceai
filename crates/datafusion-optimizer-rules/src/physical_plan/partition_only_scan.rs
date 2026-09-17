@@ -14,37 +14,42 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! [`PartitionOnlyScanRewrite`] answers a `GROUP BY`/`DISTINCT` over only
-//! (hive) partition columns from the directory listing instead of opening and
+//! [`PartitionOnlyScanRewrite`] answers a duplicate-insensitive aggregate over
+//! only *per-file-constant* columns from the file listing instead of opening and
 //! parsing every data file.
 //!
-//! The distinct values of a partition column are fully determined by the
-//! directory names (`p=1`, `p=2`, ...), which DataFusion resolves into each
-//! [`PartitionedFile::partition_values`] at physical planning time — before any
-//! file is opened. When a projection references only partition columns, a file
-//! scan still emits one row per record (the partition value repeated), so
-//! `SELECT p FROM t GROUP BY p` reads every row of every file even though the
-//! answer is the handful of distinct partition values.
+//! A per-file-constant column has the same value in every row of a file:
+//! - a **hive partition** value, fixed by the directory name (`p=1`, `p=2`, ...);
+//!   and
+//! - a **file metadata** column — `_location`, `_last_modified`, `_size` — fixed
+//!   by the object listing.
 //!
-//! This rule detects an [`AggregateExec`] that computes a pure grouping (no
-//! aggregate expressions — i.e. `GROUP BY`/`DISTINCT`) over a partition-only
-//! file scan reachable through multiplicity-agnostic operators, and replaces
-//! that scan with a source of one row per file carrying the file's partition
-//! values. The aggregate above collapses the duplicates, so the result is
-//! identical while file contents are (almost) untouched.
+//! `DataFusion` resolves both from each [`PartitionedFile`] at physical planning
+//! time, before any file is opened. When a projection references only such
+//! columns, every row a file emits is identical, yet a file scan still emits one
+//! row per record — so `SELECT p FROM t GROUP BY p` and
+//! `SELECT MAX(_last_modified) FROM t` both read every row of every file to
+//! re-derive the same per-file value, even though the answer needs one row per
+//! file.
+//!
+//! This rule detects an [`AggregateExec`] whose result is unchanged by
+//! duplicating input rows — a pure grouping (`GROUP BY`/`DISTINCT`) or
+//! `MAX`/`MIN` — over such a scan reachable through multiplicity-agnostic
+//! operators, and replaces that scan with a source of one row per file. The
+//! aggregate above absorbs the collapse, so the result is identical while file
+//! contents are (almost) untouched.
 //!
 //! Two conditions are always required:
-//! - the aggregate has **no** aggregate expressions, so its result depends only
-//!   on the *set* of partition-column tuples, never on how many rows carry each
-//!   tuple (`count(*)`, `sum`, ... would need the real row counts and are left
-//!   untouched); and
-//! - the scan's projected schema contains **only** partition columns, so no
-//!   file-content column is needed to answer the query.
+//! - the aggregate is **duplicate-insensitive** — a pure grouping (no aggregate
+//!   expressions) or `MAX`/`MIN` — so its result depends only on the *set* of
+//!   input rows, never on how many copies of each it sees (`count`/`sum`/`avg`
+//!   would need the real row counts and are left untouched); and
+//! - the scan's projected schema contains **only** per-file-constant columns, so
+//!   no file-content column is needed to answer the query.
 //!
-//! An empty file (zero rows) contributes no partition tuple to a `DISTINCT`, so
-//! a partition whose file is empty must not surface its value. How the rule
-//! learns whether a file is empty depends on what the format records, giving two
-//! replacements:
+//! An empty file (zero rows) contributes nothing, so a file that is empty must
+//! not surface a row. How the rule learns whether a file is empty depends on
+//! what the format records, giving two replacements:
 //!
 //! - **Statistics fast path (no I/O).** When every file has an **exact** row
 //!   count in its statistics, the rule reads no file at all: it builds an
@@ -59,9 +64,12 @@ limitations under the License.
 //!   yields none and its partition drops out. This decodes one record per file
 //!   instead of every row of every file.
 //!
-//! Because a partition value is constant across every row of its (non-empty)
-//! file, collapsing that file to a single row cannot change the set of partition
-//! tuples the aggregate observes, and therefore cannot change the result.
+//! Because every projected column is constant across a (non-empty) file, all of
+//! that file's rows are identical, so collapsing them to one row cannot change
+//! the set of rows a duplicate-insensitive aggregate observes, and therefore
+//! cannot change the result. The statistics fast path synthesizes that row from
+//! partition values, so it applies only to a partition-only projection; a
+//! metadata column (whose value is not in the partition list) takes the probe.
 
 use std::sync::Arc;
 
@@ -75,6 +83,10 @@ use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::AggregateExec;
+#[expect(
+    deprecated,
+    reason = "DF53 deprecates CoalesceBatchesExec (arrow BatchCoalescer); the check below still recognizes it where it appears in a plan"
+)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::filter::FilterExec;
@@ -112,9 +124,11 @@ impl PhysicalOptimizerRule for PartitionOnlyScanRewrite {
                 return Ok(Transformed::no(node));
             };
 
-            // Only a pure grouping (`GROUP BY`/`DISTINCT`) is safe: its result
-            // depends on the set of partition tuples, not on their row counts.
-            if !aggregate.aggr_expr().is_empty() {
+            // Only a duplicate-insensitive aggregate is safe: its result must
+            // depend on the *set* of input rows, not how many copies of each it
+            // sees. A pure grouping (`GROUP BY`/`DISTINCT`) and `MAX`/`MIN`
+            // qualify; `count`/`sum`/`avg` do not.
+            if !is_duplicate_insensitive_aggregate(aggregate) {
                 return Ok(Transformed::no(node));
             }
 
@@ -127,7 +141,7 @@ impl PhysicalOptimizerRule for PartitionOnlyScanRewrite {
         .data()
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "PartitionOnlyScanRewrite"
     }
 
@@ -167,17 +181,21 @@ fn rewrite_partition_only_scan(
     }
 }
 
-/// Whether an operator preserves the set of partition-column tuples reaching a
-/// downstream pure `GROUP BY`/`DISTINCT`, so a partition-only scan beneath it
-/// can be collapsed to one row per file without changing the result.
+/// Whether an operator preserves the set of rows reaching a downstream
+/// duplicate-insensitive aggregate, so a constant-only scan beneath it can be
+/// collapsed to one row per file without changing the result.
 ///
 /// - Repartition / coalesce operators only reshuffle or merge rows.
-/// - A `FilterExec` beneath a partition-only scan can only reference partition
-///   columns (nothing else is projected); a partition value is constant across
-///   a file, so the predicate keeps or drops a file's rows all together — the
-///   surviving set of tuples is the same whether the file is one row or many.
-/// - A nested pure-grouping `AggregateExec` (a partial `DISTINCT`) only removes
-///   duplicates.
+/// - A `FilterExec` beneath a constant-only scan can only reference the
+///   projected (per-file-constant) columns, so its predicate is constant across
+///   a file and keeps or drops all of a file's rows together — the surviving set
+///   is the same whether the file is one row or many.
+/// - A nested duplicate-insensitive `AggregateExec` (a partial `DISTINCT` or
+///   partial `MAX`/`MIN`) only removes duplicates or keeps an extremum.
+#[expect(
+    deprecated,
+    reason = "DF53 deprecates CoalesceBatchesExec (arrow BatchCoalescer); the check below still recognizes it where it appears in a plan"
+)]
 fn is_set_preserving(plan: &Arc<dyn ExecutionPlan>) -> bool {
     let plan = plan.as_ref();
     if plan.downcast_ref::<RepartitionExec>().is_some()
@@ -188,9 +206,28 @@ fn is_set_preserving(plan: &Arc<dyn ExecutionPlan>) -> bool {
         return true;
     }
     if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
-        return aggregate.aggr_expr().is_empty();
+        // A partial `DISTINCT` or partial `MAX`/`MIN` (the first phase of a
+        // two-phase aggregate) only removes duplicates or keeps an extremum, so
+        // it preserves the set of tuples the final aggregate observes.
+        return is_duplicate_insensitive_aggregate(aggregate);
     }
     false
+}
+
+/// Whether `aggregate`'s result is unchanged by duplicating input rows. A pure
+/// grouping (no aggregate expressions — `GROUP BY`/`DISTINCT`) and `MAX`/`MIN`
+/// qualify, because each depends only on the *set* of inputs; `count`/`sum`/`avg`
+/// do not, since they count multiplicity.
+///
+/// This pairs with the leaf check that a scan projects only per-file-constant
+/// columns: when every row a file emits is identical, a duplicate-insensitive
+/// aggregate above it gives the same result whether the file contributes one row
+/// or many, so the scan may be collapsed to one row per file.
+fn is_duplicate_insensitive_aggregate(aggregate: &AggregateExec) -> bool {
+    aggregate.aggr_expr().iter().all(|expr| {
+        let name = expr.fun().name();
+        name.eq_ignore_ascii_case("max") || name.eq_ignore_ascii_case("min")
+    })
 }
 
 /// If `plan` is a partition-only file scan under a pure grouping, replace it
@@ -216,18 +253,14 @@ fn try_rewrite_partition_only_leaf(
 }
 
 /// Returns the [`FileScanConfig`] of `plan` when it is a file scan whose
-/// projected schema contains **only** partition columns and which is safe to
-/// rewrite. Otherwise `None`.
+/// projected schema contains **only** per-file-constant columns (hive partition
+/// values and/or file metadata) and which is safe to rewrite. Otherwise `None`.
 fn partition_only_file_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&FileScanConfig> {
     let scan = plan.as_ref().downcast_ref::<DataSourceExec>()?;
     let config = scan
         .data_source()
         .as_ref()
         .downcast_ref::<FileScanConfig>()?;
-
-    if config.table_partition_cols().is_empty() {
-        return None;
-    }
 
     // When the scan is organized by partition value it advertises hash
     // partitioning on the partition columns, which a downstream aggregate may
@@ -243,14 +276,20 @@ fn partition_only_file_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&FileScanCo
         return None;
     }
 
-    // Every projected column must be a partition column; otherwise file contents
-    // are required and the scan must not be skipped.
+    // Every projected column must be constant across a file: a hive partition
+    // value (from the directory path) or a file metadata column
+    // (`_location`/`_last_modified`/`_size`, from the object listing). Then every
+    // row a file emits is identical, so one row per file carries the same tuple.
+    // Otherwise file contents are required and the scan must not be collapsed.
+    // An empty constant set matches nothing, so a plain data-column projection is
+    // correctly left untouched.
     let partition_cols = config.table_partition_cols();
-    let all_partition_cols = projected_schema
-        .fields()
-        .iter()
-        .all(|field| partition_cols.iter().any(|c| c.name() == field.name()));
-    if !all_partition_cols {
+    let metadata_cols = config.file_source().table_schema().metadata_cols();
+    let all_constant = projected_schema.fields().iter().all(|field| {
+        partition_cols.iter().any(|c| c.name() == field.name())
+            || metadata_cols.iter().any(|c| c.name() == field.name())
+    });
+    if !all_constant {
         return None;
     }
 

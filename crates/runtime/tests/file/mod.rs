@@ -288,6 +288,35 @@ async fn file_connector_partition_only_scan_probes_first_record() -> Result<(), 
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+            // A duplicate-insensitive aggregate (MAX) over the partition column
+            // is also answered by the probe, and must exclude the empty p=4
+            // partition: MAX(p) is 3, not 4.
+            let max_is_first_record_probe = (
+                "DataSourceExec",
+                Box::new(|plan: &str| plan.contains("first_record_probe=true"))
+                    as Box<dyn Fn(&str) -> bool + 'static>,
+            );
+            run_query_and_check_results_with_plan_checks(
+                &mut rt,
+                "SELECT MAX(p) FROM hivepartjson",
+                vec![max_is_first_record_probe],
+                Some(|result_batches: Vec<arrow::array::RecordBatch>| {
+                    let rows: usize = result_batches
+                        .iter()
+                        .map(arrow::array::RecordBatch::num_rows)
+                        .sum();
+                    assert_eq!(rows, 1, "MAX returns one row");
+                    let value = arrow::util::display::array_value_to_string(
+                        result_batches[0].column(0).as_ref(),
+                        0,
+                    )
+                    .expect("formats the MAX value");
+                    assert_eq!(value, "3", "MAX(p) excludes the empty p=4 partition");
+                }),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
             Ok(())
         })
         .await
