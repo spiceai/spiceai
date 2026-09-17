@@ -204,10 +204,17 @@ pub trait ObjectLister: Send + Sync {
 /// cannot append the same object twice. They move to `committed` only from a
 /// post-apply committer. An in-flight SQS notification is left on the queue
 /// (not deleted) so a failed apply can still retry.
+///
+/// A listing rebuild replaces the whole set and takes ownership of every key it
+/// lists, so each claim carries the `generation` it was made in. The consumer
+/// trims a run to its last rebuild signal and drops the superseded envelopes
+/// unapplied, and that drop must not release a key the rebuild now owns:
+/// a redelivered notification for it would be applied on top of the replacement.
 #[derive(Debug, Default, Clone)]
 struct AppliedKeySet {
     committed: HashSet<String>,
     in_flight: HashSet<String>,
+    generation: u64,
 }
 
 impl AppliedKeySet {
@@ -223,6 +230,13 @@ impl AppliedKeySet {
         self.is_committed(key) || self.is_in_flight(key)
     }
 
+    /// The generation a claim made now belongs to. Only a listing rebuild
+    /// advances it, and only from the stream task, so a caller that reads it
+    /// before yielding its envelopes still holds the generation it claimed in.
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
     fn mark_in_flight(&mut self, keys: impl IntoIterator<Item = String>) {
         for key in keys {
             if !self.committed.contains(&key) {
@@ -231,22 +245,30 @@ impl AppliedKeySet {
         }
     }
 
-    fn commit(&mut self, keys: &[String]) {
+    fn commit(&mut self, generation: u64, keys: &[String]) {
+        if generation != self.generation {
+            return;
+        }
         for key in keys {
             self.in_flight.remove(key);
             self.committed.insert(key.clone());
         }
     }
 
-    fn abort_in_flight(&mut self, keys: &[String]) {
+    fn abort_in_flight(&mut self, generation: u64, keys: &[String]) {
+        if generation != self.generation {
+            return;
+        }
         for key in keys {
             self.in_flight.remove(key);
         }
     }
 
-    fn replace_in_flight(&mut self, listed: Vec<String>) {
+    fn replace_in_flight(&mut self, listed: Vec<String>) -> u64 {
         self.committed.clear();
         self.in_flight = listed.into_iter().collect();
+        self.generation = self.generation.saturating_add(1);
+        self.generation
     }
 }
 
@@ -269,9 +291,12 @@ impl CommitChange for SqsDeleteCommitter {
 
 /// Advances [`AppliedKeySet`] after the consumer applies the envelope. Drop
 /// without `commit` releases in-flight keys so a retry or backfill can apply
-/// them again.
+/// them again. Both are no-ops once a listing rebuild has superseded the
+/// generation these keys were claimed in; the inner commit (the SQS delete)
+/// still runs, because the rows it acknowledges were applied.
 struct AppliedKeysCommitter {
     applied: Arc<Mutex<AppliedKeySet>>,
+    generation: u64,
     keys: Vec<String>,
     inner: Box<dyn CommitChange + Send + Sync>,
 }
@@ -279,14 +304,16 @@ struct AppliedKeysCommitter {
 #[async_trait]
 impl CommitChange for AppliedKeysCommitter {
     async fn commit(&self) -> std::result::Result<(), CommitError> {
-        self.applied.lock().commit(&self.keys);
+        self.applied.lock().commit(self.generation, &self.keys);
         self.inner.commit().await
     }
 }
 
 impl Drop for AppliedKeysCommitter {
     fn drop(&mut self) {
-        self.applied.lock().abort_in_flight(&self.keys);
+        self.applied
+            .lock()
+            .abort_in_flight(self.generation, &self.keys);
     }
 }
 
@@ -707,11 +734,13 @@ pub fn region_from_queue_url(queue_url: &str) -> Option<String> {
 
 fn applied_keys_committer(
     applied: &Arc<Mutex<AppliedKeySet>>,
+    generation: u64,
     keys: Vec<String>,
     inner: Box<dyn CommitChange + Send + Sync>,
 ) -> Box<dyn CommitChange + Send + Sync> {
     Box::new(AppliedKeysCommitter {
         applied: Arc::clone(applied),
+        generation,
         keys,
         inner,
     })
@@ -1262,9 +1291,9 @@ fn listing_rebuild_envelope(
 ) -> std::result::Result<ChangeEnvelope, StreamError> {
     let data = concat_listing_batches(schema, batches)?;
     let batch = wrap_data_as_change_batch(schema, &data)?.with_rebuild_from_this_batch(true);
-    applied.lock().replace_in_flight(keys.clone());
+    let generation = applied.lock().replace_in_flight(keys.clone());
     Ok(ChangeEnvelope::from_parts(
-        applied_keys_committer(applied, keys, inner),
+        applied_keys_committer(applied, generation, keys, inner),
         batch,
         false,
         true,
@@ -1352,6 +1381,7 @@ fn create_envelopes(
     queue: &Arc<dyn MessageQueue>,
     receipt_handle: &str,
 ) -> std::result::Result<Vec<ChangeEnvelope>, StreamError> {
+    let generation = applied.lock().generation();
     let last = batches.len().saturating_sub(1);
     let envelopes = batches
         .into_iter()
@@ -1367,7 +1397,7 @@ fn create_envelopes(
                 Box::new(NoOpCommitter)
             };
             let committer = if i == last {
-                applied_keys_committer(applied, keys.clone(), inner)
+                applied_keys_committer(applied, generation, keys.clone(), inner)
             } else {
                 inner
             };
@@ -1385,8 +1415,9 @@ fn backfill_envelopes(
     applied: &Arc<Mutex<AppliedKeySet>>,
     keys: Vec<String>,
 ) -> std::result::Result<Vec<ChangeEnvelope>, StreamError> {
+    let generation = applied.lock().generation();
     if batches.is_empty() {
-        applied.lock().commit(&keys);
+        applied.lock().commit(generation, &keys);
         return Ok(Vec::new());
     }
     let last = batches.len().saturating_sub(1);
@@ -1396,7 +1427,7 @@ fn backfill_envelopes(
         .map(|(i, batch)| {
             let change_batch = wrap_data_as_change_batch(schema, &batch)?;
             let committer: Box<dyn CommitChange + Send + Sync> = if i == last {
-                applied_keys_committer(applied, keys.clone(), Box::new(NoOpCommitter))
+                applied_keys_committer(applied, generation, keys.clone(), Box::new(NoOpCommitter))
             } else {
                 Box::new(NoOpCommitter)
             };
@@ -1802,6 +1833,36 @@ mod tests {
         }
     }
 
+    /// Delivers one batch of messages per `receive`, then parks — the shape of an
+    /// SQS redelivery arriving after an earlier batch has been processed.
+    struct SequenceQueue {
+        batches: Mutex<Vec<Vec<QueueMessage>>>,
+    }
+
+    #[async_trait]
+    impl MessageQueue for SequenceQueue {
+        async fn receive(&self) -> std::result::Result<Vec<QueueMessage>, QueueError> {
+            let batch = {
+                let mut batches = self.batches.lock().await;
+                if batches.is_empty() {
+                    None
+                } else {
+                    Some(batches.remove(0))
+                }
+            };
+            if let Some(messages) = batch {
+                Ok(messages)
+            } else {
+                std::future::pending::<()>().await;
+                Ok(Vec::new())
+            }
+        }
+
+        async fn delete(&self, _receipt_handle: &str) -> std::result::Result<(), QueueError> {
+            Ok(())
+        }
+    }
+
     struct FailingQueue {
         remaining_failures: Mutex<usize>,
     }
@@ -1915,7 +1976,8 @@ mod tests {
     ) -> parking_lot::Mutex<AppliedKeySet> {
         let mut set = AppliedKeySet::default();
         let keys: Vec<String> = committed.into_iter().collect();
-        set.commit(&keys);
+        let generation = set.generation();
+        set.commit(generation, &keys);
         parking_lot::Mutex::new(set)
     }
 
@@ -1937,6 +1999,17 @@ mod tests {
             config,
             listing_files: parquet_files(),
         })
+    }
+
+    async fn next_envelope(
+        stream: &mut ChangesStream,
+        timeout: Duration,
+    ) -> Option<ChangeEnvelope> {
+        match tokio::time::timeout(timeout, stream.next()).await {
+            Ok(Some(Ok(envelope))) => Some(envelope),
+            Ok(Some(Err(error))) => panic!("change stream error: {error}"),
+            Ok(None) | Err(_) => None,
+        }
     }
 
     async fn collect_until_idle(stream: ChangesStream, expected: usize) -> Vec<ChangeEnvelope> {
@@ -3351,10 +3424,85 @@ mod tests {
         assert_eq!(aligned.num_rows(), 1);
     }
 
+    /// A rebuild takes ownership of every key in its listing. The consumer trims
+    /// the run to that rebuild signal and drops the envelopes before it unapplied
+    /// (`trim_to_rebuild_signal`), so an earlier create's drop must not release a
+    /// key the rebuild now owns — a redelivered notification for it would then be
+    /// applied on top of the replacement.
+    #[tokio::test]
+    async fn stream_rebuild_keeps_its_claim_when_a_superseded_create_is_dropped() {
+        let queue: Arc<dyn MessageQueue> = Arc::new(SequenceQueue {
+            batches: Mutex::new(vec![
+                vec![
+                    QueueMessage {
+                        body: created_put_body("events/a.parquet"),
+                        receipt_handle: "rh-create".into(),
+                    },
+                    QueueMessage {
+                        body: removed_body("events/gone.parquet"),
+                        receipt_handle: "rh-removed".into(),
+                    },
+                ],
+                vec![QueueMessage {
+                    body: created_put_body("events/a.parquet"),
+                    receipt_handle: "rh-redelivered".into(),
+                }],
+            ]),
+        });
+        let reader = Arc::new(MapObjectReader {
+            objects: HashMap::from([(
+                "my-bucket/events/a.parquet".to_string(),
+                vec![id_name_batch(&[1], &["a"])],
+            )]),
+            fail_keys: vec![],
+        });
+        // Empty at startup, so the create below is the first claim on the key;
+        // the ObjectRemoved rebuild then lists that same key.
+        let lister: Arc<dyn ObjectLister> = Arc::new(SequenceLister {
+            listings: Mutex::new(vec![Vec::new(), vec!["events/a.parquet".into()]]),
+        });
+        let mut config = default_config();
+        config.on_object_removed = OnObjectRemoved::Rebuild;
+        let mut stream = stream_s3_changes(S3ChangesStreamParts {
+            dataset: events_dataset(),
+            federated_table: federated_table(id_name_batch(&[99], &["stale-federated"])),
+            acceleration: AccelerationContents::Empty,
+            queue,
+            object_reader: reader,
+            object_lister: lister,
+            config,
+            listing_files: parquet_files(),
+        });
+
+        let ready = next_envelope(&mut stream, Duration::from_secs(2))
+            .await
+            .expect("empty snapshot marks the dataset ready");
+        assert!(ready.is_dataset_ready());
+        let create = next_envelope(&mut stream, Duration::from_secs(2))
+            .await
+            .expect("the ObjectCreated notification yields a create");
+        assert_eq!(names_in(&create), vec!["a".to_string()]);
+        let rebuild = next_envelope(&mut stream, Duration::from_secs(2))
+            .await
+            .expect("the ObjectRemoved notification yields a listing rebuild");
+        assert!(rebuild.history_unavailable());
+
+        // The consumer trims the create out of the run and drops it unapplied.
+        drop(create);
+
+        assert!(
+            next_envelope(&mut stream, Duration::from_secs(2))
+                .await
+                .is_none(),
+            "a redelivered create for a key the rebuild owns must not be applied on top of the replacement"
+        );
+    }
+
     #[test]
     fn replace_applied_keys_uses_current_listing_not_clear() {
         let mut applied = AppliedKeySet::default();
-        applied.commit(&["events/gone.parquet".to_string()]);
+        let generation = applied.generation();
+        applied.commit(generation, &["events/gone.parquet".to_string()]);
         applied.replace_in_flight(vec![
             "events/a.parquet".to_string(),
             "events/b.parquet".to_string(),
@@ -3362,6 +3510,32 @@ mod tests {
         assert!(!applied.is_known("events/gone.parquet"));
         assert!(applied.is_in_flight("events/a.parquet"));
         assert!(applied.is_in_flight("events/b.parquet"));
+    }
+
+    /// A committer from before a listing rebuild must not move keys the rebuild
+    /// now owns: its commit and its drop both belong to a superseded generation.
+    #[test]
+    fn a_superseded_committer_does_not_move_a_rebuilds_keys() {
+        let applied = Arc::new(parking_lot::Mutex::new(AppliedKeySet::default()));
+        let superseded = applied.lock().generation();
+        applied
+            .lock()
+            .mark_in_flight(["events/a.parquet".to_string()]);
+        applied
+            .lock()
+            .replace_in_flight(vec!["events/a.parquet".to_string()]);
+        {
+            let _committer = AppliedKeysCommitter {
+                applied: Arc::clone(&applied),
+                generation: superseded,
+                keys: vec!["events/a.parquet".to_string()],
+                inner: Box::new(NoOpCommitter),
+            };
+        }
+        assert!(
+            applied.lock().is_in_flight("events/a.parquet"),
+            "the rebuild's claim must survive a superseded envelope's drop"
+        );
     }
 
     #[tokio::test]
@@ -3372,6 +3546,7 @@ mod tests {
             .mark_in_flight(["events/a.parquet".to_string()]);
         let committer = AppliedKeysCommitter {
             applied: Arc::clone(&applied),
+            generation: applied.lock().generation(),
             keys: vec!["events/a.parquet".to_string()],
             inner: Box::new(NoOpCommitter),
         };
@@ -3394,6 +3569,7 @@ mod tests {
         {
             let _committer = AppliedKeysCommitter {
                 applied: Arc::clone(&applied),
+                generation: applied.lock().generation(),
                 keys: vec!["events/a.parquet".to_string()],
                 inner: Box::new(NoOpCommitter),
             };

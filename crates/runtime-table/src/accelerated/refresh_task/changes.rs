@@ -8003,6 +8003,109 @@ mod tests {
         );
     }
 
+    /// Coverage for a `refresh_sql` dataset, whose accelerator is created with
+    /// the projected schema while the rebuild signal still carries source rows:
+    /// the accelerator write narrows to the accelerated schema by name, so the
+    /// replacement lands with the projected columns.
+    #[tokio::test]
+    async fn listing_rebuild_lands_on_a_projected_accelerator_schema() {
+        let dataset = "listing_rebuild_projected_schema";
+        let source_schema = Arc::new(create_test_data_schema());
+        let projected_schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let federated = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&source_schema),
+                vec![vec![id_name_batch(&[99], &["stale-federated"])]],
+            )
+            .expect("federated mem table"),
+        );
+        let accelerator = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&projected_schema),
+                vec![vec![
+                    RecordBatch::try_new(
+                        Arc::clone(&projected_schema),
+                        vec![Arc::new(Int32Array::from(vec![0]))],
+                    )
+                    .expect("projected accelerator batch"),
+                ]],
+            )
+            .expect("accelerator mem table"),
+        );
+        let task = make_refresh_task_with_source(
+            dataset,
+            Arc::clone(&federated) as Arc<dyn TableProvider>,
+            Arc::clone(&accelerator) as Arc<dyn TableProvider>,
+        );
+
+        let dataset_name = TableReference::bare(dataset);
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
+        let initial_load_completed = Arc::new(AtomicBool::new(true));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            ..Refresh::default()
+        }));
+        let mut context = ApplyContext {
+            refresh_sql: Some("SELECT id FROM listing_rebuild_projected_schema"),
+            refresh: &refresh,
+            dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
+            caching: None,
+            refresh_completion: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+
+        let listing = id_name_batch(&[1], &["existing"]);
+        let signal = cdc::ChangeEnvelope::from_parts(
+            Box::new(cdc::NoOpCommitter),
+            cdc::wrap_data_as_change_batch(&source_schema, &listing)
+                .expect("listing snapshot wraps")
+                .with_rebuild_from_this_batch(true),
+            false,
+            true,
+        );
+        assert!(
+            task.apply_envelope_run(&mut context, vec![signal]).await,
+            "a listing rebuild must land on a dataset whose accelerator is a refresh_sql projection"
+        );
+
+        let ctx = SessionContext::new();
+        let batches = ctx
+            .read_table(Arc::clone(&accelerator) as Arc<dyn TableProvider>)
+            .expect("read accelerator")
+            .collect()
+            .await
+            .expect("collect accelerator");
+        let ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("id")
+                    .expect("id")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32");
+                (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1],
+            "the replacement must be the snapshot's rows, narrowed to the accelerated columns"
+        );
+    }
+
     /// Copilot harness dual: a later federated scan seeing `b` after the
     /// captured listing `{a}` would write `b` and then backfill `b` again.
     /// Listing-driven overwrite must use the envelope rows, not the federated table.
