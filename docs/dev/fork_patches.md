@@ -280,11 +280,18 @@ so the rows below name the contracts, not every commit.
 | Cluster RPC TLS and API-key auth (fork PR #3) | Scheduler/executor traffic falls back to plaintext and unauthenticated | silent (security) | `crates/runtime/tests/tls/mod.rs` (two guards) |
 | Object-store shuffle storage (S3/Azure), `PrefixStore` wrapping, single-stream IPC per partition (fork PRs #9, #18, #40–#43) | Shuffles fall back to local disk, or S3 shuffle paths resolve to the wrong key | silent | `crates/runtime/tests/cluster/distributed_acceleration.rs` and the rest of `crates/runtime/tests/cluster/` |
 | In-memory shuffle storage with remote-fetch fallback (fork PRs #7, #8) | Every shuffle round-trips through storage | silent (perf) | `crates/runtime/tests/cluster/in_memory_shuffle.rs` |
-| Shuffle-fetch resilience: retry on a fresh connection, h2 receive-window sizing, bounded read inactivity, unordered stream consumption (fork PRs #61, #62, #63) | A transient fetch failure fails the whole query; large shuffles stall | silent | **GAP** |
+| Shuffle-fetch resilience: a buried `FetchFailed` surfaced so the scheduler can recover, retry on a fresh connection, h2 receive-window sizing, bounded read inactivity, unordered stream consumption (fork PRs #36, #61, #62, #63) | A transient fetch failure fails the whole query; large shuffles stall. The surfacing is the quiet half: a `FetchFailed` reaches the scheduler wrapped as `Shared(Arc(ArrowError(ExternalError(…))))`, and an unwrapping that stops at `ArrowError` leaves it buried, so `FailedTask::from` falls through to `FailedReason::ExecutionError` — non-retryable — and the `FetchPartitionError` recovery that reruns the offending map stage never runs | silent | **GAP** |
 | Scheduler lock hygiene across persists and awaits (fork PR #60) | Cluster wedge / runtime freeze under load | silent (hang) | **GAP** |
 | Don't swap null-aware anti joins in `JoinSelection` (fork PR #58) | A distributed anti-join returns wrong rows | silent (wrong data) | `crates/runtime/src/cluster/datafusion/mod.rs::a_null_among_the_values_leaves_no_row_selected`, `…::a_null_among_the_values_leaves_no_row_selected_where_no_swap_is_profitable`, `…::values_without_a_null_select_every_probe_absent_from_them`, `…::the_rule_neither_swaps_the_sides_nor_drops_the_flag` — these drive the scheduler's own rule rather than a live cluster, because a distributed `NOT IN` currently fails before it can return rows (the rule forces `CollectLeft` on a stage whose left input is already hash-partitioned, and `to_resolved` cannot repartition) |
 | Vortex columnar shuffle format (fork PR #7) | Shuffles fall back to Arrow IPC | build | compile-guarded |
 | Stale `TaskStatus` rejection for reset partitions (fork PR #53) | A status update already in flight when its executor was lost arrives for a partition whose task info the reset cleared. Upstream unwraps that `None`, and the panic lands on the scheduler event-loop worker: the event channel closes and every later job submission and executor heartbeat fails with `Fail to send event due to channel closed` — one late packet wedges the cluster | silent (panic, then cluster wedge) | `crates/runtime/src/cluster/datafusion/mod.rs::stale_status_for_a_reset_partition` — `a_status_for_a_partition_with_no_scheduled_task_is_refused` and `a_status_for_a_partition_whose_task_is_still_scheduled_is_accepted`, asserted against `RunningStage::update_task_info` on a stage that `RunningStage::reset_tasks` has cleared for the lost executor while another executor's task stays scheduled, so a patch that refused every status fails the second. Driving the real `reset_stages_on_lost_executor` would be closer still, but `ExecutionGraph::pop_next_task` is `#[cfg(test)]` on the fork and unreachable from here |
+| Distributed `EXPLAIN`, `EXPLAIN FORMAT TREE` and `EXPLAIN ANALYZE` (fork PR #34) | The client wraps `LogicalPlan::Explain` in a `BallistaExplainNode` so the requested format survives serialization across the client/scheduler boundary; the scheduler unwraps it and substitutes a distributed-aware `ExplainExec`. Without it a cluster cannot explain its own plans, which is the only way to see how a statement was distributed | silent (no diagnostic) | `crates/runtime/tests/cluster/distributed_cayenne_catalog.rs` and `…/distributed_iceberg.rs` run `EXPLAIN` through the cluster harness (`harness.explain` issues `EXPLAIN <sql>`) and assert on the plan it emits; `…/distributed_task_history.rs` exercises the `EXPLAIN ANALYZE` path through plan capture. The `FORMAT TREE` rendering has no repo-side assertion |
+| `executor_id` persisted on `TaskInfo`, and `ExecutionGraph` exposed to embedded callers (fork PR #38) | The scheduler is embedded here rather than run as its own binary, so both are API this workspace calls; `executor_id` is also what lets a reset identify the tasks a lost executor was running | build | compile-guarded — `crates/runtime/src/cluster/datafusion/mod.rs`'s fork PR #53 guard constructs a `TaskInfo` with it, and `crates/runtime/src/cluster/shared_job_state.rs` uses the exposed graph |
+| `get_job_execution_graph` re-exposed as `pub` (fork PR #49) | An embedded scheduler cannot read the graph of a job it is running | build | compile-guarded by `crates/runtime/src/datafusion/query/handle.rs` |
+| Execution graphs serialized for cross-scheduler recovery (fork PR #56) | A job cannot be resumed by a scheduler other than the one that planned it, so a scheduler restart loses every in-flight distributed query | build | compile-guarded by `crates/runtime/src/cluster/shared_job_state.rs`, which calls `execution_graph_to_bytes`/`execution_graph_from_bytes` and holds an `ExecutionGraphBox` |
+| A missing partition file is read as an empty partition (fork PR #54) | A map task that produced no rows for a given reducer partition writes no file for it, and the executor's flight service answers the fetch `NotFound`. Read as a failed fetch that is a failed query; read as the data-level signal it is, the partition is simply empty. Fork PR #57 keeps the pooled client on a `NotFound` for the same reason — it is not a broken connection | silent (query failure) | **GAP** — needs a cluster and a shuffle with an empty partition |
+| Shuffle-fetch clients pooled per peer instead of dialled per fetch (fork PR #57) | `fetch_partition_remote` opened a fresh `BallistaClient` — a new gRPC connection and TLS handshake — for every partition fetch, and a distributed shuffle has every reducer partition fetch from every map peer, so one query issues thousands of concurrent connection attempts. Under CPU load those handshakes run slow enough that clients abort mid-handshake and peers report `connection reset by peer`, failing the fetch and the query. One client per `(host, port, use_tls)` is cloned per fetch instead, collapsing the storm to one connection per peer, and is evicted on failure so the next fetch reconnects | silent (query failure under load) | **GAP** — the failure needs a cluster under enough CPU load to slow a handshake; measured by the fork on a distributed TPC-H run |
+| Terminal job status persisted before the job leaves the active cache (fork PR #59) | `succeed_job` removed the job from the active execution-graph cache before the `save_job` write completed, so a concurrent `get_job_status` fell through to the not-yet-updated shared state and answered a stale `Running`. The distributed query client polls on a 2s budget, so it reported a timeout for a query that had in fact succeeded | silent (a successful query reported as a timeout) | **GAP** — a race between a status poll and a save, so any test of it is a timing test; measured by the fork against the client's poll budget |
 | Stuck-query detection (fork PR #39) | A distributed query that stops making progress is not reported, so it has to be diagnosed by rerunning it | silent (no diagnostic) | **GAP** — the detection runs on the scheduler's own timer against live executor state, and the scheduler's task-issuing API is `#[cfg(test)]` on the fork, so there is no way from here to drive a query into the stuck state |
 
 ## datafusion-federation and datafusion-table-providers
@@ -583,7 +590,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**19 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**22 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -602,14 +609,20 @@ They are not equal in consequence; this is the order to close them in.
 
 3. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
    resilience (fork PRs #61–#63).
+4. `datafusion-ballista` three cluster-reliability patches (fork PRs #54, #57,
+   #59): a missing partition file read as an empty partition, shuffle-fetch
+   clients pooled per peer, and the terminal job status persisted before the job
+   leaves the active cache. Each needs a running cluster to exhibit — the last
+   is a race between a status poll and a save — and each row records what the
+   fork measured.
 **Blocked, not merely undone.** These have been looked at and cannot be closed by
 writing a test; each says what would unblock it:
 
-4. `snowflake-rs` (five rows) — no host override, private response types. Needs a
+5. `snowflake-rs` (five rows) — no host override, private response types. Needs a
    live account, or an upstream change letting the base URL be set.
-5. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
+6. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
    race, so any test of it is a timing test.
-6. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
+7. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
    there is no behaviour of ours to assert on.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
@@ -618,7 +631,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-7. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+8. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
    `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
    `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
    `snowflake-rs` streaming batches (memory, not latency — but see the
