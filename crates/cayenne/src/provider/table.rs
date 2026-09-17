@@ -45375,8 +45375,9 @@ mod tests {
         use arrow::array::StringArray;
 
         // 1000 distinct keys in a scrambled order, plus NULLs the cut must skip.
-        let mut keys: Vec<Option<String>> =
-            (0..1000).map(|i| Some(format!("k{:04}", (i * 7919) % 1000))).collect();
+        let mut keys: Vec<Option<String>> = (0..1000)
+            .map(|i| Some(format!("k{:04}", (i * 7919) % 1000)))
+            .collect();
         keys.extend([None, None, None]);
         let sample: ArrayRef = Arc::new(StringArray::from(keys));
 
@@ -45443,7 +45444,11 @@ mod tests {
             ctx.runtime_env(),
         )
         .await;
-        assert_eq!(names(&keyed), vec!["id"], "nothing observed: the primary key");
+        assert_eq!(
+            names(&keyed),
+            vec!["id"],
+            "nothing observed: the primary key"
+        );
         filter_on(&keyed, "id", 2);
         filter_on(&keyed, "sid", 4);
         assert_eq!(
@@ -45546,7 +45551,9 @@ mod tests {
                         order.iter().map(|i| format!("sid-{i:08}")),
                     )),
                     Arc::new(Int64Array::from_iter_values(
-                        order.iter().map(|&i| i64::try_from(i).expect("row fits i64")),
+                        order
+                            .iter()
+                            .map(|&i| i64::try_from(i).expect("row fits i64")),
                     )),
                 ],
             )
@@ -51545,7 +51552,7 @@ mod tests {
     ///
     /// The scan advertises `output_ordering` from `context.sort_columns()`. A
     /// curve is not a lexicographic order — it interleaves the columns, puts
-    /// NULLs first, and discards ASC/DESC — so attesting would tell DataFusion
+    /// NULLs first, and discards ASC/DESC — so attesting would tell `DataFusion`
     /// the files carry an order they do not, and it would elide a sort the data
     /// needs or open a merge join on unordered input: wrong rows, not a slow
     /// plan.

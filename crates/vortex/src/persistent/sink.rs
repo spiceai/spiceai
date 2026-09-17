@@ -968,10 +968,10 @@ async fn run_shard_writer(
 
     let write_result: DFResult<()> = async {
         loop {
-            let received = receiver.next().await;
-            let drained = received.is_none();
+            let incoming = receiver.next().await;
+            let drained = incoming.is_none();
             let mut arrived = None;
-            match (run_sort.as_mut(), received) {
+            match (run_sort.as_mut(), incoming) {
                 (None, batch) => arrived = batch,
                 (Some(sorter), Some(batch)) => sorter.push(batch)?,
                 (Some(sorter), None) => sorter.finish()?,
@@ -1338,12 +1338,12 @@ mod tests {
     use crate::persistent::VortexFormatFactory;
     use crate::persistent::VortexTableOptions;
     use crate::persistent::sink::ActiveFileWriter;
-    use crate::persistent::sink::ShardSpec;
     use crate::persistent::sink::RUN_SORT_OUTPUT_ROWS;
     use crate::persistent::sink::RunSorter;
+    use crate::persistent::sink::ShardSpec;
     use crate::persistent::sink::WriteOutputOptions;
-    use crate::persistent::sink::get_record_batch_memory_size;
     use crate::persistent::sink::finish_file_writer;
+    use crate::persistent::sink::get_record_batch_memory_size;
     use crate::persistent::sink::range_partition;
     use crate::persistent::sink::write_record_batch_stream_to_files;
 
@@ -3068,7 +3068,10 @@ mod tests {
     fn run_sorter_emits_each_run_sorted_with_nulls_first() -> anyhow::Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
         let batch = |values: Vec<Option<i64>>| {
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(values))])
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(values))],
+            )
         };
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         let mut sorter = run_sorter(u64::MAX, &pool);
@@ -3084,7 +3087,11 @@ mod tests {
             int64_values(&drain(&mut sorter)?),
             vec![None, None, Some(1), Some(3), Some(5), Some(9)]
         );
-        assert_eq!(pool.reserved(), 0, "an emitted run releases its reservation");
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "an emitted run releases its reservation"
+        );
 
         // The run is consumed: finishing again emits nothing.
         sorter.finish()?;
@@ -3189,10 +3196,7 @@ mod tests {
             sorter.push(one_col_batch(&schema, vec![4, 3])).is_err(),
             "a sealed run that was not drained must not be replaced"
         );
-        assert_eq!(
-            int64_values(&drain(&mut sorter)?),
-            vec![Some(1), Some(2)]
-        );
+        assert_eq!(int64_values(&drain(&mut sorter)?), vec![Some(1), Some(2)]);
         Ok(())
     }
 
@@ -3235,10 +3239,7 @@ mod tests {
             .await?
             .collect()
             .await?;
-        assert_eq!(
-            int64_values(&got),
-            (0..1000).map(Some).collect::<Vec<_>>()
-        );
+        assert_eq!(int64_values(&got), (0..1000).map(Some).collect::<Vec<_>>());
 
         for (path, _) in &results {
             let values = int64_values(
@@ -3291,17 +3292,18 @@ mod tests {
 
         let total_rows: u64 = results.iter().map(|(_, s)| s.row_count()).sum();
         assert_eq!(total_rows, 1000, "no row may be dropped or duplicated");
-        assert_eq!(pool.reserved(), 0, "the write must release its reservations");
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "the write must release its reservations"
+        );
         let got = ctx
             .session
             .sql("SELECT a FROM '/table/' ORDER BY a")
             .await?
             .collect()
             .await?;
-        assert_eq!(
-            int64_values(&got),
-            (0..1000).map(Some).collect::<Vec<_>>()
-        );
+        assert_eq!(int64_values(&got), (0..1000).map(Some).collect::<Vec<_>>());
         Ok(())
     }
 
