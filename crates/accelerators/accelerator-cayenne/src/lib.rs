@@ -4393,10 +4393,17 @@ impl DataAccelerator for CayenneAccelerator {
             }
         }
 
-        catalog
-            .update_table_schema(&table.table_id, &evolved)
-            .await
-            .boxed()?;
+        if plan.changes_decimal_scale() {
+            catalog
+                .update_table_schema_dropping_statistics(&table.table_id, &evolved)
+                .await
+                .boxed()?;
+        } else {
+            catalog
+                .update_table_schema(&table.table_id, &evolved)
+                .await
+                .boxed()?;
+        }
         tracing::info!(
             dataset = %source.name(),
             "Evolved Cayenne table schema: {}",
