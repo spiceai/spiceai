@@ -702,14 +702,20 @@ fn parse_mountinfo_cgroup_v1(contents: &str, controller: &str) -> Option<String>
     })
 }
 
+/// This process's resident set size, where the platform exposes it cheaply.
 #[cfg(target_os = "linux")]
-fn proc_self_rss_bytes() -> Option<u64> {
+pub(crate) fn proc_self_rss_bytes() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     status.lines().find_map(|line| {
         let rest = line.strip_prefix("VmRSS:")?.trim();
         let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
         kb.checked_mul(1024)
     })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn proc_self_rss_bytes() -> Option<u64> {
+    None
 }
 
 #[cfg(not(target_os = "linux"))]

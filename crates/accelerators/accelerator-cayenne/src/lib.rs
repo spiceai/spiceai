@@ -2713,7 +2713,8 @@ impl CayenneAccelerator {
             .with_retention_filters(retention_filters)
             .with_maintained_aggregates(maintained_aggregate_specs)
             .with_durable_write_back(durable_write_back)
-            .with_scan_view_reuse(scan_view_reuse);
+            .with_scan_view_reuse(scan_view_reuse)
+            .with_secondary_indexes(secondary_index_columns(source));
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }
@@ -3030,17 +3031,45 @@ fn memory_mode_retention_warning(table_name: &str) -> String {
     )
 }
 
-/// The warning an acceleration gets when it configures `indexes`.
+/// The column sets of the acceleration's `indexes`, one per entry, in a stable
+/// order: the entries arrive as a map, and a lookup is answered by the first
+/// index whose columns it pins.
+fn secondary_index_columns(source: &dyn AccelerationSource) -> Vec<Vec<String>> {
+    let mut indexes: Vec<Vec<String>> = source
+        .acceleration()
+        .map(|acceleration| {
+            acceleration
+                .indexes
+                .keys()
+                .map(|columns| columns.iter().map(str::to_string).collect())
+                .collect()
+        })
+        .unwrap_or_default();
+    indexes.sort();
+    indexes
+}
+
+/// Whether the acceleration declares an index as `unique`.
+fn declares_unique_index(source: &dyn AccelerationSource) -> bool {
+    source.acceleration().is_some_and(|acceleration| {
+        acceleration.indexes.values().any(|index_type| {
+            matches!(
+                index_type,
+                runtime_acceleration::acceleration::IndexType::Unique
+            )
+        })
+    })
+}
+
+/// The warning an acceleration gets when it declares a `unique` index.
 ///
-/// Every other accelerator turns `indexes` into a real secondary index; Cayenne has
-/// none to create — it prunes from the zone maps and primary-key index it derives from
-/// the data — so the setting reaches the engine and does nothing. A `unique` entry is
-/// the half that matters: on the other engines it constrains writes, and here it does
-/// not, which is the kind of difference an operator has to be told about rather than
-/// discover from duplicate rows.
-fn ignored_indexes_warning(table_name: &str) -> String {
+/// Cayenne builds the index and uses it for lookups, but on the other engines a
+/// `unique` entry also constrains writes, and here it does not — the kind of
+/// difference an operator has to be told about rather than discover from
+/// duplicate rows.
+fn unique_index_warning(table_name: &str) -> String {
     format!(
-        "Dataset '{table_name}' (cayenne): `indexes` is not applied to a Cayenne acceleration, which prunes with the zone maps and primary-key index it builds from the data itself, so a `unique` entry here does not constrain writes and duplicate rows are not rejected. Remove `indexes`, or set `primary_key` with `on_conflict` to deduplicate on a column set. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        "Dataset '{table_name}' (cayenne): a `unique` entry in `indexes` speeds up lookups but does not constrain writes, so duplicate rows are not rejected. Set `primary_key` with `on_conflict` to deduplicate on a column set. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
 }
 
@@ -3869,11 +3898,8 @@ impl DataAccelerator for CayenneAccelerator {
             tracing::warn!("{}", memory_mode_retention_warning(&table_name));
         }
 
-        if source
-            .acceleration()
-            .is_some_and(|acceleration| !acceleration.indexes.is_empty())
-        {
-            tracing::warn!("{}", ignored_indexes_warning(&table_name));
+        if declares_unique_index(source) {
+            tracing::warn!("{}", unique_index_warning(&table_name));
         }
 
         if source.acceleration().is_some_and(|acceleration| {
@@ -4086,7 +4112,8 @@ impl DataAccelerator for CayenneAccelerator {
                 // the dual-write path.
                 .with_background_compaction(Arc::clone(&self.compaction_semaphore))
                 .with_direct_partition_writes()
-                .with_scan_view_reuse(scan_view_reuse_for(source)),
+                .with_scan_view_reuse(scan_view_reuse_for(source))
+                .with_secondary_indexes(secondary_index_columns(source)),
             );
 
             // Wrap the base table provider with partitioning logic, installing
@@ -4920,7 +4947,7 @@ mod tests {
     fn ignored_setting_warnings_name_the_dataset_and_link_the_docs() {
         for warning in [
             memory_mode_retention_warning("events"),
-            ignored_indexes_warning("events"),
+            unique_index_warning("events"),
             retention_period_never_reclaimed_warning("events"),
         ] {
             assert!(
@@ -5037,8 +5064,8 @@ mod tests {
     }
 
     #[test]
-    fn ignored_indexes_warning_states_the_impact_and_the_alternative() {
-        let warning = ignored_indexes_warning("events");
+    fn unique_index_warning_states_the_impact_and_the_alternative() {
+        let warning = unique_index_warning("events");
 
         assert!(
             warning.contains("does not constrain writes"),
