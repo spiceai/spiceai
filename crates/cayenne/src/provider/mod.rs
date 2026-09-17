@@ -86,11 +86,13 @@ pub(crate) mod file_digest;
 pub(crate) mod file_pruning;
 pub(crate) mod fsync_tier;
 pub(crate) mod inlined_cache;
+pub(crate) mod lookup_index;
 pub(crate) mod maintenance;
 pub(crate) mod maintenance_metrics;
 pub(crate) mod manifest;
 pub(crate) mod mem_tier;
 pub(crate) mod mem_tier_budget;
+pub(crate) mod mem_tier_index;
 pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
 pub(crate) mod on_conflict;
@@ -205,6 +207,10 @@ pub enum Error {
     /// Data constraint violation: null PK, duplicate PK, row overflow.
     #[snafu(display("Data validation failed for table '{table}': {message}"))]
     DataValidation { table: String, message: String },
+
+    /// An accelerator option is incompatible with the table schema.
+    #[snafu(display("Invalid configuration for table '{table}': {message}"))]
+    InvalidConfiguration { table: String, message: String },
 
     /// A `mode: memory` (in-RAM) table reached its configured memory limit. Memory
     /// mode never spills to disk, so the write is rejected rather than silently
