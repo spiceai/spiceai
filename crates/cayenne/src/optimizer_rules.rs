@@ -5160,7 +5160,9 @@ mod tests {
         }
 
         fn keys(n: usize) -> Vec<Arc<dyn PhysicalExpr>> {
-            (0..n).map(|i| lit(i as i64)).collect()
+            (0..n)
+                .map(|i| lit(i64::try_from(i).expect("key index should fit in i64")))
+                .collect()
         }
 
         fn rows_under(
