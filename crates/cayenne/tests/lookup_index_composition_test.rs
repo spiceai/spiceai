@@ -48,11 +48,10 @@ async fn build_table(
     runtime_env: Arc<RuntimeEnv>,
     name: &str,
     schema: Arc<Schema>,
-    index_keys: Option<&str>,
+    index_keys: Option<&[&str]>,
 ) -> Arc<CayenneTableProvider> {
     let vortex_config = VortexConfig {
         target_vortex_file_size_mb: 1,
-        lookup_index_keys: index_keys.map(|k| vec![k.to_string()]).unwrap_or_default(),
         ..VortexConfig::default()
     };
     let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), name);
@@ -70,6 +69,11 @@ async fn build_table(
     Arc::new(
         CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
+            .with_secondary_indexes(
+                index_keys
+                    .map(|columns| vec![columns.iter().map(|c| (*c).to_string()).collect()])
+                    .unwrap_or_default(),
+            )
             .create(options)
             .await
             .expect("create table"),
@@ -130,8 +134,10 @@ fn rendered(batches: &[RecordBatch]) -> Vec<String> {
     rows
 }
 
-fn counters(table: &str) -> cayenne::lookup_index::LookupIndexCounters {
-    cayenne::lookup_index::counters_for_table(table).expect("indexed table has index state")
+fn counters(provider: &Arc<CayenneTableProvider>) -> cayenne::lookup_index::LookupIndexCounters {
+    provider
+        .lookup_index_counters()
+        .expect("indexed table has index state")
 }
 
 fn scored_schema() -> Arc<Schema> {
@@ -159,7 +165,7 @@ async fn a_column_side_cast_is_never_answered_from_the_index() {
         Arc::clone(&runtime_env),
         INDEXED,
         scored_schema(),
-        Some("TenantId+Score"),
+        Some(&["TenantId", "Score"]),
     )
     .await;
     let plain = build_table(&fixture, runtime_env, PLAIN, scored_schema(), None).await;
@@ -190,14 +196,14 @@ async fn a_column_side_cast_is_never_answered_from_the_index() {
     overwrite(&plain, batch).await;
 
     // The index is in place: a bare equality on both key columns uses it.
-    let before = counters(INDEXED);
+    let before = counters(&indexed);
     let bare = "SELECT \"AutoId\" FROM {t} WHERE \"TenantId\" = 'PLANTED' AND \"Score\" = 5.2";
     assert_eq!(
         rendered(&sql(&indexed, INDEXED, &bare.replace("{t}", INDEXED)).await),
         rendered(&sql(&plain, PLAIN, &bare.replace("{t}", PLAIN)).await)
     );
     assert_eq!(
-        counters(INDEXED).selected,
+        counters(&indexed).selected,
         before.selected + 1,
         "a bare equality on both key columns should use the index"
     );
@@ -269,7 +275,7 @@ async fn position_deletes_compose_with_the_index() {
         Arc::clone(&runtime_env),
         INDEXED,
         service_schema(),
-        Some("TenantId+ServiceId"),
+        Some(&["TenantId", "ServiceId"]),
     )
     .await;
     let plain = build_table(&fixture, runtime_env, PLAIN, service_schema(), None).await;
@@ -334,20 +340,20 @@ async fn position_deletes_compose_with_the_index() {
     let deadline = Instant::now() + Duration::from_mins(2);
     let mut served = false;
     while !served && Instant::now() < deadline {
-        let before = counters(INDEXED).selected;
+        let before = counters(&indexed).selected;
         let _ = sql(
             &indexed,
             INDEXED,
             &query_for(keys[1]).replace("{t}", INDEXED),
         )
         .await;
-        served = counters(INDEXED).selected > before;
+        served = counters(&indexed).selected > before;
         if !served {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
 
-    let before = counters(INDEXED);
+    let before = counters(&indexed);
     for &id in &keys {
         let query = query_for(id);
         assert_eq!(
@@ -356,7 +362,7 @@ async fn position_deletes_compose_with_the_index() {
             "lookup {id} diverged from the control table after deletes"
         );
     }
-    let after = counters(INDEXED);
+    let after = counters(&indexed);
     // Every lookup is answered by the index: a selection for a key some row
     // holds, an empty probe for a key none does. None falls back to a scan.
     let answered = (after.selected - before.selected) + (after.empty - before.empty);

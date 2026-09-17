@@ -233,13 +233,11 @@ impl PreparedOverwrite {
     ///
     /// Returns an error if swapping the listing table fails. Other steps are best-effort.
     pub async fn finish(self) -> Result<u64> {
-        // Publish the point-lookup index ahead of the visibility flip: an index
-        // keyed to a snapshot no scan can see yet is inert (the scan-time
-        // snapshot check refuses it), so publishing it early is safe, while
-        // publishing it late would leave a window in which every lookup falls
-        // back to a full scan.
+        // Finish the secondary index before the visibility flip, which publishes
+        // it together with the snapshot. Finishing it after the flip would leave
+        // a window in which every lookup falls back to a full scan.
         self.table
-            .publish_lookup_index_for_snapshot(&self.new_snapshot_id)
+            .stage_lookup_index_for_snapshot(&self.new_snapshot_id)
             .await;
         // Publish the new snapshot as a single atomic visibility flip under the listing
         // fence (snapshot id + deletion caches + inline cache + listing swap), so a
@@ -594,23 +592,36 @@ impl CayenneTableProvider {
         // full write concurrency (no size cap on the fan-out). Deliberately NOT
         // sized from the bytes the probe buffered: that is only a lower bound, and
         // under-sharding a multi-GB refresh to one writer would serialize the encode.
-        let (row_count, _files_written, write_stats_acc) = self
-            .write_to_snapshot_range_partitioned(
-                data,
-                target_size_bytes,
-                &new_snapshot_id,
-                target_partitions,
-                None,
-                write_policy,
-                None,
-                lookup_index_observer,
-            )
-            .await?;
-
-        if !is_s3 {
-            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
-            Self::sync_snapshot_dir(&snapshot_dir).await?;
+        let written: Result<_> = async {
+            let written = self
+                .write_to_snapshot_range_partitioned(
+                    data,
+                    target_size_bytes,
+                    &new_snapshot_id,
+                    target_partitions,
+                    None,
+                    write_policy,
+                    None,
+                    lookup_index_observer,
+                )
+                .await?;
+            if !is_s3 {
+                let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+                Self::sync_snapshot_dir(&snapshot_dir).await?;
+            }
+            Ok(written)
         }
+        .await;
+        // A write that fails before it is prepared never reaches `rollback`, so
+        // its partial index build is dropped here rather than held until the
+        // next refresh.
+        let (row_count, _files_written, write_stats_acc) = match written {
+            Ok(written) => written,
+            Err(error) => {
+                self.discard_lookup_index_build();
+                return Err(error);
+            }
+        };
 
         // Manifest snapshot model: reserve ONE sequence `S` for this overwrite
         // and AUTHOR the new snapshot's manifest with `[S, S]` — every file was

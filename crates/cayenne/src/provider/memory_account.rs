@@ -157,16 +157,33 @@ impl CayenneMemoryAccount {
         state.resize_to_total();
     }
 
-    /// Account the resident bytes of the point-lookup index. Reset to 0 when the
-    /// index is dropped or replaced.
+    /// Reserves `bytes` of secondary-index memory in this table's account, or
+    /// `None` when the pool cannot fit them.
     ///
-    /// Unlike the deletion index this one is always safe to drop — a query that
-    /// loses it falls back to an ordinary scan — so the reservation is both
-    /// visibility AND the signal its own cap is derived against.
-    pub(crate) fn set_lookup_index_bytes(&self, bytes: usize) {
+    /// Unlike every other component this one is admitted, not just published:
+    /// an index is always safe to go without — a lookup that has none scans — so
+    /// when queries already hold the pool, the index is what gives way. The bytes
+    /// stay reserved until the returned reservation is dropped, which is when the
+    /// index itself is dropped, so a replaced, stale or abandoned index can never
+    /// leave its bytes behind.
+    pub(crate) fn try_reserve_lookup_index(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Option<LookupIndexReservation> {
         let mut state = self.state.lock();
-        state.lookup_index_bytes = bytes;
-        state.resize_to_total();
+        let lookup_index_bytes = state.lookup_index_bytes.checked_add(bytes)?;
+        let total = state
+            .keyset_bytes
+            .saturating_add(state.deletion_bytes)
+            .saturating_add(state.cold_existence_bytes)
+            .saturating_add(lookup_index_bytes);
+        state.reservation.try_resize(total).ok()?;
+        state.lookup_index_bytes = lookup_index_bytes;
+        drop(state);
+        Some(LookupIndexReservation {
+            account: Arc::clone(self),
+            bytes,
+        })
     }
 
     /// Current total reserved bytes (keyset + deletions + cold existence +
@@ -196,6 +213,35 @@ impl CayenneMemoryAccount {
             lookup_index: state.lookup_index_bytes,
             reserved: state.reservation.size(),
         }
+    }
+}
+
+/// Secondary-index bytes held in a table's account, released when dropped. See
+/// [`CayenneMemoryAccount::try_reserve_lookup_index`].
+pub(crate) struct LookupIndexReservation {
+    account: Arc<CayenneMemoryAccount>,
+    bytes: usize,
+}
+
+impl LookupIndexReservation {
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl std::fmt::Debug for LookupIndexReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LookupIndexReservation")
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for LookupIndexReservation {
+    fn drop(&mut self) {
+        let mut state = self.account.state.lock();
+        state.lookup_index_bytes = state.lookup_index_bytes.saturating_sub(self.bytes);
+        state.resize_to_total();
     }
 }
 

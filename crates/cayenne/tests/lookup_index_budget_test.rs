@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! The index's byte cap, and non-string key columns.
+//! Memory-pool admission of the secondary index, and non-string key columns.
 //!
-//! Its own test binary so its tables' caps stay independent of the other
-//! binary's, and its counters are not interleaved with theirs.
+//! Each table builds against its own bounded query memory pool, so what one
+//! table's index is admitted never depends on another's.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -34,7 +34,8 @@ use cayenne::provider::CayenneContext;
 use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 
 use datafusion::datasource::TableProvider;
-use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::SessionContext;
 
 const TABLE: &str = "svc_budget";
@@ -49,12 +50,23 @@ const SMALL_ROWS: usize = 4_000;
 
 /// A composite of an INT64 and a string: the encoding has to be type-general,
 /// which it only is because keys go through the `RowConverter`.
-const INDEX_KEY: &str = "TenantId+ServiceId";
-/// Chosen to separate the two fixtures with room to spare. The cap bounds what a
-/// build accumulates as well as the resident index: the 4,000-row build
-/// accumulates ~0.2 MiB and resides in ~55 KiB, while the 40,000-row build
-/// accumulates ~2 MiB, twice this, before it could compress anything.
-const MAX_BYTES: usize = 1024 * 1024;
+const INDEX_KEY: [&str; 2] = ["TenantId", "ServiceId"];
+/// The query memory pool each table builds its index against, chosen to separate
+/// the two fixtures with room to spare. The pool admits what a build accumulates
+/// as well as the resident index: the 4,000-row build accumulates ~0.2 MiB and
+/// resides in ~55 KiB, while the 40,000-row build accumulates ~2 MiB, twice
+/// this, before it could compress anything.
+const POOL_BYTES: usize = 1024 * 1024;
+
+/// A runtime whose query memory pool holds [`POOL_BYTES`].
+fn bounded_runtime() -> (Arc<RuntimeEnv>, Arc<dyn MemoryPool>) {
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(POOL_BYTES));
+    let runtime_env = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool))
+        .build_arc()
+        .expect("runtime env");
+    (runtime_env, pool)
+}
 
 fn service_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -103,8 +115,6 @@ async fn build_named(
 ) -> Arc<CayenneTableProvider> {
     let vortex_config = VortexConfig {
         target_vortex_file_size_mb: 1,
-        lookup_index_keys: vec![INDEX_KEY.to_string()],
-        lookup_index_max_bytes: Some(MAX_BYTES),
         ..VortexConfig::default()
     };
     let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), name);
@@ -122,6 +132,7 @@ async fn build_named(
     Arc::new(
         CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
+            .with_secondary_indexes(vec![INDEX_KEY.iter().map(|c| (*c).to_string()).collect()])
             .create(options)
             .await
             .expect("create table"),
@@ -169,30 +180,41 @@ fn rows_of(batches: &[RecordBatch]) -> usize {
     batches.iter().map(RecordBatch::num_rows).sum()
 }
 
-/// Over the cap, nothing is published and every query still answers correctly
-/// from the ordinary scan.
+/// When the memory pool cannot fit the index, nothing is published and every
+/// query still answers correctly from the ordinary scan.
 ///
-/// The index is the one piece of Cayenne state that is always safe to drop — a
-/// query that loses it scans instead — so exceeding the budget must degrade,
-/// never fail and never answer from a partial index.
+/// The index is the one piece of Cayenne state that is always safe to go
+/// without — a query that has none scans instead — so a pool that cannot fit it
+/// must degrade, never fail and never answer from a partial index.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_index_over_its_byte_cap_is_not_published() {
+async fn an_index_the_memory_pool_cannot_fit_is_not_published() {
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
-    let runtime_env = Arc::new(RuntimeEnv::default());
+    let (runtime_env, pool) = bounded_runtime();
     let table = build_table(&fixture, Arc::clone(&runtime_env)).await;
     overwrite(&table, service_rows(ROWS)).await;
 
-    // The write-time build ran and gave up; nothing may be published.
+    // The write-time build ran and was refused; nothing may be published.
     assert!(
         table.verify_lookup_index_against_read_back().await.is_err(),
-        "an index over the cap must not be published"
+        "an index the pool cannot fit must not be published"
     );
-    let counters = cayenne::lookup_index::counters_for_table(TABLE).expect("table has index state");
+    let counters = table
+        .lookup_index_counters()
+        .expect("table has index state");
     assert_eq!(
         counters.index_bytes, 0,
         "an unpublished index must reserve nothing: {counters:?}"
+    );
+    assert_eq!(
+        counters.builds_unpublished, 1,
+        "the refused write-time build must be counted: {counters:?}"
+    );
+    assert_eq!(
+        pool.reserved(),
+        0,
+        "a refused build must give back what it accumulated"
     );
 
     // Results are unaffected — the composite key resolves by ordinary scan.
@@ -203,7 +225,9 @@ async fn an_index_over_its_byte_cap_is_not_published() {
     );
     assert_eq!(rows_of(&query(&table, &sql).await), 1);
 
-    let counters = cayenne::lookup_index::counters_for_table(TABLE).expect("table has index state");
+    let counters = table
+        .lookup_index_counters()
+        .expect("table has index state");
     assert_eq!(
         counters.selected, 0,
         "no selection may be attached without a published index: {counters:?}"
@@ -214,7 +238,7 @@ async fn an_index_over_its_byte_cap_is_not_published() {
     );
     assert!(
         counters.unbuilt > 0,
-        "an over-cap table should record its probes as unbuilt: {counters:?}"
+        "a table the pool refused should record its probes as unbuilt: {counters:?}"
     );
 
     // Every row is still reachable.
@@ -232,13 +256,14 @@ async fn an_index_over_its_byte_cap_is_not_published() {
 ///
 /// Keys are held in their stored types and compared through the `RowConverter`
 /// encoding, so the index is not limited to string keys — and this is what keeps
-/// the cap test above honest, by showing the same key shape working when it fits.
+/// the refusal test above honest, by showing the same key shape working in the
+/// same size of pool when it fits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_mixed_type_composite_key_is_indexed() {
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
-    let runtime_env = Arc::new(RuntimeEnv::default());
+    let (runtime_env, pool) = bounded_runtime();
     let table = build_named(&fixture, Arc::clone(&runtime_env), SMALL_TABLE).await;
     overwrite(&table, service_rows(SMALL_ROWS)).await;
 
@@ -253,21 +278,28 @@ async fn a_mixed_type_composite_key_is_indexed() {
     );
     assert!(report.keys_compared > 0, "nothing compared: {report:?}");
 
-    let counters =
-        cayenne::lookup_index::counters_for_table(SMALL_TABLE).expect("table has index state");
+    let counters = table
+        .lookup_index_counters()
+        .expect("table has index state");
     assert!(
         counters.index_bytes > 0,
         "a published index must reserve its bytes: {counters:?}"
     );
+    assert!(
+        pool.reserved() >= usize::try_from(counters.index_bytes).expect("fits usize"),
+        "the index's bytes must be reserved in the pool: {} reserved, {counters:?}",
+        pool.reserved()
+    );
     println!(
-        "mixed-type index: {} bytes reserved against a {MAX_BYTES}-byte cap",
+        "mixed-type index: {} bytes reserved in a {POOL_BYTES}-byte pool",
         counters.index_bytes
     );
 
     // The INT64 half of the key resolves through the same encoding, including
     // the coercion a planner may apply to the literal.
-    let before =
-        cayenne::lookup_index::counters_for_table(SMALL_TABLE).expect("table has index state");
+    let before = table
+        .lookup_index_counters()
+        .expect("table has index state");
     let sql = format!(
         "SELECT \"AutoId\" FROM {SMALL_TABLE} WHERE \"TenantId\" = 42 \
          AND \"ServiceId\" = 'SV{:032x}' ORDER BY \"AutoId\"",
@@ -279,8 +311,9 @@ async fn a_mixed_type_composite_key_is_indexed() {
         1,
         "mixed-type lookup returned the wrong rows"
     );
-    let after =
-        cayenne::lookup_index::counters_for_table(SMALL_TABLE).expect("table has index state");
+    let after = table
+        .lookup_index_counters()
+        .expect("table has index state");
     assert_eq!(
         after.selected,
         before.selected + 1,

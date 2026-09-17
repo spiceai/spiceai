@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Correctness checks for the point-lookup index, run on
-//! the REAL scan path: two identical Cayenne tables over identical data, one
-//! configured with `cayenne_lookup_index_keys` and one without, so the same
-//! process compares an indexed scan against an ordinary one.
+//! Correctness checks for secondary indexes, run on the REAL scan path: two
+//! identical Cayenne tables over identical data, one declaring `indexes` and one
+//! without, so the same process compares an indexed scan against an ordinary
+//! one.
 //!
 //! The probe counters are the proof that the indexed arm really used file/row
 //! selection: an index that silently fell back would return identical rows and
@@ -47,16 +47,14 @@ const INDEXED: &str = "svc_indexed";
 /// The identical control table, built without index keys, so it always scans
 /// normally.
 const PLAIN: &str = "svc_plain";
-/// The plan-evidence test uses its own pair: index state is keyed per table for
-/// the whole process, so two tests sharing a table name would share (and
-/// interleave) each other's probe counters.
+/// The plan-evidence test uses its own pair of tables.
 const INDEXED_EVIDENCE: &str = "svc_indexed_evidence";
 const PLAIN_EVIDENCE: &str = "svc_plain_evidence";
-/// The write-time build test owns its own table for the same reason.
+/// The write-time build test owns its own table.
 const INDEXED_WRITE_TIME: &str = "svc_indexed_write_time";
 
-/// The indexed tables' `cayenne_lookup_index_keys`.
-const INDEX_KEYS: [&str; 2] = ["TenantId+ServiceId", "TenantId+PoolId"];
+/// The indexed tables' `indexes`, one column set per entry.
+const INDEX_KEYS: [&[&str]; 2] = [&["TenantId", "ServiceId"], &["TenantId", "PoolId"]];
 
 const ROWS: usize = 40_000;
 /// Accounts and pools are low-cardinality, so `(TenantId, PoolId)` is
@@ -163,7 +161,7 @@ fn service_rows(offset: i64, rows: usize) -> RecordBatch {
 async fn build_table(
     fixture: &common::TestFixture,
     table_name: &str,
-    index_keys: &[&str],
+    index_keys: &[&[&str]],
     runtime_env: Arc<RuntimeEnv>,
 ) -> Arc<CayenneTableProvider> {
     // A small target file size so the table spans several Vortex files and the
@@ -172,7 +170,6 @@ async fn build_table(
     // comparison.
     let vortex_config = VortexConfig {
         target_vortex_file_size_mb: 1,
-        lookup_index_keys: index_keys.iter().map(|k| (*k).to_string()).collect(),
         ..VortexConfig::default()
     };
     let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), table_name);
@@ -191,6 +188,12 @@ async fn build_table(
     Arc::new(
         CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
+            .with_secondary_indexes(
+                index_keys
+                    .iter()
+                    .map(|columns| columns.iter().map(|c| (*c).to_string()).collect())
+                    .collect(),
+            )
             .create(options)
             .await
             .expect("create table"),
@@ -272,12 +275,10 @@ fn rendered(batches: &[RecordBatch]) -> Vec<String> {
     rows
 }
 
-fn counters_of(table: &str) -> cayenne::lookup_index::LookupIndexCounters {
-    cayenne::lookup_index::counters_for_table(table).expect("indexed table has index state")
-}
-
-fn counters() -> cayenne::lookup_index::LookupIndexCounters {
-    counters_of(INDEXED)
+fn counters_of(provider: &Arc<CayenneTableProvider>) -> cayenne::lookup_index::LookupIndexCounters {
+    provider
+        .lookup_index_counters()
+        .expect("indexed table has index state")
 }
 
 /// Issues a probe-shaped query until the background build publishes an index.
@@ -289,13 +290,13 @@ async fn wait_for_index(provider: &Arc<CayenneTableProvider>, table: &str) {
     let deadline = Instant::now() + Duration::from_mins(2);
     loop {
         let _ = query(provider, table, &sql).await;
-        if counters_of(table).access_plans_attached > 0 {
+        if counters_of(provider).access_plans_attached > 0 {
             return;
         }
         assert!(
             Instant::now() < deadline,
             "point-lookup index was never published: {:?}",
-            counters_of(table)
+            counters_of(provider)
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -316,7 +317,7 @@ async fn lookup_index_matches_the_ordinary_scan() {
     insert(&plain, PLAIN, batch).await;
 
     wait_for_index(&indexed, INDEXED).await;
-    let before = counters();
+    let before = counters_of(&indexed);
     assert_eq!(
         before.snapshot_mismatch, 0,
         "the index must bind to the snapshot it was built from"
@@ -364,7 +365,7 @@ async fn lookup_index_matches_the_ordinary_scan() {
 
     // Both lookup shapes must have gone through file/row selection, not a
     // silent fallback to the ordinary scan.
-    let after_sample = counters();
+    let after_sample = counters_of(&indexed);
     let probes = (after_sample.selected + after_sample.empty) - (before.selected + before.empty);
     assert_eq!(
         probes, 40,
@@ -443,7 +444,7 @@ async fn lookup_index_matches_the_ordinary_scan() {
     );
     assert!(rendered(&query(&plain, PLAIN, &miss_sql.replace("{table}", PLAIN)).await).is_empty());
     assert!(
-        counters().empty > 0,
+        counters_of(&indexed).empty > 0,
         "a complete index miss should be recorded as an empty probe"
     );
 
@@ -461,7 +462,7 @@ async fn lookup_index_matches_the_ordinary_scan() {
 
     // --- Rows written after the index was built move the snapshot. The index
     //     must refuse itself rather than answer from stale row addresses.
-    let mismatch_before = counters().snapshot_mismatch;
+    let mismatch_before = counters_of(&indexed).snapshot_mismatch;
     let new_batch = service_rows(2_000_000, 256);
     insert(&indexed, INDEXED, new_batch.clone()).await;
     insert(&plain, PLAIN, new_batch).await;
@@ -480,15 +481,15 @@ async fn lookup_index_matches_the_ordinary_scan() {
         new_indexed.len(),
         1,
         "a row written after the index build was lost: {:?}",
-        counters()
+        counters_of(&indexed)
     );
     assert_eq!(new_indexed, new_plain);
     assert!(
-        counters().snapshot_mismatch > mismatch_before
-            || counters().unbuilt > before.unbuilt
-            || counters().access_plans_attached > after_sample.access_plans_attached,
+        counters_of(&indexed).snapshot_mismatch > mismatch_before
+            || counters_of(&indexed).unbuilt > before.unbuilt
+            || counters_of(&indexed).access_plans_attached > after_sample.access_plans_attached,
         "the moved snapshot was neither refused nor re-indexed: {:?}",
-        counters()
+        counters_of(&indexed)
     );
 
     // Every row of the moved snapshot must still be reachable on both arms.
@@ -504,7 +505,7 @@ async fn lookup_index_matches_the_ordinary_scan() {
         rendered(&query(&plain, PLAIN, &format!("SELECT COUNT(*) FROM {PLAIN}")).await);
     assert_eq!(total_indexed, total_plain);
 
-    println!("lookup-index counters: {:?}", counters());
+    println!("lookup-index counters: {:?}", counters_of(&indexed));
 }
 
 /// Prints the executed plan for one lookup on each arm. The scan-level metrics
@@ -545,7 +546,7 @@ async fn lookup_index_plan_evidence() {
             .to_string();
         println!("=== {table} ===\n{text}");
     }
-    println!("lookup-index counters: {:?}", counters_of(INDEXED_EVIDENCE));
+    println!("lookup-index counters: {:?}", counters_of(&indexed));
 }
 
 /// The write-time index must be indistinguishable from one built by reading the
@@ -573,7 +574,7 @@ async fn write_time_index_matches_a_read_back_build() {
 
     // No query has run yet, so nothing could have triggered a read-back build:
     // an index published at this point can only have come from the write.
-    let after_write = counters_of(INDEXED_WRITE_TIME);
+    let after_write = counters_of(&table);
     assert_eq!(
         after_write.unbuilt, 0,
         "a probe fell back before any query ran: {after_write:?}"
@@ -611,7 +612,7 @@ async fn write_time_index_matches_a_read_back_build() {
 
     // The index must be usable on the FIRST query after the overwrite — that is
     // the whole point of building it before the snapshot goes visible.
-    let before = counters_of(INDEXED_WRITE_TIME);
+    let before = counters_of(&table);
     let sql = format!(
         "SELECT * FROM {INDEXED_WRITE_TIME} WHERE \"TenantId\" = '{DUP_ACCOUNT}' \
          AND \"ServiceId\" = '{DUP_APPLICATION}' AND \"Active\" = 1 LIMIT 1"
@@ -622,7 +623,7 @@ async fn write_time_index_matches_a_read_back_build() {
         1,
         "first post-overwrite lookup returned nothing"
     );
-    let after = counters_of(INDEXED_WRITE_TIME);
+    let after = counters_of(&table);
     assert_eq!(
         after.selected,
         before.selected + 1,
@@ -653,14 +654,14 @@ async fn write_time_index_matches_a_read_back_build() {
     let new_id = 3_000_000i64 + 11;
     let new_account = format!("AC{:032x}", new_id % ACCOUNTS);
     let new_application = format!("MG{new_id:032x}");
-    let before = counters_of(INDEXED_WRITE_TIME);
+    let before = counters_of(&table);
     let sql = format!(
         "SELECT \"AutoId\" FROM {INDEXED_WRITE_TIME} WHERE \"TenantId\" = '{new_account}' \
          AND \"ServiceId\" = '{new_application}' ORDER BY \"AutoId\""
     );
     let rows = rendered(&query(&table, INDEXED_WRITE_TIME, &sql).await);
     assert_eq!(rows, vec![new_id.to_string()]);
-    let after = counters_of(INDEXED_WRITE_TIME);
+    let after = counters_of(&table);
     assert_eq!(
         after.selected,
         before.selected + 1,

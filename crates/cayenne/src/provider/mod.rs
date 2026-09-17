@@ -92,6 +92,7 @@ pub(crate) mod maintenance_metrics;
 pub(crate) mod manifest;
 pub(crate) mod mem_tier;
 pub(crate) mod mem_tier_budget;
+pub(crate) mod mem_tier_index;
 pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
 pub(crate) mod on_conflict;
