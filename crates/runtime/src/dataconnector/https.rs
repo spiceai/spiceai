@@ -1617,6 +1617,20 @@ fn parse_http_json_nesting(dataset: &DatasetSpec) -> DataConnectorResult<Option<
         metadata_fields.insert("_fetched_at".to_string());
     }
 
+    // `caching_stale_if_error` tells a transient origin failure from real
+    // data by the row's `response_status` (see `cache::batches_cacheable`).
+    // Force it into the schema the same way as `_fetched_at` above, so the
+    // fallback actually engages for a JSON-decomposed dataset instead of
+    // silently never detecting the failure because the column never existed.
+    let stale_if_error_enabled = dataset
+        .acceleration
+        .as_ref()
+        .is_some_and(|acceleration| acceleration.caching_stale_if_error.serves_stale_on_error());
+    if stale_if_error_enabled && !column_order.iter().any(|n| n == "response_status") {
+        column_order.push("response_status".to_string());
+        metadata_fields.insert("response_status".to_string());
+    }
+
     Ok(Some(HttpJsonNesting::new(
         column_order,
         json_column.name.clone(),
@@ -2130,7 +2144,7 @@ data_connector_api::register_data_connector!(
 mod tests {
     use super::*;
     use crate::component::dataset::Dataset;
-    use crate::component::dataset::acceleration::Acceleration;
+    use crate::component::dataset::acceleration::{Acceleration, StaleIfError};
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::parameters::RuntimeConnectorContext;
     use crate::parameters::Parameters;
@@ -3724,6 +3738,89 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         assert!(!nesting.static_fields().contains("response_status"));
         assert!(!nesting.static_fields().contains("_fetched_at"));
         assert!(nesting.static_fields().contains("id"));
+    }
+
+    /// Regression test for #14157: without this, a `refresh_mode: caching`
+    /// dataset with `caching_stale_if_error: enabled` that decomposes JSON
+    /// into named columns never carries `response_status` unless the user
+    /// happens to declare it, so `cache::batches_cacheable` can never see a
+    /// transient origin failure and the stale-if-error fallback silently
+    /// never engages.
+    #[tokio::test]
+    async fn parse_http_json_nesting_force_includes_response_status_when_stale_if_error_enabled() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Caching, None).await;
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            refresh_mode: Some(RefreshMode::Caching),
+            caching_stale_if_error: StaleIfError::Enabled,
+            ..Default::default()
+        });
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("version"),
+            column_with_marker("extra", Value::String("*".to_string())),
+        ];
+
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting) when marker is present");
+
+        assert!(
+            nesting.column_order.iter().any(|n| n == "response_status"),
+            "response_status must be force-included so stale-if-error can detect a transient failure"
+        );
+        assert!(nesting.metadata_fields.contains("response_status"));
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_leaves_response_status_out_when_stale_if_error_disabled() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Caching, None).await;
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            refresh_mode: Some(RefreshMode::Caching),
+            caching_stale_if_error: StaleIfError::Disabled,
+            ..Default::default()
+        });
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("version"),
+            column_with_marker("extra", Value::String("*".to_string())),
+        ];
+
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting) when marker is present");
+
+        assert!(
+            !nesting.column_order.iter().any(|n| n == "response_status"),
+            "response_status should not appear unless stale-if-error needs it"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_force_includes_response_status_for_a_finite_stale_if_error_window()
+     {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Caching, None).await;
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            refresh_mode: Some(RefreshMode::Caching),
+            caching_stale_if_error: StaleIfError::For(std::time::Duration::from_secs(60)),
+            ..Default::default()
+        });
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("version"),
+            column_with_marker("extra", Value::String("*".to_string())),
+        ];
+
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting) when marker is present");
+
+        assert!(
+            nesting.column_order.iter().any(|n| n == "response_status"),
+            "a finite stale-if-error window also needs response_status to detect a transient failure"
+        );
     }
 
     #[tokio::test]
