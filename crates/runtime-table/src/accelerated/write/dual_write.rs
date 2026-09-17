@@ -281,6 +281,13 @@ async fn write_all_with_partitioned_cayenne(
             )
         })?;
 
+    // Each partition's staged append below holds that partition's write lock
+    // until the commit at the end, and partitions are staged in the order the
+    // input reaches them. Holding the table's write coordinator for the whole
+    // write keeps this from taking those locks in the opposite order to a
+    // concurrent refresh, append, or dual write on the same table.
+    let _write_coordinator = partitioned.write_coordinator().lock_owned().await;
+
     let schema = data.schema();
     let physical_exprs = create_partition_physical_exprs(partitioned, Arc::clone(&schema))?;
     let (source_tx, source_rx) = mpsc::channel(8);
@@ -900,5 +907,205 @@ mod tests {
             .await
             .expect_err("update should fail");
         assert!(err.to_string().contains("accelerator update failed"));
+    }
+
+    /// A partitioned dual write stages partitions in the order its input reaches
+    /// them, holding each partition's write lock until it commits. It must share
+    /// the table's write coordinator with every other writer that stages several
+    /// partitions, or a writer holding partition `a` that then needs `b`
+    /// deadlocks against a dual write holding `b` that needs `a`.
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn partitioned_dual_write_serializes_with_other_multi_partition_writers() {
+        use std::time::Duration;
+
+        use arrow::array::{Int64Array, StringArray};
+        use cayenne::metadata::{CreateTableOptions, VortexConfig};
+        use cayenne::{
+            CayenneCatalog, CayennePartitionCreator, CayenneTableProvider, MetadataCatalog,
+        };
+        use datafusion::catalog::TableProvider;
+        use datafusion::datasource::MemTable;
+        use datafusion::logical_expr::col;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use datafusion::scalar::ScalarValue;
+        use datafusion::sql::TableReference;
+        use datafusion_table_providers::UnsupportedTypeAction;
+        use runtime_component::dataset::acceleration::RefreshMode;
+        use runtime_table_partition::expression::PartitionedBy;
+        use runtime_table_partition::provider::PartitionTableProvider;
+        use tokio::sync::{Mutex, RwLock, mpsc};
+        use tokio_stream::wrappers::ReceiverStream;
+
+        use crate::accelerated::refresh::{Refresh, Refresher};
+        use crate::federated::FederatedTable;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("k", DataType::Utf8, false),
+        ]));
+        let rows = |ids: Vec<i64>, key: &str| {
+            let keys = vec![key; ids.len()];
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(keys)),
+                ],
+            )
+            .expect("rows match the schema")
+        };
+        let nothing = || -> SendableRecordBatchStream {
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::empty(),
+            ))
+        };
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!(
+                "sqlite://{}",
+                dir.path().join("cayenne.db").display()
+            ))
+            .expect("catalog"),
+        );
+        catalog.init().await.expect("catalog initializes");
+        let data_path = dir.path().join("data");
+        std::fs::create_dir_all(&data_path).expect("data dir");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "events".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: Vec::new(),
+                on_conflict: None,
+                base_path: data_path.display().to_string(),
+                partition_column: Some("k".to_string()),
+                vortex_config: VortexConfig::default(),
+            })
+            .await
+            .expect("partitioned table registers");
+        let partition_by = vec![PartitionedBy {
+            name: "k".to_string(),
+            expression: col("k"),
+        }];
+        let creator = Arc::new(
+            CayennePartitionCreator::new(
+                "events".to_string(),
+                data_path,
+                partition_by.clone(),
+                Arc::clone(&schema),
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                table_id,
+                UnsupportedTypeAction::Error,
+                Vec::new(),
+                None,
+                VortexConfig::default(),
+                None,
+                Vec::new(),
+                None,
+                SessionContext::new().runtime_env(),
+            )
+            .with_direct_partition_writes(),
+        );
+        let partitioned = Arc::new(
+            PartitionTableProvider::new(creator, partition_by, Arc::clone(&schema))
+                .await
+                .expect("partitioned provider"),
+        );
+        let partition = |key: &str| {
+            let partitioned = Arc::clone(&partitioned);
+            let key = key.to_string();
+            async move {
+                partitioned
+                    .get_or_create_partition_provider(vec![ScalarValue::Utf8(Some(key))])
+                    .await
+                    .expect("partition")
+                    .downcast_ref::<CayenneTableProvider>()
+                    .expect("a Cayenne partition")
+                    .clone_for_write_operations()
+            }
+        };
+
+        let federated = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated table"),
+        ) as Arc<dyn TableProvider>;
+        let refresher = Arc::new(Refresher::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("events"),
+            Arc::new(FederatedTable::new_unchecked(Arc::clone(&federated))),
+            None,
+            Arc::new(RwLock::new(Refresh::new(RefreshMode::Full))),
+            Arc::clone(&partitioned) as Arc<dyn TableProvider>,
+            None,
+            None,
+            tokio::runtime::Handle::current(),
+            Arc::new(Mutex::new(())),
+        ));
+
+        // Another multi-partition writer holds the coordinator and has staged `a`.
+        let coordinator = partitioned.write_coordinator().lock_owned().await;
+        let staged_a = partition("a")
+            .await
+            .begin_overwrite(nothing(), 1)
+            .await
+            .expect("stage a");
+
+        // The dual write reaches `b` first, then `a`.
+        let (input, input_rx) = mpsc::channel(4);
+        let dual_write = tokio::spawn(super::write_all_with_partitioned_cayenne(
+            refresher,
+            Arc::clone(&partitioned) as Arc<dyn TableProvider>,
+            Arc::clone(&federated),
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                ReceiverStream::new(input_rx),
+            )),
+            1,
+        ));
+        input
+            .send(Ok(rows(vec![1, 2], "b")))
+            .await
+            .expect("the dual write accepts input");
+        // Give a dual write that ignores the coordinator every chance to take `b`
+        // before it sees `a`: poll until something holds `b`, briefly releasing
+        // each probe that gets it.
+        let b = partition("b").await;
+        for _ in 0..40 {
+            match tokio::time::timeout(Duration::from_millis(50), b.begin_overwrite(nothing(), 1))
+                .await
+            {
+                Ok(probe) => {
+                    probe
+                        .expect("probe b")
+                        .rollback()
+                        .await
+                        .expect("release the probe");
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        input
+            .send(Ok(rows(vec![3], "a")))
+            .await
+            .expect("the dual write accepts input");
+
+        let staged_b =
+            tokio::time::timeout(Duration::from_secs(10), b.begin_overwrite(nothing(), 1))
+                .await
+                .expect("staging `b` must not wait on a dual write that is waiting for `a`")
+                .expect("stage b");
+        staged_b.rollback().await.expect("roll back b");
+        staged_a.rollback().await.expect("roll back a");
+        drop(coordinator);
+        drop(input);
+
+        let written = tokio::time::timeout(Duration::from_secs(30), dual_write)
+            .await
+            .expect("the dual write finishes once the coordinator is free")
+            .expect("the dual write task joins")
+            .expect("the dual write succeeds");
+        assert_eq!(written, 3);
     }
 }
