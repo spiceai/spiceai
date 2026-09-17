@@ -621,6 +621,12 @@ pub fn statistics_to_persisted_blob(stats: &Statistics, schema: &Schema) -> Opti
 /// Copy min/max onto `column_type`, rescaling decimal unscaled values when
 /// the bound's scale is narrower. A bound that cannot be represented as
 /// `column_type` is dropped rather than persisted at the wrong scale.
+///
+/// `sum_value` is not retagged onto the column type (Vortex `SUM` widens
+/// precision by 10). A decimal sum whose scale disagrees with the column is
+/// dropped: the blob stores unscaled integers and decode uses the schema
+/// scale, so a scale-4 sum persisted against a scale-2 column would restore
+/// as 100× too large.
 fn align_column_stats_to_schema(cs: &ColumnStatistics, column_type: &DataType) -> ColumnStatistics {
     let align = |bound: &Precision<ScalarValue>| -> Precision<ScalarValue> {
         let Some(value) = bound.get_value() else {
@@ -632,10 +638,27 @@ fn align_column_stats_to_schema(cs: &ColumnStatistics, column_type: &DataType) -
             None => Precision::Absent,
         }
     };
+    let sum_value = match (cs.sum_value.get_value(), column_decimal_scale(column_type)) {
+        (Some(sum), Some(column_scale)) if decimal_scale(sum) != Some(column_scale) => {
+            Precision::Absent
+        }
+        _ => cs.sum_value.clone(),
+    };
     ColumnStatistics {
         min_value: align(&cs.min_value),
         max_value: align(&cs.max_value),
+        sum_value,
         ..cs.clone()
+    }
+}
+
+fn column_decimal_scale(data_type: &DataType) -> Option<i8> {
+    match data_type {
+        DataType::Decimal32(_, scale)
+        | DataType::Decimal64(_, scale)
+        | DataType::Decimal128(_, scale)
+        | DataType::Decimal256(_, scale) => Some(*scale),
+        _ => None,
     }
 }
 
@@ -1240,6 +1263,61 @@ mod tests {
         assert_eq!(
             restored.column_statistics[0].max_value,
             DfPrecision::Exact(ScalarValue::Time32Second(Some(9)))
+        );
+    }
+
+    /// A live scale widening infers footer stats at the new scale, then this
+    /// helper used to persist them against the frozen open-time schema. Vortex
+    /// stores unscaled integers; restoring that blob at scale 2 turned
+    /// 123.4500 (unscaled 1_234_500) into 12345.00. Drop the sum rather than
+    /// let `SUM`/`AVG` fold the mis-scaled value.
+    #[test]
+    fn decimal_sum_is_dropped_when_persisted_against_a_narrower_scale() {
+        let live = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(14, 4),
+            true,
+        )]);
+        let frozen = Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(10, 2),
+            true,
+        )]);
+        let stats = Statistics {
+            num_rows: DfPrecision::Exact(1),
+            total_byte_size: DfPrecision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: DfPrecision::Exact(0),
+                min_value: DfPrecision::Exact(ScalarValue::Decimal128(Some(1_234_500), 14, 4)),
+                max_value: DfPrecision::Exact(ScalarValue::Decimal128(Some(1_234_500), 14, 4)),
+                sum_value: DfPrecision::Exact(ScalarValue::Decimal128(Some(1_234_500), 14, 4)),
+                distinct_count: DfPrecision::Absent,
+                byte_size: DfPrecision::Absent,
+            }],
+        };
+        let blob = statistics_to_persisted_blob(&stats, &frozen).expect("blob serializes");
+        let restored = statistics_from_persisted_blob(&blob, &frozen, 1).expect("blob restores");
+        assert_eq!(
+            restored.column_statistics[0].sum_value,
+            DfPrecision::Absent,
+            "a scale-4 sum persisted against a scale-2 schema must not restore as 12345.00"
+        );
+        assert_ne!(
+            restored.column_statistics[0].sum_value,
+            DfPrecision::Exact(ScalarValue::Decimal128(Some(1_234_500), 10, 2)),
+            "the unscaled integer 1234500 at scale 2 is 12345.00, not 123.45"
+        );
+
+        let matched = statistics_to_persisted_blob(&stats, &live).expect("live blob serializes");
+        let live_restored =
+            statistics_from_persisted_blob(&matched, &live, 1).expect("live blob restores");
+        assert!(
+            matches!(
+                &live_restored.column_statistics[0].sum_value,
+                DfPrecision::Exact(ScalarValue::Decimal128(Some(1_234_500), _, 4))
+            ),
+            "the unscaled sum must survive at scale 4 when persist and restore use the live schema, got {:?}",
+            live_restored.column_statistics[0].sum_value
         );
     }
 

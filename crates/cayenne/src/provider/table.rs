@@ -21297,7 +21297,7 @@ impl CayenneTableProvider {
             let row_count = inferred_row_count.unwrap_or(0);
             total_rows += u64::try_from(row_count.max(0)).unwrap_or(0);
             let statistics_blob =
-                crate::stats::statistics_to_persisted_blob(&stats, &self.table_metadata.schema)
+                crate::stats::statistics_to_persisted_blob(&stats, &self.table_schema())
                     .unwrap_or_else(|| {
                         tracing::warn!(
                             target: "cayenne::compaction",
@@ -32492,7 +32492,7 @@ impl CayenneTableProvider {
             let mut part_file = PartitionedFile::from(object_meta);
             if let Some(stats) = crate::stats::statistics_from_persisted_blob(
                 &file.statistics_blob,
-                &self.table_metadata.schema,
+                &self.table_schema(),
                 file.row_count,
             ) {
                 part_file = part_file.with_statistics(stats);
@@ -32929,7 +32929,7 @@ impl CayenneTableProvider {
             && persisted.file_size_bytes == file_size_bytes
             && let Some(statistics) = crate::stats::statistics_from_persisted_blob(
                 &persisted.statistics_blob,
-                &self.table_metadata.schema,
+                &self.table_schema(),
                 persisted.num_rows,
             )
             // A blob written before per-column byte sizes were persisted carries no
@@ -32961,10 +32961,9 @@ impl CayenneTableProvider {
                 .await?,
         );
 
-        if let Some(blob) = crate::stats::statistics_to_persisted_blob(
-            statistics.as_ref(),
-            &self.table_metadata.schema,
-        ) {
+        if let Some(blob) =
+            crate::stats::statistics_to_persisted_blob(statistics.as_ref(), &self.table_schema())
+        {
             let num_rows = match statistics.num_rows {
                 DFPrecision::Exact(rows) | DFPrecision::Inexact(rows) => {
                     i64::try_from(rows).unwrap_or(0)
