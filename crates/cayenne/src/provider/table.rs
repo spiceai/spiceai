@@ -4521,12 +4521,15 @@ impl CayenneTableProvider {
     ///    adapts them to the evolved schema (missing-column null-fill +
     ///    widened-type cast in the Vortex opener).
     /// 4. Under one held `listing_fence.write()`: persist the evolved schema
-    ///    to the metastore (`update_table_schema`), swap the in-memory
-    ///    [`Self::table_schema`], re-derive the cached optimizer statistics at
-    ///    the new width, clear stale per-file statistics, and rebuild the
-    ///    listing table — so a scan observes either the old schema entirely
-    ///    or the new one entirely. In-flight scans keep the `SchemaRef` they
-    ///    already loaded (old files under the old schema stay valid).
+    ///    to the metastore (`update_table_schema`, or
+    ///    `update_table_schema_dropping_statistics` when a decimal scale
+    ///    change would mis-decode leftover unscaled min/max), swap the
+    ///    in-memory [`Self::table_schema`], re-derive the cached optimizer
+    ///    statistics at the new width (or drop them on a scale change),
+    ///    clear stale per-file statistics, and rebuild the listing table —
+    ///    so a scan observes either the old schema entirely or the new one
+    ///    entirely. In-flight scans keep the `SchemaRef` they already loaded
+    ///    (old files under the old schema stay valid).
     ///
     /// Idempotent: re-applying a plan whose evolved schema is already live is
     /// a no-op; a crash between the metastore UPDATE and the swap is healed by
@@ -4608,10 +4611,21 @@ impl CayenneTableProvider {
         // Step 4: publish.
         {
             let _fence = self.listing_fence.write().await;
-            self.catalog
-                .update_table_schema(&self.table_metadata.table_id, &plan.evolved_schema)
-                .await
-                .map_err(|source| Error::Catalog { source })?;
+            let drop_decimal_stats = plan.changes_decimal_scale();
+            if drop_decimal_stats {
+                self.catalog
+                    .update_table_schema_dropping_statistics(
+                        &self.table_metadata.table_id,
+                        &plan.evolved_schema,
+                    )
+                    .await
+                    .map_err(|source| Error::Catalog { source })?;
+            } else {
+                self.catalog
+                    .update_table_schema(&self.table_metadata.table_id, &plan.evolved_schema)
+                    .await
+                    .map_err(|source| Error::Catalog { source })?;
+            }
             self.table_schema.store(Arc::clone(&plan.evolved_schema));
             {
                 // Cached optimizer statistics are column-indexed against the
@@ -4619,24 +4633,34 @@ impl CayenneTableProvider {
                 // == schema width); re-derive from the raw blob at the evolved
                 // width. A blob that no longer deserializes (widened column
                 // stat dtypes) degrades to None — unknown stats, never wrong.
+                // A decimal *scale* change cannot re-derive: the blob's
+                // unscaled integers would decode at the new scale (123.45 at
+                // scale 2 becomes 1.2345 at scale 4) and prune matching rows.
                 let mut stats_cache = self.table_statistics.write();
-                let df_stats = stats_cache
-                    .raw
-                    .as_ref()
-                    .and_then(|raw| Self::table_statistics_to_df(&plan.evolved_schema, raw));
-                stats_cache.optimizer_inexact = df_stats
-                    .as_ref()
-                    .map(|s| Self::statistics_to_inexact(s.clone()));
-                stats_cache.optimizer = df_stats;
-                // Preserve the exactness of the (unchanged) count across the
-                // schema-width re-derivation. Conservative when `raw` is cold
-                // (pre-first-persist): treat the count as NOT exact rather than
-                // trusting it — `optimizer` is `None` in that case too, so nothing
-                // is served, but this never leaves a stale-Exact flag behind.
-                stats_cache.count_exact = stats_cache
-                    .raw
-                    .as_ref()
-                    .is_some_and(|raw| raw.num_rows_exact);
+                if drop_decimal_stats {
+                    stats_cache.raw = None;
+                    stats_cache.optimizer = None;
+                    stats_cache.optimizer_inexact = None;
+                    stats_cache.count_exact = false;
+                } else {
+                    let df_stats = stats_cache
+                        .raw
+                        .as_ref()
+                        .and_then(|raw| Self::table_statistics_to_df(&plan.evolved_schema, raw));
+                    stats_cache.optimizer_inexact = df_stats
+                        .as_ref()
+                        .map(|s| Self::statistics_to_inexact(s.clone()));
+                    stats_cache.optimizer = df_stats;
+                    // Preserve the exactness of the (unchanged) count across the
+                    // schema-width re-derivation. Conservative when `raw` is cold
+                    // (pre-first-persist): treat the count as NOT exact rather than
+                    // trusting it — `optimizer` is `None` in that case too, so nothing
+                    // is served, but this never leaves a stale-Exact flag behind.
+                    stats_cache.count_exact = stats_cache
+                        .raw
+                        .as_ref()
+                        .is_some_and(|raw| raw.num_rows_exact);
+                }
             }
             // Per-file statistics were inferred against the old logical schema
             // width; drop them so the next scan re-infers at the evolved width.
@@ -10533,7 +10557,7 @@ impl CayenneTableProvider {
             })
             .ok()?;
 
-        let mut df_stats = crate::stats::file_statistics_to_df(&file_stats, stats.num_rows);
+        let mut df_stats = crate::stats::file_statistics_to_df(&file_stats, schema, stats.num_rows);
 
         // Overlay per-column NDV estimates from the HyperLogLog sketches as
         // `distinct_count`. The cluster reporter uses this to encode an
@@ -21333,7 +21357,7 @@ impl CayenneTableProvider {
             let row_count = inferred_row_count.unwrap_or(0);
             total_rows += u64::try_from(row_count.max(0)).unwrap_or(0);
             let statistics_blob =
-                crate::stats::statistics_to_persisted_blob(&stats, &self.table_metadata.schema)
+                crate::stats::statistics_to_persisted_blob(&stats, &self.table_schema())
                     .unwrap_or_else(|| {
                         tracing::warn!(
                             target: "cayenne::compaction",
@@ -32592,7 +32616,7 @@ impl CayenneTableProvider {
             let mut part_file = PartitionedFile::from(object_meta);
             if let Some(stats) = crate::stats::statistics_from_persisted_blob(
                 &file.statistics_blob,
-                &self.table_metadata.schema,
+                &self.table_schema(),
                 file.row_count,
             ) {
                 part_file = part_file.with_statistics(stats);
@@ -33029,7 +33053,7 @@ impl CayenneTableProvider {
             && persisted.file_size_bytes == file_size_bytes
             && let Some(statistics) = crate::stats::statistics_from_persisted_blob(
                 &persisted.statistics_blob,
-                &self.table_metadata.schema,
+                &self.table_schema(),
                 persisted.num_rows,
             )
             // A blob written before per-column byte sizes were persisted carries no
@@ -33061,10 +33085,9 @@ impl CayenneTableProvider {
                 .await?,
         );
 
-        if let Some(blob) = crate::stats::statistics_to_persisted_blob(
-            statistics.as_ref(),
-            &self.table_metadata.schema,
-        ) {
+        if let Some(blob) =
+            crate::stats::statistics_to_persisted_blob(statistics.as_ref(), &self.table_schema())
+        {
             let num_rows = match statistics.num_rows {
                 DFPrecision::Exact(rows) | DFPrecision::Inexact(rows) => {
                     i64::try_from(rows).unwrap_or(0)
