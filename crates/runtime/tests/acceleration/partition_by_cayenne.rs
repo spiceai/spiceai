@@ -320,13 +320,8 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
 ///
 /// This test verifies that multiple partition expressions work together:
 /// - `partition_by`: [bucket(3, id), bucket(2, score)]
-///
-/// NOTE: This test is currently disabled due to data duplication issues.
-/// The single bucket partition test (`test_cayenne_partition_by_bucket`) validates
-/// the core functionality of `partition_by` with `bucket()` expressions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
-#[ignore = "Data duplication issue with multiple partition expressions - needs investigation"]
 async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
