@@ -322,6 +322,65 @@ async fn file_connector_partition_only_scan_probes_first_record() -> Result<(), 
         .await
 }
 
+/// Regression test: a partition-only `DISTINCT` filtered by a predicate over a
+/// data column must apply that predicate. Every file in `hivepart` has an exact
+/// Parquet row count, so the rewrite's statistics fast path is reachable — but
+/// that path synthesizes a row from each file's *unfiltered* row count, with no
+/// way to evaluate a predicate pushed into the file source. It must instead
+/// fall back to the first-record probe, which decides whether a file
+/// contributes a row through the same filtered decode path a full scan would
+/// use.
+#[tokio::test]
+async fn file_connector_partition_only_scan_respects_filter() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let (_dir, dataset) = hive_partitioned_dataset()?;
+            let app = AppBuilder::new("file_connector")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            // `value` is `id * p` for `id` in `0..5`, always non-negative, so no
+            // row in any partition matches `value = -1`: the correct answer is
+            // zero partitions. A rewrite that ignored the predicate would
+            // synthesize a row for all three partitions from their (unfiltered)
+            // exact row counts.
+            run_query_and_check_results(
+                &mut rt,
+                "file_connector_partition_only_scan_respects_filter",
+                "SELECT p FROM hivepart WHERE value = -1 GROUP BY p",
+                false,
+                Some(|result_batches: Vec<arrow::array::RecordBatch>| {
+                    let rows: usize = result_batches
+                        .iter()
+                        .map(arrow::array::RecordBatch::num_rows)
+                        .sum();
+                    assert_eq!(
+                        rows, 0,
+                        "no row matches `value = -1`, so no partition qualifies"
+                    );
+                }),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            Ok(())
+        })
+        .await
+}
+
 pub fn get_dataset() -> Result<Dataset, anyhow::Error> {
     // if tests are running with `cargo test --package runtime`, this path is relative to the `runtime` crate
     // if tests are running as a built binary, this path is relative to the binary.

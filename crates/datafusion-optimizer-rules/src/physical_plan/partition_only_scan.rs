@@ -70,6 +70,13 @@ limitations under the License.
 //! cannot change the result. The statistics fast path synthesizes that row from
 //! partition values, so it applies only to a partition-only projection; a
 //! metadata column (whose value is not in the partition list) takes the probe.
+//!
+//! A predicate pushed into the file source itself (`FileSource::filter()`, e.g.
+//! Parquet row-group/page pruning) is a third reason a file may contribute no
+//! row, on top of the file being empty — and the cached statistics describe the
+//! *unfiltered* file, so the fast path cannot evaluate it. Such a scan always
+//! takes the first-record probe instead, which decides whether a file yields a
+//! row through the same filtered decode path a full scan would use.
 
 use std::sync::Arc;
 
@@ -299,10 +306,23 @@ fn partition_only_file_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&FileScanCo
 /// Statistics fast path: when every file has an **exact** row count, build an
 /// in-memory source of one row per non-empty file from the cached partition
 /// values, touching no file. Returns `None` when any file's row count is not
-/// exactly known, so the caller falls back to the first-record probe.
+/// exactly known, or when the scan carries a pushed-down source filter (whose
+/// effect on which files are non-empty these statistics cannot capture), so the
+/// caller falls back to the first-record probe.
 fn try_partition_values_memory_source(
     config: &FileScanConfig,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    // A predicate pushed into the file source (e.g. Parquet row-group/page
+    // pruning) decides which *rows* count, so it decides whether a file
+    // contributes a partition tuple at all — but this fast path synthesizes a
+    // row from each file's unfiltered exact row count, with no way to evaluate
+    // that predicate. Bail to the first-record probe instead, which decides
+    // whether a file yields a row by decoding through the identical filtered
+    // path a full scan would use.
+    if config.file_source().filter().is_some() {
+        return Ok(None);
+    }
+
     let projected_schema: SchemaRef = config.projected_schema()?;
     let partition_cols = config.table_partition_cols();
 
