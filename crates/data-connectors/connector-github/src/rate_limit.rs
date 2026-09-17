@@ -17,18 +17,11 @@ limitations under the License.
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use data_components::rate_limit::RateLimiter;
-use governor::{
-    Quota, RateLimiter as GovernorRateLimiter,
-    clock::DefaultClock,
-    middleware::NoOpMiddleware,
-    state::{InMemoryState, NotKeyed},
-};
 use reqwest::header::HeaderMap;
-use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::Instant;
 
 /// Fraction of each GitHub rate limit we are willing to consume. The remaining
 /// 10% is buffer against header lag, retries, and other users of the same token.
@@ -46,7 +39,8 @@ pub(crate) const GITHUB_GRAPHQL_SECONDARY_QUERY_POINTS: u32 = 1;
 /// time. Estimated as the sum of HTTP durations.
 pub(crate) const GITHUB_GRAPHQL_CPU_MS_PER_MINUTE: u32 = 60_000;
 
-const DEFAULT_CPU_RESERVATION_MS: u32 = 1_000;
+/// Wall window GitHub uses for GraphQL CPU: 60s of response time per 60s.
+const CPU_WINDOW: Duration = Duration::from_mins(1);
 
 /// 90% of `limit`, at least 1.
 #[must_use]
@@ -69,21 +63,48 @@ pub(crate) const fn graphql_secondary_query_cost() -> u32 {
     GITHUB_GRAPHQL_SECONDARY_QUERY_POINTS
 }
 
+/// Completed GraphQL HTTP intervals. Used to estimate CPU in the last minute
+/// as the overlap of those intervals with `[now - 60s, now]`. GitHub's budget
+/// is consumed *during* the request, so a 60s call that just finished occupies
+/// the window now and only 6s later (at 90% of 60s) is there slack again —
+/// not 60s of extra wait on top of the request.
+struct CpuWindow {
+    samples: Vec<(Instant, Instant)>,
+}
+
+impl CpuWindow {
+    fn prune(&mut self, now: Instant) {
+        let cutoff = now.checked_sub(CPU_WINDOW).unwrap_or(now);
+        self.samples.retain(|(_, end)| *end > cutoff);
+    }
+
+    fn used_ms(&self, now: Instant) -> u64 {
+        let cutoff = now.checked_sub(CPU_WINDOW).unwrap_or(now);
+        self.samples.iter().fold(0, |acc, (start, end)| {
+            let lo = (*start).max(cutoff);
+            if *end <= lo {
+                acc
+            } else {
+                acc.saturating_add(
+                    u64::try_from(end.duration_since(lo).as_millis()).unwrap_or(u64::MAX),
+                )
+            }
+        })
+    }
+}
+
 pub struct GitHubRateLimiter {
     // Track API response headers rate limits
     api_limit: Arc<RwLock<Option<RateLimitInfo>>>,
-    /// Shared GraphQL CPU-time bucket (90% of GitHub's 60s/min cap).
-    cpu_limiter: Arc<GovernorRateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>,
-    last_cpu_ms: AtomicU32,
-    cpu_burst: u32,
+    cpu: Arc<Mutex<CpuWindow>>,
+    cpu_burst_ms: u64,
 }
 
 impl std::fmt::Debug for GitHubRateLimiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GitHubRateLimiter")
             .field("api_limit", &self.api_limit)
-            .field("last_cpu_ms", &self.last_cpu_ms.load(Ordering::Relaxed))
-            .field("cpu_burst", &self.cpu_burst)
+            .field("cpu_burst_ms", &self.cpu_burst_ms)
             .finish_non_exhaustive()
     }
 }
@@ -174,24 +195,29 @@ impl RateLimitInfo {
 
 impl GitHubRateLimiter {
     pub fn new() -> Self {
-        let cpu_burst = fill_limited(GITHUB_GRAPHQL_CPU_MS_PER_MINUTE);
-        let cpu_quota = Quota::per_minute(NonZeroU32::new(cpu_burst).unwrap_or(NonZeroU32::MIN));
         Self {
             api_limit: Arc::new(RwLock::new(None)),
-            cpu_limiter: Arc::new(GovernorRateLimiter::direct(cpu_quota)),
-            last_cpu_ms: AtomicU32::new(DEFAULT_CPU_RESERVATION_MS),
-            cpu_burst,
+            cpu: Arc::new(Mutex::new(CpuWindow {
+                samples: Vec::new(),
+            })),
+            cpu_burst_ms: u64::from(fill_limited(GITHUB_GRAPHQL_CPU_MS_PER_MINUTE)),
         }
     }
 
-    async fn acquire_cpu_ms(&self, requested_ms: u32) {
-        let cpu_ms = requested_ms.clamp(1, self.cpu_burst);
-        let Some(weight) = NonZeroU32::new(cpu_ms) else {
-            return;
-        };
-        // Weight is clamped to the burst, so this only fails if the limiter
-        // cannot represent the reservation — skip rather than stall forever.
-        let _ = self.cpu_limiter.until_n_ready(weight).await;
+    async fn wait_for_cpu_budget(&self) {
+        loop {
+            let sleep_for = {
+                let mut window = self.cpu.lock().await;
+                let now = Instant::now();
+                window.prune(now);
+                let used = window.used_ms(now);
+                if used < self.cpu_burst_ms {
+                    return;
+                }
+                Duration::from_millis(used.saturating_sub(self.cpu_burst_ms).saturating_add(1))
+            };
+            tokio::time::sleep(sleep_for).await;
+        }
     }
 }
 
@@ -271,17 +297,17 @@ impl RateLimiter for GitHubRateLimiter {
             }
         }
 
-        // Pre-pay the last observed HTTP duration against GitHub's GraphQL CPU
-        // budget so concurrent scans share one 90%-fill token bucket.
-        let reserved_ms = self.last_cpu_ms.load(Ordering::Relaxed);
-        self.acquire_cpu_ms(reserved_ms).await;
+        self.wait_for_cpu_budget().await;
 
         Ok(())
     }
 
     async fn record_request_duration(&self, elapsed: Duration) {
-        let ms = u32::try_from(elapsed.as_millis().min(u128::from(u32::MAX))).unwrap_or(u32::MAX);
-        self.last_cpu_ms.store(ms.max(1), Ordering::Relaxed);
+        let now = Instant::now();
+        let start = now.checked_sub(elapsed).unwrap_or(now);
+        let mut window = self.cpu.lock().await;
+        window.samples.push((start, now));
+        window.prune(now);
     }
 }
 
@@ -441,6 +467,29 @@ mod tests {
         assert_eq!(fill_limited(60_000), 54_000);
         assert_eq!(fill_limited(5000), 4500);
         assert_eq!(fill_limited(1), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cpu_window_waits_only_the_overage_of_a_slow_request() {
+        let rate_limiter = GitHubRateLimiter::new();
+        rate_limiter
+            .record_request_duration(std::time::Duration::from_secs(60))
+            .await;
+
+        let mut wait = std::pin::pin!(rate_limiter.check_rate_limit());
+        assert!(
+            poll!(&mut wait).is_pending(),
+            "a 60s request fills 90% of the 60s CPU window"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        assert!(
+            poll!(&mut wait).is_pending(),
+            "5s later the window still holds more than 54s of CPU"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        wait.now_or_never()
+            .expect("after the 6s overage the next request must proceed")
+            .expect("rate limit check failed");
     }
 
     #[test]
