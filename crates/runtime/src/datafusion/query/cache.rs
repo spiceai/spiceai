@@ -1457,6 +1457,65 @@ impl Query {
         }
     }
 
+    /// Re-execute one recorded query on the current runtime and store the
+    /// result under its original cache key. Returns `true` when a result was
+    /// stored.
+    ///
+    /// Lookup is bypassed (`NoCache`): the originating refresh has just
+    /// invalidated the cache, and a stale hit would start SWR revalidation on
+    /// the query runtime instead of filling here. Storage is done through the
+    /// same path as SWR so the table-change clock still rejects a result that
+    /// straddled another invalidation.
+    pub(crate) async fn warm_one_cached_query(
+        df: &Arc<DataFusion>,
+        warming: &super::cache_warming::WarmingQuery,
+    ) -> bool {
+        let background_context = Self::create_background_context(warming.namespace.clone());
+        let query = super::QueryBuilder::new_arc(Arc::clone(&warming.sql), Arc::clone(df))
+            .parameters(warming.parameters.clone())
+            .for_results_cache_warming()
+            .build();
+        let input_tables = Arc::clone(&warming.input_tables);
+        let cache_key = warming.raw_key;
+        let cache_key_u64 = cache_key.as_u64();
+
+        let revalidation_started_at = std::time::Instant::now();
+        let result = background_context
+            .scope(async move { query.run().await })
+            .await;
+
+        match result {
+            Ok(query_result) => {
+                let schema = query_result.data.schema();
+                match query_result.data.try_collect::<Vec<_>>().await {
+                    Ok(batches) => {
+                        Self::cache_revalidation_result(
+                            df,
+                            &cache_key,
+                            cache_key_u64,
+                            batches,
+                            schema,
+                            input_tables,
+                            revalidation_started_at,
+                        )
+                        .await;
+                        true
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "SQL results cache warming failed to collect results: {e}"
+                        );
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("SQL results cache warming query failed: {e}");
+                false
+            }
+        }
+    }
+
     /// `read_started_at` is when the query began, and gates the cache write
     /// against any invalidation of `datasets` that lands while it runs — see
     /// [`to_cached_record_batch_stream`].

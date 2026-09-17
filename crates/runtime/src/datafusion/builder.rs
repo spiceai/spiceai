@@ -1307,6 +1307,7 @@ impl DataFusionBuilder {
             ddl_extension_store,
             datafusion_ref,
             caching,
+            results_cache_warmer: super::query::ResultsCacheWarmer::new(),
             schema_evolve_locks: TokioRwLock::new(HashMap::new()),
             pending_sink_tables: TokioRwLock::new(HashMap::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),

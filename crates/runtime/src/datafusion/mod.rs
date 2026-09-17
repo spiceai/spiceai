@@ -877,6 +877,9 @@ pub struct DataFusion {
     /// default catalog, keyed by dataset name (see [`DatasetPlacement`]).
     dataset_placements: dashmap::DashMap<String, Arc<dyn DatasetPlacement>>,
     caching: Arc<Caching>,
+    /// Recorded SQL results-cache queries, replayed after a dataset's first
+    /// full/append refresh until the cache is full.
+    pub(crate) results_cache_warmer: query::ResultsCacheWarmer,
     /// Per-dataset locks that keep writes from overlapping a schema evolution's provider
     /// swap. Writes take the lock shared, evolution takes it exclusively. Without this, a
     /// write can complete through the provider being replaced, and its rows are then
@@ -3283,6 +3286,7 @@ impl DataFusion {
         accelerated_table_builder.ready_state(effective_ready_state);
 
         accelerated_table_builder.caching(Some(Arc::clone(&self.caching)));
+        accelerated_table_builder.results_cache_warm_callback(self.results_cache_warm_callback());
 
         // For caching mode, set the TTL (max_age) and stale_while_revalidate from params
         if refresh_mode == RefreshMode::Caching {
@@ -4914,6 +4918,7 @@ impl DataFusion {
         builder.cluster_role(self.cluster_config.effective_role());
         builder.initial_load_complete(initial_load_complete);
         builder.caching(Some(Arc::clone(&self.caching)));
+        builder.results_cache_warm_callback(self.results_cache_warm_callback());
         builder.checkpointer_opt(
             dataset_checkpointer(
                 view,
