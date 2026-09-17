@@ -185,10 +185,13 @@ def drift(pinned: dict[str, set[str]], recorded: dict[str, list[str]]) -> list[s
 # this check cannot drift from the run it is about.
 NEXTEST_FILTER_RE = re.compile(r"^NEXTEST_FILTER\s*:?=\s*(?P<filter>.+)$", re.M)
 
-# A guard the ledger names, as `<path>.rs::<test>`.
-GUARD_RE = re.compile(
-    r"(?P<path>(?:crates|bin|tools)/[A-Za-z0-9_./-]+\.rs)::[A-Za-z0-9_:]+"
-)
+# Any Rust source path the ledger names. Deliberately not anchored to a
+# `::<test>` suffix: the Guard column names a test both as `path.rs::name` and as
+# `path.rs`: `name`, and the reachability question below is about the file's
+# target, not about the test's name. A path mentioned for some other reason is
+# harmless — the check only has anything to say about paths inside a `tests/`
+# directory.
+GUARD_RE = re.compile(r"(?P<path>(?:crates|bin|tools)/[A-Za-z0-9_./-]+\.rs)")
 
 # A `mod <name>;` declaration, which is what ties a `tests/<name>/mod.rs` guard to
 # the integration-test binary that actually compiles it.
@@ -196,14 +199,20 @@ def _module_declaration(module: str) -> re.Pattern[str]:
     return re.compile(rf"^\s*(?:pub\s+)?mod\s+{re.escape(module)}\s*;", re.M)
 
 
-# Guards that deliberately run outside `make nextest`, mapped to what runs them.
+# Integration-test binaries that deliberately run outside `make nextest`, mapped
+# to what does run them. Keyed by `(package, binary)` rather than by file: a
+# binary is what the filterset selects and what a workflow names, so one entry
+# covers every module compiled into it and a new module does not need a new
+# entry.
+#
 # Everything else in an integration-test target has to be named by the gate's
-# filterset: `--tests` compiles the binary either way, so a missing clause buys
+# filterset. `--tests` compiles the binary either way, so a missing clause buys
 # nothing but the seconds of running it.
-GUARDS_RUN_OUTSIDE_THE_UNIT_GATE = {
-    "crates/runtime/tests/abfs/mod.rs": "make test-integration — needs Azure credentials",
-    "crates/runtime/tests/postgres/write_back_delivery.rs": "make test-integration — needs a PostgreSQL instance",
-    "crates/runtime/tests/s3_parquet_overwrite/mod.rs": "make test-integration — needs S3 credentials",
+TARGETS_RUN_OUTSIDE_THE_UNIT_GATE = {
+    (
+        "runtime",
+        "integration",
+    ): ".github/workflows/integration.yml — needs credentials and live services",
 }
 
 
@@ -258,6 +267,11 @@ def guard_reachability(ledger_text: str) -> list[str]:
     it looks for the `binary(=…)` or `package(=…) & kind(=test)` forms the
     Makefile is written in. A clause written some other way reads here as
     unreachable, which fails loudly and is fixed by naming it the usual way.
+
+    A guard in a `src/` tree is skipped, because `kind(=lib)` and the per-crate
+    `kind(=bin)` clauses already cover those. So is a path whose owning target
+    cannot be resolved — a `tests/<dir>/` module no `tests/*.rs` declares is not
+    compiled at all, which is a different problem from not being selected.
     """
     if not MAKEFILE.is_file():
         return [f"{MAKEFILE.relative_to(REPO)} not found, so the nextest filterset cannot be read"]
@@ -268,8 +282,6 @@ def guard_reachability(ledger_text: str) -> list[str]:
 
     errors = []
     for path in sorted({match.group("path") for match in GUARD_RE.finditer(ledger_text)}):
-        if path in GUARDS_RUN_OUTSIDE_THE_UNIT_GATE:
-            continue
         if not (REPO / path).is_file():
             errors.append(
                 f"docs/dev/fork_patches.md names a guard in {path}, which does not exist"
@@ -278,13 +290,16 @@ def guard_reachability(ledger_text: str) -> list[str]:
         target = _integration_target(path)
         if target is None:
             continue
+        if target in TARGETS_RUN_OUTSIDE_THE_UNIT_GATE:
+            continue
         package, binary = target
         if f"binary(={binary})" in selection or f"package(={package}) & kind(=test)" in selection:
             continue
         errors.append(
             f"docs/dev/fork_patches.md names {path} as a guard, but `make nextest` does not "
             f"select it: add `(package(={package}) & binary(={binary}))` to NEXTEST_FILTER, or "
-            f"record it in GUARDS_RUN_OUTSIDE_THE_UNIT_GATE with the runner that does run it"
+            f"record ({package}, {binary}) in TARGETS_RUN_OUTSIDE_THE_UNIT_GATE with the runner "
+            f"that does run it"
         )
     return errors
 

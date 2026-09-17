@@ -78,11 +78,13 @@ below. `kind(=lib)` sweeps up every unit test, so the exposure is the
 integration-test targets, which `NEXTEST_FILTER` has to name one at a time;
 `--all --tests` compiles them either way, so an unnamed binary is built and then
 skipped. `scripts/check_fork_patches.py` fails when a guard named here is not
-selected there, and a guard that genuinely belongs elsewhere — one needing
+selected there, and a target that genuinely belongs elsewhere — one needing
 credentials or a live service — is recorded in that script's
-`GUARDS_RUN_OUTSIDE_THE_UNIT_GATE` with the runner that does run it. Three rows'
-guards were found this way, running nowhere: the `datafusion-functions-json`
-trio, `arrow-adbc` fork PR #4, and vortex's `set_available_parallelism`.
+`TARGETS_RUN_OUTSIDE_THE_UNIT_GATE` with the runner that does run it, keyed by
+`(package, binary)` so one entry covers every module compiled into that binary.
+Three rows' guards were found this way, running nowhere: the
+`datafusion-functions-json` trio, `arrow-adbc` fork PR #4, and vortex's
+`set_available_parallelism`.
 
 The **Loss** column says how a missing patch would surface:
 
