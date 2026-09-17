@@ -1024,6 +1024,8 @@ async fn test_cayenne_partition_by_full_refresh_removes_rows_missing_from_source
     use crate::acceleration::row_count;
     use crate::utils::wait_until_true;
 
+    const TABLE: &str = "bucket_shrink_test";
+
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -1037,7 +1039,6 @@ async fn test_cayenne_partition_by_full_refresh_removes_rows_missing_from_source
 
             crate::configure_test_datafusion();
 
-            const TABLE: &str = "bucket_shrink_test";
             let mut dataset = Dataset::new(format!("file://{}", test_file.display()), TABLE);
             let mut params = HashMap::new();
             params.insert(
