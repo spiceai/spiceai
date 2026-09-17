@@ -170,27 +170,32 @@ fn ensure_complete(
     repo: &str,
     parent_id: Option<&Value>,
 ) -> Result<()> {
-    let has_next = connection
-        .pointer("/pageInfo/hasNextPage")
-        .and_then(Value::as_bool);
-    let has_cursor = connection
-        .pointer("/pageInfo/endCursor")
-        .and_then(Value::as_str)
-        .is_some_and(|cursor| !cursor.is_empty());
+    let page_info = |field: &str| connection.get("pageInfo").and_then(|info| info.get(field));
 
     // `totalCount` is the full connection. A last follow-up page is complete
     // when GitHub says there is no next page, even if this page is short.
-    if has_next == Some(false) || (has_next == Some(true) && has_cursor) {
-        return Ok(());
-    }
-
-    if has_next.is_none() {
-        let Some(total_count) = connection.get("totalCount").and_then(Value::as_i64) else {
+    match page_info("hasNextPage").and_then(Value::as_bool) {
+        // No more pages: this page completes the connection.
+        Some(false) => return Ok(()),
+        // More pages, and a cursor to reach them with.
+        Some(true)
+            if page_info("endCursor")
+                .and_then(Value::as_str)
+                .is_some_and(|cursor| !cursor.is_empty()) =>
+        {
             return Ok(());
-        };
-        let returned_count = i64::try_from(returned).unwrap_or(i64::MAX);
-        if total_count <= returned_count {
-            return Ok(());
+        }
+        // More pages and no way to ask for them.
+        Some(true) => {}
+        // No `pageInfo` selected: fall back to this page against the total.
+        None => {
+            let Some(total_count) = connection.get("totalCount").and_then(Value::as_i64) else {
+                return Ok(());
+            };
+            let returned_count = i64::try_from(returned).unwrap_or(i64::MAX);
+            if total_count <= returned_count {
+                return Ok(());
+            }
         }
     }
 

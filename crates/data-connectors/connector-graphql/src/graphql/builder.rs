@@ -123,7 +123,7 @@ impl GraphQLClientBuilder {
     }
 
     pub fn build(self, client: reqwest::Client) -> Result<GraphQLClient> {
-        let mut graphql_client = GraphQLClient::new(
+        let graphql_client = GraphQLClient::new(
             client,
             self.endpoint,
             self.json_pointer.as_deref(),
@@ -137,7 +137,6 @@ impl GraphQLClientBuilder {
             self.semaphore,
             self.auth_header,
         )?;
-        graphql_client.set_nested_pager(self.nested_pager);
-        Ok(graphql_client)
+        Ok(graphql_client.with_nested_pager(self.nested_pager))
     }
 }

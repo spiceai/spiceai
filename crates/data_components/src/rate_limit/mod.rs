@@ -39,12 +39,6 @@ pub trait RateLimiter: Debug + Send + Sync {
     async fn update_from_headers(&self, headers: &HeaderMap);
 
     async fn check_rate_limit(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-    /// Account for the observed duration of a completed request.
-    ///
-    /// Used by limiters that budget CPU-time (GitHub's GraphQL secondary cap
-    /// is 60s of response time per 60s of wall time). The default is a no-op.
-    async fn record_request_duration(&self, _elapsed: Duration) {}
 }
 
 #[derive(Debug, Default)]

@@ -17,15 +17,22 @@ limitations under the License.
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use data_components::rate_limit::RateLimiter;
+use governor::Quota;
 use reqwest::header::HeaderMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Fraction of each GitHub rate limit we are willing to consume. The remaining
 /// 10% is buffer against header lag, retries, and other users of the same token.
-pub(crate) const GITHUB_RATE_LIMIT_FILL_NUM: u32 = 9;
-pub(crate) const GITHUB_RATE_LIMIT_FILL_DEN: u32 = 10;
+const GITHUB_RATE_LIMIT_FILL_NUM: u32 = 9;
+const GITHUB_RATE_LIMIT_FILL_DEN: u32 = 10;
+
+/// Share of a primary limit left for other users of the same token. Separate
+/// from the fill above: one paces how fast we spend, this sets how much we
+/// refuse to spend at all.
+const GITHUB_PRIMARY_RESERVE_DEN: u32 = 10;
 
 /// GitHub GraphQL secondary rate limit: 2,000 points per minute. A
 /// non-mutation GraphQL request costs 1 point.
@@ -45,7 +52,7 @@ pub(crate) fn fill_limited(limit: u32) -> u32 {
 /// Remaining primary units at which we stop issuing requests (10% of `limit`).
 fn primary_rate_limit_buffer(limit: i32) -> i32 {
     let limit = u32::try_from(limit.max(0)).unwrap_or(0);
-    let reserved = limit.saturating_sub(fill_limited(limit)).max(1);
+    let reserved = limit.div_ceil(GITHUB_PRIMARY_RESERVE_DEN).max(1);
     i32::try_from(reserved).unwrap_or(i32::MAX)
 }
 
@@ -55,20 +62,34 @@ pub(crate) const fn graphql_secondary_query_cost() -> u32 {
     GITHUB_GRAPHQL_SECONDARY_QUERY_POINTS
 }
 
+/// Quota for GitHub's GraphQL secondary point limit: replenish at the 90% fill,
+/// and allow no burst beyond one query's cost.
+///
+/// GCRA admits `burst_size` points at once and then one per
+/// `replenish_interval`, so `Quota::per_minute(fill)` on its own would admit the
+/// fill twice over in the first minute — 3,599 of the 2,000 points GitHub
+/// allows. Capping the burst at a single query holds the worst 60s window to
+/// 1,801 while leaving the sustained rate at the full 1,800 the fill targets;
+/// taking the burst out of the rate instead would cost sustained capacity for a
+/// head start a scan bounded by `github_concurrent_connections_limit` recovers
+/// within a second.
+#[must_use]
+pub(crate) fn graphql_secondary_quota() -> Quota {
+    let per_minute = NonZeroU32::new(fill_limited(GITHUB_GRAPHQL_SECONDARY_POINTS_PER_MINUTE))
+        .unwrap_or(NonZeroU32::MIN);
+    // `until_n_ready(cost)` fails permanently once cost exceeds the burst, so
+    // the burst has to cover a single query.
+    let burst = NonZeroU32::new(graphql_secondary_query_cost()).unwrap_or(NonZeroU32::MIN);
+    Quota::per_minute(per_minute).allow_burst(burst)
+}
+
 /// Honours GitHub's own rate-limit headers (`x-ratelimit-*`, `retry-after`).
 /// GraphQL CPU is not estimated locally: HTTP duration is not GitHub CPU, and
 /// a local 60s/min budget serializes scans that GitHub would still accept.
+#[derive(Debug)]
 pub struct GitHubRateLimiter {
     // Track API response headers rate limits
     api_limit: Arc<RwLock<Option<RateLimitInfo>>>,
-}
-
-impl std::fmt::Debug for GitHubRateLimiter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GitHubRateLimiter")
-            .field("api_limit", &self.api_limit)
-            .finish()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -282,6 +303,8 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use futures::{FutureExt, poll};
+    use governor::RateLimiter as GovernorRateLimiter;
+    use governor::clock::FakeRelativeClock;
     use reqwest::header::HeaderValue;
     use std::collections::HashMap;
 
@@ -433,6 +456,90 @@ mod tests {
         assert_eq!(fill_limited(60_000), 54_000);
         assert_eq!(fill_limited(5000), 4500);
         assert_eq!(fill_limited(1), 1);
+    }
+
+    /// A quota built from `Quota::per_minute(n)` alone starts full, so GCRA admits
+    /// `n` at once and another `n` as the minute replenishes — twice the intended
+    /// rate. Drive the real limiter over a fake minute and count what gets through.
+    #[test]
+    fn secondary_quota_paces_one_minute_below_githubs_limit() {
+        let clock = FakeRelativeClock::default();
+        let limiter =
+            GovernorRateLimiter::direct_with_clock(graphql_secondary_quota(), clock.clone());
+
+        let mut admitted = 0_u32;
+        for _ in 0..60_000 {
+            while limiter.check().is_ok() {
+                admitted += 1;
+            }
+            clock.advance(std::time::Duration::from_millis(1));
+        }
+
+        let limit = GITHUB_GRAPHQL_SECONDARY_POINTS_PER_MINUTE;
+        assert!(
+            admitted < limit,
+            "{admitted} points admitted in one minute reaches GitHub's {limit}/min secondary limit"
+        );
+    }
+
+    /// The count above is bounded by how finely the caller polls, so pin the
+    /// sustained rate on the quota itself: replenishment must be the whole fill,
+    /// not the fill minus a burst allowance.
+    #[test]
+    fn secondary_quota_replenishes_at_the_full_fill() {
+        let quota = graphql_secondary_quota();
+        let per_minute = u32::try_from(
+            std::time::Duration::from_mins(1).as_nanos()
+                / quota.replenish_interval().as_nanos().max(1),
+        )
+        .unwrap_or(u32::MAX);
+
+        let fill = fill_limited(GITHUB_GRAPHQL_SECONDARY_POINTS_PER_MINUTE);
+        assert_eq!(
+            per_minute, fill,
+            "the quota replenishes {per_minute} points/min, giving away part of the {fill}-point fill"
+        );
+        assert_eq!(
+            quota.burst_size().get(),
+            graphql_secondary_query_cost(),
+            "the burst must cover exactly one query's cost: less fails `until_n_ready` forever, more overshoots the fill"
+        );
+    }
+
+    /// A waiting request must not hold the lock that a completing request needs,
+    /// or one dataset's `Retry-After` stalls every other dataset on the token.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_wait_does_not_block_recording_headers() {
+        let rate_limiter = GitHubRateLimiter::new();
+        rate_limiter
+            .update_from_headers(&create_test_headers(HashMap::from([(
+                "retry-after",
+                s("3600"),
+            )])))
+            .await;
+
+        let mut wait = std::pin::pin!(rate_limiter.check_rate_limit());
+        assert!(
+            poll!(&mut wait).is_pending(),
+            "Retry-After must schedule a wait"
+        );
+
+        let headers = create_test_headers(HashMap::from([
+            ("x-ratelimit-limit", s("5000")),
+            ("x-ratelimit-remaining", s("4999")),
+            ("x-ratelimit-used", s("1")),
+            (
+                "x-ratelimit-reset",
+                (Utc::now() + Duration::hours(1)).timestamp().to_string(),
+            ),
+            ("x-ratelimit-resource", s("graphql")),
+        ]));
+        rate_limiter
+            .update_from_headers(&headers)
+            .now_or_never()
+            .expect(
+                "a pending rate-limit wait must not block a completing request from recording its headers",
+            );
     }
 
     #[test]

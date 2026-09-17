@@ -41,7 +41,6 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use governor::Quota;
 use graphql_parser::query::{
     Definition, InlineFragment, OperationDefinition, Query, Selection, SelectionSet,
 };
@@ -61,7 +60,6 @@ use secrecy::ExposeSecret;
 use snafu::ResultExt;
 use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
-use std::num::NonZeroU32;
 use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration};
 use token_provider::github_app_token::GitHubAppTokenProvider;
@@ -142,13 +140,8 @@ async fn get_github_auth_rate_control(auth_context: String) -> GitHubAuthRateCon
     // GitHub GraphQL secondary limit is 2000 points/minute at 1 point per
     // non-mutation query. Target 90% fill so 10% remains as buffer.
     // Equal 1-point costs make the shared governor FIFO fair across tables.
-    let secondary_quota_per_minute = NonZeroU32::new(rate_limit::fill_limited(
-        rate_limit::GITHUB_GRAPHQL_SECONDARY_POINTS_PER_MINUTE,
-    ))
-    .unwrap_or(NonZeroU32::MIN);
-
     let controller = RateControllerBuilder::new()
-        .with_weighted_quota(Quota::per_minute(secondary_quota_per_minute))
+        .with_weighted_quota(rate_limit::graphql_secondary_quota())
         .with_jitter(JitterConfig::new(
             Duration::from_millis(5),
             Duration::from_millis(10),
