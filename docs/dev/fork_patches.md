@@ -72,6 +72,18 @@ guard. A patch with no guard is a patch the next re-cut can drop for free.
 A guard is a test **in this repo** that fails when the patch is missing. Not a
 comment, not a test in the fork.
 
+**And one the gate runs.** A test nothing runs makes this table claim coverage
+that does not exist, which is worse than a **GAP** — a gap is at least on the list
+below. `kind(=lib)` sweeps up every unit test, so the exposure is the
+integration-test targets, which `NEXTEST_FILTER` has to name one at a time;
+`--all --tests` compiles them either way, so an unnamed binary is built and then
+skipped. `scripts/check_fork_patches.py` fails when a guard named here is not
+selected there, and a guard that genuinely belongs elsewhere — one needing
+credentials or a live service — is recorded in that script's
+`GUARDS_RUN_OUTSIDE_THE_UNIT_GATE` with the runner that does run it. Three rows'
+guards were found this way, running nowhere: the `datafusion-functions-json`
+trio, `arrow-adbc` fork PR #4, and vortex's `set_available_parallelism`.
+
 The **Loss** column says how a missing patch would surface:
 
 - **silent** — it compiles and runs, and returns different results, hangs, crashes
@@ -270,7 +282,8 @@ so the rows below name the contracts, not every commit.
 | Scheduler lock hygiene across persists and awaits (fork PR #60) | Cluster wedge / runtime freeze under load | silent (hang) | **GAP** |
 | Don't swap null-aware anti joins in `JoinSelection` (fork PR #58) | A distributed anti-join returns wrong rows | silent (wrong data) | `crates/runtime/src/cluster/datafusion/mod.rs::a_null_among_the_values_leaves_no_row_selected`, `…::a_null_among_the_values_leaves_no_row_selected_where_no_swap_is_profitable`, `…::values_without_a_null_select_every_probe_absent_from_them`, `…::the_rule_neither_swaps_the_sides_nor_drops_the_flag` — these drive the scheduler's own rule rather than a live cluster, because a distributed `NOT IN` currently fails before it can return rows (the rule forces `CollectLeft` on a stage whose left input is already hash-partitioned, and `to_resolved` cannot repartition) |
 | Vortex columnar shuffle format (fork PR #7) | Shuffles fall back to Arrow IPC | build | compile-guarded |
-| Stuck-query detection and stale `TaskStatus` rejection (fork PRs #39, #53) | A reset partition's stale status is accepted, corrupting the execution graph | silent | **GAP** |
+| Stale `TaskStatus` rejection for reset partitions (fork PR #53) | A status update already in flight when its executor was lost arrives for a partition whose task info the reset cleared. Upstream unwraps that `None`, and the panic lands on the scheduler event-loop worker: the event channel closes and every later job submission and executor heartbeat fails with `Fail to send event due to channel closed` — one late packet wedges the cluster | silent (panic, then cluster wedge) | `crates/runtime/src/cluster/datafusion/mod.rs::stale_status_for_a_reset_partition` — `a_status_for_a_partition_with_no_scheduled_task_is_refused` and `a_status_for_a_partition_whose_task_is_still_scheduled_is_accepted`, asserted against `RunningStage::update_task_info` on a stage that `RunningStage::reset_tasks` has cleared for the lost executor while another executor's task stays scheduled, so a patch that refused every status fails the second. Driving the real `reset_stages_on_lost_executor` would be closer still, but `ExecutionGraph::pop_next_task` is `#[cfg(test)]` on the fork and unreachable from here |
+| Stuck-query detection (fork PR #39) | A distributed query that stops making progress is not reported, so it has to be diagnosed by rerunning it | silent (no diagnostic) | **GAP** — the detection runs on the scheduler's own timer against live executor state, and the scheduler's task-issuing API is `#[cfg(test)]` on the fork, so there is no way from here to drive a query into the stuck state |
 
 ## datafusion-federation and datafusion-table-providers
 
@@ -487,16 +500,26 @@ Upstream [benbrandt/text-splitter](https://github.com/benbrandt/text-splitter).
 Upstream [EricLBuehler/mistral.rs](https://github.com/EricLBuehler/mistral.rs) and
 [huggingface/text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference).
 
-The `mistral.rs` fork's base is `master@2d4ba4f16`, not a release tag, and it carries
-71 commits. Most are Spice-side integration (dependency re-pointing onto
-`spiceai/candle`, logging removal so the loader does not install a global
-subscriber).
+The `mistral.rs` fork's base is `master@2d4ba4f16`, not a release tag, and it
+carries 71 commits. Most are Spice-side integration (dependency re-pointing onto
+`spiceai/candle`, CUDA and Windows build fixes).
+
+Two rows this table used to carry — assistant messages with `tool_calls` in the
+chat template, and `tracing_subscriber.init()` removed from the loaders — are gone
+because neither is fork state any longer. Both behaviours are present in
+`master@2d4ba4f16` itself, the commit this fork line was cut from. It already
+defines `MessageContent` as `Either<String, Vec<IndexMap<String, Value>>>`, which
+is the widening the `tool_calls` patch existed to make; and no loader in either
+tree installs a global subscriber — the only `tracing_subscriber` call anywhere in
+`mistralrs-core` is a `try_init()` behind a `OnceLock` in `utils/debug.rs`, byte
+identical to upstream's, and `try_init` cannot displace a subscriber `spiced` has
+already installed. The Spice commits that once made those two changes are not
+ancestors of that base, so upstream reached the same state by its own route
+rather than by taking them. A re-cut cannot lose what the fork does not carry.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | `mistral.rs`: i-quant MoE `index_select` + in-place row dequant | ~34% slower local MoE inference | silent (perf) | **GAP** |
-| `mistral.rs`: assistant messages with `tool_calls` handled in the chat template | Tool-calling conversations render wrong prompts, so the model loses tool context | silent (wrong output) | **GAP** |
-| `mistral.rs`: `tracing_subscriber.init()` removed from the loaders | The loader installs a global subscriber and hijacks `spiced`'s logging | silent (logging) | **GAP** |
 | `mistral.rs`: candle dependency re-pointed at `spiceai/candle` | Two candle versions in the graph | build | compile-guarded |
 | `text-embeddings-inference`: Spice integration + candle re-pointing | Local embedding models fail to load | build | compile-guarded |
 | `text-embeddings-inference`: pooling/model-loading fixes | Embeddings differ from the reference implementation | silent (wrong vectors) | **GAP** |
@@ -555,7 +578,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**21 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**19 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -563,34 +586,26 @@ They are not equal in consequence; this is the order to close them in.
 
 **Wrong data or wrong text, silently.** These change what a user gets back:
 
-1. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
-   PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
-   `ballista_scheduler::test_utils` is public and the fork's own
-   `test_task_update_after_reset_stage` is portable, which makes this the most
-   reachable of the remaining rows.
-2. `mistral.rs` `tool_calls` chat-template handling.
-3. `text-embeddings-inference` pooling and model-loading fixes — embeddings
+1. `datafusion-ballista` stuck-query detection (fork PR #39) — a query that stops
+   making progress goes unreported. Its sibling, stale `TaskStatus` rejection, is
+   now guarded; this half needs the scheduler driven into the stuck state, and the
+   task-issuing API for that is `#[cfg(test)]` on the fork.
+2. `text-embeddings-inference` pooling and model-loading fixes — embeddings
    differ from the reference implementation.
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-4. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+3. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
    resilience (fork PRs #61–#63).
-
-**Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
-being honoured:
-
-5. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
-   installs a global subscriber and hijacks `spiced`'s logging.
 
 **Blocked, not merely undone.** These have been looked at and cannot be closed by
 writing a test; each says what would unblock it:
 
-6. `snowflake-rs` (five rows) — no host override, private response types. Needs a
+4. `snowflake-rs` (five rows) — no host override, private response types. Needs a
    live account, or an upstream change letting the base URL be set.
-7. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
+5. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
    race, so any test of it is a timing test.
-8. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
+6. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
    there is no behaviour of ours to assert on.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
@@ -599,7 +614,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-9. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+7. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
    `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
    `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
    `snowflake-rs` streaming batches (memory, not latency — but see the

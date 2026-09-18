@@ -36,6 +36,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 LEDGER = REPO / "docs" / "dev" / "fork_patches.md"
 LOCK = REPO / "Cargo.lock"
+MAKEFILE = REPO / "Makefile"
 
 # A `Cargo.lock` source line for a crate that comes from a fork in the spiceai
 # org, e.g.
@@ -180,6 +181,114 @@ def drift(pinned: dict[str, set[str]], recorded: dict[str, list[str]]) -> list[s
     return errors
 
 
+# The gate's own filterset, read from the Makefile rather than restated here, so
+# this check cannot drift from the run it is about.
+NEXTEST_FILTER_RE = re.compile(r"^NEXTEST_FILTER\s*:?=\s*(?P<filter>.+)$", re.M)
+
+# A guard the ledger names, as `<path>.rs::<test>`.
+GUARD_RE = re.compile(
+    r"(?P<path>(?:crates|bin|tools)/[A-Za-z0-9_./-]+\.rs)::[A-Za-z0-9_:]+"
+)
+
+# A `mod <name>;` declaration, which is what ties a `tests/<name>/mod.rs` guard to
+# the integration-test binary that actually compiles it.
+def _module_declaration(module: str) -> re.Pattern[str]:
+    return re.compile(rf"^\s*(?:pub\s+)?mod\s+{re.escape(module)}\s*;", re.M)
+
+
+# Guards that deliberately run outside `make nextest`, mapped to what runs them.
+# Everything else in an integration-test target has to be named by the gate's
+# filterset: `--tests` compiles the binary either way, so a missing clause buys
+# nothing but the seconds of running it.
+GUARDS_RUN_OUTSIDE_THE_UNIT_GATE = {
+    "crates/runtime/tests/abfs/mod.rs": "make test-integration — needs Azure credentials",
+    "crates/runtime/tests/postgres/write_back_delivery.rs": "make test-integration — needs a PostgreSQL instance",
+    "crates/runtime/tests/s3_parquet_overwrite/mod.rs": "make test-integration — needs S3 credentials",
+}
+
+
+def _package_of(path: Path) -> str | None:
+    """The package a repo-relative source path belongs to."""
+    for parent in path.parents:
+        manifest = REPO / parent / "Cargo.toml"
+        if not manifest.is_file():
+            continue
+        name = re.search(r'^name\s*=\s*"(?P<name>[^"]+)"', manifest.read_text(encoding="utf-8"), re.M)
+        return name.group("name") if name else None
+    return None
+
+
+def _integration_target(path: str) -> tuple[str, str] | None:
+    """`(package, binary)` when `path` is compiled into an integration-test binary.
+
+    `None` for a guard in a `src/` tree — a lib or bin target, which the gate
+    selects wholesale by kind.
+    """
+    parts = Path(path).parts
+    if "tests" not in parts:
+        return None
+    index = parts.index("tests")
+    crate_dir = Path(*parts[:index])
+    inside = parts[index + 1 :]
+    if not inside:
+        return None
+    package = _package_of(Path(path))
+    if package is None:
+        return None
+    if len(inside) == 1:
+        # `tests/<name>.rs` is its own target.
+        return package, inside[0].removesuffix(".rs")
+    # `tests/<name>/…` is a module; the target is whichever `tests/*.rs` declares it.
+    declaration = _module_declaration(inside[0])
+    for candidate in sorted((REPO / crate_dir / "tests").glob("*.rs")):
+        if declaration.search(candidate.read_text(encoding="utf-8")):
+            return package, candidate.stem
+    return None
+
+
+def guard_reachability(ledger_text: str) -> list[str]:
+    """Whether `make nextest` actually runs every guard the ledger names.
+
+    A guard is a test that fails when a patch goes missing, so a guard the gate
+    never selects is a comment: the ledger keeps claiming coverage while nothing
+    checks it. `kind(=lib)` sweeps up every unit test, so the exposure is the
+    integration-test targets, which the filterset has to name one at a time.
+
+    This matches the filterset's clauses textually rather than evaluating them —
+    it looks for the `binary(=…)` or `package(=…) & kind(=test)` forms the
+    Makefile is written in. A clause written some other way reads here as
+    unreachable, which fails loudly and is fixed by naming it the usual way.
+    """
+    if not MAKEFILE.is_file():
+        return [f"{MAKEFILE.relative_to(REPO)} not found, so the nextest filterset cannot be read"]
+    filterset = NEXTEST_FILTER_RE.search(MAKEFILE.read_text(encoding="utf-8"))
+    if not filterset:
+        return ["Makefile no longer defines NEXTEST_FILTER, so nothing pins the gate's selection"]
+    selection = filterset.group("filter")
+
+    errors = []
+    for path in sorted({match.group("path") for match in GUARD_RE.finditer(ledger_text)}):
+        if path in GUARDS_RUN_OUTSIDE_THE_UNIT_GATE:
+            continue
+        if not (REPO / path).is_file():
+            errors.append(
+                f"docs/dev/fork_patches.md names a guard in {path}, which does not exist"
+            )
+            continue
+        target = _integration_target(path)
+        if target is None:
+            continue
+        package, binary = target
+        if f"binary(={binary})" in selection or f"package(={package}) & kind(=test)" in selection:
+            continue
+        errors.append(
+            f"docs/dev/fork_patches.md names {path} as a guard, but `make nextest` does not "
+            f"select it: add `(package(={package}) & binary(={binary}))` to NEXTEST_FILTER, or "
+            f"record it in GUARDS_RUN_OUTSIDE_THE_UNIT_GATE with the runner that does run it"
+        )
+    return errors
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="print every fork and its recorded revision")
@@ -214,7 +323,11 @@ def main() -> int:
         )
         return 1
 
-    errors = drift(pinned, recorded) + gap_accounting(ledger_text)
+    errors = (
+        drift(pinned, recorded)
+        + gap_accounting(ledger_text)
+        + guard_reachability(ledger_text)
+    )
     if errors:
         print(
             f"\n{len(errors)} problem(s) with docs/dev/fork_patches.md:\n",
