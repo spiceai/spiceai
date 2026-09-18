@@ -461,6 +461,7 @@ async fn test_cold_tier_normalized_clustering_prunes_both_dimensions_impl(
     for file in &cold_files {
         let stats = cayenne::stats::file_statistics_to_df(
             &cayenne::stats::deserialize_file_statistics(&file.statistics_blob, schema.as_ref())?,
+            schema.as_ref(),
             file.row_count,
         );
         let lo = int64_bound(&stats.column_statistics[2].min_value);
