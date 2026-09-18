@@ -463,6 +463,18 @@ impl CayenneContext {
         !self.config.sort_columns.is_empty()
     }
 
+    /// Get the explicit multi-dimensional clustering columns.
+    #[must_use]
+    pub fn cluster_by(&self) -> &[String] {
+        &self.config.cluster_by
+    }
+
+    /// Whether the operator configured multi-dimensional clustering.
+    #[must_use]
+    pub fn has_cluster_by(&self) -> bool {
+        !self.config.cluster_by.is_empty()
+    }
+
     /// Whether [`Self::sort_columns`] is an operator statement of intent rather
     /// than a schema-inference guess.
     ///

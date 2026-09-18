@@ -87,6 +87,21 @@ where
         }
     }
 
+    async fn replace_if(
+        &self,
+        key: u64,
+        value: V,
+        should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> bool {
+        match self {
+            Self::Moka(backend) => backend.replace_if(key, value, should_replace).await,
+            #[cfg(feature = "pingora")]
+            Self::Pingora(backend) => backend.replace_if(key, value, should_replace).await,
+            #[cfg(not(feature = "pingora"))]
+            Self::MokaFallback(backend) => backend.replace_if(key, value, should_replace).await,
+        }
+    }
+
     async fn get(&self, key: &u64) -> Option<V> {
         match self {
             Self::Moka(backend) => backend.get(key).await,
@@ -307,7 +322,7 @@ fn build_moka_cache<
     };
 
     Cache::builder()
-        .time_to_live(ttl)
+        .expire_after(crate::backend::moka::CacheTtl { ttl })
         .weigher(|_key, value: &V| -> u32 {
             let val: usize = value.get_memory_size();
             match val.try_into() {
@@ -517,6 +532,15 @@ impl<
             let total = self.total_requests.load(Ordering::Relaxed);
             V::update_hit_ratio(hits, total);
         }
+    }
+
+    async fn replace_if(
+        &self,
+        key: &u64,
+        value: V,
+        should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> bool {
+        self.backend.replace_if(*key, value, should_replace).await
     }
 
     async fn invalidate_all(&self) {

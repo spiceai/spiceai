@@ -18,6 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use app::AppBuilder;
 
+use futures::StreamExt;
 use runtime::Runtime;
 use spicepod::{
     component::dataset::Dataset,
@@ -125,6 +126,143 @@ async fn file_connector_datatypes() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
+
+            Ok(())
+        })
+        .await
+}
+
+/// Builds a `file:` dataset pointed at a directory of NDJSON files with the
+/// `_last_modified` and `_location` listing-table metadata columns enabled,
+/// mirroring the config in <https://github.com/spiceai/spiceai/issues/14113>.
+fn get_metadata_ndjson_dataset(dir: &std::path::Path) -> Dataset {
+    let mut dataset = Dataset::new(format!("file:{}/", dir.display()), "t");
+    dataset.params = Some(Params::from_string_map(
+        vec![
+            ("file_format".to_string(), "json".to_string()),
+            ("json_format".to_string(), "jsonl".to_string()),
+            ("file_extension".to_string(), ".jsonl".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    dataset.metadata.insert(
+        "_last_modified".to_string(),
+        serde_json::Value::String("enabled".to_string()),
+    );
+    dataset.metadata.insert(
+        "_location".to_string(),
+        serde_json::Value::String("enabled".to_string()),
+    );
+    dataset
+}
+
+/// Runs `query`, drains the stream and returns `(schema, total_rows)`.
+///
+/// A stream that panics or errors (the failure mode in the issue) propagates out
+/// of here and fails the test.
+async fn run_and_count(
+    rt: &Runtime,
+    query: &str,
+) -> Result<(arrow::datatypes::SchemaRef, usize), anyhow::Error> {
+    let mut result = rt
+        .datafusion()
+        .query_builder(query)
+        .build()
+        .run()
+        .await
+        .map_err(|e| anyhow::anyhow!("query '{query}' failed to plan/execute: {e}"))?;
+
+    let schema = result.data.schema();
+    let mut rows = 0;
+    while let Some(batch) = result.data.next().await {
+        rows += batch
+            .map_err(|e| anyhow::anyhow!("query '{query}' produced an error batch: {e}"))?
+            .num_rows();
+    }
+    Ok((schema, rows))
+}
+
+/// Regression test for <https://github.com/spiceai/spiceai/issues/14113>:
+/// projecting an enabled metadata column (`_last_modified` / `_location`) from a
+/// flat, non-partitioned local NDJSON dataset used to panic the query executor
+/// with `index out of bounds` in the file-scan projection layer. The metadata
+/// columns must be as queryable as the data columns.
+#[tokio::test]
+async fn file_connector_metadata_columns_projection() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            // A single flat NDJSON file, exactly as in the issue reproduction.
+            std::fs::write(
+                dir.path().join("f.jsonl"),
+                "{\"id\":0,\"value\":10}\n{\"id\":1,\"value\":20}\n{\"id\":2,\"value\":30}\n",
+            )?;
+
+            let app = AppBuilder::new("file_connector_metadata")
+                .with_dataset(get_metadata_ndjson_dataset(dir.path()))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            // The metadata columns must register in the schema, ordered *after*
+            // the data columns (the layout invariant whose violation caused the
+            // out-of-bounds panic at scan time).
+            let (schema, star_rows) = run_and_count(&rt, "SELECT * FROM t").await?;
+            assert_eq!(star_rows, 3, "SELECT * should return all 3 rows");
+            let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+            let pos = |name: &str| {
+                names
+                    .iter()
+                    .position(|n| *n == name)
+                    .unwrap_or_else(|| panic!("column '{name}' missing from schema {names:?}"))
+            };
+            // The out-of-bounds panic came from the file-scan classifying a
+            // metadata column as a partition column, which only holds when the
+            // metadata columns sit *after* the data columns in the table schema.
+            assert!(
+                pos("_last_modified") > pos("id") && pos("_last_modified") > pos("value"),
+                "_last_modified must be appended after the data columns: {names:?}"
+            );
+            assert!(
+                pos("_location") > pos("id") && pos("_location") > pos("value"),
+                "_location must be appended after the data columns: {names:?}"
+            );
+
+            // Every query from the issue must return rows instead of panicking.
+            // These all *materialize* a metadata column, which is the crashing path.
+            let (_, rows) = run_and_count(&rt, "SELECT _last_modified FROM t LIMIT 3").await?;
+            assert_eq!(rows, 3, "SELECT _last_modified should return 3 rows");
+
+            let (_, rows) = run_and_count(&rt, "SELECT max(_last_modified) FROM t").await?;
+            assert_eq!(rows, 1, "SELECT max(_last_modified) should return 1 row");
+
+            let (_, rows) = run_and_count(&rt, "SELECT _location FROM t LIMIT 3").await?;
+            assert_eq!(rows, 3, "SELECT _location should return 3 rows");
+
+            let (_, rows) =
+                run_and_count(&rt, "SELECT _last_modified, _location, id, value FROM t").await?;
+            assert_eq!(
+                rows, 3,
+                "combined data + metadata projection should return 3 rows"
+            );
+
+            // Data-only queries were never affected; assert they still hold.
+            let (_, rows) = run_and_count(&rt, "SELECT id, value FROM t").await?;
+            assert_eq!(rows, 3, "data-only projection should return 3 rows");
+
+            let (_, rows) = run_and_count(&rt, "SELECT count(*) FROM t").await?;
+            assert_eq!(rows, 1, "count(*) should return 1 row");
 
             Ok(())
         })
