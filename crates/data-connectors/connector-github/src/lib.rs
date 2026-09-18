@@ -628,9 +628,11 @@ impl Github {
             );
         }
 
+        // REST spends `core`; the GraphQL client spends `graphql`. GitHub meters
+        // them separately, so they must not wait on each other's quota.
         GithubRestClient::new(
             token,
-            Arc::clone(&self.rate_limiter) as Arc<dyn RateLimiter>,
+            Arc::new(self.rate_limiter.split_primary_quotas()) as Arc<dyn RateLimiter>,
         )
         .map_err(Into::into)
     }

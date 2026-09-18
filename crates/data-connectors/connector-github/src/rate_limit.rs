@@ -226,6 +226,21 @@ impl GitHubRateLimiter {
             secondary_retry_after: Arc::new(RwLock::new(None)),
         }
     }
+
+    /// A handle for an API whose primary quotas GitHub meters separately, still
+    /// bound to this limiter's `retry-after`.
+    ///
+    /// GitHub meters `core` and `graphql` independently, so a REST scan that
+    /// spends `core` must not hold back GraphQL requests that have their own
+    /// 5,000 to spend. The secondary limit is the opposite: it is charged to the
+    /// token, so both handles have to observe the same deadline.
+    #[must_use]
+    pub fn split_primary_quotas(&self) -> Self {
+        Self {
+            primary: Arc::new(RwLock::new(HashMap::new())),
+            secondary_retry_after: Arc::clone(&self.secondary_retry_after),
+        }
+    }
 }
 
 #[async_trait]
@@ -248,90 +263,114 @@ impl RateLimiter for GitHubRateLimiter {
     }
 
     async fn check_rate_limit(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        enum Wait {
-            Secondary {
-                until: DateTime<Utc>,
-            },
-            Primary {
-                until: DateTime<Utc>,
-                resource: String,
-                remaining: i32,
-                limit: i32,
-                used: i32,
-            },
+        // A deadline can be pushed out by a concurrent 403 while this request is
+        // already asleep, so re-read after each wait and only return once the
+        // latest deadline has been served. Returning on the snapshot taken before
+        // the sleep sends at the old deadline and earns another 403.
+        let mut served: Option<DateTime<Utc>> = None;
+
+        loop {
+            let Some(wait) = self.next_wait().await else {
+                return Ok(());
+            };
+
+            if served.is_some_and(|previous| wait.until() <= previous) {
+                return Ok(());
+            }
+
+            let until = wait.until();
+            let wait_duration = (until - Utc::now())
+                .to_std()
+                .unwrap_or(Duration::from_secs(1));
+            wait.warn(wait_duration);
+            served = Some(until);
+            tokio::time::sleep(wait_duration).await;
         }
+    }
+}
 
-        // `retry-after` means stop now, whatever the primary headers say.
-        let secondary_wait = {
-            let retry_after = *self.secondary_retry_after.read().await;
-            retry_after.filter(|until| Utc::now() < *until)
-        };
+/// A reason to hold the next request back, and the wording the user sees for it.
+enum Wait {
+    Secondary {
+        until: DateTime<Utc>,
+    },
+    Primary {
+        until: DateTime<Utc>,
+        resource: String,
+        remaining: i32,
+        limit: i32,
+        used: i32,
+    },
+}
 
-        let wait = if let Some(until) = secondary_wait {
-            Some(Wait::Secondary { until })
-        } else {
-            let primary_limits = self.primary.read().await;
-            // Each resource is metered on its own, so a quota with room cannot
-            // answer for one that is spent; wait out the latest reset among them.
-            let exhausted = primary_limits
-                .values()
-                .filter(|primary| primary.is_exhausted())
-                .max_by_key(|primary| primary.reset_time);
+impl Wait {
+    fn until(&self) -> DateTime<Utc> {
+        match self {
+            Wait::Secondary { until } | Wait::Primary { until, .. } => *until,
+        }
+    }
 
-            if exhausted.is_none() {
-                log_primary_status(primary_limits.values());
-            }
-
-            exhausted.map(|primary| Wait::Primary {
-                until: primary.reset_time,
-                resource: primary.resource.clone(),
-                remaining: primary.remaining,
-                limit: primary.limit,
-                used: primary.used,
-            })
-        };
-
-        match wait {
-            Some(Wait::Secondary { until }) => {
-                let wait_duration = (until - Utc::now())
-                    .to_std()
-                    .unwrap_or(Duration::from_secs(1));
-                let wait_duration_secs = wait_duration.as_secs();
-                tracing::warn!(
-                    "GitHub API secondary rate limit exceeded. Waiting for {} second{} until {} before sending another request.",
-                    wait_duration_secs,
-                    if wait_duration_secs == 1 { "" } else { "s" },
-                    until
-                );
-                tokio::time::sleep(wait_duration).await;
-            }
-            Some(Wait::Primary {
+    fn warn(&self, wait_duration: Duration) {
+        let secs = wait_duration.as_secs();
+        let plural = if secs == 1 { "" } else { "s" };
+        match self {
+            Wait::Secondary { until } => tracing::warn!(
+                "GitHub API secondary rate limit exceeded. Waiting for {} second{} until {} before sending another request.",
+                secs,
+                plural,
+                until
+            ),
+            Wait::Primary {
                 until,
                 resource,
                 remaining,
                 limit,
                 used,
-            }) => {
-                let wait_duration = (until - Utc::now())
-                    .to_std()
-                    .unwrap_or(Duration::from_secs(1));
-                let wait_duration_secs = wait_duration.as_secs();
-                tracing::warn!(
-                    "GitHub API primary rate limit is nearly exhausted for {}. Waiting for {} second{} until {}. Remaining: {}, Limit: {}, Used: {}",
-                    resource,
-                    wait_duration_secs,
-                    if wait_duration_secs == 1 { "" } else { "s" },
-                    until,
-                    remaining,
-                    limit,
-                    used,
-                );
-                tokio::time::sleep(wait_duration).await;
-            }
-            None => {}
+            } => tracing::warn!(
+                "GitHub API primary rate limit is nearly exhausted for {}. Waiting for {} second{} until {}. Remaining: {}, Limit: {}, Used: {}",
+                resource,
+                secs,
+                plural,
+                until,
+                remaining,
+                limit,
+                used,
+            ),
+        }
+    }
+}
+
+impl GitHubRateLimiter {
+    /// What the latest response headers say to wait for, if anything.
+    async fn next_wait(&self) -> Option<Wait> {
+        // `retry-after` means stop now, whatever the primary headers say.
+        let secondary = {
+            let retry_after = *self.secondary_retry_after.read().await;
+            retry_after.filter(|until| Utc::now() < *until)
+        };
+        if let Some(until) = secondary {
+            return Some(Wait::Secondary { until });
         }
 
-        Ok(())
+        let primary_limits = self.primary.read().await;
+        // Only the quotas this handle charges: GitHub meters each resource on its
+        // own, so a spent `core` is not a reason to hold a `graphql` request.
+        let exhausted = primary_limits
+            .values()
+            .filter(|primary| primary.is_exhausted())
+            .max_by_key(|primary| primary.reset_time);
+
+        if exhausted.is_none() {
+            log_primary_status(primary_limits.values());
+        }
+
+        exhausted.map(|primary| Wait::Primary {
+            until: primary.reset_time,
+            resource: primary.resource.clone(),
+            remaining: primary.remaining,
+            limit: primary.limit,
+            used: primary.used,
+        })
     }
 }
 
@@ -643,6 +682,97 @@ mod tests {
         assert!(
             poll!(&mut wait).is_pending(),
             "an exhausted graphql quota must still wait after a healthy core response"
+        );
+    }
+
+    /// A 403 that lands while a request is already asleep pushes the deadline out.
+    /// Returning at the deadline read before the sleep sends early and earns
+    /// another 403.
+    #[tokio::test(start_paused = true)]
+    async fn a_later_retry_after_extends_a_wait_already_in_progress() {
+        let rate_limiter = GitHubRateLimiter::new();
+        rate_limiter
+            .update_from_headers(&create_test_headers(HashMap::from([(
+                "retry-after",
+                s("60"),
+            )])))
+            .await;
+
+        let mut wait = std::pin::pin!(rate_limiter.check_rate_limit());
+        assert!(
+            poll!(&mut wait).is_pending(),
+            "the first Retry-After must schedule a wait"
+        );
+
+        // A sibling request is told to back off for longer.
+        rate_limiter
+            .update_from_headers(&create_test_headers(HashMap::from([(
+                "retry-after",
+                s("300"),
+            )])))
+            .await;
+
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        assert!(
+            poll!(&mut wait).is_pending(),
+            "the extended deadline must still hold the request back"
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(301)).await;
+        wait.now_or_never()
+            .expect("the extended deadline must release the request once it passes")
+            .expect("rate limit check failed");
+    }
+
+    /// GitHub meters `core` and `graphql` separately. A REST scan that spends
+    /// `core` must not stall GraphQL requests with 5,000 of their own to spend.
+    #[tokio::test]
+    async fn an_exhausted_rest_quota_does_not_hold_back_graphql() {
+        let rest = GitHubRateLimiter::new();
+        let graphql = rest.split_primary_quotas();
+
+        rest.update_from_headers(&create_test_headers(HashMap::from([
+            ("x-ratelimit-limit", s("5000")),
+            ("x-ratelimit-remaining", s("0")),
+            ("x-ratelimit-used", s("5000")),
+            (
+                "x-ratelimit-reset",
+                (Utc::now() + Duration::hours(1)).timestamp().to_string(),
+            ),
+            ("x-ratelimit-resource", s("core")),
+        ])))
+        .await;
+
+        let mut rest_wait = std::pin::pin!(rest.check_rate_limit());
+        assert!(
+            poll!(&mut rest_wait).is_pending(),
+            "the handle that spent core must wait for it to reset"
+        );
+
+        graphql
+            .check_rate_limit()
+            .now_or_never()
+            .expect("a spent core quota must not hold back a graphql request")
+            .expect("rate limit check failed");
+    }
+
+    /// The secondary limit is charged to the token, not the resource, so both
+    /// handles have to honour one `retry-after`.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_after_on_one_handle_holds_the_other() {
+        let rest = GitHubRateLimiter::new();
+        let graphql = rest.split_primary_quotas();
+
+        rest.update_from_headers(&create_test_headers(HashMap::from([(
+            "retry-after",
+            s("3600"),
+        )])))
+        .await;
+
+        let mut wait = std::pin::pin!(graphql.check_rate_limit());
+        assert!(
+            poll!(&mut wait).is_pending(),
+            "a Retry-After charged to the token must hold every handle on it"
         );
     }
 
