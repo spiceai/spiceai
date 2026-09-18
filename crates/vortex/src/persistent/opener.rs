@@ -61,6 +61,7 @@ use crate::convert::schema::calculate_physical_schema;
 use crate::metrics::PARTITION_LABEL;
 use crate::metrics::PATH_LABEL;
 use crate::persistent::cache::CachedVortexMetadata;
+use crate::persistent::cache::cache_footer;
 use crate::persistent::deferred_projection::DeferredProjectionReader;
 use crate::persistent::reader::VortexReaderFactory;
 use crate::persistent::segment_cache::SharedSegmentCache;
@@ -211,7 +212,8 @@ impl FileOpener for VortexOpener {
                 ));
             }
 
-            if let Some(file_metadata_cache) = file_metadata_cache
+            let mut footer_from_cache = false;
+            if let Some(file_metadata_cache) = file_metadata_cache.as_ref()
                 && let Some(entry) = file_metadata_cache.get(file.path())
                 && entry.is_valid_for(&file.object_meta)
                 && let Some(vortex_metadata) = entry
@@ -220,12 +222,30 @@ impl FileOpener for VortexOpener {
                     .downcast_ref::<CachedVortexMetadata>()
             {
                 open_opts = open_opts.with_footer(vortex_metadata.footer().clone());
+                footer_from_cache = true;
             }
 
             let vxf = open_opts
                 .open_read(reader)
                 .await
                 .map_err(|e| exec_datafusion_err!("Failed to open Vortex file {e}"))?;
+
+            // A footer the write path cached lives only in the writing process, so
+            // every file a scan meets that this process did not write - the whole
+            // table after a restart, and any file another node wrote - re-reads and
+            // re-parses the footer on every split open, forever. Caching what the
+            // open just parsed, keyed on the very `ObjectMeta` the scan listed, makes
+            // the entry validate for every later split and query.
+            if !footer_from_cache
+                && let Some(file_metadata_cache) = file_metadata_cache.as_ref()
+            {
+                cache_footer(
+                    file_metadata_cache,
+                    file.object_meta.clone(),
+                    Arc::new(CachedVortexMetadata::new(&vxf)),
+                    "scan",
+                );
+            }
 
             // This is the expected arrow types of the actual columns in the file, which might have different types
             // from the unified logical schema or miss
