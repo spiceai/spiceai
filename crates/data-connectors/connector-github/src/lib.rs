@@ -27,7 +27,7 @@ use connector_graphql::graphql::client::UnnestBehavior;
 use connector_graphql::graphql::{
     self, FilterPushdownResult, GraphQLContext,
     builder::GraphQLClientBuilder,
-    client::{GraphQLClient, GraphQLQuery, PaginationParameters},
+    client::{GraphQLClient, GraphQLQuery, NestedConnectionPager, PaginationParameters},
     provider::{GraphQLTableProvider, GraphQLTableProviderBuilder},
 };
 use data_components::rate_limit::RateLimiter;
@@ -41,7 +41,6 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use governor::Quota;
 use graphql_parser::query::{
     Definition, InlineFragment, OperationDefinition, Query, Selection, SelectionSet,
 };
@@ -61,7 +60,6 @@ use secrecy::ExposeSecret;
 use snafu::ResultExt;
 use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
-use std::num::NonZeroU32;
 use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration};
 use token_provider::github_app_token::GitHubAppTokenProvider;
@@ -105,8 +103,14 @@ type GitHubConcurrencyLimits = HashMap<String, (usize, Arc<Semaphore>)>;
 static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<GitHubConcurrencyLimits>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+#[derive(Clone)]
+struct GitHubAuthRateControl {
+    controller: Arc<RateController>,
+    limiter: Arc<GitHubRateLimiter>,
+}
+
 static GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS: LazyLock<
-    RwLock<HashMap<String, Arc<RateController>>>,
+    RwLock<HashMap<String, GitHubAuthRateControl>>,
 > = LazyLock::new(|| RwLock::new(HashMap::new()));
 static UNAUTHENTICATED_AUTH_CONTEXT: &str = "unauthenticated";
 const GITHUB_CONNECTOR_DOCS_URL: &str =
@@ -120,37 +124,36 @@ fn sanitize_github_validation_body(body: &str) -> String {
     body.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-async fn get_github_auth_context_rate_controller(auth_context: String) -> Arc<RateController> {
-    let rate_controllers = GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS.read().await;
-    if let Some(controller) = rate_controllers.get(&auth_context) {
-        return Arc::clone(controller);
+async fn get_github_auth_rate_control(auth_context: String) -> GitHubAuthRateControl {
+    {
+        let rate_controllers = GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS.read().await;
+        if let Some(existing) = rate_controllers.get(&auth_context) {
+            return existing.clone();
+        }
     }
 
-    drop(rate_controllers);
     let mut rate_controllers = GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS.write().await;
+    if let Some(existing) = rate_controllers.get(&auth_context) {
+        return existing.clone();
+    }
 
-    // GitHub secondary rate limit for GraphQL is 2000 points per minute
-    let Some(secondary_quota_per_minute) = NonZeroU32::new(2000) else {
-        unreachable!("2000 is non-zero");
-    };
-
-    // GitHub secondary rate limit for requests per minute cannot exceed 90 CPU time per 60 seconds wall time
-    let Some(cpu_time_limit) = NonZeroU32::new(90) else {
-        unreachable!("90 is non-zero");
-    };
-
-    let rate_controller = RateControllerBuilder::new()
-        .with_weighted_quota(Quota::per_minute(secondary_quota_per_minute))
-        .add_quota(Quota::per_minute(cpu_time_limit))
+    // GitHub GraphQL secondary limit is 2000 points/minute at 1 point per
+    // non-mutation query. Target 90% fill so 10% remains as buffer.
+    // Equal 1-point costs make the shared governor FIFO fair across tables.
+    let controller = RateControllerBuilder::new()
+        .with_weighted_quota(rate_limit::graphql_secondary_quota())
         .with_jitter(JitterConfig::new(
             Duration::from_millis(5),
             Duration::from_millis(10),
-        ));
+        ))
+        .build();
 
-    let controller = rate_controller.build();
-    rate_controllers.insert(auth_context.clone(), Arc::clone(&controller));
-
-    controller
+    let control = GitHubAuthRateControl {
+        controller,
+        limiter: Arc::new(GitHubRateLimiter::new()),
+    };
+    rate_controllers.insert(auth_context, control.clone());
+    control
 }
 
 const GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 10;
@@ -183,6 +186,8 @@ pub struct GitHubTableGraphQLParams {
     unnest_behavior: UnnestBehavior,
     /// The GraphQL schema of the response data, if available
     schema: Option<SchemaRef>,
+    /// When set, truncated nested connections are completed via `node(id:)` follow-up pages.
+    nested_pager: Option<NestedConnectionPager>,
 }
 
 impl GitHubTableGraphQLParams {
@@ -198,7 +203,14 @@ impl GitHubTableGraphQLParams {
             json_pointer,
             unnest_behavior,
             schema,
+            nested_pager: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_nested_pager(mut self, pager: NestedConnectionPager) -> Self {
+        self.nested_pager = Some(pager);
+        self
     }
 }
 
@@ -418,7 +430,7 @@ impl Github {
             |t| t.dyn_hash(),
         );
 
-        let rate_controller = get_github_auth_context_rate_controller(auth_context).await;
+        let rate_controller = get_github_auth_rate_control(auth_context).await.controller;
 
         let client = reqwest::Client::builder()
             .user_agent(util::spiceai_user_agent())
@@ -449,6 +461,7 @@ impl Github {
         .with_rate_limiter(Some(Arc::clone(&self.rate_limiter) as Arc<dyn RateLimiter>))
         .with_semaphore(Some(Arc::clone(&self.semaphore)))
         .with_rate_controller(Some(rate_controller))
+        .with_nested_pager(gql_client_params.nested_pager)
         .build(client)
         .boxed()
     }
@@ -615,9 +628,11 @@ impl Github {
             );
         }
 
+        // REST spends `core`; the GraphQL client spends `graphql`. GitHub meters
+        // them separately, so they must not wait on each other's quota.
         GithubRestClient::new(
             token,
-            Arc::clone(&self.rate_limiter) as Arc<dyn RateLimiter>,
+            Arc::new(self.rate_limiter.split_primary_quotas()) as Arc<dyn RateLimiter>,
         )
         .map_err(Into::into)
     }
@@ -976,10 +991,16 @@ impl DataConnectorFactory for GithubFactory {
                 Arc::new(Semaphore::new(max_concurrent_connections))
             };
 
+            let auth_context = token_provider.as_ref().map_or_else(
+                || UNAUTHENTICATED_AUTH_CONTEXT.to_string(),
+                |token| token.dyn_hash(),
+            );
+            let rate_limiter = get_github_auth_rate_control(auth_context).await.limiter;
+
             Ok(Arc::new(Github {
                 params: params.parameters,
                 token: token_provider,
-                rate_limiter: Arc::new(GitHubRateLimiter::new()),
+                rate_limiter,
                 semaphore,
             }) as Arc<dyn DataConnector>)
         })
