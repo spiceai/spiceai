@@ -146,8 +146,10 @@ mod tests {
     use datafusion::config::ConfigOptions;
     use datafusion::datasource::DefaultTableSource;
     use datafusion::datasource::TableProvider;
+    use datafusion::datasource::empty::EmptyTable;
     use datafusion::functions::expr_fn::{date_part, date_trunc};
     use datafusion::functions_aggregate::expr_fn::count;
+    use datafusion::logical_expr::exists;
     use datafusion::logical_expr::{
         ColumnarValue, Expr, Extension, JoinType, LogicalPlan, LogicalPlanBuilder, ScalarUDF,
         TableSource, Volatility, builder::LogicalTableSource, cast, create_udf,
@@ -2529,5 +2531,85 @@ mod tests {
         })
         .expect("walking a logical plan cannot fail");
         found
+    }
+
+    /// An `EXISTS` subquery over a federated table has to be federated.
+    ///
+    /// `Expr::Exists` fell through the analyzer's expression walk, so the tables
+    /// inside an `EXISTS` subquery were invisible to the provider verdict and the
+    /// subquery was never federated. It then runs locally — one scan per table
+    /// reference, every join and aggregate evaluated here — while the statement
+    /// around it federates. Fork PR #74 handles the expression in both halves of
+    /// the walk: counting the subquery's tables toward the verdict, and federating
+    /// the subquery's own plan.
+    ///
+    /// The outer table is deliberately *not* federated. That way the statement
+    /// cannot federate as one unit, so the only thing that can carry a federated
+    /// node is the subquery itself, and the assertion cannot be satisfied by the
+    /// outer plan being wrapped instead. The subquery is a `Limit` over the scan
+    /// for the reason the DML guard above gives: a bare scan is served by the
+    /// adaptor and never wrapped.
+    #[test]
+    fn an_exists_subquery_over_a_federated_table_is_federated() {
+        // A real provider, not a `LogicalTableSource`: the analyzer resolves every
+        // scan through `source_as_provider`, which refuses anything else outright
+        // ("TableSource was not DefaultTableSource").
+        let local: Arc<dyn TableSource> =
+            Arc::new(DefaultTableSource::new(Arc::new(EmptyTable::new(
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            ))));
+        let subquery = LogicalPlanBuilder::scan("t", federated_table_source(), None)
+            .expect("scan the federated table")
+            .limit(0, Some(1))
+            .expect("limit the scan")
+            .build()
+            .expect("build the subquery");
+
+        let statement = LogicalPlanBuilder::scan("local", local, None)
+            .expect("scan the local table")
+            .filter(exists(Arc::new(subquery)))
+            .expect("filter on EXISTS")
+            .build()
+            .expect("build the statement");
+
+        let analyzed = FederationAnalyzerRule::new()
+            .analyze(statement, &ConfigOptions::default())
+            .expect("the analyzer accepts a statement with an EXISTS subquery");
+
+        assert!(
+            !contains_a_federated_node(&analyzed),
+            "the outer table is not federated, so nothing outside the subquery may be \
+             wrapped — otherwise the assertion below could be met by the wrong node. \
+             Shape was:\n{}",
+            analyzed.display_indent()
+        );
+        assert!(
+            an_exists_subquery_is_federated(&analyzed),
+            "the subquery's only table is federated, so the subquery has to be pushed to \
+             that provider rather than run here a scan at a time. Shape was:\n{}",
+            analyzed.display_indent()
+        );
+    }
+
+    /// Whether some `EXISTS` subquery in `plan` came back federated.
+    fn an_exists_subquery_is_federated(plan: &LogicalPlan) -> bool {
+        let mut federated = false;
+        plan.apply(|node| {
+            for expr in node.expressions() {
+                expr.apply(|e| {
+                    if let Expr::Exists(exists) = e
+                        && contains_a_federated_node(exists.subquery.subquery.as_ref())
+                    {
+                        federated = true;
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .expect("walking an expression cannot fail");
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("walking a logical plan cannot fail");
+        federated
     }
 }
