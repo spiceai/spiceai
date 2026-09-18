@@ -320,7 +320,7 @@ where
 }
 
 /// Production SQL Raw hit: `QueryResult::from_cached_raw` + `into_source`.
-/// Prefetch runs at construction; each poll is one `Arc` clone.
+/// Each poll is one `Arc` clone; no serve-path prefetch.
 fn sql_raw_hit_stream(
     stored: &cache::result::query::CachedBatches,
     schema: &SchemaRef,
@@ -392,7 +392,7 @@ where
 /// Pre-change SQL serve: `Arc<Vec<RecordBatch>>`, `RecordBatch::clone`
 /// on each poll. Bench-local so construct+drain and construct+drain+touch
 /// isolate the new SQL path (`QueryResult::from_cached_raw` →
-/// `CachedRawStream`, prefetch + one `Arc` clone per poll).
+/// `CachedRawStream`, one `Arc` clone per poll).
 struct LegacyCachedStream {
     data: Arc<Vec<RecordBatch>>,
     schema: SchemaRef,
@@ -540,11 +540,11 @@ fn numeric_working_set(
 /// `legacy_stream` / `legacy_stream_touch` are the old SQL serve path
 /// (`LegacyCachedStream`: `Arc<Vec<_>>`, `RecordBatch::clone` on poll).
 /// `cached_raw_stream` / `cached_raw_stream_touch` are the new SQL serve
-/// path (`QueryResult::from_cached_raw` → `into_source`: prefetch + one
-/// `Arc` clone per poll). `legacy_column_clone` and `arc_batch_clone`
+/// path (`QueryResult::from_cached_raw` → `into_source`: one `Arc` clone
+/// per poll, no prefetch). `legacy_column_clone` and `arc_batch_clone`
 /// isolate the per-batch clone cost without stream construction — they are
 /// not the serve-path comparison. `*_touch_working_set` rotates through
-/// entries larger than LLC so prefetch is not measured on a warm line.
+/// entries larger than LLC so the scan is not measured on a warm line.
 /// `concurrent_hits` / `concurrent_legacy_hits` use persistent workers.
 fn bench_raw_stream_serve(c: &mut Criterion) {
     let mut group = c.benchmark_group("raw_stream_serve");

@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 pub mod embeddings;
-pub(crate) mod prefetch;
 pub mod query;
 pub mod search;
 
