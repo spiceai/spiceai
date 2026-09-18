@@ -39,7 +39,7 @@ use http::{HeaderMap, HeaderValue, header::CONTENT_TYPE};
 use mediatype::{MediaType, names};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
-use arrow::array::RecordBatch;
+use futures::StreamExt;
 use llms::chat::nsql::{FailedAttempt, QueryGenerationContext, default::DefaultSqlGeneration};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};

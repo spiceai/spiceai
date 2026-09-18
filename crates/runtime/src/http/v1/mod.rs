@@ -546,7 +546,7 @@ fn json_array_body_from_batches<S, B>(
     account: Arc<EgressAccount>,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send
 where
-    S: Stream<Item = Result<B, datafusion::error::DataFusionError>> + Send + 'static,
+    S: Stream<Item = Result<B, datafusion::error::DataFusionError>> + Send + Unpin + 'static,
     B: SqlJsonBatch,
 {
     let mut batches =

@@ -2443,7 +2443,7 @@ fn attach_cancellation_to_item_stream<S, I, G>(
     guard: G,
 ) -> Pin<Box<dyn Stream<Item = Result<I, DataFusionError>> + Send>>
 where
-    S: Stream<Item = Result<I, DataFusionError>> + Send + 'static,
+    S: Stream<Item = Result<I, DataFusionError>> + Send + Unpin + 'static,
     I: Send + 'static,
     G: Send + 'static,
 {
