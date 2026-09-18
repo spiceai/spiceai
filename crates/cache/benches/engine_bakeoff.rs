@@ -33,7 +33,7 @@ use rand::{RngExt, SeedableRng};
 use sharded_cache::EvictionPolicy;
 use std::hint::black_box;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "pingora")]
 use cache::PingoraBackend;
@@ -226,6 +226,110 @@ fn run_mixed<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
     }
 }
 
+
+/// Sorted-sample percentile of individual get latencies (nanoseconds).
+fn percentile_ns(sorted: &[u64], p: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+    sorted[rank.min(sorted.len() - 1)]
+}
+
+struct Hit70Latency {
+    mops: f64,
+    p50_ns: u64,
+    p999_ns: u64,
+    samples: usize,
+}
+
+/// Measure ~70/30 get throughput and **per-get** P50 / P99.9 latency.
+fn measure_hit70_latency<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
+    handle: &tokio::runtime::Handle,
+    backend: &Arc<B>,
+    threads: usize,
+) -> Hit70Latency {
+    let wall_start = Instant::now();
+    let joins: Vec<_> = (0..threads)
+        .map(|thread_id| {
+            let backend = Arc::clone(backend);
+            let handle = handle.clone();
+            std::thread::spawn(move || {
+                let mut rng = StdRng::seed_from_u64(thread_id as u64 + 100);
+                let mut samples = Vec::with_capacity(OPERATIONS_PER_THREAD);
+                handle.block_on(async {
+                    for _ in 0..OPERATIONS_PER_THREAD {
+                        let key = if rng.random_bool(0.7) {
+                            rng.random_range(0..HIT70_HOT_SET)
+                        } else {
+                            rng.random_range(0..KEY_SPACE)
+                        };
+                        let t0 = Instant::now();
+                        black_box(backend.get(&key).await);
+                        samples.push(u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX));
+                    }
+                });
+                samples
+            })
+        })
+        .collect();
+    let mut all = Vec::with_capacity(threads * OPERATIONS_PER_THREAD);
+    for join in joins {
+        all.extend(join.join().expect("worker panicked"));
+    }
+    let wall = wall_start.elapsed().as_secs_f64().max(1e-9);
+    all.sort_unstable();
+    let total_ops = (threads * OPERATIONS_PER_THREAD) as f64;
+    Hit70Latency {
+        mops: (total_ops / wall) / 1_000_000.0,
+        p50_ns: percentile_ns(&all, 0.50),
+        p999_ns: percentile_ns(&all, 0.999),
+        samples: all.len(),
+    }
+}
+
+fn print_hit70_latency_table(handle: &tokio::runtime::Handle) {
+    eprintln!();
+    eprintln!("=== hit70 individual-get latency (sorted samples P50 / P99.9) ===");
+    eprintln!("engine\tthreads\tMops/s\tp50_ns\tp99.9_ns\tsamples");
+    for threads in THREAD_COUNTS {
+        for (name, policy) in [
+            ("spice_lru", EvictionPolicy::Lru),
+            ("spice_lfu", EvictionPolicy::Lfu),
+            ("spice_tinylfu", EvictionPolicy::TinyLfu),
+        ] {
+            let backend = spice_backend(policy);
+            handle.block_on(prefill_hit70(backend.as_ref()));
+            let s = measure_hit70_latency(handle, &backend, threads);
+            eprintln!(
+                "{name}\t{threads}\t{:.2}\t{}\t{}\t{}",
+                s.mops, s.p50_ns, s.p999_ns, s.samples
+            );
+        }
+        {
+            let backend = moka_backend();
+            handle.block_on(prefill_hit70(backend.as_ref()));
+            let s = measure_hit70_latency(handle, &backend, threads);
+            eprintln!(
+                "moka_lru\t{threads}\t{:.2}\t{}\t{}\t{}",
+                s.mops, s.p50_ns, s.p999_ns, s.samples
+            );
+        }
+        #[cfg(feature = "pingora")]
+        {
+            let backend = pingora_backend();
+            handle.block_on(prefill_hit70(backend.as_ref()));
+            let s = measure_hit70_latency(handle, &backend, threads);
+            eprintln!(
+                "pingora\t{threads}\t{:.2}\t{}\t{}\t{}",
+                s.mops, s.p50_ns, s.p999_ns, s.samples
+            );
+        }
+    }
+    eprintln!("=== end hit70 latency table ===");
+    eprintln!();
+}
+
 fn configure_group(group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(2));
@@ -243,6 +347,9 @@ fn bench_concurrent_get_hit70(c: &mut Criterion) {
     configure_group(&mut group);
     let rt = runtime();
     let handle = rt.handle().clone();
+    // One-shot per-get P99.9 table (sorted samples) printed before Criterion
+    // throughput so the PR can cite both Mops/s and tail latency.
+    print_hit70_latency_table(&handle);
 
     for threads in THREAD_COUNTS {
         group.throughput(Throughput::Elements(

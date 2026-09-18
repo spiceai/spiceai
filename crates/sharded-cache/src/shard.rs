@@ -31,6 +31,7 @@ use crate::EvictionPolicy;
 use crate::hasher::IdentityBuildHasher;
 use crate::sketch::CountMinSketch;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Which SLRU / window segment an entry currently occupies.
@@ -71,7 +72,9 @@ enum Slot<V> {
 
 struct Node<V> {
     key: u64,
-    value: V,
+    /// Shared handle so a hit can `Arc::clone` under a short shard lock and
+    /// clone the fat `V` only after unlock.
+    value: Arc<V>,
     inserted_at: Instant,
     weight: u64,
     region: Region,
@@ -81,8 +84,14 @@ struct Node<V> {
     next: Option<u32>,
 }
 
+
+pub(crate) fn into_owned<V: Clone>(value: Arc<V>) -> V {
+    Arc::try_unwrap(value).unwrap_or_else(|shared| (*shared).clone())
+}
+
 pub(crate) enum GetOutcome<V> {
-    Hit(V),
+    /// Live hit: `Arc` handle cloned under the shard lock (no list surgery).
+    Hit(Arc<V>),
     Miss,
     Expired { value: V, weight: u64 },
 }
@@ -302,7 +311,9 @@ impl<V> Shard<V> {
 }
 
 impl<V: Clone> Shard<V> {
-    /// Non-destructive get: clone the value and promote in place.
+    /// Short-lock hit path: look up, bump freq, `Arc::clone` the value handle.
+    /// Does **not** relink LRU/LFU/W-TinyLFU lists — callers enqueue a touch and
+    /// apply promotions via [`Self::apply_touch`] off the get latency path.
     pub(crate) fn get(&mut self, key: u64, now: Instant, ttl: Duration) -> GetOutcome<V> {
         let Some(&idx) = self.map.get(&key) else {
             return GetOutcome::Miss;
@@ -323,14 +334,22 @@ impl<V: Clone> Shard<V> {
             return GetOutcome::Expired { value, weight };
         }
         let value = match self.slots.get(idx as usize) {
-            Some(Slot::Occupied(node)) => node.value.clone(),
+            Some(Slot::Occupied(node)) => Arc::clone(&node.value),
             _ => return GetOutcome::Miss,
         };
         if let Some(Slot::Occupied(node)) = self.slots.get_mut(idx as usize) {
             node.freq = node.freq.saturating_add(1);
         }
-        self.on_hit(idx);
         GetOutcome::Hit(value)
+    }
+
+    /// Apply a buffered hit: region relink / probation→protected (W-TinyLFU).
+    /// No-op if `key` is gone. Does not bump `freq` (already counted on get).
+    pub(crate) fn apply_touch(&mut self, key: u64) {
+        let Some(&idx) = self.map.get(&key) else {
+            return;
+        };
+        self.on_hit(idx);
     }
 
     pub(crate) fn insert(
@@ -346,7 +365,7 @@ impl<V: Clone> Shard<V> {
         let region = self.admit_region();
         let idx = self.alloc(Node {
             key,
-            value,
+            value: Arc::new(value),
             inserted_at: now,
             weight,
             region,
@@ -460,7 +479,7 @@ impl<V: Clone> Shard<V> {
     where
         F: Fn(&V) -> bool,
     {
-        let matched = self.collect_matching(|node| predicate(&node.value));
+        let matched = self.collect_matching(|node| predicate(node.value.as_ref()));
         self.remove_indices(matched)
     }
 
@@ -485,7 +504,7 @@ impl<V: Clone> Shard<V> {
         // appending forever after churn + clear.
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if let Slot::Occupied(node) = std::mem::replace(slot, Slot::Vacant) {
-                values.push(node.value);
+                values.push(into_owned(node.value));
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "slot index fits in u32; the cache cannot hold u32::MAX entries"
@@ -537,7 +556,7 @@ impl<V: Clone> Shard<V> {
             self.map.remove(&key);
             if let Some(Slot::Occupied(node)) = self.take_slot(idx) {
                 weight = weight.saturating_add(node.weight);
-                values.push(node.value);
+                values.push(into_owned(node.value));
             }
         }
         (values, weight)
@@ -568,7 +587,7 @@ impl<V: Clone> Shard<V> {
     }
 }
 
-impl<V> Shard<V> {
+impl<V: Clone> Shard<V> {
     fn replace(
         &mut self,
         idx: u32,
@@ -579,7 +598,7 @@ impl<V> Shard<V> {
         let (old_weight, old_value, region) = match self.slots.get_mut(idx as usize) {
             Some(Slot::Occupied(node)) => {
                 let old_weight = node.weight;
-                let old_value = std::mem::replace(&mut node.value, value);
+                let old_value = into_owned(std::mem::replace(&mut node.value, Arc::new(value)));
                 let region = node.region;
                 node.weight = weight;
                 node.inserted_at = now;
@@ -699,7 +718,7 @@ impl<V> Shard<V> {
 
     fn take_value_and_free(&mut self, idx: u32) -> Option<V> {
         match self.take_slot(idx)? {
-            Slot::Occupied(node) => Some(node.value),
+            Slot::Occupied(node) => Some(into_owned(node.value)),
             Slot::Vacant => None,
         }
     }
@@ -748,8 +767,10 @@ mod tests {
         assert_eq!(shard.keys_mru_first(), vec![2, 1]);
 
         let got = shard.get(1, now, Duration::from_mins(1));
-        assert!(matches!(got, GetOutcome::Hit(10)));
+        assert!(matches!(got, GetOutcome::Hit(ref v) if **v == 10));
         assert_eq!(shard.len(), 2, "a hit must not remove the entry");
+        // Promote is buffered: apply explicitly (cache drains off the get path).
+        shard.apply_touch(1);
         assert_eq!(shard.keys_mru_first(), vec![1, 2]);
     }
 
@@ -829,7 +850,13 @@ mod tests {
         shard.insert(1, 10, 5, now);
         assert!(shard.move_window_to_probation(1));
         let got = shard.get(1, now, Duration::from_mins(1));
-        assert!(matches!(got, GetOutcome::Hit(10)));
+        assert!(matches!(got, GetOutcome::Hit(ref v) if **v == 10));
+        assert_eq!(
+            shard.peek_region(1),
+            Some(Region::Probation),
+            "get must not relink; touch apply promotes"
+        );
+        shard.apply_touch(1);
         assert_eq!(shard.peek_region(1), Some(Region::Protected));
         assert_eq!(shard.protected_weight(), 5);
     }

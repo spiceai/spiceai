@@ -22,12 +22,18 @@ limitations under the License.
 //! to shard **`key % 16`** ([`shard_index`]). Keys are pre-hashed `u64` values;
 //! each shard's map uses an identity hasher so they are not hashed again.
 //!
-//! # Get is non-destructive
+//! # Get is non-destructive (short-lock + buffered promote)
 //!
-//! [`ShardedCache::get`] never removes an entry to serve a hit. A hit clones
-//! the value and updates LRU recency in place. Two concurrent hits on the same
-//! key both succeed. This is the hard gate against `Pingora`'s remove-and-re-admit
-//! path (spiceai/spiceai#12985).
+//! [`ShardedCache::get`] never removes an entry to serve a hit. Under the shard
+//! `parking_lot::Mutex` a hit only looks up, bumps frequency / sketch metadata,
+//! and `Arc::clone`s the value handle — then unlocks. The fat `V` clone happens
+//! after unlock. Region relinks (LRU / LFU / W-TinyLFU) are enqueued into a
+//! per-shard touch buffer and applied from [`ShardedCache::run_pending_tasks`],
+//! [`ShardedCache::insert`], and a best-effort drain on the get path (Moka-like
+//! buffered ops: concurrent touch order may be slightly looser; differential
+//! value agreement still holds). Two concurrent hits on the same key both
+//! succeed. This is the hard gate against `Pingora`'s remove-and-re-admit path
+//! (spiceai/spiceai#12985).
 //!
 //! # Table invalidation
 //!
@@ -39,7 +45,7 @@ mod shard;
 mod sketch;
 
 use parking_lot::Mutex;
-use shard::{GetOutcome, Shard};
+use shard::{GetOutcome, Shard, into_owned};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -108,12 +114,26 @@ impl EvictionListener for NoopListener {
     fn on_evict(_reason: EvictionReason) {}
 }
 
+
+/// Soft cap on buffered touches per shard. Excess oldest touches are dropped
+/// (Moka-like): eviction heuristics tolerate lost promotions under overload.
+const TOUCH_DRAIN_THRESHOLD: usize = 64;
+const TOUCH_BUFFER_CAP: usize = 1024;
+
+#[repr(align(64))]
+struct TouchBuffer {
+    keys: Mutex<Vec<u64>>,
+}
+
 #[repr(align(64))]
 struct CachePadded<T>(T);
 
 /// Sharded cache keyed by pre-hashed `u64` values.
 pub struct ShardedCache<V, L: EvictionListener = NoopListener> {
     shards: Box<[CachePadded<Mutex<Shard<V>>>; NUM_SHARDS]>,
+    /// Per-shard buffered touches (key ids). Separate from the shard data
+    /// mutex so get can unlock the map before enqueueing / draining promotes.
+    touch_buffers: Box<[CachePadded<TouchBuffer>; NUM_SHARDS]>,
     max_weight: u64,
     ttl: Duration,
     policy: EvictionPolicy,
@@ -141,13 +161,18 @@ pub struct ShardedCache<V, L: EvictionListener = NoopListener> {
     _listener: std::marker::PhantomData<L>,
 }
 
-impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
+impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
     /// Create a cache with a byte budget of `max_weight` and a per-entry TTL.
     #[must_use]
     pub fn new(max_weight: u64, ttl: Duration, policy: EvictionPolicy) -> Self {
         Self {
             shards: Box::new(core::array::from_fn(|_| {
                 CachePadded(Mutex::new(Shard::new(policy)))
+            })),
+            touch_buffers: Box::new(core::array::from_fn(|_| {
+                CachePadded(TouchBuffer {
+                    keys: Mutex::new(Vec::new()),
+                })
             })),
             max_weight,
             ttl,
@@ -182,6 +207,9 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             return;
         }
         let shard_idx = shard_index(key);
+        // Apply deferred get-path promotes before admission so eviction sees
+        // up-to-date region / frequency state for this shard.
+        self.drain_touches_blocking(shard_idx);
         let mut shard = self.shards[shard_idx].0.lock();
         // Sample TTL after the shard lock so wait time is not charged to the
         // entry (and so TinyLFU can expire this shard before admission).
@@ -223,42 +251,53 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     ///
     /// Never removes a live entry. An expired entry is dropped and reported
     /// as [`EvictionReason::Expired`].
+    ///
+    /// # Short lock + buffered promote
+    ///
+    /// Under the shard mutex this only looks up, bumps LFU/sketch metadata,
+    /// and `Arc::clone`s the resident handle — then unlocks. The fat `V`
+    /// clone runs after unlock. LRU / LFU / W-TinyLFU region relinks are
+    /// recorded in a per-shard touch buffer and applied from
+    /// [`Self::run_pending_tasks`], [`Self::insert`], and a best-effort drain
+    /// on this path. Concurrent touch order may be slightly looser (Moka-like
+    /// buffered ops); differential value agreement still holds. Demotion /
+    /// trim stay off the get hot path (`try_lock` / after unlock).
     pub fn get(&self, key: &u64) -> Option<V> {
-        let mut shard = self.shards[shard_index(*key)].0.lock();
-        let now = Instant::now();
-        if matches!(self.policy, EvictionPolicy::TinyLfu) {
-            shard.increment_sketch(*key);
-        }
-        let before_window = shard.window_weight();
-        let before_protected = shard.protected_weight();
-        match shard.get(*key, now, self.ttl) {
-            GetOutcome::Hit(value) => {
-                let after_protected = shard.protected_weight();
-                if after_protected > before_protected {
-                    let gained = after_protected - before_protected;
-                    self.protected_weight.fetch_add(gained, Ordering::Relaxed);
-                }
-                drop(shard);
-                if matches!(self.policy, EvictionPolicy::TinyLfu) {
-                    self.demote_protected_if_over_cap();
-                }
-                Some(value)
+        let shard_idx = shard_index(*key);
+        let handle = {
+            let mut shard = self.shards[shard_idx].0.lock();
+            let now = Instant::now();
+            if matches!(self.policy, EvictionPolicy::TinyLfu) {
+                shard.increment_sketch(*key);
             }
-            GetOutcome::Miss => None,
-            GetOutcome::Expired { value, weight } => {
-                self.sub_weight(weight);
-                self.sync_segment_weights_after_removal(
-                    before_window,
-                    shard.window_weight(),
-                    before_protected,
-                    shard.protected_weight(),
-                );
-                drop(shard);
-                drop(value);
-                L::on_evict(EvictionReason::Expired);
-                None
+            let before_window = shard.window_weight();
+            let before_protected = shard.protected_weight();
+            match shard.get(*key, now, self.ttl) {
+                GetOutcome::Hit(handle) => handle,
+                GetOutcome::Miss => return None,
+                GetOutcome::Expired { value, weight } => {
+                    self.sub_weight(weight);
+                    self.sync_segment_weights_after_removal(
+                        before_window,
+                        shard.window_weight(),
+                        before_protected,
+                        shard.protected_weight(),
+                    );
+                    drop(shard);
+                    drop(value);
+                    L::on_evict(EvictionReason::Expired);
+                    return None;
+                }
             }
-        }
+        };
+        // Fat payload clone is outside the shard mutex (try_unwrap when unique).
+        let value = into_owned(handle);
+        self.record_touch(shard_idx, *key);
+        // Promote is off the get latency path: best-effort drain only once
+        // the per-shard buffer reaches TOUCH_DRAIN_THRESHOLD (`try_lock`).
+        // Insert and `run_pending_tasks` drain the rest (Moka-like buffered ops).
+        self.maybe_drain_touches(shard_idx);
+        Some(value)
     }
 
     /// Remove `key` if present. This is not an eviction and is not reported.
@@ -295,6 +334,9 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         self.sub_weight(removed);
         self.window_weight.store(0, Ordering::Relaxed);
         self.protected_weight.store(0, Ordering::Relaxed);
+        for buf in self.touch_buffers.iter() {
+            buf.0.keys.lock().clear();
+        }
         // Release every shard before dropping values. A value destructor that
         // re-enters the cache would otherwise deadlock on these non-reentrant
         // locks, and large Arrow-backed values would extend the hold.
@@ -331,8 +373,14 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         self.weight.load(Ordering::Relaxed)
     }
 
-    /// Expire stale entries and evict down to `max_weight`.
+    /// Expire stale entries, apply buffered promotes, and evict down to `max_weight`.
+    ///
+    /// Drains every shard's touch buffer so region relinks deferred from
+    /// [`Self::get`] are applied before expiry / size maintenance.
     pub fn run_pending_tasks(&self) {
+        for shard_idx in 0..NUM_SHARDS {
+            self.drain_touches_blocking(shard_idx);
+        }
         for shard_idx in 0..NUM_SHARDS {
             let mut shard = self.shards[shard_idx].0.lock();
             let now = Instant::now();
@@ -417,6 +465,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             while self.needs_overflow_trim() {
                 #[cfg(test)]
                 self.run_before_size_victim();
+                // Apply deferred get-path promotes before choosing a victim.
+                self.drain_all_touches();
                 if !self.needs_overflow_trim() {
                     break;
                 }
@@ -538,6 +588,9 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         // or moved, so a concurrent get can promote / change the region.
         #[cfg(test)]
         self.run_before_size_victim();
+        // Concurrent gets (incl. the test hook) may have buffered promotes on
+        // any shard; apply them before frequency compare / victim choice.
+        self.drain_all_touches();
 
         let total_over = self.weight.load(Ordering::Relaxed) > self.max_weight;
         let victim = self.lowest_freq_region_tail(shard::Region::Probation);
@@ -614,12 +667,116 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         false
     }
 
+    /// Record a get-path touch for later region relink.
+    fn record_touch(&self, shard_idx: usize, key: u64) {
+        let mut buf = self.touch_buffers[shard_idx].0.keys.lock();
+        if buf.len() >= TOUCH_BUFFER_CAP {
+            // Drop oldest under overload (Moka-like); value agreement unaffected.
+            let overflow = buf.len() + 1 - TOUCH_BUFFER_CAP;
+            buf.drain(0..overflow);
+        }
+        buf.push(key);
+    }
+
+    fn maybe_drain_touches(&self, shard_idx: usize) {
+        let pending = self.touch_buffers[shard_idx].0.keys.lock().len();
+        if pending < TOUCH_DRAIN_THRESHOLD {
+            return;
+        }
+        self.drain_touches_try(shard_idx);
+    }
+
+        fn take_touch_batch(&self, shard_idx: usize) -> Vec<u64> {
+        let mut buf = self.touch_buffers[shard_idx].0.keys.lock();
+        std::mem::take(&mut *buf)
+    }
+
+    fn requeue_touches(&self, shard_idx: usize, keys: &[u64]) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut buf = self.touch_buffers[shard_idx].0.keys.lock();
+        // Prefer newer touches if requeue would exceed the soft cap.
+        let room = TOUCH_BUFFER_CAP.saturating_sub(buf.len());
+        if room == 0 {
+            return;
+        }
+        let start = keys.len().saturating_sub(room);
+        buf.extend_from_slice(&keys[start..]);
+    }
+
+    fn apply_touch_batch(&self, shard_idx: usize, keys: &[u64]) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut shard = self.shards[shard_idx].0.lock();
+        let before_protected = shard.protected_weight();
+        for &key in keys {
+            shard.apply_touch(key);
+        }
+        let after_protected = shard.protected_weight();
+        if after_protected > before_protected {
+            self.protected_weight
+                .fetch_add(after_protected - before_protected, Ordering::Relaxed);
+        } else if before_protected > after_protected {
+            self.protected_weight
+                .fetch_sub(before_protected - after_protected, Ordering::Relaxed);
+        }
+        drop(shard);
+        if matches!(self.policy, EvictionPolicy::TinyLfu) {
+            self.demote_protected_if_over_cap();
+        }
+    }
+
+    fn drain_touches_try(&self, shard_idx: usize) {
+        let batch = self.take_touch_batch(shard_idx);
+        if batch.is_empty() {
+            return;
+        }
+        let Some(mut shard) = self.shards[shard_idx].0.try_lock() else {
+            self.requeue_touches(shard_idx, &batch);
+            return;
+        };
+        let before_protected = shard.protected_weight();
+        for &key in &batch {
+            shard.apply_touch(key);
+        }
+        let after_protected = shard.protected_weight();
+        if after_protected > before_protected {
+            self.protected_weight
+                .fetch_add(after_protected - before_protected, Ordering::Relaxed);
+        } else if before_protected > after_protected {
+            self.protected_weight
+                .fetch_sub(before_protected - after_protected, Ordering::Relaxed);
+        }
+        drop(shard);
+        if matches!(self.policy, EvictionPolicy::TinyLfu) {
+            self.demote_protected_if_over_cap();
+        }
+    }
+
+    fn drain_touches_blocking(&self, shard_idx: usize) {
+        let batch = self.take_touch_batch(shard_idx);
+        self.apply_touch_batch(shard_idx, &batch);
+    }
+
+    fn drain_all_touches(&self) {
+        for shard_idx in 0..NUM_SHARDS {
+            self.drain_touches_blocking(shard_idx);
+        }
+    }
+
     /// Demote protected → probation while the global protected segment is over cap.
     ///
     /// Uses `try_lock` on `trim` so a hit that promotes into protected cannot
     /// deadlock with an in-flight `insert` that already holds `trim` and is
     /// waiting on this shard.
     fn demote_protected_if_over_cap(&self) {
+        // Cheap shared load first: steady-state hits must not RMW the
+        // cache-wide `trim` mutex when protected is already under cap.
+        if self.protected_weight.load(Ordering::Relaxed) <= self.protected_cap() {
+            return;
+        }
         let Some(_trim) = self.trim.try_lock() else {
             return;
         };
@@ -742,6 +899,7 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         key: u64,
         evicted: &mut Vec<(V, EvictionReason)>,
     ) -> bool {
+        self.drain_touches_blocking(shard_idx);
         let mut shard = self.shards[shard_idx].0.lock();
         let now = Instant::now();
         let before_window = shard.window_weight();
@@ -819,8 +977,10 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     }
 
     /// Unlink this shard's region tail only when it is still `expected`.
-    /// A concurrent get can promote the snapshot victim off the tail between
-    /// selection and this re-lock; returning false lets the caller reselect.
+    /// A concurrent get may have buffered a promote for this key; we drain
+    /// that shard's touch buffer before re-checking the tail so a completed
+    /// hit is visible (Moka-like: promote is deferred, but applied before
+    /// size unlink). Returning false lets the caller reselect.
     fn remove_tail_for_size(
         &self,
         shard_idx: usize,
@@ -828,6 +988,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         region: shard::Region,
         evicted: &mut Vec<(V, EvictionReason)>,
     ) -> bool {
+        // Apply deferred get-path promotes before trusting the snapshot tail.
+        self.drain_touches_blocking(shard_idx);
         let mut shard = self.shards[shard_idx].0.lock();
         let now = Instant::now();
         let before_window = shard.window_weight();
@@ -1245,6 +1407,7 @@ mod tests {
             Some("v16".to_string()),
             "read the oldest so recency no longer matches insertion order"
         );
+        cache.run_pending_tasks();
         assert_eq!(cache.keys_in_lru_order(), vec![16, 80, 64, 48, 32]);
 
         let removed = cache.invalidate_matching(|value| value.data == "v48");
