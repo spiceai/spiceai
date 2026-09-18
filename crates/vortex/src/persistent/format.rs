@@ -78,6 +78,7 @@ use super::segment_cache;
 use super::segment_cache::SharedSegmentCache;
 use super::sink::{ShardSpec, VortexSink};
 use super::source::VortexSource;
+use super::write_observer::VortexWriteObserver;
 use crate::PrecisionExt as _;
 use crate::convert::TryToDataFusion;
 
@@ -275,13 +276,19 @@ pub struct WriteShardConfig {
     /// key column is set: ordering a composite key needs a lexicographic
     /// comparison this does not implement, so a multi-column key hashes.
     pub range_bounds: Option<Vec<ScalarValue>>,
+    /// Sort each range shard's rows by the shard key in runs of at most this
+    /// many uncompressed bytes before encoding them. Ignored unless the write is
+    /// range-partitioned. `None` ⇒ rows keep their arrival order within a shard.
+    pub range_run_sort_bytes: Option<u64>,
 }
 
 /// Vortex implementation of a `DataFusion` [`FileFormat`].
+#[derive(Clone)]
 pub struct VortexFormat {
     session: VortexSession,
     opts: VortexTableOptions,
     access_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>>,
+    write_observer: Option<Arc<dyn VortexWriteObserver>>,
     segment_cache: Option<Arc<SharedSegmentCache>>,
     write_shard: Option<WriteShardConfig>,
 }
@@ -293,6 +300,10 @@ impl Debug for VortexFormat {
             .field(
                 "access_plan_provider",
                 &self.access_plan_provider.as_ref().map(|_| "configured"),
+            )
+            .field(
+                "write_observer",
+                &self.write_observer.as_ref().map(|_| "configured"),
             )
             .field("segment_cache", &self.segment_cache)
             .finish_non_exhaustive()
@@ -476,6 +487,7 @@ impl VortexFormat {
             session,
             opts,
             access_plan_provider: None,
+            write_observer: None,
             segment_cache,
             write_shard: None,
         }
@@ -602,11 +614,19 @@ impl VortexFormat {
         access_plan_provider: Arc<dyn VortexAccessPlanProvider>,
     ) -> Self {
         Self {
-            session: self.session.clone(),
-            opts: self.opts.clone(),
             access_plan_provider: Some(access_plan_provider),
-            segment_cache: self.segment_cache.clone(),
-            write_shard: self.write_shard.clone(),
+            ..self.clone()
+        }
+    }
+
+    /// Returns a format whose writes report the file and file-local row position
+    /// of every batch they emit, so a caller can build a row-address index during
+    /// the write rather than by reading the finished files back.
+    #[must_use]
+    pub fn with_write_observer(&self, write_observer: Arc<dyn VortexWriteObserver>) -> Self {
+        Self {
+            write_observer: Some(write_observer),
+            ..self.clone()
         }
     }
 
@@ -619,11 +639,8 @@ impl VortexFormat {
     #[must_use]
     pub fn with_write_shard(&self, config: WriteShardConfig) -> Self {
         Self {
-            session: self.session.clone(),
-            opts: self.opts.clone(),
-            access_plan_provider: self.access_plan_provider.clone(),
-            segment_cache: self.segment_cache.clone(),
             write_shard: Some(config),
+            ..self.clone()
         }
     }
 
@@ -740,6 +757,7 @@ impl VortexFormat {
                 expr: Arc::clone(expr),
                 bounds: bounds.clone(),
                 partitions,
+                run_sort_bytes: write_shard.range_run_sort_bytes,
             };
         }
         ShardSpec::Hash { exprs, partitions }
@@ -1129,6 +1147,7 @@ impl FileFormat for VortexFormat {
             self.session.clone(),
             target_file_size,
             shard_spec,
+            self.write_observer.clone(),
         ));
 
         Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)) as _)
@@ -1445,6 +1464,7 @@ mod tests {
             write_concurrency,
             shard_key_columns: keys.iter().map(|s| (*s).to_string()).collect(),
             range_bounds,
+            range_run_sort_bytes: None,
         })
     }
 
