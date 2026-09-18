@@ -29,6 +29,7 @@ moka = { workspace = true, features = ["future"] }
 opentelemetry.workspace = true
 parking_lot.workspace = true
 pingora-lru = { workspace = true, optional = true }
+sharded-cache = { path = "../sharded-cache" }
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tokio.workspace = true
@@ -65,6 +66,10 @@ name = "hash_algorithms"
 [[bench]]
 harness = false
 name = "cache_hit_costs"
+
+[[bench]]
+harness = false
+name = "engine_bakeoff"
 
 [lints]
 workspace = true

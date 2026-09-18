@@ -55,10 +55,14 @@ pub enum HashingAlgorithm {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CacheEngine {
-    /// Moka cache engine (default) - stable, built-in TTL, no race conditions
+    /// Historical default. Accepted for spicepod compatibility and ignored:
+    /// SQL, search, and embeddings `LruCache` paths always use the Spice
+    /// sharded cache.
     #[default]
     Moka,
-    /// Pingora-LRU cache engine - 2-3x faster, sharded architecture, manual TTL handling with a rare race condition. Note: table-specific invalidation scans the cache in place, so its cost is proportional to the number of cached entries.
+    /// Historical Pingora-LRU option. Accepted and ignored; a one-time warning
+    /// is logged. SQL, search, and embeddings caches always use the Spice
+    /// sharded cache.
     Pingora,
 }
 
@@ -128,6 +132,8 @@ pub struct CacheConfig {
     pub caching_policy: CachingPolicy,
     #[serde(default)]
     pub hashing_algorithm: HashingAlgorithm,
+    /// Accepted for spicepod compatibility and ignored. `LruCache` always uses
+    /// the Spice sharded cache.
     #[serde(default)]
     pub engine: CacheEngine,
 }
@@ -162,6 +168,8 @@ pub struct SQLResultsCacheConfig {
     pub hashing_algorithm: HashingAlgorithm,
     #[serde(default)]
     pub cache_key_type: CacheKeyType,
+    /// Accepted for spicepod compatibility and ignored. `LruCache` always uses
+    /// the Spice sharded cache.
     #[serde(default)]
     pub engine: CacheEngine,
     /// Maximum age for serving stale cached results while revalidating in the background.
@@ -219,6 +227,8 @@ pub struct ResultsCache {
     pub cache_key_type: CacheKeyType,
     #[serde(default)]
     pub hashing_algorithm: HashingAlgorithm,
+    /// Accepted for spicepod compatibility and ignored. `LruCache` always uses
+    /// the Spice sharded cache.
     #[serde(default)]
     pub engine: CacheEngine,
     /// Maximum stale-while-revalidate duration to add to the cache TTL.

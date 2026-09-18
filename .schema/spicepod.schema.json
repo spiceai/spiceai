@@ -782,12 +782,12 @@
     "CacheEngine": {
       "oneOf": [
         {
-          "description": "Moka cache engine (default) - stable, built-in TTL, no race conditions",
+          "description": "Historical default. Accepted for spicepod compatibility and ignored: SQL, search, and embeddings `LruCache` paths always use the Spice sharded cache.",
           "type": "string",
           "const": "moka"
         },
         {
-          "description": "Pingora-LRU cache engine - 2-3x faster, sharded architecture, manual TTL handling with a rare race condition. Note: table-specific invalidation scans the cache in place, so its cost is proportional to the number of cached entries.",
+          "description": "Historical Pingora-LRU option. Accepted and ignored; a one-time warning is logged. SQL, search, and embeddings caches always use the Spice sharded cache.",
           "type": "string",
           "const": "pingora"
         }

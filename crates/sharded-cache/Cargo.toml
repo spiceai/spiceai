@@ -1,0 +1,15 @@
+[package]
+description = "Sharded in-memory cache with LRU and TinyLFU eviction for Spice results caches"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "sharded-cache"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+parking_lot.workspace = true
+
+[lints]
+workspace = true

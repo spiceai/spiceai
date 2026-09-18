@@ -19274,6 +19274,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sharded-cache"
+version = "2.4.0-unstable"
+dependencies = [
+ "parking_lot",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

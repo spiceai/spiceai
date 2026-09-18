@@ -49,6 +49,7 @@ pub mod result;
 pub use backend::CacheBackend;
 pub use backend::CacheBackendBuilder;
 pub use backend::MokaBackend;
+pub use backend::SpiceBackend;
 
 #[cfg(feature = "pingora")]
 pub use backend::PingoraBackend;

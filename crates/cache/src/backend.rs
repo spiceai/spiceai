@@ -16,13 +16,15 @@ limitations under the License.
 
 //! Cache backend abstraction for pluggable cache implementations.
 //!
-//! This module provides a trait-based abstraction that allows runtime selection
-//! between different cache engines (Moka, Pingora-LRU).
+//! `LruCache` always uses [`SpiceBackend`]. [`MokaBackend`] and (when compiled)
+//! [`PingoraBackend`] remain for benches and for call sites that have not yet
+//! migrated.
 
 use async_trait::async_trait;
 use std::time::Duration;
 
 pub mod moka;
+pub mod spice;
 
 #[cfg(feature = "pingora")]
 pub mod pingora;
@@ -30,6 +32,7 @@ pub mod pingora;
 use crate::Sizeable;
 
 pub use self::moka::MokaBackend;
+pub use self::spice::SpiceBackend;
 
 #[cfg(feature = "pingora")]
 pub use self::pingora::PingoraBackend;
@@ -98,4 +101,12 @@ pub trait CacheBackend<V: Sizeable>: Send + Sync {
 
     /// Run any pending maintenance tasks (e.g., evictions)
     async fn run_pending_tasks(&self);
+
+    /// Drop every entry whose value satisfies `predicate`.
+    ///
+    /// Must not promote survivors. Returns how many entries were removed.
+    ///
+    /// Wrappers must forward this; a default no-op would silently skip table
+    /// invalidation on a wrapped backend.
+    async fn invalidate_matching(&self, predicate: &(dyn Fn(&V) -> bool + Send + Sync)) -> usize;
 }

@@ -60,10 +60,12 @@ where
 
     /// Creates a Moka backend wrapping an existing Moka cache.
     ///
-    /// This is useful when you have already configured a Moka cache with
-    /// specific settings (eviction policy, listeners, etc.) and want to
-    /// use it with the [`CacheBackend`] trait.
+    /// Kept for leftover Moka call sites and benches until those migrate.
     #[must_use]
+    #[expect(
+        dead_code,
+        reason = "retained for P4 Moka call sites and engine bakeoff helpers"
+    )]
     pub(crate) fn from_cache(cache: Cache<u64, V, PassthroughHashBuilder<T>>) -> Self {
         Self { cache }
     }
@@ -72,6 +74,10 @@ where
     ///
     /// Moka's predicate-based invalidation (`invalidate_entries_if`) has no equivalent on
     /// the [`CacheBackend`] trait, so table invalidation reaches for the cache itself.
+    #[expect(
+        dead_code,
+        reason = "retained for P4 Moka call sites until LruCache-only leftovers migrate"
+    )]
     pub(crate) fn cache(&self) -> &Cache<u64, V, PassthroughHashBuilder<T>> {
         &self.cache
     }
@@ -117,5 +123,21 @@ where
 
     async fn run_pending_tasks(&self) {
         self.cache.run_pending_tasks().await;
+    }
+
+    async fn invalidate_matching(&self, predicate: &(dyn Fn(&V) -> bool + Send + Sync)) -> usize {
+        self.cache.run_pending_tasks().await;
+        let keys: Vec<u64> = self
+            .cache
+            .iter()
+            .filter(|(_, value)| predicate(value))
+            .map(|(key, _)| *key)
+            .collect();
+        let removed = keys.len();
+        for key in keys {
+            self.cache.invalidate(&key);
+        }
+        self.cache.run_pending_tasks().await;
+        removed
     }
 }

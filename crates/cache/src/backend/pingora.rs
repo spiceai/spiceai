@@ -323,6 +323,13 @@ where
     where
         F: Fn(&V) -> bool,
     {
+        self.remove_matching(predicate)
+    }
+
+    fn remove_matching<F>(&self, predicate: F) -> usize
+    where
+        F: Fn(&V) -> bool,
+    {
         let mut removed = 0;
         for key in self.keys_matching(predicate) {
             let shard_idx = Self::get_shard_index(key);
@@ -532,6 +539,10 @@ where
         // size, and because a cache that stopped being written to should not hold weight
         // it has been asked to give up.
         self.evict_to_weight_limit();
+    }
+
+    async fn invalidate_matching(&self, predicate: &(dyn Fn(&V) -> bool + Send + Sync)) -> usize {
+        self.remove_matching(predicate)
     }
 }
 
