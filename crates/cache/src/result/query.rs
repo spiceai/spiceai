@@ -379,8 +379,9 @@ pub struct CachedStream {
 impl CachedStream {
     /// Serve a shared `Arc<Vec<RecordBatch>>` (search cache, tests).
     ///
-    /// Indexes the vec in place. Search hits stay on the pre-change path.
-    /// SQL Raw hits use [`CachedRawStream::from_raw`].
+    /// Indexes the vec in place. Search aggregation and other `DataFusion`
+    /// consumers still need an owned `RecordBatch` per poll. SQL Raw hits
+    /// use [`CachedRawStream::from_raw`].
     #[must_use]
     pub fn new(data: Arc<Vec<RecordBatch>>, schema: SchemaRef) -> Self {
         Self {
@@ -422,9 +423,10 @@ impl RecordBatchStream for CachedStream {
 /// Raw SQL results-cache serve stream: each poll is `Arc::clone` of a stored
 /// batch (one atomic), not `RecordBatch::clone` of every column.
 ///
-/// Software prefetch of a few cache lines did not beat the clone on the
-/// warm or concurrent drain (see `cache_hit_costs`); this stream does not
-/// prefetch.
+/// HTTP and Flight drain this via [`QueryResult::from_cached_raw`] /
+/// [`QueryResultSource::CachedRaw`]. Prefetches the first batch's data
+/// buffers and the next batch's headers at construction, and the following
+/// batch's headers on each later poll.
 pub struct CachedRawStream {
     data: CachedBatches,
     schema: SchemaRef,
@@ -433,8 +435,12 @@ pub struct CachedRawStream {
 
 impl CachedRawStream {
     /// Serve a Raw (or just-decoded) pre-`Arc`'d slice.
+    ///
+    /// Prefetches the first batch's data buffers and the next batch's headers
+    /// before returning so HTTP JSON / Flight IPC see warm lines on first poll.
     #[must_use]
     pub fn from_raw(data: CachedBatches, schema: SchemaRef) -> Self {
+        super::prefetch::prefetch_raw_serve_arced(&data);
         Self {
             data,
             schema,
@@ -460,6 +466,9 @@ impl Stream for CachedRawStream {
             return Poll::Ready(None);
         };
         self.index = index + 1;
+        if let Some(next) = self.data.get(self.index) {
+            super::prefetch::prefetch_batch_headers(next.as_ref());
+        }
         Poll::Ready(Some(Ok(batch)))
     }
 
@@ -479,6 +488,7 @@ pub enum QueryResultData {
     /// Planned or search-cache path: `DataFusion`'s owned-batch stream.
     Stream(SendableRecordBatchStream),
     /// Raw SQL cache hit: one `Arc` clone per batch on the HTTP/Flight path.
+    /// Prefetch already ran at [`CachedRawStream::from_raw`].
     CachedRaw {
         data: SendableCachedRawStream,
         schema: SchemaRef,
