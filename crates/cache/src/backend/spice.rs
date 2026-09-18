@@ -97,7 +97,12 @@ where
     }
 
     async fn clear(&self) {
-        self.cache.clear();
+        // `clear` walks every shard. Do it off the Tokio worker so a large
+        // cache cannot stall `/health` the way `run_pending_tasks` would.
+        let cache = Arc::clone(&self.cache);
+        if let Err(err) = tokio::task::spawn_blocking(move || cache.clear()).await {
+            tracing::debug!("Spice cache clear task did not finish: {err}");
+        }
     }
 
     async fn iter_keys(&self) -> Vec<u64> {

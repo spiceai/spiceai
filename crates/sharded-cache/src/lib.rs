@@ -366,34 +366,42 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
 
     /// Compare the just-admitted key with the actual overflow victim — the
     /// lowest-frequency LRU tail across shards — and evict the loser.
+    ///
+    /// A stale snapshot (victim already gone, shard empty) is not treated as
+    /// trim-complete: re-select up to [`NUM_SHARDS`] times while still over
+    /// budget so another shard's tail can still be claimed. Falling back to
+    /// numeric-order LRU would evict a hotter resident than `TinyLFU` chose.
     fn evict_tinylfu_one(
         &self,
         admitted: Option<u64>,
         evicted: &mut Vec<(V, EvictionReason)>,
     ) -> bool {
-        let Some((victim_shard, victim_key, victim_freq)) = self.lowest_freq_lru_tail() else {
-            return false;
-        };
-        if let Some(candidate) = admitted {
-            let candidate_shard = shard_index(candidate);
-            let (present, candidate_freq) = {
-                let shard = self.shards[candidate_shard].0.lock();
-                (shard.contains(candidate), shard.sketch_estimate(candidate))
+        for _ in 0..NUM_SHARDS {
+            if self.weight.load(Ordering::Relaxed) <= self.max_weight {
+                return false;
+            }
+            let Some((victim_shard, victim_key, victim_freq)) = self.lowest_freq_lru_tail() else {
+                return false;
             };
-            if present
-                && candidate != victim_key
-                && candidate_freq < victim_freq
-                && self.remove_for_size(candidate_shard, candidate, evicted)
-            {
+            if let Some(candidate) = admitted {
+                let candidate_shard = shard_index(candidate);
+                let (present, candidate_freq) = {
+                    let shard = self.shards[candidate_shard].0.lock();
+                    (shard.contains(candidate), shard.sketch_estimate(candidate))
+                };
+                if present
+                    && candidate != victim_key
+                    && candidate_freq < victim_freq
+                    && self.remove_for_size(candidate_shard, candidate, evicted)
+                {
+                    return true;
+                }
+            }
+            if self.remove_for_size(victim_shard, victim_key, evicted) {
                 return true;
             }
         }
-        if self.remove_for_size(victim_shard, victim_key, evicted) {
-            return true;
-        }
-        // The snapshot victim may have been removed concurrently, leaving
-        // that shard empty. Other shards can still put the cache over budget.
-        self.evict_first_other(victim_shard, evicted)
+        false
     }
 
     /// The overflow victim is the LRU tail with the lowest home-shard sketch
