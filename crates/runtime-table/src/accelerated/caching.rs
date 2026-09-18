@@ -1865,9 +1865,10 @@ impl CacheRefreshHelper {
     /// # Arguments
     /// * `is_expired` - If `true`, data exists in the cache but is expired, so we use upsert.
     ///   If `false`, no data exists in the cache, so we use insert (append).
-    /// * `stale_if_error` - If `true` and `expired_batches` is provided, serve the expired cached data
-    ///   when the upstream source returns an error instead of propagating the error.
-    /// * `expired_batches` - The expired cached data to serve if `stale_if_error` is enabled and
+    /// * `stale_if_error` - `Disabled` never serves stale; `Enabled` serves it with no bound;
+    ///   `For(duration)` serves it only while its measured staleness is within `duration` of
+    ///   going stale, and propagates the origin's failure once past that window.
+    /// * `expired_batches` - The expired cached data to serve if `stale_if_error` allows it and
     ///   the source returns an error.
     /// * `io_runtime` - Tokio runtime handle for spawning background write tasks.
     /// * `synchronized_children` - Child accelerators that should also receive the cached data.
@@ -2666,6 +2667,7 @@ mod tests {
         Int32Array, RecordBatch, StringArray, TimestampNanosecondArray, UInt16Array,
     };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow_tools::metadata_keys::HTTP_RESPONSE_STATUS_METADATA_KEY;
     use async_trait::async_trait;
     use cache::utils::RESPONSE_STATUS_COLUMN;
     use datafusion::catalog::Session;
@@ -2996,7 +2998,15 @@ mod tests {
                 Field::new("request_path", DataType::Utf8, true),
                 Field::new("request_query", DataType::Utf8, true),
                 Field::new("content", DataType::Utf8, true),
-                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+                // Tagged the way the real HTTP connector's `base_table_schema`
+                // tags it, so `cache::is_http_result_batch` recognizes it —
+                // see `HTTP_RESPONSE_STATUS_METADATA_KEY`.
+                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false).with_metadata(
+                    std::collections::HashMap::from([(
+                        HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+                        "1".to_string(),
+                    )]),
+                ),
                 Field::new(
                     CACHE_REFRESHED_AT_COLUMN,
                     DataType::Timestamp(TimeUnit::Nanosecond, None),

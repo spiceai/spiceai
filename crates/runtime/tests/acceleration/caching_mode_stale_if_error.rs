@@ -29,21 +29,29 @@ limitations under the License.
 //! The unbounded `enabled` form is pinned alongside as the behavior the window
 //! replaces.
 //!
-//! The origin is taken down rather than switched to a 5xx because a failing
-//! fetch is the failure mode the window is specified against (#14126: the
-//! connector's timeouts propagate as errors), and because it does not depend on
-//! how the connector shapes an error response into rows.
+//! The origin is taken down for the send-error tests rather than switched to a
+//! 5xx because a failing fetch is one failure mode the window is specified
+//! against (#14126: the connector's timeouts propagate as errors) and it does
+//! not depend on how the connector shapes an error response into rows. A
+//! failing origin more commonly reaches the connector as a *successful* fetch
+//! whose row carries a 5xx `response_status` instead (the connector accepts
+//! the response once its own retries are exhausted) — a distinct code path
+//! (`cache::batches_cacheable`) covered separately below, including on a
+//! JSON-decomposed schema (`columns:` + `json_object: "*"`), where
+//! `response_status` is not declared by the user and has to be forced into the
+//! schema for the fallback to see it at all (#14156, #14157).
 //!
 //! The sleeps are deliberate: the TTL and the window are what is under test,
 //! and both are kept to a few seconds.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use app::AppBuilder;
-use arrow::array::{Array, UInt16Array};
+use arrow::array::{Array, StringArray, UInt16Array};
+use axum::http::StatusCode;
 use axum::{Router, routing::get};
 use datafusion::error::DataFusionError;
 use datafusion::prelude::*;
@@ -52,6 +60,7 @@ use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
     component::dataset::Dataset,
     param::Params,
+    semantic::Column,
 };
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -78,10 +87,15 @@ const PAST_WINDOW: Duration = Duration::from_secs(10);
 const ROWS: usize = 3;
 
 /// A mock origin serving `/items` as a JSON array of [`ROWS`] objects, counting
-/// the requests that reach it, until it is taken down.
+/// the requests that reach it, until it is taken down or switched to answer
+/// with a fixed HTTP status (see [`Origin::set_status`]) — the shape a
+/// connector-exhausted-retries failure actually takes, as distinct from a
+/// send error from [`Origin::take_down`].
 struct Origin {
     addr: SocketAddr,
     fetches: Arc<AtomicUsize>,
+    status: Arc<AtomicU16>,
+    empty_fault_body: Arc<std::sync::atomic::AtomicBool>,
     shutdown: oneshot::Sender<()>,
 }
 
@@ -89,20 +103,41 @@ impl Origin {
     async fn start() -> Self {
         let fetches = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&fetches);
+        let status = Arc::new(AtomicU16::new(200));
+        let status_for_handler = Arc::clone(&status);
+        let empty_fault_body = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let empty_fault_body_for_handler = Arc::clone(&empty_fault_body);
         let (tx, rx) = oneshot::channel::<()>();
 
         let app = Router::new().route(
             "/items",
             get(move |uri: axum::http::Uri| {
                 let counter = Arc::clone(&counter);
+                let status = Arc::clone(&status_for_handler);
+                let empty_fault_body = Arc::clone(&empty_fault_body_for_handler);
                 async move {
                     counter.fetch_add(1, Ordering::SeqCst);
+                    let current_status = status.load(Ordering::SeqCst);
+                    if current_status != 200 {
+                        let code =
+                            StatusCode::from_u16(current_status).expect("a valid HTTP status code");
+                        let body = if empty_fault_body.load(Ordering::SeqCst) {
+                            String::new()
+                        } else {
+                            format!("origin fault: status {current_status}")
+                        };
+                        return (code, [("content-type", "text/plain")], body);
+                    }
                     let query = uri.query().unwrap_or_default().to_string();
                     let body = (1..=ROWS)
                         .map(|rank| format!(r#"{{"rank":{rank},"query":"{query}"}}"#))
                         .collect::<Vec<_>>()
                         .join(",");
-                    ([("content-type", "application/json")], format!("[{body}]"))
+                    (
+                        StatusCode::OK,
+                        [("content-type", "application/json")],
+                        format!("[{body}]"),
+                    )
                 }
             }),
         );
@@ -123,12 +158,33 @@ impl Origin {
         Self {
             addr,
             fetches,
+            status,
+            empty_fault_body,
             shutdown: tx,
         }
     }
 
     fn fetches(&self) -> usize {
         self.fetches.load(Ordering::SeqCst)
+    }
+
+    /// Switches the origin to answer every request with `status` instead of
+    /// the good JSON body, without taking the server down — the shape a
+    /// failing origin takes once the connector's own retries are exhausted:
+    /// a *successful* fetch whose row carries the failing `response_status`
+    /// (see `cache::batches_cacheable`), not a send error.
+    fn set_status(&self, status: u16) {
+        self.status.store(status, Ordering::SeqCst);
+    }
+
+    /// Like [`Self::set_status`], but the fault body is empty instead of
+    /// `"origin fault: status N"` — the shape that decomposes to zero content
+    /// rows (see `create_batch_from_rows_errors_on_a_retryable_zero_row_5xx_response`
+    /// in `data_components`), as distinct from the one-row-of-nulls shape a
+    /// non-empty, non-JSON body decomposes to.
+    fn set_status_with_empty_body(&self, status: u16) {
+        self.empty_fault_body.store(true, Ordering::SeqCst);
+        self.status.store(status, Ordering::SeqCst);
     }
 
     /// Stops the origin and returns once new connections to it are refused, so
@@ -189,6 +245,27 @@ fn caching_dataset(
     dataset
 }
 
+/// Decomposes the origin's `{"rank":N,"query":"..."}` body into named
+/// columns via `json_object: "*"`, the shape #14156/#14157 are about: the
+/// user never declares `response_status`, so the runtime has to force it
+/// into the schema itself for `caching_stale_if_error` to see anything.
+fn decompose_into_named_columns(mut dataset: Dataset) -> Dataset {
+    let mut extra = Column::new("extra");
+    extra
+        .metadata
+        .insert("json_object".to_string(), serde_json::json!("*"));
+    // `request_path` is declared (and filtered on below) purely so the
+    // connector knows which of `allowed_request_paths` to fetch, matching
+    // the undecomposed tests above — it is not part of what #14157 is about.
+    dataset.columns = vec![
+        Column::new("request_path"),
+        Column::new("rank"),
+        Column::new("query"),
+        extra,
+    ];
+    dataset
+}
+
 async fn build_runtime(dataset: Dataset, name: &str) -> Arc<Runtime> {
     let mut app = AppBuilder::new(name).with_dataset(dataset).build();
     // The SQL results cache would answer the repeated reads below from its own
@@ -200,6 +277,27 @@ async fn build_runtime(dataset: Dataset, name: &str) -> Arc<Runtime> {
     if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
         sql_cache.enabled = false;
     }
+
+    configure_test_datafusion();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    tokio::select! {
+        () = tokio::time::sleep(Duration::from_mins(2)) => {
+            panic!("timed out waiting for datasets to load");
+        }
+        () = Arc::clone(&rt).load_components() => {}
+    }
+    runtime_ready_check(&rt).await;
+    rt
+}
+
+/// Like [`build_runtime`], but with the SQL results cache left *on* — the
+/// one test below that is actually about that independent cache
+/// (`a_zero_row_5xx_is_not_cached_by_the_sql_results_cache_on_a_non_caching_dataset`)
+/// needs it enabled to exercise `cache::to_cached_record_batch_stream`.
+async fn build_runtime_with_sql_results_cache(dataset: Dataset, name: &str) -> Arc<Runtime> {
+    let mut app = AppBuilder::new(name).with_dataset(dataset).build();
+    app.runtime.caching.sql_results =
+        Some(spicepod::component::caching::SQLResultsCacheConfig::default());
 
     configure_test_datafusion();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
@@ -237,6 +335,41 @@ async fn fetch_statuses(rt: &Runtime, query: &str) -> Result<Vec<u16>, DataFusio
                 .expect("response_status is UInt16")
                 .iter()
                 .flatten()
+                .collect::<Vec<_>>()
+        })
+        .collect())
+}
+
+/// One cache lookup against a [`decompose_into_named_columns`] dataset,
+/// filtered on the decomposed `rank` column itself so the cache-key
+/// derivation exercised is the decomposed-schema one, not the metadata-only
+/// one the undecomposed tests above already cover. Returns the matching
+/// rows' `rank` values: empty (not an error) if the row decomposed from the
+/// origin's non-JSON error body instead of a good response (see
+/// `decompose_json_row`) and so filtered out on `rank`, which is the
+/// empty-result shape #14157 observed.
+async fn fetch_decomposed_rank(rt: &Runtime, rank: usize) -> Result<Vec<String>, DataFusionError> {
+    let batches = rt
+        .datafusion()
+        .ctx
+        .table("http_data")
+        .await?
+        .filter(col("request_path").eq(lit("/items")))?
+        .filter(col("rank").eq(lit(rank.to_string())))?
+        .select(vec![col("rank")])?
+        .collect()
+        .await?;
+    Ok(batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("rank is Utf8 (undeclared type defaults to Utf8)")
+                .iter()
+                .flatten()
+                .map(str::to_string)
                 .collect::<Vec<_>>()
         })
         .collect())
@@ -426,5 +559,201 @@ async fn enabled_serves_stale_with_no_bound() -> Result<(), anyhow::Error> {
         vec![200; ROWS],
         "`enabled` keeps serving the stale rows where a finite window would have stopped"
     );
+    Ok(())
+}
+
+/// The dominant failure mode: the origin never goes offline, it just starts
+/// answering with a 5xx. The connector accepts that as a *successful* fetch
+/// once its own retries are exhausted, so `caching_stale_if_error` has to
+/// notice the `response_status` on an `Ok` batch (`cache::batches_cacheable`)
+/// rather than only handling a transport `Err` — regression coverage for
+/// #14156, where a stale allowlist rejected this exact 8-column schema and
+/// left the fallback permanently unreachable for a real HTTP dataset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_5xx_status_row_is_recognized_as_a_transient_failure_inside_the_window()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+    register_test_connectors().await;
+
+    let origin = Origin::start().await;
+    let dataset = caching_dataset(
+        &origin,
+        &format!("{}s", WINDOW.as_secs()),
+        None,
+        Mode::Memory,
+        vec![],
+    );
+    let rt = build_runtime(dataset, "caching_stale_if_error_5xx_status").await;
+
+    let first = fetch_statuses(&rt, "key=a").await?;
+    assert_eq!(
+        first,
+        vec![200; ROWS],
+        "the first read is the origin's good response"
+    );
+    let cached_at = wait_for_cached_rows(&rt, ROWS, Duration::from_secs(30))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("the response was never cached, so no stale read was possible: {e}")
+        })?;
+
+    // The origin stays up and reachable — only its status changes. A
+    // send-error test would never exercise the `Ok` batch this covers.
+    origin.set_status(503);
+
+    tokio::time::sleep_until(tokio::time::Instant::from_std(cached_at + INSIDE_WINDOW)).await;
+    let inside = fetch_statuses(&rt, "key=a").await?;
+    assert_eq!(
+        inside,
+        vec![200; ROWS],
+        "inside the window the stale rows are served in place of the origin's 503"
+    );
+
+    tokio::time::sleep_until(tokio::time::Instant::from_std(cached_at + PAST_WINDOW)).await;
+    let past = fetch_statuses(&rt, "key=a").await?;
+    // The fault body isn't a JSON array like the good response, so it need not
+    // decompose into `ROWS` rows the way the 200 response does — only that
+    // every row served carries the origin's 503, not the stale 200 copy.
+    assert!(
+        !past.is_empty() && past.iter().all(|&status| status == 503),
+        "past the window the origin's 503 must reach the client instead of the stale copy, got {past:?}"
+    );
+    Ok(())
+}
+
+/// The same 5xx-as-successful-fetch failure, on a dataset that decomposes the
+/// JSON body into named `columns:` — the shape #14157 is about. The user
+/// never declares `response_status`, so unless the runtime forces it into the
+/// schema (`parse_http_json_nesting`), `cache::batches_cacheable` cannot see
+/// it at all and the fallback silently never engages, no matter how #14156 is
+/// fixed. Uses `enabled` rather than a finite window to isolate that
+/// question from the window-boundary timing the tests above already cover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_5xx_response_is_recognized_on_a_json_decomposed_dataset() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+    register_test_connectors().await;
+
+    let origin = Origin::start().await;
+    let dataset = decompose_into_named_columns(caching_dataset(
+        &origin,
+        "enabled",
+        None,
+        Mode::Memory,
+        vec![],
+    ));
+    let rt = build_runtime(dataset, "caching_stale_if_error_5xx_decomposed").await;
+
+    let first = fetch_decomposed_rank(&rt, 1).await?;
+    assert_eq!(
+        first,
+        vec!["1"],
+        "the first read decomposes the origin's good response into named columns"
+    );
+    wait_for_cached_rows(&rt, ROWS, Duration::from_secs(30))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("the response was never cached, so no stale read was possible: {e}")
+        })?;
+
+    origin.set_status(503);
+    tokio::time::sleep(TTL + Duration::from_secs(1)).await;
+
+    let stale = fetch_decomposed_rank(&rt, 1).await?;
+    assert_eq!(
+        stale,
+        vec!["1"],
+        "the decomposed stale row must still be served, not an empty result: an origin \
+        failure the fingerprint cannot see is silently indistinguishable from real data \
+        decomposing to NULL, which is what #14157 observed as HTTP 200 with an empty body"
+    );
+    Ok(())
+}
+
+/// Regression coverage for the independent, runtime-wide SQL results cache
+/// (`runtime.caching.sql_results`): it also calls `cache::batches_cacheable`
+/// on any dataset's query result, regardless of the dataset's own refresh
+/// mode. This dataset is unaccelerated on purpose, so the accelerator's own
+/// stale-if-error machinery is not in play — this is testing the SQL results
+/// cache in isolation.
+///
+/// An empty 503 body still decomposes to exactly one row (the HTTP connector
+/// preserves an empty body as one row of raw content, same as any other
+/// non-JSON body), with every declared business column `NULL` and
+/// `response_status: 503` — a shape `cache::batches_cacheable` correctly
+/// rejects via the field-metadata fingerprint, once that fingerprint
+/// (`HTTP_RESPONSE_STATUS_METADATA_KEY`) is actually present on a schema
+/// that never declared `response_status`, *and* `response_status` survives
+/// to the batch `batches_cacheable` inspects. `SELECT *` guarantees the
+/// latter; it does not for a narrower query.
+///
+/// KNOWN GAP, not fixed by this test or by this PR: a query that does not
+/// reference `response_status` at all — e.g. `SELECT rank FROM http_data
+/// WHERE request_path = '/items'` — lets `DataFusion`'s column-pruning
+/// projection pushdown drop it before `cache::to_cached_record_batch_stream`
+/// ever sees the batch, so the same 503 *is* wrongly cached in that case
+/// (reproduced locally: swapping the query below for that one flips this
+/// test from passing to failing with `cache_status: CacheHit` on the second
+/// attempt). Fixing that needs `response_status` (or an equivalent signal)
+/// to survive an arbitrary user projection before reaching the cache
+/// decision — a separate, larger design than a schema-level fix, tracked as
+/// a follow-up rather than attempted here. Checks `QueryResult::cache_status`
+/// directly, which is the runtime's own record of whether a query was served
+/// from — or written to — the results cache, rather than inferring it
+/// indirectly from row content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_5xx_response_is_not_cached_by_the_sql_results_cache_on_an_unaccelerated_dataset()
+-> Result<(), anyhow::Error> {
+    use futures::TryStreamExt;
+
+    let _tracing = init_tracing(None);
+    register_test_connectors().await;
+
+    let origin = Origin::start().await;
+    origin.set_status_with_empty_body(503);
+
+    let mut dataset = Dataset::new(format!("http://{}", origin.addr), "http_data");
+    dataset.params = Some(Params::from_string_map(
+        [
+            ("file_format", "json"),
+            ("allowed_request_paths", "/items"),
+            ("max_retries", "0"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    ));
+    let dataset = decompose_into_named_columns(dataset);
+
+    let rt =
+        build_runtime_with_sql_results_cache(dataset, "sql_results_cache_5xx_not_cached").await;
+
+    let sql = "SELECT * FROM http_data WHERE request_path = '/items'";
+
+    // Run the same failing query twice. Neither run may report a cache hit:
+    // if the first, failing fetch had been wrongly written to the results
+    // cache, the second, identical query would find it there.
+    for attempt in 1..=2 {
+        let result = rt
+            .datafusion()
+            .query_builder(sql)
+            .build()
+            .run()
+            .await
+            .expect("query planning should succeed");
+        let cache_status = result.cache_status;
+        // Drain the stream so any post-execution cache write (which happens
+        // once the stream completes) has actually run before the next query.
+        let _rows: Vec<_> = result.data.try_collect().await.expect(
+            "the query itself must not error: the failing body decomposes to one row \
+            of NULLs, not a stream error",
+        );
+
+        assert_ne!(
+            cache_status,
+            cache::result::CacheStatus::CacheHit,
+            "attempt {attempt}: a transient 503 must never be served from the SQL results cache \
+            (got {cache_status:?})"
+        );
+    }
     Ok(())
 }

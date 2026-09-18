@@ -1111,7 +1111,12 @@ impl HttpTableProvider {
             Field::new("request_body", DataType::Utf8, true),
             Field::new("request_headers", DataType::Utf8, true),
             Field::new("content", DataType::Utf8, false),
-            Field::new("response_status", DataType::UInt16, false),
+            Field::new("response_status", DataType::UInt16, false).with_metadata(
+                std::collections::HashMap::from([(
+                    crate::HTTP_RESPONSE_STATUS_METADATA_KEY.to_string(),
+                    "1".to_string(),
+                )]),
+            ),
             Field::new(
                 "response_headers",
                 DataType::Map(
@@ -2239,9 +2244,37 @@ impl HttpExec {
         content_rows: &[String],
         fetch_result: &HttpFetchResult,
     ) -> DataFusionResult<RecordBatch> {
+        // A body that decomposes to zero rows is ambiguous on its own: for a 2xx
+        // response it is a legitimate empty result, but for a retryable failure
+        // (5xx/429, e.g. an empty or `[]` error body) there are no rows to carry
+        // `response_status` on at all — an empty batch here would be
+        // indistinguishable from a real empty result to `cache::batches_cacheable`
+        // and to any caller, which is the empty-result shape #14157 was reported
+        // against. A row-count-independent signal is needed, and this connector
+        // has no side channel to carry one through `TableProvider::scan` — so
+        // surface it as an actual fetch error instead of a successful empty
+        // batch. `CacheRefreshHelper::handle_cache_miss`'s existing `Err` arm
+        // already implements stale-if-error correctly (serve the cached copy
+        // inside the window, propagate the error past it or with nothing
+        // cached), and for any other refresh mode or an unaccelerated query the
+        // error reaches the caller directly rather than being cached by the
+        // independent SQL results cache as if it were data.
         let num_rows = content_rows.len();
 
         if num_rows == 0 {
+            if HttpTableProvider::is_retryable_status(fetch_result.response_status) {
+                return Err(if fetch_result.response_status == 429 {
+                    Error::RateLimited {
+                        message: "the origin answered 429 Too Many Requests with an empty body"
+                            .to_string(),
+                    }
+                } else {
+                    Error::HttpServerError {
+                        status: fetch_result.response_status,
+                    }
+                }
+                .into());
+            }
             return RecordBatch::try_new(
                 Arc::clone(&self.projected_schema),
                 self.projected_schema
@@ -8418,6 +8451,83 @@ mod tests {
             response_status: 200,
             response_headers: Vec::new(),
         }
+    }
+
+    /// Regression coverage for #14157's empty-result shape: a retryable
+    /// status (5xx) whose body decomposes to zero content rows has nothing
+    /// to carry `response_status` on, so a successful empty batch here would
+    /// be indistinguishable from a real empty result to every caller
+    /// (`cache::batches_cacheable`, the independent SQL results cache, and a
+    /// plain unaccelerated query) regardless of refresh mode. Must surface as
+    /// an error instead.
+    #[test]
+    fn create_batch_from_rows_errors_on_a_retryable_zero_row_5xx_response() {
+        let provider = Arc::new(base_provider());
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+        let fetch_result = HttpFetchResult {
+            response_status: 503,
+            ..empty_fetch_result()
+        };
+
+        let err = exec
+            .create_batch_from_rows(None, None, None, None, &[], &fetch_result)
+            .expect_err("a zero-row 503 must be an error, not a successful empty batch");
+        assert!(
+            err.to_string().contains("503"),
+            "error should name the status code, got: {err}"
+        );
+    }
+
+    /// Same as above for a zero-row 429 (rate limited), which uses a
+    /// different error variant than a 5xx.
+    #[test]
+    fn create_batch_from_rows_errors_on_a_retryable_zero_row_429_response() {
+        let provider = Arc::new(base_provider());
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+        let fetch_result = HttpFetchResult {
+            response_status: 429,
+            ..empty_fetch_result()
+        };
+
+        exec.create_batch_from_rows(None, None, None, None, &[], &fetch_result)
+            .expect_err("a zero-row 429 must be an error, not a successful empty batch");
+    }
+
+    /// A genuinely empty 2xx result (the origin really has no rows to
+    /// return) must stay a successful empty batch.
+    #[test]
+    fn create_batch_from_rows_stays_empty_for_a_genuine_2xx_empty_result() {
+        let provider = Arc::new(base_provider());
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+
+        let batch = exec
+            .create_batch_from_rows(None, None, None, None, &[], &empty_fetch_result())
+            .expect("a genuine empty 2xx result must not error");
+
+        assert_eq!(batch.num_rows(), 0);
+    }
+
+    /// A non-retryable zero-row status (e.g. a 4xx with an empty body) is not
+    /// this connector's problem to second-guess: stays a successful empty
+    /// batch, matching a 2xx.
+    #[test]
+    fn create_batch_from_rows_stays_empty_for_a_zero_row_4xx_response() {
+        let provider = Arc::new(base_provider());
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+        let fetch_result = HttpFetchResult {
+            response_status: 404,
+            ..empty_fetch_result()
+        };
+
+        let batch = exec
+            .create_batch_from_rows(None, None, None, None, &[], &fetch_result)
+            .expect("a zero-row 4xx must not error");
+
+        assert_eq!(batch.num_rows(), 0);
     }
 
     /// Like `nested_exec`, but accepts an explicit Arrow schema so a
