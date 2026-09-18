@@ -826,13 +826,13 @@ fn bench_encoded_stream_serve(c: &mut Criterion) {
     for (batches, rows, text_columns) in cases {
         let payload: Vec<RecordBatch> = (0..batches).map(|_| batch(rows, text_columns)).collect();
         let schema = payload[0].schema();
-        let encoded = runtime
+        let zstd_payload = runtime
             .block_on(encoder.encode(&payload))
             .expect("the batches encode");
         let now = Instant::now();
         let cached = CachedQueryResult::new(
-            Bytes::from(encoded.bytes.clone()),
-            encoded.decoded_len,
+            Bytes::from(zstd_payload.bytes.clone()),
+            zstd_payload.decoded_len,
             Arc::clone(&schema),
             Arc::new(HashSet::new()),
             now,
@@ -845,13 +845,13 @@ fn bench_encoded_stream_serve(c: &mut Criterion) {
         );
         let id = format!(
             "batches={batches}/rows={rows}/text_columns={text_columns}/ipc_bytes={}/encoded_bytes={}",
-            encoded.decoded_len,
-            encoded.bytes.len()
+            zstd_payload.decoded_len,
+            zstd_payload.bytes.len()
         );
 
         group.bench_with_input(
             BenchmarkId::new("zstd_decode_only", &id),
-            &encoded.bytes,
+            &zstd_payload.bytes,
             |b, bytes| {
                 b.to_async(&runtime).iter(|| async {
                     black_box(
@@ -866,7 +866,7 @@ fn bench_encoded_stream_serve(c: &mut Criterion) {
 
         group.bench_with_input(
             BenchmarkId::new("decode_and_wrap", &id),
-            &encoded.bytes,
+            &zstd_payload.bytes,
             |b, bytes| {
                 b.to_async(&runtime).iter(|| async {
                     let decoded = encoder
@@ -880,7 +880,7 @@ fn bench_encoded_stream_serve(c: &mut Criterion) {
 
         group.bench_with_input(
             BenchmarkId::new("legacy_encoded_hit", &id),
-            &encoded.bytes,
+            &zstd_payload.bytes,
             |b, bytes| {
                 b.to_async(&runtime).iter(|| async {
                     let decoded = encoder
