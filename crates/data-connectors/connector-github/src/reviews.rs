@@ -286,6 +286,35 @@ mod tests {
         assert_eq!(rows[1]["commit_sha"], serde_json::Value::Null);
     }
 
+    /// GitHub returns `nodes: null` rather than `[]` for some resources, and the
+    /// `pageInfo` this query now selects says nothing about whether the page's
+    /// nodes arrived. Emitting no rows for a pull request that reported 110
+    /// reviews would leave every count over it short with nothing to say so.
+    #[test]
+    fn unnest_fails_when_a_terminal_page_reports_reviews_but_returns_no_node_list() {
+        let params = args().get_graphql_values();
+        let UnnestBehavior::Custom(unnest) = &params.unnest_behavior else {
+            panic!("reviews must fan out its rows with a custom unnest");
+        };
+
+        let error = unnest(&json!({
+            "pull_request_id": "PR_1",
+            "pull_request_number": 13435,
+            "reviews": {
+                "totalCount": 110,
+                "pageInfo": {"hasNextPage": false, "endCursor": "cursor"},
+                "nodes": null
+            }
+        }))
+        .expect_err("a page reporting 110 reviews and returning none must fail the scan");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("110") && message.contains("pull request '13435'"),
+            "the error must name the pull request and the count it reported, got: {message}"
+        );
+    }
+
     #[test]
     fn every_emitted_key_is_declared_in_the_schema() {
         // A key the schema does not declare is silently dropped by the Arrow JSON

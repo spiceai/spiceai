@@ -111,25 +111,37 @@ where
         return Ok(Vec::new());
     };
 
+    // GitHub returns `nodes: null` rather than `[]` for an empty connection, so a
+    // missing node list is not a loss on its own — but it carries no page for
+    // `pageInfo` to vouch for, so only `totalCount` can say whether rows are
+    // missing. Answering that from `hasNextPage` would accept a terminal page
+    // that reported 110 children and delivered none of them.
+    let Some(raw_nodes) = connection.get("nodes").and_then(Value::as_array) else {
+        ensure_empty_connection(
+            connection,
+            spec,
+            owner,
+            repo,
+            parent.get(spec.parent_id_key),
+        )?;
+        return Ok(Vec::new());
+    };
+
     // Count only the nodes that can become rows: a node that is null or not an
     // object is skipped below.
-    let raw_nodes = connection.get("nodes").and_then(Value::as_array);
-    let nodes: Vec<Value> = raw_nodes.map_or_else(Vec::new, |nodes| {
-        nodes
-            .iter()
-            .filter(|node| node.is_object())
-            .cloned()
-            .collect()
-    });
+    let nodes: Vec<Value> = raw_nodes
+        .iter()
+        .filter(|node| node.is_object())
+        .cloned()
+        .collect();
 
     // `pageInfo` answers whether the connection is fully paged, not whether every
     // node on this page was readable, so an unusable node has to be caught on its
     // own. Otherwise a terminal page silently emits fewer rows than it carried.
-    let raw_len = raw_nodes.map_or(0, Vec::len);
-    if nodes.len() != raw_len {
+    if nodes.len() != raw_nodes.len() {
         return Err(unusable_node_error(
-            raw_len.saturating_sub(nodes.len()),
-            raw_len,
+            raw_nodes.len().saturating_sub(nodes.len()),
+            raw_nodes.len(),
             spec,
             owner,
             repo,
@@ -215,6 +227,49 @@ fn ensure_complete(
     ))
 }
 
+/// Fails when a connection returned no node list without reporting itself empty.
+///
+/// Every query that fans out selects `totalCount`, so a null node list beside a
+/// non-zero — or absent — count is a page whose rows cannot be accounted for.
+fn ensure_empty_connection(
+    connection: &Value,
+    spec: &NestedConnection<'_>,
+    owner: &str,
+    repo: &str,
+    parent_id: Option<&Value>,
+) -> Result<()> {
+    let total_count = connection.get("totalCount").and_then(Value::as_i64);
+    if total_count.is_some_and(|total| total <= 0) {
+        return Ok(());
+    }
+
+    let parent_id = parent_name(parent_id);
+    let parent_label = spec.parent_label;
+    let child_label = spec.child_label;
+    let count_clause = total_count.map_or_else(
+        || format!("GitHub returned no {child_label} and no count to check that against"),
+        |total| format!("GitHub reported {total} {child_label} but returned none of them"),
+    );
+
+    Err(Error::InvalidObjectAccess {
+        message: format!(
+            "Failed to read the {child_label} of {parent_label} '{parent_id}' ({owner}/{repo}): {count_clause}, so every count over that {parent_label} would be short with no way to tell. Retry the refresh; if it persists, the access token may not be able to see all of them. See: https://spiceai.org/docs/components/data-connectors/github"
+        ),
+    })
+}
+
+/// Names the parent in an error, falling back to `unknown` when the query did
+/// not select the key that identifies it.
+fn parent_name(parent_id: Option<&Value>) -> String {
+    parent_id.map_or_else(
+        || "unknown".to_string(),
+        |value| match value {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        },
+    )
+}
+
 /// Names the parent whose page carried a node we could not read, and what that
 /// costs, so a short row count is never silent.
 fn unusable_node_error(
@@ -225,13 +280,7 @@ fn unusable_node_error(
     repo: &str,
     parent_id: Option<&Value>,
 ) -> Error {
-    let parent_id = parent_id.map_or_else(
-        || "unknown".to_string(),
-        |value| match value {
-            Value::String(text) => text.clone(),
-            other => other.to_string(),
-        },
-    );
+    let parent_id = parent_name(parent_id);
 
     let parent_label = spec.parent_label;
     let child_label = spec.child_label;
@@ -259,13 +308,7 @@ fn truncated_connection_error(
             |total_count| format!("GitHub returned {returned_count} of {total_count}"),
         );
 
-    let parent_id = parent_id.map_or_else(
-        || "unknown".to_string(),
-        |value| match value {
-            Value::String(text) => text.clone(),
-            other => other.to_string(),
-        },
-    );
+    let parent_id = parent_name(parent_id);
 
     let parent_label = spec.parent_label;
     let child_label = spec.child_label;
@@ -380,6 +423,52 @@ mod tests {
             error.to_string().contains("pull request '42'"),
             "the error must name the parent, got: {error}"
         );
+    }
+
+    /// GitHub returns `nodes: null` rather than `[]` for an empty connection, so a
+    /// missing node list is only readable as "empty" when `totalCount` agrees.
+    #[test]
+    fn fan_out_fails_when_the_node_list_is_missing_but_children_were_reported() {
+        let missing = json!({
+            "pull_request_id": "PR_1",
+            "pull_request_number": 42,
+            "reviews": {
+                "totalCount": 110,
+                "pageInfo": {"hasNextPage": false, "endCursor": "cursor"},
+                "nodes": null
+            }
+        });
+
+        let error = fan_out(&missing, &REVIEWS, "spiceai", "spiceai", |_| {}).expect_err(
+            "a connection reporting 110 children and no node list must not pass as empty",
+        );
+
+        // Pinned whole so a reword cannot drop the parent, the count, or the fix.
+        assert_eq!(
+            error.to_string(),
+            "Invalid GraphQL object access: Failed to read the reviews of pull request '42' \
+             (spiceai/spiceai): GitHub reported 110 reviews but returned none of them, so every \
+             count over that pull request would be short with no way to tell. Retry the refresh; \
+             if it persists, the access token may not be able to see all of them. \
+             See: https://spiceai.org/docs/components/data-connectors/github"
+        );
+    }
+
+    #[test]
+    fn fan_out_returns_no_rows_when_an_empty_connection_omits_its_node_list() {
+        let empty = json!({
+            "pull_request_id": "PR_1",
+            "pull_request_number": 42,
+            "reviews": {
+                "totalCount": 0,
+                "pageInfo": {"hasNextPage": false, "endCursor": null},
+                "nodes": null
+            }
+        });
+
+        let rows = fan_out(&empty, &REVIEWS, "spiceai", "spiceai", |_| {})
+            .expect("a connection with no children yields no rows");
+        assert!(rows.is_empty());
     }
 
     #[test]
