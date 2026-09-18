@@ -130,6 +130,17 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// <https://github.com/spiceai/spiceai/issues/12931> reported.
 pub trait Sizeable {
     fn get_memory_size(&self) -> usize;
+
+    /// Whether replacing this value in the store should keep the entry's
+    /// remaining TTL rather than starting a new one.
+    ///
+    /// Used for an encoded-to-raw promotion: the payload is the same result,
+    /// only its in-memory form changed, so extending its life would make a
+    /// first hit reset `item_ttl`. New results (a miss store, a revalidation)
+    /// leave this `false`.
+    fn keep_remaining_ttl(&self) -> bool {
+        false
+    }
 }
 
 impl Sizeable for Vec<Vec<f32>> {
@@ -227,6 +238,14 @@ pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
         is_valid: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
     ) -> Option<V>;
     async fn put_raw_key(&self, key: &u64, value: V);
+    /// Replace the value at `key` only when `should_replace` accepts the
+    /// currently stored value. See [`crate::backend::CacheBackend::replace_if`].
+    async fn replace_if(
+        &self,
+        key: &u64,
+        value: V,
+        should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> bool;
     async fn invalidate_all(&self);
     async fn size_bytes(&self) -> u64;
     async fn item_count(&self) -> u64;
@@ -980,6 +999,62 @@ impl QueryResultsCacheProvider {
     ) -> Result<()> {
         let res = self.cache.put_raw_key(&raw_key.as_u64(), result).await;
         Ok(res)
+    }
+
+    /// Decode `result` for serving. The first successful decode of an encoded
+    /// entry replaces the stored value with [`result::query::CachedData::Raw`]
+    /// so a later fetch of `raw_key` is an `Arc::clone` and the weigher bills
+    /// the decoded size.
+    ///
+    /// Concurrent first hits share one decode (the entry's `OnceCell`). The
+    /// replace is skipped when a newer result already occupies the key, or
+    /// when the decoded size would not fit `max_size` — that last case keeps
+    /// the encoded bytes so the entry is not evicted by the promotion itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if decoding fails.
+    pub async fn records(
+        &self,
+        raw_key: &RawCacheKey,
+        result: &CachedQueryResult,
+    ) -> std::result::Result<Arc<Vec<arrow::array::RecordBatch>>, encoding::Error> {
+        let records = result.records().await?;
+        self.promote_encoded_to_raw(raw_key, result, &records).await;
+        Ok(records)
+    }
+
+    async fn promote_encoded_to_raw(
+        &self,
+        raw_key: &RawCacheKey,
+        result: &CachedQueryResult,
+        records: &Arc<Vec<arrow::array::RecordBatch>>,
+    ) {
+        if !result.is_encoded() {
+            return;
+        }
+
+        let promoted = result.to_promoted_raw(Arc::clone(records));
+        let promoted_size = u64::try_from(promoted.get_memory_size()).unwrap_or(u64::MAX);
+        if promoted_size > self.cache_max_size {
+            tracing::debug!(
+                promoted_size,
+                cache_max_size = self.cache_max_size,
+                "Skipping encoded-to-raw promotion because the decoded entry exceeds cache max size"
+            );
+            return;
+        }
+
+        let expected = promoted.clone();
+        self.cache
+            .replace_if(
+                &raw_key.as_u64(),
+                promoted,
+                &move |current: &CachedQueryResult| {
+                    current.is_encoded() && current.is_same_generation(&expected)
+                },
+            )
+            .await;
     }
 
     /// # Errors
@@ -2026,5 +2101,290 @@ mod tests {
         (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
             .then_some(())
             .expect("cache should be disabled for COPY");
+    }
+
+    async fn encoded_counting_result(
+        rows: usize,
+    ) -> (
+        CachedQueryResult,
+        Arc<std::sync::atomic::AtomicUsize>,
+        arrow::datatypes::SchemaRef,
+    ) {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let values = vec![0i32; rows];
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(values))],
+        )
+        .expect("batch");
+        let (encoder, decodes) = encoding::CountingEncoder::zstd();
+        let now = Instant::now();
+        let result = CachedQueryResult::from_batches(
+            vec![batch],
+            Arc::clone(&schema),
+            Arc::new(HashSet::new()),
+            now,
+            now,
+            Some(encoder),
+        )
+        .await
+        .expect("encoded result");
+        (result, decodes, schema)
+    }
+
+    /// Store encoded → first fetch decodes and promotes → second fetch is Raw
+    /// and does not decode.
+    #[tokio::test]
+    async fn second_fetch_of_an_encoded_key_is_raw_and_does_not_decode() {
+        let provider = QueryResultsCacheProvider::try_new(
+            &SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                max_size: Some("8MiB".to_string()),
+                encoding: spicepod::component::caching::Encoding::Zstd,
+                ..SQLResultsCacheConfig::default()
+            },
+            Box::new([]),
+        )
+        .expect("valid cache provider");
+
+        let key = RawCacheKey::new(42);
+        let (result, decodes, _) = encoded_counting_result(5_000).await;
+        assert!(result.is_encoded(), "store path must start encoded");
+        let encoded_weight = result.memory_size();
+
+        provider
+            .put_raw_key(&key, result)
+            .await
+            .expect("put encoded");
+
+        let first = provider.get_raw_key(&key).await.expect("get").expect("hit");
+        assert!(first.is_encoded(), "first fetch is still the encoded store");
+        let first_records = provider
+            .records(&key, &first)
+            .await
+            .expect("first decode+promote");
+        assert_eq!(first_records[0].num_rows(), 5_000);
+        assert_eq!(
+            decodes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first fetch must decode once"
+        );
+
+        provider.run_pending_tasks().await;
+        let second = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("hit after promote");
+        assert!(
+            !second.is_encoded(),
+            "the stored entry must be Raw after the first successful decode"
+        );
+        let second_records = provider.records(&key, &second).await.expect("raw path");
+        assert!(
+            Arc::ptr_eq(&first_records, &second_records),
+            "the second fetch must Arc-share the promoted batches"
+        );
+        assert_eq!(
+            decodes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second fetch must not decode"
+        );
+        assert!(
+            second.memory_size() > encoded_weight,
+            "the weigher must bill the raw size after promotion, got {} then {}",
+            encoded_weight,
+            second.memory_size()
+        );
+        assert!(
+            provider.size().await >= second.memory_size(),
+            "the store's weighted size must reflect the promoted raw entry, got {} vs {}",
+            provider.size().await,
+            second.memory_size()
+        );
+    }
+
+    /// A promotion must not replace a newer result stored under the same key.
+    #[tokio::test]
+    async fn promote_does_not_overwrite_a_newer_generation() {
+        let provider = QueryResultsCacheProvider::try_new(
+            &SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                max_size: Some("8MiB".to_string()),
+                encoding: spicepod::component::caching::Encoding::Zstd,
+                ..SQLResultsCacheConfig::default()
+            },
+            Box::new([]),
+        )
+        .expect("valid cache provider");
+
+        let key = RawCacheKey::new(43);
+        let (first, decodes, _) = encoded_counting_result(1_000).await;
+        provider
+            .put_raw_key(&key, first.clone())
+            .await
+            .expect("put first generation");
+
+        let (newer, _, _) = encoded_counting_result(1_000).await;
+        assert!(
+            !first.is_same_generation(&newer),
+            "the second store is a distinct generation"
+        );
+        provider
+            .put_raw_key(&key, newer.clone())
+            .await
+            .expect("put newer generation");
+
+        // Decode the stale clone and attempt promotion of the key it came from.
+        let _ = provider
+            .records(&key, &first)
+            .await
+            .expect("stale clone still decodes");
+        assert_eq!(decodes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let stored = provider.get_raw_key(&key).await.expect("get").expect("hit");
+        assert!(
+            stored.is_encoded(),
+            "the newer encoded generation must still be stored"
+        );
+        assert!(
+            stored.is_same_generation(&newer),
+            "promotion of the stale clone must not replace the newer result"
+        );
+    }
+
+    /// When decoded size would not fit `max_size`, keep the encoded entry so
+    /// promotion cannot evict the only copy of the result.
+    #[tokio::test]
+    async fn promote_is_skipped_when_raw_exceeds_max_size() {
+        let provider = QueryResultsCacheProvider::try_new(
+            &SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                max_size: Some("4KiB".to_string()),
+                encoding: spicepod::component::caching::Encoding::Zstd,
+                ..SQLResultsCacheConfig::default()
+            },
+            Box::new([]),
+        )
+        .expect("valid cache provider");
+
+        let key = RawCacheKey::new(44);
+        let (result, decodes, schema) = encoded_counting_result(8_000).await;
+        // A separate raw entry of the same shape, so the size check does not
+        // fill this encoded value's decode cell.
+        let now = Instant::now();
+        let raw_probe = CachedQueryResult::new_raw(
+            vec![
+                arrow::array::RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(arrow::array::Int32Array::from(vec![0i32; 8_000]))],
+                )
+                .expect("batch"),
+            ],
+            schema,
+            Arc::new(HashSet::new()),
+            now,
+            now,
+        );
+        assert!(
+            raw_probe.memory_size() > 4 * 1024,
+            "fixture must exceed a 4 KiB cache once raw, got {}",
+            raw_probe.memory_size()
+        );
+        assert!(
+            result.memory_size() <= 4 * 1024,
+            "fixture must fit encoded, got {}",
+            result.memory_size()
+        );
+
+        provider
+            .put_raw_key(&key, result)
+            .await
+            .expect("put encoded that fits");
+
+        let first = provider.get_raw_key(&key).await.expect("get").expect("hit");
+        let _ = provider
+            .records(&key, &first)
+            .await
+            .expect("decode; promote must be skipped");
+
+        provider.run_pending_tasks().await;
+        let second = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("still cached");
+        assert!(
+            second.is_encoded(),
+            "an entry that cannot fit raw must stay encoded rather than be evicted"
+        );
+        let _ = provider.records(&key, &second).await.expect("second hit");
+        assert_eq!(
+            decodes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the shared decode cell still avoids a second zstd+IPC pass"
+        );
+    }
+
+    /// A promotion is a reweigh of the same result, so it must not restart
+    /// `item_ttl`. Time itself is under test here.
+    #[tokio::test]
+    async fn promote_does_not_restart_item_ttl() {
+        let provider = QueryResultsCacheProvider::try_new(
+            &SQLResultsCacheConfig {
+                item_ttl: Some("250ms".to_string()),
+                max_size: Some("8MiB".to_string()),
+                encoding: spicepod::component::caching::Encoding::Zstd,
+                ..SQLResultsCacheConfig::default()
+            },
+            Box::new([]),
+        )
+        .expect("valid cache provider");
+
+        let key = RawCacheKey::new(45);
+        let (result, _, _) = encoded_counting_result(32).await;
+        provider
+            .put_raw_key(&key, result)
+            .await
+            .expect("put encoded");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let first = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("still live before promote");
+        let _ = provider
+            .records(&key, &first)
+            .await
+            .expect("decode+promote");
+        provider.run_pending_tasks().await;
+
+        let promoted = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("promoted entry must still be live");
+        assert!(
+            !promoted.is_encoded(),
+            "the entry must be Raw after promotion"
+        );
+
+        // Original remaining TTL is ~150ms. If promotion restarted a 250ms
+        // TTL, this wait would still leave the entry live.
+        tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+        provider.run_pending_tasks().await;
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("get after original ttl")
+                .is_none(),
+            "promotion must not restart item_ttl"
+        );
     }
 }

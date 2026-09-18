@@ -172,6 +172,47 @@ pub fn get_encoder(encoding: Encoding) -> Option<Arc<dyn Encoder>> {
     }
 }
 
+/// A zstd encoder that counts `decode` calls. Test-only: used to prove a second
+/// cache hit (or a concurrent first hit) does not pay zstd+IPC again.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct CountingEncoder {
+    inner: ZstdEncoder,
+    decodes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl CountingEncoder {
+    pub(crate) fn zstd() -> (Arc<dyn Encoder>, Arc<std::sync::atomic::AtomicUsize>) {
+        let decodes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Arc::new(Self {
+                inner: ZstdEncoder::default(),
+                decodes: Arc::clone(&decodes),
+            }),
+            decodes,
+        )
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl Encoder for CountingEncoder {
+    async fn encode(&self, batches: &[RecordBatch]) -> Result<Encoded> {
+        self.inner.encode(batches).await
+    }
+
+    async fn decode(&self, data: &[u8]) -> Result<Vec<RecordBatch>> {
+        self.decodes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.decode(data).await
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
