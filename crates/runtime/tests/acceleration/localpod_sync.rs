@@ -425,8 +425,9 @@ async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Resul
         .await
 }
 
-/// Build the issue's Spicepod: a file-backed parent with the default in-memory accelerator and a
-/// `localpod:` child over it. `refresh_sql` is the edit the reload applies to the parent.
+/// Build the issue's Spicepod: a file-backed parent with the default in-memory accelerator, a
+/// `localpod:` child over it, and a `localpod:` grandchild over the child. `refresh_sql` is the
+/// edit the reload applies to the parent.
 fn app_with_parent_refresh_sql(csv_path: &Path, refresh_sql: Option<&str>) -> App {
     let mut parent = Dataset::new(format!("file://{}", csv_path.display()), "time_series");
     parent.params = Some(Params::from_string_map(
@@ -446,26 +447,40 @@ fn app_with_parent_refresh_sql(csv_path: &Path, refresh_sql: Option<&str>) -> Ap
 
     AppBuilder::new("test_localpod_child_follows_parent_hot_reload")
         .with_dataset(parent)
-        .with_dataset(localpod_child())
+        .with_dataset(localpod_dataset(
+            "localpod:time_series",
+            "local_time_series",
+        ))
+        .with_dataset(localpod_dataset(
+            "localpod:local_time_series",
+            "local_local_time_series",
+        ))
         .build()
 }
 
-/// The `localpod:` child of [`app_with_parent_refresh_sql`], identical in every app so no apply
+/// A `localpod:` dataset of [`app_with_parent_refresh_sql`], identical in every app so no apply
 /// ever reloads it for a change of its own.
-fn localpod_child() -> Dataset {
-    let mut child = Dataset::new("localpod:time_series", "local_time_series");
-    child.acceleration = Some(Acceleration {
+fn localpod_dataset(from: &str, name: &str) -> Dataset {
+    let mut dataset = Dataset::new(from, name);
+    dataset.acceleration = Some(Acceleration {
         enabled: true,
         refresh_mode: Some(RefreshMode::Full),
         ..Acceleration::default()
     });
-    child
+    dataset
 }
 
-/// The issue's Spicepod with the parent removed: only the `localpod:` child remains.
-fn app_with_child_only() -> App {
+/// The issue's Spicepod with the parent removed: only the `localpod:` chain remains.
+fn app_with_localpod_chain_only() -> App {
     AppBuilder::new("test_localpod_child_follows_parent_hot_reload")
-        .with_dataset(localpod_child())
+        .with_dataset(localpod_dataset(
+            "localpod:time_series",
+            "local_time_series",
+        ))
+        .with_dataset(localpod_dataset(
+            "localpod:local_time_series",
+            "local_local_time_series",
+        ))
         .build()
 }
 
@@ -517,6 +532,11 @@ async fn test_localpod_child_follows_parent_hot_reload() -> Result<(), anyhow::E
                 5,
                 "localpod child should load the five startup rows"
             );
+            assert_eq!(
+                count_rows(&runtime, "local_local_time_series").await,
+                5,
+                "localpod grandchild should load the five startup rows"
+            );
 
             // The issue's edit: a `refresh_sql` on the parent's acceleration, which keeps two of
             // the five rows and replaces the parent's accelerated table on hot reload.
@@ -538,13 +558,25 @@ async fn test_localpod_child_follows_parent_hot_reload() -> Result<(), anyhow::E
                 "parent should serve only the rows its new refresh_sql keeps"
             );
 
-            // The child must be reloaded onto the parent's new table. Before the #3288 fix it
-            // kept the parent's retired table and stayed at the startup count of 5.
+            // The child must be reloaded onto the parent's new table, and the grandchild onto the
+            // child's. Before the #3288 fix both kept the retired tables and stayed at the
+            // startup count of 5.
             assert_eq!(
                 wait_for_count(&runtime, "local_time_series", 2, Duration::from_secs(30)).await,
                 2,
                 "localpod child should follow its parent's hot reload (kept serving the \
                  parent's retired table before the #3288 fix)"
+            );
+            assert_eq!(
+                wait_for_count(
+                    &runtime,
+                    "local_local_time_series",
+                    2,
+                    Duration::from_secs(30)
+                )
+                .await,
+                2,
+                "localpod grandchild should follow the chain's hot reload"
             );
 
             Ok(())
@@ -552,14 +584,16 @@ async fn test_localpod_child_follows_parent_hot_reload() -> Result<(), anyhow::E
         .await
 }
 
-/// A `localpod` child must bind to a parent that is removed from the Spicepod and added back,
-/// instead of staying on the table the removed parent left behind.
+/// A `localpod` chain must bind to a parent that is removed from the Spicepod and added back,
+/// instead of staying on the tables the removed parent left behind.
 ///
 /// Regression test for <https://github.com/spiceai/spiceai/issues/3288>, the other way a
 /// parent's registration is replaced under an unchanged child: the child's own entry never
 /// changes across either apply, so before the fix neither apply reloaded it, and it went on
 /// serving the removed parent's rows. A child of a parent added in the same apply cannot bind
-/// until that parent is registered, so its reload is chained behind the parent's load.
+/// until that parent is registered, so its reload is chained behind the parent's load — and the
+/// grandchild's behind the child's, since a load this apply spawns registers nothing until it
+/// runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_localpod_child_follows_parent_removed_and_added_back() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -590,11 +624,12 @@ async fn test_localpod_child_follows_parent_removed_and_added_back() -> Result<(
             }
             runtime_ready_check(&runtime).await;
             assert_eq!(count_rows(&runtime, "local_time_series").await, 5);
+            assert_eq!(count_rows(&runtime, "local_local_time_series").await, 5);
 
             // Remove the parent. Its unload is awaited inside `apply_app`.
             assert!(
                 Arc::clone(&runtime)
-                    .apply_app(Arc::new(app_with_child_only()))
+                    .apply_app(Arc::new(app_with_localpod_chain_only()))
                     .await,
                 "dropping the parent differs from the booted spicepod, so it must apply"
             );
@@ -619,9 +654,9 @@ async fn test_localpod_child_follows_parent_removed_and_added_back() -> Result<(
                     .await,
                 "re-adding the parent differs from the child-only spicepod, so it must apply"
             );
-            // Both loads are spawned by `apply_app`, so each table is unregistered, then
+            // The loads are spawned by `apply_app`, so each table is unregistered, then
             // registered but still loading, for a moment: the parent until its load completes,
-            // the child because it is unloaded and chained behind the parent.
+            // the child and grandchild because they are unloaded and chained behind it.
             assert_eq!(
                 wait_for_registered_count(&runtime, "time_series", 2, Duration::from_secs(30))
                     .await,
@@ -639,6 +674,18 @@ async fn test_localpod_child_follows_parent_removed_and_added_back() -> Result<(
                 Some(2),
                 "localpod child should bind to the re-added parent (kept serving the removed \
                  parent's rows before the #3288 fix)"
+            );
+            assert_eq!(
+                wait_for_registered_count(
+                    &runtime,
+                    "local_local_time_series",
+                    2,
+                    Duration::from_secs(30)
+                )
+                .await,
+                Some(2),
+                "localpod grandchild should bind to the re-added chain (reloaded inline while \
+                 its parent was still unloaded before the fix, and never retried)"
             );
 
             Ok(())

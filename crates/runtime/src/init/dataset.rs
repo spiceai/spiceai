@@ -1851,6 +1851,9 @@ impl Runtime {
         // consuming it and the rest racing it.
         let mut localpod_by_parent: HashMap<TableReference, Vec<(Arc<Dataset>, BootstrapStatus)>> =
             HashMap::new();
+        // The `localpod` datasets queued in `localpod_by_parent`. A queued dataset registers
+        // nothing until its chain runs, so a `localpod` dataset reading through it queues too.
+        let mut queued_localpods: HashSet<TableReference> = HashSet::new();
 
         for ds in &datasets_to_apply {
             let bootstrap_status = match init_results.get(&ds.name) {
@@ -1866,17 +1869,19 @@ impl Runtime {
             };
 
             if existing_datasets.iter().any(|d| d.name == ds.name) {
-                // A `localpod` dataset whose parent this same diff adds cannot bind to it
-                // until that parent is registered, so it is unloaded here and chained behind
-                // the parent's load below, exactly like a newly added child.
+                // A `localpod` dataset whose parent this same diff adds — or queues, deeper in
+                // a chain — cannot bind to it until that parent is registered, so it is
+                // unloaded here and queued behind the parent's load below, exactly like a
+                // newly added child.
                 if let Some(parent) = localpod_parent(ds)
-                    && added_futures.contains_key(&parent)
+                    && (added_futures.contains_key(&parent) || queued_localpods.contains(&parent))
                 {
                     Arc::clone(&self)
                         .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
                         .await;
                     self.status
                         .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+                    queued_localpods.insert(ds.name.clone());
                     localpod_by_parent
                         .entry(parent)
                         .or_default()
@@ -1891,9 +1896,10 @@ impl Runtime {
             self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
 
-            if ds.source() == LOCALPOD_DATACONNECTOR {
+            if let Some(parent) = localpod_parent(ds) {
+                queued_localpods.insert(ds.name.clone());
                 localpod_by_parent
-                    .entry(TableReference::parse_str(ds.path()))
+                    .entry(parent)
                     .or_default()
                     .push((Arc::clone(ds), bootstrap_status));
                 continue;
@@ -1914,25 +1920,35 @@ impl Runtime {
             );
         }
 
-        for (parent, children) in localpod_by_parent {
-            // Chain behind the parent only when this same diff adds it. A parent
-            // that is unchanged, or that was updated in the loop above, is already
-            // registered.
+        // Every queued `localpod` dataset loads behind its parent: a load this diff spawns
+        // (`added_futures`) or, deeper in a chain, another queued `localpod` dataset. A parent
+        // that is unchanged, or that was updated in the loop above, is already registered, so
+        // its children start at once. Chains are built from their roots, so a key that is
+        // itself queued is reached through its own parent's chain rather than scheduled on
+        // its own — ordering the apply set cannot sequence loads that are spawned.
+        let mut parents: Vec<TableReference> = localpod_by_parent.keys().cloned().collect();
+        parents.sort_by_key(|parent| queued_localpods.contains(parent));
+        for parent in parents {
+            let Some(children) = localpod_by_parent.remove(&parent) else {
+                // Already part of a root's chain.
+                continue;
+            };
             let parent_future = added_futures.remove(&parent);
-            let runtime = Arc::clone(&self);
-            let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
+            let chains: Vec<_> = children
+                .into_iter()
+                .map(|(ds, bootstrap_status)| {
+                    Arc::clone(&self).localpod_load_chain(
+                        ds,
+                        bootstrap_status,
+                        &mut localpod_by_parent,
+                    )
+                })
+                .collect();
             tokio::spawn(async move {
                 if let Some(parent_future) = parent_future {
                     parent_future.await;
                 }
-                join_all(children.into_iter().map(|(ds, bootstrap_status)| {
-                    Arc::clone(&runtime).load_dataset(
-                        ds,
-                        bootstrap_status,
-                        Arc::clone(&load_semaphore),
-                    )
-                }))
-                .await;
+                join_all(chains).await;
             });
         }
 
@@ -1975,6 +1991,32 @@ impl Runtime {
                     .await;
             }
         }
+    }
+
+    /// The load of a queued `localpod` dataset, followed by the loads of the `localpod` datasets
+    /// queued behind it, recursively, so a child never binds before its parent registers. Each
+    /// dataset's children are taken out of `localpod_by_parent` as its chain is built, so a
+    /// `localpod` cycle — which can never load — is built once and ends.
+    fn localpod_load_chain(
+        self: Arc<Self>,
+        ds: Arc<Dataset>,
+        bootstrap_status: BootstrapStatus,
+        localpod_by_parent: &mut HashMap<TableReference, Vec<(Arc<Dataset>, BootstrapStatus)>>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let children: Vec<_> = localpod_by_parent
+            .remove(&ds.name)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(child, child_status)| {
+                Arc::clone(&self).localpod_load_chain(child, child_status, localpod_by_parent)
+            })
+            .collect();
+        let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
+        Box::pin(async move {
+            self.load_dataset(ds, bootstrap_status, load_semaphore)
+                .await;
+            join_all(children).await;
+        })
     }
 
     /// Initialize datasets configured with accelerators before registering the datasets.
