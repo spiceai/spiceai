@@ -2190,6 +2190,158 @@ mod tests {
         }
     }
 
+    /// The nested-pagination path end to end over a mock server: an outer page
+    /// whose child connection is truncated, the `node(id:)` follow-ups, and the
+    /// terminal page. The live full-history tests are `#[ignore]`, so without
+    /// this nothing guards the feature in CI.
+    mod nested_pagination {
+        use std::sync::Arc;
+
+        use arrow::array::{Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use serde_json::{Value, json};
+        use url::Url;
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use crate::graphql::builder::GraphQLClientBuilder;
+        use crate::graphql::client::{
+            GraphQLQuery, NestedConnectionPager, UnnestBehavior, UnnestHandler,
+        };
+
+        const OUTER_QUERY: &str = "query { view(first: 10) {
+            nodes { id reviews(first: 2) { totalCount pageInfo { hasNextPage endCursor } nodes { id } } }
+            pageInfo { hasNextPage endCursor }
+        } }";
+
+        fn reviews_page(nodes: &[&str], has_next: bool, end_cursor: &str) -> Value {
+            json!({
+                "totalCount": 5,
+                "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor},
+                "nodes": nodes.iter().map(|id| json!({"id": id})).collect::<Vec<_>>(),
+            })
+        }
+
+        #[tokio::test]
+        async fn follow_up_pages_emit_every_child_once_and_request_cursors_in_order() {
+            let server = MockServer::start().await;
+
+            // Most specific first: the follow-ups are keyed on their cursor.
+            Mock::given(method("POST"))
+                .and(body_string_contains(r#"after: \"c2\""#))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"node": {"reviews": reviews_page(&["R5"], false, "c3")}}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains(r#"after: \"c1\""#))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"node": {"reviews": reviews_page(&["R3", "R4"], true, "c2")}}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("view(first: 10)"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"view": {
+                        "nodes": [{"id": "PR_1", "reviews": reviews_page(&["R1", "R2"], true, "c1")}],
+                        "pageInfo": {"hasNextPage": false, "endCursor": Value::Null},
+                    }}
+                })))
+                .mount(&server)
+                .await;
+
+            // Flatten each parent into one row per review, the way the GitHub
+            // connector's fan-out does, so every child is countable.
+            let unnest_reviews: UnnestHandler = Box::new(|parent: &Value| {
+                Ok(parent
+                    .get("reviews")
+                    .and_then(|c| c.get("nodes"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default())
+            });
+
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                UnnestBehavior::Custom(unnest_reviews),
+            )
+            .with_json_pointer(Some("/data/view/nodes"))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
+            .with_nested_pager(Some(NestedConnectionPager {
+                connection_key: "reviews",
+                parent_id_key: "id",
+                type_condition: "PullRequest",
+                node_selection: "id",
+                page_size: 2,
+            }))
+            .build(reqwest::Client::new())
+            .expect("client to build");
+
+            // The provider normally stamps the client's pointer onto the query;
+            // inference would otherwise walk into the nested connection.
+            let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
+                .expect("query to parse")
+                .with_json_pointer(Arc::from("/data/view/nodes"));
+            let result = client
+                .execute(&query, None, None, None, None, None)
+                .await
+                .expect("the nested connection to be completed");
+
+            let mut ids: Vec<String> = Vec::new();
+            for batch in &result.records {
+                let column = batch
+                    .column_by_name("id")
+                    .expect("the id column")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("id to be a string column");
+                for i in 0..column.len() {
+                    ids.push(column.value(i).to_string());
+                }
+            }
+
+            assert_eq!(
+                ids,
+                vec!["R1", "R2", "R3", "R4", "R5"],
+                "every child of the truncated connection must be emitted exactly once"
+            );
+
+            // `after:` forces the pages of one parent to be sequential.
+            let bodies: Vec<String> = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .iter()
+                .map(|r| String::from_utf8_lossy(&r.body).to_string())
+                .collect();
+            let cursor_order: Vec<&str> = bodies
+                .iter()
+                .filter_map(|b| {
+                    if b.contains(r#"after: \"c1\""#) {
+                        Some("c1")
+                    } else if b.contains(r#"after: \"c2\""#) {
+                        Some("c2")
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(
+                cursor_order,
+                vec!["c1", "c2"],
+                "follow-up pages of one parent must be requested in cursor order"
+            );
+        }
+    }
+
     mod empty_page_schema {
         use std::sync::Arc;
 
