@@ -34,15 +34,46 @@ use crate::AsTableRefs;
 use crate::Sizeable;
 use crate::encoding::Encoder;
 use crate::intern::Interned;
-use crate::sizing::{BUFFER_OVERHEAD_BYTES, ENTRY_OVERHEAD_BYTES, arc_heap_size};
+use crate::sizing::{
+    ARC_HEADER_BYTES, BUFFER_OVERHEAD_BYTES, ENTRY_OVERHEAD_BYTES, arc_heap_size,
+};
 
 use super::CacheStatus;
+
+/// Shared raw result batches: one `Arc` around a slice of pre-`Arc`'d batches.
+///
+/// A Raw cache hit clones this slice handle once. Callers that can hold
+/// `Arc<RecordBatch>` pay one atomic per batch; `DataFusion`'s stream item is
+/// still an owned `RecordBatch`, so [`CachedStream`] materializes that with
+/// `RecordBatch::clone`.
+pub type CachedBatches = Arc<[Arc<RecordBatch>]>;
+
+/// Wrap owned batches for Raw storage / serve. Moves each batch into an `Arc`
+/// so a later hit shares the batch with one atomic rather than rebuilding a
+/// `Vec` of independently cloned column `ArrayRef`s.
+#[must_use]
+pub fn wrap_raw_batches(batches: Vec<RecordBatch>) -> CachedBatches {
+    batches.into_iter().map(Arc::new).collect()
+}
+
+/// Heap billed for a [`CachedBatches`] slice: the outer `Arc<[Arc<RecordBatch>]>`
+/// allocation, plus one `Arc<RecordBatch>` header and `RecordBatch` struct per
+/// element. Array buffers are charged by the caller.
+fn raw_batches_heap_size(batches: &CachedBatches) -> usize {
+    ARC_HEADER_BYTES
+        + batches.len() * std::mem::size_of::<Arc<RecordBatch>>()
+        + batches.len() * arc_heap_size::<RecordBatch>()
+}
 
 /// Cached data storage - either raw `RecordBatches` (no encoding) or encoded bytes.
 #[derive(Debug, Clone)]
 pub enum CachedData {
-    /// Raw `RecordBatches` stored directly (encoding: none)
-    Raw(Arc<Vec<RecordBatch>>),
+    /// Raw `RecordBatches` stored directly (encoding: none).
+    ///
+    /// Each batch is pre-`Arc`'d so a hit clones one slice handle and can
+    /// hand a batch out with a single atomic. `DataFusion` still needs an owned
+    /// `RecordBatch` on the stream, which [`CachedStream`] materializes.
+    Raw(CachedBatches),
     /// IPC-serialized bytes, additionally compressed (e.g., with zstd)
     Encoded {
         bytes: Bytes,
@@ -94,7 +125,7 @@ impl CachedQueryResult {
         read_started_at: Instant,
     ) -> Self {
         Self {
-            data: CachedData::Raw(Arc::new(super::prepare_for_storage(batches))),
+            data: CachedData::Raw(wrap_raw_batches(super::prepare_for_storage(batches))),
             schema: crate::intern::schema::intern(schema),
             input_tables: crate::intern::table_set::intern(input_tables),
             cached_at,
@@ -163,7 +194,7 @@ impl CachedQueryResult {
                 decoded_len: payload.decoded_len,
             }
         } else {
-            CachedData::Raw(Arc::new(super::prepare_for_storage(records)))
+            CachedData::Raw(wrap_raw_batches(super::prepare_for_storage(records)))
         };
 
         Ok(Self {
@@ -178,19 +209,36 @@ impl CachedQueryResult {
 
     /// Decode and return the cached record batches.
     ///
+    /// Raw entries return the stored pre-`Arc`'d slice (`Arc::clone` of the
+    /// handle only). Encoded entries wrap the decoded batches the same way so
+    /// the caller can build a [`CachedStream`] without a second column-Arc pass.
+    ///
     /// # Errors
     ///
     /// Returns an error if decoding fails.
-    pub async fn records(&self) -> Result<Arc<Vec<RecordBatch>>, crate::encoding::Error> {
+    pub async fn records(&self) -> Result<CachedBatches, crate::encoding::Error> {
         match &self.data {
             CachedData::Raw(batches) => Ok(Arc::clone(batches)),
             CachedData::Encoded { bytes, .. } => {
                 if let Some(encoder) = &self.encoder {
-                    encoder.decode(bytes).await.map(Arc::new)
+                    encoder.decode(bytes).await.map(wrap_raw_batches)
                 } else {
                     Err(crate::encoding::Error::NoEncoderSpecified)
                 }
             }
+        }
+    }
+
+    /// The pre-`Arc`'d batches of a Raw entry, if this value is stored raw.
+    ///
+    /// Isolated from [`Self::records`]: encoded hits still decode through
+    /// that path. A Raw serve uses this so it never goes through a `Vec`
+    /// rebuild.
+    #[must_use]
+    pub fn raw_batches(&self) -> Option<CachedBatches> {
+        match &self.data {
+            CachedData::Raw(batches) => Some(Arc::clone(batches)),
+            CachedData::Encoded { .. } => None,
         }
     }
 
@@ -263,8 +311,7 @@ impl CachedQueryResult {
 
         match &self.data {
             CachedData::Raw(batches) => {
-                size += arc_heap_size::<Vec<RecordBatch>>()
-                    + batches.len() * std::mem::size_of::<RecordBatch>();
+                size += raw_batches_heap_size(batches);
                 for batch in batches.iter() {
                     // get_array_memory_size accounts for all array data.
                     size += batch.get_array_memory_size();
@@ -309,19 +356,76 @@ impl AsTableRefs for CachedQueryResult {
     }
 }
 
+/// How a [`CachedStream`] holds the batches it will yield.
+enum StreamBatches {
+    /// Pre-`Arc`'d Raw (or decoded) batches. Construction is one slice
+    /// `Arc::clone`; each poll materializes the owned `RecordBatch`
+    /// `DataFusion` requires.
+    Arced(CachedBatches),
+    /// Shared `Arc<Vec<RecordBatch>>` (search cache). Indexed without wrapping
+    /// so a search hit does not `RecordBatch::clone` every batch at construction.
+    Shared(Arc<Vec<RecordBatch>>),
+}
+
+impl StreamBatches {
+    fn len(&self) -> usize {
+        match self {
+            Self::Arced(batches) => batches.len(),
+            Self::Shared(batches) => batches.len(),
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<&RecordBatch> {
+        match self {
+            Self::Arced(batches) => batches.get(index).map(std::convert::AsRef::as_ref),
+            Self::Shared(batches) => batches.get(index),
+        }
+    }
+
+    fn clone_batch(&self, index: usize) -> Option<RecordBatch> {
+        match self {
+            // DataFusion's stream item is an owned `RecordBatch`, so the
+            // column `ArrayRef`s are still cloned here. The stored
+            // `Arc<RecordBatch>` is the cheaper handle (`raw_batches`,
+            // construction); this is the owned value the caller must hold.
+            Self::Arced(batches) => batches.get(index).map(|batch| RecordBatch::clone(batch)),
+            Self::Shared(batches) => batches.get(index).cloned(),
+        }
+    }
+}
+
 pub struct CachedStream {
-    /// Vector of record batches
-    data: Arc<Vec<RecordBatch>>,
+    data: StreamBatches,
     /// Schema representing the data
     schema: SchemaRef,
     index: usize,
 }
 
 impl CachedStream {
+    /// Serve a shared `Arc<Vec<RecordBatch>>` (search cache, tests).
+    ///
+    /// Indexes the vec in place and prefetches the first batch. Prefer
+    /// [`Self::from_raw`] for SQL Raw hits, where batches are already
+    /// pre-`Arc`'d.
     #[must_use]
     pub fn new(data: Arc<Vec<RecordBatch>>, schema: SchemaRef) -> Self {
+        super::prefetch::prefetch_raw_serve(data.as_slice());
         Self {
-            data,
+            data: StreamBatches::Shared(data),
+            schema,
+            index: 0,
+        }
+    }
+
+    /// Serve a Raw (or just-decoded) pre-`Arc`'d slice.
+    ///
+    /// Prefetches the first batch's data buffers and the next batch's headers
+    /// before returning so the caller's first poll / encode sees warm lines.
+    #[must_use]
+    pub fn from_raw(data: CachedBatches, schema: SchemaRef) -> Self {
+        super::prefetch::prefetch_raw_serve_arced(&data);
+        Self {
+            data: StreamBatches::Arced(data),
             schema,
             index: 0,
         }
@@ -335,18 +439,20 @@ impl Stream for CachedStream {
         mut self: std::pin::Pin<&mut Self>,
         _: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        Poll::Ready(if self.index < self.data.len() {
-            let index = self.index;
-            let batch = self.data.get(index).cloned().map(Ok);
-            self.index += 1;
-            batch
-        } else {
-            None
-        })
+        let index = self.index;
+        let Some(batch) = self.data.clone_batch(index) else {
+            return Poll::Ready(None);
+        };
+        self.index = index + 1;
+        if let Some(next) = self.data.get(self.index) {
+            super::prefetch::prefetch_batch_headers(next);
+        }
+        Poll::Ready(Some(Ok(batch)))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.data.len(), Some(self.data.len()))
+        let remaining = self.data.len().saturating_sub(self.index);
+        (remaining, Some(remaining))
     }
 }
 
@@ -383,6 +489,7 @@ mod tests {
     use super::*;
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field};
+    use std::pin::Pin;
 
     #[test]
     fn test_memory_size_raw_batches() {
@@ -429,9 +536,11 @@ mod tests {
             cached_at,
         );
 
+        let CachedData::Raw(stored) = &cached_result.data else {
+            panic!("expected raw batches");
+        };
         let expected_size = std::mem::size_of::<CachedQueryResult>() as u64
-            + crate::sizing::arc_heap_size::<Vec<RecordBatch>>() as u64
-            + 2 * std::mem::size_of::<RecordBatch>() as u64
+            + raw_batches_heap_size(stored) as u64
             + batch1.get_array_memory_size() as u64
             + batch2.get_array_memory_size() as u64
             + (crate::sizing::BUFFER_OVERHEAD_BYTES
@@ -786,7 +895,7 @@ mod tests {
         let records = cached_result.records().await.expect("should decode");
         assert!(records.is_empty(), "Should have no record batches");
 
-        let stream = CachedStream::new(records, cached_result.schema.arc());
+        let stream = CachedStream::from_raw(records, cached_result.schema.arc());
         assert_eq!(
             stream.schema().fields().len(),
             3,
@@ -960,5 +1069,140 @@ mod tests {
         );
         let records = cached_result.records().await.expect("decoded batches");
         assert_eq!(records[0].num_rows(), n);
+    }
+
+    fn drain_stream(mut stream: CachedStream) -> Vec<RecordBatch> {
+        let mut batches = Vec::new();
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            match Pin::new(&mut stream).poll_next(&mut cx) {
+                Poll::Ready(Some(Ok(batch))) => batches.push(batch),
+                Poll::Ready(None) => break,
+                Poll::Ready(Some(Err(e))) => panic!("CachedStream yielded an error: {e}"),
+                Poll::Pending => panic!("CachedStream must be immediately ready"),
+            }
+        }
+        batches
+    }
+
+    fn int_batch(schema: &SchemaRef, values: &[i32]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![Arc::new(Int32Array::from(values.to_vec()))],
+        )
+        .expect("batch")
+    }
+
+    /// Empty Raw serve: no batches, schema preserved, `size_hint` is 0.
+    #[test]
+    fn cached_stream_from_raw_empty_preserves_schema() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let stream = CachedStream::from_raw(wrap_raw_batches(Vec::new()), Arc::clone(&schema));
+        assert_eq!(stream.schema(), schema);
+        assert_eq!(stream.size_hint(), (0, Some(0)));
+        assert!(drain_stream(stream).is_empty());
+    }
+
+    /// Single-batch Raw serve: values, schema, and column `ArrayRef` identity
+    /// (shallow clone, not a deep copy) are preserved.
+    #[test]
+    fn cached_stream_from_raw_single_batch_shares_column_arcs() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = int_batch(&schema, &[1, 2, 3]);
+        let stored = wrap_raw_batches(vec![batch]);
+        let stream = CachedStream::from_raw(Arc::clone(&stored), Arc::clone(&schema));
+        assert_eq!(stream.size_hint(), (1, Some(1)));
+
+        let yielded = drain_stream(stream);
+        assert_eq!(yielded.len(), 1);
+        assert_eq!(yielded[0].num_rows(), 3);
+        assert_eq!(yielded[0].schema(), schema);
+        assert!(
+            Arc::ptr_eq(yielded[0].column(0), stored[0].column(0)),
+            "serve must share column arrays with the stored batch, not copy buffers"
+        );
+    }
+
+    /// Multi-batch Raw serve: order, values, remaining `size_hint`, and a
+    /// second consumer of the same `CachedBatches` all match.
+    #[test]
+    fn cached_stream_from_raw_multi_batch_is_stable_across_consumers() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let stored = wrap_raw_batches(vec![
+            int_batch(&schema, &[1, 2]),
+            int_batch(&schema, &[3]),
+            int_batch(&schema, &[4, 5, 6]),
+        ]);
+
+        let mut first = CachedStream::from_raw(Arc::clone(&stored), Arc::clone(&schema));
+        assert_eq!(first.size_hint(), (3, Some(3)));
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let first_batch = match Pin::new(&mut first).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(batch))) => batch,
+            other => panic!("expected first batch, got {other:?}"),
+        };
+        assert_eq!(first.size_hint(), (2, Some(2)));
+        assert_eq!(first_batch.num_rows(), 2);
+
+        let rest = drain_stream(first);
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[0].num_rows(), 1);
+        assert_eq!(rest[1].num_rows(), 3);
+
+        let second = drain_stream(CachedStream::from_raw(
+            Arc::clone(&stored),
+            Arc::clone(&schema),
+        ));
+        assert_eq!(second.len(), 3);
+        assert_eq!(
+            second.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            vec![2, 1, 3]
+        );
+        let col0 = second[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int column");
+        assert_eq!(col0.values(), &[1, 2]);
+    }
+
+    /// Shared-vec serve (search cache) keeps the same stream contract.
+    #[test]
+    fn cached_stream_from_shared_vec_multi_batch() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let shared = Arc::new(vec![int_batch(&schema, &[10]), int_batch(&schema, &[20, 21])]);
+        let yielded = drain_stream(CachedStream::new(Arc::clone(&shared), Arc::clone(&schema)));
+        assert_eq!(yielded.len(), 2);
+        assert_eq!(yielded[0].num_rows(), 1);
+        assert_eq!(yielded[1].num_rows(), 2);
+        assert!(Arc::ptr_eq(yielded[0].column(0), shared[0].column(0)));
+    }
+
+    /// `raw_batches` is present only for Raw entries and `Arc`-shares the store.
+    #[test]
+    fn raw_batches_is_the_stored_slice() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let cached = CachedQueryResult::new_raw(
+            vec![int_batch(&schema, &[7])],
+            Arc::clone(&schema),
+            Arc::new(HashSet::new()),
+            Instant::now(),
+            Instant::now(),
+        );
+        let raw = cached.raw_batches().expect("raw entry");
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].num_rows(), 1);
+        let CachedData::Raw(stored) = &cached.data else {
+            panic!("expected raw");
+        };
+        assert!(
+            Arc::ptr_eq(stored, &raw),
+            "raw_batches must Arc-share the stored slice"
+        );
     }
 }

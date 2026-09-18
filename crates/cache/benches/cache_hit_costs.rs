@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 //! What serving a results-cache hit costs before any rows move: decoding an encoded entry,
-//! and computing a logical-plan key, including for a parameterized statement.
+//! computing a logical-plan key (including for a parameterized statement), and
+//! draining a Raw multi-batch serve stream.
 
 #![allow(clippy::expect_used)] // Benchmarks can panic
 
@@ -28,7 +29,13 @@ use arrow::datatypes::{DataType, Field, Schema};
 use cache::encoding::{Encoder, ZstdEncoder};
 use cache::get_hash_builder;
 use cache::key::CacheKey;
+use cache::result::query::{CachedQueryResult, CachedStream};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use futures::Stream;
+use std::collections::HashSet;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Instant;
 use datafusion::common::{ParamValues, ScalarValue};
 use datafusion::logical_expr::{LogicalPlan, col, placeholder, table_scan};
 use spicepod::component::caching::HashingAlgorithm;
@@ -256,10 +263,195 @@ fn bench_parameterized_key(c: &mut Criterion) {
     group.finish();
 }
 
+fn drain_cached_stream(mut stream: CachedStream) -> usize {
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut rows = 0;
+    loop {
+        match Pin::new(&mut stream).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                rows += batch.num_rows();
+                black_box(&batch);
+            }
+            Poll::Ready(None) => break,
+            Poll::Ready(Some(Err(e))) => panic!("stream error: {e}"),
+            Poll::Pending => panic!("CachedStream must be immediately ready"),
+        }
+    }
+    rows
+}
+
+/// Touch column values so prefetch of data buffers can show up in wall time.
+fn drain_and_touch(mut stream: CachedStream) -> i64 {
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut sum = 0_i64;
+    loop {
+        match Pin::new(&mut stream).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                if let Some(col) = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                {
+                    for value in col.values() {
+                        sum = sum.wrapping_add(*value);
+                    }
+                }
+                black_box(&batch);
+            }
+            Poll::Ready(None) => break,
+            Poll::Ready(Some(Err(e))) => panic!("stream error: {e}"),
+            Poll::Pending => panic!("CachedStream must be immediately ready"),
+        }
+    }
+    sum
+}
+
+/// Raw multi-batch hit: construct the serve stream and drain it.
+///
+/// `legacy_column_clone` is today's `poll_next` (`RecordBatch::clone` per
+/// batch: schema Arc + every column `ArrayRef`). `arc_batch_clone` is the
+/// pre-`Arc`'d handoff (one atomic per batch). `cached_stream_from_raw` is
+/// the production serve path (prefetch + `Arc::clone` + the owned
+/// `RecordBatch` `DataFusion` still requires).
+fn bench_raw_stream_serve(c: &mut Criterion) {
+    let mut group = c.benchmark_group("raw_stream_serve");
+    let cases = [
+        (1, 100, 1),
+        (8, 100, 1),
+        (16, 100, 1),
+        (64, 32, 1),
+        (8, 64, 20),
+        (1, 10, 200),
+    ];
+    for (batches, rows, text_columns) in cases {
+        let payload: Vec<RecordBatch> = (0..batches).map(|_| batch(rows, text_columns)).collect();
+        let schema = payload[0].schema();
+        let now = Instant::now();
+        let cached = CachedQueryResult::new_raw(
+            payload,
+            Arc::clone(&schema),
+            Arc::new(HashSet::new()),
+            now,
+            now,
+        );
+        let stored = cached.raw_batches().expect("raw entry");
+        let id = format!("batches={batches}/rows={rows}/text_columns={text_columns}");
+
+        group.bench_with_input(
+            BenchmarkId::new("legacy_column_clone", &id),
+            &stored,
+            |b, stored| {
+                b.iter(|| {
+                    let mut rows = 0;
+                    for batch in stored.iter() {
+                        let cloned = RecordBatch::clone(batch);
+                        rows += cloned.num_rows();
+                        black_box(cloned);
+                    }
+                    black_box(rows)
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("arc_batch_clone", &id),
+            &stored,
+            |b, stored| {
+                b.iter(|| {
+                    let mut n = 0;
+                    for batch in stored.iter() {
+                        let handle = Arc::clone(batch);
+                        n += handle.num_rows();
+                        black_box(handle);
+                    }
+                    black_box(n)
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("cached_stream_from_raw", &id),
+            &stored,
+            |b, stored| {
+                b.iter(|| {
+                    let stream = CachedStream::from_raw(Arc::clone(stored), Arc::clone(&schema));
+                    black_box(drain_cached_stream(stream))
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("cached_stream_from_raw_touch", &id),
+            &stored,
+            |b, stored| {
+                b.iter(|| {
+                    let stream = CachedStream::from_raw(Arc::clone(stored), Arc::clone(&schema));
+                    black_box(drain_and_touch(stream))
+                });
+            },
+        );
+    }
+
+    // Concurrent Raw hits of one stored entry: the path that used to bounce
+    // column `ArrayRef` atomics across cores on every poll.
+    let wide: Vec<RecordBatch> = (0..8).map(|_| batch(64, 20)).collect();
+    let schema = wide[0].schema();
+    let now = Instant::now();
+    let cached = CachedQueryResult::new_raw(
+        wide,
+        Arc::clone(&schema),
+        Arc::new(HashSet::new()),
+        now,
+        now,
+    );
+    let stored = cached.raw_batches().expect("raw entry");
+    group.bench_function(
+        BenchmarkId::new("concurrent_hits", "threads=4/batches=8/rows=64/text_columns=20"),
+        |b| {
+            b.iter(|| {
+                std::thread::scope(|scope| {
+                    for _ in 0..4 {
+                        let stored = Arc::clone(&stored);
+                        let schema = Arc::clone(&schema);
+                        scope.spawn(move || {
+                            let stream = CachedStream::from_raw(stored, schema);
+                            black_box(drain_cached_stream(stream))
+                        });
+                    }
+                });
+            });
+        },
+    );
+
+    // Same payload served through `CachedStream::new` (shared vec) so the
+    // search-cache path stays in the comparison.
+    let shared_vec = {
+        let batches: Vec<RecordBatch> = stored.iter().map(|b| RecordBatch::clone(b)).collect();
+        Arc::new(batches)
+    };
+    group.bench_function(
+        BenchmarkId::new(
+            "cached_stream_from_shared_vec",
+            "batches=8/rows=64/text_columns=20",
+        ),
+        |b| {
+            b.iter(|| {
+                let stream = CachedStream::new(Arc::clone(&shared_vec), Arc::clone(&schema));
+                black_box(drain_cached_stream(stream))
+            });
+        },
+    );
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_zstd_decode,
     bench_plan_key,
-    bench_parameterized_key
+    bench_parameterized_key,
+    bench_raw_stream_serve
 );
 criterion_main!(benches);

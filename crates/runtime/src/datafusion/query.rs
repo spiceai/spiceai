@@ -997,14 +997,17 @@ impl Query {
                     let ttl = cache_provider.ttl();
                     let now = std::time::Instant::now();
                     if !cached_result.is_stale(ttl, now)
-                        && let Ok(records) = cached_result.records().await
+                        && let Some(records) = match cached_result.raw_batches() {
+                            Some(raw) => Some(raw),
+                            None => cached_result.records().await.ok(),
+                        }
                     {
                         tracing::debug!(
                             job_id,
                             cache_key = plan_cache_key.as_u64(),
                             "Returning cached result for distributed query (plan)"
                         );
-                        let stream = ::cache::result::query::CachedStream::new(
+                        let stream = ::cache::result::query::CachedStream::from_raw(
                             records,
                             cached_result.schema.arc(),
                         );
