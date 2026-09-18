@@ -63,7 +63,7 @@ use crate::{
     tracing_util::dataset_registered_trace,
 };
 use app::App;
-use datafusion::sql::TableReference;
+use datafusion::sql::{ResolvedTableReference, TableReference};
 use futures::StreamExt;
 use futures::future::join_all;
 use opentelemetry::KeyValue;
@@ -1844,16 +1844,20 @@ impl Runtime {
         // `LocalPodConnector::read_provider` raises `InvalidTableName` when its
         // parent is not registered yet, and that is classified permanent, so a
         // child racing its parent would fail for good rather than retry.
-        let mut added_futures: HashMap<TableReference, Pin<Box<dyn Future<Output = ()> + Send>>> =
-            HashMap::new();
+        let mut added_futures: HashMap<
+            ResolvedTableReference,
+            Pin<Box<dyn Future<Output = ()> + Send>>,
+        > = HashMap::new();
         // Keyed by parent so several localpod datasets reading from one newly added
         // dataset all chain behind the same load, rather than the first one
         // consuming it and the rest racing it.
-        let mut localpod_by_parent: HashMap<TableReference, Vec<(Arc<Dataset>, BootstrapStatus)>> =
-            HashMap::new();
+        let mut localpod_by_parent: HashMap<
+            ResolvedTableReference,
+            Vec<(Arc<Dataset>, BootstrapStatus)>,
+        > = HashMap::new();
         // The `localpod` datasets queued in `localpod_by_parent`. A queued dataset registers
         // nothing until its chain runs, so a `localpod` dataset reading through it queues too.
-        let mut queued_localpods: HashSet<TableReference> = HashSet::new();
+        let mut queued_localpods: HashSet<ResolvedTableReference> = HashSet::new();
 
         for ds in &datasets_to_apply {
             let bootstrap_status = match init_results.get(&ds.name) {
@@ -1881,7 +1885,7 @@ impl Runtime {
                         .await;
                     self.status
                         .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-                    queued_localpods.insert(ds.name.clone());
+                    queued_localpods.insert(resolved(&ds.name));
                     localpod_by_parent
                         .entry(parent)
                         .or_default()
@@ -1897,7 +1901,7 @@ impl Runtime {
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
 
             if let Some(parent) = localpod_parent(ds) {
-                queued_localpods.insert(ds.name.clone());
+                queued_localpods.insert(resolved(&ds.name));
                 localpod_by_parent
                     .entry(parent)
                     .or_default()
@@ -1911,7 +1915,7 @@ impl Runtime {
             let ds_clone = Arc::clone(ds);
             let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
             added_futures.insert(
-                ds.name.clone(),
+                resolved(&ds.name),
                 Box::pin(async move {
                     runtime
                         .load_dataset(ds_clone, bootstrap_status, load_semaphore)
@@ -1926,7 +1930,7 @@ impl Runtime {
         // its children start at once. Chains are built from their roots, so a key that is
         // itself queued is reached through its own parent's chain rather than scheduled on
         // its own — ordering the apply set cannot sequence loads that are spawned.
-        let mut parents: Vec<TableReference> = localpod_by_parent.keys().cloned().collect();
+        let mut parents: Vec<ResolvedTableReference> = localpod_by_parent.keys().cloned().collect();
         parents.sort_by_key(|parent| queued_localpods.contains(parent));
         for parent in parents {
             let Some(children) = localpod_by_parent.remove(&parent) else {
@@ -2001,10 +2005,13 @@ impl Runtime {
         self: Arc<Self>,
         ds: Arc<Dataset>,
         bootstrap_status: BootstrapStatus,
-        localpod_by_parent: &mut HashMap<TableReference, Vec<(Arc<Dataset>, BootstrapStatus)>>,
+        localpod_by_parent: &mut HashMap<
+            ResolvedTableReference,
+            Vec<(Arc<Dataset>, BootstrapStatus)>,
+        >,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let children: Vec<_> = localpod_by_parent
-            .remove(&ds.name)
+            .remove(&resolved(&ds.name))
             .unwrap_or_default()
             .into_iter()
             .map(|(child, child_status)| {
@@ -2526,9 +2533,18 @@ fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
     drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
 }
 
+/// A dataset name as the query engine resolves it, so `parent`, `public.parent`, and
+/// `spice.public.parent` name one dataset here as they do in a query.
+fn resolved(name: &TableReference) -> ResolvedTableReference {
+    name.clone().resolve(
+        crate::datafusion::SPICE_DEFAULT_CATALOG,
+        crate::datafusion::SPICE_DEFAULT_SCHEMA,
+    )
+}
+
 /// The dataset a `localpod` dataset reads through, or `None` for any other connector.
-fn localpod_parent(ds: &Dataset) -> Option<TableReference> {
-    (ds.source() == LOCALPOD_DATACONNECTOR).then(|| TableReference::parse_str(ds.path()))
+fn localpod_parent(ds: &Dataset) -> Option<ResolvedTableReference> {
+    (ds.source() == LOCALPOD_DATACONNECTOR).then(|| resolved(&TableReference::parse_str(ds.path())))
 }
 
 /// Extends the datasets a spicepod apply reloads with every `localpod` dataset that reads
@@ -2544,8 +2560,8 @@ fn with_localpod_dependents(
     mut reloading: Vec<Arc<Dataset>>,
     all: &[Arc<Dataset>],
 ) -> Vec<Arc<Dataset>> {
-    let mut reloading_names: HashSet<TableReference> =
-        reloading.iter().map(|ds| ds.name.clone()).collect();
+    let mut reloading_names: HashSet<ResolvedTableReference> =
+        reloading.iter().map(|ds| resolved(&ds.name)).collect();
 
     // A child of a reloading child reloads too, so iterate to a fixpoint. Each pass adds at
     // least one dataset or stops, so it runs at most `all.len()` times.
@@ -2553,10 +2569,10 @@ fn with_localpod_dependents(
     while added {
         added = false;
         for ds in all {
-            if !reloading_names.contains(&ds.name)
+            if !reloading_names.contains(&resolved(&ds.name))
                 && localpod_parent(ds).is_some_and(|parent| reloading_names.contains(&parent))
             {
-                reloading_names.insert(ds.name.clone());
+                reloading_names.insert(resolved(&ds.name));
                 reloading.push(Arc::clone(ds));
                 added = true;
             }
@@ -2565,8 +2581,8 @@ fn with_localpod_dependents(
 
     // Parents first: a child binds to whatever its parent has registered when it reloads. The
     // walk up is bounded so a `localpod` cycle, which can never load, cannot spin here.
-    let by_name: HashMap<&TableReference, &Arc<Dataset>> =
-        all.iter().map(|ds| (&ds.name, ds)).collect();
+    let by_name: HashMap<ResolvedTableReference, &Arc<Dataset>> =
+        all.iter().map(|ds| (resolved(&ds.name), ds)).collect();
     let depth = |ds: &Arc<Dataset>| {
         let mut depth = 0;
         let mut current = ds;
@@ -4263,7 +4279,8 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
     }
 
     /// A `localpod` dataset reloads whenever the dataset it reads through does — through any
-    /// depth of `localpod` chaining — and after it, whatever order the spicepod lists them in.
+    /// depth of `localpod` chaining, and however its parent is spelled — and after it, whatever
+    /// order the spicepod lists them in.
     /// Regression test for <https://github.com/spiceai/spiceai/issues/3288>.
     #[tokio::test]
     async fn localpod_dependents_reload_after_their_parent() {
@@ -4271,9 +4288,11 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         let all = datasets_of(
             &runtime,
             &[
-                // The grandchild is listed first, so the order below is the function's.
-                spicepod::component::dataset::Dataset::new("localpod:child", "grandchild"),
-                spicepod::component::dataset::Dataset::new("localpod:parent", "child"),
+                // The grandchild is listed first, so the order below is the function's. The
+                // parents are spelled with the default schema and catalog: a `localpod` path
+                // is resolved the way the query engine resolves it, not compared as text.
+                spicepod::component::dataset::Dataset::new("localpod:public.child", "grandchild"),
+                spicepod::component::dataset::Dataset::new("localpod:spice.public.parent", "child"),
                 spicepod::component::dataset::Dataset::new("file:data.csv", "parent"),
                 spicepod::component::dataset::Dataset::new("localpod:other", "other_child"),
                 spicepod::component::dataset::Dataset::new("file:other.csv", "other"),

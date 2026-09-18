@@ -427,7 +427,8 @@ async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Resul
 
 /// Build the issue's Spicepod: a file-backed parent with the default in-memory accelerator, a
 /// `localpod:` child over it, and a `localpod:` grandchild over the child. `refresh_sql` is the
-/// edit the reload applies to the parent.
+/// edit the reload applies to the parent. The long results-cache TTL is what lets the tests
+/// observe a stale cached result instead of its expiry.
 fn app_with_parent_refresh_sql(csv_path: &Path, refresh_sql: Option<&str>) -> App {
     let mut parent = Dataset::new(format!("file://{}", csv_path.display()), "time_series");
     parent.params = Some(Params::from_string_map(
@@ -446,6 +447,7 @@ fn app_with_parent_refresh_sql(csv_path: &Path, refresh_sql: Option<&str>) -> Ap
     });
 
     AppBuilder::new("test_localpod_child_follows_parent_hot_reload")
+        .with_sql_cache(long_lived_results_cache())
         .with_dataset(parent)
         .with_dataset(localpod_dataset(
             "localpod:time_series",
@@ -470,9 +472,17 @@ fn localpod_dataset(from: &str, name: &str) -> Dataset {
     dataset
 }
 
+fn long_lived_results_cache() -> SQLResultsCacheConfig {
+    SQLResultsCacheConfig {
+        item_ttl: Some("10m".to_string()),
+        ..Default::default()
+    }
+}
+
 /// The issue's Spicepod with the parent removed: only the `localpod:` chain remains.
 fn app_with_localpod_chain_only() -> App {
     AppBuilder::new("test_localpod_child_follows_parent_hot_reload")
+        .with_sql_cache(long_lived_results_cache())
         .with_dataset(localpod_dataset(
             "localpod:time_series",
             "local_time_series",
@@ -626,6 +636,13 @@ async fn test_localpod_child_follows_parent_removed_and_added_back() -> Result<(
             assert_eq!(count_rows(&runtime, "local_time_series").await, 5);
             assert_eq!(count_rows(&runtime, "local_local_time_series").await, 5);
 
+            // Warm the query path's caches for the child: the plan cache now holds a plan
+            // over the child's current table, and the results cache its count.
+            let (status, count) = cached_count(&runtime, "local_time_series").await;
+            assert_eq!((status, count), (CacheStatus::CacheMiss, 5));
+            let (status, count) = cached_count(&runtime, "local_time_series").await;
+            assert_eq!((status, count), (CacheStatus::CacheHit, 5));
+
             // Remove the parent. Its unload is awaited inside `apply_app`.
             assert!(
                 Arc::clone(&runtime)
@@ -686,6 +703,15 @@ async fn test_localpod_child_follows_parent_removed_and_added_back() -> Result<(
                 Some(2),
                 "localpod grandchild should bind to the re-added chain (reloaded inline while \
                  its parent was still unloaded before the fix, and never retried)"
+            );
+
+            // The query path, with its plan and results caches warmed over the child's previous
+            // table above, must answer from the child's new table.
+            let (_, cached) = cached_count(&runtime, "local_time_series").await;
+            assert_eq!(
+                cached, 2,
+                "the query path should answer from the child's new table, not from a plan or \
+                 result cached over its previous one"
             );
 
             Ok(())
