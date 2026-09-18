@@ -19,6 +19,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use data_components::rate_limit::RateLimiter;
 use governor::Quota;
 use reqwest::header::HeaderMap;
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,14 +89,16 @@ pub(crate) fn graphql_secondary_quota() -> Quota {
 /// a local 60s/min budget serializes scans that GitHub would still accept.
 #[derive(Debug)]
 pub struct GitHubRateLimiter {
-    // Track API response headers rate limits
-    api_limit: Arc<RwLock<Option<RateLimitInfo>>>,
-}
+    /// Latest primary state per `x-ratelimit-resource`. GitHub meters each
+    /// resource separately, so a `core` response must not answer for the quota
+    /// a `graphql` response reported.
+    primary: Arc<RwLock<HashMap<String, PrimaryRateLimitInfo>>>,
 
-#[derive(Debug, Clone)]
-pub enum RateLimitInfo {
-    Primary(PrimaryRateLimitInfo),
-    Secondary(SecondaryRateLimitInfo),
+    /// Deadline GitHub's `retry-after` holds the whole token to, kept until it
+    /// elapses. One limiter is shared by every dataset on a token, so this is
+    /// held apart from the primary state above: a sibling request completing
+    /// normally must not retire a secondary limit still in force.
+    secondary_retry_after: Arc<RwLock<Option<DateTime<Utc>>>>,
 }
 
 // A primary rate limit that is indicated by x-ratelimit headers
@@ -114,17 +117,11 @@ pub struct SecondaryRateLimitInfo {
     pub retry_after: DateTime<Utc>,
 }
 
-// See https://docs.github.com/en/graphql/overview/rate-limits-and-node-limits-for-the-graphql-api#checking-the-status-of-your-primary-rate-limit
-impl RateLimitInfo {
-    pub fn from_headers(headers: &HeaderMap) -> Option<Self> {
-        // `retry-after` means stop now, even if primary remaining is still high.
-        // GitHub's secondary/CPU cap returns 403 with both header families set.
-        Self::secondary_rate_limit_from_headers(headers)
-            .map(RateLimitInfo::Secondary)
-            .or_else(|| Self::primary_rate_limit_from_headers(headers).map(RateLimitInfo::Primary))
-    }
-
-    fn secondary_rate_limit_from_headers(headers: &HeaderMap) -> Option<SecondaryRateLimitInfo> {
+impl SecondaryRateLimitInfo {
+    /// GitHub's secondary limit answers 403 with both header families set, so
+    /// `retry-after` is recorded from the same response as the primary state
+    /// rather than instead of it.
+    fn from_headers(headers: &HeaderMap) -> Option<Self> {
         headers
             .get("retry-after")
             .and_then(|h| h.to_str().ok().map(|s| s.parse::<u64>().ok()))
@@ -132,8 +129,11 @@ impl RateLimitInfo {
             .map(|secs| Utc::now() + Duration::from_secs(secs))
             .map(|retry_after| SecondaryRateLimitInfo { retry_after })
     }
+}
 
-    fn primary_rate_limit_from_headers(headers: &HeaderMap) -> Option<PrimaryRateLimitInfo> {
+// See https://docs.github.com/en/graphql/overview/rate-limits-and-node-limits-for-the-graphql-api#checking-the-status-of-your-primary-rate-limit
+impl PrimaryRateLimitInfo {
+    fn from_headers(headers: &HeaderMap) -> Option<Self> {
         let limit = headers
             .get("x-ratelimit-limit")?
             .to_str()
@@ -174,12 +174,56 @@ impl RateLimitInfo {
             resource,
         })
     }
+
+    /// Share of this resource's limit already spent.
+    fn usage_percent(&self) -> f64 {
+        if self.limit <= 0 {
+            return 0.0;
+        }
+        (f64::from(self.used) / f64::from(self.limit)) * 100.0
+    }
+
+    /// Whether this resource has spent everything above the reserve and has not
+    /// yet reset.
+    fn is_exhausted(&self) -> bool {
+        self.remaining <= primary_rate_limit_buffer(self.limit) && Utc::now() < self.reset_time
+    }
+}
+
+/// Reports the resource closest to its limit, which is the quota that will stop
+/// the scan first and so the only one worth a line per check.
+fn log_primary_status<'a>(limits: impl Iterator<Item = &'a PrimaryRateLimitInfo>) {
+    let Some(primary) = limits.max_by(|a, b| a.usage_percent().total_cmp(&b.usage_percent()))
+    else {
+        return;
+    };
+
+    let usage_percent = primary.usage_percent();
+    if usage_percent >= 80.0 {
+        tracing::warn!(
+            "GitHub API rate limit is getting low for {}: {}/{} remaining ({:.1}% used). Reset at {}",
+            primary.resource,
+            primary.remaining,
+            primary.limit,
+            usage_percent,
+            primary.reset_time
+        );
+    } else {
+        tracing::trace!(
+            "GitHub API rate limit status for {}: {}/{} remaining. Reset at {}",
+            primary.resource,
+            primary.remaining,
+            primary.limit,
+            primary.reset_time
+        );
+    }
 }
 
 impl GitHubRateLimiter {
     pub fn new() -> Self {
         Self {
-            api_limit: Arc::new(RwLock::new(None)),
+            primary: Arc::new(RwLock::new(HashMap::new())),
+            secondary_retry_after: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -187,9 +231,19 @@ impl GitHubRateLimiter {
 #[async_trait]
 impl RateLimiter for GitHubRateLimiter {
     async fn update_from_headers(&self, headers: &HeaderMap) {
-        if let Some(rate_limit) = RateLimitInfo::from_headers(headers) {
-            let mut api_limit = self.api_limit.write().await;
-            *api_limit = Some(rate_limit);
+        if let Some(secondary) = SecondaryRateLimitInfo::from_headers(headers) {
+            let mut retry_after = self.secondary_retry_after.write().await;
+            // Only ever extended: a response asking for a shorter wait than the
+            // one in force cannot release the token early, and a response
+            // carrying no `retry-after` at all cannot clear it.
+            if retry_after.is_none_or(|current| secondary.retry_after > current) {
+                *retry_after = Some(secondary.retry_after);
+            }
+        }
+
+        if let Some(primary) = PrimaryRateLimitInfo::from_headers(headers) {
+            let mut primary_limits = self.primary.write().await;
+            primary_limits.insert(primary.resource.clone(), primary);
         }
     }
 
@@ -207,51 +261,34 @@ impl RateLimiter for GitHubRateLimiter {
             },
         }
 
-        let wait = {
-            let api_limit_guard = self.api_limit.read().await;
-            match &*api_limit_guard {
-                Some(RateLimitInfo::Secondary(secondary)) if Utc::now() < secondary.retry_after => {
-                    Some(Wait::Secondary {
-                        until: secondary.retry_after,
-                    })
-                }
-                Some(RateLimitInfo::Primary(primary))
-                    if primary.remaining <= primary_rate_limit_buffer(primary.limit)
-                        && Utc::now() < primary.reset_time =>
-                {
-                    Some(Wait::Primary {
-                        until: primary.reset_time,
-                        resource: primary.resource.clone(),
-                        remaining: primary.remaining,
-                        limit: primary.limit,
-                        used: primary.used,
-                    })
-                }
-                Some(RateLimitInfo::Primary(primary)) => {
-                    let usage_percent =
-                        (f64::from(primary.used) / f64::from(primary.limit)) * 100.0;
-                    if usage_percent >= 80.0 {
-                        tracing::warn!(
-                            "GitHub API rate limit is getting low for {}: {}/{} remaining ({:.1}% used). Reset at {}",
-                            primary.resource,
-                            primary.remaining,
-                            primary.limit,
-                            usage_percent,
-                            primary.reset_time
-                        );
-                    } else {
-                        tracing::trace!(
-                            "GitHub API rate limit status for {}: {}/{} remaining. Reset at {}",
-                            primary.resource,
-                            primary.remaining,
-                            primary.limit,
-                            primary.reset_time
-                        );
-                    }
-                    None
-                }
-                _ => None,
+        // `retry-after` means stop now, whatever the primary headers say.
+        let secondary_wait = {
+            let retry_after = *self.secondary_retry_after.read().await;
+            retry_after.filter(|until| Utc::now() < *until)
+        };
+
+        let wait = if let Some(until) = secondary_wait {
+            Some(Wait::Secondary { until })
+        } else {
+            let primary_limits = self.primary.read().await;
+            // Each resource is metered on its own, so a quota with room cannot
+            // answer for one that is spent; wait out the latest reset among them.
+            let exhausted = primary_limits
+                .values()
+                .filter(|primary| primary.is_exhausted())
+                .max_by_key(|primary| primary.reset_time);
+
+            if exhausted.is_none() {
+                log_primary_status(primary_limits.values());
             }
+
+            exhausted.map(|primary| Wait::Primary {
+                until: primary.reset_time,
+                resource: primary.resource.clone(),
+                remaining: primary.remaining,
+                limit: primary.limit,
+                used: primary.used,
+            })
         };
 
         match wait {
@@ -306,7 +343,6 @@ mod tests {
     use governor::RateLimiter as GovernorRateLimiter;
     use governor::clock::FakeRelativeClock;
     use reqwest::header::HeaderValue;
-    use std::collections::HashMap;
 
     fn create_test_headers(values: HashMap<&'static str, String>) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -437,17 +473,13 @@ mod tests {
         let headers = create_test_headers(HashMap::from([("retry-after", s("30"))]));
 
         let before = Utc::now() + Duration::seconds(30);
-        let rate_limit = RateLimitInfo::from_headers(&headers);
+        let info = SecondaryRateLimitInfo::from_headers(&headers)
+            .expect("Retry-After must parse into a secondary limit");
         let after = Utc::now() + Duration::seconds(30);
-        match rate_limit {
-            Some(RateLimitInfo::Secondary(info)) => {
-                assert!(
-                    (before..=after).contains(&info.retry_after),
-                    "Retry-After must be relative to the header parsing time"
-                );
-            }
-            _ => panic!("Expected Secondary rate limit info"),
-        }
+        assert!(
+            (before..=after).contains(&info.retry_after),
+            "Retry-After must be relative to the header parsing time"
+        );
     }
 
     #[test]
@@ -540,6 +572,78 @@ mod tests {
             .expect(
                 "a pending rate-limit wait must not block a completing request from recording its headers",
             );
+
+        let mut later_wait = std::pin::pin!(rate_limiter.check_rate_limit());
+        assert!(
+            poll!(&mut later_wait).is_pending(),
+            "a request arriving after those headers must still wait out the Retry-After"
+        );
+    }
+
+    /// The limiter is shared by every dataset on one token, so a sibling request
+    /// completing normally must not retire a secondary limit that has not elapsed.
+    #[tokio::test(start_paused = true)]
+    async fn a_normal_response_does_not_clear_an_active_secondary_wait() {
+        let rate_limiter = GitHubRateLimiter::new();
+        rate_limiter
+            .update_from_headers(&create_test_headers(HashMap::from([(
+                "retry-after",
+                s("3600"),
+            )])))
+            .await;
+
+        // A sibling dataset's request finishes normally, carrying only primary headers.
+        rate_limiter
+            .update_from_headers(&create_test_headers(HashMap::from([
+                ("x-ratelimit-limit", s("5000")),
+                ("x-ratelimit-remaining", s("4999")),
+                ("x-ratelimit-used", s("1")),
+                (
+                    "x-ratelimit-reset",
+                    (Utc::now() + Duration::hours(1)).timestamp().to_string(),
+                ),
+                ("x-ratelimit-resource", s("graphql")),
+            ])))
+            .await;
+
+        let mut wait = std::pin::pin!(rate_limiter.check_rate_limit());
+        assert!(
+            poll!(&mut wait).is_pending(),
+            "a normal response must not clear the Retry-After the token is still under"
+        );
+    }
+
+    /// GitHub meters each `x-ratelimit-resource` separately, so a healthy `core`
+    /// response must not retire an exhausted `graphql` quota.
+    #[tokio::test(start_paused = true)]
+    async fn a_healthy_resource_does_not_clear_another_resources_exhausted_quota() {
+        let rate_limiter = GitHubRateLimiter::new();
+        let reset = (Utc::now() + Duration::hours(1)).timestamp().to_string();
+
+        rate_limiter
+            .update_from_headers(&create_test_headers(HashMap::from([
+                ("x-ratelimit-limit", s("5000")),
+                ("x-ratelimit-remaining", s("0")),
+                ("x-ratelimit-used", s("5000")),
+                ("x-ratelimit-reset", reset.clone()),
+                ("x-ratelimit-resource", s("graphql")),
+            ])))
+            .await;
+        rate_limiter
+            .update_from_headers(&create_test_headers(HashMap::from([
+                ("x-ratelimit-limit", s("5000")),
+                ("x-ratelimit-remaining", s("4999")),
+                ("x-ratelimit-used", s("1")),
+                ("x-ratelimit-reset", reset),
+                ("x-ratelimit-resource", s("core")),
+            ])))
+            .await;
+
+        let mut wait = std::pin::pin!(rate_limiter.check_rate_limit());
+        assert!(
+            poll!(&mut wait).is_pending(),
+            "an exhausted graphql quota must still wait after a healthy core response"
+        );
     }
 
     #[test]
@@ -592,8 +696,12 @@ mod tests {
             .expect("rate limit check failed");
     }
 
-    #[test]
-    fn test_rate_limit_header_precedence() {
+    /// GitHub's secondary limit answers 403 with both header families set, and
+    /// `retry-after` is what has to be honoured — a primary quota with room left
+    /// says nothing about a secondary limit already tripped.
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_wins_over_a_primary_quota_with_room_left() {
+        let rate_limiter = GitHubRateLimiter::new();
         let headers = create_test_headers(HashMap::from([
             ("x-ratelimit-limit", s("5000")),
             ("x-ratelimit-remaining", s("1766")),
@@ -606,11 +714,13 @@ mod tests {
             ("retry-after", s("30")),
         ]));
 
-        let rate_limit = RateLimitInfo::from_headers(&headers);
-        match rate_limit {
-            Some(RateLimitInfo::Secondary(_)) => (),
-            _ => panic!("retry-after must win over primary remaining"),
-        }
+        rate_limiter.update_from_headers(&headers).await;
+
+        let mut wait = std::pin::pin!(rate_limiter.check_rate_limit());
+        assert!(
+            poll!(&mut wait).is_pending(),
+            "retry-after must win over primary remaining"
+        );
     }
 
     #[test]
@@ -626,18 +736,14 @@ mod tests {
             ("x-ratelimit-resource", s("graphql")),
         ]));
 
-        let rate_limit = RateLimitInfo::from_headers(&headers);
-        match rate_limit {
-            Some(RateLimitInfo::Primary(info)) => {
-                assert_eq!(info.limit, 5000);
-                assert_eq!(info.remaining, 4990);
-                assert_eq!(info.used, 10);
-                assert_eq!(info.resource, "graphql");
+        let info = PrimaryRateLimitInfo::from_headers(&headers)
+            .expect("x-ratelimit headers must parse into a primary limit");
+        assert_eq!(info.limit, 5000);
+        assert_eq!(info.remaining, 4990);
+        assert_eq!(info.used, 10);
+        assert_eq!(info.resource, "graphql");
 
-                assert_eq!(info.reset_time.timestamp(), reset_time.timestamp());
-                assert_eq!(info.reset_time.timestamp_subsec_nanos(), 0);
-            }
-            _ => panic!("Expected Primary rate limit info"),
-        }
+        assert_eq!(info.reset_time.timestamp(), reset_time.timestamp());
+        assert_eq!(info.reset_time.timestamp_subsec_nanos(), 0);
     }
 }
