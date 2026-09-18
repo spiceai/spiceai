@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -91,10 +91,35 @@ pub enum EnsureSchemaError {
     CatalogMissing { catalog: String },
 }
 
+/// Serializes the existence check and the registration in [`ensure_schema_exists`].
+///
+/// `CatalogProvider::register_schema` *replaces* the schema already held under a
+/// name, and a schema is published empty and filled in by the registrations that
+/// follow, so a replacement discards every table the replaced instance already
+/// owned. Those tables resolve as `<catalog>.<schema>.<table>` not found at query
+/// time while the registration that owned them reported success. Datasets, views and
+/// accelerated refreshes register concurrently, so two callers both seeing an absent
+/// schema is an ordinary interleaving rather than a rare one.
+static SCHEMA_CREATION: Mutex<()> = Mutex::new(());
+
+fn schema_creation_guard() -> MutexGuard<'static, ()> {
+    // A panic elsewhere must not make schema registration permanently unavailable.
+    SCHEMA_CREATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Registers `table_reference`'s schema in `catalog` if it does not already exist.
 ///
 /// A table reference without a schema component needs nothing registered, so
 /// that case succeeds without touching the catalog.
+///
+/// Concurrent callers are serialized, so the caller that creates a schema keeps
+/// owning it and every table registered into it stays reachable. A schema published
+/// by a path that does not take this lock — the SQL `CREATE SCHEMA` statement
+/// registers into the catalog directly — can still be replaced here, and nothing in
+/// this function can merge it back: the trait offers only a replacing registration.
+/// That case is reported rather than dropped silently.
 ///
 /// # Errors
 ///
@@ -114,6 +139,11 @@ pub fn ensure_schema_exists(
         return Ok(());
     };
 
+    // Held across both the check and the registration: releasing it in between lets a
+    // second caller see an absent schema and publish a different instance for the same
+    // name, orphaning the tables registered into the first.
+    let _guard = schema_creation_guard();
+
     // If the schema exists, nothing to do.
     if catalog_provider.schema(schema_name).is_some() {
         return Ok(());
@@ -122,7 +152,100 @@ pub fn ensure_schema_exists(
     // Create the schema
     let schema_provider = Arc::new(SpiceSchemaProvider::new());
     match catalog_provider.register_schema(schema_name, schema_provider) {
+        Ok(Some(displaced)) if !displaced.table_names().is_empty() => {
+            tracing::warn!(
+                catalog,
+                schema = schema_name,
+                tables = ?displaced.table_names(),
+                "Creating this schema replaced one that already owned tables; they are no longer reachable under the name"
+            );
+            Ok(())
+        }
         Ok(_) => Ok(()),
         Err(_) => unreachable!("register_schema will never fail"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::{
+        catalog::{MemoryCatalogProvider, SchemaProvider},
+        datasource::{TableProvider, empty::EmptyTable},
+        execution::context::SessionContext,
+        sql::TableReference,
+    };
+
+    use super::ensure_schema_exists;
+
+    const CATALOG: &str = "spice";
+    const REFERENCE_SCHEMA: &str = "__test_reference";
+
+    fn table() -> Arc<dyn TableProvider> {
+        Arc::new(EmptyTable::new(Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]))))
+    }
+
+    fn schema_of(ctx: &SessionContext) -> Arc<dyn SchemaProvider> {
+        ctx.catalog(CATALOG)
+            .and_then(|catalog| catalog.schema(REFERENCE_SCHEMA))
+            .unwrap_or_else(|| panic!("{CATALOG}.{REFERENCE_SCHEMA} is not registered"))
+    }
+
+    #[test]
+    fn every_concurrent_registration_into_a_new_schema_stays_registered() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 8;
+
+        let ctx = SessionContext::new();
+        ctx.register_catalog(CATALOG, Arc::new(MemoryCatalogProvider::new()));
+
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let ctx = ctx.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..PER_THREAD {
+                        let name = format!("table_{t}_{i}");
+                        ensure_schema_exists(
+                            &ctx,
+                            CATALOG,
+                            &TableReference::partial(REFERENCE_SCHEMA, name.clone()),
+                        )
+                        .expect("schema ensured");
+                        schema_of(&ctx)
+                            .register_table(name, table())
+                            .expect("table registered");
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("registration thread");
+        }
+
+        let expected: Vec<String> = (0..THREADS)
+            .flat_map(|t| (0..PER_THREAD).map(move |i| format!("table_{t}_{i}")))
+            .collect();
+        let schema = schema_of(&ctx);
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter(|name| !schema.table_exist(name))
+            .map(String::as_str)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} of {} tables are unreachable after concurrent registration into one new schema: {missing:?}",
+            missing.len(),
+            expected.len(),
+        );
     }
 }
