@@ -947,9 +947,7 @@ impl Query {
                                 "Returning cached result for distributed query"
                             );
                             // Return a QueryHandle with cached results
-                            let schema = result
-                                .cached_schema()
-                                .unwrap_or_else(|| result.data.schema());
+                            let schema = result.cached_schema().unwrap_or_else(|| result.schema());
                             return Ok(QueryHandle::new_with_cached_result(
                                 job_id.to_string(),
                                 schema,

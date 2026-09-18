@@ -1382,7 +1382,7 @@ impl Query {
                         Ok(query_result) => {
                             let schema = query_result
                                 .cached_schema()
-                                .unwrap_or_else(|| query_result.data.schema());
+                                .unwrap_or_else(|| query_result.schema());
                             tracing::debug!(
                                 cache_key = cache_key_u64,
                                 "Background query execution succeeded, collecting batches"
