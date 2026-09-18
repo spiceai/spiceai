@@ -1166,6 +1166,131 @@ mod tests {
         scalar_count(ctx, &sql).await
     }
 
+    /// An `IN` list's answer must not depend on how many elements it has.
+    ///
+    /// Vortex answers a `list_contains` call by OR-ing one equality array per list
+    /// element. The fork adds a second form (fork PR #95): from four elements up it
+    /// keys a set on the list once and probes it in a single pass over the rows, for
+    /// primitive, `Utf8` and `Binary` needles. Two forms answering one operation is
+    /// the hazard. The probe's equality is the kernel's own `NativePType::is_eq`
+    /// rather than a comparison kernel, so a re-cut that carries the probe without
+    /// that equality — or keys the set under a different width, or drops the
+    /// null-element fallback — answers the same query differently depending only on
+    /// how long its `IN` list is.
+    ///
+    /// Each arm asks one membership question twice: once with three elements and
+    /// once with four, where the fourth repeats an element and so adds nothing to
+    /// the set. Three is the last length the equality form answers and four the
+    /// first the probe answers, so the two counts have to agree, and a build where
+    /// they disagree is returning wrong rows for one of them.
+    ///
+    /// The `DECIMAL` arm is the control. The probe does not cover decimals, so both
+    /// lengths take the equality form there; it fails only if the harness itself has
+    /// stopped asking what it means to ask.
+    ///
+    /// What this cannot see is the probe being absent altogether — both lengths then
+    /// take the equality form and agree. That loss costs throughput rather than
+    /// correctness and belongs to the benchmark suites; what this guards is the
+    /// answer.
+    #[tokio::test]
+    async fn an_in_list_answers_the_same_either_side_of_the_probe_threshold() -> anyhow::Result<()>
+    {
+        let ctx = TestSessionContext::default();
+
+        // Every arm holds five rows and selects the first, third and fifth, so the
+        // expected count is the same for all of them and a wrong one is obvious.
+        const EXPECTED: i64 = 3;
+
+        struct Arm<'a> {
+            table: &'a str,
+            sql_type: &'a str,
+            rows: &'a [&'a str],
+            /// Three elements: answered by the equality form.
+            below: &'a [&'a str],
+            /// Four elements with a repeat: the same membership, answered by the probe.
+            at: &'a [&'a str],
+        }
+
+        let arms = [
+            Arm {
+                table: "probe_i64",
+                sql_type: "BIGINT",
+                rows: &["10", "20", "30", "40", "50"],
+                below: &["10", "30", "50"],
+                at: &["10", "30", "50", "10"],
+            },
+            Arm {
+                table: "probe_utf8",
+                sql_type: "VARCHAR",
+                rows: &["'alpha'", "'bravo'", "'charlie'", "'delta'", "'echo'"],
+                below: &["'alpha'", "'charlie'", "'echo'"],
+                at: &["'alpha'", "'charlie'", "'echo'", "'alpha'"],
+            },
+            Arm {
+                table: "probe_f64",
+                sql_type: "DOUBLE",
+                rows: &["1.5", "2.5", "3.5", "4.5", "5.5"],
+                below: &["1.5", "3.5", "5.5"],
+                at: &["1.5", "3.5", "5.5", "1.5"],
+            },
+            // A `TIMESTAMP` column is the `vortex.timestamp` extension type. Fork
+            // PR #95 deleted the extension kernel that answered these and routed
+            // them through the generic probe on the storage values instead, so this
+            // arm is the one that crosses that path.
+            Arm {
+                table: "probe_timestamp",
+                sql_type: "TIMESTAMP",
+                rows: &[
+                    "TIMESTAMP '2024-01-01 00:00:00'",
+                    "TIMESTAMP '2024-01-02 00:00:00'",
+                    "TIMESTAMP '2024-01-03 00:00:00'",
+                    "TIMESTAMP '2024-01-04 00:00:00'",
+                    "TIMESTAMP '2024-01-05 00:00:00'",
+                ],
+                below: &[
+                    "TIMESTAMP '2024-01-01 00:00:00'",
+                    "TIMESTAMP '2024-01-03 00:00:00'",
+                    "TIMESTAMP '2024-01-05 00:00:00'",
+                ],
+                at: &[
+                    "TIMESTAMP '2024-01-01 00:00:00'",
+                    "TIMESTAMP '2024-01-03 00:00:00'",
+                    "TIMESTAMP '2024-01-05 00:00:00'",
+                    "TIMESTAMP '2024-01-01 00:00:00'",
+                ],
+            },
+            Arm {
+                table: "probe_decimal",
+                sql_type: "DECIMAL(12, 2)",
+                rows: &["10.00", "20.00", "30.00", "40.00", "50.00"],
+                below: &["10.00", "30.00", "50.00"],
+                at: &["10.00", "30.00", "50.00", "10.00"],
+            },
+        ];
+
+        for arm in arms {
+            one_column_table(&ctx, arm.table, arm.sql_type, arm.rows).await?;
+
+            let below = pushed_down_in_list_count(&ctx, arm.table, arm.below).await?;
+            let at = pushed_down_in_list_count(&ctx, arm.table, arm.at).await?;
+
+            assert_eq!(
+                below, EXPECTED,
+                "the three-element {} list selects the first, third and fifth row",
+                arm.sql_type
+            );
+            assert_eq!(
+                at, below,
+                "the same {} membership answered by the probe has to give the answer \
+                 the equality form gives; a fourth element that repeats the first \
+                 adds nothing to the list",
+                arm.sql_type
+            );
+        }
+
+        Ok(())
+    }
+
     /// A null in an `IN` list must not cost the list its other elements.
     ///
     /// This is a regression test first and a fork guard second, because writing the
@@ -1283,6 +1408,67 @@ mod tests {
             text_with_null, 3,
             "a null element leaves a text list selecting its other three"
         );
+
+        Ok(())
+    }
+
+    /// Statistics must not skip a chunk over an `IN` list that one of its rows matches.
+    ///
+    /// Fork PR #95 also rewrote how an `IN` list falsifies a scope. The list used to
+    /// become an `AND` of one term per element; it is now a single `OR` describing
+    /// the list as intervals — the scope lies wholly outside the list's range, or
+    /// wholly inside one of the gaps between two adjacent sorted elements, since
+    /// nothing orders between an adjacent pair.
+    ///
+    /// That reasoning is sound and unobservable when it is wrong in the dangerous
+    /// direction: a gap computed one element too wide skips a chunk that holds a
+    /// matching row, and the query returns fewer rows with no error. So the rows are
+    /// the assertion, over data laid out to make a wrong gap decide the answer.
+    ///
+    /// Each `INSERT` is written as its own file, so the three below give the scan
+    /// three scopes with disjoint ranges to falsify independently.
+    #[tokio::test]
+    async fn a_clustered_in_list_does_not_skip_a_chunk_that_holds_a_match() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+
+        // The first file's range is [10, 40] and it holds only the two endpoints, so
+        // 20 and 30 fall in a gap of the *data* while sitting inside the range. A
+        // list of all four therefore has to read it and match two rows.
+        one_column_table(&ctx, "clustered", "BIGINT", &["10", "40"]).await?;
+        insert_rows(&ctx, "clustered", &["110", "140"]).await?;
+        insert_rows(&ctx, "clustered", &["210", "240"]).await?;
+
+        let spanning_a_gap =
+            pushed_down_in_list_count(&ctx, "clustered", &["10", "20", "30", "40"]).await?;
+        assert_eq!(
+            spanning_a_gap, 2,
+            "the list's endpoints are rows of the first file, so no gap between its \
+             elements can rule that file out"
+        );
+
+        // One element from each file, so a scope wrongly ruled out loses exactly the
+        // row it held and the count says which.
+        let one_from_each =
+            pushed_down_in_list_count(&ctx, "clustered", &["10", "110", "210", "10"]).await?;
+        assert_eq!(
+            one_from_each, 3,
+            "every file holds one element of the list and none may be skipped"
+        );
+
+        // The other direction, so the falsification is doing something rather than
+        // reading every chunk: a list wholly inside one gap of every file's range
+        // matches nothing.
+        let wholly_within_the_gaps =
+            pushed_down_in_list_count(&ctx, "clustered", &["20", "25", "30", "35"]).await?;
+        assert_eq!(
+            wholly_within_the_gaps, 0,
+            "no row of any file equals any element of this list"
+        );
+
+        // And a list past every range, the plainest scope to rule out.
+        let outside_every_range =
+            pushed_down_in_list_count(&ctx, "clustered", &["900", "901", "902", "903"]).await?;
+        assert_eq!(outside_every_range, 0, "no file's range reaches this list");
 
         Ok(())
     }
