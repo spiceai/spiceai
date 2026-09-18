@@ -2358,4 +2358,66 @@ mod tests {
             );
         }
     }
+
+    /// A federated batch that does not fit its declared schema must fail, not come
+    /// back with a NULL where the value was.
+    ///
+    /// `SchemaCastScanExec` coerces every batch a remote returns to the schema the
+    /// plan declared, through `datafusion_federation`'s `try_cast_to`. Arrow's
+    /// default cast is the *safe* one: a value the target type cannot hold becomes
+    /// NULL instead of an error. So a federated column read one width too narrow —
+    /// a remote `BIGINT` the plan typed `INT`, which is what a schema inferred from
+    /// one driver and used against another gives — returns NULLs where the remote
+    /// returned numbers, on a query that reports success. The fork casts with
+    /// `safe: false` instead (federation PR #67), which makes it a failed query.
+    ///
+    /// The overflow arm is the point: the whole value of the patch is that the case
+    /// stops being silent. The in-range arm is the control, because a cast that
+    /// refused everything would satisfy the first assertion by itself.
+    #[test]
+    fn a_federated_value_too_wide_for_its_declared_type_is_an_error_not_a_null() {
+        use datafusion::arrow::array::{Int32Array, Int64Array, RecordBatch};
+        use datafusion_federation::schema_cast::record_convert::try_cast_to;
+
+        let remote = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        let declared = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)]));
+
+        let overflowing = Int64Array::from(vec![i64::from(i32::MAX) + 1]);
+
+        // The counterfactual, run here rather than asserted in prose: Arrow's
+        // default cast is the one `try_cast_to` used before the patch, and it
+        // answers this very value with a NULL and no error. Without this arm the
+        // assertion below would also hold on a build where nothing could overflow.
+        let safe = datafusion::arrow::compute::cast(&overflowing, &DataType::Int32)
+            .expect("arrow's safe cast reports no error at all");
+        assert_eq!(
+            safe.null_count(),
+            1,
+            "the safe cast is the behaviour the patch replaces: it turns the overflow into a NULL"
+        );
+
+        let batch = RecordBatch::try_new(Arc::clone(&remote), vec![Arc::new(overflowing) as _])
+            .expect("an Int64 batch matching its own schema");
+        assert!(
+            try_cast_to(batch, Arc::clone(&declared)).is_err(),
+            "one past i32::MAX has to fail the cast; the safe cast above hands it back as NULL, \
+             so the query answers with a NULL where the remote sent a number and reports no error"
+        );
+
+        let in_range = RecordBatch::try_new(
+            Arc::clone(&remote),
+            vec![Arc::new(Int64Array::from(vec![7_i64]))],
+        )
+        .expect("an Int64 batch matching its own schema");
+        let cast = try_cast_to(in_range, declared).expect("7 is representable as an i32");
+        assert_eq!(
+            cast.column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("the column was cast to Int32")
+                .value(0),
+            7,
+            "a value the target type holds still has to come through it"
+        );
+    }
 }
