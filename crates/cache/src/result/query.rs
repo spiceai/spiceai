@@ -375,13 +375,6 @@ impl StreamBatches {
         }
     }
 
-    fn get(&self, index: usize) -> Option<&RecordBatch> {
-        match self {
-            Self::Arced(batches) => batches.get(index).map(std::convert::AsRef::as_ref),
-            Self::Shared(batches) => batches.get(index),
-        }
-    }
-
     fn clone_batch(&self, index: usize) -> Option<RecordBatch> {
         match self {
             // DataFusion's stream item is an owned `RecordBatch`, so the
@@ -399,51 +392,40 @@ pub struct CachedStream {
     /// Schema representing the data
     schema: SchemaRef,
     index: usize,
-    /// Prefetch the next batch's headers after each poll. Only the Raw
-    /// SQL serve path ([`Self::from_raw`]) sets this; search and
-    /// just-decoded Encoded hits do not.
-    prefetch_next: bool,
 }
 
 impl CachedStream {
     /// Serve a shared `Arc<Vec<RecordBatch>>` (search cache, tests).
     ///
-    /// Indexes the vec in place. Does not prefetch — search hits stay on
-    /// the pre-change path. SQL Raw hits use [`Self::from_raw`].
+    /// Indexes the vec in place. SQL Raw and decoded hits use
+    /// [`Self::from_raw`] / [`Self::from_arced`].
     #[must_use]
     pub fn new(data: Arc<Vec<RecordBatch>>, schema: SchemaRef) -> Self {
         Self {
             data: StreamBatches::Shared(data),
             schema,
             index: 0,
-            prefetch_next: false,
         }
     }
 
     /// Serve a Raw SQL hit from a pre-`Arc`'d slice.
     ///
-    /// Prefetches the first batch's data buffers and the next batch's headers
-    /// before returning so the caller's first poll / encode sees warm lines.
-    /// Just-decoded Encoded entries should use [`Self::from_arced`] instead.
+    /// Same stream as [`Self::from_arced`]. `DataFusion` still needs an owned
+    /// `RecordBatch` on each poll. Software prefetch of a few cache lines did
+    /// not beat `RecordBatch::clone` on the warm or concurrent DF drain (see
+    /// `cache_hit_costs`).
     #[must_use]
     pub fn from_raw(data: CachedBatches, schema: SchemaRef) -> Self {
-        super::prefetch::prefetch_raw_serve_arced(&data);
-        Self {
-            data: StreamBatches::Arced(data),
-            schema,
-            index: 0,
-            prefetch_next: true,
-        }
+        Self::from_arced(data, schema)
     }
 
-    /// Serve a pre-`Arc`'d slice without prefetch (Encoded decode, tests).
+    /// Serve a pre-`Arc`'d slice (Encoded decode, or a Raw hit).
     #[must_use]
     pub fn from_arced(data: CachedBatches, schema: SchemaRef) -> Self {
         Self {
             data: StreamBatches::Arced(data),
             schema,
             index: 0,
-            prefetch_next: false,
         }
     }
 }
@@ -460,11 +442,6 @@ impl Stream for CachedStream {
             return Poll::Ready(None);
         };
         self.index = index + 1;
-        if self.prefetch_next
-            && let Some(next) = self.data.get(self.index)
-        {
-            super::prefetch::prefetch_batch_headers(next);
-        }
         Poll::Ready(Some(Ok(batch)))
     }
 
@@ -1189,7 +1166,7 @@ mod tests {
         assert_eq!(col0.values(), &[1, 2]);
     }
 
-    /// Encoded-decode serve: same batches and schema, no prefetch.
+    /// Encoded-decode serve: same batches and schema as a Raw hit.
     #[test]
     fn cached_stream_from_arced_multi_batch() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
@@ -1236,6 +1213,10 @@ mod tests {
         assert!(
             Arc::ptr_eq(stored, &raw),
             "raw_batches must Arc-share the stored slice"
+        );
+        assert!(
+            Arc::ptr_eq(&raw[0], &stored[0]),
+            "callers that can hold `Arc<RecordBatch>` share the stored handle"
         );
     }
 }

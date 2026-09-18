@@ -287,7 +287,7 @@ where
     rows
 }
 
-/// Touch column values so prefetch of data buffers can show up in wall time.
+/// Touch column values so a consumer-side scan is in the wall time.
 fn drain_and_touch<S>(mut stream: S) -> i64
 where
     S: Stream<Item = Result<RecordBatch, DataFusionError>> + Unpin,
@@ -317,10 +317,9 @@ where
     sum
 }
 
-/// Pre-change `CachedStream`: `Arc<Vec<RecordBatch>>`, no prefetch,
-/// `RecordBatch::clone` on each poll. Bench-local so construct+drain and
-/// construct+drain+touch isolate the storage/prefetch change from the
-/// production path (`CachedStream::from_raw`, which now prefetches).
+/// Pre-change `CachedStream`: `Arc<Vec<RecordBatch>>`, `RecordBatch::clone`
+/// on each poll. Bench-local so construct+drain and construct+drain+touch
+/// isolate the storage change from the production constructors.
 struct LegacyCachedStream {
     data: Arc<Vec<RecordBatch>>,
     schema: SchemaRef,
@@ -423,7 +422,7 @@ fn run_persistent_concurrent_bench<F>(
 
 /// Distinct Raw entries whose array buffers exceed a large last-level
 /// cache (this host's L3 is 320 MiB). Rotating through the set keeps
-/// prefetch/touch off a warm line.
+/// the scan off a warm line.
 fn numeric_working_set(
     target_bytes: usize,
 ) -> (
@@ -468,12 +467,12 @@ fn numeric_working_set(
 /// Raw multi-batch hit: construct the serve stream and drain it.
 ///
 /// `legacy_stream` / `legacy_stream_touch` are the old end-to-end path
-/// (`LegacyCachedStream`: `Arc<Vec<_>>`, no prefetch, `RecordBatch::clone`
-/// on poll). `cached_stream_from_raw` / `cached_stream_from_raw_touch` are
-/// the production path (prefetch + pre-`Arc`'d slice). `legacy_column_clone`
-/// and `arc_batch_clone` isolate the per-batch clone cost without stream
-/// construction. `*_touch_working_set` rotates through entries larger
-/// than LLC so prefetch is not measured on a warm line.
+/// (`LegacyCachedStream`: `Arc<Vec<_>>`, `RecordBatch::clone` on poll).
+/// `cached_stream_from_raw` / `cached_stream_from_arced` are the production
+/// constructors (pre-`Arc`'d slice; no serve-path prefetch).
+/// `legacy_column_clone` and `arc_batch_clone` isolate the per-batch clone
+/// cost without stream construction. `*_touch_working_set` rotates through
+/// entries larger than LLC so the scan is not measured on a warm line.
 /// `concurrent_hits` / `concurrent_legacy_hits` use persistent workers.
 fn bench_raw_stream_serve(c: &mut Criterion) {
     let mut group = c.benchmark_group("raw_stream_serve");
@@ -632,7 +631,7 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
         },
     );
 
-    // Search-cache path: `CachedStream::new` does not prefetch.
+    // Search-cache path: `CachedStream::new` indexes `Arc<Vec<_>>`.
     let shared_vec = wide_shared;
     group.bench_function(
         BenchmarkId::new(
