@@ -39,6 +39,7 @@ use futures::Stream;
 use spicepod::component::caching::HashingAlgorithm;
 use std::collections::HashSet;
 use std::pin::Pin;
+use std::sync::Barrier;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -361,6 +362,109 @@ impl RecordBatchStream for LegacyCachedStream {
     }
 }
 
+/// Time `n_threads` hits that start together. Workers live for the whole
+/// bench; each sample sends one hit per worker, they barrier among
+/// themselves, then the clock waits for every drain. Thread create/join
+/// stays outside the timed region.
+fn run_persistent_concurrent_bench<F>(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    id: BenchmarkId,
+    n_threads: usize,
+    work: F,
+) where
+    F: Fn() + Send + Sync,
+{
+    std::thread::scope(|scope| {
+        let go = Arc::new(Barrier::new(n_threads));
+        let mut work_txs = Vec::with_capacity(n_threads);
+        let mut done_rxs = Vec::with_capacity(n_threads);
+
+        for _ in 0..n_threads {
+            let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<bool>(1);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+            work_txs.push(work_tx);
+            done_rxs.push(done_rx);
+            let go = Arc::clone(&go);
+            let work = &work;
+            scope.spawn(move || {
+                loop {
+                    match work_rx.recv() {
+                        Ok(true) => {
+                            go.wait();
+                            work();
+                            done_tx.send(()).expect("main is waiting for this hit");
+                        }
+                        Ok(false) | Err(_) => break,
+                    }
+                }
+            });
+        }
+
+        group.bench_function(id, |b| {
+            b.iter_custom(|iters| {
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    for tx in &work_txs {
+                        tx.send(true).expect("worker is alive");
+                    }
+                    for rx in &done_rxs {
+                        rx.recv().expect("worker finished the hit");
+                    }
+                }
+                t0.elapsed()
+            });
+        });
+
+        for tx in work_txs {
+            let _ = tx.send(false);
+        }
+    });
+}
+
+/// Distinct Raw entries whose array buffers exceed a large last-level
+/// cache (this host's L3 is 320 MiB). Rotating through the set keeps
+/// prefetch/touch off a warm line.
+fn numeric_working_set(
+    target_bytes: usize,
+) -> (
+    SchemaRef,
+    Vec<cache::result::query::CachedBatches>,
+    Vec<Arc<Vec<RecordBatch>>>,
+) {
+    const BATCHES: usize = 8;
+    const ROWS: usize = 262_144;
+    let mut raws = Vec::new();
+    let mut legacies = Vec::new();
+    let mut schema = None;
+    let mut filled = 0;
+    while filled < target_bytes {
+        let payload: Vec<RecordBatch> = (0..BATCHES).map(|_| batch(ROWS, 0)).collect();
+        filled += payload.iter().map(RecordBatch::get_array_memory_size).sum::<usize>();
+        let this_schema = payload[0].schema();
+        if schema.is_none() {
+            schema = Some(Arc::clone(&this_schema));
+        }
+        let now = Instant::now();
+        let cached = CachedQueryResult::new_raw(
+            payload,
+            this_schema,
+            Arc::new(HashSet::new()),
+            now,
+            now,
+        );
+        let stored = cached.raw_batches().expect("raw entry");
+        let shared = Arc::new(
+            stored
+                .iter()
+                .map(|batch| RecordBatch::clone(batch))
+                .collect::<Vec<_>>(),
+        );
+        raws.push(stored);
+        legacies.push(shared);
+    }
+    (schema.expect("working set"), raws, legacies)
+}
+
 /// Raw multi-batch hit: construct the serve stream and drain it.
 ///
 /// `legacy_stream` / `legacy_stream_touch` are the old end-to-end path
@@ -368,7 +472,9 @@ impl RecordBatchStream for LegacyCachedStream {
 /// on poll). `cached_stream_from_raw` / `cached_stream_from_raw_touch` are
 /// the production path (prefetch + pre-`Arc`'d slice). `legacy_column_clone`
 /// and `arc_batch_clone` isolate the per-batch clone cost without stream
-/// construction.
+/// construction. `*_touch_working_set` rotates through entries larger
+/// than LLC so prefetch is not measured on a warm line.
+/// `concurrent_hits` / `concurrent_legacy_hits` use persistent workers.
 fn bench_raw_stream_serve(c: &mut Criterion) {
     let mut group = c.benchmark_group("raw_stream_serve");
     let cases = [
@@ -495,43 +601,23 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
             .map(|batch| RecordBatch::clone(batch))
             .collect::<Vec<_>>(),
     );
-    // Absolute times include thread spawn/join; the pair isolates the
-    // serve-path delta under the same concurrency.
-    group.bench_function(
-        BenchmarkId::new("concurrent_hits", "threads=4/batches=8/rows=64/text_columns=20"),
-        |b| {
-            b.iter(|| {
-                std::thread::scope(|scope| {
-                    for _ in 0..4 {
-                        let stored = Arc::clone(&stored);
-                        let schema = Arc::clone(&schema);
-                        scope.spawn(move || {
-                            let stream = CachedStream::from_raw(stored, schema);
-                            black_box(drain_stream(stream))
-                        });
-                    }
-                });
-            });
+    let concurrent_id = "threads=4/batches=8/rows=64/text_columns=20";
+    run_persistent_concurrent_bench(
+        &mut group,
+        BenchmarkId::new("concurrent_hits", concurrent_id),
+        4,
+        || {
+            let stream = CachedStream::from_raw(Arc::clone(&stored), Arc::clone(&schema));
+            black_box(drain_stream(stream));
         },
     );
-    group.bench_function(
-        BenchmarkId::new(
-            "concurrent_legacy_hits",
-            "threads=4/batches=8/rows=64/text_columns=20",
-        ),
-        |b| {
-            b.iter(|| {
-                std::thread::scope(|scope| {
-                    for _ in 0..4 {
-                        let shared = Arc::clone(&wide_shared);
-                        let schema = Arc::clone(&schema);
-                        scope.spawn(move || {
-                            let stream = LegacyCachedStream::new(shared, schema);
-                            black_box(drain_stream(stream))
-                        });
-                    }
-                });
-            });
+    run_persistent_concurrent_bench(
+        &mut group,
+        BenchmarkId::new("concurrent_legacy_hits", concurrent_id),
+        4,
+        || {
+            let stream = LegacyCachedStream::new(Arc::clone(&wide_shared), Arc::clone(&schema));
+            black_box(drain_stream(stream));
         },
     );
 
@@ -546,6 +632,38 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
             b.iter(|| {
                 let stream = CachedStream::new(Arc::clone(&shared_vec), Arc::clone(&schema));
                 black_box(drain_stream(stream))
+            });
+        },
+    );
+
+    // Matched old/new touch on a working set larger than a 320 MiB LLC.
+    const WORKING_SET_BYTES: usize = 384 * 1024 * 1024;
+    let (ws_schema, ws_raw, ws_legacy) = numeric_working_set(WORKING_SET_BYTES);
+    let ws_id = format!(
+        "batches=8/rows=262144/text_columns=0/entries={}/target=384MiB",
+        ws_raw.len()
+    );
+    let mut raw_idx = 0;
+    group.bench_function(
+        BenchmarkId::new("cached_stream_from_raw_touch_working_set", &ws_id),
+        |b| {
+            b.iter(|| {
+                let stored = &ws_raw[raw_idx];
+                raw_idx = (raw_idx + 1) % ws_raw.len();
+                let stream = CachedStream::from_raw(Arc::clone(stored), Arc::clone(&ws_schema));
+                black_box(drain_and_touch(stream))
+            });
+        },
+    );
+    let mut legacy_idx = 0;
+    group.bench_function(
+        BenchmarkId::new("legacy_stream_touch_working_set", &ws_id),
+        |b| {
+            b.iter(|| {
+                let shared = &ws_legacy[legacy_idx];
+                legacy_idx = (legacy_idx + 1) % ws_legacy.len();
+                let stream = LegacyCachedStream::new(Arc::clone(shared), Arc::clone(&ws_schema));
+                black_box(drain_and_touch(stream))
             });
         },
     );
