@@ -125,17 +125,19 @@ where
         self.cache.run_pending_tasks().await;
     }
 
-    async fn invalidate_matching(&self, predicate: &(dyn Fn(&V) -> bool + Send + Sync)) -> usize {
+    async fn invalidate_matching(
+        &self,
+        predicate: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> usize {
         self.cache.run_pending_tasks().await;
         let keys: Vec<u64> = self
             .cache
             .iter()
-            .filter(|(_, value)| predicate(value))
-            .map(|(key, _)| *key)
+            .filter_map(|(key, value)| predicate(&value).then_some(*key))
             .collect();
         let removed = keys.len();
         for key in keys {
-            self.cache.invalidate(&key);
+            self.cache.invalidate(&key).await;
         }
         self.cache.run_pending_tasks().await;
         removed

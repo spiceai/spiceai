@@ -113,12 +113,12 @@ async fn prefill<B: CacheBackend<BenchValue>>(backend: &B) {
 
 fn run_gets<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
     handle: &tokio::runtime::Handle,
-    backend: Arc<B>,
+    backend: &Arc<B>,
     threads: usize,
 ) {
     let joins: Vec<_> = (0..threads)
         .map(|thread_id| {
-            let backend = Arc::clone(&backend);
+            let backend = Arc::clone(backend);
             let handle = handle.clone();
             std::thread::spawn(move || {
                 let mut rng = StdRng::seed_from_u64(thread_id as u64);
@@ -138,12 +138,12 @@ fn run_gets<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
 
 fn run_mixed<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
     handle: &tokio::runtime::Handle,
-    backend: Arc<B>,
+    backend: &Arc<B>,
     threads: usize,
 ) {
     let joins: Vec<_> = (0..threads)
         .map(|thread_id| {
-            let backend = Arc::clone(&backend);
+            let backend = Arc::clone(backend);
             let handle = handle.clone();
             std::thread::spawn(move || {
                 let mut rng = StdRng::seed_from_u64(thread_id as u64);
@@ -193,7 +193,7 @@ fn bench_concurrent_get(c: &mut Criterion) {
                     handle.block_on(prefill(backend.as_ref()));
                     backend
                 },
-                |backend| run_gets(&handle, backend, n),
+                |backend| run_gets(&handle, &backend, n),
                 criterion::BatchSize::LargeInput,
             );
         });
@@ -205,7 +205,7 @@ fn bench_concurrent_get(c: &mut Criterion) {
                     handle.block_on(prefill(backend.as_ref()));
                     backend
                 },
-                |backend| run_gets(&handle, backend, n),
+                |backend| run_gets(&handle, &backend, n),
                 criterion::BatchSize::LargeInput,
             );
         });
@@ -218,7 +218,7 @@ fn bench_concurrent_get(c: &mut Criterion) {
                     handle.block_on(prefill(backend.as_ref()));
                     backend
                 },
-                |backend| run_gets(&handle, backend, n),
+                |backend| run_gets(&handle, &backend, n),
                 criterion::BatchSize::LargeInput,
             );
         });
@@ -244,7 +244,7 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
                     handle.block_on(prefill(backend.as_ref()));
                     backend
                 },
-                |backend| run_mixed(&handle, backend, n),
+                |backend| run_mixed(&handle, &backend, n),
                 criterion::BatchSize::LargeInput,
             );
         });
@@ -256,7 +256,7 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
                     handle.block_on(prefill(backend.as_ref()));
                     backend
                 },
-                |backend| run_mixed(&handle, backend, n),
+                |backend| run_mixed(&handle, &backend, n),
                 criterion::BatchSize::LargeInput,
             );
         });
@@ -269,7 +269,7 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
                     handle.block_on(prefill(backend.as_ref()));
                     backend
                 },
-                |backend| run_mixed(&handle, backend, n),
+                |backend| run_mixed(&handle, &backend, n),
                 criterion::BatchSize::LargeInput,
             );
         });

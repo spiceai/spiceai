@@ -108,5 +108,8 @@ pub trait CacheBackend<V: Sizeable>: Send + Sync {
     ///
     /// Wrappers must forward this; a default no-op would silently skip table
     /// invalidation on a wrapped backend.
-    async fn invalidate_matching(&self, predicate: &(dyn Fn(&V) -> bool + Send + Sync)) -> usize;
+    async fn invalidate_matching(
+        &self,
+        predicate: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> usize;
 }

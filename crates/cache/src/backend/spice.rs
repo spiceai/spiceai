@@ -39,14 +39,14 @@ fn map_reason(reason: sharded_cache::EvictionReason) -> EvictionReason {
 /// Forwards evictions to [`CacheMetrics`] on `V`.
 struct MetricsListener<V>(PhantomData<fn() -> V>);
 
-impl<V: CacheMetrics> EvictionListener for MetricsListener<V> {
+impl<V: CacheMetrics + Send + Sync + 'static> EvictionListener for MetricsListener<V> {
     fn on_evict(reason: sharded_cache::EvictionReason) {
         V::record_eviction(map_reason(reason));
     }
 }
 
 /// Spice sharded cache implementing [`CacheBackend`].
-pub struct SpiceBackend<V: Clone + Send + 'static> {
+pub struct SpiceBackend<V: CacheMetrics + Clone + Send + Sync + 'static> {
     cache: ShardedCache<V, MetricsListener<V>>,
 }
 
@@ -74,12 +74,6 @@ where
         F: Fn(&V) -> bool,
     {
         self.cache.invalidate_matching(predicate)
-    }
-
-    /// Keys most-recently-used first within each shard. Test helper for recency.
-    #[cfg(test)]
-    pub(crate) fn keys_in_lru_order(&self) -> Vec<u64> {
-        self.cache.keys_in_lru_order()
     }
 }
 
@@ -121,7 +115,10 @@ where
         self.cache.run_pending_tasks();
     }
 
-    async fn invalidate_matching(&self, predicate: &(dyn Fn(&V) -> bool + Send + Sync)) -> usize {
+    async fn invalidate_matching(
+        &self,
+        predicate: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> usize {
         self.cache.invalidate_matching(predicate)
     }
 }

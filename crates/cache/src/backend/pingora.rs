@@ -541,7 +541,10 @@ where
         self.evict_to_weight_limit();
     }
 
-    async fn invalidate_matching(&self, predicate: &(dyn Fn(&V) -> bool + Send + Sync)) -> usize {
+    async fn invalidate_matching(
+        &self,
+        predicate: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> usize {
         self.remove_matching(predicate)
     }
 }
