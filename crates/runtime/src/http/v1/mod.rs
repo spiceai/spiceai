@@ -52,7 +52,7 @@ use crate::{
     egress::EgressAccount,
     status::ComponentStatus,
 };
-use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
+use arrow::{array::RecordBatch, datatypes::SchemaRef, util::pretty::pretty_format_batches};
 use async_stream::try_stream;
 use axum::{
     body::Body,
@@ -61,7 +61,10 @@ use axum::{
 };
 use axum_extra::TypedHeader;
 use bytes::Bytes;
-use cache::result::CacheStatus;
+use cache::result::{
+    CacheStatus,
+    query::{QueryResult, QueryResultSource, SendableCachedRawStream},
+};
 use csv::Writer;
 use datafusion::common::ParamValues;
 use datafusion::execution::{SendableRecordBatchStream, memory_pool::MemoryPool};
@@ -74,7 +77,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::ResultExt;
 
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 
 use runtime_auth::AuthPrincipalRef;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
@@ -282,7 +285,26 @@ pub async fn sql_to_http_response(
         }
     };
 
-    query_stream_to_http_response(query_res.data, query_res.cache_status, format, memory_pool).await
+    query_result_to_http_response(query_res, format, memory_pool).await
+}
+
+async fn query_result_to_http_response(
+    query_res: QueryResult,
+    format: ResponseMimeType,
+    memory_pool: Arc<dyn MemoryPool>,
+) -> Response {
+    match query_res.into_source() {
+        QueryResultSource::CachedRaw {
+            data,
+            schema,
+            cache_status,
+        } => {
+            query_raw_stream_to_http_response(data, schema, cache_status, format, memory_pool).await
+        }
+        QueryResultSource::Stream { data, cache_status } => {
+            query_stream_to_http_response(data, cache_status, format, memory_pool).await
+        }
+    }
 }
 
 /// Converts a query stream to the requested HTTP response format.
@@ -455,6 +477,58 @@ async fn buffered_sql_response(
         .into_response()
 }
 
+async fn query_raw_stream_to_http_response(
+    mut data_stream: SendableCachedRawStream,
+    schema: SchemaRef,
+    cache_status: CacheStatus,
+    format: ResponseMimeType,
+    memory_pool: Arc<dyn MemoryPool>,
+) -> Response {
+    if !matches!(format, ResponseMimeType::Json) || schema_has_union_columns(&schema) {
+        let data = match data_stream.try_collect::<Vec<_>>().await {
+            Ok(batches) => batches
+                .iter()
+                .map(|batch| RecordBatch::clone(batch.as_ref()))
+                .collect(),
+            Err(e) => {
+                return sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e));
+            }
+        };
+        return to_http_response(data, cache_status, format, ResponseMetadata::empty())
+            .await
+            .into_response();
+    }
+
+    let first = match data_stream.next().await {
+        Some(Ok(batch)) => Some(batch),
+        Some(Err(e)) => {
+            return sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e));
+        }
+        None => None,
+    };
+
+    let headers = response_headers(format, cache_status).await;
+    let account = EgressAccount::register(&memory_pool, "http_egress");
+    let body = Body::from_stream(json_array_body_from_batches(first, data_stream, account));
+    (StatusCode::OK, headers, body).into_response()
+}
+
+trait SqlJsonBatch: Send + 'static {
+    fn as_record_batch(&self) -> &RecordBatch;
+}
+
+impl SqlJsonBatch for RecordBatch {
+    fn as_record_batch(&self) -> &RecordBatch {
+        self
+    }
+}
+
+impl SqlJsonBatch for Arc<RecordBatch> {
+    fn as_record_batch(&self) -> &RecordBatch {
+        self.as_ref()
+    }
+}
+
 /// Streams the query result as a single JSON array, one input batch at a time,
 /// charging each serialized chunk against the query memory pool via `account`.
 /// The bytes emitted are identical to the non-streamed `arrow_to_json` output.
@@ -463,6 +537,18 @@ fn json_array_body_stream(
     rest: SendableRecordBatchStream,
     account: Arc<EgressAccount>,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    json_array_body_from_batches(first, rest, account)
+}
+
+fn json_array_body_from_batches<S, B>(
+    first: Option<B>,
+    rest: S,
+    account: Arc<EgressAccount>,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send
+where
+    S: Stream<Item = Result<B, datafusion::error::DataFusionError>> + Send + 'static,
+    B: SqlJsonBatch,
+{
     let mut batches =
         futures::stream::iter(first.map(Ok::<_, datafusion::error::DataFusionError>)).chain(rest);
     try_stream! {
@@ -474,7 +560,7 @@ fn json_array_body_stream(
         while let Some(item) = batches.next().await {
             let batch = item.map_err(|e| std::io::Error::other(e.to_string()))?;
             writer
-                .write(&batch)
+                .write(batch.as_record_batch())
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             let chunk = std::mem::take(writer.get_mut());
             if !chunk.is_empty() {
@@ -521,10 +607,8 @@ pub async fn run_sql_with_read_only(
         .run()
         .await?;
 
-    Ok((
-        query_res.data.try_collect::<Vec<RecordBatch>>().await?,
-        query_res.cache_status,
-    ))
+    let cache_status = query_res.cache_status;
+    Ok((query_res.collect_batches().await?, cache_status))
 }
 
 // Converts a buffered query result to an HTTP response.

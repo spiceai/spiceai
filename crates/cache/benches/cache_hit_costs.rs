@@ -29,7 +29,10 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cache::encoding::{Encoder, ZstdEncoder};
 use cache::get_hash_builder;
 use cache::key::CacheKey;
-use cache::result::query::{CachedQueryResult, CachedStream};
+use cache::result::CacheStatus;
+use cache::result::query::{
+    CachedQueryResult, CachedStream, QueryResult, QueryResultSource, SendableCachedRawStream,
+};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion::common::{ParamValues, ScalarValue};
 use datafusion::error::DataFusionError;
@@ -266,6 +269,75 @@ fn bench_parameterized_key(c: &mut Criterion) {
     group.finish();
 }
 
+fn drain_raw_stream<S>(mut stream: S) -> usize
+where
+    S: Stream<Item = Result<Arc<RecordBatch>, DataFusionError>> + Unpin,
+{
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut rows = 0;
+    loop {
+        match Pin::new(&mut stream).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                rows += batch.num_rows();
+                black_box(&batch);
+            }
+            Poll::Ready(None) => break,
+            Poll::Ready(Some(Err(e))) => panic!("stream error: {e}"),
+            Poll::Pending => panic!("serve stream must be immediately ready"),
+        }
+    }
+    rows
+}
+
+fn drain_raw_and_touch<S>(mut stream: S) -> i64
+where
+    S: Stream<Item = Result<Arc<RecordBatch>, DataFusionError>> + Unpin,
+{
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut sum = 0_i64;
+    loop {
+        match Pin::new(&mut stream).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                if let Some(col) = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                {
+                    for value in col.values() {
+                        sum = sum.wrapping_add(*value);
+                    }
+                }
+                black_box(&batch);
+            }
+            Poll::Ready(None) => break,
+            Poll::Ready(Some(Err(e))) => panic!("stream error: {e}"),
+            Poll::Pending => panic!("serve stream must be immediately ready"),
+        }
+    }
+    sum
+}
+
+/// Production SQL Raw hit: `QueryResult::from_cached_raw` + `into_source`.
+/// Prefetch runs at construction; each poll is one `Arc` clone.
+fn sql_raw_hit_stream(
+    stored: &cache::result::query::CachedBatches,
+    schema: &SchemaRef,
+) -> SendableCachedRawStream {
+    let result = QueryResult::from_cached_raw(
+        Arc::clone(stored),
+        Arc::clone(schema),
+        CacheStatus::CacheHit,
+    );
+    match result.into_source() {
+        QueryResultSource::CachedRaw { data, .. } => data,
+        QueryResultSource::Stream { .. } => {
+            panic!("from_cached_raw must yield QueryResultSource::CachedRaw")
+        }
+    }
+}
+
 fn drain_stream<S>(mut stream: S) -> usize
 where
     S: Stream<Item = Result<RecordBatch, DataFusionError>> + Unpin,
@@ -317,9 +389,11 @@ where
     sum
 }
 
-/// Pre-change `CachedStream`: `Arc<Vec<RecordBatch>>`, `RecordBatch::clone`
-/// on each poll. Bench-local so construct+drain and construct+drain+touch
-/// isolate the storage change from the production constructors.
+/// Pre-change SQL serve: `Arc<Vec<RecordBatch>>`, no prefetch,
+/// `RecordBatch::clone` on each poll. Bench-local so construct+drain and
+/// construct+drain+touch isolate the new SQL path
+/// (`QueryResult::from_cached_raw` → `CachedRawStream`, prefetch + one
+/// `Arc` clone per poll).
 struct LegacyCachedStream {
     data: Arc<Vec<RecordBatch>>,
     schema: SchemaRef,
@@ -438,19 +512,17 @@ fn numeric_working_set(
     let mut filled = 0;
     while filled < target_bytes {
         let payload: Vec<RecordBatch> = (0..BATCHES).map(|_| batch(ROWS, 0)).collect();
-        filled += payload.iter().map(RecordBatch::get_array_memory_size).sum::<usize>();
+        filled += payload
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .sum::<usize>();
         let this_schema = payload[0].schema();
         if schema.is_none() {
             schema = Some(Arc::clone(&this_schema));
         }
         let now = Instant::now();
-        let cached = CachedQueryResult::new_raw(
-            payload,
-            this_schema,
-            Arc::new(HashSet::new()),
-            now,
-            now,
-        );
+        let cached =
+            CachedQueryResult::new_raw(payload, this_schema, Arc::new(HashSet::new()), now, now);
         let stored = cached.raw_batches().expect("raw entry");
         let shared = Arc::new(
             stored
@@ -466,13 +538,14 @@ fn numeric_working_set(
 
 /// Raw multi-batch hit: construct the serve stream and drain it.
 ///
-/// `legacy_stream` / `legacy_stream_touch` are the old end-to-end path
-/// (`LegacyCachedStream`: `Arc<Vec<_>>`, `RecordBatch::clone` on poll).
-/// `cached_stream_from_raw` / `cached_stream_from_arced` are the production
-/// constructors (pre-`Arc`'d slice; no serve-path prefetch).
-/// `legacy_column_clone` and `arc_batch_clone` isolate the per-batch clone
-/// cost without stream construction. `*_touch_working_set` rotates through
-/// entries larger than LLC so the scan is not measured on a warm line.
+/// `legacy_stream` / `legacy_stream_touch` are the old SQL serve path
+/// (`LegacyCachedStream`: `Arc<Vec<_>>`, no prefetch, `RecordBatch::clone`
+/// on poll). `cached_raw_stream` / `cached_raw_stream_touch` are the new
+/// SQL serve path (`QueryResult::from_cached_raw` → `into_source`: prefetch
+/// + one `Arc` clone per poll). `legacy_column_clone` and `arc_batch_clone`
+/// isolate the per-batch clone cost without stream construction — they are
+/// not the serve-path comparison. `*_touch_working_set` rotates through
+/// entries larger than LLC so prefetch is not measured on a warm line.
 /// `concurrent_hits` / `concurrent_legacy_hits` use persistent workers.
 fn bench_raw_stream_serve(c: &mut Criterion) {
     let mut group = c.benchmark_group("raw_stream_serve");
@@ -541,7 +614,8 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
             &shared_vec,
             |b, shared_vec| {
                 b.iter(|| {
-                    let stream = LegacyCachedStream::new(Arc::clone(shared_vec), Arc::clone(&schema));
+                    let stream =
+                        LegacyCachedStream::new(Arc::clone(shared_vec), Arc::clone(&schema));
                     black_box(drain_stream(stream))
                 });
             },
@@ -552,41 +626,31 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
             &shared_vec,
             |b, shared_vec| {
                 b.iter(|| {
-                    let stream = LegacyCachedStream::new(Arc::clone(shared_vec), Arc::clone(&schema));
+                    let stream =
+                        LegacyCachedStream::new(Arc::clone(shared_vec), Arc::clone(&schema));
                     black_box(drain_and_touch(stream))
                 });
             },
         );
 
         group.bench_with_input(
-            BenchmarkId::new("cached_stream_from_arced", &id),
+            BenchmarkId::new("cached_raw_stream", &id),
             &stored,
             |b, stored| {
                 b.iter(|| {
-                    let stream = CachedStream::from_arced(Arc::clone(stored), Arc::clone(&schema));
-                    black_box(drain_stream(stream))
+                    let stream = sql_raw_hit_stream(stored, &schema);
+                    black_box(drain_raw_stream(stream))
                 });
             },
         );
 
         group.bench_with_input(
-            BenchmarkId::new("cached_stream_from_raw", &id),
+            BenchmarkId::new("cached_raw_stream_touch", &id),
             &stored,
             |b, stored| {
                 b.iter(|| {
-                    let stream = CachedStream::from_raw(Arc::clone(stored), Arc::clone(&schema));
-                    black_box(drain_stream(stream))
-                });
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("cached_stream_from_raw_touch", &id),
-            &stored,
-            |b, stored| {
-                b.iter(|| {
-                    let stream = CachedStream::from_raw(Arc::clone(stored), Arc::clone(&schema));
-                    black_box(drain_and_touch(stream))
+                    let stream = sql_raw_hit_stream(stored, &schema);
+                    black_box(drain_raw_and_touch(stream))
                 });
             },
         );
@@ -617,8 +681,8 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
         BenchmarkId::new("concurrent_hits", concurrent_id),
         4,
         || {
-            let stream = CachedStream::from_raw(Arc::clone(&stored), Arc::clone(&schema));
-            black_box(drain_stream(stream));
+            let stream = sql_raw_hit_stream(&stored, &schema);
+            black_box(drain_raw_stream(stream));
         },
     );
     run_persistent_concurrent_bench(
@@ -655,13 +719,13 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
     );
     let mut raw_idx = 0;
     group.bench_function(
-        BenchmarkId::new("cached_stream_from_raw_touch_working_set", &ws_id),
+        BenchmarkId::new("cached_raw_stream_touch_working_set", &ws_id),
         |b| {
             b.iter(|| {
                 let stored = &ws_raw[raw_idx];
                 raw_idx = (raw_idx + 1) % ws_raw.len();
-                let stream = CachedStream::from_raw(Arc::clone(stored), Arc::clone(&ws_schema));
-                black_box(drain_and_touch(stream))
+                let stream = sql_raw_hit_stream(stored, &ws_schema);
+                black_box(drain_raw_and_touch(stream))
             });
         },
     );

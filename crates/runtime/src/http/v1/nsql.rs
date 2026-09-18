@@ -34,7 +34,6 @@ use axum::{
     },
 };
 use axum_extra::{TypedHeader, extract::Query};
-use futures::{StreamExt, TryStreamExt};
 use headers_accept::Accept;
 use http::{HeaderMap, HeaderValue, header::CONTENT_TYPE};
 use mediatype::{MediaType, names};
@@ -690,31 +689,34 @@ pub(crate) async fn handle_nsql_query(
                 };
 
                 match query_result {
-                    Ok(result) => match result.data.try_collect::<Vec<RecordBatch>>().await {
-                        Ok(data) => {
-                            return to_http_response(
-                                data,
-                                result.cache_status,
-                                ResponseMimeType::from_accept_header(accept.as_ref()),
-                                ResponseMetadata::empty().with_sql(&cleaned_query),
-                            )
-                            .instrument(span.clone())
-                            .await;
-                        }
-                        Err(e) => {
-                            if num_retries >= DEFAULT_NSQL_RETRIES {
-                                tracing::error!("Error collecting query results: {e}");
-                                return (StatusCode::BAD_REQUEST, headers, e.to_string());
+                    Ok(result) => {
+                        let cache_status = result.cache_status;
+                        match result.collect_batches().await {
+                            Ok(data) => {
+                                return to_http_response(
+                                    data,
+                                    cache_status,
+                                    ResponseMimeType::from_accept_header(accept.as_ref()),
+                                    ResponseMetadata::empty().with_sql(&cleaned_query),
+                                )
+                                .instrument(span.clone())
+                                .await;
                             }
+                            Err(e) => {
+                                if num_retries >= DEFAULT_NSQL_RETRIES {
+                                    tracing::error!("Error collecting query results: {e}");
+                                    return (StatusCode::BAD_REQUEST, headers, e.to_string());
+                                }
 
-                            tracing::debug!("Error collecting query results: {e}. Retrying...");
+                                tracing::debug!("Error collecting query results: {e}. Retrying...");
 
-                            num_retries += 1;
-                            sql_gen_ctx
-                                .failed_attempts
-                                .push(FailedAttempt::new(cleaned_query.clone(), e.to_string()));
+                                num_retries += 1;
+                                sql_gen_ctx
+                                    .failed_attempts
+                                    .push(FailedAttempt::new(cleaned_query.clone(), e.to_string()));
+                            }
                         }
-                    },
+                    }
                     Err(e) => {
                         // If query failed, retry with the updated context
 

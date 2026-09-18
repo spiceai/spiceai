@@ -14,12 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{borrow::Cow, fmt::Display, fmt::Write as _, sync::Arc};
+use std::{borrow::Cow, fmt::Display, fmt::Write as _, pin::Pin, sync::Arc};
 
 use ::cache::{
     AsTableRefs, get_logical_plan_input_tables,
     key::CacheKey,
-    result::{CacheStatus, query::QueryResult},
+    result::{
+        CacheStatus,
+        query::{QueryResult, SendableCachedRawStream},
+    },
 };
 use app::spicepod::component::runtime::FlightBatchSize;
 use arrow::{
@@ -79,7 +82,7 @@ use datafusion::execution::SessionState;
 use datafusion::prelude::SessionContext;
 
 use async_stream::stream;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 
 use super::{
     SPICE_RUNTIME_SCHEMA,
@@ -944,7 +947,9 @@ impl Query {
                                 "Returning cached result for distributed query"
                             );
                             // Return a QueryHandle with cached results
-                            let schema = result.data.schema();
+                            let schema = result
+                                .cached_schema()
+                                .unwrap_or_else(|| result.data.schema());
                             return Ok(QueryHandle::new_with_cached_result(
                                 job_id.to_string(),
                                 schema,
@@ -954,7 +959,7 @@ impl Query {
                                     trace_span.clone(),
                                     Arc::clone(&request_context),
                                     tracker,
-                                    result.data,
+                                    result.into_record_batch_stream(),
                                 ),
                                 Arc::clone(&request_context),
                                 trace_span,
@@ -997,20 +1002,12 @@ impl Query {
                     let ttl = cache_provider.ttl();
                     let now = std::time::Instant::now();
                     if !cached_result.is_stale(ttl, now) {
-                        let stream = if let Some(raw) = cached_result.raw_batches() {
-                            Some(::cache::result::query::CachedStream::from_raw(
-                                raw,
-                                cached_result.schema.arc(),
-                            ))
+                        let records = if let Some(raw) = cached_result.raw_batches() {
+                            Some(raw)
                         } else {
-                            cached_result.records().await.ok().map(|records| {
-                                ::cache::result::query::CachedStream::from_arced(
-                                    records,
-                                    cached_result.schema.arc(),
-                                )
-                            })
+                            cached_result.records().await.ok()
                         };
-                        if let Some(stream) = stream {
+                        if let Some(records) = records {
                             tracing::debug!(
                                 job_id,
                                 cache_key = plan_cache_key.as_u64(),
@@ -1021,7 +1018,12 @@ impl Query {
                                 Arc::clone(logical_plan.schema().inner()),
                                 Arc::clone(&self.df),
                                 None,
-                                Box::pin(stream),
+                                QueryResult::from_cached_raw(
+                                    records,
+                                    cached_result.schema.arc(),
+                                    CacheStatus::CacheHit,
+                                )
+                                .into_record_batch_stream(),
                                 Arc::clone(&request_context),
                                 trace_span,
                                 Arc::clone(&sql_preview),
@@ -1167,7 +1169,13 @@ impl Query {
                 let spans = self.query_spans(&future_request_context);
                 self.run_internal(future_request_context, probe, guards, spans, query_start)
                     .await
-                    .map(|query_result| (query_result.cache_status, query_result.data))
+                    .map(|query_result| {
+                        // Consume the assembled serve stream. A hopped encoded
+                        // hit carries the tracker on `cached_raw`; taking
+                        // `.data` would drop that stream unpolled.
+                        let cache_status = query_result.cache_status;
+                        (cache_status, query_result.into_record_batch_stream())
+                    })
             },
         )
         .await
@@ -2272,8 +2280,9 @@ pub(crate) fn instrument_record_batch_stream(
 
 /// [`instrument_record_batch_stream`] applied to a whole [`QueryResult`].
 fn instrument_query_result(query_result: QueryResult, span: Span) -> QueryResult {
-    let QueryResult { data, cache_status } = query_result;
-    QueryResult::new(instrument_record_batch_stream(data, span), cache_status)
+    query_result
+        .map_cached_raw(|stream| Box::pin(stream.instrument(span.clone())))
+        .map_data(|data| instrument_record_batch_stream(data, span))
 }
 
 fn attach_cancellation_to_query_result<G>(
@@ -2286,11 +2295,21 @@ fn attach_cancellation_to_query_result<G>(
 where
     G: Send + 'static,
 {
-    let QueryResult { data, cache_status } = query_result;
-    QueryResult::new(
-        attach_cancellation_to_stream(data, cancellation_token, query_id, timeout_state, guard),
-        cache_status,
-    )
+    if query_result.has_cached_raw() {
+        query_result.map_cached_raw(|stream| {
+            attach_cancellation_to_item_stream(
+                stream,
+                cancellation_token,
+                query_id,
+                timeout_state,
+                guard,
+            )
+        })
+    } else {
+        query_result.map_data(|data| {
+            attach_cancellation_to_stream(data, cancellation_token, query_id, timeout_state, guard)
+        })
+    }
 }
 
 /// Cancellation attachment for a served cache hit. Kept together so
@@ -2316,17 +2335,22 @@ fn assemble_cached_query_result<G>(
 where
     G: Send + 'static,
 {
-    let QueryResult { data, cache_status } = attach_cancellation_to_query_result(
+    let schema = query_result.cached_schema();
+    let query_result = attach_cancellation_to_query_result(
         query_result,
         cancel.token,
         cancel.query_id,
         cancel.timeout_state,
         cancel.guard,
     );
-    QueryResult::new(
-        attach_query_tracker_to_stream(span, request_context, tracker, data),
-        cache_status,
-    )
+    if let Some(schema) = schema {
+        query_result.map_cached_raw(|stream| {
+            attach_query_tracker_to_cached_raw(span, request_context, tracker, stream, schema)
+        })
+    } else {
+        query_result
+            .map_data(|data| attach_query_tracker_to_stream(span, request_context, tracker, data))
+    }
 }
 
 /// Wraps a record batch stream so that cancellation via the supplied
@@ -2410,6 +2434,137 @@ where
     });
 
     Box::pin(RecordBatchStreamAdapter::new(schema, Box::pin(wrapped)))
+}
+
+fn attach_cancellation_to_item_stream<S, I, G>(
+    stream: S,
+    cancellation_token: tokio_util::sync::CancellationToken,
+    query_id: Arc<str>,
+    timeout_state: QueryTimeoutState,
+    guard: G,
+) -> Pin<Box<dyn Stream<Item = Result<I, DataFusionError>> + Send>>
+where
+    S: Stream<Item = Result<I, DataFusionError>> + Send + 'static,
+    I: Send + 'static,
+    G: Send + 'static,
+{
+    struct State<S, G> {
+        stream: Option<S>,
+        token: tokio_util::sync::CancellationToken,
+        query_id: Arc<str>,
+        timeout: QueryTimeoutState,
+        guard: Option<G>,
+        emitted_cancel: bool,
+    }
+
+    impl<S, G> State<S, G> {
+        fn release_query_resources(&mut self) {
+            self.stream.take();
+            self.guard.take();
+        }
+
+        fn cancellation_error(&self) -> DataFusionError {
+            DataFusionError::External(Box::new(self.timeout.cancellation_error(&self.query_id)))
+        }
+    }
+
+    let state = State {
+        stream: Some(stream),
+        token: cancellation_token,
+        query_id,
+        timeout: timeout_state,
+        guard: Some(guard),
+        emitted_cancel: false,
+    };
+
+    let wrapped = futures::stream::unfold(state, |mut state| async move {
+        if state.emitted_cancel {
+            return None;
+        }
+        if state.token.is_cancelled() {
+            state.emitted_cancel = true;
+            state.release_query_resources();
+            return Some((Err(state.cancellation_error()), state));
+        }
+        let token = state.token.clone();
+        let mut stream = state.stream.take()?;
+        tokio::select! {
+            biased;
+            () = token.cancelled() => {
+                state.emitted_cancel = true;
+                state.release_query_resources();
+                Some((Err(state.cancellation_error()), state))
+            }
+            next = stream.next() => {
+                state.stream = Some(stream);
+                next.map(|item| (item, state))
+            }
+        }
+    });
+
+    Box::pin(wrapped)
+}
+
+fn attach_query_tracker_to_cached_raw(
+    span: Span,
+    request_context: Arc<RequestContext>,
+    tracker: Option<QueryTracker>,
+    mut stream: SendableCachedRawStream,
+    schema: arrow::datatypes::SchemaRef,
+) -> SendableCachedRawStream {
+    let Some(tracker) = tracker else {
+        return stream;
+    };
+
+    let schema_copy = Arc::clone(&schema);
+    let mut num_records = 0u64;
+    let mut num_output_bytes = 0u64;
+    let capture_task_history = tracker.task_history_enabled && tracker.captured_output_enabled;
+    let mut captured_output = Cow::Borrowed("[]");
+    let inner_span = span.clone();
+
+    let updated_stream = stream! {
+        while let Some(batch_result) = stream.next().await {
+            let batch_result = batch_result.map_err(find_datafusion_root);
+            match &batch_result {
+                Ok(batch) => {
+                    if capture_task_history && num_records == 0 {
+                        captured_output = output_preview(batch.as_ref());
+                    }
+
+                    num_output_bytes += batch.get_array_memory_size() as u64;
+                    num_records += batch.num_rows() as u64;
+                    yield batch_result
+                }
+                Err(e) => {
+                    tracker
+                        .schema(schema_copy)
+                        .rows_produced(num_records)
+                        .finish_with_error(
+                            &request_context,
+                            e.to_string(),
+                            stream_error_code(e),
+                        );
+                    if capture_task_history {
+                        tracing::error!(target: "task_history", parent: &inner_span, "{e}");
+                    }
+                    yield batch_result;
+                    return;
+                }
+            }
+        }
+
+        finish_returned_output(
+            &request_context,
+            tracker,
+            schema_copy,
+            num_records,
+            num_output_bytes,
+            &captured_output,
+        );
+    };
+
+    Box::pin(updated_stream.instrument(span))
 }
 
 /// Returns true if `err` represents a query cancellation produced by
@@ -4928,6 +5083,73 @@ mod tests {
             &query_id,
         );
         assert!(result.data.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_raw_cache_hit_finishes_through_the_tracker() {
+        use ::cache::result::query::{QueryResultSource, wrap_raw_batches};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![42])) as ArrayRef],
+        )
+        .expect("batch");
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+        let request_context = Arc::new(RequestContextBuilder::new(Protocol::Internal).build());
+        let query_id = Arc::<str>::from(uuid::Uuid::new_v4().to_string());
+        let tracker = QueryTracker {
+            task_history_enabled: false,
+            captured_output_enabled: false,
+            schema: None,
+            query_duration_secs: None,
+            query_execution_duration_secs: None,
+            rows_produced: 0,
+            results_cache_hit: Some(true),
+            is_accelerated: None,
+            error_message: None,
+            error_code: None,
+            query_duration_timer: tokio::time::Instant::now(),
+            query_execution_duration_timer: tokio::time::Instant::now(),
+            datasets: Arc::new(HashSet::new()),
+        };
+        let result = assemble_cached_query_result(
+            QueryResult::from_cached_raw(
+                wrap_raw_batches(vec![batch]),
+                Arc::clone(&schema),
+                CacheStatus::CacheHit,
+            ),
+            Some(tracker),
+            request_context,
+            tracing::Span::current(),
+            CachedHitCancel {
+                token: cancel_token,
+                query_id: Arc::clone(&query_id),
+                timeout_state: QueryTimeoutState::default(),
+                guard: (),
+            },
+        );
+        match result.into_source() {
+            QueryResultSource::CachedRaw { mut data, .. } => {
+                let cancellation = data
+                    .next()
+                    .await
+                    .expect("assembled raw hit should emit cancellation");
+                assert_query_cancelled(
+                    cancellation.expect_err("first item should be cancellation"),
+                    &query_id,
+                );
+                assert!(data.next().await.is_none());
+            }
+            QueryResultSource::Stream { .. } => {
+                panic!("from_cached_raw must assemble QueryResultSource::CachedRaw")
+            }
+        }
     }
 
     #[tokio::test]

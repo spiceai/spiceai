@@ -49,7 +49,6 @@ use datafusion::common::{DataFusionError, ParamValues, TableReference};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::{ast::Statement as SqlStatement, dialect::PostgreSqlDialect};
-use futures::TryStreamExt;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Error as QueryError, QueryBuilder, ResultsCacheMode};
@@ -208,32 +207,22 @@ pub async fn run_transaction(
             };
 
         let cache_status = query_res.cache_status;
-        let mut data = query_res.data;
         // Every statement must run to completion so its writes stage and any error
         // (including a gate abort) surfaces before the next statement — and before
         // COMMIT. Only the FINAL statement's batches are kept: its result can be
         // emitted to the caller only once the commit is confirmed (a conflict must
         // surface as an error, never as a truncated result), so it is materialized
         // here and returned after commit. Intermediate statements (the gate,
-        // earlier writes) are drained without materializing their batches.
-        if index + 1 == statement_count {
-            match data.try_collect::<Vec<RecordBatch>>().await {
-                Ok(batches) => last = Some((batches, cache_status)),
-                Err(e) => {
-                    abort_transaction(handle.as_ref()).await;
-                    return Err(TransactionError::Stream(e));
+        // earlier writes) are drained without keeping their batches.
+        match query_res.collect_batches().await {
+            Ok(batches) => {
+                if index + 1 == statement_count {
+                    last = Some((batches, cache_status));
                 }
             }
-        } else {
-            loop {
-                match data.try_next().await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(e) => {
-                        abort_transaction(handle.as_ref()).await;
-                        return Err(TransactionError::Stream(e));
-                    }
-                }
+            Err(e) => {
+                abort_transaction(handle.as_ref()).await;
+                return Err(TransactionError::Stream(e));
             }
         }
     }

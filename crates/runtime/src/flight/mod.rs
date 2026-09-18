@@ -38,7 +38,10 @@ use arrow_flight::{
 };
 use arrow_ipc::{CompressionType, writer::IpcWriteOptions};
 use bytes::Bytes;
-use cache::result::{CacheStatus, query::QueryResult};
+use cache::result::{
+    CacheStatus,
+    query::{QueryResult, QueryResultSource, SendableCachedRawStream},
+};
 use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::MemoryPool;
@@ -332,7 +335,15 @@ impl Service {
     ) -> (BoxStream<'static, Result<FlightData, Status>>, CacheStatus) {
         // Reuse the same options for all messages.
         let options = ipc_write_options;
-        let raw_schema = query_result.data.schema();
+        let cache_status = query_result.cache_status;
+        let (raw_schema, data_stream) = match query_result.into_source() {
+            QueryResultSource::CachedRaw { data, schema, .. } => {
+                (schema, FlightBatchStream::Shared(data))
+            }
+            QueryResultSource::Stream { data, .. } => {
+                (data.schema(), FlightBatchStream::Owned(data))
+            }
+        };
 
         let needs_view_cast = raw_schema
             .fields()
@@ -366,8 +377,6 @@ impl Service {
             ..Default::default()
         };
 
-        let cache_status = query_result.cache_status;
-
         // The schema is ready immediately. Batches are encoded as the Flight
         // response is polled so a ready result is never drained through `None`
         // at construction — that poll is what finishes query telemetry.
@@ -378,7 +387,7 @@ impl Service {
         account.reserve_now(flight_data_size(&schema_flight_data));
         let stream = InlineFlightStream {
             pending: VecDeque::from([Ok(schema_flight_data)]),
-            data_stream: Some(query_result.data),
+            data_stream: Some(data_stream),
             spawned: None,
             taken_bytes: 0,
             taken_batches: 0,
@@ -453,6 +462,47 @@ struct FlightEncodeArgs {
     request_context: Arc<RequestContext>,
 }
 
+enum ServedFlightBatch {
+    Owned(RecordBatch),
+    Shared(Arc<RecordBatch>),
+}
+
+impl ServedFlightBatch {
+    fn as_record_batch(&self) -> &RecordBatch {
+        match self {
+            Self::Owned(batch) => batch,
+            Self::Shared(batch) => batch,
+        }
+    }
+
+    fn array_memory_size(&self) -> usize {
+        self.as_record_batch().get_array_memory_size()
+    }
+}
+
+enum FlightBatchStream {
+    Owned(datafusion::execution::SendableRecordBatchStream),
+    Shared(SendableCachedRawStream),
+}
+
+impl Stream for FlightBatchStream {
+    type Item = Result<ServedFlightBatch, DataFusionError>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            Self::Owned(stream) => Pin::new(stream)
+                .poll_next(cx)
+                .map(|item| item.map(|result| result.map(ServedFlightBatch::Owned))),
+            Self::Shared(stream) => Pin::new(stream)
+                .poll_next(cx)
+                .map(|item| item.map(|result| result.map(ServedFlightBatch::Shared))),
+        }
+    }
+}
+
 /// Flight response that encodes ready batches on the request task as the
 /// client polls, then hands any remainder to [`FlightEncodeStream`].
 ///
@@ -464,7 +514,7 @@ struct FlightEncodeArgs {
 /// encode path, including when this stream falls back to it.
 struct InlineFlightStream {
     pending: VecDeque<Result<FlightData, Status>>,
-    data_stream: Option<datafusion::execution::SendableRecordBatchStream>,
+    data_stream: Option<FlightBatchStream>,
     spawned: Option<FlightEncodeStream>,
     taken_bytes: usize,
     taken_batches: usize,
@@ -486,7 +536,7 @@ impl InlineFlightStream {
         Some(message)
     }
 
-    fn spawn_remaining(&mut self, prepend: Option<RecordBatch>) -> Result<(), Status> {
+    fn spawn_remaining(&mut self, prepend: Option<ServedFlightBatch>) -> Result<(), Status> {
         let Some(data_stream) = self.data_stream.take() else {
             return Err(Status::internal(
                 "Flight encode has no remaining record-batch stream to spawn",
@@ -538,7 +588,7 @@ impl Stream for InlineFlightStream {
             };
             match Pin::new(data_stream).poll_next(cx) {
                 Poll::Ready(Some(Ok(batch))) => {
-                    this.taken_bytes += batch.get_array_memory_size();
+                    this.taken_bytes += batch.array_memory_size();
                     this.taken_batches += 1;
                     if inline_encode_budget_exhausted(this.taken_bytes, this.taken_batches) {
                         if let Err(status) = this.spawn_remaining(Some(batch)) {
@@ -553,7 +603,7 @@ impl Stream for InlineFlightStream {
                         ))));
                     };
                     match encode_flight_batch(
-                        batch,
+                        batch.as_record_batch(),
                         args.needs_view_cast,
                         &args.schema,
                         &args.encoder,
@@ -616,7 +666,7 @@ impl Stream for InlineFlightStream {
 /// dedicated CPU runtime that overlap is free; on the shared IO-runtime
 /// fallback the spawn costs one scheduling hop before the first byte.
 fn spawn_flight_encode_stream(
-    data_stream: BoxStream<'static, Result<RecordBatch, DataFusionError>>,
+    data_stream: BoxStream<'static, Result<ServedFlightBatch, DataFusionError>>,
     args: FlightEncodeArgs,
     account: Arc<EgressAccount>,
 ) -> FlightEncodeStream {
@@ -647,7 +697,7 @@ fn spawn_flight_encode_stream(
             while let Some(batch_result) = data_stream.next().await {
                 match batch_result {
                     Ok(batch) => match encode_flight_batch(
-                        batch,
+                        batch.as_record_batch(),
                         needs_view_cast,
                         &schema,
                         &encoder,
@@ -695,7 +745,7 @@ fn spawn_flight_encode_stream(
 /// messages, applying the `Utf8View`/`BinaryView` → `Large*` cast when the
 /// advertised schema was expanded.
 fn encode_flight_batch(
-    batch: RecordBatch,
+    batch: &RecordBatch,
     needs_view_cast: bool,
     schema: &Arc<Schema>,
     encoder: &IpcDataGenerator,
@@ -704,15 +754,17 @@ fn encode_flight_batch(
     compression_context: &mut CompressionContext,
 ) -> Result<(Vec<FlightData>, FlightData), Status> {
     // Cast view columns to match the expanded schema we advertised.
+    let cast;
     let batch = if needs_view_cast {
-        arrow_tools::schema::cast_view_columns(batch, schema)
-            .map_err(|e| Status::internal(e.to_string()))?
+        cast = arrow_tools::schema::cast_view_columns(batch.clone(), schema)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        &cast
     } else {
         batch
     };
 
     let (dicts, batch_data) = encoder
-        .encode(&batch, dict_tracker, options, compression_context)
+        .encode(batch, dict_tracker, options, compression_context)
         .map_err(|e| Status::internal(e.to_string()))?;
 
     Ok((
