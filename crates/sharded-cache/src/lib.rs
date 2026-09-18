@@ -123,6 +123,11 @@ pub struct ShardedCache<V, L: EvictionListener = NoopListener> {
     /// so a concurrent `remove` can restore the budget first.
     #[cfg(test)]
     before_size_victim: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only: run after a size victim is chosen and before its budget is
+    /// claimed, so a concurrent `remove` can restore the limit in the window
+    /// that used to unlink-then-rollback.
+    #[cfg(test)]
+    before_claim_size: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
     _listener: std::marker::PhantomData<L>,
 }
 
@@ -143,6 +148,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             after_publish: Mutex::new(None),
             #[cfg(test)]
             before_size_victim: Mutex::new(None),
+            #[cfg(test)]
+            before_claim_size: Mutex::new(None),
             _listener: std::marker::PhantomData,
         }
     }
@@ -503,6 +510,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     /// A concurrent `remove` / `clear` / invalidation can restore the limit
     /// after the `while` check; a failed claim means this victim stays.
     fn claim_size_eviction(&self, victim_weight: u64) -> bool {
+        #[cfg(test)]
+        self.run_before_claim_size();
         loop {
             let current = self.weight.load(Ordering::Relaxed);
             if current <= self.max_weight {
@@ -627,6 +636,25 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         F: Fn() + Send + Sync + 'static,
     {
         *self.before_size_victim.lock() = Some(std::sync::Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_before_claim_size(&self) {
+        let hook = {
+            let guard = self.before_claim_size.lock();
+            guard.as_ref().map(std::sync::Arc::clone)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_before_claim_size<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self.before_claim_size.lock() = Some(std::sync::Arc::new(hook));
     }
 }
 
@@ -1119,7 +1147,7 @@ mod tests {
         );
 
         let cache_for_hook = Arc::clone(&cache);
-        cache.set_before_size_victim(move || {
+        cache.set_before_claim_size(move || {
             cache_for_hook.remove(&1);
         });
         std::thread::sleep(Duration::from_millis(80));
