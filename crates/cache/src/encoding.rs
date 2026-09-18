@@ -172,8 +172,9 @@ pub fn get_encoder(encoding: Encoding) -> Option<Arc<dyn Encoder>> {
     }
 }
 
-/// A zstd encoder that counts `decode` calls. Test-only: used to prove a second
-/// cache hit (or a concurrent first hit) does not pay zstd+IPC again.
+/// A zstd encoder that counts `decode` calls. Test-only: used to prove hit1
+/// and hit2 each decode, a third fetch does not, and concurrent `records()`
+/// on one clone share a decode.
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct CountingEncoder {

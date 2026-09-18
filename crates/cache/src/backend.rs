@@ -69,10 +69,11 @@ pub trait CacheBackend<V: Sizeable>: Send + Sync {
     /// Replace the value at `key` with `value` only when `should_replace`
     /// accepts the value currently stored.
     ///
-    /// Used to promote an encoded results-cache entry to raw batches after the
-    /// first decode: the key, TTL and generation stay put, and only the
-    /// in-memory form (and so the weigher) change. Returns whether the replace
-    /// ran. A concurrent store of a newer result must make this return `false`.
+    /// Used to rewrite a resident results-cache entry in place (record a
+    /// decode hit, or promote Encoded → Raw after the second decode): the key,
+    /// TTL and generation stay put, and only the in-memory form (and so the
+    /// weigher) change. Returns whether the replace ran. A concurrent store of
+    /// a newer result must make this return `false`.
     ///
     /// Implementations must not restart the entry's remaining TTL when the new
     /// value asks to keep it ([`crate::Sizeable::keep_remaining_ttl`]).

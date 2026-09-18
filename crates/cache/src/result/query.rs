@@ -49,10 +49,16 @@ pub enum CachedData {
         /// The size of the Arrow IPC stream `bytes` decodes to. See
         /// [`crate::encoding::Encoded::decoded_len`].
         decoded_len: usize,
-        /// Filled by the first successful decode of this entry. Clones of the
-        /// same stored value share the cell, so concurrent first hits decode
-        /// once and `Arc`-share the batches.
+        /// Filled by a successful decode of *this* stored value. Clones of the
+        /// same fetch share the cell, so concurrent `records()` on one get
+        /// decode once. The store writes a fresh empty cell after the first
+        /// hit so a later fetch of the key decodes again (and may then
+        /// promote).
         decoded: Arc<tokio::sync::OnceCell<Arc<Vec<RecordBatch>>>>,
+        /// Successful decode-serves recorded on the stored entry. `0` at
+        /// insert; `1` after the first cache hit (still encoded); the second
+        /// hit promotes to [`CachedData::Raw`].
+        decode_hits: u8,
     },
 }
 
@@ -61,6 +67,7 @@ fn encoded_payload(bytes: Bytes, decoded_len: usize) -> CachedData {
         bytes,
         decoded_len,
         decoded: Arc::new(tokio::sync::OnceCell::new()),
+        decode_hits: 0,
     }
 }
 
@@ -90,10 +97,10 @@ pub struct CachedQueryResult {
     pub read_started_at: Instant,
     /// Encoder used to decode the data
     encoder: Option<Arc<dyn Encoder>>,
-    /// Set when this value is a decode-promotion of an entry already in the
-    /// store (`Encoded` → `Raw` for the same result). A replace that keeps
-    /// this flag must not reset the entry's remaining TTL: it is a reweigh,
-    /// not a new result.
+    /// Set when this value is a reweigh of an entry already in the store
+    /// (first-hit decode counter, or `Encoded` → `Raw`). A replace that keeps
+    /// this flag must not reset the entry's remaining TTL: it is not a new
+    /// result.
     keep_remaining_ttl: bool,
 }
 
@@ -192,12 +199,10 @@ impl CachedQueryResult {
 
     /// Decode and return the cached record batches.
     ///
-    /// An encoded entry decodes at most once: concurrent callers share one
-    /// zstd+IPC pass through [`tokio::sync::OnceCell`], and later calls on
-    /// those clones `Arc::clone` the batches. The cache store is promoted to
-    /// [`CachedData::Raw`] separately (see
-    /// [`crate::QueryResultsCacheProvider::records`]) so a later *fetch* of
-    /// the same key takes the raw path and the weigher bills the decoded size.
+    /// Concurrent `records()` on clones of the same fetch share one zstd+IPC
+    /// pass through [`tokio::sync::OnceCell`]. The cache store is updated
+    /// separately (see [`crate::QueryResultsCacheProvider::records`]): the
+    /// first hit stays encoded, the second promotes to [`CachedData::Raw`].
     ///
     /// # Errors
     ///
@@ -223,8 +228,49 @@ impl CachedQueryResult {
         }
     }
 
+    /// How many successful decode-serves the store has recorded for this
+    /// encoded entry, or `None` if it is already raw.
+    #[must_use]
+    pub(crate) fn encoded_decode_hits(&self) -> Option<u8> {
+        match &self.data {
+            CachedData::Raw(_) => None,
+            CachedData::Encoded { decode_hits, .. } => Some(*decode_hits),
+        }
+    }
+
+    /// Encoded copy after the first successful decode-serve: still compressed,
+    /// with a fresh decode cell so the next fetch of the key pays zstd+IPC
+    /// again. [`Self::keep_remaining_ttl`] is set so the counter bump does not
+    /// restart TTL.
+    #[must_use]
+    pub(crate) fn with_recorded_decode_hit(&self) -> Self {
+        let data = match &self.data {
+            CachedData::Encoded {
+                bytes,
+                decoded_len,
+                decode_hits,
+                ..
+            } => CachedData::Encoded {
+                bytes: bytes.clone(),
+                decoded_len: *decoded_len,
+                decoded: Arc::new(tokio::sync::OnceCell::new()),
+                decode_hits: decode_hits.saturating_add(1),
+            },
+            CachedData::Raw(batches) => CachedData::Raw(Arc::clone(batches)),
+        };
+        Self {
+            data,
+            schema: self.schema.clone(),
+            input_tables: self.input_tables.clone(),
+            cached_at: self.cached_at,
+            read_started_at: self.read_started_at,
+            encoder: self.encoder.clone(),
+            keep_remaining_ttl: true,
+        }
+    }
+
     /// A raw copy of this entry holding `records`, used to replace the stored
-    /// encoded value after the first successful decode.
+    /// encoded value after the second successful decode.
     ///
     /// Timestamps are copied so a concurrent store of a newer result (different
     /// `cached_at` / `read_started_at`) is not overwritten. [`Self::keep_remaining_ttl`]
@@ -1029,10 +1075,11 @@ mod tests {
         (Some(encoder), decodes)
     }
 
-    /// The first `records()` of an encoded entry pays zstd+IPC; a second call
-    /// on the same value (or a clone that shares its decode cell) must not.
+    /// The first `records()` of an encoded *clone* pays zstd+IPC; a second
+    /// call on that same clone (or one that shares its decode cell) must not.
+    /// Store promotion is a separate replace after a *second cache fetch*.
     #[tokio::test]
-    async fn second_records_on_an_encoded_entry_does_not_decode_again() {
+    async fn records_on_one_encoded_clone_decodes_once() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -1055,6 +1102,7 @@ mod tests {
             cached_result.is_encoded(),
             "fixture must start encoded under zstd"
         );
+        assert_eq!(cached_result.encoded_decode_hits(), Some(0));
 
         let first = cached_result.records().await.expect("first decode");
         assert_eq!(first[0].num_rows(), 5);
@@ -1065,16 +1113,16 @@ mod tests {
         );
 
         let clone = cached_result.clone();
-        let second = clone.records().await.expect("second fetch");
+        let second = clone.records().await.expect("second call on same clone");
         assert_eq!(second[0].num_rows(), 5);
         assert!(
             Arc::ptr_eq(&first, &second),
-            "the second records() must Arc-share the batches from the first decode"
+            "a second records() on the same clone must Arc-share the first decode"
         );
         assert_eq!(
             decodes.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "a second records() on the same encoded entry must not decode again"
+            "a second records() on the same clone must not decode again"
         );
         assert!(
             cached_result.is_encoded(),
@@ -1146,7 +1194,16 @@ mod tests {
             read_started_at,
             None,
         );
-        let raw = encoded.to_promoted_raw(Arc::new(Vec::new()));
+        let recorded = encoded.with_recorded_decode_hit();
+        assert!(recorded.is_encoded());
+        assert_eq!(recorded.encoded_decode_hits(), Some(1));
+        assert!(encoded.is_same_generation(&recorded));
+        assert!(
+            recorded.keep_remaining_ttl(),
+            "recording a decode hit is a reweigh of the same result, so TTL must not restart"
+        );
+
+        let raw = recorded.to_promoted_raw(Arc::new(Vec::new()));
 
         assert!(!raw.is_encoded());
         assert!(encoded.is_same_generation(&raw));

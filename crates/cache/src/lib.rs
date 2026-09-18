@@ -134,10 +134,10 @@ pub trait Sizeable {
     /// Whether replacing this value in the store should keep the entry's
     /// remaining TTL rather than starting a new one.
     ///
-    /// Used for an encoded-to-raw promotion: the payload is the same result,
-    /// only its in-memory form changed, so extending its life would make a
-    /// first hit reset `item_ttl`. New results (a miss store, a revalidation)
-    /// leave this `false`.
+    /// Used when rewriting a resident results-cache entry in place (recording
+    /// a decode hit, or promoting Encoded → Raw): the payload is the same
+    /// result, so extending its life would make a hit reset `item_ttl`. New
+    /// results (a miss store, a revalidation) leave this `false`.
     fn keep_remaining_ttl(&self) -> bool {
         false
     }
@@ -1002,14 +1002,17 @@ impl QueryResultsCacheProvider {
     }
 
     /// Decode `result` for serving. The first successful decode of an encoded
-    /// entry replaces the stored value with [`result::query::CachedData::Raw`]
-    /// so a later fetch of `raw_key` is an `Arc::clone` and the weigher bills
-    /// the decoded size.
+    /// entry leaves it encoded, so a one-shot key does not inflate to Raw. The
+    /// second successful decode replaces the stored value with
+    /// [`result::query::CachedData::Raw`] so a later fetch of `raw_key` is an
+    /// `Arc::clone` and the weigher bills the decoded size.
     ///
-    /// Concurrent first hits share one decode (the entry's `OnceCell`). The
-    /// replace is skipped when a newer result already occupies the key, or
-    /// when the decoded size would not fit `max_size` — that last case keeps
-    /// the encoded bytes so the entry is not evicted by the promotion itself.
+    /// Concurrent `records()` on one fetch share a decode (`OnceCell`). The
+    /// stored cell is cleared after the first hit so the second fetch decodes
+    /// again. The replace is skipped when a newer result already occupies the
+    /// key, or when the decoded size would not fit `max_size` — that last
+    /// case keeps the encoded bytes so the entry is not evicted by the
+    /// promotion itself.
     ///
     /// # Errors
     ///
@@ -1020,8 +1023,33 @@ impl QueryResultsCacheProvider {
         result: &CachedQueryResult,
     ) -> std::result::Result<Arc<Vec<arrow::array::RecordBatch>>, encoding::Error> {
         let records = result.records().await?;
-        self.promote_encoded_to_raw(raw_key, result, &records).await;
+        self.after_encoded_decode(raw_key, result, &records).await;
         Ok(records)
+    }
+
+    async fn after_encoded_decode(
+        &self,
+        raw_key: &RawCacheKey,
+        result: &CachedQueryResult,
+        records: &Arc<Vec<arrow::array::RecordBatch>>,
+    ) {
+        match result.encoded_decode_hits() {
+            Some(0) => {
+                let recorded = result.with_recorded_decode_hit();
+                self.cache
+                    .replace_if(
+                        &raw_key.as_u64(),
+                        recorded,
+                        &|current: &CachedQueryResult| {
+                            current.is_same_generation(result)
+                                && current.encoded_decode_hits() == Some(0)
+                        },
+                    )
+                    .await;
+            }
+            Some(1) => self.promote_encoded_to_raw(raw_key, result, records).await,
+            _ => {}
+        }
     }
 
     async fn promote_encoded_to_raw(
@@ -1030,10 +1058,6 @@ impl QueryResultsCacheProvider {
         result: &CachedQueryResult,
         records: &Arc<Vec<arrow::array::RecordBatch>>,
     ) {
-        if !result.is_encoded() {
-            return;
-        }
-
         let promoted = result.to_promoted_raw(Arc::clone(records));
         let promoted_size = u64::try_from(promoted.get_memory_size()).unwrap_or(u64::MAX);
         if promoted_size > self.cache_max_size {
@@ -1045,13 +1069,12 @@ impl QueryResultsCacheProvider {
             return;
         }
 
-        let expected = promoted.clone();
         self.cache
             .replace_if(
                 &raw_key.as_u64(),
                 promoted,
-                &move |current: &CachedQueryResult| {
-                    current.is_encoded() && current.is_same_generation(&expected)
+                &|current: &CachedQueryResult| {
+                    current.is_same_generation(result) && current.encoded_decode_hits() == Some(1)
                 },
             )
             .await;
@@ -2135,10 +2158,10 @@ mod tests {
         (result, decodes, schema)
     }
 
-    /// Store encoded → first fetch decodes and promotes → second fetch is Raw
-    /// and does not decode.
+    /// Store encoded → first fetch decodes and stays Encoded → second fetch
+    /// decodes again and promotes → third fetch is Raw and does not decode.
     #[tokio::test]
-    async fn second_fetch_of_an_encoded_key_is_raw_and_does_not_decode() {
+    async fn third_fetch_of_an_encoded_key_is_raw_and_does_not_decode() {
         let provider = QueryResultsCacheProvider::try_new(
             &SQLResultsCacheConfig {
                 item_ttl: Some("10m".to_string()),
@@ -2162,10 +2185,7 @@ mod tests {
 
         let first = provider.get_raw_key(&key).await.expect("get").expect("hit");
         assert!(first.is_encoded(), "first fetch is still the encoded store");
-        let first_records = provider
-            .records(&key, &first)
-            .await
-            .expect("first decode+promote");
+        let first_records = provider.records(&key, &first).await.expect("first decode");
         assert_eq!(first_records[0].num_rows(), 5_000);
         assert_eq!(
             decodes.load(std::sync::atomic::Ordering::SeqCst),
@@ -2178,33 +2198,157 @@ mod tests {
             .get_raw_key(&key)
             .await
             .expect("get")
+            .expect("hit after first decode");
+        assert!(
+            second.is_encoded(),
+            "a one-shot must not inflate to Raw after the first decode"
+        );
+        assert_eq!(second.encoded_decode_hits(), Some(1));
+        let second_records = provider
+            .records(&key, &second)
+            .await
+            .expect("second decode+promote");
+        assert_eq!(second_records[0].num_rows(), 5_000);
+        assert_eq!(
+            decodes.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the second fetch must decode again before promoting"
+        );
+
+        provider.run_pending_tasks().await;
+        let third = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
             .expect("hit after promote");
         assert!(
-            !second.is_encoded(),
-            "the stored entry must be Raw after the first successful decode"
+            !third.is_encoded(),
+            "the stored entry must be Raw after the second successful decode"
         );
-        let second_records = provider.records(&key, &second).await.expect("raw path");
+        let third_records = provider.records(&key, &third).await.expect("raw path");
         assert!(
-            Arc::ptr_eq(&first_records, &second_records),
-            "the second fetch must Arc-share the promoted batches"
+            Arc::ptr_eq(&second_records, &third_records),
+            "the third fetch must Arc-share the promoted batches"
         );
         assert_eq!(
             decodes.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the second fetch must not decode"
+            2,
+            "the third fetch must not decode"
         );
         assert!(
-            second.memory_size() > encoded_weight,
+            third.memory_size() > encoded_weight,
             "the weigher must bill the raw size after promotion, got {} then {}",
             encoded_weight,
-            second.memory_size()
+            third.memory_size()
         );
         assert!(
-            provider.size().await >= second.memory_size(),
+            provider.size().await >= third.memory_size(),
             "the store's weighted size must reflect the promoted raw entry, got {} vs {}",
             provider.size().await,
-            second.memory_size()
+            third.memory_size()
         );
+    }
+
+    /// A one-shot key stays encoded after its only decode.
+    #[tokio::test]
+    async fn one_shot_fetch_leaves_the_entry_encoded() {
+        let provider = QueryResultsCacheProvider::try_new(
+            &SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                max_size: Some("8MiB".to_string()),
+                encoding: spicepod::component::caching::Encoding::Zstd,
+                ..SQLResultsCacheConfig::default()
+            },
+            Box::new([]),
+        )
+        .expect("valid cache provider");
+
+        let key = RawCacheKey::new(46);
+        let (result, decodes, _) = encoded_counting_result(1_000).await;
+        provider
+            .put_raw_key(&key, result)
+            .await
+            .expect("put encoded");
+
+        let first = provider.get_raw_key(&key).await.expect("get").expect("hit");
+        let _ = provider.records(&key, &first).await.expect("decode");
+        provider.run_pending_tasks().await;
+
+        let stored = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("still cached");
+        assert!(
+            stored.is_encoded(),
+            "one successful decode must not promote to Raw"
+        );
+        assert_eq!(stored.encoded_decode_hits(), Some(1));
+        assert_eq!(decodes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Concurrent first-wave `records()` on one fetch share a decode and must
+    /// not promote: they are still one hit of a one-shot key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_fetches_leave_the_entry_encoded() {
+        let provider = Arc::new(
+            QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    max_size: Some("8MiB".to_string()),
+                    encoding: spicepod::component::caching::Encoding::Zstd,
+                    ..SQLResultsCacheConfig::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        let key = RawCacheKey::new(47);
+        let (result, decodes, _) = encoded_counting_result(2_000).await;
+        provider
+            .put_raw_key(&key, result)
+            .await
+            .expect("put encoded");
+
+        let first = provider.get_raw_key(&key).await.expect("get").expect("hit");
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let provider = Arc::clone(&provider);
+                let first = first.clone();
+                tokio::spawn(async move { provider.records(&key, &first).await.expect("decode") })
+            })
+            .collect();
+
+        let mut results = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            results.push(task.await.expect("task joins"));
+        }
+
+        assert_eq!(
+            decodes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "concurrent first-wave records() must share one decode"
+        );
+        let head = &results[0];
+        for (i, batches) in results.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(head, batches),
+                "concurrent first fetch {i} must Arc-share the winning decode"
+            );
+        }
+
+        provider.run_pending_tasks().await;
+        let stored = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("still cached");
+        assert!(
+            stored.is_encoded(),
+            "a concurrent first wave must not promote to Raw"
+        );
+        assert_eq!(stored.encoded_decode_hits(), Some(1));
     }
 
     /// A promotion must not replace a newer result stored under the same key.
@@ -2238,12 +2382,19 @@ mod tests {
             .await
             .expect("put newer generation");
 
-        // Decode the stale clone and attempt promotion of the key it came from.
+        // First decode of the stale clone only records a hit, which must not
+        // overwrite the newer generation. A second decode would try to promote.
         let _ = provider
             .records(&key, &first)
             .await
             .expect("stale clone still decodes");
         assert_eq!(decodes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let stale_second = first.with_recorded_decode_hit();
+        let _ = provider
+            .records(&key, &stale_second)
+            .await
+            .expect("stale clone's second decode still serves");
 
         let stored = provider.get_raw_key(&key).await.expect("get").expect("hit");
         assert!(
@@ -2309,23 +2460,35 @@ mod tests {
         let _ = provider
             .records(&key, &first)
             .await
-            .expect("decode; promote must be skipped");
+            .expect("first decode; still encoded");
 
         provider.run_pending_tasks().await;
         let second = provider
             .get_raw_key(&key)
             .await
             .expect("get")
+            .expect("still cached after first hit");
+        assert!(second.is_encoded(), "first hit must not promote");
+        let _ = provider
+            .records(&key, &second)
+            .await
+            .expect("second decode; promote must be skipped");
+
+        provider.run_pending_tasks().await;
+        let third = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
             .expect("still cached");
         assert!(
-            second.is_encoded(),
+            third.is_encoded(),
             "an entry that cannot fit raw must stay encoded rather than be evicted"
         );
-        let _ = provider.records(&key, &second).await.expect("second hit");
+        let _ = provider.records(&key, &third).await.expect("third hit");
         assert_eq!(
             decodes.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the shared decode cell still avoids a second zstd+IPC pass"
+            2,
+            "hit1 and hit2 each decode; skipping promotion leaves the filled decode cell, so later fetches do not decode again"
         );
     }
 
@@ -2358,10 +2521,22 @@ mod tests {
             .await
             .expect("get")
             .expect("still live before promote");
-        let _ = provider
-            .records(&key, &first)
+        let _ = provider.records(&key, &first).await.expect("first decode");
+        provider.run_pending_tasks().await;
+
+        let second = provider
+            .get_raw_key(&key)
             .await
-            .expect("decode+promote");
+            .expect("get")
+            .expect("still live for second decode");
+        assert!(
+            second.is_encoded(),
+            "the first decode must leave the entry encoded"
+        );
+        let _ = provider
+            .records(&key, &second)
+            .await
+            .expect("second decode+promote");
         provider.run_pending_tasks().await;
 
         let promoted = provider
@@ -2371,7 +2546,7 @@ mod tests {
             .expect("promoted entry must still be live");
         assert!(
             !promoted.is_encoded(),
-            "the entry must be Raw after promotion"
+            "the entry must be Raw after the second decode"
         );
 
         // Original remaining TTL is ~150ms. If promotion restarted a 250ms

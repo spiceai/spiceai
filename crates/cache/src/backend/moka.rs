@@ -27,8 +27,8 @@ use std::hash::BuildHasher;
 use std::time::{Duration, Instant};
 
 /// TTL policy that matches Moka's `time_to_live` on create and on a normal
-/// overwrite, but keeps the remaining lifetime when the new value is a
-/// decode-promotion ([`Sizeable::keep_remaining_ttl`]).
+/// overwrite, but keeps the remaining lifetime when the new value is an
+/// in-place rewrite ([`Sizeable::keep_remaining_ttl`]).
 #[derive(Clone, Copy)]
 pub(crate) struct CacheTtl {
     pub ttl: Duration,

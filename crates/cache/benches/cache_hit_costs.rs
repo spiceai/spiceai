@@ -292,11 +292,11 @@ fn encoded_entry(
     )
 }
 
-/// First vs second fetch of the same zstd-encoded cache key.
+/// First, second, and third fetch of the same zstd-encoded cache key.
 ///
-/// `hit1` stores a fresh encoded entry each iteration and pays zstd+IPC plus
-/// the promote-to-raw replace. `hit2` runs against an entry already promoted,
-/// so the fetch is `Arc::clone` of the raw batches.
+/// `hit1` stores a fresh encoded entry and pays zstd+IPC; the store stays
+/// Encoded. `hit2` runs against that one-hit encoded entry, pays zstd+IPC
+/// again, and promotes to Raw. `hit3` is `Arc::clone` of the raw batches.
 fn bench_encoded_hit_promotion(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -322,7 +322,7 @@ fn bench_encoded_hit_promotion(c: &mut Criterion) {
             bytes.len()
         );
 
-        group.bench_function(BenchmarkId::new("hit1_decode_and_promote", &id), {
+        group.bench_function(BenchmarkId::new("hit1_decode", &id), {
             let bytes = bytes.clone();
             let schema = Arc::clone(&schema);
             move |b| {
@@ -345,12 +345,8 @@ fn bench_encoded_hit_promotion(c: &mut Criterion) {
                         runtime.block_on(async move {
                             let entry =
                                 provider.get_raw_key(&key).await.expect("get").expect("hit");
-                            black_box(
-                                provider
-                                    .records(&key, &entry)
-                                    .await
-                                    .expect("decode+promote"),
-                            )
+                            debug_assert!(entry.is_encoded(), "hit1 starts encoded");
+                            black_box(provider.records(&key, &entry).await.expect("hit1 decode"))
                         })
                     },
                     BatchSize::SmallInput,
@@ -358,7 +354,7 @@ fn bench_encoded_hit_promotion(c: &mut Criterion) {
             }
         });
 
-        group.bench_function(BenchmarkId::new("hit2_raw", &id), {
+        group.bench_function(BenchmarkId::new("hit2_decode_and_promote", &id), {
             let bytes = bytes.clone();
             let schema = Arc::clone(&schema);
             move |b| {
@@ -382,10 +378,7 @@ fn bench_encoded_hit_promotion(c: &mut Criterion) {
                                 .await
                                 .expect("get")
                                 .expect("hit1");
-                            provider
-                                .records(&key, &entry)
-                                .await
-                                .expect("hit1 decode+promote");
+                            provider.records(&key, &entry).await.expect("hit1 decode");
                         });
                         (provider, key)
                     },
@@ -396,7 +389,61 @@ fn bench_encoded_hit_promotion(c: &mut Criterion) {
                                 .await
                                 .expect("get")
                                 .expect("hit2");
-                            debug_assert!(!entry.is_encoded(), "hit2 must be the raw path");
+                            debug_assert!(
+                                entry.is_encoded(),
+                                "hit2 must still be encoded before promote"
+                            );
+                            black_box(
+                                provider
+                                    .records(&key, &entry)
+                                    .await
+                                    .expect("hit2 decode+promote"),
+                            )
+                        })
+                    },
+                    BatchSize::SmallInput,
+                );
+            }
+        });
+
+        group.bench_function(BenchmarkId::new("hit3_raw", &id), {
+            let bytes = bytes.clone();
+            let schema = Arc::clone(&schema);
+            move |b| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("a tokio runtime");
+                b.iter_batched(
+                    || {
+                        let provider = zstd_results_cache();
+                        let key = RawCacheKey::new(1);
+                        runtime.block_on(async {
+                            provider
+                                .put_raw_key(
+                                    &key,
+                                    encoded_entry(bytes.clone(), decoded_len, &schema),
+                                )
+                                .await
+                                .expect("put");
+                            for _ in 0..2 {
+                                let entry = provider
+                                    .get_raw_key(&key)
+                                    .await
+                                    .expect("get")
+                                    .expect("warmup hit");
+                                provider.records(&key, &entry).await.expect("warmup decode");
+                            }
+                        });
+                        (provider, key)
+                    },
+                    |(provider, key)| {
+                        runtime.block_on(async move {
+                            let entry = provider
+                                .get_raw_key(&key)
+                                .await
+                                .expect("get")
+                                .expect("hit3");
+                            debug_assert!(!entry.is_encoded(), "hit3 must be the raw path");
                             black_box(provider.records(&key, &entry).await.expect("raw"))
                         })
                     },
