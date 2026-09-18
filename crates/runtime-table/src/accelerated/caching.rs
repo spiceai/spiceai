@@ -4308,6 +4308,7 @@ mod tests {
 
         let stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))],
             None,
@@ -5035,7 +5036,7 @@ mod tests {
                 input,
                 Some(max_age),
                 Some(stale_while_revalidate),
-                false,
+                StaleIfError::Disabled,
                 Arc::clone(&source) as Arc<dyn TableProvider>,
                 Arc::clone(&accelerator) as Arc<dyn TableProvider>,
                 "test_dataset".to_string(),
