@@ -89,17 +89,16 @@ use std::{collections::HashMap, fmt, sync::Arc};
 
 use arrow::{
     array::{
-        Array, ArrayData, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array,
-        Date64Array, Decimal128Array, Decimal256Array, DurationMicrosecondArray,
-        DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray,
-        FixedSizeBinaryArray, FixedSizeListArray, Float64Array, GenericListArray, Int8Array,
-        Int16Array, Int32Array, Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray,
-        IntervalYearMonthArray, LargeBinaryArray, LargeStringArray, MapArray, OffsetSizeTrait,
-        RecordBatch, StringArray, StringViewArray, StructArray, Time32MillisecondArray,
-        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, make_array,
-        new_empty_array,
+        Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+        Decimal128Array, Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray,
+        DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray,
+        Float64Array, GenericListArray, Int8Array, Int16Array, Int32Array, Int64Array,
+        IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeBinaryArray,
+        LargeStringArray, MapArray, OffsetSizeTrait, RecordBatch, StringArray, StringViewArray,
+        StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
+        Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+        UInt64Array, make_array, new_empty_array,
     },
     buffer::{NullBuffer, OffsetBuffer},
     compute::{CastOptions, cast, cast_with_options, take},
@@ -2455,21 +2454,21 @@ struct DecodedMaps {
 /// `arrow::compute::cast` packs only primitive, string and binary value types into a dictionary,
 /// so a dictionary over a list, map, boolean, duration or interval column that the write path
 /// stored without complaint would fail every scan with a raw `CastError`. This builds the array
-/// directly instead. Distinct values are found through the row format wherever it supports the
-/// value type, so the dictionary is as compact as `cast` makes one; a value type the row format
-/// cannot encode (a map) gets one entry per row. Either way a NULL stays a NULL key, and a column
-/// with more entries than `key_type` can index is refused with an error that names the key type
-/// rather than an Arrow-internal one.
+/// directly instead. Distinct values are found through the row format (see [`row_encodable`]),
+/// so the dictionary is as compact as `cast` makes one and the keys a scan needs grow with the
+/// distinct values, not the row count; a value type the row format cannot express at all gets
+/// one entry per row. Either way a NULL stays a NULL key, and a column with more entries than
+/// `key_type` can index is refused with an error that names the key type rather than an
+/// Arrow-internal one.
 fn dictionary_encode(
     values: &ArrayRef,
     key_type: &DataType,
     dictionary_type: &DataType,
 ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
-    let value_field = SortField::new(values.data_type().clone());
     let (keys, distinct): (Vec<Option<u64>>, ArrayRef) =
-        if RowConverter::supports_fields(std::slice::from_ref(&value_field)) {
-            let rows = RowConverter::new(vec![value_field])?
-                .convert_columns(std::slice::from_ref(values))?;
+        if let Some(encodable) = row_encodable(values) {
+            let rows = RowConverter::new(vec![SortField::new(encodable.data_type().clone())])?
+                .convert_columns(std::slice::from_ref(&encodable))?;
             let rows: Vec<_> = rows.iter().collect();
             let mut key_of_row: HashMap<&[u8], u64> = HashMap::new();
             let mut distinct_indices: Vec<u64> = Vec::new();
@@ -2495,7 +2494,7 @@ fn dictionary_encode(
             (keys, Arc::clone(values))
         };
 
-    let keys = cast_with_options(
+    let data = cast_with_options(
         &UInt64Array::from(keys),
         key_type,
         &CastOptions {
@@ -2511,14 +2510,42 @@ fn dictionary_encode(
             distinct.len()
         )
     })?
-    .to_data();
-    let data = ArrayData::builder(dictionary_type.clone())
-        .len(keys.len())
-        .buffers(keys.buffers().to_vec())
-        .nulls(keys.nulls().cloned())
-        .add_child_data(distinct.to_data())
-        .build()?;
+    .to_data()
+    .into_builder()
+    .data_type(dictionary_type.clone())
+    .add_child_data(distinct.to_data())
+    .build()?;
     Ok(make_array(data))
+}
+
+/// The array whose rows stand in for `values` in the row format: `values` itself where the row
+/// format supports its type, a map as the list of entry structs it is stored as (the row format
+/// encodes lists and structs but not maps), or `None` when neither is encodable.
+///
+/// Re-reading a map as a list is exact: a `MapArray` is a `ListArray` of its entries with a
+/// different type tag, so equal maps encode to equal rows and different maps to different ones.
+fn row_encodable(values: &ArrayRef) -> Option<ArrayRef> {
+    let supports = |array: &ArrayRef| {
+        RowConverter::supports_fields(&[SortField::new(array.data_type().clone())])
+    };
+    if supports(values) {
+        return Some(Arc::clone(values));
+    }
+    let DataType::Map(entries_field, _) = values.data_type() else {
+        return None;
+    };
+    let map = values.as_any().downcast_ref::<MapArray>()?;
+    let entries: ArrayRef = Arc::new(map.entries().clone());
+    let list: ArrayRef = Arc::new(
+        GenericListArray::<i32>::try_new(
+            Arc::clone(entries_field),
+            map.offsets().clone(),
+            entries,
+            map.nulls().cloned(),
+        )
+        .ok()?,
+    );
+    supports(&list).then_some(list)
 }
 
 /// Rebuilds a `List` or `LargeList` column, which differ only in the width of their offsets.
@@ -3758,6 +3785,15 @@ mod tests {
         };
         assert_eq!(millis, 5_000, "5s should convert to 5000ms");
     }
+    /// The map `{"k": 1}` as a one-row `Utf8` to `Int64` map scalar.
+    fn single_entry_map() -> ScalarValue {
+        let mut map = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        map.keys().append_value("k");
+        map.values().append_value(1);
+        map.append(true).expect("map row should append");
+        ScalarValue::Map(Arc::new(map.finish()))
+    }
+
     /// Builds a `ScalarValue::List` holding one list of nullable `Int32` elements.
     fn int32_list_scalar(elements: Vec<Option<i32>>) -> ScalarValue {
         let mut builder = ListBuilder::new(Int32Builder::new());
@@ -4639,14 +4675,10 @@ mod tests {
             Box::new(ScalarValue::FixedSizeList(Arc::new(fixed.finish()))),
         ));
 
-        // The row format cannot encode a map, so this takes the one-entry-per-row path.
-        let mut map = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
-        map.keys().append_value("k");
-        map.values().append_value(1);
-        map.append(true).expect("map row should append");
+        // The row format cannot encode a map; it is re-read as the list of entry structs it is.
         assert_round_trips(&ScalarValue::Dictionary(
             Box::new(DataType::Int32),
-            Box::new(ScalarValue::Map(Arc::new(map.finish()))),
+            Box::new(single_entry_map()),
         ));
 
         assert_round_trips(&ScalarValue::Dictionary(
@@ -4723,6 +4755,44 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("elements should be Int32");
         assert_eq!(elements.values(), &[1, 2]);
+    }
+
+    /// Equal maps share one dictionary entry too, so the keys a scan needs grow with the distinct
+    /// maps rather than with the rows: a run of NULLs and repeated maps longer than the key type's
+    /// range reads back, where one key per row would have overflowed it.
+    #[test]
+    fn test_values_to_record_batch_dictionary_of_maps_shares_entries_past_the_key_range() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(single_entry_map().data_type()),
+            ),
+            true,
+        )]));
+        let stored = scalar_value_to_turso(single_entry_map(), TimestampFormat::default())
+            .expect("a map should be storable");
+        // 128 NULL rows push every later row position past an Int8 key, then 129 equal maps.
+        let rows: Vec<Vec<TursoValue>> = std::iter::repeat_n(vec![TursoValue::Null], 128)
+            .chain(std::iter::repeat_n(vec![stored], 129))
+            .collect();
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("repeated maps need one key, however many rows hold them");
+
+        let dictionary = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int8Type>>()
+            .expect("column should be a dictionary with the declared Int8 keys");
+        assert_eq!(
+            dictionary.values().len(),
+            1,
+            "equal maps should share one entry"
+        );
+        assert!(dictionary.is_null(0) && dictionary.is_null(127));
+        assert!(dictionary.is_valid(128) && dictionary.is_valid(256));
+        assert_eq!(dictionary.keys().value(128), dictionary.keys().value(256));
     }
 
     /// A column with more distinct values than its declared key type can index is refused with an
