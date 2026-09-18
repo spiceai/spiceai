@@ -20,6 +20,7 @@ use crate::HashBuilder;
 use crate::HashProvider;
 #[cfg(feature = "pingora")]
 use crate::InvalidationDidNotFinishSnafu;
+use crate::KeyHasher;
 use crate::Result;
 use crate::Sizeable;
 use crate::TabledCacheProvider;
@@ -231,7 +232,7 @@ impl<
     }
 }
 
-type BuiltLruCache<V> = LruCache<V, HashBuilder, Box<dyn Hasher + Send + Sync + 'static>>;
+type BuiltLruCache<V> = LruCache<V, HashBuilder, KeyHasher>;
 
 /// Builds an LRU cache provider from the given configuration.
 ///

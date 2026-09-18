@@ -19,6 +19,8 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
 
+pub use crate::namespace_key::namespace_key_header;
+
 use async_openai::types::embeddings::CreateEmbeddingRequest;
 use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::ParamValues;
@@ -144,10 +146,14 @@ impl CacheKey<'_> {
     /// `namespace_id` is the principal's stable opaque id (empty for
     /// public/system).
     ///
-    /// The byte stream hashed is:
+    /// The byte stream hashed is [`namespace_key_header`], then
+    /// `namespace_id`, then the payload, i.e.
     /// `[namespace_tag][namespace_id.len() as u64 LE][namespace_id...][payload...]`
     /// so that `(tag=1, id="abc")` and `(tag=1, id="a")` followed by a
-    /// payload starting with `"bc"` cannot collide.
+    /// payload starting with `"bc"` cannot collide. That prefix-unambiguity
+    /// is a Verus postcondition on the header followed by the id (see
+    /// [`namespace_key_header`]), not a comment-only claim. The header is a
+    /// fixed-size array, so computing a namespaced key does not allocate.
     #[must_use]
     pub fn as_raw_key_in_namespace<T: Hasher>(
         &self,
@@ -155,8 +161,7 @@ impl CacheKey<'_> {
         namespace_tag: u8,
         namespace_id: &[u8],
     ) -> RawCacheKey {
-        hasher.write_u8(namespace_tag);
-        hasher.write_u64(namespace_id.len() as u64);
+        hasher.write(&namespace_key_header(namespace_tag, namespace_id));
         hasher.write(namespace_id);
         self.hash_payload(&mut hasher);
         RawCacheKey(hasher.finish())
@@ -195,24 +200,33 @@ impl<T: BuildHasher + Clone + Send + Sync + 'static> BuildHasher for Passthrough
 where
     <T as BuildHasher>::Hasher: Send + Sync + 'static,
 {
-    type Hasher = PassthroughHasher<T::Hasher>;
+    type Hasher = PassthroughHasher<T>;
 
     fn build_hasher(&self) -> Self::Hasher {
         PassthroughHasher {
             hash: None,
-            hasher: self.hasher.build_hasher(),
+            hasher: None,
+            builder: self.hasher.clone(),
         }
     }
 }
 
-pub(crate) struct PassthroughHasher<T: Hasher + Send + Sync + 'static> {
+pub(crate) struct PassthroughHasher<T: BuildHasher> {
     hash: Option<u64>,
-    hasher: T,
+    /// Built only once bytes are written. The `u64` keys every lookup and insert
+    /// hash never need it, and building one can allocate — the streaming
+    /// `XxHash3_64` does.
+    hasher: Option<T::Hasher>,
+    builder: T,
 }
 
-impl<T: Hasher + Send + Sync + 'static> Hasher for PassthroughHasher<T> {
+impl<T: BuildHasher> Hasher for PassthroughHasher<T> {
     fn finish(&self) -> u64 {
-        self.hash.unwrap_or_else(|| self.hasher.finish())
+        match (self.hash, &self.hasher) {
+            (Some(hash), _) => hash,
+            (None, Some(hasher)) => hasher.finish(),
+            (None, None) => self.builder.build_hasher().finish(),
+        }
     }
 
     // moka generates an internal UUID v4 for bucket IDs, which is a string
@@ -221,7 +235,9 @@ impl<T: Hasher + Send + Sync + 'static> Hasher for PassthroughHasher<T> {
     //
     // to support this need, we fallback to the hash builder from the generic type for non-u64 inputs
     fn write(&mut self, bytes: &[u8]) {
-        self.hasher.write(bytes);
+        self.hasher
+            .get_or_insert_with(|| self.builder.build_hasher())
+            .write(bytes);
     }
 
     fn write_u64(&mut self, i: u64) {
@@ -234,6 +250,77 @@ mod tests {
     use std::hash::RandomState;
 
     use super::*;
+
+    #[test]
+    fn as_raw_key_in_namespace_writes_the_verified_prefix_first() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct RecordingHasher {
+            writes: Rc<RefCell<Vec<Vec<u8>>>>,
+        }
+
+        impl Hasher for RecordingHasher {
+            fn write(&mut self, bytes: &[u8]) {
+                self.writes.borrow_mut().push(bytes.to_vec());
+            }
+
+            fn finish(&self) -> u64 {
+                0
+            }
+        }
+
+        let writes = Rc::new(RefCell::new(Vec::new()));
+        let hasher = RecordingHasher {
+            writes: Rc::clone(&writes),
+        };
+        let _ = CacheKey::Query("select 1", None).as_raw_key_in_namespace(hasher, 1, b"alice");
+        let recorded = writes.borrow();
+        assert!(
+            recorded.len() >= 2,
+            "the hasher must see the namespace header and id"
+        );
+        assert_eq!(
+            recorded[0],
+            namespace_key_header(1, b"alice"),
+            "the first write must be the verified header, not a parallel encoding"
+        );
+        assert_eq!(
+            recorded[1], b"alice",
+            "the id must follow the header that carries its length"
+        );
+    }
+
+    #[test]
+    fn as_raw_key_in_namespace_distinguishes_principals() {
+        use std::hash::BuildHasher;
+        use std::hash::BuildHasherDefault;
+
+        type Xxh3 = BuildHasherDefault<twox_hash::XxHash3_64>;
+        let key_for = |tag: u8, id: &[u8]| {
+            CacheKey::Query("select 1", None).as_raw_key_in_namespace(
+                Xxh3::default().build_hasher(),
+                tag,
+                id,
+            )
+        };
+
+        assert_ne!(
+            key_for(1, b"alice").as_u64(),
+            key_for(1, b"bob").as_u64(),
+            "distinct principals must not share a results-cache key"
+        );
+        assert_ne!(
+            key_for(0, b"").as_u64(),
+            key_for(2, b"").as_u64(),
+            "public and system (both empty id) must not share a results-cache key"
+        );
+        assert_eq!(
+            key_for(1, b"alice").as_u64(),
+            key_for(1, b"alice").as_u64(),
+            "the same namespace and payload must be stable"
+        );
+    }
 
     // explicitly allow this rule, because we're validating that the builtin u64 hash -> .write_u64() path works as expected
     #[expect(clippy::manual_hash_one)]
@@ -250,5 +337,68 @@ mod tests {
         let hash2 = hasher2.finish();
 
         assert_eq!(hash1, hash2);
+    }
+
+    /// A plan's key is the value of hashing that plan write by write, for every
+    /// configured algorithm — including `ahash`, which folds integer writes.
+    #[test]
+    fn a_plan_key_is_the_same_however_its_bytes_reach_the_hasher() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::logical_expr::{col, table_scan};
+        use spicepod::component::caching::HashingAlgorithm;
+
+        let schema = Schema::new(
+            (0..200)
+                .map(|i| {
+                    let data_type = if i % 2 == 0 {
+                        DataType::Int64
+                    } else {
+                        DataType::Utf8
+                    };
+                    Field::new(format!("c{i}"), data_type, true)
+                })
+                .collect::<Vec<_>>(),
+        );
+        let plan = |columns: usize| {
+            table_scan(Some("wide"), &schema, None)
+                .expect("a scan of the wide schema")
+                .project((0..columns).map(|i| col(format!("c{i}"))))
+                .expect("a projection of its columns")
+                .build()
+                .expect("the plan")
+        };
+        let (wide, narrow) = (plan(200), plan(1));
+
+        for algorithm in [
+            HashingAlgorithm::Ahash,
+            HashingAlgorithm::Siphash,
+            HashingAlgorithm::Blake3,
+            HashingAlgorithm::XXH3,
+            HashingAlgorithm::XXH32,
+            HashingAlgorithm::XXH64,
+            HashingAlgorithm::XXH128,
+        ] {
+            let builder = crate::get_hash_builder(algorithm).expect("a supported algorithm");
+            let mut write_by_write = builder.build_hasher();
+            write_by_write.write(&crate::namespace_key::namespace_key_header(1, b"abc"));
+            write_by_write.write(b"abc");
+            wide.hash(&mut write_by_write);
+
+            let key = CacheKey::LogicalPlan(&wide).as_raw_key_in_namespace(
+                builder.build_hasher(),
+                1,
+                b"abc",
+            );
+            assert_eq!(key.as_u64(), write_by_write.finish(), "{algorithm:?}");
+        }
+
+        let ahash = crate::get_hash_builder(HashingAlgorithm::Ahash).expect("ahash");
+        let key = |plan: &LogicalPlan| {
+            CacheKey::LogicalPlan(plan)
+                .as_raw_key_in_namespace(ahash.build_hasher(), 0, &[])
+                .as_u64()
+        };
+        assert_eq!(key(&wide), key(&wide));
+        assert_ne!(key(&wide), key(&narrow));
     }
 }

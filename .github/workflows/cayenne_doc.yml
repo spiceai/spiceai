@@ -87,7 +87,7 @@ jobs:
         run: npm ci --ignore-scripts
 
       # Cache the browser mermaid-cli renders in, keyed by the lockfile — the
-      # pinned mermaid-cli pins puppeteer, which pins the browser build, so the
+      # pinned mermaid-cli and puppeteer versions pin the browser build, so the
       # lockfile is exactly the key that changes when a different browser is
       # needed.
       - name: Cache the headless browser

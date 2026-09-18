@@ -45,7 +45,9 @@ use crate::{
         acceleration::{Acceleration, DurableWriteBackKey, Mode, RefreshMode},
         builder::DatasetBuilder,
     },
-    component::{AcceleratedComponent, disabled_acceleration_warning},
+    component::{
+        AcceleratedComponent, deprecated_ready_state_warning, disabled_acceleration_warning,
+    },
     dataaccelerator::{AccelerationSource, validate_snapshot_consistency, validate_snapshot_paths},
     dataconnector::{
         self, ConnectorComponent, DataConnector, ODBC_DATACONNECTOR, SCYLLADB_DATACONNECTOR,
@@ -86,17 +88,20 @@ use util::{error_spaced, warn_spaced};
 /// bound once per dataset.
 const HOT_RELOAD_INITIAL_REFRESH_TIMEOUT: Duration = Duration::from_mins(5);
 
-/// Warn an operator whose dataset or view sets `acceleration.enabled: false` and leaves
-/// settings in the block that the runtime will not apply (#13514).
+/// Warn an operator about what their dataset's or view's acceleration block asks for and
+/// the runtime will not do as written: settings that `enabled: false` discards (#13514), and
+/// the deprecated `acceleration.ready_state`, honoured but superseded by the component's own
+/// `ready_state` (#13749).
 ///
-/// Deliberately **not** in `DatasetBuilder`/`ViewBuilder`'s `TryFrom`, where this started.
-/// Those conversions are not the load path: `datasets_iter` runs them on every call to
-/// `get_valid_datasets`, and `GET /v1/datasets` is one of those callers — so a warning
-/// emitted there fires once per misconfigured dataset **per HTTP request**, in a caller
-/// that passes `LogErrors(false)` precisely to say "do not log from here". Emitting it
-/// here instead puts it behind the same `log_errors` gate as the load errors beside it,
-/// so it is tied to a load rather than to a read.
-pub(crate) fn warn_about_discarded_acceleration_settings(
+/// Deliberately **not** in `DatasetBuilder`/`ViewBuilder`'s `TryFrom`, where both started.
+/// Those conversions are not the load path: `datasets_iter` and `get_valid_views` run them on
+/// every call to `get_valid_datasets`/`get_valid_views`, and `GET /v1/datasets`, every
+/// accelerated component's `initialized_sources()` and the hot-reload comparison are among
+/// those callers — each passing `LogErrors(false)` precisely to say "do not log from here".
+/// A warning emitted inside the conversion therefore printed once per *call*, not once per
+/// component. Emitting here puts both behind the same `log_errors` gate as the load errors
+/// beside them, so they are tied to a load rather than to a read.
+pub(crate) fn warn_about_acceleration_block(
     component: AcceleratedComponent,
     name: &str,
     acceleration: Option<&spicepod::acceleration::Acceleration>,
@@ -108,16 +113,23 @@ pub(crate) fn warn_about_discarded_acceleration_settings(
     let Some(acceleration) = acceleration else {
         return;
     };
+
+    // Both formatters escape the name: a *quoted* Spicepod identifier passes validation
+    // carrying a newline, and would otherwise forge a second log line.
     let ignored = acceleration.fields_ignored_when_disabled();
-    if ignored.is_empty() {
-        return;
+    if !ignored.is_empty() {
+        tracing::warn!(
+            "{}",
+            disabled_acceleration_warning(component, name, &ignored)
+        );
     }
-    // The name is escaped inside the formatter: a *quoted* Spicepod identifier passes
-    // validation carrying a newline, and would otherwise forge a second log line.
-    tracing::warn!(
-        "{}",
-        disabled_acceleration_warning(component, name, &ignored)
-    );
+
+    // Reading the deprecated key is the point.
+    #[expect(deprecated)]
+    let sets_deprecated_ready_state = acceleration.ready_state.is_some();
+    if sets_deprecated_ready_state {
+        tracing::warn!("{}", deprecated_ready_state_warning(component, name));
+    }
 }
 
 /// One sample of the startup `Dataset load summary` line: how many datasets have
@@ -390,7 +402,7 @@ impl Runtime {
             .zip(&app.datasets)
             .filter_map(|(ds, spicepod_ds)| match ds {
                 Ok(ds) => {
-                    warn_about_discarded_acceleration_settings(
+                    warn_about_acceleration_block(
                         AcceleratedComponent::Dataset,
                         &spicepod_ds.name,
                         spicepod_ds.acceleration.as_ref(),
@@ -1222,6 +1234,14 @@ impl Runtime {
         // obsolete, so we remove them
         self.df.clear_cached_plans().await;
 
+        // A reload can change what the dataset reads, so results read from its
+        // previous contents must stop being served as fresh, and a query that
+        // planned against the previous registration must not store its result.
+        // Both of those read the table-change clock this marks. The replacement
+        // below marks it again: this mark cannot reject a result whose read
+        // starts after it and still lands on the old registration.
+        self.invalidate_cached_results_for(&ds.name).await;
+
         match Arc::clone(&self)
             .load_dataset_connector(Arc::clone(&ds))
             .await
@@ -1235,6 +1255,13 @@ impl Runtime {
                         .await
                     {
                         Ok(()) => {
+                            // Mark again now the swap has happened. The mark above
+                            // stops results read before the reload from being served
+                            // as fresh, but a query that started after it and read the
+                            // previous registration finishes with a `read_started_at`
+                            // the clock would accept, so its result must be rejected by
+                            // a mark at the replacement itself.
+                            self.invalidate_cached_results_for(&ds.name).await;
                             self.status
                                 .update_dataset(&ds.name, status::ComponentStatus::Ready);
                             return;
@@ -1253,7 +1280,7 @@ impl Runtime {
                     .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
                     .await;
 
-                if let Err(e) = DatasetInitialization::plan_eager(
+                let initialized = DatasetInitialization::plan_eager(
                     Arc::clone(&ds),
                     Arc::clone(&self),
                     Arc::clone(&connector),
@@ -1263,8 +1290,16 @@ impl Runtime {
                 )
                 .initialize()
                 .await
-                .map(|_ready| ())
-                {
+                .map(|_ready| ());
+
+                // The registration this dataset reads through has just been
+                // replaced, so mark the table again: a query that began after
+                // the mark at the top of this reload, and read the registration
+                // being replaced, would otherwise store a result the clock
+                // accepts as fresh.
+                self.invalidate_cached_results_for(&ds.name).await;
+
+                if let Err(e) = initialized {
                     self.status.update_dataset(
                         &ds.name,
                         status::ComponentStatus::error_with_message(e.to_string()),
@@ -1276,6 +1311,27 @@ impl Runtime {
                 // Only the hot-reload context it cannot know is added here (#12365).
                 tracing::error!("Unable to update dataset {}: {e}", ds.name);
             }
+        }
+    }
+
+    /// Marks the results-cache table clock for `dataset`, so results read from
+    /// what it held before this point stop being served as fresh and a result
+    /// read before it cannot be stored as fresh afterwards.
+    ///
+    /// Degrade and continue, as the write paths that mark the same clock do: a
+    /// reload that could not mark it still has to finish, and the warning is how
+    /// an operator learns that queries may keep being answered from the previous
+    /// contents until `item_ttl` expires.
+    async fn invalidate_cached_results_for(&self, dataset: &TableReference) {
+        if let Err(e) = self
+            .df
+            .caching()
+            .invalidate_for_table(dataset.clone())
+            .await
+        {
+            tracing::warn!(
+                "Dataset '{dataset}' is updating, but the results cached from its previous contents could not be invalidated, so queries may be answered from them until they expire. Cause: {e}"
+            );
         }
     }
 
@@ -3798,6 +3854,152 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         );
     }
 
+    /// A reload marks the results-cache table clock for the dataset it reloads.
+    ///
+    /// The reload replaces what the dataset reads, so a result read from its previous
+    /// contents must stop being served as fresh, and a query that planned against the
+    /// previous registration must not store the result it reads. Both of those are
+    /// decided by that mark: `entry_validity` reads it on every hit, and
+    /// `tables_changed_since` reads it before a result is stored. Clearing the cached
+    /// plans, which is all the reload used to do, changes neither.
+    #[tokio::test]
+    async fn updating_a_dataset_invalidates_the_results_cached_from_it() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let ds = unloadable_dataset(&runtime);
+        let provider = runtime
+            .df
+            .results_cache_provider()
+            .expect("the results cache is enabled by default");
+
+        let tables = std::collections::HashSet::from([ds.name.clone()]);
+        let read_started_at = std::time::Instant::now();
+        assert!(
+            !provider.tables_changed_since(&tables, read_started_at),
+            "nothing has changed this dataset yet"
+        );
+
+        // This dataset's connector cannot be built, so the reload fails after the
+        // point that must invalidate: what the assertion below pins is that the
+        // invalidation happens before the reload touches the registration at all.
+        Arc::clone(&runtime).update_dataset(Arc::clone(&ds)).await;
+
+        assert!(
+            provider.tables_changed_since(&tables, read_started_at),
+            "a reload must mark the table, or results read from the dataset's previous contents \
+             stay servable as fresh until item_ttl expires"
+        );
+    }
+
+    /// A connector whose construction blocks until the test releases it, so a
+    /// reload can be held open between the mark at its start and the replacement
+    /// at its end.
+    struct GatedConnectorFactory {
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl DataConnectorFactory for GatedConnectorFactory {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn create<'a>(
+            &'a self,
+            _params: ConnectorParams,
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
+            let gate = Arc::clone(&self.gate);
+            Box::pin(async move {
+                let _permit = gate
+                    .acquire()
+                    .await
+                    .expect("the test releases the gate before awaiting the reload");
+                Ok(Arc::new(SchemaOnlyConnector) as Arc<dyn DataConnector>)
+            })
+        }
+
+        fn prefix(&self) -> &'static str {
+            "gated_reload"
+        }
+
+        fn parameters(&self) -> &'static [ParameterSpec] {
+            &[]
+        }
+    }
+
+    /// The reload marks the table again once the registration has been replaced.
+    ///
+    /// The mark at the start of `update_dataset` cannot cover a query that begins
+    /// *after* it: that query reads the registration still being replaced and
+    /// finishes with a `read_started_at` later than the mark, so
+    /// `tables_changed_since` accepts its result and the cache serves the
+    /// dataset's previous contents as fresh until `item_ttl`.
+    ///
+    /// The instant this asserts from is therefore taken while the reload is
+    /// parked inside connector construction, after the first mark has already
+    /// landed — which is what makes it fail when only that first mark exists.
+    #[tokio::test]
+    async fn a_dataset_reload_marks_the_table_again_once_it_has_been_replaced() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        register_connector_factory(
+            "gated_reload",
+            Arc::new(GatedConnectorFactory {
+                gate: Arc::clone(&gate),
+            }),
+        )
+        .await;
+
+        let spec = spicepod::component::dataset::Dataset::new("gated_reload:any", "replaced");
+        let app = app::AppBuilder::new("reload_marks_at_replacement")
+            .with_dataset(spec.clone())
+            .build();
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let ds = Arc::new(
+            DatasetBuilder::try_from(spec)
+                .expect("valid dataset builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::clone(&runtime))
+                .build()
+                .expect("valid runtime dataset"),
+        );
+        let provider = runtime
+            .df
+            .results_cache_provider()
+            .expect("the results cache is enabled by default");
+        let tables = std::collections::HashSet::from([ds.name.clone()]);
+
+        let before_the_reload = std::time::Instant::now();
+        let reload = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            let ds = Arc::clone(&ds);
+            async move { runtime.update_dataset(ds).await }
+        });
+
+        // The reload is now parked in connector construction, with its first mark
+        // already recorded.
+        assert!(
+            test_framework::utils::wait_until_true(Duration::from_secs(30), || {
+                let provider = Arc::clone(&provider);
+                let tables = tables.clone();
+                async move { provider.tables_changed_since(&tables, before_the_reload) }
+            })
+            .await,
+            "the reload must mark the table before it builds the connector"
+        );
+
+        // Stands in for a query that starts here, reads the registration being
+        // replaced, and stores its result: only a mark from the replacement is
+        // later than this instant.
+        let read_started_mid_reload = std::time::Instant::now();
+        gate.add_permits(1);
+        reload.await.expect("the reload task should not panic");
+
+        assert!(
+            provider.tables_changed_since(&tables, read_started_mid_reload),
+            "the replacement must mark the table too, or a result read from the previous \
+             registration after the reload started is stored and served as fresh"
+        );
+    }
+
     /// A dataset whose `from:` names no registered connector, so building its
     /// connector always fails.
     fn unloadable_dataset(runtime: &Arc<crate::Runtime>) -> Arc<Dataset> {
@@ -3952,6 +4154,95 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         assert!(
             !summary.is_settled(),
             "an Initializing dataset keeps the sampler alive"
+        );
+    }
+
+    /// Every `acceleration.ready_state` deprecation line emitted while `f` runs. Synchronous
+    /// callers only — `get_valid_datasets` and `get_valid_views` log on the caller's thread.
+    fn ready_state_deprecation_lines(f: impl FnOnce()) -> Vec<String> {
+        crate::tracing_util::warn_lines_emitted_by(f)
+            .into_iter()
+            .filter(|line| line.contains("sets `acceleration.ready_state`"))
+            .collect()
+    }
+
+    /// One dataset and one view, both setting the deprecated key, plus a dataset that does not.
+    fn app_with_deprecated_ready_state() -> Arc<app::App> {
+        #[expect(deprecated)]
+        let acceleration = spicepod::acceleration::Acceleration {
+            ready_state: Some(spicepod::component::dataset::ReadyState::OnRegistration),
+            ..spicepod::acceleration::Acceleration::default()
+        };
+
+        let mut trips = spicepod::component::dataset::Dataset::new("test:source", "trips");
+        trips.acceleration = Some(acceleration.clone());
+
+        let mut trips_vw = spicepod::component::view::View::new("trips_vw".to_string());
+        trips_vw.sql = Some("SELECT 1".to_string());
+        trips_vw.acceleration = Some(acceleration);
+
+        let mut current = spicepod::component::dataset::Dataset::new("test:source", "current");
+        current.acceleration = Some(spicepod::acceleration::Acceleration::default());
+
+        Arc::new(
+            app::AppBuilder::new("deprecated_ready_state")
+                .with_dataset(trips)
+                .with_dataset(current)
+                .with_view(trips_vw)
+                .build(),
+        )
+    }
+
+    /// Regression test for #13749: the deprecation notice prints exactly once per component,
+    /// from the load path, and never from a read — not once per `get_valid_*` call.
+    #[tokio::test]
+    async fn the_ready_state_deprecation_is_reported_once_per_component_and_only_on_load() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let app = app_with_deprecated_ready_state();
+
+        let on_dataset_load = ready_state_deprecation_lines(|| {
+            let loaded = Arc::clone(&runtime).get_valid_datasets(&app, LogErrors(true));
+            assert_eq!(loaded.len(), 2, "both datasets must build");
+        });
+        assert_eq!(
+            on_dataset_load.len(),
+            1,
+            "one dataset sets the key, so one line — not one per conversion, and none for the \
+             dataset that does not set it: {on_dataset_load:?}"
+        );
+        assert!(
+            on_dataset_load[0].contains("Dataset 'trips'"),
+            "the line names the component that set the key: {on_dataset_load:?}"
+        );
+
+        // `get_valid_views` also rebuilds every dataset (with `LogErrors(false)`) to check for
+        // name collisions, so this is where the dataset's line used to reappear.
+        let on_view_load = ready_state_deprecation_lines(|| {
+            let loaded = Arc::clone(&runtime).get_valid_views(&app, LogErrors(true));
+            assert_eq!(loaded.len(), 1, "the view must build");
+        });
+        assert_eq!(
+            on_view_load.len(),
+            1,
+            "loading the views reports the view's key once and the datasets' not at all: \
+             {on_view_load:?}"
+        );
+        assert!(
+            on_view_load[0].contains("View 'trips_vw'"),
+            "the line names the view: {on_view_load:?}"
+        );
+
+        // A read — `GET /v1/datasets`, `initialized_sources()`, the hot-reload comparison —
+        // says so with `LogErrors(false)`, and must not warn: these are the callers that
+        // multiplied the line.
+        let on_read = ready_state_deprecation_lines(|| {
+            let datasets = Arc::clone(&runtime).get_valid_datasets(&app, LogErrors(false));
+            let views = Arc::clone(&runtime).get_valid_views(&app, LogErrors(false));
+            assert_eq!((datasets.len(), views.len()), (2, 1));
+        });
+        assert!(
+            on_read.is_empty(),
+            "a read must not emit the deprecation notice: {on_read:?}"
         );
     }
 }

@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q46"
+---
++-------------+--------------+-------------+--------------------+------------------+---------+-----------+
+| c_last_name | c_first_name | ca_city     | bought_city        | ss_ticket_number | amt     | profit    |
++-------------+--------------+-------------+--------------------+------------------+---------+-----------+
+| Aaron       | Alicia       | Oak Hill    | Bridgeport         | 9778993          | 0.00    | -10975.43 |
+| Aaron       | Angelica     | Belmont     | Pleasant Hill      | 18792910         | 305.19  | -19595.87 |
+| Aaron       | Barbara      | White Oak   | Greenfield         | 23868407         | 77.52   | 751.02    |
+| Aaron       | Brenda       | Kingston    | Wilson             | 13126556         | 4045.84 | -10327.85 |
+| Aaron       | Charles      | Ashland     | Pleasant Hill      | 23837730         | 6421.29 | -9145.86  |
+| Aaron       | Cynthia      | Cedar Grove | Shady Grove        | 10202504         | 1248.01 | -12305.94 |
+| Aaron       | Dale         | Oak Hill    | Macon              | 18697197         | 0.00    | -7561.58  |
+| Aaron       | Dale         | Oak Hill    | Oakland            | 15544894         | 2776.14 | -12605.58 |
+| Aaron       | Dale         | Oak Hill    | Washington Heights | 11537651         | 1981.66 | -10637.57 |
+| Aaron       | Duncan       | Springfield | Clifton            | 18531090         | 7986.95 | -12714.76 |
++-------------+--------------+-------------+--------------------+------------------+---------+-----------+

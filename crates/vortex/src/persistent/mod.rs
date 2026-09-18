@@ -4,7 +4,9 @@
 //! Persistent implementation of a Vortex table provider.
 mod access_plan;
 mod cache;
+mod write_observer;
 pub use cache::synthetic_object_meta;
+mod deferred_projection;
 mod format;
 pub mod metrics;
 mod opener;
@@ -26,6 +28,7 @@ pub use segment_cache::{
     register_segment_cache_metrics,
 };
 pub use source::VortexSource;
+pub use write_observer::VortexWriteObserver;
 
 #[cfg(test)]
 mod tests {
@@ -1055,6 +1058,47 @@ mod tests {
             matched,
             i64::from(ROWS / 2),
             "the IN list covers the upper half of the rows and nothing else"
+        );
+
+        // The same depth against a DECIMAL column, which is what still reaches
+        // the OR tree this test exists for. A primitive list this long is
+        // answered by a set probe, and the probe does not cover decimals, so the
+        // whole list goes back to OR-ing one equality per element — the form
+        // whose right-leaning shape blew the stack. Without this arm the
+        // assertion above passes on a build that never constructs the tree.
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE amounts \
+                    (amount DECIMAL(12, 2) NOT NULL) \
+                STORED AS vortex \
+                LOCATION '/large_in_list_decimal/'",
+            )
+            .await?;
+
+        let decimal_values = (0..ROWS)
+            .map(|id| format!("({id}.00)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ctx.session
+            .sql(&format!("INSERT INTO amounts VALUES {decimal_values}"))
+            .await?
+            .collect()
+            .await?;
+
+        let decimal_in_list = (0..IN_LIST_LEN)
+            .map(|offset| format!("{}.00", ROWS / 2 + offset))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let matched_decimal = scalar_count(
+            &ctx,
+            &format!("SELECT count(*) FROM amounts WHERE amount IN ({decimal_in_list})"),
+        )
+        .await?;
+
+        assert_eq!(
+            matched_decimal,
+            i64::from(ROWS / 2),
+            "the decimal IN list covers the upper half of the rows and nothing else"
         );
 
         Ok(())
