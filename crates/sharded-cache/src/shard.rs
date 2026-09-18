@@ -55,7 +55,7 @@ struct Node<V> {
 pub(crate) enum GetOutcome<V> {
     Hit(V),
     Miss,
-    Expired { weight: u64 },
+    Expired { value: V, weight: u64 },
 }
 
 pub(crate) struct WeightDelta {
@@ -141,9 +141,15 @@ impl<V: Clone> Shard<V> {
             _ => return GetOutcome::Miss,
         };
         if expired {
-            let weight = self.unlink_and_free(idx);
+            let weight = match self.slots.get(idx as usize) {
+                Some(Slot::Occupied(node)) => node.weight,
+                _ => 0,
+            };
             self.map.remove(&key);
-            return GetOutcome::Expired { weight };
+            let Some(value) = self.take_value_and_free(idx) else {
+                return GetOutcome::Miss;
+            };
+            return GetOutcome::Expired { value, weight };
         }
         let value = match self.slots.get(idx as usize) {
             Some(Slot::Occupied(node)) => node.value.clone(),
@@ -153,7 +159,13 @@ impl<V: Clone> Shard<V> {
         GetOutcome::Hit(value)
     }
 
-    pub(crate) fn insert(&mut self, key: u64, value: V, weight: u64, now: Instant) -> WeightDelta {
+    pub(crate) fn insert(
+        &mut self,
+        key: u64,
+        value: V,
+        weight: u64,
+        now: Instant,
+    ) -> (WeightDelta, Option<V>) {
         if let Some(&idx) = self.map.get(&key) {
             return self.replace(idx, value, weight, now);
         }
@@ -168,10 +180,13 @@ impl<V: Clone> Shard<V> {
         self.map.insert(key, idx);
         self.push_front(idx);
         self.weight = self.weight.saturating_add(weight);
-        WeightDelta {
-            added: weight,
-            removed: 0,
-        }
+        (
+            WeightDelta {
+                added: weight,
+                removed: 0,
+            },
+            None,
+        )
     }
 
     pub(crate) fn remove(&mut self, key: u64) -> Option<(V, u64)> {
@@ -280,20 +295,29 @@ impl<V: Clone> Shard<V> {
 }
 
 impl<V> Shard<V> {
-    fn replace(&mut self, idx: u32, value: V, weight: u64, now: Instant) -> WeightDelta {
-        let old_weight = match self.slots.get_mut(idx as usize) {
+    fn replace(
+        &mut self,
+        idx: u32,
+        value: V,
+        weight: u64,
+        now: Instant,
+    ) -> (WeightDelta, Option<V>) {
+        let (old_weight, old_value) = match self.slots.get_mut(idx as usize) {
             Some(Slot::Occupied(node)) => {
-                let old = node.weight;
-                node.value = value;
+                let old_weight = node.weight;
+                let old_value = std::mem::replace(&mut node.value, value);
                 node.weight = weight;
                 node.inserted_at = now;
-                old
+                (old_weight, old_value)
             }
             _ => {
-                return WeightDelta {
-                    added: 0,
-                    removed: 0,
-                };
+                return (
+                    WeightDelta {
+                        added: 0,
+                        removed: 0,
+                    },
+                    None,
+                );
             }
         };
         self.weight = self
@@ -301,10 +325,13 @@ impl<V> Shard<V> {
             .saturating_sub(old_weight)
             .saturating_add(weight);
         self.promote(idx);
-        WeightDelta {
-            added: weight,
-            removed: old_weight,
-        }
+        (
+            WeightDelta {
+                added: weight,
+                removed: old_weight,
+            },
+            Some(old_value),
+        )
     }
 
     fn promote(&mut self, idx: u32) {
@@ -371,18 +398,6 @@ impl<V> Shard<V> {
         }
     }
 
-    fn unlink_and_free(&mut self, idx: u32) -> u64 {
-        let weight = match self.slots.get(idx as usize) {
-            Some(Slot::Occupied(node)) => node.weight,
-            _ => 0,
-        };
-        self.unlink(idx);
-        self.slots[idx as usize] = Slot::Vacant;
-        self.free.push(idx);
-        self.weight = self.weight.saturating_sub(weight);
-        weight
-    }
-
     fn take_value_and_free(&mut self, idx: u32) -> Option<V> {
         self.unlink(idx);
         match std::mem::replace(self.slots.get_mut(idx as usize)?, Slot::Vacant) {
@@ -437,7 +452,7 @@ mod tests {
         shard.insert(1, 10, 5, inserted);
         let later = inserted + Duration::from_secs(2);
         let got = shard.get(1, later, Duration::from_secs(1));
-        assert!(matches!(got, GetOutcome::Expired { weight: 5 }));
+        assert!(matches!(got, GetOutcome::Expired { weight: 5, .. }));
         assert_eq!(shard.len(), 0);
         assert_eq!(shard.weight, 0);
     }

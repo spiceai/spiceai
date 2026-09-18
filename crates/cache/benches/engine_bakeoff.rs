@@ -97,7 +97,7 @@ fn spice_backend() -> Arc<SpiceBackend<BenchValue>> {
 
 fn moka_backend() -> Arc<MokaBackend<BenchValue, std::hash::RandomState>> {
     let builder = CacheBackendBuilder::new(CACHE_WEIGHT, Duration::from_mins(1));
-    Arc::new(MokaBackend::new(&builder, std::hash::RandomState::new()))
+    Arc::new(MokaBackend::lru(&builder, std::hash::RandomState::new()))
 }
 
 #[cfg(feature = "pingora")]

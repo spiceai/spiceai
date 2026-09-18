@@ -46,40 +46,46 @@ where
 {
     /// Creates a new Moka backend with the given configuration.
     pub fn new(builder: &CacheBackendBuilder, hasher: T) -> Self {
-        let cache: Cache<u64, V, PassthroughHashBuilder<T>> = Cache::builder()
+        Self::build(builder, hasher, None)
+    }
+
+    /// Moka configured as LRU so the engine bakeoff compares the same policy
+    /// as [`crate::backend::SpiceBackend`] default (`EvictionPolicy::Lru`).
+    #[must_use]
+    pub fn lru(builder: &CacheBackendBuilder, hasher: T) -> Self {
+        Self::build(builder, hasher, Some(moka::policy::EvictionPolicy::lru()))
+    }
+
+    fn build(
+        builder: &CacheBackendBuilder,
+        hasher: T,
+        policy: Option<moka::policy::EvictionPolicy>,
+    ) -> Self {
+        let mut cache = Cache::builder()
             .time_to_live(builder.ttl())
             .weigher(|_key, value: &V| -> u32 {
                 let val: usize = value.get_memory_size();
                 val.try_into().unwrap_or(u32::MAX)
             })
-            .max_capacity(builder.max_capacity())
-            .build_with_hasher(PassthroughHashBuilder::new(hasher));
-
-        Self { cache }
+            .max_capacity(builder.max_capacity());
+        if let Some(policy) = policy {
+            cache = cache.eviction_policy(policy);
+        }
+        Self {
+            cache: cache.build_with_hasher(PassthroughHashBuilder::new(hasher)),
+        }
     }
 
     /// Creates a Moka backend wrapping an existing Moka cache.
     ///
-    /// Kept for leftover Moka call sites and benches until those migrate.
+    /// Kept for leftover Moka call sites until those migrate.
     #[must_use]
     #[expect(
         dead_code,
-        reason = "retained for leftover Moka call sites and the engine bakeoff"
+        reason = "retained for leftover Moka call sites that still wrap an existing cache"
     )]
     pub(crate) fn from_cache(cache: Cache<u64, V, PassthroughHashBuilder<T>>) -> Self {
         Self { cache }
-    }
-
-    /// The moka cache this backend wraps.
-    ///
-    /// Moka's predicate-based invalidation (`invalidate_entries_if`) has no equivalent on
-    /// the [`CacheBackend`] trait, so table invalidation reaches for the cache itself.
-    #[expect(
-        dead_code,
-        reason = "retained for leftover Moka call sites that still reach the inner cache"
-    )]
-    pub(crate) fn cache(&self) -> &Cache<u64, V, PassthroughHashBuilder<T>> {
-        &self.cache
     }
 }
 

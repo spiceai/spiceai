@@ -75,7 +75,9 @@ pub enum EvictionReason {
 /// Admission / eviction policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EvictionPolicy {
-    /// Least-recently-used: the coldest entry is the next size-eviction victim.
+    /// Least-recently-used *within each shard*. Overflow trim walks other
+    /// shards in numeric index order and evicts the first non-empty tail, so
+    /// the victim is not chosen by a global LRU timestamp comparison.
     #[default]
     Lru,
     /// `TinyLFU` admission over LRU eviction: a new key that would push the cache
@@ -147,19 +149,31 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     /// lowest-frequency LRU tail across shards).
     pub fn insert(&self, key: u64, value: V, weight: usize) {
         let weight = u64::try_from(weight).unwrap_or(u64::MAX);
-        let now = Instant::now();
         let shard_idx = shard_index(key);
         let mut shard = self.shards[shard_idx].0.lock();
+        // Sample TTL after the shard lock so wait time is not charged to the
+        // entry (and so TinyLFU can expire this shard before admission).
+        let now = Instant::now();
 
+        let mut expired = Vec::new();
         if matches!(self.policy, EvictionPolicy::TinyLfu) {
+            let (values, expired_weight) = shard.expire_older_than(now, self.ttl);
+            if expired_weight > 0 {
+                self.sub_weight(expired_weight);
+            }
+            expired = values;
             shard.increment_sketch(key);
         }
 
-        let delta = shard.insert(key, value, weight, now);
+        let (delta, replaced) = shard.insert(key, value, weight, now);
         // Publish the weight before releasing the shard so a concurrent
         // remove of this key cannot subtract before the matching add.
         self.apply_delta(delta.net());
         drop(shard);
+        drop(replaced);
+        for _ in expired {
+            L::on_evict(EvictionReason::Expired);
+        }
         #[cfg(test)]
         self.wait_after_publish();
         self.evict_to_limit(shard_idx, Some(key));
@@ -170,17 +184,18 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     /// Never removes a live entry. An expired entry is dropped and reported
     /// as [`EvictionReason::Expired`].
     pub fn get(&self, key: &u64) -> Option<V> {
-        let now = Instant::now();
         let mut shard = self.shards[shard_index(*key)].0.lock();
+        let now = Instant::now();
         if matches!(self.policy, EvictionPolicy::TinyLfu) {
             shard.increment_sketch(*key);
         }
         match shard.get(*key, now, self.ttl) {
             GetOutcome::Hit(value) => Some(value),
             GetOutcome::Miss => None,
-            GetOutcome::Expired { weight } => {
+            GetOutcome::Expired { value, weight } => {
                 self.sub_weight(weight);
                 drop(shard);
+                drop(value);
                 L::on_evict(EvictionReason::Expired);
                 None
             }
@@ -199,9 +214,12 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     /// Drop every entry. Not reported as evictions.
     pub fn clear(&self) {
         // Lock order is shard 0..N so a concurrent `clear` cannot deadlock.
+        // Keep the removed values alive until every shard lock is released:
+        // a `Drop` that re-enters this cache would otherwise deadlock, and
+        // dropping Arrow-backed values would extend the all-shards hold.
         let mut guards: Vec<_> = self.shards.iter().map(|s| s.0.lock()).collect();
-        let mut removed: u64 = 0;
         let mut values = Vec::new();
+        let mut removed: u64 = 0;
         for guard in &mut guards {
             let (shard_values, weight) = guard.take_all();
             removed = removed.saturating_add(weight);
@@ -246,9 +264,9 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
 
     /// Expire stale entries and evict down to `max_weight`.
     pub fn run_pending_tasks(&self) {
-        let now = Instant::now();
         for shard_idx in 0..NUM_SHARDS {
             let mut shard = self.shards[shard_idx].0.lock();
+            let now = Instant::now();
             let (expired, weight) = shard.expire_older_than(now, self.ttl);
             self.sub_weight(weight);
             drop(shard);
@@ -320,9 +338,9 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
 
     /// Drop every expired entry so stale weight cannot displace a live victim.
     fn expire_all_stale(&self) {
-        let now = Instant::now();
         for shard in self.shards.iter() {
             let mut shard = shard.0.lock();
+            let now = Instant::now();
             let (expired, weight) = shard.expire_older_than(now, self.ttl);
             if expired.is_empty() {
                 continue;
@@ -375,16 +393,17 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
 
     fn remove_for_size(&self, shard_idx: usize, key: u64) -> bool {
         let mut shard = self.shards[shard_idx].0.lock();
-        let weight = if let Some((_, weight)) = shard.remove(key) {
-            weight
+        let (value, weight) = if let Some((value, weight)) = shard.remove(key) {
+            (value, weight)
         } else {
-            let Some((_, _, weight)) = shard.evict_lru() else {
+            let Some((_, value, weight)) = shard.evict_lru() else {
                 return false;
             };
-            weight
+            (value, weight)
         };
         self.sub_weight(weight);
         drop(shard);
+        drop(value);
         L::on_evict(EvictionReason::Size);
         true
     }
@@ -396,6 +415,9 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         self.evict_one_from(prefer)
     }
 
+    /// Evict from the first other shard in numeric index order that has a
+    /// victim. This is not a global LRU comparison: shard 0's tail is tried
+    /// before shard 15's even if shard 15's tail is colder.
     fn evict_first_other(&self, prefer: usize) -> bool {
         (0..NUM_SHARDS)
             .filter(|&shard_idx| shard_idx != prefer)
@@ -414,11 +436,12 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             }
             return true;
         }
-        let Some((_key, _value, weight)) = shard.evict_lru() else {
+        let Some((_key, value, weight)) = shard.evict_lru() else {
             return false;
         };
         self.sub_weight(weight);
         drop(shard);
+        drop(value);
         L::on_evict(EvictionReason::Size);
         true
     }
@@ -869,5 +892,24 @@ mod tests {
             0,
             "every insert's weight must be published before a concurrent remove can subtract"
         );
+    }
+
+    #[test]
+    fn tinylfu_expires_a_hot_same_shard_resident_before_admission() {
+        let cache: ShardedCache<TestValue> =
+            ShardedCache::new(100, Duration::from_millis(30), EvictionPolicy::TinyLfu);
+        let old = 16u64;
+        let new = 32u64;
+        cache.insert(old, TestValue::with_size("old", 100), 100);
+        for _ in 0..64 {
+            assert!(cache.get(&old).is_some());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        cache.insert(new, TestValue::with_size("new", 100), 100);
+        assert!(
+            cache.get(&new).is_some(),
+            "an expired same-shard resident must not block TinyLFU admission"
+        );
+        assert!(cache.get(&old).is_none());
     }
 }

@@ -540,10 +540,11 @@ impl Caching {
         Ok(())
     }
 
-    /// Drives moka housekeeping on every configured cache. `moka::future::Cache`
-    /// has no background maintenance thread, so invalidation predicates and
-    /// expired entries on a cache with no `get`/`insert` traffic are only
-    /// reclaimed when this runs.
+    /// Drives housekeeping on every configured cache. SQL results expire stale
+    /// entries via `run_pending_tasks` (Spice shard walk on the blocking pool)
+    /// and then refresh size gauges. Plans, search, and embeddings run
+    /// `checkpoint`. Expired entries on a cache with no `get`/`insert` traffic
+    /// are only reclaimed when this runs.
     pub async fn run_pending_maintenance(&self) {
         // The interner pools are reclaimed here rather than by the runtime,
         // because this crate is the only thing that populates them: every value
@@ -1180,8 +1181,9 @@ impl QueryResultsCacheProvider {
     }
 
     /// Re-reports the size and item-count gauges from the cache's current
-    /// state. Both accessors drive `moka` housekeeping first, so this reflects
-    /// entries already dropped by invalidation or expiry.
+    /// state. Size and item count read the Spice backend's live counters (no
+    /// expiry scan); call `run_pending_tasks` / `checkpoint` first when the
+    /// gauges should exclude unobserved TTL entries.
     pub async fn report_size_metrics(&self) {
         CachedQueryResult::record_item_count(self.item_count().await);
         CachedQueryResult::record_size(self.size().await);
