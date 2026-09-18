@@ -561,7 +561,8 @@ impl TursoTableProvider {
     ///
     /// Recurses for `Dictionary`, whose values the write path stores unwrapped. `column` is the
     /// field's name, so an error names the column at fault rather than leaving a dataset with
-    /// several columns of the same type to guess.
+    /// several columns of the same type to guess. It is user-chosen, so every message escapes
+    /// it: a name carrying a newline must not break a message that has to stay on one line.
     #[expect(
         clippy::too_many_lines,
         clippy::match_same_arms,
@@ -782,7 +783,7 @@ impl TursoTableProvider {
             // reads as NULL rather than being padded or truncated to fit.
             DataType::FixedSizeBinary(width) => {
                 let expected = usize::try_from(*width).map_err(|_| {
-                        format!("Failed to read the column '{column}' from Turso: {width} is not a valid fixed-size binary width")
+                        format!("Failed to read the column '{}' from Turso: {width} is not a valid fixed-size binary width", column.escape_debug())
                     })?;
                 let values = rows.iter().map(|row| match row.get(col_idx) {
                     Some(TursoValue::Blob(b)) if b.len() == expected => Some(b.as_slice()),
@@ -1148,9 +1149,10 @@ impl TursoTableProvider {
             // it compares first, so name the type here instead.
             other => {
                 return Err(format!(
-                        "Failed to read the column '{column}' from Turso: the {other} type is not supported by the Turso accelerator. \
+                        "Failed to read the column '{}' from Turso: the {other} type is not supported by the Turso accelerator. \
                         Cast the column to a supported type, or accelerate this dataset with a different engine. \
-                        See: https://spiceai.org/docs/components/data-accelerators/turso"
+                        See: https://spiceai.org/docs/components/data-accelerators/turso",
+                        column.escape_debug()
                     )
                     .into());
             }
@@ -2509,9 +2511,10 @@ fn dictionary_encode(
     )
     .map_err(|e| {
         format!(
-            "Failed to read the dictionary column '{column}' from Turso: its {} entries do not fit the {key_type} keys the column declares ({e}). \
+            "Failed to read the dictionary column '{}' from Turso: its {} entries do not fit the {key_type} keys the column declares ({e}). \
             Re-create the dataset with a wider dictionary key type, or accelerate it with a different engine. \
             See: https://spiceai.org/docs/components/data-accelerators/turso",
+            column.escape_debug(),
             distinct.len()
         )
     })?
