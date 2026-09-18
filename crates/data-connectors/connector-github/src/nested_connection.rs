@@ -111,20 +111,31 @@ where
         return Ok(Vec::new());
     };
 
-    // Count only the nodes that can become rows. A node that is null or not an
-    // object is skipped below, so counting the raw array would let a response
-    // like `{"totalCount": 1, "nodes": [null]}` pass the completeness check and
-    // emit nothing — losing exactly the guarantee this check exists to give.
-    let nodes = connection
-        .get("nodes")
-        .and_then(Value::as_array)
-        .map_or_else(Vec::new, |nodes| {
-            nodes
-                .iter()
-                .filter(|node| node.is_object())
-                .cloned()
-                .collect()
-        });
+    // Count only the nodes that can become rows: a node that is null or not an
+    // object is skipped below.
+    let raw_nodes = connection.get("nodes").and_then(Value::as_array);
+    let nodes: Vec<Value> = raw_nodes.map_or_else(Vec::new, |nodes| {
+        nodes
+            .iter()
+            .filter(|node| node.is_object())
+            .cloned()
+            .collect()
+    });
+
+    // `pageInfo` answers whether the connection is fully paged, not whether every
+    // node on this page was readable, so an unusable node has to be caught on its
+    // own. Otherwise a terminal page silently emits fewer rows than it carried.
+    let raw_len = raw_nodes.map_or(0, Vec::len);
+    if nodes.len() != raw_len {
+        return Err(unusable_node_error(
+            raw_len.saturating_sub(nodes.len()),
+            raw_len,
+            spec,
+            owner,
+            repo,
+            parent.get(spec.parent_id_key),
+        ));
+    }
 
     ensure_complete(
         connection,
@@ -202,6 +213,33 @@ fn ensure_complete(
     Err(truncated_connection_error(
         connection, returned, spec, owner, repo, parent_id,
     ))
+}
+
+/// Names the parent whose page carried a node we could not read, and what that
+/// costs, so a short row count is never silent.
+fn unusable_node_error(
+    unusable: usize,
+    raw_len: usize,
+    spec: &NestedConnection<'_>,
+    owner: &str,
+    repo: &str,
+    parent_id: Option<&Value>,
+) -> Error {
+    let parent_id = parent_id.map_or_else(
+        || "unknown".to_string(),
+        |value| match value {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        },
+    );
+
+    let parent_label = spec.parent_label;
+    let child_label = spec.child_label;
+    Error::InvalidObjectAccess {
+        message: format!(
+            "Failed to read the {child_label} of {parent_label} '{parent_id}' ({owner}/{repo}): GitHub returned {unusable} of {raw_len} as null rather than an object, so those rows would be missing from every count over that {parent_label} with no way to tell. Retry the refresh; if it persists, the access token may not be able to see all of them. See: https://spiceai.org/docs/components/data-connectors/github"
+        ),
+    }
 }
 
 fn truncated_connection_error(
@@ -311,8 +349,36 @@ mod tests {
             .expect_err("a null node must not pass as a delivered row");
 
         assert!(
-            error.to_string().contains("0 of 1"),
-            "the error must count the null node as missing, got: {error}"
+            error.to_string().contains("1 of 1 as null"),
+            "the error must count the null node as unreadable, got: {error}"
+        );
+    }
+
+    #[test]
+    fn fan_out_fails_on_an_unusable_node_even_when_page_info_says_complete() {
+        // `pageInfo` answers "is the connection fully paged", not "was every node
+        // readable". A terminal page that drops a node still loses rows.
+        let unusable = json!({
+            "pull_request_id": "PR_1",
+            "pull_request_number": 42,
+            "reviews": {
+                "totalCount": 110,
+                "pageInfo": {"hasNextPage": false, "endCursor": "cursor"},
+                "nodes": [
+                    {"id": "R_1"}, {"id": "R_2"}, {"id": "R_3"}, {"id": "R_4"},
+                    {"id": "R_5"}, {"id": "R_6"}, {"id": "R_7"}, {"id": "R_8"},
+                    {"id": "R_9"}, null
+                ]
+            }
+        });
+
+        let error = fan_out(&unusable, &REVIEWS, "spiceai", "spiceai", |_| {}).expect_err(
+            "a null node must not pass as a delivered row just because the page is terminal",
+        );
+
+        assert!(
+            error.to_string().contains("pull request '42'"),
+            "the error must name the parent, got: {error}"
         );
     }
 
