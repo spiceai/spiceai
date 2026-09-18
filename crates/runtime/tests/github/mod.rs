@@ -2465,9 +2465,9 @@ struct SpiceaiGitHubTotals {
     default_branch: String,
 }
 
-/// Live `totalCount` from GitHub GraphQL. A hardcoded floor (10_000 pulls,
-/// 1_000 issues) is wrong in both directions: spiceai/spiceai currently has
-/// fewer than 10_000 pull requests, so a complete load would fail that floor,
+/// Live `totalCount` from GitHub GraphQL. A hardcoded floor (`10_000` pulls,
+/// `1_000` issues) is wrong in both directions: spiceai/spiceai currently has
+/// fewer than `10_000` pull requests, so a complete load would fail that floor,
 /// and a floor below the real total would pass a truncated scan.
 async fn spiceai_github_totals() -> Result<SpiceaiGitHubTotals, String> {
     let token = std::env::var("GITHUB_TOKEN")
