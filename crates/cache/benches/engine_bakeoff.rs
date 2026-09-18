@@ -46,6 +46,8 @@ const PREFILL: u64 = 8_000;
 /// the 8 MiB budget holds all of them (`HOT_KEY_SPACE * 32` bytes).
 const HOT_KEY_SPACE: u64 = 8_000;
 const OPERATIONS_PER_THREAD: usize = 8_000;
+/// Thread counts for every bakeoff group, including the 32/64 contention cells.
+const THREAD_COUNTS: [usize; 5] = [1, 8, 16, 32, 64];
 
 #[derive(Clone)]
 struct BenchValue(String);
@@ -197,7 +199,7 @@ fn bench_concurrent_get(c: &mut Criterion) {
     let rt = runtime();
     let handle = rt.handle().clone();
 
-    for threads in [1, 8, 16] {
+    for threads in THREAD_COUNTS {
         group.throughput(Throughput::Elements(
             (threads * OPERATIONS_PER_THREAD) as u64,
         ));
@@ -248,7 +250,7 @@ fn bench_concurrent_get_hot(c: &mut Criterion) {
     let rt = runtime();
     let handle = rt.handle().clone();
 
-    for threads in [1, 8, 16] {
+    for threads in THREAD_COUNTS {
         group.throughput(Throughput::Elements(
             (threads * OPERATIONS_PER_THREAD) as u64,
         ));
@@ -299,7 +301,7 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
     let rt = runtime();
     let handle = rt.handle().clone();
 
-    for threads in [1, 8, 16] {
+    for threads in THREAD_COUNTS {
         group.throughput(Throughput::Elements(
             (threads * OPERATIONS_PER_THREAD) as u64,
         ));

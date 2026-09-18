@@ -80,7 +80,8 @@ pub enum EvictionPolicy {
     Lru,
     /// `TinyLFU` admission over LRU eviction: a new key that would push the cache
     /// over `max_weight` is admitted only if it is at least as frequent as the
-    /// current LRU victim.
+    /// overflow victim — the lowest-frequency LRU tail across all shards, which
+    /// is the same entry overflow trim removes.
     TinyLfu,
 }
 
@@ -112,6 +113,10 @@ pub struct ShardedCache<V, L: EvictionListener = NoopListener> {
     /// Serializes overflow trimming so two concurrent inserts cannot each
     /// evict a victim after a single removal would already restore the budget.
     trim: Mutex<()>,
+    /// Test-only: wait after publishing weight and before overflow trim so a
+    /// two-thread test can force both inserts to observe the overflow.
+    #[cfg(test)]
+    after_publish: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
     _listener: std::marker::PhantomData<L>,
 }
 
@@ -128,6 +133,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             policy,
             weight: AtomicU64::new(0),
             trim: Mutex::new(()),
+            #[cfg(test)]
+            after_publish: Mutex::new(None),
             _listener: std::marker::PhantomData,
         }
     }
@@ -135,8 +142,9 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     /// Insert `value` under `key` with the given byte `weight`.
     ///
     /// A value heavier than `max_weight` is admitted and then size-evicted, so
-    /// it is not retained. `TinyLFU` may reject a *new* key that would exceed
-    /// the budget if it is less frequent than the current LRU victim.
+    /// it is not retained. `TinyLFU` may evict a *new* key that would exceed
+    /// the budget if it is less frequent than the overflow victim (the
+    /// lowest-frequency LRU tail across shards).
     pub fn insert(&self, key: u64, value: V, weight: usize) {
         let weight = u64::try_from(weight).unwrap_or(u64::MAX);
         let now = Instant::now();
@@ -145,9 +153,6 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
 
         if matches!(self.policy, EvictionPolicy::TinyLfu) {
             shard.increment_sketch(key);
-            if self.should_reject_tinylfu(&shard, key, weight) {
-                return;
-            }
         }
 
         let delta = shard.insert(key, value, weight, now);
@@ -155,7 +160,9 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         // remove of this key cannot subtract before the matching add.
         self.apply_delta(delta.net());
         drop(shard);
-        self.evict_to_limit(shard_idx);
+        #[cfg(test)]
+        self.wait_after_publish();
+        self.evict_to_limit(shard_idx, Some(key));
     }
 
     /// Clone the value for `key` if it is present and unexpired.
@@ -243,7 +250,7 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
                 L::on_evict(EvictionReason::Expired);
             }
         }
-        self.evict_to_limit(0);
+        self.evict_to_limit(0, None);
     }
 
     /// Drop every entry whose value satisfies `predicate`.
@@ -283,33 +290,18 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         keys
     }
 
-    /// Reject a *new* key when this shard is already over budget *and* the
-    /// candidate is less frequent than this shard's LRU tail. Eviction for
-    /// `TinyLFU` also starts on this shard, so admission and the victim match.
-    fn should_reject_tinylfu(&self, shard: &Shard<V>, key: u64, weight: u64) -> bool {
-        if shard.contains(key) {
-            return false;
-        }
-        if self.weight.load(Ordering::Relaxed).saturating_add(weight) <= self.max_weight {
-            return false;
-        }
-        let Some(victim) = shard.tail_key() else {
-            return false;
-        };
-        shard.sketch_estimate(key) < shard.sketch_estimate(victim)
-    }
-
-    fn evict_to_limit(&self, prefer: usize) {
+    /// Overflow trim. The outer weight check is a fast path; the limit is
+    /// rechecked under `trim` before each victim so two concurrent inserts
+    /// cannot each evict after one removal would restore the budget.
+    fn evict_to_limit(&self, prefer: usize, admitted: Option<u64>) {
         if self.weight.load(Ordering::Relaxed) <= self.max_weight {
             return;
         }
         let _trim = self.trim.lock();
+        self.expire_all_stale();
         while self.weight.load(Ordering::Relaxed) > self.max_weight {
             let progressed = match self.policy {
-                // `TinyLFU` admission compares against the inserting shard's
-                // tail, so trim that shard first. A one-shot on an empty shard
-                // is then self-evicted instead of displacing a hot key elsewhere.
-                EvictionPolicy::TinyLfu => self.evict_prefer_then_others(prefer),
+                EvictionPolicy::TinyLfu => self.evict_tinylfu_one(admitted),
                 // LRU must not self-evict a just-admitted sole resident while
                 // an older victim exists on another shard.
                 EvictionPolicy::Lru => self.evict_others_then_prefer(prefer),
@@ -320,11 +312,75 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         }
     }
 
-    fn evict_prefer_then_others(&self, prefer: usize) -> bool {
-        if self.evict_one_from(prefer) {
-            return true;
+    /// Drop every expired entry so stale weight cannot displace a live victim.
+    fn expire_all_stale(&self) {
+        let now = Instant::now();
+        for shard in self.shards.iter() {
+            let mut shard = shard.0.lock();
+            let (expired, weight) = shard.expire_older_than(now, self.ttl);
+            if expired.is_empty() {
+                continue;
+            }
+            self.sub_weight(weight);
+            drop(shard);
+            for _ in expired {
+                L::on_evict(EvictionReason::Expired);
+            }
         }
-        self.evict_first_other(prefer)
+    }
+
+    /// Compare the just-admitted key with the actual overflow victim — the
+    /// lowest-frequency LRU tail across shards — and evict the loser.
+    fn evict_tinylfu_one(&self, admitted: Option<u64>) -> bool {
+        let Some((victim_shard, victim_key, victim_freq)) = self.lowest_freq_lru_tail() else {
+            return false;
+        };
+        if let Some(candidate) = admitted {
+            let candidate_shard = shard_index(candidate);
+            let (present, candidate_freq) = {
+                let shard = self.shards[candidate_shard].0.lock();
+                (shard.contains(candidate), shard.sketch_estimate(candidate))
+            };
+            if present && candidate != victim_key && candidate_freq < victim_freq {
+                return self.remove_for_size(candidate_shard, candidate);
+            }
+        }
+        self.remove_for_size(victim_shard, victim_key)
+    }
+
+    /// The overflow victim is the LRU tail with the lowest home-shard sketch
+    /// estimate. Ties keep the lowest shard index. Each lock is taken alone so
+    /// this cannot deadlock with `insert`.
+    fn lowest_freq_lru_tail(&self) -> Option<(usize, u64, u8)> {
+        let mut best: Option<(usize, u64, u8)> = None;
+        for (shard_idx, shard) in self.shards.iter().enumerate() {
+            let shard = shard.0.lock();
+            let Some(key) = shard.tail_key() else {
+                continue;
+            };
+            let freq = shard.sketch_estimate(key);
+            let take = best.is_none_or(|(_, _, best_freq)| freq < best_freq);
+            if take {
+                best = Some((shard_idx, key, freq));
+            }
+        }
+        best
+    }
+
+    fn remove_for_size(&self, shard_idx: usize, key: u64) -> bool {
+        let mut shard = self.shards[shard_idx].0.lock();
+        let weight = if let Some((_, weight)) = shard.remove(key) {
+            weight
+        } else {
+            let Some((_, _, weight)) = shard.evict_lru() else {
+                return false;
+            };
+            weight
+        };
+        self.sub_weight(weight);
+        drop(shard);
+        L::on_evict(EvictionReason::Size);
+        true
     }
 
     fn evict_others_then_prefer(&self, prefer: usize) -> bool {
@@ -380,6 +436,22 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(amount))
             });
+    }
+
+    #[cfg(test)]
+    fn wait_after_publish(&self) {
+        let barrier = {
+            let guard = self.after_publish.lock();
+            guard.as_ref().map(std::sync::Arc::clone)
+        };
+        if let Some(barrier) = barrier {
+            barrier.wait();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_after_publish_barrier(&self, barrier: std::sync::Arc<std::sync::Barrier>) {
+        *self.after_publish.lock() = Some(barrier);
     }
 }
 
@@ -655,24 +727,59 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_overflow_inserts_leave_one_resident() {
-        let cache = Arc::new(cache(100, Duration::from_mins(1)));
-        let left = Arc::clone(&cache);
-        let right = Arc::clone(&cache);
-        let a = std::thread::spawn(move || {
-            left.insert(0, TestValue::with_size("a", 100), 100);
-        });
-        let b = std::thread::spawn(move || {
-            right.insert(1, TestValue::with_size("b", 100), 100);
-        });
-        a.join().expect("thread panicked");
-        b.join().expect("thread panicked");
-        assert!(cache.weighted_size() <= 100);
-        assert_eq!(
-            cache.len(),
-            1,
-            "two concurrent overflow inserts must not each evict a victim"
+    fn tinylfu_admits_a_frequent_key_over_a_cold_resident_on_another_shard() {
+        let cache: ShardedCache<TestValue> =
+            ShardedCache::new(100, Duration::from_mins(1), EvictionPolicy::TinyLfu);
+        let cold = 0u64;
+        let hot = 1u64;
+        cache.insert(cold, TestValue::with_size("cold", 100), 100);
+        for _ in 0..64 {
+            assert!(
+                cache.get(&hot).is_none(),
+                "probes increment the sketch before the key is admitted"
+            );
+        }
+        cache.insert(hot, TestValue::with_size("hot", 100), 100);
+        assert!(
+            cache.get(&hot).is_some(),
+            "`TinyLFU` must admit a frequently probed key by evicting a colder resident on another shard"
         );
+        assert!(
+            cache.get(&cold).is_none(),
+            "the colder cross-shard LRU tail is the overflow victim"
+        );
+    }
+
+    #[test]
+    fn concurrent_overflow_inserts_leave_one_resident() {
+        for trial in 0..20 {
+            let cache = Arc::new(cache(100, Duration::from_mins(1)));
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            cache.set_after_publish_barrier(Arc::clone(&barrier));
+            let left = Arc::clone(&cache);
+            let right = Arc::clone(&cache);
+            let a = std::thread::spawn(move || {
+                left.insert(0, TestValue::with_size("a", 100), 100);
+            });
+            let b = std::thread::spawn(move || {
+                right.insert(1, TestValue::with_size("b", 100), 100);
+            });
+            a.join().expect("thread panicked");
+            b.join().expect("thread panicked");
+            assert!(
+                cache.weighted_size() <= 100,
+                "trial {trial}: weight must stay at or under the budget"
+            );
+            assert!(
+                cache.weighted_size() > 0,
+                "trial {trial}: overflow trim must not remove every resident"
+            );
+            assert_eq!(
+                cache.len(),
+                1,
+                "trial {trial}: two concurrent overflow inserts must not each evict a victim"
+            );
+        }
     }
 
     #[test]
