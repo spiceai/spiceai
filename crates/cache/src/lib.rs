@@ -1010,9 +1010,11 @@ impl QueryResultsCacheProvider {
     /// Concurrent `records()` on one fetch share a decode (`OnceCell`). The
     /// stored cell is cleared after the first hit so the second fetch decodes
     /// again. The replace is skipped when a newer result already occupies the
-    /// key, or when the decoded size would not fit `max_size` — that last
-    /// case keeps the encoded bytes so the entry is not evicted by the
-    /// promotion itself.
+    /// key, or when the decoded size would not fit `max_size`. That last case
+    /// keeps the encoded bytes so the entry is not evicted by the promotion
+    /// itself, and rewrites the stored value with a fresh empty decode cell so
+    /// the decoded batches (still held by the returned `Arc`) are not retained
+    /// off-budget.
     ///
     /// # Errors
     ///
@@ -1066,6 +1068,16 @@ impl QueryResultsCacheProvider {
                 cache_max_size = self.cache_max_size,
                 "Skipping encoded-to-raw promotion because the decoded entry exceeds cache max size"
             );
+            // Keep the encoded payload (promotion must not evict the only
+            // copy) and the caller's served `Arc`, but drop the stored
+            // decode cell so `memory_size()` is not under-billing resident
+            // decoded batches.
+            let reset = result.with_cleared_decode_cell();
+            self.cache
+                .replace_if(&raw_key.as_u64(), reset, &|current: &CachedQueryResult| {
+                    current.is_same_generation(result) && current.encoded_decode_hits() == Some(1)
+                })
+                .await;
             return;
         }
 
@@ -2284,6 +2296,10 @@ mod tests {
             "one successful decode must not promote to Raw"
         );
         assert_eq!(stored.encoded_decode_hits(), Some(1));
+        assert!(
+            !stored.encoded_has_resident_decode(),
+            "the first hit must replace the stored decode cell so decoded batches are not retained"
+        );
         assert_eq!(decodes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -2408,7 +2424,9 @@ mod tests {
     }
 
     /// When decoded size would not fit `max_size`, keep the encoded entry so
-    /// promotion cannot evict the only copy of the result.
+    /// promotion cannot evict the only copy of the result. The served `Arc` is
+    /// kept; the stored decode cell is reset so decoded batches are not
+    /// retained off-budget.
     #[tokio::test]
     async fn promote_is_skipped_when_raw_exceeds_max_size() {
         let provider = QueryResultsCacheProvider::try_new(
@@ -2484,11 +2502,33 @@ mod tests {
             third.is_encoded(),
             "an entry that cannot fit raw must stay encoded rather than be evicted"
         );
-        let _ = provider.records(&key, &third).await.expect("third hit");
+        assert!(
+            !third.encoded_has_resident_decode(),
+            "skipping promotion must drop the stored decode cell so decoded batches are not retained off-budget"
+        );
+        let third_records = provider.records(&key, &third).await.expect("third hit");
+        assert_eq!(third_records[0].num_rows(), 8_000);
         assert_eq!(
             decodes.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "hit1 and hit2 each decode; skipping promotion leaves the filled decode cell, so later fetches do not decode again"
+            3,
+            "hit1 and hit2 each decode; skipping promotion must reset the stored decode cell, so a later fetch decodes again"
+        );
+
+        provider.run_pending_tasks().await;
+        let fourth = provider
+            .get_raw_key(&key)
+            .await
+            .expect("get")
+            .expect("still cached after a post-skip decode");
+        assert!(fourth.is_encoded(), "still encoded after another skip");
+        assert!(
+            !fourth.encoded_has_resident_decode(),
+            "each skipped promotion must leave the stored decode cell empty"
+        );
+        assert!(
+            fourth.memory_size() <= 4 * 1024,
+            "the weigher must still bill compressed size after a skipped promotion, got {}",
+            fourth.memory_size()
         );
     }
 
