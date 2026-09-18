@@ -121,13 +121,13 @@ pub fn is_retriable_error(error: &Error) -> bool {
             status.is_server_error() || *status == StatusCode::REQUEST_TIMEOUT
         }
         Error::JsonDecodeError { status, .. } => {
-            // JSON decode errors with server error status codes are often due to
-            // truncated responses from timeouts or server issues.
-            // A non-JSON 403 is also retriable: it indicates a transient upstream
-            // proxy/abuse-detection block (e.g. GitHub's "Request forbidden by
-            // administrative rules"), not a genuine credentials/permissions error
-            // (which would return valid JSON).
-            status.is_server_error() || *status == StatusCode::FORBIDDEN
+            // Truncated bodies show up as HTTP 200 with EOF mid-string; 5xx/403
+            // HTML is the same class of transient upstream failure. A 4xx JSON
+            // error (except 403) is a real client failure and is not retried.
+            status.is_success()
+                || status.is_server_error()
+                || *status == StatusCode::FORBIDDEN
+                || *status == StatusCode::REQUEST_TIMEOUT
         }
         Error::ReqwestInternal { source } => {
             // Check for transient network/connection errors:
@@ -327,6 +327,19 @@ mod tests {
         assert!(
             is_retriable_error(&error),
             "a 403 secondary rate limit must retry the same page after retry-after"
+        );
+    }
+
+    #[test]
+    fn truncated_ok_json_is_retriable() {
+        let error = Error::JsonDecodeError {
+            status: StatusCode::OK,
+            detail: "EOF while parsing a string at line 1 column 219264".to_string(),
+            response_preview: "{\"data\":{\"repository\":".to_string(),
+        };
+        assert!(
+            is_retriable_error(&error),
+            "a truncated HTTP 200 body must retry the same page, not restart the scan"
         );
     }
 

@@ -1812,6 +1812,14 @@ impl GraphQLClient {
                     .await
                     .map_err(|e| {
                         if is_retriable_error(&e) {
+                            if matches!(
+                                &e,
+                                Error::JsonDecodeError { status, .. } if status.is_success()
+                            ) {
+                                // Truncated HTTP 200: the pooled connection is
+                                // likely half-closed. Retry on a new TCP stream.
+                                close_conn.store(true, Ordering::Relaxed);
+                            }
                             if is_gateway_error(&e) {
                                 close_conn.store(true, Ordering::Relaxed);
                                 // Shrink the per-page size for the next retry.
