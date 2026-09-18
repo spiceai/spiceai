@@ -85,7 +85,7 @@ limitations under the License.
 //! The read path automatically detects the storage format (TEXT vs INTEGER) and converts
 //! to the Arrow schema's expected timestamp type and unit.
 
-use std::{fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use arrow::{
     array::{
@@ -98,14 +98,15 @@ use arrow::{
         StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
         Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
         TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-        new_empty_array,
+        UInt64Array, make_array, new_empty_array,
     },
     buffer::{NullBuffer, OffsetBuffer},
-    compute::{CastOptions, cast, cast_with_options},
+    compute::{CastOptions, cast, cast_with_options, take},
     datatypes::{
         DataType, Field, FieldRef, IntervalDayTime, IntervalMonthDayNano, Schema, SchemaRef,
         TimeUnit, i256,
     },
+    row::{RowConverter, SortField},
 };
 use async_trait::async_trait;
 use datafusion::{
@@ -543,6 +544,7 @@ impl TursoTableProvider {
             columns.push(Self::column_from_turso_values(
                 rows,
                 col_idx,
+                field.name(),
                 field.data_type(),
             )?);
         }
@@ -557,7 +559,10 @@ impl TursoTableProvider {
     /// The inverse of [`scalar_value_to_turso`], and it must stay one: a type that function stores
     /// but this one cannot rebuild is a column that writes without error and cannot be read back.
     ///
-    /// Recurses for `Dictionary`, whose values the write path stores unwrapped.
+    /// Recurses for `Dictionary`, whose values the write path stores unwrapped. `column` is the
+    /// field's name, so an error names the column at fault rather than leaving a dataset with
+    /// several columns of the same type to guess. It is user-chosen, so every message escapes
+    /// it: a name carrying a newline must not break a message that has to stay on one line.
     #[expect(
         clippy::too_many_lines,
         clippy::match_same_arms,
@@ -567,6 +572,7 @@ impl TursoTableProvider {
     fn column_from_turso_values(
         rows: &[Vec<TursoValue>],
         col_idx: usize,
+        column: &str,
         data_type: &DataType,
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
         let column: ArrayRef = match data_type {
@@ -777,7 +783,7 @@ impl TursoTableProvider {
             // reads as NULL rather than being padded or truncated to fit.
             DataType::FixedSizeBinary(width) => {
                 let expected = usize::try_from(*width).map_err(|_| {
-                        format!("Failed to read a column from Turso: {width} is not a valid fixed-size binary width")
+                        format!("Failed to read the column '{}' from Turso: {width} is not a valid fixed-size binary width", column.escape_debug())
                     })?;
                 let values = rows.iter().map(|row| match row.get(col_idx) {
                     Some(TursoValue::Blob(b)) if b.len() == expected => Some(b.as_slice()),
@@ -1131,19 +1137,22 @@ impl TursoTableProvider {
                 )
             }
             // `scalar_value_to_turso` stores a dictionary value unwrapped, so what is stored is
-            // whatever the value type stores. Rebuild that, then re-encode.
-            DataType::Dictionary(_, value_type) => {
-                let values = Self::column_from_turso_values(rows, col_idx, value_type)?;
-                cast(&values, data_type)?
+            // whatever the value type stores. Rebuild that, then dictionary-encode it directly:
+            // `cast` packs only primitive, string and binary value types, so a dictionary over a
+            // list, map, boolean, duration or interval column would write but fail every scan.
+            DataType::Dictionary(key_type, value_type) => {
+                let values = Self::column_from_turso_values(rows, col_idx, column, value_type)?;
+                dictionary_encode(&values, key_type, data_type, column)?
             }
             // Rebuilding an unhandled type as a string only defers the failure to
             // `RecordBatch::try_new`, which reports it as a mismatch against whichever column
             // it compares first, so name the type here instead.
             other => {
                 return Err(format!(
-                        "Failed to read a column from Turso: the {other} type is not supported by the Turso accelerator. \
+                        "Failed to read the column '{}' from Turso: the {other} type is not supported by the Turso accelerator. \
                         Cast the column to a supported type, or accelerate this dataset with a different engine. \
-                        See: https://spiceai.org/docs/components/data-accelerators/turso"
+                        See: https://spiceai.org/docs/components/data-accelerators/turso",
+                        column.escape_debug()
                     )
                     .into());
             }
@@ -2104,14 +2113,11 @@ fn convert_timestamp_to_turso(
 /// A type this function cannot represent returns an error rather than `NULL`, so a column the
 /// accelerator cannot store fails the write instead of reading back as a column of nulls.
 ///
-/// # Read support is narrower
+/// # Read support must stay as wide
 ///
-/// [`TursoTableProvider::values_to_record_batch`] reconstructs fewer types than this function
-/// stores: a list only with `Int32` elements, a map only from `Utf8` to `Int32`, and neither
-/// `LargeList`, `FixedSizeList`, `Dictionary`, `Float16` nor `FixedSizeBinary` at all. A column of
-/// one of those types fails its scan with an Arrow schema mismatch whatever is stored for it, so
-/// writing the value faithfully is what makes the stored data correct once the read side catches
-/// up. See #12631.
+/// [`TursoTableProvider::values_to_record_batch`] is the inverse of this function. A type this
+/// function stores but that one cannot rebuild is a column that writes without error and can
+/// never be read back, so a new arm here needs its counterpart there.
 #[expect(clippy::match_same_arms)]
 fn scalar_value_to_turso(
     value: ScalarValue,
@@ -2297,7 +2303,48 @@ const MAP_KEY_COLUMN: usize = 0;
 /// Position of the value column in a `MapArray`'s entries struct.
 const MAP_VALUE_COLUMN: usize = 1;
 
-/// Serializes the elements of one list value as a JSON array, for storage in a `TEXT` column.
+/// Version of the encoding written for a list value's elements.
+///
+/// A payload carrying this version was written by an encoder whose output the reader can trust. It
+/// is not the only payload the reader will serve, because a version marker is not what makes a
+/// stored list correct — see [`classify_stored_list`] for what an unversioned payload is judged on.
+const LIST_ENCODING_VERSION: u64 = 1;
+
+/// The one payload the pre-version writer produced, for every list whatever the list held: a JSON
+/// array of exactly one null.
+///
+/// A list that genuinely holds a single null encodes to the same bytes, so an *unversioned* payload
+/// of this shape cannot be attributed to either writer and is refused. Any other unversioned shape
+/// is proof of a writer that was not the broken one, so it is served.
+///
+/// Only a `List` column can hold such a payload — see [`PreVersionWriter`].
+fn is_pre_version_list_shape(elements: &[serde_json::Value]) -> bool {
+    matches!(elements, [serde_json::Value::Null])
+}
+
+/// Whether the pre-version writer could have stored anything under the column being read.
+///
+/// It had one list arm, for `ScalarValue::List`. `LargeList` and `FixedSizeList` values reached the
+/// unsupported-type path instead and never became rows, so a payload under one of those columns can
+/// only have come from a writer that serialized the list's real contents — including the one that
+/// encodes to a bare array of a single null. Applying the ambiguity there would refuse correct data
+/// for a collision that cannot have happened.
+#[derive(Clone, Copy)]
+enum PreVersionWriter {
+    /// A column type it stored, so its one ambiguous shape is undecidable here.
+    CouldHaveStored,
+    /// A column type it never stored, so no payload under this column is its output.
+    NeverStored,
+}
+
+/// Envelope member naming the [`LIST_ENCODING_VERSION`] a payload was written under.
+const LIST_ENCODING_VERSION_KEY: &str = "v";
+
+/// Envelope member holding a list payload's elements.
+const LIST_ENCODING_ELEMENTS_KEY: &str = "e";
+
+/// Serializes the elements of one list value for storage in a `TEXT` column, as a JSON envelope
+/// naming the encoding version the elements were written under.
 fn list_elements_to_json(
     elements: &ArrayRef,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -2309,7 +2356,17 @@ fn list_elements_to_json(
         )?)?);
     }
 
-    serde_json::to_string(&json_values)
+    let mut envelope = serde_json::Map::with_capacity(2);
+    envelope.insert(
+        LIST_ENCODING_VERSION_KEY.to_string(),
+        serde_json::Value::from(LIST_ENCODING_VERSION),
+    );
+    envelope.insert(
+        LIST_ENCODING_ELEMENTS_KEY.to_string(),
+        serde_json::Value::Array(json_values),
+    );
+
+    serde_json::to_string(&envelope)
         .map_err(|e| format!("Failed to serialize List as JSON: {e}").into())
 }
 
@@ -2398,13 +2455,121 @@ struct DecodedMaps {
     validity: Vec<bool>,
 }
 
+/// Dictionary-encodes `values` as `dictionary_type`, whose keys are `key_type`.
+///
+/// `arrow::compute::cast` packs only primitive, string and binary value types into a dictionary,
+/// so a dictionary over a list, map, boolean, duration or interval column that the write path
+/// stored without complaint would fail every scan with a raw `CastError`. This builds the array
+/// directly instead. Distinct values are found through the row format (see [`row_encodable`]),
+/// so the dictionary is as compact as `cast` makes one and the keys a scan needs grow with the
+/// distinct values, not the row count; a value type the row format cannot express at all gets
+/// one entry per row. Either way a NULL stays a NULL key, and a column with more entries than
+/// `key_type` can index is refused with an error that names the column and the key type rather
+/// than an Arrow-internal one.
+fn dictionary_encode(
+    values: &ArrayRef,
+    key_type: &DataType,
+    dictionary_type: &DataType,
+    column: &str,
+) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
+    let (keys, distinct): (Vec<Option<u64>>, ArrayRef) =
+        if let Some(encodable) = row_encodable(values) {
+            let rows = RowConverter::new(vec![SortField::new(encodable.data_type().clone())])?
+                .convert_columns(std::slice::from_ref(&encodable))?;
+            let rows: Vec<_> = rows.iter().collect();
+            let mut key_of_row: HashMap<&[u8], u64> = HashMap::new();
+            let mut distinct_indices: Vec<u64> = Vec::new();
+            let keys = (0..values.len())
+                .map(|index| {
+                    if values.is_null(index) {
+                        return None;
+                    }
+                    let next_key = distinct_indices.len() as u64;
+                    let key = *key_of_row.entry(rows[index].as_ref()).or_insert_with(|| {
+                        distinct_indices.push(index as u64);
+                        next_key
+                    });
+                    Some(key)
+                })
+                .collect();
+            let distinct = take(values.as_ref(), &UInt64Array::from(distinct_indices), None)?;
+            (keys, distinct)
+        } else {
+            let keys = (0..values.len())
+                .map(|index| (!values.is_null(index)).then_some(index as u64))
+                .collect();
+            (keys, Arc::clone(values))
+        };
+
+    let data = cast_with_options(
+        &UInt64Array::from(keys),
+        key_type,
+        &CastOptions {
+            safe: false,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| {
+        format!(
+            "Failed to read the dictionary column '{}' from Turso: its {} entries do not fit the {key_type} keys the column declares ({e}). \
+            Re-create the dataset with a wider dictionary key type, or accelerate it with a different engine. \
+            See: https://spiceai.org/docs/components/data-accelerators/turso",
+            column.escape_debug(),
+            distinct.len()
+        )
+    })?
+    .to_data()
+    .into_builder()
+    .data_type(dictionary_type.clone())
+    .add_child_data(distinct.to_data())
+    .build()?;
+    Ok(make_array(data))
+}
+
+/// The array whose rows stand in for `values` in the row format: `values` itself where the row
+/// format supports its type, a map as the list of entry structs it is stored as (the row format
+/// encodes lists and structs but not maps), or `None` when neither is encodable.
+///
+/// Re-reading a map as a list is exact: a `MapArray` is a `ListArray` of its entries with a
+/// different type tag, so equal maps encode to equal rows and different maps to different ones.
+fn row_encodable(values: &ArrayRef) -> Option<ArrayRef> {
+    let supports = |array: &ArrayRef| {
+        RowConverter::supports_fields(&[SortField::new(array.data_type().clone())])
+    };
+    if supports(values) {
+        return Some(Arc::clone(values));
+    }
+    let DataType::Map(entries_field, _) = values.data_type() else {
+        return None;
+    };
+    let map = values.as_any().downcast_ref::<MapArray>()?;
+    let entries: ArrayRef = Arc::new(map.entries().clone());
+    let list: ArrayRef = Arc::new(
+        GenericListArray::<i32>::try_new(
+            Arc::clone(entries_field),
+            map.offsets().clone(),
+            entries,
+            map.nulls().cloned(),
+        )
+        .ok()?,
+    );
+    supports(&list).then_some(list)
+}
+
 /// Rebuilds a `List` or `LargeList` column, which differ only in the width of their offsets.
 fn list_column<O: OffsetSizeTrait>(
     rows: &[Vec<TursoValue>],
     col_idx: usize,
     element_field: &FieldRef,
 ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
-    let decoded = decode_stored_lists(rows, col_idx, element_field)?;
+    // 32-bit offsets are a `List`, which the pre-version writer stored; 64-bit offsets are a
+    // `LargeList`, which it did not.
+    let pre_version_writer = if O::IS_LARGE {
+        PreVersionWriter::NeverStored
+    } else {
+        PreVersionWriter::CouldHaveStored
+    };
+    let decoded = decode_stored_lists(rows, col_idx, element_field, pre_version_writer)?;
     Ok(Arc::new(GenericListArray::<O>::try_new(
         Arc::clone(element_field),
         OffsetBuffer::from_lengths(decoded.lengths),
@@ -2419,14 +2584,21 @@ fn decode_stored_lists(
     rows: &[Vec<TursoValue>],
     col_idx: usize,
     element_field: &FieldRef,
+    pre_version_writer: PreVersionWriter,
 ) -> Result<DecodedLists, Box<dyn std::error::Error + Send + Sync>> {
     let element_type = element_field.data_type();
     let mut elements: Vec<ScalarValue> = Vec::new();
     let mut lengths = Vec::with_capacity(rows.len());
     let mut validity = Vec::with_capacity(rows.len());
+    let mut refusals = ListRefusals::default();
 
     for row in rows {
-        if let Some(values) = decode_stored_list_row(row.get(col_idx), element_type) {
+        if let Some(values) = decode_stored_list_row(
+            row.get(col_idx),
+            element_type,
+            pre_version_writer,
+            &mut refusals,
+        ) {
             lengths.push(values.len());
             validity.push(true);
             elements.extend(values);
@@ -2435,6 +2607,8 @@ fn decode_stored_lists(
             validity.push(false);
         }
     }
+
+    warn_on_refused_list_payloads(&refusals);
 
     Ok(DecodedLists {
         elements: scalars_to_array(elements, element_type)?,
@@ -2463,10 +2637,17 @@ fn decode_stored_fixed_size_lists(
     // rows and let the element vector grow, rather than trusting `rows * width` as a capacity.
     let mut elements: Vec<ScalarValue> = Vec::with_capacity(rows.len());
     let mut validity = Vec::with_capacity(rows.len());
+    let mut refusals = ListRefusals::default();
 
     for row in rows {
-        if let Some(values) = decode_stored_list_row(row.get(col_idx), element_type)
-            .filter(|values| values.len() == slots)
+        if let Some(values) = decode_stored_list_row(
+            row.get(col_idx),
+            element_type,
+            // The pre-version writer never stored a `FixedSizeList`.
+            PreVersionWriter::NeverStored,
+            &mut refusals,
+        )
+        .filter(|values| values.len() == slots)
         {
             validity.push(true);
             elements.extend(values);
@@ -2476,6 +2657,8 @@ fn decode_stored_fixed_size_lists(
             elements.extend(std::iter::repeat_n(unset.clone(), slots));
         }
     }
+
+    warn_on_refused_list_payloads(&refusals);
 
     Ok(DecodedFixedSizeLists {
         elements: scalars_to_array(elements, element_type)?,
@@ -2519,20 +2702,125 @@ fn decode_stored_maps(
     })
 }
 
-/// The elements of one stored list, or `None` if nothing was stored for it or it does not decode as
-/// a JSON array of the declared element type.
+/// What a stored list payload turns out to be, decided in one parse so that a refused cell can say
+/// why without the payload being read twice.
+enum StoredListPayload {
+    /// Elements to decode as the column's element type.
+    Elements(Vec<serde_json::Value>),
+    /// An unversioned payload of the one shape the broken writer produced, under a column that
+    /// writer stored — see [`is_pre_version_list_shape`] and [`PreVersionWriter`]. Undecidable, so
+    /// refused.
+    AmbiguousPreVersion,
+    /// An envelope naming an encoding version this build does not write, so its shape is not one
+    /// this reader knows how to interpret.
+    UnknownVersion,
+    /// Not a list payload this reader recognises at all.
+    Unreadable,
+}
+
+/// Decides what a stored list payload is.
+///
+/// An envelope is served when it names [`LIST_ENCODING_VERSION`]. A bare array carries no version,
+/// so it predates the marker — but that alone does not condemn it: the broken writer emitted exactly
+/// one shape, so only that shape is ambiguous and every other bare array is provably from a writer
+/// that serialized the list's real contents. Refusing all of them would discard correct data to no
+/// benefit.
+///
+/// The same argument bounds which columns the ambiguity applies to at all: under a column the broken
+/// writer never stored, even that one shape is unambiguous. `pre_version_writer` carries which kind
+/// of column this is — see [`PreVersionWriter`].
+fn classify_stored_list(json: &str, pre_version_writer: PreVersionWriter) -> StoredListPayload {
+    match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(serde_json::Value::Object(mut envelope)) => {
+            let version = envelope
+                .get(LIST_ENCODING_VERSION_KEY)
+                .and_then(serde_json::Value::as_u64);
+            if version != Some(LIST_ENCODING_VERSION) {
+                return StoredListPayload::UnknownVersion;
+            }
+            match envelope.remove(LIST_ENCODING_ELEMENTS_KEY) {
+                Some(serde_json::Value::Array(elements)) => StoredListPayload::Elements(elements),
+                // Claims a version whose shape it does not have, so it is corrupt rather than
+                // written under a rule this reader could apply.
+                _ => StoredListPayload::Unreadable,
+            }
+        }
+        Ok(serde_json::Value::Array(elements)) => match pre_version_writer {
+            PreVersionWriter::CouldHaveStored if is_pre_version_list_shape(&elements) => {
+                StoredListPayload::AmbiguousPreVersion
+            }
+            _ => StoredListPayload::Elements(elements),
+        },
+        _ => StoredListPayload::Unreadable,
+    }
+}
+
+/// Per-column tally of stored list cells refused for a reason an operator can act on.
+///
+/// Counted rather than logged per row so a scan reports once instead of once per cell.
+#[derive(Default)]
+struct ListRefusals {
+    /// Payloads of the shape the broken writer produced, which cannot be attributed.
+    ambiguous_pre_version: usize,
+    /// Payloads written under an encoding version newer than this build's.
+    unknown_version: usize,
+}
+
+/// The elements of one stored list, or `None` if nothing was stored for it, it cannot be
+/// attributed, or it does not decode as the declared element type.
+///
+/// Records the refusals worth reporting in `refusals`; a payload that is simply unreadable is not
+/// one of them, because the existing conversion-failure WARN already covers it as drift.
 fn decode_stored_list_row(
     stored: Option<&TursoValue>,
     element_type: &DataType,
+    pre_version_writer: PreVersionWriter,
+    refusals: &mut ListRefusals,
 ) -> Option<Vec<ScalarValue>> {
     let Some(TursoValue::Text(json)) = stored else {
         return None;
     };
-    let elements: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
+    let elements = match classify_stored_list(json, pre_version_writer) {
+        StoredListPayload::Elements(elements) => elements,
+        StoredListPayload::AmbiguousPreVersion => {
+            refusals.ambiguous_pre_version += 1;
+            return None;
+        }
+        StoredListPayload::UnknownVersion => {
+            refusals.unknown_version += 1;
+            return None;
+        }
+        StoredListPayload::Unreadable => return None,
+    };
     elements
         .iter()
         .map(|element| json_value_to_scalar(element, element_type))
         .collect()
+}
+
+/// Emits one WARN per refusal reason a scanned list column hit, each naming its own remedy.
+///
+/// Separate from the per-scan conversion-failure WARN, which reports the same cells as type drift.
+/// These say what actually happened and what fixes it.
+fn warn_on_refused_list_payloads(refusals: &ListRefusals) {
+    if refusals.ambiguous_pre_version > 0 {
+        let count = refusals.ambiguous_pre_version;
+        tracing::warn!(
+            "Turso read: {count} stored list value(s) hold the single-null payload that a build \
+             predating the list encoding version wrote for every list, whatever the list held. \
+             That is also what a list genuinely holding one null looks like, so these cannot be \
+             attributed and were returned as NULL rather than served. Refresh this dataset to \
+             rebuild them."
+        );
+    }
+    if refusals.unknown_version > 0 {
+        let count = refusals.unknown_version;
+        tracing::warn!(
+            "Turso read: {count} stored list value(s) name a list encoding version this build does \
+             not write, and were returned as NULL. This acceleration was written by a newer build \
+             than the one reading it: upgrade this build, or refresh the dataset to rewrite them."
+        );
+    }
 }
 
 /// The entries of one stored map, or `None` if nothing was stored for it or it does not decode as a
@@ -2796,10 +3084,10 @@ impl VisitorMut for TursoBetweenVisitor {
 mod tests {
     use super::*;
     use arrow::array::{
-        ArrayRef, Int32Builder, Int64Array, Int64Builder, ListBuilder, MapBuilder, StringArray,
-        StringBuilder,
+        ArrayRef, DictionaryArray, FixedSizeListBuilder, Int32Builder, Int64Array, Int64Builder,
+        ListArray, ListBuilder, MapBuilder, StringArray, StringBuilder,
     };
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Int8Type, Schema};
     use datafusion::datasource::sink::DataSink;
     use datafusion::physical_plan::memory::MemoryStream;
     use datafusion::sql::sqlparser::parser::Parser;
@@ -3505,6 +3793,15 @@ mod tests {
         };
         assert_eq!(millis, 5_000, "5s should convert to 5000ms");
     }
+    /// The map `{"k": 1}` as a one-row `Utf8` to `Int64` map scalar.
+    fn single_entry_map() -> ScalarValue {
+        let mut map = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        map.keys().append_value("k");
+        map.values().append_value(1);
+        map.append(true).expect("map row should append");
+        ScalarValue::Map(Arc::new(map.finish()))
+    }
+
     /// Builds a `ScalarValue::List` holding one list of nullable `Int32` elements.
     fn int32_list_scalar(elements: Vec<Option<i32>>) -> ScalarValue {
         let mut builder = ListBuilder::new(Int32Builder::new());
@@ -3513,6 +3810,20 @@ mod tests {
         }
         builder.append(true);
         ScalarValue::List(Arc::new(builder.finish()))
+    }
+
+    /// The stored form of a list payload written under the current encoding version.
+    ///
+    /// Built rather than written as a literal so that a test asserts the envelope's shape without
+    /// depending on the member order `serde_json::Map` happens to keep — see [`stored_json`].
+    fn list_envelope(elements: serde_json::Value) -> serde_json::Value {
+        let mut envelope = serde_json::Map::with_capacity(2);
+        envelope.insert(
+            LIST_ENCODING_VERSION_KEY.to_string(),
+            serde_json::Value::from(LIST_ENCODING_VERSION),
+        );
+        envelope.insert(LIST_ENCODING_ELEMENTS_KEY.to_string(), elements);
+        serde_json::Value::Object(envelope)
     }
 
     /// Regression test for #12628: a list scalar wraps its elements in a one-row array, so
@@ -3526,8 +3837,8 @@ mod tests {
         .expect("an Int32 list should convert");
 
         assert_eq!(
-            value,
-            TursoValue::Text("[1,2,3]".to_string()),
+            stored_json(&value),
+            list_envelope(serde_json::json!([1, 2, 3])),
             "the list's elements should be serialized, not the wrapper array"
         );
     }
@@ -3541,7 +3852,10 @@ mod tests {
         )
         .expect("a list with a null element should convert");
 
-        assert_eq!(value, TursoValue::Text("[1,null,3]".to_string()));
+        assert_eq!(
+            stored_json(&value),
+            list_envelope(serde_json::json!([1, null, 3]))
+        );
     }
 
     /// An empty list is distinct from a null list.
@@ -3550,7 +3864,215 @@ mod tests {
         let value = scalar_value_to_turso(int32_list_scalar(vec![]), TimestampFormat::default())
             .expect("an empty list should convert");
 
-        assert_eq!(value, TursoValue::Text("[]".to_string()));
+        assert_eq!(stored_json(&value), list_envelope(serde_json::json!([])));
+    }
+
+    /// The `List<Int32>` type the stored-payload tests below read against.
+    fn int32_list_type() -> DataType {
+        DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
+    }
+
+    /// Reads one already-stored value back as the declared type, the way a scan does — the entry
+    /// point a payload written by an older build arrives through.
+    fn read_stored(stored: TursoValue, data_type: DataType) -> ArrayRef {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("c", data_type, true)]));
+        let batch = TursoTableProvider::values_to_record_batch(&[vec![stored]], &schema)
+            .expect("the stored value should be readable");
+        Arc::clone(batch.column(0))
+    }
+
+    /// Regression test for #12632: a `mode: file` acceleration keeps its payloads across an
+    /// upgrade, and every list the pre-#12628 writer stored is the literal single-null array,
+    /// whatever the list held. Reading that as a one-element list holding null serves a value the
+    /// source never had — and stops warning about it, because it now parses.
+    #[test]
+    fn test_an_ambiguous_pre_version_list_payload_is_not_served_as_data() {
+        let column = read_stored(TursoValue::Text("[null]".to_string()), int32_list_type());
+
+        assert!(
+            column.is_null(0),
+            "the one payload shape the broken writer produced should read as NULL, not as a \
+             one-element list holding null"
+        );
+    }
+
+    /// The refusal is confined to the one ambiguous shape. An unversioned payload holding anything
+    /// else could not have come from the broken writer — that writer emitted a single null for
+    /// every list — so it is real data and must still be served, rather than being discarded for
+    /// merely predating the marker.
+    #[test]
+    fn test_an_unversioned_list_payload_holding_contents_is_still_served() {
+        let mut expected = ListBuilder::new(Int32Builder::new());
+        for element in [1, 2, 3] {
+            expected.values().append_value(element);
+        }
+        expected.append(true);
+        let expected = ScalarValue::List(Arc::new(expected.finish()))
+            .to_array()
+            .expect("the list should build an array");
+
+        assert_eq!(
+            read_stored(TursoValue::Text("[1,2,3]".to_string()), int32_list_type()).as_ref(),
+            expected.as_ref(),
+            "an unversioned payload the broken writer could not have produced should be served"
+        );
+    }
+
+    /// An unversioned empty list is in the same class: the broken writer wrote a single null even
+    /// for an empty list, so a stored empty array is proof of a writer that was not it.
+    #[test]
+    fn test_an_unversioned_empty_list_payload_is_still_served() {
+        let column = read_stored(TursoValue::Text("[]".to_string()), int32_list_type());
+
+        assert!(
+            !column.is_null(0),
+            "an unversioned empty list should be served, not refused for lacking a version"
+        );
+        assert_eq!(column.len(), 1, "the batch should hold the one row read");
+    }
+
+    /// The other half of the same rule: a list of one null written by the *current* encoder is
+    /// real data and must survive. Without the version marker this is the same stored text as the
+    /// corrupt payload above, which is why the marker exists.
+    #[test]
+    fn test_a_versioned_single_null_list_still_reads_back() {
+        assert_round_trips(&int32_list_scalar(vec![None]));
+    }
+
+    /// A refused payload is a non-NULL stored value that read as NULL, so the existing per-scan
+    /// conversion-failure WARN counts it. Nothing about the upgrade is silent.
+    #[test]
+    fn test_an_ambiguous_pre_version_list_payload_is_counted_as_a_conversion_failure() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("c", int32_list_type(), true)]));
+        let rows = vec![vec![TursoValue::Text("[null]".to_string())]];
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("the stored value should be readable");
+
+        assert_eq!(
+            TursoTableProvider::count_conversion_failures(&rows, &batch),
+            vec![1],
+            "a refused legacy payload should be reported, not counted as genuinely NULL"
+        );
+    }
+
+    /// The ambiguity is bounded by which columns the broken writer could have written, not only by
+    /// the payload's shape. It had one list arm, for `ScalarValue::List`; a `FixedSizeList` reached
+    /// the unsupported-type path and never became a row. So a single-null array under a fixed-size
+    /// column is the current encoder's output for a list that genuinely holds one null, and
+    /// refusing it would discard data on a collision that cannot have happened.
+    #[test]
+    fn test_a_single_null_fixed_size_list_payload_is_served_as_data() {
+        let column = read_stored(
+            TursoValue::Text("[null]".to_string()),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 1),
+        );
+
+        assert!(
+            !column.is_null(0),
+            "no payload under a fixed-size list column can be the broken writer's, so this is data"
+        );
+
+        let elements = column
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeListArray>()
+            .expect("the column should read back as a fixed-size list")
+            .value(0);
+        assert_eq!(elements.len(), 1, "the list should hold its one element");
+        assert!(
+            elements.is_null(0),
+            "that element is the null that was stored"
+        );
+    }
+
+    /// `LargeList` is in the same class as `FixedSizeList`, and for the same reason: the broken
+    /// writer had no arm for it either, so its single-null payload is data rather than a collision.
+    #[test]
+    fn test_a_single_null_large_list_payload_is_served_as_data() {
+        let column = read_stored(
+            TursoValue::Text("[null]".to_string()),
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Int32, true))),
+        );
+
+        assert!(
+            !column.is_null(0),
+            "no payload under a large list column can be the broken writer's, so this is data"
+        );
+
+        let elements = column
+            .as_any()
+            .downcast_ref::<arrow::array::LargeListArray>()
+            .expect("the column should read back as a large list")
+            .value(0);
+        assert_eq!(elements.len(), 1, "the list should hold its one element");
+        assert!(
+            elements.is_null(0),
+            "that element is the null that was stored"
+        );
+    }
+
+    /// A payload naming a version this build does not write is refused rather than read under the
+    /// current rules, so a file written by a newer build cannot be misread by an older one.
+    #[test]
+    fn test_a_list_envelope_of_another_version_is_not_served() {
+        let stored = serde_json::json!({
+            LIST_ENCODING_VERSION_KEY: LIST_ENCODING_VERSION + 1,
+            LIST_ENCODING_ELEMENTS_KEY: [1, 2, 3],
+        })
+        .to_string();
+
+        assert!(
+            read_stored(TursoValue::Text(stored), int32_list_type()).is_null(0),
+            "an envelope naming an unknown encoding version should read as NULL"
+        );
+    }
+
+    /// The version must be the integer this build writes, not merely something that reads as one.
+    /// A float, a string, or a boolean in that member means the payload was not written by an
+    /// encoder this reader knows, so accepting any of them would serve a shape on a coincidence.
+    #[test]
+    fn test_a_list_envelope_whose_version_is_not_an_integer_is_not_served() {
+        for version in [
+            serde_json::json!(1.0),
+            serde_json::json!("1"),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ] {
+            let mut envelope = serde_json::Map::with_capacity(2);
+            envelope.insert(LIST_ENCODING_VERSION_KEY.to_string(), version.clone());
+            envelope.insert(
+                LIST_ENCODING_ELEMENTS_KEY.to_string(),
+                serde_json::json!([1, 2, 3]),
+            );
+            let stored = serde_json::Value::Object(envelope).to_string();
+
+            assert!(
+                read_stored(TursoValue::Text(stored), int32_list_type()).is_null(0),
+                "an envelope whose version member is {version} should read as NULL"
+            );
+        }
+    }
+
+    /// An envelope whose elements member is missing or is not an array names a version whose shape
+    /// it does not have, so it is refused rather than read as an empty list.
+    #[test]
+    fn test_a_list_envelope_without_an_elements_array_is_not_served() {
+        for elements in [None, Some(serde_json::json!(7))] {
+            let mut envelope = serde_json::Map::with_capacity(2);
+            envelope.insert(
+                LIST_ENCODING_VERSION_KEY.to_string(),
+                serde_json::Value::from(LIST_ENCODING_VERSION),
+            );
+            if let Some(elements) = &elements {
+                envelope.insert(LIST_ENCODING_ELEMENTS_KEY.to_string(), elements.clone());
+            }
+            let stored = serde_json::Value::Object(envelope).to_string();
+
+            assert!(
+                read_stored(TursoValue::Text(stored), int32_list_type()).is_null(0),
+                "an envelope with elements {elements:?} should read as NULL"
+            );
+        }
     }
 
     /// A null list is SQL NULL, not the text `[]`.
@@ -3582,7 +4104,10 @@ mod tests {
         )
         .expect("a Float64 list should convert");
 
-        assert_eq!(value, TursoValue::Text("[1.5,-2.25]".to_string()));
+        assert_eq!(
+            stored_json(&value),
+            list_envelope(serde_json::json!([1.5, -2.25]))
+        );
     }
 
     /// `LargeList` and `FixedSizeList` are declared `TEXT` by the accelerator's DDL, so they have
@@ -3598,7 +4123,10 @@ mod tests {
             TimestampFormat::default(),
         )
         .expect("a LargeList should convert");
-        assert_eq!(large_value, TursoValue::Text("[7,8]".to_string()));
+        assert_eq!(
+            stored_json(&large_value),
+            list_envelope(serde_json::json!([7, 8]))
+        );
 
         let mut fixed = arrow::array::FixedSizeListBuilder::new(Int32Builder::new(), 2);
         fixed.values().append_value(9);
@@ -3609,7 +4137,10 @@ mod tests {
             TimestampFormat::default(),
         )
         .expect("a FixedSizeList should convert");
-        assert_eq!(fixed_value, TursoValue::Text("[9,10]".to_string()));
+        assert_eq!(
+            stored_json(&fixed_value),
+            list_envelope(serde_json::json!([9, 10]))
+        );
     }
 
     /// A non-finite float has no JSON form; `serde_json` encodes it as `null`, which would be
@@ -3846,11 +4377,15 @@ mod tests {
             stored.push(row.get_value(0).expect("tags should be present"));
         }
 
+        let [tags_row, null_row] = stored.as_slice() else {
+            panic!("both written rows should be stored, got {stored:?}");
+        };
         assert_eq!(
-            stored,
-            vec![TursoValue::Text("[10,20]".to_string()), TursoValue::Null],
-            "the list's elements should be stored, and a null list should stay NULL"
+            stored_json(tags_row),
+            list_envelope(serde_json::json!([10, 20])),
+            "the list's elements should be stored"
         );
+        assert_eq!(*null_row, TursoValue::Null, "a null list should stay NULL");
     }
     /// The read path pairs with the write path: a stored list whose element is null must come back
     /// as a list holding a null, not as a null list.
@@ -4127,6 +4662,171 @@ mod tests {
             .expect("a dictionary column should be readable");
         assert!(batch.column(0).is_valid(0));
         assert!(batch.column(0).is_null(1), "a NULL should stay NULL");
+    }
+
+    /// A dictionary over a nested, boolean, duration or interval value type round-trips. `cast`
+    /// cannot dictionary-pack any of those value types, so the reader has to build the dictionary
+    /// itself; a column it could not would write without error and never read back.
+    #[test]
+    fn test_values_to_record_batch_reads_a_dictionary_over_each_unpackable_value_type() {
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(int32_list_scalar(vec![Some(7)])),
+        ));
+
+        let mut fixed = FixedSizeListBuilder::new(Int32Builder::new(), 2);
+        fixed.values().append_value(1);
+        fixed.values().append_value(2);
+        fixed.append(true);
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::UInt8),
+            Box::new(ScalarValue::FixedSizeList(Arc::new(fixed.finish()))),
+        ));
+
+        // The row format cannot encode a map; it is re-read as the list of entry structs it is.
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(single_entry_map()),
+        ));
+
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::Int16),
+            Box::new(ScalarValue::Boolean(Some(true))),
+        ));
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::DurationMillisecond(Some(1_500))),
+        ));
+        assert_round_trips(&ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::IntervalYearMonth(Some(14))),
+        ));
+    }
+
+    /// Rows holding the same value share one dictionary entry, a NULL stays a NULL key, and the
+    /// keys are built as the type the column declares.
+    #[test]
+    fn test_values_to_record_batch_dictionary_encodes_repeated_nested_values_once() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Int32,
+                    true,
+                )))),
+            ),
+            true,
+        )]));
+        let stored = |elements: Vec<Option<i32>>| {
+            scalar_value_to_turso(int32_list_scalar(elements), TimestampFormat::default())
+                .expect("a list should be storable")
+        };
+        let rows = vec![
+            vec![stored(vec![Some(1), Some(2)])],
+            vec![stored(vec![Some(3)])],
+            vec![stored(vec![Some(1), Some(2)])],
+            vec![TursoValue::Null],
+        ];
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("a dictionary of lists should be readable");
+
+        let dictionary = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int8Type>>()
+            .expect("column should be a dictionary with the declared Int8 keys");
+        let values = dictionary
+            .values()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("dictionary values should be lists");
+        assert_eq!(
+            values.len(),
+            2,
+            "two distinct lists should make two entries"
+        );
+        assert_eq!(
+            dictionary.keys().value(0),
+            dictionary.keys().value(2),
+            "equal lists should share an entry"
+        );
+        assert_ne!(dictionary.keys().value(0), dictionary.keys().value(1));
+        assert!(dictionary.is_null(3), "a NULL should stay NULL");
+        let first_key =
+            usize::try_from(dictionary.keys().value(0)).expect("a key should index the values");
+        let first = values.value(first_key);
+        let elements = first
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("elements should be Int32");
+        assert_eq!(elements.values(), &[1, 2]);
+    }
+
+    /// Equal maps share one dictionary entry too, so the keys a scan needs grow with the distinct
+    /// maps rather than with the rows: a run of NULLs and repeated maps longer than the key type's
+    /// range reads back, where one key per row would have overflowed it.
+    #[test]
+    fn test_values_to_record_batch_dictionary_of_maps_shares_entries_past_the_key_range() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(single_entry_map().data_type()),
+            ),
+            true,
+        )]));
+        let stored = scalar_value_to_turso(single_entry_map(), TimestampFormat::default())
+            .expect("a map should be storable");
+        // 128 NULL rows push every later row position past an Int8 key, then 129 equal maps.
+        let rows: Vec<Vec<TursoValue>> = std::iter::repeat_n(vec![TursoValue::Null], 128)
+            .chain(std::iter::repeat_n(vec![stored], 129))
+            .collect();
+
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema)
+            .expect("repeated maps need one key, however many rows hold them");
+
+        let dictionary = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int8Type>>()
+            .expect("column should be a dictionary with the declared Int8 keys");
+        assert_eq!(
+            dictionary.values().len(),
+            1,
+            "equal maps should share one entry"
+        );
+        assert!(dictionary.is_null(0) && dictionary.is_null(127));
+        assert!(dictionary.is_valid(128) && dictionary.is_valid(256));
+        assert_eq!(dictionary.keys().value(128), dictionary.keys().value(256));
+    }
+
+    /// A column with more distinct values than its declared key type can index is refused with an
+    /// error that names the key type, not with an Arrow-internal message.
+    #[test]
+    fn test_values_to_record_batch_names_a_dictionary_whose_keys_overflow() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        // Int8 keys index 128 entries; one more distinct value has nowhere to go.
+        let rows: Vec<Vec<TursoValue>> = (0..129)
+            .map(|i| vec![TursoValue::Text(format!("v{i}"))])
+            .collect();
+
+        let Err(e) = TursoTableProvider::values_to_record_batch(&rows, &schema) else {
+            panic!("129 distinct values cannot be indexed by Int8 keys");
+        };
+        let message = e.to_string();
+        assert!(
+            message.contains("column 'c'")
+                && message.contains("Int8")
+                && message.contains("129 entries"),
+            "the error should name the column, the key type and the entry count: {message}"
+        );
     }
 
     /// `FixedSizeBinary` had no arm, and a blob of another width cannot fill the cell.

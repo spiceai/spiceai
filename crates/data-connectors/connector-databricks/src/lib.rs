@@ -249,6 +249,9 @@ pub const PARAMETERS: &[ParameterSpec] = &[
 /// Databricks data connector.
 pub struct Databricks {
     read_provider: Arc<dyn Read>,
+    /// SQL warehouse metadata lookup used to reject foreign tables on Classic
+    /// warehouses before schema discovery reports them as queryable.
+    sql_warehouse_type_provider: Option<Arc<dyn SqlWarehouseTypeProvider>>,
     initialization: ComponentInitialization,
     metrics: Option<Arc<DatabricksMetrics>>,
     /// Unity Catalog client for table type detection and permission checking.
@@ -264,6 +267,18 @@ pub struct Databricks {
     /// build the storage URL fragment understood by `SpiceObjectStoreRegistry`.
     /// Present only in `delta_lake` mode.
     storage_params: Option<Parameters>,
+}
+
+#[async_trait]
+trait SqlWarehouseTypeProvider: Send + Sync {
+    async fn is_classic_warehouse(&self) -> Result<bool, sql_warehouse::Error>;
+}
+
+#[async_trait]
+impl SqlWarehouseTypeProvider for DatabricksSqlWarehouse {
+    async fn is_classic_warehouse(&self) -> Result<bool, sql_warehouse::Error> {
+        DatabricksSqlWarehouse::is_classic_warehouse(self).await
+    }
 }
 
 impl std::fmt::Debug for Databricks {
@@ -362,7 +377,7 @@ impl Databricks {
                         Arc::new(data_components::schema_discovery::NoPermissionsCheck)
                     };
 
-                let read_provider =
+                let read_provider = Arc::new(
                     DatabricksSqlWarehouse::with_config_semaphore_permissions_and_rate_controller(
                         endpoint,
                         sql_warehouse_id,
@@ -372,11 +387,13 @@ impl Databricks {
                         permissions,
                         rate_controller,
                     )
-                    .context(UnableToConstructDatabricksSqlWarehouseSnafu)?;
+                    .context(UnableToConstructDatabricksSqlWarehouseSnafu)?,
+                );
                 let metrics = Some(Arc::clone(read_provider.metrics()));
 
                 Ok(Self {
-                    read_provider: Arc::new(read_provider),
+                    read_provider: Arc::clone(&read_provider) as Arc<dyn Read>,
+                    sql_warehouse_type_provider: Some(read_provider),
                     initialization,
                     metrics,
                     uc_client,
@@ -442,6 +459,7 @@ impl Databricks {
 
                 Ok(Self {
                     read_provider: Arc::clone(&delta_provider) as Arc<dyn Read>,
+                    sql_warehouse_type_provider: None,
                     initialization,
                     metrics: None,
                     uc_client,
@@ -598,6 +616,7 @@ impl Databricks {
 
         Ok(Self {
             read_provider,
+            sql_warehouse_type_provider: None,
 
             // Databricks spark connect doesn't support U2M, so no deferred loading
             initialization: ComponentInitialization::default(),
@@ -686,7 +705,7 @@ impl Databricks {
                         dataconnector: "databricks".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
                         message: format!(
-                            "Unsupported Unity Catalog table type '{}' for table '{}'. Only MANAGED, EXTERNAL, FOREIGN, and MATERIALIZED_VIEW tables can be queried.",
+                            "Unsupported Unity Catalog table type '{}' for table '{}'. Only MANAGED, EXTERNAL, FOREIGN, VIEW, MATERIALIZED_VIEW, and STREAMING_TABLE tables can be queried.",
                             uc_table.table_type, full_name
                         ),
                     });
@@ -696,6 +715,31 @@ impl Databricks {
                     table_type = %uc_table.table_type,
                     "Unity Catalog table type is supported"
                 );
+
+                if uc_table.table_type.eq_ignore_ascii_case("FOREIGN")
+                    && let Some(provider) = &self.sql_warehouse_type_provider
+                {
+                    match provider.is_classic_warehouse().await {
+                        Ok(true) => {
+                            return Err(classify_table_provider_error(
+                                dataset,
+                                Box::new(sql_warehouse::Error::ForeignTableOnClassicWarehouse {
+                                    dataset_name: full_name,
+                                    message: "Unity Catalog reports a FOREIGN table and the configured SQL warehouse is Classic"
+                                        .to_string(),
+                                }),
+                            ));
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                table = %full_name,
+                                %error,
+                                "Failed to determine SQL warehouse type for a foreign table; proceeding with schema discovery"
+                            );
+                        }
+                    }
+                }
 
                 if uc_table.requires_read_permission_validation() {
                     true
@@ -1457,6 +1501,17 @@ mod tests {
         }
     }
 
+    struct MockSqlWarehouseTypeProvider {
+        is_classic: bool,
+    }
+
+    #[async_trait]
+    impl SqlWarehouseTypeProvider for MockSqlWarehouseTypeProvider {
+        async fn is_classic_warehouse(&self) -> Result<bool, sql_warehouse::Error> {
+            Ok(self.is_classic)
+        }
+    }
+
     #[derive(Clone)]
     struct MockHttpResponse {
         status_line: &'static str,
@@ -1608,6 +1663,14 @@ mod tests {
         dataset_from: &str,
         responses: Vec<MockHttpResponse>,
     ) -> (DataConnectorResult<()>, usize, usize, Vec<String>) {
+        run_read_provider_with_uc_responses_and_warehouse_type(dataset_from, responses, None).await
+    }
+
+    async fn run_read_provider_with_uc_responses_and_warehouse_type(
+        dataset_from: &str,
+        responses: Vec<MockHttpResponse>,
+        sql_warehouse_type_provider: Option<Arc<dyn SqlWarehouseTypeProvider>>,
+    ) -> (DataConnectorResult<()>, usize, usize, Vec<String>) {
         let (endpoint, requests, captured_requests) = start_mock_server(responses).await;
 
         let read_call_count = Arc::new(AtomicUsize::new(0));
@@ -1615,6 +1678,7 @@ mod tests {
             read_provider: Arc::new(MockRead {
                 call_count: Arc::clone(&read_call_count),
             }),
+            sql_warehouse_type_provider,
             initialization: ComponentInitialization::default(),
             metrics: None,
             uc_client: Some(Arc::new(
@@ -2034,12 +2098,13 @@ mod tests {
     #[tokio::test]
     async fn test_read_provider_skips_effective_permissions_for_foreign_tables() {
         let (result, read_call_count, request_count, captured_requests) =
-            run_read_provider_with_uc_responses(
+            run_read_provider_with_uc_responses_and_warehouse_type(
                 "databricks:workspace.tpch_sf400.part",
                 vec![MockHttpResponse::json(
                     "200 OK",
                     r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"FOREIGN","data_source_format":"DELTA","columns":[],"storage_location":null}"#,
                 )],
+                Some(Arc::new(MockSqlWarehouseTypeProvider { is_classic: false })),
             )
             .await;
 
@@ -2063,13 +2128,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_provider_rejects_foreign_table_on_classic_before_schema_discovery() {
+        let (result, read_call_count, request_count, captured_requests) =
+            run_read_provider_with_uc_responses_and_warehouse_type(
+                "databricks:workspace.tpch_sf400.part",
+                vec![MockHttpResponse::json(
+                    "200 OK",
+                    r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"FOREIGN","data_source_format":"DELTA","columns":[],"storage_location":null}"#,
+                )],
+                Some(Arc::new(MockSqlWarehouseTypeProvider { is_classic: true })),
+            )
+            .await;
+
+        let error = result.expect_err("Classic warehouses cannot query foreign tables");
+        assert!(
+            matches!(error, DataConnectorError::InvalidConfigurationNoSource { ref message, .. } if message.contains("Lakehouse Federation foreign table")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            read_call_count, 0,
+            "schema discovery should not run for a foreign table on Classic"
+        );
+        assert_eq!(request_count, 1, "only the UC table lookup should run");
+        assert_request_seen(&captured_requests, "/api/2.1/unity-catalog/tables/");
+        assert_request_not_seen(
+            &captured_requests,
+            "/api/2.1/unity-catalog/effective-permissions/table/",
+        );
+    }
+
+    /// Streaming tables and views are plain `SELECT` targets on a SQL
+    /// warehouse, so the read must proceed to the permission check and the
+    /// warehouse instead of being rejected up front.
+    #[tokio::test]
+    async fn test_read_provider_accepts_streaming_tables_and_views() {
+        for table_type in ["STREAMING_TABLE", "VIEW"] {
+            let (result, read_call_count, request_count, captured_requests) =
+                run_read_provider_with_uc_responses(
+                    "databricks:workspace.tpch_sf400.part",
+                    vec![
+                        MockHttpResponse::json(
+                            "200 OK",
+                            format!(
+                                r#"{{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"{table_type}","data_source_format":"DELTA","columns":[],"storage_location":null}}"#
+                            ),
+                        ),
+                        MockHttpResponse::json(
+                            "200 OK",
+                            r#"{"privilege_assignments":[{"principal":"analytics-team","privileges":[{"privilege":"SELECT"}]}]}"#,
+                        ),
+                    ],
+                )
+                .await;
+
+            if let Err(err) = &result {
+                panic!("{table_type} should be queryable through a SQL warehouse: {err}");
+            }
+            assert_eq!(
+                read_call_count, 1,
+                "{table_type}: expected the Databricks read to be attempted"
+            );
+            assert_eq!(
+                request_count, 2,
+                "{table_type}: expected table metadata and permission requests"
+            );
+            assert_request_seen(
+                &captured_requests,
+                "/api/2.1/unity-catalog/effective-permissions/table/",
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_read_provider_fails_for_unsupported_uc_table_types() {
         let (result, read_call_count, request_count, captured_requests) =
             run_read_provider_with_uc_responses(
                 "databricks:workspace.tpch_sf400.part",
                 vec![MockHttpResponse::json(
                     "200 OK",
-                    r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"VIEW","data_source_format":"VIEW","columns":[],"storage_location":null}"#,
+                    r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"METRIC_VIEW","data_source_format":"VIEW","columns":[],"storage_location":null}"#,
                 )],
             )
             .await;
@@ -2078,7 +2215,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("Unsupported Unity Catalog table type 'VIEW'"),
+                .contains("Unsupported Unity Catalog table type 'METRIC_VIEW'"),
             "unexpected error: {err}"
         );
         assert_eq!(

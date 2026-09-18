@@ -34,7 +34,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 
 use datafusion::prelude::*;
-use datafusion_common::DataFusionError;
+use datafusion_common::{DFSchema, DataFusionError};
 
 use std::sync::Arc;
 
@@ -738,3 +738,142 @@ async fn test_time_retention_keeps_null_timestamps_impl(
 }
 
 test_with_backends!(test_time_retention_keeps_null_timestamps_impl);
+
+/// Parse a `retention_sql` predicate containing `now()`, matching the
+/// expression stored on the table at open (not folded).
+fn parse_now_retention_filter(
+    schema: &Schema,
+    sql: &str,
+) -> Result<Expr, Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new();
+    let df_schema = DFSchema::try_from(schema.clone())?;
+    Ok(ctx.parse_sql_expr(sql, &df_schema)?)
+}
+
+/// Collect sorted `id` values from `table_name`.
+async fn query_ids(
+    runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    provider: Arc<dyn TableProvider>,
+    table_name: &str,
+) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime_env);
+    ctx.register_table(table_name, provider)?;
+    let df = ctx
+        .sql(&format!("SELECT id FROM {table_name} ORDER BY id"))
+        .await?;
+    let batches = df.collect().await?;
+    let mut ids = Vec::new();
+    for batch in &batches {
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column");
+        for i in 0..col.len() {
+            ids.push(col.value(i));
+        }
+    }
+    Ok(ids)
+}
+
+/// Stored `now()` retention filter must evict expired rows on the post-write
+/// pass without invoking `NowFunc` (`invoke should not be called on a
+/// simplified now() function`).
+async fn now_retention_sql_deletes_expired_impl(
+    fixture: TestFixture,
+    table_name: &str,
+    primary_key: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table_dir = fixture.data_path.join(table_name);
+    std::fs::create_dir_all(&table_dir)?;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "arrival_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+    ]));
+
+    let retention_expr =
+        parse_now_retention_filter(&schema, "arrival_time < now() - INTERVAL '1 hour'")?;
+
+    let table_options = CreateTableOptions {
+        table_name: table_name.to_string(),
+        schema: Arc::clone(&schema),
+        primary_key,
+        on_conflict: None,
+        base_path: table_dir.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig {
+            inline_max_rows: 0,
+            compaction_background_interval_ms: 0,
+            ..Default::default()
+        },
+    };
+
+    let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table_provider = Arc::new(
+        CayenneTableProvider::create_table_with_retention(
+            catalog_arc,
+            table_options,
+            vec![retention_expr],
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+    let old_us = now_us - 7_200_000_000; // 2h ago — past the 1h cutoff
+    for (id, ts) in [(1i64, old_us), (2i64, now_us)] {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![id])),
+                Arc::new(TimestampMicrosecondArray::from(vec![ts]).with_timezone("UTC")),
+            ],
+        )?;
+        let inserted = common::insert_batch(table_provider.as_ref(), batch).await?;
+        assert_eq!(inserted, 1, "Should insert 1 row for id={id}");
+    }
+
+    table_provider
+        .flush_pending_maintenance()
+        .await
+        .map_err(|err| {
+            format!("flush_pending_maintenance failed applying now() retention filter: {err}")
+        })?;
+
+    let ids = query_ids(
+        ctx.runtime_env(),
+        Arc::clone(&table_provider) as Arc<dyn TableProvider>,
+        table_name,
+    )
+    .await?;
+    assert_eq!(
+        ids,
+        vec![2],
+        "now() retention should delete the 2h-old row and keep the fresh row"
+    );
+
+    Ok(())
+}
+
+/// No-PK (position-based) path: `build_vortex_filter`.
+async fn test_now_retention_sql_deletes_expired_no_pk_impl(
+    fixture: TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    now_retention_sql_deletes_expired_impl(fixture, "now_ret_no_pk", vec![]).await
+}
+
+/// Int64 PK path: `build_physical_filters` (CDC / Saffron).
+async fn test_now_retention_sql_deletes_expired_pk_impl(
+    fixture: TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    now_retention_sql_deletes_expired_impl(fixture, "now_ret_pk", vec!["id".to_string()]).await
+}
+
+test_with_backends!(test_now_retention_sql_deletes_expired_no_pk_impl);
+test_with_backends!(test_now_retention_sql_deletes_expired_pk_impl);

@@ -25,9 +25,17 @@ use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
 
-/// Get a Command for the spice binary
+/// Get a Command for the spice binary.
+///
+/// `SPICED_PATH` is cleared. The CLI resolves the runtime from it and reports a
+/// pin that names nothing runnable as an error, so a developer or CI runner
+/// with one exported would otherwise make every assertion below a property of
+/// the host rather than of the CLI. A test that wants a pin sets one on the
+/// returned command.
 fn spice_cmd() -> Command {
-    cargo_bin_cmd!("spice")
+    let mut cmd = cargo_bin_cmd!("spice");
+    cmd.env_remove("SPICED_PATH");
+    cmd
 }
 
 // ============================================================================
@@ -44,6 +52,54 @@ mod version {
             .assert()
             .success()
             .stdout(predicate::str::contains("CLI version:"));
+    }
+
+    /// A `SPICED_PATH` naming something no runtime can be run from. Returned
+    /// with its `TempDir`, which has to outlive the command under test.
+    ///
+    /// A directory, not a file missing its execute bit: Windows carries no
+    /// execute bit, so a plain file is runnable there and the CLI would probe
+    /// it, report its version as unavailable and exit successfully — passing
+    /// the pin through the resolver these tests are asserting it is rejected
+    /// by. Being a directory fails `is_runnable_binary` on every platform.
+    fn unrunnable_pin() -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().expect("create tempdir");
+        let pin = dir.path().join("spiced");
+        fs::create_dir(&pin).expect("create the pin");
+        (dir, pin)
+    }
+
+    /// The pin survives the fixture's `env_remove`, and a pin that names
+    /// nothing runnable is reported instead of being silently ignored.
+    #[test]
+    fn a_pinned_runtime_that_is_not_runnable_is_reported_by_version() {
+        let (_dir, pin) = unrunnable_pin();
+
+        let mut cmd = spice_cmd();
+        cmd.env("SPICED_PATH", &pin)
+            .arg("version")
+            .assert()
+            .failure()
+            .stdout(predicate::str::contains("CLI version:"))
+            .stdout(predicate::str::contains("SPICED_PATH"))
+            .stdout(predicate::str::contains(pin.display().to_string()))
+            .stdout(predicate::str::contains("https://spiceai.org/docs/cli"));
+    }
+
+    /// The machine-readable form stays machine-readable when resolution
+    /// fails: stdout carries the JSON document or nothing at all, never the
+    /// human error, which a caller parsing `-o json` would choke on.
+    #[test]
+    fn a_failed_resolution_does_not_write_prose_into_json_output() {
+        let (_dir, pin) = unrunnable_pin();
+
+        let mut cmd = spice_cmd();
+        cmd.env("SPICED_PATH", &pin)
+            .args(["version", "-o", "json"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("SPICED_PATH"))
+            .stdout(predicate::str::is_empty().trim());
     }
 
     #[test]

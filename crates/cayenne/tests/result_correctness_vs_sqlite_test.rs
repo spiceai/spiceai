@@ -43,7 +43,7 @@ use support::report::{RunResult, summary_line};
 use support::sqlite_engine::{
     load_sqlite_from_batches, load_sqlite_from_parquet, sqlite_query_batches,
 };
-use support::ssb_data::{SSB_TABLES, ssb_queries, write_ssb_parquet};
+use support::ssb_data::{SSB_TABLES, ensure_ssb_fixture, ssb_queries};
 use support::{
     CayenneHarness, ParityOutcome, assert_all_pass_or_excluded, compare_actual_results,
     execute_cayenne, make_dim_batch, make_fact_batch, micro_bench_queries, write_parquet,
@@ -153,9 +153,7 @@ async fn ssb_full_result_parity_vs_sqlite() {
     eprintln!("SSB parity vs SQLite at scale={scale}");
 
     let ssb_dir = scratch.join(format!("ssb_scale{scale}"));
-    if !ssb_dir.join("lineorder.parquet").exists() {
-        write_ssb_parquet(&ssb_dir, scale);
-    }
+    ensure_ssb_fixture(&ssb_dir, scale);
 
     let mut cayenne = CayenneHarness::new().await;
     for table in SSB_TABLES {

@@ -638,7 +638,7 @@ impl DataSink for CayennePartitionedAppendSink {
             let mut total_rows: u64 = 0;
             for prep in prepared {
                 let table_id = prep.table_id().to_string();
-                prep.finish_deferred_snapshot_maintenance().await;
+                prep.finish_deferred_snapshot_maintenance();
                 match prep.finish().await {
                     Ok(rows) => total_rows = total_rows.saturating_add(rows),
                     Err(error) => {

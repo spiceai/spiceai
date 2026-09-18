@@ -107,6 +107,8 @@ mod databricks_spark_m2m;
 #[cfg(feature = "databricks")]
 mod databricks_sql_warehouse;
 #[cfg(feature = "databricks")]
+mod databricks_sql_warehouse_m2m;
+#[cfg(feature = "databricks")]
 mod databricks_sql_warehouse_permissions;
 mod dataset_availability;
 mod datasets_api;
@@ -153,6 +155,8 @@ mod odbc;
 #[cfg(feature = "oracle")]
 mod oracle;
 #[cfg(not(windows))]
+mod otel_ingest_races;
+#[cfg(not(windows))]
 mod otel_restart;
 mod plan_capture;
 #[cfg(feature = "postgres")]
@@ -169,6 +173,7 @@ mod results_cache;
 mod retention;
 mod s3;
 mod s3_location_pruning;
+mod s3_parquet_overwrite;
 #[cfg(any(
     feature = "postgres",
     feature = "duckdb",
@@ -323,6 +328,9 @@ where
             filters => vec![
                 // Normalize HTTP server ports: http://127.0.0.1:12345 → http://127.0.0.1:<PORT>
                 (r"http://127\.0\.0\.1:\d+", "http://127.0.0.1:<PORT>"),
+                // Spark Connect plans include Databricks connection details. Those identify
+                // the test fixture, not the plan being asserted.
+                (r"compute_context=sc://[^ ]+", "compute_context=<DATABRICKS_SPARK_CONNECT>"),
             ],
         }, {
             insta::assert_snapshot!(snapshot_name, explain_plan);

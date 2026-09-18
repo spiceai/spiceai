@@ -55,6 +55,7 @@ runtime = { path = "../../runtime" }
 app = { path = "../../app" }
 runtime-secrets = { path = "../../runtime-secrets", default-features = false }
 tokio.workspace = true
+wiremock = "0.6"
 
 [features]
 default = []

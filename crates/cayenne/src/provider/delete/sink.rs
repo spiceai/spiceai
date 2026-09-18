@@ -52,7 +52,9 @@ use super::super::deletion_strategy::{
     Int64PkDeletionSnapshot, PkDeletionStrategyWithCache, RowConverterDeletionSnapshot,
 };
 use super::super::memory_account::CayenneMemoryAccount;
+use super::super::pk_validation::null_primary_key_message;
 use super::super::utils::{bytes_key, convert_to_u64_box, i64_key};
+use super::filter_exec::{InsertRecordHandling, is_pk_visible_i64, is_pk_visible_row_key};
 use super::vector_io::DeletionVectorWriteResult;
 use super::vector_io::{
     DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter,
@@ -63,6 +65,7 @@ use crate::metadata::{DeleteFile, TableMetadata};
 use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef};
 use arrow_schema::SchemaRef;
+use std::collections::HashMap;
 
 use crate::row_converter::RowConverter;
 use async_trait::async_trait;
@@ -83,6 +86,7 @@ use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use futures::StreamExt;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex as TokioMutex;
 
 // Position-based deletion methods implemented in sink/position_based.rs
@@ -141,6 +145,13 @@ impl Drop for StagedPkDelete {
     }
 }
 
+/// Bump `scan_input_version` so [`crate::ScanViewReuse::UntilInvalidated`] recaptures.
+fn bump_scan_input_version(version: Option<&AtomicU64>) {
+    if let Some(version) = version {
+        version.fetch_add(1, Ordering::Release);
+    }
+}
+
 pub(crate) struct PreparedDeletionPublish {
     strategy: PkDeletionStrategyWithCache,
     table_memory: Arc<CayenneMemoryAccount>,
@@ -148,6 +159,7 @@ pub(crate) struct PreparedDeletionPublish {
     publish: PreparedDeletionCache,
     deleted_count: u64,
     cleanup_armed: bool,
+    scan_input_version: Option<Arc<AtomicU64>>,
 }
 
 enum PreparedDeletionCache {
@@ -237,6 +249,7 @@ impl PreparedDeletionPublish {
         }
         self.table_memory
             .set_deletion_bytes(self.strategy.approx_resident_bytes());
+        bump_scan_input_version(self.scan_input_version.as_deref());
         Ok(())
     }
 
@@ -274,6 +287,26 @@ fn cleanup_uncommitted_delete_paths_blocking(paths: Vec<std::path::PathBuf>) {
             }
         }
     });
+}
+
+/// One table a filtered delete scans, with the visibility rules its rows are read under.
+///
+/// Both are carried rather than derived from each other, because the three sources do
+/// not line up two-by-two: the main listing applies re-inserts with no sequence cutoff
+/// (`apply_deletion_filter_with_insert_records`), a protected snapshot ignores them and
+/// has a cutoff (`apply_partial_deletion_filter`), and the COLD tier ignores them with
+/// NO cutoff (`apply_deletion_filter`). Deriving the mode from "is there a cutoff" gets
+/// cold wrong, and cold is the case where it costs a row: its files hold fully
+/// superseded data, so treating a re-inserted key as live there matches the stale value
+/// and tombstones the key — deleting the replacement that never matched the predicate.
+#[derive(Clone)]
+pub(crate) struct DeleteScanSource {
+    /// Only deletions NEWER than this apply to these rows. `None` — every deletion
+    /// applies — for the main listing and the cold tier.
+    pub(crate) min_delete_seq: Option<i64>,
+    /// Whether a key re-inserted after its delete reads as live again.
+    pub(crate) insert_records: InsertRecordHandling,
+    pub(crate) table: Arc<ListingTable>,
 }
 
 impl StagedPkDelete {
@@ -411,10 +444,33 @@ pub struct CayenneDeletionSink {
     pk_row_converter: Option<Arc<RowConverter>>,
     /// Indices of primary key columns in the table schema.
     pk_column_indices: Vec<usize>,
-    /// Extra listing tables to also scan for deletion keys, beyond the main
-    /// listing table — the protected snapshots and (for cold-tier tables) the
-    /// cold-tier files. The sink treats every entry uniformly.
-    additional_scan_tables: Vec<Arc<ListingTable>>,
+    /// Extra listing tables to also scan for deletion keys, beyond the main listing
+    /// table — the protected snapshots and (for cold-tier tables) the cold-tier files —
+    /// each paired with the delete sequence its rows are visible above.
+    ///
+    /// A protected snapshot carries `max_delete_seq_at_creation`: only deletes NEWER than
+    /// that apply to its rows, which is precisely what tells a superseded version from
+    /// the row that replaced it. Without it, a key-based delete can match a version an
+    /// upsert already retired and tombstone the KEY, taking the live row with it. `None`
+    /// is the base case — the current snapshot and cold-tier files, where every delete
+    /// applies.
+    additional_scan_tables: Vec<DeleteScanSource>,
+    /// How the main listing table treats an upsert's re-insert marker. Carried from the
+    /// caller rather than fixed here, because it is conditional in exactly the way
+    /// `scan` makes it conditional: with no protected snapshot, main holds the only copy
+    /// of a key and a re-insert marker means the row is live (`Apply`); with a protected
+    /// snapshot present, the replacement lives THERE and main holds only the superseded
+    /// version, which the marker must not resurrect (`Ignore`). Assuming `Apply` lets a
+    /// predicate matching only the retired value tombstone the KEY and take the
+    /// replacement — which never matched the predicate — with it.
+    main_insert_records: InsertRecordHandling,
+    /// The table's live protected-snapshot map, re-read under the execution-time
+    /// `write_lock` to catch the one transition `main_insert_records` cannot be captured
+    /// across: the plan is built before that lock is taken, so an ordinary upsert can
+    /// publish a protected snapshot in between and turn a captured `Apply` into the
+    /// resurrection case. Only 0 -> non-empty is unsafe; a capture that already saw one
+    /// is `Ignore` and stays correct however many more appear.
+    protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
     /// Shared `RuntimeEnv` for S3 object store access.
     runtime_env: Arc<RuntimeEnv>,
     /// Shared write lock to prevent concurrent writes/refreshes from racing with deletions.
@@ -426,6 +482,11 @@ pub struct CayenneDeletionSink {
     /// allocations through the SAME allocator as every other writer of this
     /// table, so memory and the DB `current_sequence_number` never diverge.
     seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
+    /// The owning table's `scan_input_version`. Bumped when this sink publishes
+    /// a deletion so [`crate::ScanViewReuse::UntilInvalidated`] recaptures
+    /// rather than serving the pre-delete view. `None` on internal persist-only
+    /// helpers that are not a user-visible delete.
+    scan_input_version: Option<Arc<AtomicU64>>,
     /// Whether this sink must return a VERIFIED deleted-row count — i.e. it backs
     /// a user-visible `DELETE`, where the count is surfaced to the SQL client as
     /// "rows affected". When false (the CDC/internal default), the `pk IN (...)`
@@ -452,7 +513,9 @@ impl CayenneDeletionSink {
         table_memory: Arc<CayenneMemoryAccount>,
         pk_row_converter: Option<Arc<RowConverter>>,
         pk_column_indices: Vec<usize>,
-        additional_scan_tables: Vec<Arc<ListingTable>>,
+        additional_scan_tables: Vec<DeleteScanSource>,
+        main_insert_records: InsertRecordHandling,
+        protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Option<Arc<TokioMutex<()>>>,
         seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
@@ -468,11 +531,26 @@ impl CayenneDeletionSink {
             pk_row_converter,
             pk_column_indices,
             additional_scan_tables,
+            main_insert_records,
+            protected_snapshots,
             runtime_env,
             write_lock,
             seq_allocator,
             count_exact: false,
+            scan_input_version: None,
         }
+    }
+
+    /// Wire the owning table's scan-input version so a published delete
+    /// invalidates the demand scan-view cache.
+    #[must_use]
+    pub(crate) fn with_scan_input_version(mut self, version: Arc<AtomicU64>) -> Self {
+        self.scan_input_version = Some(version);
+        self
+    }
+
+    pub(super) fn notify_scan_input_change(&self) {
+        bump_scan_input_version(self.scan_input_version.as_deref());
     }
 
     /// Set whether this sink must return an exact, verified deleted-row count.
@@ -586,7 +664,7 @@ impl CayenneDeletionSink {
                         if pk_columns.iter().any(|column| column.null_count() > 0) {
                             return Err(Error::DataValidation {
                                 table: table_name.clone(),
-                                message: "Primary key values must be non-null".to_string(),
+                                message: null_primary_key_message(&batch, &projected_indices),
                             });
                         }
                         let rows = row_converter.convert_columns(&pk_columns)?;
@@ -670,12 +748,91 @@ impl CayenneDeletionSink {
         if pk_array.null_count() > 0 {
             return Err(Error::DataValidation {
                 table: table_name.clone(),
-                message: "Primary key values must be non-null".to_string(),
+                message: null_primary_key_message(batch, std::slice::from_ref(pk_column_index)),
             });
         }
 
         let pk_values: Vec<i64> = pk_array.values().iter().copied().collect();
         Ok(pk_values)
+    }
+
+    /// How the main listing table must treat an upsert's re-insert marker, re-checked
+    /// against the live protected-snapshot map.
+    ///
+    /// `main_insert_records` is decided while the DELETE plan is built, which is before
+    /// the execution-time `write_lock` is held, so an ordinary upsert can publish a
+    /// protected snapshot in the gap. Scanning main with `Apply` once one exists is the
+    /// resurrection case: main then holds only the superseded version, a predicate
+    /// matching its retired value tombstones the KEY, and that tombstone hides the
+    /// replacement that never matched.
+    ///
+    /// Downgrading to `Ignore` leaves a residual, and it is the safe direction to be
+    /// wrong in. The snapshot published after the capture is not in
+    /// `additional_scan_tables` either, so a key whose superseded version matched is
+    /// left undeleted rather than destroyed. The resulting STATE is the one the serial
+    /// order "this DELETE, then that upsert" produces — the key survives at the
+    /// replacement value, which is where the upsert put it — so no row is lost or
+    /// resurrected. What diverges is the `rows affected` handed back to the client: it
+    /// under-reports those keys, and a user `DELETE` has no later pass to correct that
+    /// (retention, which re-runs, does). The next `DELETE` captures the snapshot and
+    /// sees them.
+    ///
+    /// Rebuilding the scan sources here against the live map would narrow that window
+    /// but not close it: `write_lock` is not the boundary that orders protected-snapshot
+    /// publication. A mem-tier checkpoint drops `write_lock` right after its capture and
+    /// publishes under `listing_fence.write()` alone (see `RewriteScope`), so a snapshot
+    /// can still appear while this DELETE holds `write_lock`, and mid-scan.
+    fn live_main_insert_records(&self) -> InsertRecordHandling {
+        if self.main_insert_records == InsertRecordHandling::Apply
+            && !self.protected_snapshots.load().is_empty()
+        {
+            // Counted, because the trade is only sound while it stays rare: a rate that
+            // climbs with ingest load means user DELETEs routinely under-report the rows
+            // they affected, which is the point at which rebuilding the scan sources
+            // against the live map — and paying a fence for the residual race above —
+            // buys something. Without the counter that is unanswerable.
+            telemetry::cayenne::track_delete_main_visibility_downgrade(&[
+                telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
+            ]);
+            return InsertRecordHandling::Ignore;
+        }
+        self.main_insert_records
+    }
+
+    /// Whether an Int64-keyed row from a snapshot whose deletions are visible above
+    /// `min_delete_seq` is still live. `None` is the base case — the current snapshot and
+    /// cold tier, where every delete applies.
+    ///
+    /// Delegates to the read path's own predicate rather than probing the index directly:
+    /// a bare `get_with_min_seq(..).is_none()` is only half the rule, and misses that a
+    /// tombstoned key re-inserted after its delete is visible again.
+    fn is_live_int64_pk(&self, pk: i64, source: &DeleteScanSource) -> bool {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => is_pk_visible_i64(
+                pk,
+                &deletion_snapshot.load().tombstones,
+                source.insert_records,
+                source.min_delete_seq,
+            ),
+            _ => true,
+        }
+    }
+
+    /// [`Self::is_live_int64_pk`] for composite / non-integer primary keys.
+    fn is_live_row_key(&self, key: &[u8], source: &DeleteScanSource) -> bool {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => is_pk_visible_row_key(
+                key,
+                &deletion_snapshot.load().tombstones,
+                source.insert_records,
+                source.min_delete_seq,
+            ),
+            _ => true,
+        }
     }
 
     /// Extract row keys from a batch using the `RowConverter`.
@@ -700,7 +857,7 @@ impl CayenneDeletionSink {
     async fn prepare_delete_filtered_rows_from_tables(
         &self,
         ctx: &SessionContext,
-        tables: &[Arc<ListingTable>],
+        tables: &[DeleteScanSource],
     ) -> super::super::Result<Option<PreparedDeletionPublish>> {
         let table_name = &self.table_metadata.table_name;
 
@@ -791,8 +948,8 @@ impl CayenneDeletionSink {
                 let mut delete_sequence: Option<i64> = None;
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
 
-                for table in tables {
-                    let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
+                for source in tables {
+                    let scan_plan = source.table.scan(&ctx.state(), None, &[], None).await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
                     while let Some(batch_result) = stream.next().await {
@@ -802,7 +959,17 @@ impl CayenneDeletionSink {
                             continue;
                         }
 
-                        pending_pk_values.extend(self.extract_int64_pk_values(&batch)?);
+                        // Drop rows this snapshot's own visibility already retires. A
+                        // tombstone newer than the snapshot's threshold means an upsert
+                        // superseded this version; tombstoning its KEY would take the row
+                        // that replaced it — which never matched the predicate — with it.
+                        // One bloom-prefiltered probe per row: no second scan, and nothing
+                        // held that the raw scan did not already hold.
+                        pending_pk_values.extend(
+                            self.extract_int64_pk_values(&batch)?
+                                .into_iter()
+                                .filter(|pk| self.is_live_int64_pk(*pk, source)),
+                        );
 
                         if pending_pk_values.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
                             let chunk_values = std::mem::take(&mut pending_pk_values);
@@ -853,8 +1020,8 @@ impl CayenneDeletionSink {
                 let mut delete_sequence: Option<i64> = None;
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
 
-                for table in tables {
-                    let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
+                for source in tables {
+                    let scan_plan = source.table.scan(&ctx.state(), None, &[], None).await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
                     while let Some(batch_result) = stream.next().await {
@@ -864,7 +1031,13 @@ impl CayenneDeletionSink {
                             continue;
                         }
 
-                        pending_row_keys.extend(self.extract_row_keys(&batch, row_converter)?);
+                        // See the Int64 branch: this snapshot's threshold is what tells
+                        // a superseded version from the row that replaced it.
+                        pending_row_keys.extend(
+                            self.extract_row_keys(&batch, row_converter)?
+                                .into_iter()
+                                .filter(|key| self.is_live_row_key(key, source)),
+                        );
 
                         if pending_row_keys.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
                             let chunk_keys = std::mem::take(&mut pending_row_keys);
@@ -925,11 +1098,20 @@ impl CayenneDeletionSink {
             Arc::clone(&self.runtime_env),
         );
         let listing_table = self.listing_table.load_full();
-        let mut all_tables = vec![Arc::clone(&listing_table)];
+        let mut all_tables = vec![DeleteScanSource {
+            min_delete_seq: None,
+            insert_records: self.live_main_insert_records(),
+            table: Arc::clone(&listing_table),
+        }];
         all_tables.extend(self.additional_scan_tables.iter().cloned());
         if self.filters.is_empty() {
-            self.prepare_delete_all_rows_from_tables(&ctx, &all_tables)
-                .await
+            // Delete-all removes every row, so no version is preferred over another and
+            // the thresholds carry no information.
+            let plain: Vec<Arc<ListingTable>> = all_tables
+                .iter()
+                .map(|source| Arc::clone(&source.table))
+                .collect();
+            self.prepare_delete_all_rows_from_tables(&ctx, &plain).await
         } else {
             self.prepare_delete_filtered_rows_from_tables(&ctx, &all_tables)
                 .await
@@ -1132,6 +1314,7 @@ impl CayenneDeletionSink {
             publish,
             deleted_count,
             cleanup_armed: true,
+            scan_input_version: self.scan_input_version.as_ref().map(Arc::clone),
         })
     }
 
@@ -1167,17 +1350,30 @@ impl DeletionSink for CayenneDeletionSink {
 
         // Collect all tables to scan: main listing table + the extra tables
         // (protected snapshots and, for cold-tier tables, the cold-tier files).
-        let mut all_tables = vec![Arc::clone(&listing_table)];
-        for extra_table in &self.additional_scan_tables {
-            all_tables.push(Arc::clone(extra_table));
-        }
+        let mut all_tables = vec![DeleteScanSource {
+            min_delete_seq: None,
+            insert_records: self.live_main_insert_records(),
+            table: Arc::clone(&listing_table),
+        }];
+        all_tables.extend(self.additional_scan_tables.iter().cloned());
 
         let prepared = if self.filters.is_empty() {
-            self.prepare_delete_all_rows_from_tables(&ctx, &all_tables)
-                .await
+            // See above: delete-all needs no per-snapshot visibility.
+            let plain: Vec<Arc<ListingTable>> = all_tables
+                .iter()
+                .map(|source| Arc::clone(&source.table))
+                .collect();
+            self.prepare_delete_all_rows_from_tables(&ctx, &plain).await
         } else if self.pk_deletion_strategy.is_position_based() {
+            // A position tombstone names a file and row position, so it can only ever
+            // hide the version it matched — the per-snapshot thresholds that keep a key
+            // tombstone off a live row carry nothing for it.
+            let position_tables: Vec<Arc<ListingTable>> = all_tables
+                .iter()
+                .map(|source| Arc::clone(&source.table))
+                .collect();
             return self
-                .delete_filtered_rows_position_based(&ctx, &all_tables)
+                .delete_filtered_rows_position_based(&ctx, &position_tables)
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
         } else {

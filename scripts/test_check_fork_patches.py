@@ -30,6 +30,7 @@ from check_fork_patches import (  # noqa: E402
     gap_accounting,
     ledger_pins,
     pinned_forks,
+    temporary_pins,
 )
 
 failures = 0
@@ -204,7 +205,38 @@ ledger_text = LEDGER.read_text(encoding="utf-8")
 check("the shipped tree marks at least one gap", "**GAP**" in ledger_text, True)
 check("the shipped Open gaps list accounts for every gap", gap_accounting(ledger_text), [])
 
+# A pin on a pull request's branch is reviewable and must not land. The marker is
+# what makes it un-landable, so the guard has to see it — and has to stay quiet
+# for the ordinary rows it sits beside.
+_ORDINARY_ROW = (
+    "| [vortex](#vortex) | `" + "a" * 40 + "` | `spiceai-54` |\n"
+)
+_TEMPORARY_ROW = (
+    "| [vortex](#vortex) | `" + "b" * 40 + "` | `in-list-hashed-probe` "
+    "(TEMPORARY: spiceai/vortex#95) |\n"
+)
+
+check(
+    "a pin recorded against a long-lived branch does not block",
+    temporary_pins(_ORDINARY_ROW),
+    [],
+)
+
+_blocked = temporary_pins(_TEMPORARY_ROW)
+check("a pin marked temporary blocks", len(_blocked), 1)
+check(
+    "the message names what has to merge first",
+    "spiceai/vortex#95" in _blocked[0] and "vortex" in _blocked[0],
+    True,
+)
+check(
+    "a temporary row beside ordinary rows is still caught",
+    len(temporary_pins(_ORDINARY_ROW + _TEMPORARY_ROW + _ORDINARY_ROW)),
+    1,
+)
+
 if failures:
     print(f"\n{failures} of {checks} checks FAILED")
     raise SystemExit(1)
 print(f"\nall {checks} checks passed")
+

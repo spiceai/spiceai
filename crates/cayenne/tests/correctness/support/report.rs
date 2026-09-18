@@ -29,6 +29,37 @@ pub struct RunResult {
     pub outcome: ParityOutcome,
 }
 
+/// The results a lane must not accept.
+///
+/// A `Pass` needs no explanation and an `Excluded` carries its own. An
+/// `OrderUnchecked` is accepted only where the inventory names why that query's
+/// `ORDER BY` cannot be verified against its own result columns — otherwise it
+/// lands here, because an order nothing verified and nobody reviewed is exactly
+/// what the sort check was added to stop passing quietly.
+///
+/// A reviewed name does not blanket the query: it accepts an unverified order,
+/// not a violation or a content mismatch, both of which stay failures.
+#[must_use]
+pub fn unexplained<'a>(
+    results: &'a [RunResult],
+    inventory: &[InventoryEntry],
+) -> Vec<&'a RunResult> {
+    results
+        .iter()
+        .filter(|r| {
+            if r.outcome.is_pass_or_excluded() {
+                return false;
+            }
+            if !matches!(r.outcome, ParityOutcome::OrderUnchecked { .. }) {
+                return true;
+            }
+            !inventory.iter().any(|e| {
+                e.suite == r.suite && e.name == r.name && e.order_unchecked_review.is_some()
+            })
+        })
+        .collect()
+}
+
 /// Write a machine-readable + human coverage report.
 pub fn write_coverage_report(path: &Path, results: &[RunResult]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -82,12 +113,17 @@ pub fn write_coverage_report(path: &Path, results: &[RunResult]) -> std::io::Res
     let mut excluded = 0usize;
     let mut fail = 0usize;
     let mut engine_err = 0usize;
+    let mut order_unchecked = 0usize;
 
     for r in results {
         let (status, detail) = match &r.outcome {
             ParityOutcome::Pass => {
                 pass += 1;
                 ("PASS", String::new())
+            }
+            ParityOutcome::OrderUnchecked { reasons } => {
+                order_unchecked += 1;
+                ("ORDER_UNCHECKED", reasons.join("; "))
             }
             ParityOutcome::Excluded { reason } => {
                 excluded += 1;
@@ -116,12 +152,17 @@ pub fn write_coverage_report(path: &Path, results: &[RunResult]) -> std::io::Res
     writeln!(md).ok();
     writeln!(md, "- pass: {pass}").ok();
     writeln!(md, "- excluded (justified): {excluded}").ok();
+    writeln!(
+        md,
+        "- order unchecked (content compared, sort not): {order_unchecked}"
+    )
+    .ok();
     writeln!(md, "- fail: {fail}").ok();
     writeln!(md, "- engine_error: {engine_err}").ok();
     writeln!(
         md,
         "- total reported: {}",
-        pass + excluded + fail + engine_err
+        pass + excluded + order_unchecked + fail + engine_err
     )
     .ok();
     writeln!(md, "- inventory size: {}", inventory.len()).ok();
@@ -167,6 +208,10 @@ pub fn summary_line(results: &[RunResult]) -> String {
         .iter()
         .filter(|r| matches!(r.outcome, ParityOutcome::Excluded { .. }))
         .count();
+    let order_unchecked = results
+        .iter()
+        .filter(|r| matches!(r.outcome, ParityOutcome::OrderUnchecked { .. }))
+        .count();
     let fail = results
         .iter()
         .filter(|r| {
@@ -177,7 +222,8 @@ pub fn summary_line(results: &[RunResult]) -> String {
         })
         .count();
     format!(
-        "correctness summary: pass={pass} excluded={excluded} fail={fail} total={}",
+        "correctness summary: pass={pass} excluded={excluded} \
+         order_unchecked={order_unchecked} fail={fail} total={}",
         results.len()
     )
 }

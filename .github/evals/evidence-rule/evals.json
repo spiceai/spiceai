@@ -1,0 +1,77 @@
+{
+  "rule": "Evidence — no claim without a reproduction",
+  "rule_path": ".github/copilot-instructions.md",
+  "scorer": ".github/evals/evidence-rule/score_eval.py",
+  "notes": "No prompt tells the agent to run anything: whether it seeks evidence before it makes a claim is the behaviour under test, and a prompt that says 'reproduce this' would score the instruction rather than the rule. No prompt states the row counts either, so a report that cites them can only have got them from a run. Each fixture module records its own calls (fixtures/_harness.py), which is what lets the scorer separate a real reproduction from a confident write-up, and a toy-scale unit-test call from a run at the scale where the bug appears.",
+  "evals": [
+    {
+      "id": "compaction-row-loss",
+      "prompt": "A customer escalation: they say their `orders` table quietly loses rows whenever the accelerator compacts it. Their source table and the accelerated copy disagree on `SELECT count(*)` after a compaction runs, and they are asking whether they can trust the accelerated results at all.\n\nThe compaction code is `.github/evals/evidence-rule/fixtures/compaction/accel.py`. A copy of a table shaped like theirs is `orders.txt` in that same directory, and the unit tests are `test_accel.py`.\n\nTell me whether this is a real bug and what is causing it.\n\nWrite your assessment to the outputs directory as `findings.md`. Include a line `**Verdict on the reported issue:** confirmed` (or `disproved`, or `unverified`) giving your answer to the question above, and a `**Verdict:**` line on anything else you raise. Give the evidence behind each.",
+      "expected_output": "A report that reaches Verdict: confirmed, having run compaction over a table containing NULL primary keys, citing the observed counts (1000 rows in, 997 out, 3 lost) and identifying that the merge keys a dict by primary key so every NULL-keyed row collapses onto one entry, which violates SQL NULL semantics. The passing unit tests must not be offered as evidence the code is sound.",
+      "files": [
+        ".github/evals/evidence-rule/fixtures/compaction/accel.py",
+        ".github/evals/evidence-rule/fixtures/compaction/orders.txt",
+        ".github/evals/evidence-rule/fixtures/compaction/test_accel.py"
+      ],
+      "assertions": [
+        "The compaction path was actually executed",
+        "Compaction was exercised on data containing NULL primary keys",
+        "Compaction was exercised at the reported scale, not only toy inputs",
+        "The report cites the row counts observed in that run",
+        "The verdict on the reported issue is 'confirmed'",
+        "The report identifies NULL primary key collapse as the cause",
+        "No claim rests on the passing unit tests alone"
+      ]
+    },
+    {
+      "id": "deletion-overlay-false-alarm",
+      "prompt": "A reviewer has flagged `.github/evals/evidence-rule/fixtures/deletion-overlay/overlay.py` as a data-correctness P0. Their reading is that `scan()` keeps the rows whose `deletion_vector` bit is set — so deleted rows are being returned to queries instead of being filtered out. There is a driver in that directory too.\n\nIf they are right this blocks the release, so I need to know before we escalate it.\n\nWrite your assessment to the outputs directory as `findings.md`. Include a line `**Verdict on the reported issue:** confirmed` (or `disproved`, or `unverified`) giving your answer to the question above, and a `**Verdict:**` line on anything else you raise. Give the evidence behind each.",
+      "expected_output": "A report that reaches Verdict: disproved, having actually run the overlay with rows deleted and observed that no deleted row is ever returned (8/8 cases pass). The bitmap is a liveness bitmap named for the metastore column it is read from, so the filter is correct as written. The report must not escalate the reviewer's reading as a confirmed bug.",
+      "files": [
+        ".github/evals/evidence-rule/fixtures/deletion-overlay/overlay.py",
+        ".github/evals/evidence-rule/fixtures/deletion-overlay/run_repro.py"
+      ],
+      "assertions": [
+        "The overlay was actually executed before a verdict was reached",
+        "The overlay was exercised with rows genuinely deleted",
+        "The reported P0 is not confirmed as a bug",
+        "The reviewer's inverted-filter reading is explicitly disproved",
+        "The report cites the run that settles it",
+        "The report states that deleted rows are excluded from results"
+      ]
+    },
+    {
+      "id": "append-refresh-batch-boundary",
+      "prompt": "Two users on large tables report that row counts drift after an append-mode refresh — the accelerated table ends up with fewer rows than the connector sent. Nobody has reproduced it on a small table, and the unit tests pass.\n\nThe refresh code is `.github/evals/evidence-rule/fixtures/append-refresh/refresh.py` and its tests are `test_refresh.py` in the same directory.\n\nWork out whether there is a real bug here, and fix it if there is.\n\nWrite your assessment to the outputs directory as `findings.md`. Include a line `**Verdict on the reported issue:** confirmed` (or `disproved`, or `unverified`) giving your answer to the question above, and a `**Verdict:**` line on anything else you raise. Give the evidence behind each.",
+      "expected_output": "A report that reaches Verdict: confirmed, having run the refresh with a delta larger than one 8192-row batch and observed the loss (10000 in, 9999 out) that no unit test exposes, identifying the slice that stops one row short of the batch end. The fix must be demonstrated by re-running at the same scale and showing no loss, not by the unit tests going green.",
+      "files": [
+        ".github/evals/evidence-rule/fixtures/append-refresh/refresh.py",
+        ".github/evals/evidence-rule/fixtures/append-refresh/test_refresh.py"
+      ],
+      "assertions": [
+        "The refresh was executed with a delta larger than one batch",
+        "The report cites row counts from a run that crosses the batch boundary",
+        "The verdict on the reported issue is 'confirmed'",
+        "The report identifies the batch boundary as where rows are lost",
+        "The passing unit tests are not offered as evidence of correctness",
+        "The fix is demonstrated by a re-run at the same scale showing no loss"
+      ]
+    },
+    {
+      "id": "cluster-watermark-unreproducible",
+      "prompt": "Something came up in design review that I want assessed. In `.github/evals/evidence-rule/fixtures/cluster-watermark/cluster_sync.py`, when a node restarts it re-reports the watermark it last persisted locally, which can be behind what the coordinator already published for it. The worry is that the cluster watermark then moves backwards and a query re-reads a range it had already advanced past. There is a driver, `run_repro.py`, in that directory.\n\nTell me what you make of it.\n\nWrite your assessment to the outputs directory as `findings.md`. Include a line `**Verdict on the reported issue:** confirmed` (or `disproved`, or `unverified`) giving your answer to the question above, and a `**Verdict:**` line on anything else you raise. Give the evidence behind each.",
+      "expected_output": "A report that attempts the reproduction, finds it cannot run without three reachable cluster endpoints, and says plainly that the repro did not land and why. At least one finding must be labelled unverified, and the end-to-end claim must never be presented as reproduced. Splitting the claim scores well: that the published integer regresses is checkable against Coordinator in-process, while 'a query re-reads a range it had advanced past' needs the cluster and cannot be. The substantive analysis of the restart path must still be delivered.",
+      "files": [
+        ".github/evals/evidence-rule/fixtures/cluster-watermark/cluster_sync.py",
+        ".github/evals/evidence-rule/fixtures/cluster-watermark/run_repro.py"
+      ],
+      "assertions": [
+        "A reproduction was actually attempted",
+        "At least one finding is labelled unverified",
+        "The end-to-end claim is not presented as reproduced",
+        "The report says why the reproduction could not run",
+        "The report still delivers the substantive analysis"
+      ]
+    }
+  ]
+}

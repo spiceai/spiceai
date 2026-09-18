@@ -23,8 +23,13 @@ use tempfile::TempDir;
 #[cfg(target_os = "linux")]
 const USAGE_EXIT_CODE: i32 = 2;
 
+/// `SPICED_PATH` is cleared for the same reason the other environment
+/// overrides below are: `spice cloud service` resolves the runtime, and a pin
+/// exported by the host would decide the outcome instead of the CLI.
 fn spice_cmd() -> Command {
-    cargo_bin_cmd!("spice")
+    let mut cmd = cargo_bin_cmd!("spice");
+    cmd.env_remove("SPICED_PATH");
+    cmd
 }
 
 fn empty_instance() -> TempDir {

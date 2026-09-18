@@ -1,0 +1,4251 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! `BigQuery` translations for the JSON extraction functions and the regexp
+//! predicate, and the `BigQuery` dialect that installs them.
+//!
+//! `datafusion-functions-json` takes a **variadic path**, not a `JSONPath`
+//! string: `json_get_int(col, 'a', 'b', 0)` reads key `a`, then key `b`, then
+//! array element 0. A string argument is always an object key — `('a.b')` is
+//! one key literally named `a.b`, not a two-step path — and an integer argument
+//! is always an array index. [`json_path`] is the one place that mapping is
+//! written down, and both the translation and the pushdown policy read it, so
+//! what the dialect can render and what the deny-list lets through cannot
+//! diverge.
+
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::sync::Arc;
+
+use chrono::DateTime;
+use datafusion::arrow::array::timezone::Tz;
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
+use datafusion::common::{DataFusionError, Result, ScalarValue};
+use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction};
+use datafusion::logical_expr::{Expr, SortExpr};
+use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
+use datafusion::sql::sqlparser::ast::{
+    self, BinaryOperator, CaseWhen, Function, FunctionArg, FunctionArgExpr, ObjectName,
+    WindowFrameBound,
+};
+use datafusion::sql::unparser::Unparser;
+use datafusion::sql::unparser::dialect::{
+    BigQueryDialect, CharacterLengthStyle, DateFieldExtractStyle, Dialect, IntervalStyle,
+    ScalarFnToSqlHandler,
+};
+
+pub(crate) const JSON_GET_INT_NAME: &str = "json_get_int";
+pub(crate) const JSON_GET_STR_NAME: &str = "json_get_str";
+pub(crate) const JSON_GET_BOOL_NAME: &str = "json_get_bool";
+pub(crate) const JSON_GET_FLOAT_NAME: &str = "json_get_float";
+pub(crate) const JSON_CONTAINS_NAME: &str = "json_contains";
+pub(crate) const JSON_AS_TEXT_NAME: &str = "json_as_text";
+pub(crate) const JSON_LENGTH_NAME: &str = "json_length";
+/// `json_length`'s alias. `ScalarUDF::name` returns the canonical name, so a
+/// plan never carries this one — but the federation deny-list is built from
+/// the registry, which does, and a name it denies that this dialect cannot
+/// render would be inconsistent. Both names carry the same handler.
+pub(crate) const JSON_LEN_NAME: &str = "json_len";
+pub(crate) const JSON_OBJECT_KEYS_NAME: &str = "json_object_keys";
+/// `json_object_keys`'s alias, carried for the reason [`JSON_LEN_NAME`] gives.
+pub(crate) const JSON_KEYS_NAME: &str = "json_keys";
+
+/// The first byte of a JSON string node's normalized JSON token.
+///
+/// `json_get_str` answers only for a JSON **string** — `jiter`'s `Peek::String`
+/// — and NULL for every other node. `JSON_VALUE` cannot express that on its
+/// own: it renders a number as its digits and a bool as `true`/`false`, where
+/// `json_get_str` returns NULL. `JSON_QUERY` returns either a native `JSON`
+/// value or a JSON-formatted `STRING`, matching the document's input type;
+/// `FORMAT('%t', …)` normalizes both forms to printable JSON text. A leading
+/// double quote then distinguishes a string node from every other type. See
+/// [`json_get_str_to_sql`].
+const JSON_STRING_TOKEN_PREFIX: &str = "\"";
+
+/// The grammar Rust's `i64::FromStr` accepts, which is what
+/// `json_get_int` applies to a JSON **string** node.
+///
+/// `SAFE_CAST(… AS INT64)` on its own is wider than that — `BigQuery` reads a
+/// hexadecimal literal, and trims surrounding whitespace — so extracting
+/// through this pattern first is what makes the string case exact. Everything
+/// it rejects, `json_get_int` also rejects, and returns NULL for.
+///
+/// It also agrees at the boundaries: an integer too large for `i64` is NULL on
+/// both sides, because Rust's `i64::FromStr` fails rather than saturating.
+/// See [`FLOAT64_FROM_STR`] for the float grammar, which agrees for the
+/// opposite reason — both sides saturate.
+///
+/// Any group must be non-capturing. `REGEXP_EXTRACT` accepts **at most one**
+/// capturing group and errors on more, which would fail every federated call
+/// remotely; with none it returns the whole match, which is what this wants.
+/// [`tests::no_pattern_has_a_capturing_group`] holds the patterns to that.
+const INT64_FROM_STR: &str = r"^[+-]?[0-9]+$";
+
+/// The grammar Rust's `f64::FromStr` accepts, which is what `json_get_float`
+/// applies to a JSON **string** node.
+///
+/// Measured against `BigQuery`: `SAFE_CAST(… AS FLOAT64)` saturates an
+/// out-of-range magnitude to `±Infinity` and underflows to zero, exactly as
+/// Rust does, and reads `inf`, `infinity` and `nan` case-insensitively, exactly
+/// as Rust does. So the boundaries need no special rendering — they already
+/// agree.
+///
+/// What does not agree is the same pair the integer form has: `SAFE_CAST`
+/// reads `0x2A` as 42 and trims `  1.5  `, where `f64::FromStr` fails and
+/// `json_get_float` is NULL. Extracting through this pattern first is what
+/// closes that, and nothing else.
+///
+/// Every group is non-capturing, for the reason [`INT64_FROM_STR`] gives.
+const FLOAT64_FROM_STR: &str = r"^[+-]?(?:(?i:inf|infinity|nan)|(?:[0-9]+\.[0-9]*|[0-9]*\.[0-9]+|[0-9]+)(?:[eE][+-]?[0-9]+)?)$";
+
+/// What `BigQuery` should be asked for, given a `json_get_*` call's path
+/// arguments.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum JsonPath {
+    /// A `BigQuery` JSON path — `$."a"."b"[0]` — reaching the same node the
+    /// variadic path names.
+    Path(String),
+    /// The path can never resolve, so the call is NULL for every row.
+    /// `datafusion-functions-json` maps a negative index and a NULL path
+    /// element to its own `JsonPath::None`, which no lookup ever matches.
+    NeverResolves,
+}
+
+/// Builds the `BigQuery` JSON path for a `json_get_*` call, or `None` when the
+/// call has a shape `BigQuery` cannot be asked for.
+///
+/// The one shape with no translation is a **non-literal** path element:
+/// `json_get_int(doc, key_col)` is legal — the functions are
+/// `Signature::variadic_any` — and `BigQuery`'s JSON path argument must be a
+/// constant, so there is nothing to emit. Such a call must not federate at all;
+/// `crate::function_support` is what stops it, using this same function.
+pub(crate) fn json_path(args: &[Expr]) -> Option<JsonPath> {
+    // The first argument is the document; the rest are the path.
+    let (_document, path) = args.split_first()?;
+    if path.is_empty() {
+        // `json_get_int(col)` reads the document itself. `$` is the JSONPath
+        // for that, but what BigQuery returns for a bare `$` over a scalar
+        // document is not pinned by anything here, so it is left to evaluate
+        // locally rather than guessed at.
+        return None;
+    }
+
+    let mut rendered = String::from("$");
+    for element in path {
+        let Expr::Literal(value, _) = element else {
+            return None;
+        };
+        match value {
+            ScalarValue::Utf8(Some(key))
+            | ScalarValue::LargeUtf8(Some(key))
+            | ScalarValue::Utf8View(Some(key)) => {
+                if !key_is_renderable(key) {
+                    return None;
+                }
+                // BigQuery quotes a key with double quotes, which is what lets
+                // a key containing `.` stay one key.
+                let _ = write!(rendered, r#"."{key}""#);
+            }
+            ScalarValue::Int64(Some(index)) if *index >= 0 => {
+                let _ = write!(rendered, "[{index}]");
+            }
+            ScalarValue::UInt64(Some(index)) => {
+                let _ = write!(rendered, "[{index}]");
+            }
+            // A negative index, or a NULL path element of a type the function
+            // accepts, resolves to nothing for every row.
+            ScalarValue::Int64(Some(_) | None)
+            | ScalarValue::UInt64(None)
+            | ScalarValue::Utf8(None)
+            | ScalarValue::LargeUtf8(None)
+            | ScalarValue::Utf8View(None) => return Some(JsonPath::NeverResolves),
+            // Any other literal type is rejected by the function's own
+            // `return_type`, so it cannot reach a plan.
+            _ => return None,
+        }
+    }
+    Some(JsonPath::Path(rendered))
+}
+
+/// Whether a key can be written into the path at all.
+///
+/// The path is emitted as a `BigQuery` **raw** string literal, so what is
+/// written is what the JSON path parser reads: nothing processes backslashes in
+/// between. That holds only while the key contains nothing either layer would
+/// read as structure — `\'` would end the literal, `"` would end the quoted
+/// field name, `\\` is an escape to the JSON path parser, and a control
+/// character has no agreed spelling in either. Escaping across two layers with
+/// different rules is how a key silently becomes a *different* path, so such a
+/// key is left for the local engine instead.
+fn key_is_renderable(key: &str) -> bool {
+    !key.contains(['\'', '"', '\\']) && !key.chars().any(char::is_control)
+}
+
+/// Whether the path arguments of a `json_get_*` call can be rendered. Reads
+/// [`json_path`], so it answers exactly the question the handlers can answer.
+fn json_path_is_renderable(args: &[Expr], _scope: Option<&datafusion::common::DFSchema>) -> bool {
+    json_path(args).is_some()
+}
+/// The aggregates whose `FILTER` the `BigQuery` dialect rewrites exactly.
+///
+/// Mirrors `filter_rewrite_is_exact` in the fork's unparser, and has to stay
+/// equal to it — the bitwise three are on it because `BigQuery` spells them under
+/// the same names, so they federate; `bool_and`/`bool_or` are not, because it
+/// spells those `LOGICAL_AND`/`LOGICAL_OR` and they never federate at all: the dialect declines what this list omits, and a declined
+/// rendering is a *failed query* unless federation also refuses it, since a
+/// federated statement has no local-execution fallback. The two directions of
+/// drift are `bigquery_refuses_only_the_filtered_aggregate_shapes_it_cannot_rewrite`
+/// in `connector-adbc`, which tests the boundary rather than a fixed set.
+const FILTER_REWRITE_IS_EXACT: &[&str] = &[
+    "count", "sum", "min", "max", "avg", "bit_and", "bit_or", "bit_xor",
+];
+
+/// The aggregates whose *only* `BigQuery` rendering comes from the dialect's
+/// aggregate override, which spells them by ordering the group.
+///
+/// `BigQuery` has neither name, so where the override declines — which it does
+/// for a descending ordering — the generic rendering emits the `DataFusion` name
+/// verbatim and `BigQuery` answers `Function not found`. Mirrors the match arms
+/// of `aggregate_function_to_sql_overrides` in the fork's `BigQuery` dialect.
+const PERCENTILE_REWRITES: &[&str] = &["median", "approx_percentile_cont"];
+
+/// Whether the `BigQuery` dialect can translate this particular *aggregate*
+/// call, given the `FILTER` it carries.
+///
+/// `BigQuery` has no `FILTER (WHERE …)` clause — measured, `COUNT(*) FILTER
+/// (WHERE x > 1)` is a syntax error — so the dialect moves the predicate inside
+/// the aggregate as `COUNTIF(p)` or `CASE WHEN p THEN arg END`. That is exact
+/// only for an aggregate that both skips null inputs and ignores input order,
+/// which is what [`FILTER_REWRITE_IS_EXACT`] lists; the dialect declines
+/// anything else, and this refuses the same set so it evaluates locally instead
+/// of reaching `BigQuery` as SQL it cannot parse.
+///
+/// `array_agg` is the one that matters in practice: the `CASE` gives it an
+/// element for every *rejected* row, and `BigQuery` will not build an array
+/// holding a null at all, so the rewrite fails for any filter that actually
+/// filters — where `DataFusion` answers `[2, 3]`.
+///
+/// A **descending** ordering is refused only for [`PERCENTILE_REWRITES`]. Those
+/// are rendered by ordering the group, so a descending sort takes the value from
+/// the other end and the rendering would answer over the wrong row; the dialect
+/// declines, which leaves the `DataFusion` name in place for `BigQuery` to reject
+/// (`Function not found: median`) rather than answering quietly wrong.
+///
+/// Ordering is not consulted for anything else. Every aggregate on the rewrite
+/// allowlist skips nulls and ignores input order, so the `FILTER` rewrite drops
+/// an `ORDER BY` safely in either direction. Refusing those would not cost a
+/// pushdown but fail the query, since the fallback is a generic `FILTER` clause
+/// `BigQuery` cannot parse — measured before spiceai/datafusion#219 scoped the
+/// dialect's check to the percentiles:
+///
+/// ```text
+/// sum(id ORDER BY id DESC) FILTER (WHERE id > 1)
+///   -> SELECT sum(`id`) FILTER (WHERE (`id` > 1)) ...
+///   -> Syntax error: Expected ")" but got "("
+/// ```
+///
+/// Note what is *not* refused. `COUNT(NULL) FILTER (…)` renders correctly as
+/// `COUNT(CASE WHEN p THEN NULL END)`, which is 0 exactly as `COUNT(NULL)` is —
+/// verified on `BigQuery` — so refusing it would only cost the pushdown.
+#[must_use]
+pub fn can_translate_aggregate(call: &AggregateFunction) -> bool {
+    let name = call.func.name();
+
+    // Checked ahead of the `FILTER` question, because it decides an unfiltered
+    // call too.
+    if call.params.order_by.iter().any(|sort| !sort.asc)
+        && PERCENTILE_REWRITES
+            .iter()
+            .any(|rewritten| name.eq_ignore_ascii_case(rewritten))
+    {
+        return false;
+    }
+
+    if call.params.filter.is_none() {
+        return true;
+    }
+    if !FILTER_REWRITE_IS_EXACT
+        .iter()
+        .any(|exact| name.eq_ignore_ascii_case(exact))
+    {
+        return false;
+    }
+    // A multi-argument aggregate has no obvious argument for the predicate to
+    // guard, so the dialect declines it rather than guessing.
+    call.params.args.len() <= 1
+}
+
+/// Whether the `BigQuery` dialect can translate this particular *window* call.
+///
+/// Nothing in the dialect's *aggregate* handling is reached for a window call,
+/// so anything that handling exists to rewrite renders verbatim here and
+/// `BigQuery` refuses the statement. Two of those, both measured through the
+/// runtime against a real project:
+///
+/// * a `FILTER`, which has no window rewriting at all —
+///   `SELECT COUNT(id) FILTER (WHERE id > 1) OVER () FROM advances` federates and
+///   comes back `Syntax error: Expected ")" but got "("`.
+/// * a [`PERCENTILE_REWRITES`] name. `MEDIAN(x)` reaches `BigQuery` as
+///   `PERCENTILE_CONT` *only* through the aggregate override, so in window
+///   position the `DataFusion` name goes out as written:
+///   `SELECT MEDIAN(requested_amount) OVER (PARTITION BY type) FROM payments_stream`
+///   answers `Function not found: median`, and the `approx_percentile_cont`
+///   spelling answers the same for its own name. The aggregate form of the same
+///   call is rewritten and works, which is what makes the gap easy to miss.
+///
+/// Refusing them here leaves the window for the local engine, which answers it.
+#[must_use]
+pub fn can_translate_window(call: &datafusion::logical_expr::expr::WindowFunction) -> bool {
+    if call.params.filter.is_some() {
+        return false;
+    }
+    let name = call.fun.name();
+    !PERCENTILE_REWRITES
+        .iter()
+        .any(|rewritten| name.eq_ignore_ascii_case(rewritten))
+}
+
+/// Whether the `BigQuery` dialect can translate this call, for the pushdown
+/// policy to consult.
+///
+/// A function with no entry in [`SCALAR_OVERRIDES`] or
+/// [`BUILTIN_SCALAR_OVERRIDES`] is not this check's business: a Spice function
+/// the deny-list has not carved out is already denied, and a `DataFusion`
+/// built-in with no handler here is either denied by name (`regexp_match`) or
+/// unparses through the inner dialect.
+#[must_use]
+pub fn can_translate(call: &ScalarFunction, scope: Option<&datafusion::common::DFSchema>) -> bool {
+    let name = call.func.name();
+    // `date_part` is rendered by the *inner* dialect, so it has no entry here —
+    // an entry would install its handler too, and a placeholder handler
+    // short-circuits the real rewrite. Only the call check belongs to us.
+    if name == "date_part" {
+        return date_part_field_is_renderable(&call.args);
+    }
+    SCALAR_OVERRIDES
+        .iter()
+        .chain(BUILTIN_SCALAR_OVERRIDES)
+        .find(|entry| entry.name == name)
+        .is_none_or(|entry| (entry.can_translate)(&call.args, scope))
+}
+
+/// A function the `BigQuery` dialect rewrites into native SQL.
+///
+/// The handler and the per-call check are one entry because they are one fact:
+/// a handler that can only render some call shapes is safe only while the
+/// deny-list refuses the rest. Splitting them into a list and a separate match
+/// is what lets a later partial handler be carved out of the deny-list with
+/// nothing to refuse its untranslatable shapes, which puts the function name
+/// verbatim into the remote SQL.
+pub(crate) struct ScalarOverride {
+    pub(crate) name: &'static str,
+    /// Renders the call, or fails if it cannot — see [`json_get_number_to_sql`].
+    pub(crate) handler: fn(&Unparser, &[Expr]) -> Result<Option<ast::Expr>>,
+    /// Whether `handler` can render a call with these arguments.
+    ///
+    /// The scope is the schema the arguments resolve against, and is `None`
+    /// where the type cannot be established — see
+    /// [`datafusion_table_providers::util::supported_functions::ScalarCallSupport`].
+    /// A rendering whose correctness depends on an operand's *declared* type
+    /// must answer `false` there rather than assume one; every other check
+    /// ignores it.
+    pub(crate) can_translate: fn(&[Expr], Option<&datafusion::common::DFSchema>) -> bool,
+}
+
+/// Every function the `BigQuery` dialect rewrites, with what each consumer
+/// needs. [`crate::dialect`] derives the dialect's handlers, the deny-list
+/// carve-out, and the per-call check from this one table.
+pub(crate) const SCALAR_OVERRIDES: &[ScalarOverride] = &[
+    ScalarOverride {
+        name: JSON_AS_TEXT_NAME,
+        handler: json_as_text_to_sql,
+        can_translate: json_text_is_renderable,
+    },
+    ScalarOverride {
+        name: crate::optimizer_rule::JSON_GET_IS_NULL_NAME,
+        handler: json_get_is_null_to_sql,
+        can_translate: json_text_is_renderable,
+    },
+    ScalarOverride {
+        name: JSON_GET_INT_NAME,
+        handler: json_get_int_to_sql,
+        can_translate: json_path_is_renderable,
+    },
+    ScalarOverride {
+        name: JSON_GET_STR_NAME,
+        handler: json_get_str_to_sql,
+        can_translate: json_path_is_renderable,
+    },
+    ScalarOverride {
+        name: JSON_GET_BOOL_NAME,
+        handler: json_get_bool_to_sql,
+        can_translate: json_path_is_renderable,
+    },
+    ScalarOverride {
+        name: JSON_GET_FLOAT_NAME,
+        handler: json_get_float_to_sql,
+        can_translate: json_path_is_renderable,
+    },
+    ScalarOverride {
+        name: JSON_LENGTH_NAME,
+        handler: json_length_to_sql,
+        can_translate: json_path_is_renderable,
+    },
+    ScalarOverride {
+        name: JSON_CONTAINS_NAME,
+        handler: json_contains_to_sql,
+        can_translate: json_contains_is_renderable,
+    },
+    ScalarOverride {
+        name: JSON_LEN_NAME,
+        handler: json_length_to_sql,
+        can_translate: json_path_is_renderable,
+    },
+    ScalarOverride {
+        name: JSON_OBJECT_KEYS_NAME,
+        handler: json_object_keys_to_sql,
+        can_translate: json_path_is_renderable,
+    },
+    ScalarOverride {
+        name: JSON_KEYS_NAME,
+        handler: json_object_keys_to_sql,
+        can_translate: json_path_is_renderable,
+    },
+];
+
+/// The `DataFusion` built-ins the `BigQuery` dialect rewrites into native SQL.
+///
+/// A separate table from [`SCALAR_OVERRIDES`] because the deny-list treats the
+/// two differently: a Spice function must be carved out of the deny-list by
+/// name to federate at all, while a built-in federates unless denied, so
+/// putting one in the carve-out would do nothing. What a built-in needs is the
+/// other two pieces — a handler, because the unparser otherwise emits the call
+/// verbatim into SQL `BigQuery` rejects, and a per-call check, because the
+/// handler can only render some call shapes and the rest must stay local.
+pub(crate) const BUILTIN_SCALAR_OVERRIDES: &[ScalarOverride] = &[
+    ScalarOverride {
+        name: super::REGEXP_LIKE_NAME,
+        handler: regexp_like_to_sql,
+        can_translate: regexp_like_is_renderable,
+    },
+    ScalarOverride {
+        name: "array_element",
+        handler: array_element_to_sql,
+        can_translate: array_index_is_renderable,
+    },
+];
+
+/// Whether the `date_part` field is one the dialect can name.
+///
+/// A field that is not a constant string is refused: the inner dialect cannot
+/// render it, and it would reach `BigQuery` as `date_part(…)`, which has no such
+/// function.
+///
+/// `dow` is deliberately absent, and its absence is what keeps a weekday off
+/// `BigQuery` rather than sending a wrong one. Two spellings of a weekday arrive
+/// as the *same* call — a `ScalarFunction` named `date_part` — carrying
+/// different functions: `date_part('dow', c)` resolves through the registry to
+/// `datafusion_spark`'s, which counts Sunday as 1, while `EXTRACT(DOW FROM c)` is
+/// planned straight onto `DataFusion`'s, which counts Sunday as 0. Measured on a
+/// Wednesday: `4` and `3`. The name cannot separate them, so any single rendering
+/// answers one of the two a day short. Refusing the call here leaves it above the
+/// federated scan, where each spelling keeps the value it has today — see
+/// [#13920](https://github.com/spiceai/spiceai/issues/13920), which tracks making
+/// the two agree. `doy`, `week` and `quarter` were measured to agree between the
+/// spellings and federate.
+fn date_part_field_is_renderable(args: &[Expr]) -> bool {
+    let [Expr::Literal(field, _), _operand] = args else {
+        // Not a constant field: the inner dialect cannot render it either, and
+        // it reaches `BigQuery` as `date_part(…)`, which has no such function.
+        return false;
+    };
+    let field = match field {
+        ScalarValue::Utf8(Some(field))
+        | ScalarValue::LargeUtf8(Some(field))
+        | ScalarValue::Utf8View(Some(field)) => field.to_lowercase(),
+        _ => return false,
+    };
+    matches!(
+        field.as_str(),
+        "year" | "month" | "day" | "hour" | "minute" | "second" | "doy" | "week" | "quarter"
+    )
+}
+
+/// `array_element` is 1-based and counts from the end for a negative index.
+/// `BigQuery` has no end-relative subscript, so the fork's dialect renders only
+/// a non-negative index and refuses the rest; this is the check that keeps the
+/// refusal off the pushdown path, leaving such a call to evaluate locally rather
+/// than failing the query.
+fn array_index_is_renderable(args: &[Expr], _scope: Option<&datafusion::common::DFSchema>) -> bool {
+    let [_, Expr::Literal(index, _)] = args else {
+        return false;
+    };
+    index.data_type().is_integer()
+        && matches!(
+            index.cast_to(&DataType::Int64),
+            Ok(ScalarValue::Int64(Some(index))) if index >= 0
+        )
+}
+
+/// Defers to the fork's `BigQuery` rendering, which spells the subscript
+/// `SAFE_ORDINAL` so it agrees with `array_element`'s 1-based indexing.
+///
+/// Registered here only so [`can_translate`] can refuse the indexes that
+/// rendering will not take. Returning `Ok(None)` instead would fall through to
+/// the generic 0-based subscript, which reads the neighbouring element.
+fn array_element_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
+    BigQueryDialect::new().scalar_function_to_sql_overrides(unparser, "array_element", args)
+}
+
+/// The error a JSON handler raises for a call it cannot render.
+///
+/// Unreachable with the deny-list installed, which refuses exactly these calls.
+/// Reachable only if this dialect is used without
+/// `deny_spice_functions_for_bigquery_table_providers`, and there the
+/// alternative — `Ok(None)` — makes the unparser emit the function verbatim into
+/// `BigQuery` SQL, which is the wrong answer dressed as a remote error.
+fn unrenderable_json_call(function: &str) -> DataFusionError {
+    let document_requirement = if function == JSON_CONTAINS_NAME {
+        " The document must also be a column whose JSON or STRING type is declared by the source."
+    } else {
+        ""
+    };
+    DataFusionError::Plan(format!(
+        "Failed to run this query against BigQuery: '{function}' was called in a form BigQuery \
+         cannot express, so the query cannot be completed. BigQuery needs a constant JSON path \
+         where every path argument must be a literal, there must be at least one, and a key \
+         cannot contain a quote, a backslash or a control character.{document_requirement} \
+         Rewrite the call to meet these requirements, or set 'query_federation: disabled' on \
+         the dataset to evaluate it locally instead. \
+         See: https://spiceai.org/docs/components/data-connectors/adbc"
+    ))
+}
+
+/// How `BigQuery` holds the document a JSON call reads, when the source said.
+///
+/// Not a `DataType` question: a native `JSON` column and a `STRING` column both
+/// arrive as `Utf8`, and the canonical `arrow.json` extension that distinguishes
+/// them lives in the field's *metadata*.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum JsonDocument {
+    /// A native `BigQuery` `JSON` column.
+    Native,
+    /// A `STRING` column holding JSON text.
+    Text,
+}
+
+/// What the source said the document column is, or `None` if it did not say.
+///
+/// Computed expressions without source metadata do not establish the remote
+/// JSON representation from their Arrow string type alone.
+pub(crate) fn json_document_kind(
+    document: &Expr,
+    scope: Option<&datafusion::common::DFSchema>,
+) -> Option<JsonDocument> {
+    use datafusion::logical_expr::ExprSchemable as _;
+    let (_, field) = document.to_field(scope?).ok()?;
+    json_document_kind_of(&field)
+}
+
+fn json_document_kind_with(
+    document: &Expr,
+    resolve: &impl Fn(&Expr) -> Option<JsonDocument>,
+) -> Option<JsonDocument> {
+    match document {
+        Expr::Alias(alias) => json_document_kind_with(&alias.expr, resolve),
+        Expr::ScalarFunction(call)
+            if call
+                .func
+                .inner()
+                .downcast_ref::<datafusion::functions::core::coalesce::CoalesceFunc>()
+                .is_some() =>
+        {
+            let mut kinds = call
+                .args
+                .iter()
+                .map(|arg| json_document_kind_with(arg, resolve));
+            let first = kinds.next()??;
+            kinds.all(|kind| kind == Some(first)).then_some(first)
+        }
+        Expr::Column(_) => resolve(document),
+        _ => None,
+    }
+}
+
+fn unparsed_json_document_kind(unparser: &Unparser, document: &Expr) -> Option<JsonDocument> {
+    json_document_kind_with(document, &|expr| {
+        unparser
+            .resolved_field(expr)
+            .as_deref()
+            .and_then(json_document_kind_of)
+    })
+}
+
+/// [`json_document_kind`] once the field is in hand.
+pub(crate) fn json_document_kind_of(
+    field: &datafusion::arrow::datatypes::Field,
+) -> Option<JsonDocument> {
+    let metadata = field.metadata();
+    // The canonical Arrow extension first; `BIGQUERY:type` is the driver's own
+    // statement of the remote type and agrees with it.
+    if metadata
+        .get("ARROW:extension:name")
+        .is_some_and(|n| n == "arrow.json")
+        || metadata.get("BIGQUERY:type").is_some_and(|t| t == "JSON")
+    {
+        return Some(JsonDocument::Native);
+    }
+    if metadata.get("BIGQUERY:type").is_some_and(|t| t == "STRING") {
+        return Some(JsonDocument::Text);
+    }
+    None
+}
+
+/// Whether `json_contains` can be rendered for this call.
+///
+/// Needs a renderable path *and* a document whose remote type the source
+/// declared — see [`json_document_kind`].
+fn json_contains_is_renderable(
+    args: &[Expr],
+    scope: Option<&datafusion::common::DFSchema>,
+) -> bool {
+    json_path(args).is_some()
+        && args
+            .first()
+            .and_then(|document| json_document_kind(document, scope))
+            .is_some()
+}
+
+/// `json_contains(doc, path…)` → whether the path resolves to a node.
+///
+/// `json_contains` is true for a node of *any* type, a JSON `null` included, and
+/// false when the path does not resolve. Which `BigQuery` expression says that
+/// depends on how the column is held, and the two are not interchangeable —
+/// measured over all node kinds on both:
+///
+/// * native `JSON`: `JSON_QUERY(doc, '<path>') IS NOT NULL`. A present JSON
+///   `null` comes back as a JSON `null` value, which is not SQL NULL, so it is
+///   told apart from a missing key.
+/// * `STRING`: the same test over `SAFE.PARSE_JSON(doc)`. Applied to the raw
+///   string, `JSON_QUERY` returns SQL **NULL** for a present JSON `null` — the
+///   very confusion this function was denied for — and `SAFE.` is what makes a
+///   malformed document `false` rather than an error.
+///
+/// Swapping them is not a near miss: `PARSE_JSON` on a `JSON` column is a type
+/// error, and the direct form on a `STRING` column reads a present null as
+/// absent, quietly. The alternative of normalising both with `FORMAT('%t', …)`
+/// is measured equivalent but refuses past 1 MiB of output ("Output string too
+/// long while evaluating FORMAT"), which would turn a working query into a
+/// failure on a large document; the type-directed pair is clean at 9 MB.
+pub(crate) fn json_contains_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    let (Some(document), Some(path)) = (args.first(), json_path(args)) else {
+        return Err(unrenderable_json_call(JSON_CONTAINS_NAME));
+    };
+
+    // `NeverResolves` is a path no lookup matches, so the answer is `false` for
+    // every row — not NULL, which is what the shared `json_call_to_sql` emits
+    // for the accessors.
+    let JsonPath::Path(path) = path else {
+        return Ok(Some(ast::Expr::Value(ast::Value::Boolean(false).into())));
+    };
+
+    let Some(kind) = unparser
+        .resolved_field(document)
+        .as_deref()
+        .and_then(json_document_kind_of)
+    else {
+        return Err(unrenderable_json_call(JSON_CONTAINS_NAME));
+    };
+
+    let document = unparser.expr_to_sql(document)?;
+    let document = match kind {
+        JsonDocument::Native => document,
+        JsonDocument::Text => call_function("SAFE.PARSE_JSON", vec![document]),
+    };
+
+    Ok(Some(ast::Expr::IsNotNull(Box::new(call_function(
+        "JSON_QUERY",
+        vec![document, ast::Expr::Value(raw_string(&path).into())],
+    )))))
+}
+
+/// Extracts scalar text without parsing a JSON-formatted STRING. Parsing would
+/// change numeric tokens such as `1.50` and `1e+00`. Containers fail explicitly
+/// because `JSON_QUERY` changes whitespace in the matched source text.
+fn json_as_text_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
+    let (document, path) = text_json_arguments(unparser, args, JSON_AS_TEXT_NAME)?;
+    let Some(path) = path else {
+        return Ok(Some(cast_null_to(ast::DataType::String(None))));
+    };
+    let value = call_function("JSON_VALUE", vec![document.clone(), path.clone()]);
+    let query = call_function("JSON_QUERY", vec![document.clone(), path]);
+    let container = call_function(
+        "REGEXP_CONTAINS",
+        vec![
+            query.clone(),
+            ast::Expr::Value(raw_string(r"^[\[{]").into()),
+        ],
+    );
+    Ok(Some(guard_json_text_escapes(
+        document,
+        query,
+        Some(container),
+        value,
+    )))
+}
+
+/// Null checks preserve `json_get`'s integer range without returning its
+/// Arrow union across the remote boundary. A quoted integer is a string and
+/// must not be range checked; only an unquoted integer token uses INT64.
+fn json_get_is_null_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
+    let (document, path) =
+        text_json_arguments(unparser, args, crate::optimizer_rule::JSON_GET_IS_NULL_NAME)?;
+    let Some(path) = path else {
+        return Ok(Some(ast::Expr::Value(ast::Value::Boolean(true).into())));
+    };
+    let token = call_function("JSON_QUERY", vec![document.clone(), path]);
+    let integer = call_function(
+        "REGEXP_CONTAINS",
+        vec![
+            token.clone(),
+            ast::Expr::Value(raw_string(r"^-?[0-9]+$").into()),
+        ],
+    );
+    let integer_is_null = ast::Expr::IsNull(Box::new(ast::Expr::Cast {
+        kind: ast::CastKind::SafeCast,
+        expr: Box::new(token.clone()),
+        data_type: ast::DataType::Int64,
+        array: false,
+        format: None,
+    }));
+    let token_is_null = call_function(
+        "COALESCE",
+        vec![
+            ast::Expr::BinaryOp {
+                left: Box::new(token.clone()),
+                op: BinaryOperator::Eq,
+                right: Box::new(sql_string("null")),
+            },
+            ast::Expr::Value(ast::Value::Boolean(true).into()),
+        ],
+    );
+    Ok(Some(guard_json_text_escapes(
+        document,
+        token,
+        None,
+        case_when(integer, integer_is_null, Some(token_is_null)),
+    )))
+}
+
+/// JSON extraction from STRING can replace UTF-16 surrogate escapes with
+/// replacement characters. An escaped U+FFFD scalar is preserved by both engines
+/// and does not imply substitution. Text extraction also rejects containers
+/// because their original serialization is not preserved.
+fn guard_json_text_escapes(
+    document: ast::Expr,
+    token: ast::Expr,
+    container: Option<ast::Expr>,
+    result: ast::Expr,
+) -> ast::Expr {
+    let surrogate_escape = ast::Expr::BinaryOp {
+        left: Box::new(call_function(
+            "REGEXP_CONTAINS",
+            vec![
+                document,
+                ast::Expr::Value(raw_string(r"\\u[dD][89a-fA-F][0-9a-fA-F]{2}").into()),
+            ],
+        )),
+        op: BinaryOperator::And,
+        right: Box::new(call_function(
+            "CONTAINS_SUBSTR",
+            vec![token, sql_string("\u{fffd}")],
+        )),
+    };
+    let unsupported = if let Some(container) = container {
+        ast::Expr::BinaryOp {
+            left: Box::new(surrogate_escape),
+            op: BinaryOperator::Or,
+            right: Box::new(container),
+        }
+    } else {
+        surrogate_escape
+    };
+    case_when(
+        unsupported,
+        call_function(
+            "ERROR",
+            vec![sql_string(
+                "Failed to evaluate JSON in BigQuery: this JSON value cannot be evaluated without changing the result. Set query_federation to disabled on the dataset to evaluate this query locally. See https://spiceai.org/docs/components/data-connectors/adbc",
+            )],
+        ),
+        Some(result),
+    )
+}
+
+// Native JSON numeric tokens need not retain their input spelling. Only a
+// declared STRING source preserves the token spelling both engines read.
+fn json_text_is_renderable(args: &[Expr], scope: Option<&datafusion::common::DFSchema>) -> bool {
+    use datafusion::logical_expr::ExprSchemable as _;
+    let (Some(document), Some(scope)) = (args.first(), scope) else {
+        return false;
+    };
+    json_path(args).is_some()
+        && json_document_kind_with(document, &|expr| {
+            let (_, field) = expr.to_field(scope).ok()?;
+            json_document_kind_of(&field)
+        }) == Some(JsonDocument::Text)
+}
+
+fn text_json_arguments(
+    unparser: &Unparser,
+    args: &[Expr],
+    function: &str,
+) -> Result<(ast::Expr, Option<ast::Expr>)> {
+    let (Some(document), Some(path)) = (args.first(), json_path(args)) else {
+        return Err(unrenderable_json_call(function));
+    };
+    if unparsed_json_document_kind(unparser, document) != Some(JsonDocument::Text) {
+        return Err(unrenderable_json_call(function));
+    }
+    let path = match path {
+        JsonPath::Path(path) => Some(ast::Expr::Value(raw_string(&path).into())),
+        JsonPath::NeverResolves => None,
+    };
+    Ok((unparser.expr_to_sql(document)?, path))
+}
+
+fn sql_string(value: &str) -> ast::Expr {
+    ast::Expr::Value(ast::Value::SingleQuotedString(value.to_string()).into())
+}
+
+fn case_when(condition: ast::Expr, result: ast::Expr, else_result: Option<ast::Expr>) -> ast::Expr {
+    ast::Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![CaseWhen { condition, result }],
+        else_result: else_result.map(Box::new),
+    }
+}
+
+/// Renders one `json_get_*` call: pulls out the document and the JSON path,
+/// and hands both to `render` as `BigQuery` SQL.
+///
+/// Every handler goes through here so the failure below is written once. It is
+/// unreachable with the deny-list installed, which refuses exactly the calls
+/// [`json_path`] cannot render. Reachable only if this dialect is used without
+/// `deny_spice_functions_for_bigquery_table_providers`, and there the
+/// alternative — returning `Ok(None)` — makes the unparser emit `json_get_*`
+/// verbatim into `BigQuery` SQL, which is the wrong answer dressed as a remote
+/// error. Fail where it can be read instead.
+///
+/// `null_type` is what a path that can never resolve renders as. It carries the
+/// function's own return type: an untyped NULL would leave the federated schema
+/// disagreeing with the plan's.
+fn json_call_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+    function: &str,
+    null_type: ast::DataType,
+    render: impl FnOnce(ast::Expr, ast::Expr) -> ast::Expr,
+) -> Result<Option<ast::Expr>> {
+    let (Some(document), Some(path)) = (args.first(), json_path(args)) else {
+        return Err(unrenderable_json_call(function));
+    };
+
+    let path = match path {
+        JsonPath::NeverResolves => return Ok(Some(cast_null_to(null_type))),
+        JsonPath::Path(path) => path,
+    };
+
+    Ok(Some(render(
+        unparser.expr_to_sql(document)?,
+        ast::Expr::Value(raw_string(&path).into()),
+    )))
+}
+
+/// `json_get_int(doc, path…)` →
+/// `SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(doc, '<path>'), r'^[+-]?[0-9]+$') AS INT64)`.
+///
+/// `JSON_VALUE` renders the node at the path as a string and returns NULL for
+/// an object, an array, a JSON `null` and a missing path — which is what
+/// `json_get_int` returns for all four. `true` and `false` render as `"true"`
+/// and `"false"`, which the pattern rejects, matching `json_get_int` again. A
+/// number renders as its own token, so a float or an exponent form is rejected
+/// exactly as `json_get_int` rejects it, and an integer outside `INT64` is a
+/// NULL from `SAFE_CAST` exactly as it is a NULL from the `i64` conversion. The
+/// pattern is what makes a JSON **string** node exact — see [`INT64_FROM_STR`].
+pub(crate) fn json_get_int_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
+    json_get_number_to_sql(
+        unparser,
+        args,
+        JSON_GET_INT_NAME,
+        INT64_FROM_STR,
+        ast::DataType::Int64,
+    )
+}
+
+/// `json_get_str(doc, path…)` →
+/// `CASE WHEN STARTS_WITH(FORMAT('%t', JSON_QUERY(doc, '<path>')), '"') THEN JSON_VALUE(doc, '<path>') END`.
+///
+/// `json_get_str` answers only for a JSON **string** node and NULL for every
+/// other kind. `JSON_VALUE` alone is wider than that: it renders a number as
+/// its digits and a bool as `true`/`false`, so it would answer a string where
+/// `json_get_str` answers NULL — on rows a `WHERE … IS NOT NULL` then keeps
+/// remotely and drops locally.
+///
+/// `JSON_QUERY` preserves the document representation: it returns `JSON` for a
+/// native `JSON` document and `STRING` for a JSON-formatted string document.
+/// `FORMAT('%t', …)` turns both results into the node's printable JSON token,
+/// where only a string node opens with a double quote — a number, a bool, a
+/// JSON `null`, an object and an array all render bare. Testing that first byte
+/// is what narrows `JSON_VALUE` to exactly the nodes the local function answers
+/// for, so the guard is the whole reason this is translatable at all.
+///
+/// Where the two already agree, no guard is needed: `JSON_QUERY` returns SQL
+/// NULL for a missing path, and `STARTS_WITH` over NULL is NULL, so the `CASE`
+/// falls through to its implicit NULL — which is what `json_get_str` returns.
+/// The escape handling agrees too: `JSON_VALUE` unescapes, and so does
+/// `jiter`'s `known_str`, so the guard reads the raw token while the value
+/// comes back decoded.
+pub(crate) fn json_get_str_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
+    json_call_to_sql(
+        unparser,
+        args,
+        JSON_GET_STR_NAME,
+        ast::DataType::String(None),
+        |document, path| {
+            let normalized_json_token = call_function(
+                "FORMAT",
+                vec![
+                    ast::Expr::Value(ast::Value::SingleQuotedString("%t".to_string()).into()),
+                    call_function("JSON_QUERY", vec![document.clone(), path.clone()]),
+                ],
+            );
+            let is_string_node = call_function(
+                "STARTS_WITH",
+                vec![
+                    normalized_json_token,
+                    ast::Expr::Value(
+                        ast::Value::SingleQuotedString(JSON_STRING_TOKEN_PREFIX.to_string()).into(),
+                    ),
+                ],
+            );
+            ast::Expr::Case {
+                case_token: AttachedToken::empty(),
+                end_token: AttachedToken::empty(),
+                operand: None,
+                conditions: vec![CaseWhen {
+                    condition: is_string_node,
+                    result: call_function("JSON_VALUE", vec![document, path]),
+                }],
+                // No ELSE: a CASE with no matching WHEN is NULL, which is what
+                // `json_get_str` returns for every non-string node.
+                else_result: None,
+            }
+        },
+    )
+}
+
+/// `json_get_bool(doc, path…)` →
+/// `CASE JSON_VALUE(doc, '<path>') WHEN 'true' THEN TRUE WHEN 'false' THEN FALSE END`.
+///
+/// `json_get_bool` answers for a JSON `true`/`false`, and for a JSON **string**
+/// that Rust's `bool::from_str` accepts — which is `"true"` and `"false"`
+/// exactly, case-sensitively. Everything else is NULL.
+///
+/// Comparing `JSON_VALUE`'s rendering is what matches that, and the reason no
+/// cast appears here. Measured against `BigQuery`: `SAFE_CAST('TRUE' AS BOOL)`
+/// and `SAFE_CAST('True' AS BOOL)` both give `true`, where `bool::from_str`
+/// rejects both and the local function returns NULL. A string comparison is
+/// case-sensitive, so the two agree on exactly the same values.
+/// [`tests::no_bool_rendering_casts_to_bool`] is what keeps the cast out.
+///
+/// The single `JSON_VALUE` covers both accepted shapes at once: it renders a
+/// bool node as `true`/`false` and a string node as its decoded contents, so
+/// `"true"` and `true` both arrive as `'true'` — which is what `json_get_bool`
+/// does too. It decodes escapes on the way, so a string written `"tr\u0075e"`
+/// is `true` on both sides. A number renders as its digits and never matches,
+/// and an object, an array, a JSON `null` and a missing path are NULL from
+/// `JSON_VALUE` — NULL from `json_get_bool` as well.
+pub(crate) fn json_get_bool_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    json_call_to_sql(
+        unparser,
+        args,
+        JSON_GET_BOOL_NAME,
+        ast::DataType::Bool,
+        |document, path| {
+            let arm = |literal: &str, value: bool| CaseWhen {
+                condition: ast::Expr::Value(
+                    ast::Value::SingleQuotedString(literal.to_string()).into(),
+                ),
+                result: ast::Expr::Value(ast::Value::Boolean(value).into()),
+            };
+            ast::Expr::Case {
+                case_token: AttachedToken::empty(),
+                end_token: AttachedToken::empty(),
+                operand: Some(Box::new(call_function("JSON_VALUE", vec![document, path]))),
+                conditions: vec![arm("true", true), arm("false", false)],
+                // No ELSE: everything `bool::from_str` rejects is NULL on both sides.
+                else_result: None,
+            }
+        },
+    )
+}
+
+/// `json_get_float(doc, path…)` →
+/// `SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(doc, '<path>'), r'<float grammar>') AS FLOAT64)`.
+///
+/// The same shape as [`json_get_int_to_sql`], because the same two things are
+/// true: `JSON_VALUE` renders the node as its own token, and `SAFE_CAST` is
+/// wider than Rust's `FromStr` in ways a pattern can close.
+///
+/// The boundaries need nothing extra. `SAFE_CAST(… AS FLOAT64)` saturates an
+/// out-of-range magnitude to `±Infinity` and underflows to zero exactly as
+/// `f64::FromStr` does, and accepts `inf`/`infinity`/`nan` with the same
+/// case-insensitivity — all measured against `BigQuery`.
+/// `json_get_float_saturates_an_out_of_range_magnitude_to_infinity` in
+/// `runtime-udfs-api` holds the local half of that agreement.
+pub(crate) fn json_get_float_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    json_get_number_to_sql(
+        unparser,
+        args,
+        JSON_GET_FLOAT_NAME,
+        FLOAT64_FROM_STR,
+        ast::DataType::Float64,
+    )
+}
+
+/// `json_length(doc, path…)` → a `CASE` counting an array's elements or an
+/// object's keys, and NULL for every other node.
+///
+/// `json_length` answers only for an array and an object. `BigQuery` counts the
+/// two with different functions, so the node's own JSON token picks the branch:
+/// only an array's opens with `[` and only an object's with `{`.
+///
+/// * array — `ARRAY_LENGTH(JSON_QUERY_ARRAY(doc, path))`.
+/// * object — `ARRAY_LENGTH(JSON_KEYS(SAFE.PARSE_JSON(JSON_QUERY(doc, path)), 1))`.
+///   The depth argument is load-bearing: without it `JSON_KEYS` descends,
+///   returning `["b", "c", "c.d"]` for `{"b":1,"c":{"d":2}}` where
+///   `json_length` counts two. `SAFE.PARSE_JSON` cannot fail the query — it is
+///   NULL for anything it will not parse, and `JSON_KEYS` and `ARRAY_LENGTH`
+///   carry that NULL out — so neither `CASE` branch can raise where the local
+///   function returns a number.
+///
+/// An empty array and an empty object are both 0 on both sides, and every
+/// scalar node, a JSON `null`, a missing path and a NULL document are NULL on
+/// both — all measured against `BigQuery`.
+///
+/// The local function returns `UInt64` and `BigQuery` has no unsigned type, so
+/// the count arrives as `INT64` and the scan's schema cast reconciles it. A
+/// count is never negative, so the conversion cannot lose one.
+pub(crate) fn json_length_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
+    json_call_to_sql(
+        unparser,
+        args,
+        JSON_LENGTH_NAME,
+        ast::DataType::Int64,
+        |document, path| {
+            let token = || call_function("JSON_QUERY", vec![document.clone(), path.clone()]);
+            let opens_with = |brace: &str| {
+                call_function(
+                    "STARTS_WITH",
+                    vec![
+                        token(),
+                        ast::Expr::Value(ast::Value::SingleQuotedString(brace.to_string()).into()),
+                    ],
+                )
+            };
+            ast::Expr::Case {
+                case_token: AttachedToken::empty(),
+                end_token: AttachedToken::empty(),
+                operand: None,
+                conditions: vec![
+                    CaseWhen {
+                        condition: opens_with("["),
+                        result: call_function(
+                            "ARRAY_LENGTH",
+                            vec![call_function(
+                                "JSON_QUERY_ARRAY",
+                                vec![document.clone(), path.clone()],
+                            )],
+                        ),
+                    },
+                    CaseWhen {
+                        condition: opens_with("{"),
+                        result: call_function(
+                            "ARRAY_LENGTH",
+                            vec![call_function(
+                                "JSON_KEYS",
+                                vec![parse_json(token()), depth(1)],
+                            )],
+                        ),
+                    },
+                ],
+                // No ELSE: json_length is NULL for every node that is neither.
+                else_result: None,
+            }
+        },
+    )
+}
+
+/// `json_object_keys(doc, path…)` →
+/// `CASE WHEN STARTS_WITH(JSON_QUERY(doc, '<path>'), '{')
+///  THEN JSON_KEYS(SAFE.PARSE_JSON(JSON_QUERY(doc, '<path>')), 1) END`.
+///
+/// `json_object_keys` answers only for an object, and only with that object's
+/// own keys. The depth argument is what holds `JSON_KEYS` to the same level —
+/// without it `BigQuery` descends and returns `["b", "c", "c.d"]` where the local
+/// function returns `["b", "c"]`. The `{` test is what makes every other node
+/// NULL, matching the local function, since what `JSON_KEYS` does with an array
+/// or a scalar is not something this rests on.
+///
+/// This is the one function here whose element type has to survive the trip:
+/// it returns `List(Field { name: "item", … })`, and `BigQuery` sends back an
+/// `ARRAY<STRING>` whose element field the driver names. A disagreement there
+/// would fail the query rather than answer it differently, so unlike the rest
+/// of this module the risk is loud. Measured against a real `BigQuery` through
+/// the ADBC driver: the array arrives as a `List(Utf8)` the plan accepts.
+pub(crate) fn json_object_keys_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    json_call_to_sql(
+        unparser,
+        args,
+        JSON_OBJECT_KEYS_NAME,
+        ast::DataType::Array(ast::ArrayElemTypeDef::AngleBracket(Box::new(
+            ast::DataType::String(None),
+        ))),
+        |document, path| {
+            let token = call_function("JSON_QUERY", vec![document, path]);
+            ast::Expr::Case {
+                case_token: AttachedToken::empty(),
+                end_token: AttachedToken::empty(),
+                operand: None,
+                conditions: vec![CaseWhen {
+                    condition: call_function(
+                        "STARTS_WITH",
+                        vec![
+                            token.clone(),
+                            ast::Expr::Value(
+                                ast::Value::SingleQuotedString("{".to_string()).into(),
+                            ),
+                        ],
+                    ),
+                    result: call_function("JSON_KEYS", vec![parse_json(token), depth(1)]),
+                }],
+                else_result: None,
+            }
+        },
+    )
+}
+
+fn json_get_number_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+    function: &str,
+    pattern: &str,
+    cast_to: ast::DataType,
+) -> Result<Option<ast::Expr>> {
+    json_call_to_sql(
+        unparser,
+        args,
+        function,
+        cast_to.clone(),
+        |document, path| ast::Expr::Cast {
+            kind: ast::CastKind::SafeCast,
+            expr: Box::new(call_function(
+                "REGEXP_EXTRACT",
+                vec![
+                    call_function("JSON_VALUE", vec![document, path]),
+                    ast::Expr::Value(raw_string(pattern).into()),
+                ],
+            )),
+            data_type: cast_to,
+            array: false,
+            format: None,
+        },
+    )
+}
+
+/// `regexp_like(str, pattern[, flags])` →
+/// `REGEXP_CONTAINS(str, r'<pattern>')`, with literal flags folded into the
+/// pattern as an inline `(?ims)` group.
+///
+/// The two agree call-for-call: both answer whether the pattern matches
+/// anywhere in the string, both are a plain `BOOL`, and both are NULL when the
+/// string or the pattern is NULL. That exactness holds only for a pattern both
+/// regex engines read identically, which is what [`regexp_contains`] holds the
+/// translation to; every other shape is refused by the per-call check and
+/// evaluated locally.
+///
+/// The failure below is written for the same reason [`json_call_to_sql`]'s is:
+/// unreachable with the deny-list's per-call check installed, and the
+/// alternative — `Ok(None)` — makes the unparser emit `regexp_like` verbatim
+/// into `BigQuery` SQL, which fails remotely as `Function not found`.
+pub(crate) fn regexp_like_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
+    let Some(call) = regexp_contains(args) else {
+        return Err(DataFusionError::Plan(format!(
+            "Failed to run this query against BigQuery: '{name}' was called in a form BigQuery \
+             cannot express, so the query cannot be completed. BigQuery needs a constant pattern \
+             both regular-expression engines read identically: the pattern and any flags must be \
+             literals, the only supported flags are 'i', 'm' and 's' (as the flags argument or \
+             an inline (?...) group), and the pattern cannot contain a quote, a control or \
+             non-ASCII character, or the classes \\d, \\D, \\w, \\W, \\s, \\S, \\b, \\B, \\p or \
+             \\P. Use a plain constant pattern, or set 'query_federation: disabled' on the \
+             dataset to evaluate it locally instead. \
+             See: https://spiceai.org/docs/components/data-connectors/adbc",
+            name = super::REGEXP_LIKE_NAME,
+        )));
+    };
+    Ok(Some(call_function(
+        "REGEXP_CONTAINS",
+        vec![
+            unparser.expr_to_sql(call.input)?,
+            ast::Expr::Value(raw_string(&call.pattern).into()),
+        ],
+    )))
+}
+
+/// Whether the arguments of a `regexp_like` call can be rendered. Reads
+/// [`regexp_contains`], so it answers exactly the question the handler can
+/// answer.
+fn regexp_like_is_renderable(args: &[Expr], _scope: Option<&datafusion::common::DFSchema>) -> bool {
+    regexp_contains(args).is_some()
+}
+
+/// The `REGEXP_CONTAINS` call a `regexp_like` invocation translates into.
+struct RegexpContains<'a> {
+    input: &'a Expr,
+    /// The pattern with any flags already folded in as an inline group.
+    pattern: String,
+}
+
+/// Builds the `REGEXP_CONTAINS` arguments for a `regexp_like` call, or `None`
+/// when the call has a shape whose remote behavior is not pinned to the local
+/// one: a non-literal pattern or flags argument, a flag with no `BigQuery`
+/// equivalent, or a pattern the two engines read differently — see
+/// [`pattern_is_engine_agnostic`].
+fn regexp_contains(args: &[Expr]) -> Option<RegexpContains<'_>> {
+    let (input, pattern, flags) = match args {
+        [input, pattern] => (input, pattern, ""),
+        [input, pattern, flags] => (input, pattern, literal_utf8(flags)?),
+        _ => return None,
+    };
+    let pattern = literal_utf8(pattern)?;
+    if !pattern_is_engine_agnostic(pattern) {
+        return None;
+    }
+    let flags = folded_flags(flags)?;
+    let pattern = if flags.is_empty() {
+        pattern.to_string()
+    } else {
+        format!("(?{flags}){pattern}")
+    };
+    Some(RegexpContains { input, pattern })
+}
+
+/// The text of a Utf8-family literal, or `None` for anything else — including
+/// a typed NULL, which has no text to scan.
+fn literal_utf8(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Literal(
+            ScalarValue::Utf8(Some(text))
+            | ScalarValue::LargeUtf8(Some(text))
+            | ScalarValue::Utf8View(Some(text)),
+            _,
+        ) => Some(text),
+        _ => None,
+    }
+}
+
+/// Whether the local engine — Rust's `regex` crate — and `BigQuery`'s RE2 read
+/// this pattern to mean the same thing.
+///
+/// The two are near relatives, but the differences are silent: a diverging
+/// pattern changes *which rows match*, not whether the query runs. The known
+/// divergences are Unicode, inline modes, character-class algebra, and repeat
+/// bounds. The Perl classes and word
+/// boundaries (`\d`, `\w`, `\s`, `\b` and their negations) are Unicode-aware
+/// in Rust's `regex` and ASCII-only in RE2, so `\d` matches an Arabic-Indic
+/// digit locally and not remotely, and `\p{…}`/`\P{…}` lean on each engine's
+/// Unicode tables. Inline `(?…)` modifier groups carry the same hazard in
+/// mode form: Rust reads modes RE2 does not have — `(?x)a b` (extended mode)
+/// matches `ab` locally and is a syntax error remotely — so a group head is
+/// accepted only when [`group_options_are_engine_agnostic`] can read it as
+/// something both engines agree on. Rather than enumerate agreements, this
+/// accepts only patterns built from constructs with one reading: printable
+/// ASCII, with no escape of those class letters and no group options beyond
+/// `i`, `m` and `s`. Rust's set operators inside character classes (`&&`,
+/// `--`, `~~`) are rejected because RE2 reads them as literal punctuation,
+/// and counted repetition bounds above RE2's 1000 limit stay local.
+/// [`tests::rusts_perl_classes_are_unicode_aware`],
+/// [`tests::rust_only_inline_modes_exist`], and
+/// [`tests::rust_supports_regex_features_re2_does_not`] hold the local halves
+/// of the divergences this guards against.
+///
+/// A single quote and control characters are rejected for a different reason:
+/// the pattern is emitted as a `BigQuery` **raw** string literal (see
+/// [`raw_string`]), which a `'` would terminate and a control character has no
+/// spelling in.
+fn pattern_is_engine_agnostic(pattern: &str) -> bool {
+    let mut chars = pattern.chars().peekable();
+    let mut in_character_class = false;
+    let mut previous_class_character = None;
+    while let Some(c) = chars.next() {
+        if !c.is_ascii() || c.is_ascii_control() || c == '\'' {
+            return false;
+        }
+        match c {
+            '\\' => match chars.next() {
+                // A trailing backslash is an invalid pattern; refuse rather
+                // than reason about which engine rejects it first.
+                None => return false,
+                Some(escaped) => {
+                    if !escaped.is_ascii() || escaped.is_ascii_control() || escaped == '\'' {
+                        return false;
+                    }
+                    if matches!(
+                        escaped,
+                        'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'b' | 'B' | 'p' | 'P'
+                    ) {
+                        return false;
+                    }
+                    previous_class_character = None;
+                }
+            },
+            '[' if in_character_class && chars.peek() == Some(&':') => {
+                if !consume_posix_class(&mut chars) {
+                    return false;
+                }
+                previous_class_character = None;
+            }
+            '[' if in_character_class => {
+                // Nested character classes participate in Rust's set algebra
+                // but are not a portable RE2 construct.
+                return false;
+            }
+            '[' => {
+                in_character_class = true;
+                previous_class_character = None;
+            }
+            ']' if in_character_class => {
+                in_character_class = false;
+                previous_class_character = None;
+            }
+            '&' | '-' | '~' if in_character_class => {
+                if previous_class_character == Some(c) {
+                    return false;
+                }
+                previous_class_character = Some(c);
+            }
+            _ if in_character_class => previous_class_character = Some(c),
+            '(' if chars.peek() == Some(&'?') => {
+                chars.next();
+                if !group_options_are_engine_agnostic(&mut chars) {
+                    return false;
+                }
+            }
+            '{' if counted_repetition_exceeds_re2_limit(&chars) => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Whether the characters after an unescaped `{` begin a counted repetition
+/// whose lower or upper bound exceeds RE2's hard limit of 1000. Invalid or
+/// non-repetition brace text is left for the local regex compiler to diagnose.
+fn counted_repetition_exceeds_re2_limit(chars: &std::iter::Peekable<std::str::Chars>) -> bool {
+    let mut chars = chars.clone();
+    let Some(lower) = repetition_bound(&mut chars) else {
+        return false;
+    };
+    if lower > 1000 {
+        return true;
+    }
+    matches!(chars.next(), Some(','))
+        && repetition_bound(&mut chars).is_some_and(|upper| upper > 1000)
+}
+
+fn repetition_bound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<u32> {
+    let mut value: Option<u32> = None;
+    while let Some(digit) = chars.peek().and_then(|c| c.to_digit(10)) {
+        chars.next();
+        value = Some(value.unwrap_or(0).saturating_mul(10).saturating_add(digit));
+    }
+    value
+}
+
+/// Consume the remainder of a POSIX class such as `[:digit:]` after its
+/// opening `[` has already been read. Both engines support these ASCII
+/// classes, and treating the inner `[` as Rust class nesting would otherwise
+/// unnecessarily keep them local.
+fn consume_posix_class(chars: &mut std::iter::Peekable<std::str::Chars>) -> bool {
+    if chars.next() != Some(':') {
+        return false;
+    }
+    let mut saw_name_character = false;
+    while let Some(c) = chars.next() {
+        if c == ':' && chars.peek() == Some(&']') {
+            chars.next();
+            return saw_name_character;
+        }
+        if !c.is_ascii_alphabetic() {
+            return false;
+        }
+        saw_name_character = true;
+    }
+    false
+}
+
+/// Reads the `…` of a `(?…` group head, accepting only what both engines
+/// agree on: `:` (a plain non-capturing group), or inline flags from
+/// `i`/`m`/`s` — optionally negated after one `-` — closed by `)` (a flag
+/// directive) or `:` (a scoped group). Everything else is refused: Rust-only
+/// modes (`x` extended, `R` CRLF, `u` Unicode toggles), `U` (deliberately
+/// refused as a flags argument, so its inline spelling must not slip
+/// through), named groups, and lookarounds. An empty directive like `(?)` is
+/// refused too — both engines reject it, and the local error is the readable
+/// one.
+fn group_options_are_engine_agnostic(chars: &mut std::iter::Peekable<std::str::Chars>) -> bool {
+    if chars.peek() == Some(&':') {
+        chars.next();
+        return true;
+    }
+    let mut saw_flag = false;
+    let mut saw_dash = false;
+    loop {
+        match chars.next() {
+            Some('i' | 'm' | 's') => saw_flag = true,
+            Some('-') if !saw_dash => saw_dash = true,
+            Some(')' | ':') => return saw_flag,
+            _ => return false,
+        }
+    }
+}
+
+/// The flags to fold into the pattern as an inline `(?…)` group, deduplicated
+/// into a canonical order, or `None` when a flag has no `BigQuery` equivalent.
+///
+/// RE2 accepts inline `i`, `m` and `s` with the meanings the local engine
+/// gives them. `R` (CRLF mode) has no RE2 counterpart, and it changes where
+/// `^`/`$` match, so it cannot be dropped. RE2 documents `U` (swap greediness)
+/// too, but whether `BigQuery`'s build honors it has not been measured against
+/// a real `BigQuery`, so it is refused rather than assumed.
+fn folded_flags(flags: &str) -> Option<String> {
+    if flags.chars().any(|flag| !matches!(flag, 'i' | 'm' | 's')) {
+        return None;
+    }
+    Some(
+        ['i', 'm', 's']
+            .into_iter()
+            .filter(|flag| flags.contains(*flag))
+            .collect(),
+    )
+}
+
+/// `SAFE.PARSE_JSON(value)` — SAFE so a document it will not parse is a NULL
+/// carried out through the call rather than a failed query.
+fn parse_json(value: ast::Expr) -> ast::Expr {
+    call_qualified_function("SAFE", "PARSE_JSON", vec![value])
+}
+
+/// A `JSON_KEYS` depth argument. Load-bearing: without it `BigQuery` descends and
+/// returns nested paths, where the local functions see only the top level.
+fn depth(levels: u32) -> ast::Expr {
+    ast::Expr::Value(ast::Value::Number(levels.to_string(), false).into())
+}
+
+fn cast_null_to(data_type: ast::DataType) -> ast::Expr {
+    ast::Expr::Cast {
+        kind: ast::CastKind::Cast,
+        expr: Box::new(ast::Expr::Value(ast::Value::Null.into())),
+        data_type,
+        array: false,
+        format: None,
+    }
+}
+
+/// A call to a function reached through a prefix, such as `SAFE.PARSE_JSON`.
+fn call_qualified_function(prefix: &str, name: &str, args: Vec<ast::Expr>) -> ast::Expr {
+    let mut call = call_function(name, args);
+    if let ast::Expr::Function(function) = &mut call {
+        function.name = ObjectName(vec![
+            ast::ObjectNamePart::Identifier(ast::Ident::new(prefix)),
+            ast::ObjectNamePart::Identifier(ast::Ident::new(name)),
+        ]);
+    }
+    call
+}
+
+fn call_function(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
+    ast::Expr::Function(Function {
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(ast::Ident::new(name))]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: args
+                .into_iter()
+                .map(|arg| FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)))
+                .collect(),
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    })
+}
+
+/// A `BigQuery` raw string literal, `r'…'`. Raw so a backslash in the value is
+/// the value's own, not something the SQL string layer consumes first — which
+/// matters for a regex escape and for a JSON path alike.
+fn raw_string(value: &str) -> ast::Value {
+    ast::Value::SingleQuotedRawStringLiteral(value.to_string())
+}
+
+/// [`BigQueryDialect`] plus Spice's own scalar-function handlers.
+///
+/// `BigQueryDialect` does not implement [`Dialect::with_custom_scalar_overrides`]
+/// — it panics — so the handlers cannot be attached to it directly. This wraps
+/// it instead, holding the handler map itself and forwarding every other
+/// [`Dialect`] method to the inner dialect. **Every** method is forwarded
+/// explicitly: inheriting a trait default here would silently unparse
+/// `BigQuery` SQL as if it were the generic dialect, changing quoting, casts
+/// and interval rendering with no error anywhere.
+pub struct SpiceBigQueryDialect {
+    inner: BigQueryDialect,
+    custom_scalar_fn_overrides: HashMap<String, ScalarFnToSqlHandler>,
+}
+
+impl Default for SpiceBigQueryDialect {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SpiceBigQueryDialect {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: BigQueryDialect::new(),
+            custom_scalar_fn_overrides: HashMap::new(),
+        }
+    }
+}
+
+/// Every `Dialect` method is forwarded explicitly, and the lint keeps it that way.
+///
+/// An unlisted method falls back to the *trait default*, which is the generic
+/// rendering rather than `BigQuery`'s — so a method added upstream would silently
+/// revert `BigQuery` to generic SQL, with no error anywhere. Denying
+/// `missing_trait_methods` turns that into a compile failure instead.
+#[deny(clippy::missing_trait_methods)]
+impl Dialect for SpiceBigQueryDialect {
+    fn with_custom_scalar_overrides(mut self, handlers: Vec<(&str, ScalarFnToSqlHandler)>) -> Self {
+        for (name, handler) in handlers {
+            self.custom_scalar_fn_overrides
+                .insert(name.to_string(), handler);
+        }
+        self
+    }
+
+    fn scalar_function_to_sql_overrides(
+        &self,
+        unparser: &Unparser,
+        func_name: &str,
+        args: &[Expr],
+    ) -> Result<Option<ast::Expr>> {
+        if let Some(handler) = self.custom_scalar_fn_overrides.get(func_name) {
+            return handler(unparser, args);
+        }
+        self.inner
+            .scalar_function_to_sql_overrides(unparser, func_name, args)
+    }
+
+    fn aggregate_function_to_sql_overrides(
+        &self,
+        unparser: &Unparser,
+        func_name: &str,
+        args: &[Expr],
+        distinct: bool,
+        filter: Option<&Expr>,
+        order_by: &[SortExpr],
+    ) -> Result<Option<ast::Expr>> {
+        self.inner.aggregate_function_to_sql_overrides(
+            unparser, func_name, args, distinct, filter, order_by,
+        )
+    }
+
+    fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
+        self.inner.identifier_quote_style(identifier)
+    }
+
+    fn use_array_keyword_for_array_literals(&self) -> bool {
+        self.inner.use_array_keyword_for_array_literals()
+    }
+
+    fn supports_nulls_first_in_sort(&self) -> bool {
+        self.inner.supports_nulls_first_in_sort()
+    }
+
+    fn use_timestamp_for_date64(&self) -> bool {
+        self.inner.use_timestamp_for_date64()
+    }
+
+    fn interval_style(&self) -> IntervalStyle {
+        self.inner.interval_style()
+    }
+
+    fn float64_ast_dtype(&self) -> ast::DataType {
+        self.inner.float64_ast_dtype()
+    }
+
+    fn utf8_cast_dtype(&self) -> ast::DataType {
+        self.inner.utf8_cast_dtype()
+    }
+
+    fn large_utf8_cast_dtype(&self) -> ast::DataType {
+        self.inner.large_utf8_cast_dtype()
+    }
+
+    fn date_field_extract_style(&self) -> DateFieldExtractStyle {
+        self.inner.date_field_extract_style()
+    }
+
+    fn character_length_style(&self) -> CharacterLengthStyle {
+        self.inner.character_length_style()
+    }
+
+    fn int64_cast_dtype(&self) -> ast::DataType {
+        self.inner.int64_cast_dtype()
+    }
+
+    fn int8_cast_dtype(&self) -> ast::DataType {
+        self.inner.int8_cast_dtype()
+    }
+
+    fn int32_cast_dtype(&self) -> ast::DataType {
+        self.inner.int32_cast_dtype()
+    }
+
+    fn timestamp_cast_dtype(&self, time_unit: &TimeUnit, tz: &Option<Arc<str>>) -> ast::DataType {
+        self.inner.timestamp_cast_dtype(time_unit, tz)
+    }
+
+    fn timestamp_literal_cast_dtype(
+        &self,
+        time_unit: &TimeUnit,
+        tz: &Option<Arc<str>>,
+    ) -> ast::DataType {
+        self.inner.timestamp_literal_cast_dtype(time_unit, tz)
+    }
+
+    fn decimal_type_to_sql(&self, precision: u64, scale: i64) -> Option<ast::DataType> {
+        self.inner.decimal_type_to_sql(precision, scale)
+    }
+
+    fn date_difference_to_sql(&self, lhs: ast::Expr, rhs: ast::Expr) -> Option<ast::Expr> {
+        self.inner.date_difference_to_sql(lhs, rhs)
+    }
+
+    fn date_to_integer_to_sql(&self, date: ast::Expr) -> Option<ast::Expr> {
+        self.inner.date_to_integer_to_sql(date)
+    }
+
+    fn string_to_timestamp_to_sql(
+        &self,
+        value: ast::Expr,
+        tz: Option<&Arc<str>>,
+    ) -> Option<ast::Expr> {
+        self.inner.string_to_timestamp_to_sql(value, tz)
+    }
+
+    fn string_to_date_to_sql(&self, value: ast::Expr) -> Option<ast::Expr> {
+        self.inner.string_to_date_to_sql(value)
+    }
+
+    fn supports_recursive_cte(&self) -> bool {
+        self.inner.supports_recursive_cte()
+    }
+
+    fn supports_distinct_recursive_cte(&self) -> bool {
+        self.inner.supports_distinct_recursive_cte()
+    }
+
+    fn integer_division_to_sql(&self, lhs: ast::Expr, rhs: ast::Expr) -> Option<ast::Expr> {
+        self.inner.integer_division_to_sql(lhs, rhs)
+    }
+
+    fn requires_explicit_comparison_coercion(&self) -> bool {
+        self.inner.requires_explicit_comparison_coercion()
+    }
+
+    fn timestamp_literal_max_subsecond_digits(&self) -> Option<usize> {
+        self.inner.timestamp_literal_max_subsecond_digits()
+    }
+
+    fn timestamp_at_time_zone_to_sql(&self, input: ast::Expr, tz: &str) -> Option<ast::Expr> {
+        self.inner.timestamp_at_time_zone_to_sql(input, tz)
+    }
+
+    fn date32_cast_dtype(&self) -> ast::DataType {
+        self.inner.date32_cast_dtype()
+    }
+
+    fn supports_column_alias_in_table_alias(&self) -> bool {
+        self.inner.supports_column_alias_in_table_alias()
+    }
+
+    fn requires_derived_table_alias(&self) -> bool {
+        self.inner.requires_derived_table_alias()
+    }
+
+    fn division_operator(&self) -> BinaryOperator {
+        self.inner.division_operator()
+    }
+
+    fn higher_order_function_to_sql_overrides(
+        &self,
+        unparser: &Unparser,
+        func_name: &str,
+        args: &[Expr],
+    ) -> Result<Option<ast::Expr>> {
+        self.inner
+            .higher_order_function_to_sql_overrides(unparser, func_name, args)
+    }
+
+    fn window_func_support_window_frame(
+        &self,
+        func_name: &str,
+        start_bound: &WindowFrameBound,
+        end_bound: &WindowFrameBound,
+    ) -> bool {
+        self.inner
+            .window_func_support_window_frame(func_name, start_bound, end_bound)
+    }
+
+    fn union_distinct_set_quantifier(&self) -> ast::SetQuantifier {
+        self.inner.union_distinct_set_quantifier()
+    }
+
+    fn full_qualified_col(&self) -> bool {
+        self.inner.full_qualified_col()
+    }
+
+    fn unnest_as_table_factor(&self) -> bool {
+        self.inner.unnest_as_table_factor()
+    }
+
+    fn unnest_as_lateral_flatten(&self) -> bool {
+        self.inner.unnest_as_lateral_flatten()
+    }
+
+    fn col_alias_overrides(&self, alias: &str) -> Result<Option<String>> {
+        self.inner.col_alias_overrides(alias)
+    }
+
+    fn supports_qualify(&self) -> bool {
+        self.inner.supports_qualify()
+    }
+
+    fn timestamp_with_tz_to_string(&self, dt: DateTime<Tz>, unit: TimeUnit) -> String {
+        self.inner.timestamp_with_tz_to_string(dt, unit)
+    }
+
+    fn supports_empty_select_list(&self) -> bool {
+        self.inner.supports_empty_select_list()
+    }
+
+    fn string_literal_to_sql(&self, s: &str) -> Option<ast::Expr> {
+        self.inner.string_literal_to_sql(s)
+    }
+
+    fn group_by_matches_select_subexpressions(&self) -> bool {
+        self.inner.group_by_matches_select_subexpressions()
+    }
+
+    fn range_window_default_nulls_first(&self, asc: bool) -> Option<bool> {
+        self.inner.range_window_default_nulls_first(asc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::logical_expr::expr::{WindowFunction, WindowFunctionParams};
+    use datafusion::logical_expr::{
+        ColumnarValue, ExprFunctionExt, ScalarUDF, Volatility, WindowFrame,
+        WindowFunctionDefinition, create_udf,
+    };
+    use datafusion::prelude::{col, lit};
+    use datafusion::sql::unparser::Unparser;
+
+    use super::{
+        FLOAT64_FROM_STR, INT64_FROM_STR, JSON_CONTAINS_NAME, JSON_GET_BOOL_NAME,
+        JSON_GET_FLOAT_NAME, JSON_GET_INT_NAME, JSON_GET_STR_NAME, JSON_KEYS_NAME, JSON_LEN_NAME,
+        JSON_LENGTH_NAME, JSON_OBJECT_KEYS_NAME, JsonPath, SpiceBigQueryDialect, can_translate,
+        json_path,
+    };
+    use crate::dialect::{REGEXP_LIKE_NAME, new_bigquery_dialect};
+    use datafusion::common::ScalarValue;
+    use datafusion::logical_expr::Expr;
+    use datafusion::logical_expr::expr::ScalarFunction;
+
+    fn json_udf(name: &str, arity: usize) -> Arc<ScalarUDF> {
+        Arc::new(create_udf(
+            name,
+            vec![DataType::Utf8; arity],
+            DataType::Int64,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ))
+    }
+
+    fn call(name: &str, args: Vec<Expr>) -> ScalarFunction {
+        ScalarFunction::new_udf(json_udf(name, args.len()), args)
+    }
+
+    /// The SQL the `BigQuery` dialect renders for one `json_get_*` call.
+    fn render(name: &str, args: Vec<Expr>) -> String {
+        let dialect = new_bigquery_dialect();
+        Unparser::new(dialect.as_ref())
+            .expr_to_sql(&Expr::ScalarFunction(call(name, args)))
+            .expect("the BigQuery dialect renders this call")
+            .to_string()
+    }
+
+    #[test]
+    fn a_literal_key_becomes_a_bigquery_json_path() {
+        assert_eq!(
+            json_path(&[col("doc"), lit("a")]),
+            Some(JsonPath::Path(r#"$."a""#.to_string()))
+        );
+    }
+
+    #[test]
+    fn the_variadic_path_becomes_one_json_path() {
+        assert_eq!(
+            json_path(&[col("doc"), lit("a"), lit("b"), lit(0_i64)]),
+            Some(JsonPath::Path(r#"$."a"."b"[0]"#.to_string()))
+        );
+    }
+
+    #[test]
+    fn a_dotted_key_stays_one_key() {
+        // `json_get_int(doc, 'a.b')` reads a key literally named `a.b`. Quoting
+        // it is what stops BigQuery reading it as two steps, which would return
+        // a different value rather than an error.
+        assert_eq!(
+            json_path(&[col("doc"), lit("a.b")]),
+            Some(JsonPath::Path(r#"$."a.b""#.to_string()))
+        );
+    }
+
+    #[test]
+    fn a_key_the_two_quoting_layers_disagree_about_is_not_translated() {
+        // A quote, a backslash or a control character means one of the SQL
+        // literal layer and the JSONPath layer would read the key as structure.
+        // Escaping across both is how a key silently becomes a different path,
+        // so these are left for the local engine.
+        for key in [r#"a"b"#, r"a\b", "a'b", "a\nb", "a\tb"] {
+            assert_eq!(
+                json_path(&[col("doc"), lit(key)]),
+                None,
+                "{key:?} cannot be written into a BigQuery JSON path unambiguously"
+            );
+        }
+    }
+
+    #[test]
+    fn no_pattern_has_a_capturing_group() {
+        // `REGEXP_EXTRACT` accepts at most one capturing group and errors on
+        // more; with none it returns the whole match. A capturing group added
+        // here would fail every federated call at BigQuery, which no local test
+        // can see.
+        for pattern in [INT64_FROM_STR, FLOAT64_FROM_STR] {
+            let mut chars = pattern.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => {
+                        chars.next();
+                    }
+                    '(' => assert_eq!(
+                        chars.peek(),
+                        Some(&'?'),
+                        "capturing group in {pattern}: every group must be `(?:…)`"
+                    ),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_path_that_can_never_resolve_is_recognised_as_such() {
+        // A negative index and a NULL path element both map to
+        // `datafusion-functions-json`'s own `JsonPath::None`, which matches
+        // nothing, so the call is NULL for every row.
+        for element in [
+            lit(-1_i64),
+            Expr::Literal(ScalarValue::Utf8(None), None),
+            Expr::Literal(ScalarValue::Int64(None), None),
+        ] {
+            assert_eq!(
+                json_path(&[col("doc"), element.clone()]),
+                Some(JsonPath::NeverResolves),
+                "{element} names nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_literal_path_element_has_no_translation() {
+        // BigQuery's JSON path argument must be a constant, so there is nothing
+        // to render for a per-row path.
+        assert_eq!(json_path(&[col("doc"), col("key")]), None);
+        assert_eq!(json_path(&[col("doc"), lit("a"), col("key")]), None);
+    }
+
+    #[test]
+    fn a_call_with_no_path_has_no_translation() {
+        assert_eq!(json_path(&[col("doc")]), None);
+    }
+
+    /// `array_element` renders only a non-negative index, so the gate has to
+    /// [`can_translate`] with no schema, which is what every case here needs:
+    /// these assert *shape*, and the scope only matters for a rendering whose
+    /// correctness depends on an operand's declared type.
+    fn translates(call: &ScalarFunction) -> bool {
+        can_translate(call, None)
+    }
+
+    /// refuse the rest — otherwise the call is pushed down and the rendering
+    /// then fails the whole query instead of evaluating locally.
+    #[test]
+    fn array_element_federates_only_for_a_non_negative_integer_index() {
+        assert!(translates(&call(
+            "array_element",
+            vec![col("arr"), lit(1i64)]
+        )));
+        assert!(translates(&call(
+            "array_element",
+            vec![col("arr"), lit(0i64)]
+        )));
+        // Counts from the end, which BigQuery cannot express.
+        assert!(!translates(&call(
+            "array_element",
+            vec![col("arr"), lit(-1i64)]
+        )));
+        // Sign unknown until it runs.
+        assert!(!translates(&call(
+            "array_element",
+            vec![col("arr"), col("i")]
+        )));
+        // Not an ordinal BigQuery would take.
+        assert!(!translates(&call(
+            "array_element",
+            vec![col("arr"), lit("1")]
+        )));
+
+        // And what does federate keeps the 1-based spelling.
+        let sql = render("array_element", vec![col("arr"), lit(1i64)]);
+        assert!(sql.contains("SAFE_ORDINAL(1)"), "not 1-based: {sql}");
+    }
+
+    #[test]
+    fn can_translate_answers_for_the_json_functions_and_defers_on_the_rest() {
+        assert!(translates(&call(
+            JSON_GET_INT_NAME,
+            vec![col("doc"), lit("a")]
+        )));
+        assert!(!translates(&call(
+            JSON_GET_INT_NAME,
+            vec![col("doc"), col("key")]
+        )));
+        assert!(translates(&call(
+            JSON_GET_STR_NAME,
+            vec![col("doc"), lit("a")]
+        )));
+        assert!(!translates(&call(
+            JSON_GET_STR_NAME,
+            vec![col("doc"), col("key")]
+        )));
+        assert!(translates(&call(
+            JSON_GET_BOOL_NAME,
+            vec![col("doc"), lit("a")]
+        )));
+        assert!(!translates(&call(
+            JSON_GET_BOOL_NAME,
+            vec![col("doc"), col("key")]
+        )));
+        assert!(
+            translates(&call("upper", vec![col("doc"), col("key")])),
+            "upper has no handler in this dialect, so it is not this check's business — \
+             the deny-list has not carved it out and it cannot federate at all"
+        );
+
+        // `json_contains` *does* have a handler now, and its check is stricter
+        // than a renderable path: the rendering differs for a native `JSON`
+        // column and a `STRING` one, so a document whose remote type the source
+        // did not declare is refused rather than guessed at. With no scope
+        // nothing is declared, so every shape here refuses.
+        for args in [vec![col("doc"), lit("a")], vec![col("doc"), col("key")]] {
+            assert!(
+                !translates(&call(super::JSON_CONTAINS_NAME, args)),
+                "json_contains must refuse a document whose BigQuery type is not \
+                 established — the two renderings are not interchangeable"
+            );
+        }
+    }
+
+    /// An optimized recursive CTE behind a derived table opens the statement.
+    ///
+    /// This covers the unparser shape produced by an optimized `SessionContext`
+    /// plan. The federation analyzer produces a different arrangement; the
+    /// real-engine harness in `test/scripts/bigquery-pushdown.sh` guards that
+    /// execution path.
+    #[tokio::test]
+    async fn a_recursive_cte_behind_a_derived_table_opens_the_statement() {
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("id", DataType::Int64, true),
+        ]));
+        ctx.register_table(
+            "t",
+            Arc::new(
+                datafusion::catalog::MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                    .expect("build the table"),
+            ) as Arc<dyn datafusion::catalog::TableProvider>,
+        )
+        .expect("register the table");
+
+        let generator = "WITH RECURSIVE g AS (                           SELECT 1 AS n UNION ALL SELECT n + 1 AS n FROM g WHERE n < 5                         ) ";
+        let rendered = |sql: String| {
+            let ctx = ctx.clone();
+            async move {
+                let plan = ctx
+                    .sql(&sql)
+                    .await
+                    .expect("plan the statement")
+                    .into_optimized_plan()
+                    .expect("optimize the plan");
+                unparse_plan(new_bigquery_dialect().as_ref(), &plan)
+            }
+        };
+
+        // The generator is nested behind a derived table.
+        let behind_derived = rendered(format!(
+            "{generator}SELECT t.id FROM t JOIN (SELECT n FROM g) gg ON t.id = gg.n"
+        ))
+        .await;
+        assert!(
+            behind_derived.starts_with("WITH RECURSIVE"),
+            "the CTE has to open the statement: {behind_derived}"
+        );
+        assert!(
+            !behind_derived.contains("JOIN (WITH"),
+            "a WITH inside a derived table is what BigQuery refuses: {behind_derived}"
+        );
+
+        // The control: joined directly, which was already hoisted and must stay so.
+        let joined_directly = rendered(format!(
+            "{generator}SELECT t.id FROM t JOIN g ON t.id = g.n"
+        ))
+        .await;
+        assert!(
+            joined_directly.starts_with("WITH RECURSIVE"),
+            "a directly joined generator still opens the statement: {joined_directly}"
+        );
+    }
+
+    /// Every nameable date field federates, except `dow`; a computed field does
+    /// not.
+    ///
+    /// `dow` is the exception because the two spellings of a weekday carry
+    /// different functions behind the same name — Spark's `date_part` counts
+    /// Sunday as 1, `DataFusion`'s 0, measured on a Wednesday as 4 and 3 — so no
+    /// single rendering serves both and the call has to stay local.
+    #[test]
+    fn every_nameable_date_field_federates_and_a_computed_one_does_not() {
+        let field = |name: &str| call("date_part", vec![lit(name), col("d")]);
+        for pushed in ["doy", "week", "quarter", "year", "month", "day"] {
+            assert!(
+                translates(&field(pushed)),
+                "{pushed} renders through the dialect, so it federates"
+            );
+        }
+        // `dow` is the one field the dialect will not render, because the two
+        // spellings that reach it disagree by a day (see the doc comment on
+        // `date_part_field_is_renderable`). It has to be refused *here* too: a
+        // rendering the dialect declines but federation allows is not a local
+        // fallback, it is a failed query.
+        assert!(
+            !translates(&field("dow")),
+            "dow must not federate: no single rendering serves both spellings"
+        );
+        // A field the dialect cannot name reaches BigQuery as `date_part(…)`,
+        // which it has no function for.
+        assert!(
+            !translates(&call("date_part", vec![col("part"), col("d")])),
+            "a non-constant field cannot be rendered at all"
+        );
+    }
+
+    /// `json_contains` renders by the document's *declared* type, and refuses
+    /// when the source did not declare one.
+    ///
+    /// The two spellings are not interchangeable, measured over every node kind:
+    ///
+    /// * native `JSON` — `JSON_QUERY(doc, path) IS NOT NULL`. A present JSON
+    ///   `null` is a JSON `null` value, not SQL NULL, so it is told apart from a
+    ///   missing key.
+    /// * `STRING` — the same over `SAFE.PARSE_JSON(doc)`. Applied to the raw
+    ///   string, `JSON_QUERY` answers SQL NULL for a present JSON `null` too,
+    ///   which is the confusion this function was denied for.
+    ///
+    /// Swapping them is not a near miss: `PARSE_JSON` on a `JSON` column is a
+    /// type error, and the direct form on a `STRING` column reads a present null
+    /// as absent, quietly. So a document the source did not describe — a
+    /// computed expression carries no marker — is refused rather than guessed.
+    #[test]
+    fn json_contains_renders_by_the_documents_declared_type() {
+        let column = |name: &str, bigquery_type: Option<&str>| {
+            let mut field = datafusion::arrow::datatypes::Field::new(name, DataType::Utf8, true);
+            if let Some(bigquery_type) = bigquery_type {
+                field = field.with_metadata(
+                    [("BIGQUERY:type".to_string(), bigquery_type.to_string())]
+                        .into_iter()
+                        .collect(),
+                );
+            }
+            field
+        };
+        let scope = Arc::new(
+            datafusion::common::DFSchema::try_from(datafusion::arrow::datatypes::Schema::new(
+                vec![
+                    column("native", Some("JSON")),
+                    column("text", Some("STRING")),
+                    column("undeclared", None),
+                ],
+            ))
+            .expect("scope"),
+        );
+        let dialect = new_bigquery_dialect();
+        let unparser = Unparser::new(dialect.as_ref()).with_schema(Arc::clone(&scope));
+        let render = |document: &str| {
+            dialect
+                .scalar_function_to_sql_overrides(
+                    &unparser,
+                    super::JSON_CONTAINS_NAME,
+                    &[col(document), lit("a")],
+                )
+                .map(|rendered| rendered.map(|expr| expr.to_string()))
+        };
+
+        let native = render("native")
+            .expect("a native JSON document renders")
+            .expect("a rendering");
+        assert!(
+            native.contains("JSON_QUERY(`native`, R'$.\"a\"')") && native.contains("IS NOT NULL"),
+            "a native JSON column is asked directly: {native}"
+        );
+        assert!(
+            !native.contains("PARSE_JSON"),
+            "PARSE_JSON on a JSON column is a type error: {native}"
+        );
+
+        let text = render("text")
+            .expect("a STRING document renders")
+            .expect("a rendering");
+        assert!(
+            text.contains("SAFE.PARSE_JSON(`text`)"),
+            "a STRING column has to be parsed first, and SAFE. is what makes a \
+             malformed document false rather than an error: {text}"
+        );
+        assert!(
+            text.contains("IS NOT NULL"),
+            "the parsed document is still asked whether the path resolves: {text}"
+        );
+
+        // Undeclared: refused by the per-call check, and the handler raises
+        // rather than guessing if it is ever reached without the deny-list.
+        assert!(
+            !can_translate(
+                &call(super::JSON_CONTAINS_NAME, vec![col("undeclared"), lit("a")]),
+                Some(scope.as_ref()),
+            ),
+            "a document with no declared BigQuery type must not federate"
+        );
+        assert!(
+            render("undeclared").is_err(),
+            "the handler must raise rather than pick a rendering at random"
+        );
+
+        // And the two declared forms *do* federate.
+        for document in ["native", "text"] {
+            assert!(
+                can_translate(
+                    &call(super::JSON_CONTAINS_NAME, vec![col(document), lit("a")]),
+                    Some(scope.as_ref()),
+                ),
+                "{document} has a declared type, so it federates"
+            );
+        }
+    }
+
+    #[test]
+    fn json_text_and_null_checks_preserve_source_types() {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::common::DFSchema;
+        use datafusion::functions::core::expr_fn::coalesce;
+
+        let field = |name: &str, kind: &str| {
+            Field::new(name, DataType::Utf8, true)
+                .with_metadata([("BIGQUERY:type".to_string(), kind.to_string())].into())
+        };
+        let scope = Arc::new(
+            DFSchema::try_from(Schema::new(vec![
+                field("text", "STRING"),
+                field("native", "JSON"),
+                Field::new("unknown", DataType::Utf8, true),
+            ]))
+            .expect("source schema"),
+        );
+        let dialect = new_bigquery_dialect();
+        let unparser = Unparser::new(dialect.as_ref()).with_schema(Arc::clone(&scope));
+        for name in [
+            super::JSON_AS_TEXT_NAME,
+            crate::optimizer_rule::JSON_GET_IS_NULL_NAME,
+        ] {
+            for document in [
+                col("text"),
+                coalesce(vec![col("text"), col("text")]).alias("document"),
+            ] {
+                let args = vec![document, lit("context"), lit("iteration")];
+                assert!(can_translate(&call(name, args.clone()), Some(&scope)));
+                let sql = dialect
+                    .scalar_function_to_sql_overrides(&unparser, name, &args)
+                    .expect("typed JSON rendering")
+                    .expect("SQL expression")
+                    .to_string();
+                assert!(
+                    !sql.contains("PARSE_JSON") && !sql.contains("TO_JSON_STRING"),
+                    "{sql}"
+                );
+                assert!(
+                    sql.contains("ERROR("),
+                    "unsupported escapes must not return changed data: {sql}"
+                );
+                if name == super::JSON_AS_TEXT_NAME {
+                    assert!(sql.contains("JSON_VALUE"), "{sql}");
+                } else {
+                    assert!(sql.contains("SAFE_CAST"), "{sql}");
+                }
+            }
+            for document in [
+                col("unknown"),
+                col("native"),
+                coalesce(vec![col("native"), col("native")]),
+                coalesce(vec![col("text"), col("native")]),
+            ] {
+                let args = vec![document, lit("value")];
+                assert!(!can_translate(&call(name, args.clone()), Some(&scope)));
+                dialect
+                    .scalar_function_to_sql_overrides(&unparser, name, &args)
+                    .expect_err("unsupported source types must not render");
+            }
+            let args = vec![col("text"), col("unknown")];
+            assert!(!can_translate(&call(name, args), Some(&scope)));
+        }
+    }
+
+    #[test]
+    fn json_get_int_renders_as_a_guarded_safe_cast() {
+        assert_eq!(
+            render(JSON_GET_INT_NAME, vec![col("doc"), lit("a")]),
+            r#"SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(`doc`, R'$."a"'), R'^[+-]?[0-9]+$') AS INT64)"#
+        );
+    }
+
+    #[test]
+    fn an_index_in_the_path_renders_after_the_key() {
+        assert_eq!(
+            render(JSON_GET_INT_NAME, vec![col("doc"), lit("a"), lit(2_i64)]),
+            r#"SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(`doc`, R'$."a"[2]'), R'^[+-]?[0-9]+$') AS INT64)"#
+        );
+    }
+
+    #[test]
+    fn json_get_str_renders_as_a_guarded_json_value() {
+        // The STARTS_WITH/FORMAT/JSON_QUERY guard is the whole reason this is
+        // translatable: JSON_VALUE alone renders a JSON number as its digits,
+        // where `json_get_str` returns NULL. FORMAT normalizes JSON_QUERY's
+        // native JSON and JSON-formatted string result types before the guard.
+        assert_eq!(
+            render(JSON_GET_STR_NAME, vec![col("doc"), lit("a")]),
+            r#"CASE WHEN STARTS_WITH(FORMAT('%t', JSON_QUERY(`doc`, R'$."a"')), '"') THEN JSON_VALUE(`doc`, R'$."a"') END"#
+        );
+    }
+
+    #[test]
+    fn json_get_str_never_resolving_renders_as_a_typed_null() {
+        // Utf8, not Int64: a federated schema that disagrees with the local one
+        // is a cast error at best and a wrong column type at worst.
+        assert_eq!(
+            render(JSON_GET_STR_NAME, vec![col("doc"), lit(-1_i64)]),
+            "CAST(NULL AS STRING)"
+        );
+    }
+
+    #[test]
+    fn json_get_bool_renders_as_a_case_over_the_rendered_text() {
+        // A string comparison, not SAFE_CAST(… AS BOOL): the cast is
+        // case-insensitive where Rust's `bool::from_str` is not, so a cast
+        // would answer true for "TRUE" where the local function is NULL.
+        assert_eq!(
+            render(JSON_GET_BOOL_NAME, vec![col("doc"), lit("a")]),
+            r#"CASE JSON_VALUE(`doc`, R'$."a"') WHEN 'true' THEN true WHEN 'false' THEN false END"#
+        );
+    }
+
+    #[test]
+    fn no_bool_rendering_casts_to_bool() {
+        // The whole reason `json_get_bool` is translatable is that it never
+        // reaches BigQuery's BOOL cast. If one appears, the case-sensitivity
+        // agreement is gone and "TRUE" starts answering true remotely only.
+        let sql = render(JSON_GET_BOOL_NAME, vec![col("doc"), lit("a")]);
+        assert!(
+            !sql.contains("AS BOOL"),
+            "a BOOL cast is case-insensitive and must not appear: {sql}"
+        );
+    }
+
+    #[test]
+    fn json_get_float_renders_as_a_guarded_safe_cast() {
+        assert_eq!(
+            render(JSON_GET_FLOAT_NAME, vec![col("doc"), lit("a")]),
+            concat!(
+                r#"SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(`doc`, R'$."a"'), "#,
+                r#"R'^[+-]?(?:(?i:inf|infinity|nan)|(?:[0-9]+\.[0-9]*|[0-9]*\.[0-9]+|[0-9]+)"#,
+                r#"(?:[eE][+-]?[0-9]+)?)$') AS FLOAT64)"#
+            )
+        );
+    }
+
+    #[test]
+    fn the_float_grammar_accepts_what_rust_accepts_and_nothing_more() {
+        // Every case is asserted against Rust's own parser as well as the
+        // pattern, so the two cannot drift apart while the test still passes.
+        // `regex` and BigQuery's engine are both RE2 lineage, so a pattern this
+        // one accepts is one BigQuery accepts.
+        let pattern = regex::Regex::new(FLOAT64_FROM_STR).expect("the float grammar compiles");
+        for accepted in [
+            "1", "-1", "1.5", "-1.5", "1.", ".5", "1e3", "-1E-3", "0", "inf", "-inf", "Infinity",
+            "INFINITY", "nan", "NaN", "+1.5",
+        ] {
+            assert!(
+                pattern.is_match(accepted),
+                "`{accepted}` parses as f64 in Rust, so the pattern must accept it"
+            );
+            assert!(
+                accepted.parse::<f64>().is_ok(),
+                "`{accepted}` must actually parse in Rust, or this test is asserting the wrong thing"
+            );
+        }
+        for rejected in [
+            "0x2A", "  1.5  ", "1.5f", "", "e3", "1e", "1,5", "true", "--1",
+        ] {
+            assert!(
+                !pattern.is_match(rejected),
+                "`{rejected}` is not an f64 in Rust, so the pattern must reject it"
+            );
+            assert!(
+                rejected.parse::<f64>().is_err(),
+                "`{rejected}` must actually fail in Rust, or this test is asserting the wrong thing"
+            );
+        }
+    }
+
+    #[test]
+    fn regexp_like_renders_as_regexp_contains() {
+        assert_eq!(
+            render(REGEXP_LIKE_NAME, vec![col("code"), lit("^R[0-9]{2}")]),
+            r"REGEXP_CONTAINS(`code`, R'^R[0-9]{2}')"
+        );
+    }
+
+    #[test]
+    fn regexp_like_folds_literal_flags_into_the_pattern() {
+        // BigQuery's REGEXP_CONTAINS has no flags argument; RE2 reads the same
+        // flags inline. Deduplicated into a canonical order so the rendering
+        // is deterministic.
+        assert_eq!(
+            render(
+                REGEXP_LIKE_NAME,
+                vec![col("code"), lit("^r[0-9]{2}"), lit("si")]
+            ),
+            r"REGEXP_CONTAINS(`code`, R'(?is)^r[0-9]{2}')"
+        );
+        assert_eq!(
+            render(REGEXP_LIKE_NAME, vec![col("code"), lit("^r"), lit("")]),
+            render(REGEXP_LIKE_NAME, vec![col("code"), lit("^r")]),
+            "empty flags are the two-argument call"
+        );
+    }
+
+    #[test]
+    fn regexp_like_translates_only_the_shapes_both_engines_read_identically() {
+        for (accepted, args) in [
+            (
+                "a plain literal pattern",
+                vec![col("code"), lit("^R[0-9]{2}$")],
+            ),
+            ("an escaped metacharacter", vec![col("code"), lit(r"^R\.")]),
+            (
+                "a POSIX class, which is ASCII in both engines",
+                vec![col("code"), lit("[[:digit:]]+")],
+            ),
+            (
+                "literal ims flags",
+                vec![col("code"), lit("^r"), lit("ims")],
+            ),
+            (
+                "an inline flag directive both engines read",
+                vec![col("code"), lit("(?i)^r[0-9]{2}")],
+            ),
+            (
+                "a scoped inline flag group",
+                vec![col("code"), lit("(?im-s:foo)bar")],
+            ),
+            (
+                "a plain non-capturing group",
+                vec![col("code"), lit("(?:ab)+")],
+            ),
+            ("a negated inline flag", vec![col("code"), lit("(?-i)r")]),
+            (
+                "a capture group followed by a quantifier",
+                vec![col("code"), lit("(ab)?c")],
+            ),
+            (
+                "counted repetition at RE2's inclusive limit",
+                vec![col("code"), lit("a{1,1000}")],
+            ),
+            (
+                "an open-ended repetition at RE2's inclusive limit",
+                vec![col("code"), lit("a{1000,}")],
+            ),
+            (
+                "single class punctuation without a Rust set operator",
+                vec![col("code"), lit("[a&~-]")],
+            ),
+            (
+                "an escaped parenthesis before a question mark",
+                vec![col("code"), lit(r"\(?a")],
+            ),
+        ] {
+            assert!(
+                translates(&call(REGEXP_LIKE_NAME, args)),
+                "{accepted} must translate"
+            );
+        }
+        for (rejected, args) in [
+            (
+                "a non-literal pattern, which cannot be scanned",
+                vec![col("code"), col("pattern")],
+            ),
+            (
+                "a NULL pattern, which has no text to scan",
+                vec![col("code"), Expr::Literal(ScalarValue::Utf8(None), None)],
+            ),
+            (
+                r"\d, Unicode-aware locally and ASCII in RE2",
+                vec![col("code"), lit(r"^\d+$")],
+            ),
+            (
+                r"\b, whose word boundary is Unicode-dependent",
+                vec![col("code"), lit(r"\bR01\b")],
+            ),
+            ("a non-ASCII pattern", vec![col("code"), lit("^caf\u{e9}")]),
+            (
+                "a quote, which would end the raw string literal",
+                vec![col("code"), lit("^'R")],
+            ),
+            ("a trailing backslash", vec![col("code"), lit(r"^R\")]),
+            (
+                "the U flag, unmeasured against BigQuery",
+                vec![col("code"), lit("^r"), lit("U")],
+            ),
+            (
+                "the R flag, which has no RE2 counterpart",
+                vec![col("code"), lit("^r"), lit("R")],
+            ),
+            (
+                "non-literal flags",
+                vec![col("code"), lit("^r"), col("flags")],
+            ),
+            (
+                "the inline x mode, which RE2 does not have",
+                vec![col("code"), lit("(?x)a b")],
+            ),
+            (
+                "the inline U flag, refused for the same reason as the U flags argument",
+                vec![col("code"), lit("(?U)a+")],
+            ),
+            (
+                "the inline R CRLF mode, which has no RE2 counterpart",
+                vec![col("code"), lit("(?R)^a")],
+            ),
+            ("an inline Unicode toggle", vec![col("code"), lit("(?u)a")]),
+            (
+                "a named capture group, which the two engines spell differently",
+                vec![col("code"), lit("(?P<n>a)")],
+            ),
+            (
+                "a lookahead, which neither engine supports",
+                vec![col("code"), lit("(?=a)")],
+            ),
+            ("an empty flag directive", vec![col("code"), lit("(?)a")]),
+            (
+                "an exact repetition above RE2's limit",
+                vec![col("code"), lit("a{1001}")],
+            ),
+            (
+                "an open-ended repetition above RE2's limit",
+                vec![col("code"), lit("a{1001,}")],
+            ),
+            (
+                "an upper repetition bound above RE2's limit",
+                vec![col("code"), lit("a{1,1001}")],
+            ),
+            (
+                "Rust character-class intersection",
+                vec![col("code"), lit("[a&&b]")],
+            ),
+            (
+                "Rust character-class difference",
+                vec![col("code"), lit("[a--b]")],
+            ),
+            (
+                "Rust character-class symmetric difference",
+                vec![col("code"), lit("[a~~b]")],
+            ),
+            (
+                "a nested class used by Rust set algebra",
+                vec![col("code"), lit("[a&&[b]]")],
+            ),
+        ] {
+            assert!(
+                !translates(&call(REGEXP_LIKE_NAME, args)),
+                "{rejected} must stay local"
+            );
+        }
+    }
+
+    #[test]
+    fn rusts_perl_classes_are_unicode_aware() {
+        // The local half of the divergence the pattern gate guards against:
+        // Rust's `\d` matches a Unicode digit where RE2's is `[0-9]`, so a
+        // pattern carrying it federated to BigQuery would silently keep
+        // different rows. If this stops matching, the gate guards nothing and
+        // can be relaxed.
+        let digits = regex::Regex::new(r"^\d+$").expect("the digit pattern compiles");
+        assert!(
+            digits.is_match("\u{663}\u{664}\u{665}"),
+            "Rust's \\d must match Arabic-Indic digits, or the gate is pointless"
+        );
+    }
+
+    #[test]
+    fn rust_only_inline_modes_exist() {
+        // The local half of the inline-modifier divergence the gate guards
+        // against: Rust's regex reads `(?x)` (extended mode, whitespace
+        // ignored), which RE2 does not have — so `(?x)a b` matches `ab`
+        // locally and is a syntax error remotely. If Rust ever drops the
+        // mode, the group-options gate can be relaxed.
+        let extended = regex::Regex::new("(?x)a b").expect("Rust reads extended mode");
+        assert!(
+            extended.is_match("ab"),
+            "extended mode must ignore the space, or the gate guards nothing"
+        );
+        assert!(
+            !extended.is_match("a b"),
+            "in extended mode the literal space is not part of the pattern"
+        );
+    }
+
+    #[test]
+    fn rust_supports_regex_features_re2_does_not() {
+        assert!(
+            regex::Regex::new("a{1001}").is_ok(),
+            "Rust must accept a repetition above RE2's 1000 limit, or the bound gate is unnecessary"
+        );
+
+        let intersection =
+            regex::Regex::new("^[a&&b]$").expect("Rust reads character-class intersection");
+        assert!(
+            !intersection.is_match("a") && !intersection.is_match("b"),
+            "Rust must read `&&` as set intersection rather than literal ampersands"
+        );
+    }
+
+    #[test]
+    fn regexp_like_never_renders_verbatim() {
+        for args in [
+            vec![col("code"), lit("^R[0-9]{2}")],
+            vec![col("code"), lit("^r"), lit("i")],
+        ] {
+            let sql = render(REGEXP_LIKE_NAME, args);
+            assert!(
+                !sql.contains(REGEXP_LIKE_NAME),
+                "{REGEXP_LIKE_NAME} must not reach BigQuery SQL: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_untranslatable_regexp_like_fails_rather_than_unparsing_verbatim() {
+        // Unreachable with the deny-list's per-call check installed; see
+        // `an_untranslatable_call_fails_rather_than_unparsing_verbatim` for why
+        // the alternative is worse.
+        let dialect = new_bigquery_dialect();
+        let error = Unparser::new(dialect.as_ref())
+            .expr_to_sql(&Expr::ScalarFunction(call(
+                REGEXP_LIKE_NAME,
+                vec![col("code"), col("pattern")],
+            )))
+            .expect_err("a non-literal pattern has no BigQuery translation");
+        let message = error.to_string();
+        for expected in [
+            "must be literals",
+            "query_federation",
+            "https://spiceai.org/docs/components/data-connectors/adbc",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the error must carry {expected:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dialect_renders_every_builtin_it_overrides() {
+        // The mirror of `the_dialect_renders_every_name_the_deny_list_carves_out`
+        // for the built-in table: an entry whose handler cannot render the
+        // shape its own `can_translate` accepts would fail at execution.
+        let dialect = new_bigquery_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        for entry in super::BUILTIN_SCALAR_OVERRIDES {
+            // One call per entry, because an entry's `can_translate` accepts the
+            // shapes its own handler renders and those differ: `array_element`
+            // takes an array and a non-negative integer index where the regex
+            // entries take a column and a pattern.
+            let args: [Expr; 2] = match entry.name {
+                "array_element" => [col("arr"), lit(1_i64)],
+                _ => [col("code"), lit("^R[0-9]{2}")],
+            };
+            assert!(
+                (entry.can_translate)(&args, None),
+                "`{name}`'s representative call must be translatable",
+                name = entry.name
+            );
+            let rendered = dialect
+                .scalar_function_to_sql_overrides(&unparser, entry.name, &args)
+                .unwrap_or_else(|error| {
+                    panic!("the dialect must render `{}`: {error}", entry.name)
+                });
+            assert!(
+                rendered.is_some(),
+                "`{name}` has an override entry but no handler answered for it",
+                name = entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_rewritten_null_check_unparses_into_regexp_contains() {
+        // The production path end to end, minus the network: the optimizer rule
+        // rewrites the NULL-check idiom before federation, and this dialect
+        // renders what the rewrite produces.
+        use datafusion::optimizer::{OptimizerContext, OptimizerRule};
+
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("code", DataType::Utf8, true),
+        ]));
+        let source = Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+            schema,
+        )) as Arc<dyn datafusion::logical_expr::TableSource>;
+        let matches = Expr::ScalarFunction(ScalarFunction::new_udf(
+            datafusion::functions::regex::regexp_match(),
+            vec![col("code"), lit("^R[0-9]{2}")],
+        ));
+        let plan = datafusion::logical_expr::LogicalPlanBuilder::scan("t", source, None)
+            .expect("scan t")
+            .filter(Expr::IsNotNull(Box::new(matches)))
+            .expect("filter")
+            .project(vec![col("code")])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        let rewritten = crate::optimizer_rule::RegexpMatchNullCheckRewrite::new()
+            .rewrite(plan, &OptimizerContext::new())
+            .expect("the optimizer rule rewrites the plan")
+            .data;
+        let sql = unparse_plan(new_bigquery_dialect().as_ref(), &rewritten);
+
+        assert!(
+            sql.contains("REGEXP_CONTAINS(") && sql.contains("IS TRUE"),
+            "the NULL-check must reach BigQuery as a REGEXP_CONTAINS predicate: {sql}"
+        );
+        assert!(
+            !sql.contains("regexp_"),
+            "no DataFusion regexp function may reach BigQuery SQL: {sql}"
+        );
+    }
+
+    #[test]
+    fn json_length_counts_an_array_and_an_object_differently() {
+        // The depth argument on JSON_KEYS is what keeps an object's count to
+        // its own keys: without it BigQuery descends and returns nested paths,
+        // where json_length counts only the top level.
+        assert_eq!(
+            render(JSON_LENGTH_NAME, vec![col("doc"), lit("a")]),
+            concat!(
+                r#"CASE WHEN STARTS_WITH(JSON_QUERY(`doc`, R'$."a"'), '[') "#,
+                r#"THEN ARRAY_LENGTH(JSON_QUERY_ARRAY(`doc`, R'$."a"')) "#,
+                r#"WHEN STARTS_WITH(JSON_QUERY(`doc`, R'$."a"'), '{') "#,
+                r#"THEN ARRAY_LENGTH(JSON_KEYS(SAFE.PARSE_JSON(JSON_QUERY(`doc`, R'$."a"')), 1)) END"#
+            )
+        );
+    }
+
+    #[test]
+    fn json_length_object_keys_are_capped_to_the_top_level() {
+        let sql = render(JSON_LENGTH_NAME, vec![col("doc"), lit("a")]);
+        assert!(
+            sql.contains("JSON_KEYS(SAFE.PARSE_JSON(JSON_QUERY(`doc`, R'$.\"a\"')), 1)"),
+            "JSON_KEYS must carry the depth argument, or it counts nested paths: {sql}"
+        );
+    }
+
+    #[test]
+    fn json_object_keys_renders_as_a_depth_capped_json_keys() {
+        assert_eq!(
+            render(JSON_OBJECT_KEYS_NAME, vec![col("doc"), lit("a")]),
+            concat!(
+                r#"CASE WHEN STARTS_WITH(JSON_QUERY(`doc`, R'$."a"'), '{') "#,
+                r#"THEN JSON_KEYS(SAFE.PARSE_JSON(JSON_QUERY(`doc`, R'$."a"')), 1) END"#
+            )
+        );
+    }
+
+    #[test]
+    fn json_object_keys_never_resolving_keeps_its_element_type() {
+        // An untyped NULL would make the federated schema disagree with the
+        // plan's List(Utf8), which is a failed query rather than a wrong row.
+        assert_eq!(
+            render(JSON_OBJECT_KEYS_NAME, vec![col("doc"), lit(-1_i64)]),
+            "CAST(NULL AS ARRAY<STRING>)"
+        );
+    }
+
+    #[test]
+    fn the_alias_renders_exactly_as_the_canonical_name_does() {
+        assert_eq!(
+            render(JSON_LEN_NAME, vec![col("doc"), lit("a")]),
+            render(JSON_LENGTH_NAME, vec![col("doc"), lit("a")]),
+            "`json_len` is `json_length`; the two must not drift"
+        );
+        assert_eq!(
+            render(JSON_KEYS_NAME, vec![col("doc"), lit("a")]),
+            render(JSON_OBJECT_KEYS_NAME, vec![col("doc"), lit("a")]),
+            "`json_keys` is `json_object_keys`; the two must not drift"
+        );
+    }
+
+    #[test]
+    fn a_path_that_can_never_resolve_renders_as_a_typed_null() {
+        assert_eq!(
+            render(JSON_GET_INT_NAME, vec![col("doc"), lit(-1_i64)]),
+            "CAST(NULL AS INT64)"
+        );
+    }
+
+    #[test]
+    fn no_rendering_ever_contains_the_function_verbatim() {
+        for name in [
+            JSON_GET_INT_NAME,
+            JSON_GET_STR_NAME,
+            JSON_GET_BOOL_NAME,
+            JSON_GET_FLOAT_NAME,
+            JSON_LENGTH_NAME,
+            JSON_OBJECT_KEYS_NAME,
+        ] {
+            for args in [
+                vec![col("doc"), lit("a")],
+                vec![col("doc"), lit("a"), lit(0_i64)],
+                vec![col("doc"), lit(-1_i64)],
+            ] {
+                let sql = render(name, args);
+                assert!(
+                    !sql.contains(name),
+                    "{name} must not reach BigQuery SQL: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_untranslatable_call_fails_rather_than_unparsing_verbatim() {
+        // Unreachable with the deny-list installed. If the dialect is used
+        // without it, the alternative is emitting a JSON function call into
+        // BigQuery SQL, so this fails where a reader can see it instead.
+        let dialect = new_bigquery_dialect();
+        for name in [
+            JSON_GET_INT_NAME,
+            JSON_LENGTH_NAME,
+            JSON_OBJECT_KEYS_NAME,
+            JSON_CONTAINS_NAME,
+        ] {
+            let error = Unparser::new(dialect.as_ref())
+                .expr_to_sql(&Expr::ScalarFunction(call(
+                    name,
+                    vec![col("doc"), col("key")],
+                )))
+                .expect_err("a dynamic path has no BigQuery translation");
+            let message = error.to_string();
+            for expected in [
+                name,
+                "must be a literal",
+                "query_federation",
+                "https://spiceai.org/docs/components/data-connectors/adbc",
+            ] {
+                assert!(
+                    message.contains(expected),
+                    "the error must carry {expected:?}: {message}"
+                );
+            }
+            assert_eq!(
+                message.contains("column"),
+                name == JSON_CONTAINS_NAME,
+                "only json_contains requires a source-declared document column: {message}"
+            );
+            assert!(
+                !message.contains("policy"),
+                "the error must not name an internal mechanism: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dialect_renders_every_name_the_deny_list_carves_out() {
+        // The carve-out is what lets these names federate. A name in it that
+        // the dialect has no handler for would be unparsed verbatim, so the
+        // list is only safe while the dialect answers for all of it.
+        let dialect = new_bigquery_dialect();
+        // A scope declaring `doc` as a BigQuery STRING column. `json_contains`
+        // renders differently for a native JSON column and refuses a document
+        // whose type the source did not declare, so it needs one; every other
+        // handler ignores it.
+        let scope = Arc::new(
+            datafusion::common::DFSchema::try_from(datafusion::arrow::datatypes::Schema::new(
+                vec![
+                    datafusion::arrow::datatypes::Field::new("doc", DataType::Utf8, true)
+                        .with_metadata(
+                            [("BIGQUERY:type".to_string(), "STRING".to_string())]
+                                .into_iter()
+                                .collect(),
+                        ),
+                ],
+            ))
+            .expect("scope"),
+        );
+        let unparser = Unparser::new(dialect.as_ref()).with_schema(scope);
+        for name in crate::dialect::bigquery_native_function_names() {
+            let rendered = dialect
+                .scalar_function_to_sql_overrides(&unparser, name, &[col("doc"), lit("a")])
+                .unwrap_or_else(|error| panic!("the dialect must render `{name}`: {error}"));
+            assert!(
+                rendered.is_some(),
+                "`{name}` is carved out of the deny-list but the dialect has no handler for it, \
+                 so it would be unparsed verbatim into BigQuery SQL"
+            );
+        }
+    }
+
+    #[test]
+    fn a_predicate_over_a_json_function_unparses_into_the_statement() {
+        // The whole statement, not just the expression: this is the SQL a
+        // federated scan sends, so it is where a verbatim `json_get_*` would
+        // show up.
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("doc", DataType::Utf8, true),
+        ]));
+        let source = Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+            schema,
+        )) as Arc<dyn datafusion::logical_expr::TableSource>;
+        let plan = datafusion::logical_expr::LogicalPlanBuilder::scan("t", source, None)
+            .expect("scan t")
+            .filter(
+                Expr::ScalarFunction(call(JSON_GET_INT_NAME, vec![col("doc"), lit("a")]))
+                    .eq(lit(1_i64)),
+            )
+            .expect("filter")
+            .build()
+            .expect("build");
+
+        let dialect = new_bigquery_dialect();
+        let sql = Unparser::new(dialect.as_ref())
+            .plan_to_sql(&plan)
+            .expect("the BigQuery dialect unparses the plan")
+            .to_string();
+
+        assert!(sql.contains("JSON_VALUE("), "no JSON_VALUE in: {sql}");
+        assert!(sql.contains("SAFE_CAST("), "no SAFE_CAST in: {sql}");
+        assert!(
+            !sql.contains("json_get_"),
+            "a Spice-only function reached BigQuery SQL: {sql}"
+        );
+    }
+
+    #[test]
+    fn the_wrapper_unparses_exactly_as_the_bigquery_dialect_does() {
+        // Every `Dialect` method is forwarded to the inner dialect. Inheriting
+        // a trait default for one instead would change quoting, a cast's type
+        // name or an alias silently — valid SQL that BigQuery rejects, or worse,
+        // accepts differently. Unparsing the same plan through both is what
+        // notices, whichever method was missed.
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("n", DataType::Int64, false),
+            datafusion::arrow::datatypes::Field::new(
+                "ts",
+                DataType::Timestamp(
+                    datafusion::arrow::datatypes::TimeUnit::Nanosecond,
+                    Some("UTC".into()),
+                ),
+                true,
+            ),
+        ]));
+        let source = Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+            schema,
+        )) as Arc<dyn datafusion::logical_expr::TableSource>;
+        let plan = datafusion::logical_expr::LogicalPlanBuilder::scan("t", source, None)
+            .expect("scan t")
+            .project(vec![
+                datafusion::prelude::cast(col("n"), DataType::Float64).alias("a.b"),
+                datafusion::prelude::cast(col("n"), DataType::Utf8),
+                datafusion::prelude::cast(col("ts"), DataType::Date32),
+                col("ts").alias("raw"),
+            ])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        let unparse = |dialect: &dyn datafusion::sql::unparser::dialect::Dialect| {
+            Unparser::new(dialect)
+                .plan_to_sql(&plan)
+                .expect("unparse the plan")
+                .to_string()
+        };
+
+        assert_eq!(
+            unparse(&SpiceBigQueryDialect::new()),
+            unparse(&datafusion::sql::unparser::dialect::BigQueryDialect::new()),
+            "a `Dialect` method is not forwarded to the inner BigQuery dialect"
+        );
+    }
+
+    #[test]
+    fn the_wrapper_emits_valid_bigquery_set_and_window_syntax() {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("id", DataType::Int64, false),
+        ]));
+        let source = Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+            Arc::clone(&schema),
+        )) as Arc<dyn datafusion::logical_expr::TableSource>;
+        let scan = |name: &'static str| {
+            datafusion::logical_expr::LogicalPlanBuilder::scan(name, Arc::clone(&source), None)
+                .expect("build table scan")
+                .project(vec![col(format!("{name}.id"))])
+                .expect("project id")
+                .build()
+                .expect("build scan plan")
+        };
+
+        let left = scan("left_table");
+        let right = scan("right_table");
+        let distinct = datafusion::logical_expr::LogicalPlanBuilder::from(left.clone())
+            .union_distinct(right.clone())
+            .expect("build distinct union")
+            .build()
+            .expect("build distinct union plan");
+        let all = datafusion::logical_expr::LogicalPlanBuilder::from(left)
+            .union(right)
+            .expect("build all union")
+            .build()
+            .expect("build all union plan");
+
+        let distinct_sql = unparse_plan(new_bigquery_dialect().as_ref(), &distinct);
+        let all_sql = unparse_plan(new_bigquery_dialect().as_ref(), &all);
+        assert!(
+            distinct_sql.contains(" UNION DISTINCT "),
+            "BigQuery requires an explicit DISTINCT quantifier: {distinct_sql}"
+        );
+        assert!(
+            all_sql.contains(" UNION ALL "),
+            "UNION ALL must retain duplicate rows: {all_sql}"
+        );
+
+        let input = datafusion::logical_expr::LogicalPlanBuilder::scan(
+            "window_values",
+            Arc::clone(&source),
+            None,
+        )
+        .expect("build window table scan")
+        .build()
+        .expect("build window input");
+        let order_by = vec![col("window_values.id").sort(true, true)];
+        let row_number = Expr::WindowFunction(Box::new(WindowFunction {
+            fun: WindowFunctionDefinition::WindowUDF(
+                datafusion::functions_window::row_number::row_number_udwf(),
+            ),
+            params: WindowFunctionParams {
+                args: vec![],
+                partition_by: vec![],
+                order_by: order_by.clone(),
+                window_frame: WindowFrame::new(Some(false)),
+                null_treatment: None,
+                distinct: false,
+                filter: None,
+            },
+        }))
+        .alias("row_num");
+        let running_sum = Expr::WindowFunction(Box::new(WindowFunction {
+            fun: WindowFunctionDefinition::AggregateUDF(
+                datafusion::functions_aggregate::sum::sum_udaf(),
+            ),
+            params: WindowFunctionParams {
+                args: vec![col("window_values.id")],
+                partition_by: vec![],
+                order_by,
+                window_frame: WindowFrame::new(Some(true)),
+                null_treatment: None,
+                distinct: false,
+                filter: None,
+            },
+        }))
+        .alias("running_sum");
+        let window = datafusion::logical_expr::LogicalPlanBuilder::from(input)
+            .window(vec![row_number, running_sum])
+            .expect("build window expressions")
+            .build()
+            .expect("build window plan");
+        let window_sql = unparse_plan(new_bigquery_dialect().as_ref(), &window);
+        assert!(
+            window_sql.contains(
+                "row_number() OVER (ORDER BY `window_values`.`id` ASC NULLS FIRST) AS `row_num`"
+            ),
+            "BigQuery rejects a window frame on ROW_NUMBER: {window_sql}"
+        );
+        assert!(
+            window_sql.contains(
+                "sum(`window_values`.`id`) OVER (ORDER BY `window_values`.`id` ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS `running_sum`"
+            ),
+            "aggregate window frames change which rows contribute and must be retained: {window_sql}"
+        );
+    }
+
+    /// [`timestamp_scan`] plus a value column, for a window function to aggregate.
+    fn windowed_scan() -> datafusion::logical_expr::LogicalPlanBuilder {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new(
+                "ts",
+                DataType::Timestamp(
+                    datafusion::arrow::datatypes::TimeUnit::Nanosecond,
+                    Some("UTC".into()),
+                ),
+                true,
+            ),
+            datafusion::arrow::datatypes::Field::new("v", DataType::Int64, true),
+        ]));
+        let source = Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+            schema,
+        )) as Arc<dyn datafusion::logical_expr::TableSource>;
+        datafusion::logical_expr::LogicalPlanBuilder::scan("t", source, None).expect("scan t")
+    }
+
+    /// A scan of `t(ts)` carrying a UTC nanosecond timestamp, which most arms of
+    /// [`the_wrapper_forwards_every_bigquery_specific_rendering`] filter or project over.
+    fn timestamp_scan() -> datafusion::logical_expr::LogicalPlanBuilder {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new(
+                "ts",
+                DataType::Timestamp(
+                    datafusion::arrow::datatypes::TimeUnit::Nanosecond,
+                    Some("UTC".into()),
+                ),
+                true,
+            ),
+        ]));
+        let source = Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+            schema,
+        )) as Arc<dyn datafusion::logical_expr::TableSource>;
+        datafusion::logical_expr::LogicalPlanBuilder::scan("t", source, None).expect("scan t")
+    }
+
+    /// A scan of one `DATE` column and one naive timestamp column, for the
+    /// renderings that depend on an operand being a date or a civil timestamp.
+    fn date_scan() -> datafusion::logical_expr::LogicalPlanBuilder {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("d", DataType::Date32, true),
+            datafusion::arrow::datatypes::Field::new("note", DataType::Utf8, true),
+            datafusion::arrow::datatypes::Field::new("e", DataType::Date32, true),
+            datafusion::arrow::datatypes::Field::new(
+                "naive",
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]));
+        let source = Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+            schema,
+        )) as Arc<dyn datafusion::logical_expr::TableSource>;
+        datafusion::logical_expr::LogicalPlanBuilder::scan("d", source, None).expect("scan d")
+    }
+
+    /// The SQL `dialect` renders for `plan`.
+    fn unparse_plan(
+        dialect: &dyn datafusion::sql::unparser::dialect::Dialect,
+        plan: &datafusion::logical_expr::LogicalPlan,
+    ) -> String {
+        Unparser::new(dialect)
+            .plan_to_sql(plan)
+            .expect("unparse the plan")
+            .to_string()
+    }
+
+    /// A recursive CTE renders as `WITH RECURSIVE` through the wrapper, and only
+    /// for a dialect that has opted in.
+    ///
+    /// Separate from [`the_wrapper_forwards_every_bigquery_specific_rendering`]
+    /// because this one asserts a *statement* shape rather than a fragment of a
+    /// `SELECT`, and because it needs the negative direction too: the gate is the
+    /// load-bearing half. A federated statement has no local-execution fallback,
+    /// so emitting `WITH RECURSIVE` to an engine that cannot run one turns a
+    /// query that used to evaluate locally into a failure.
+    #[test]
+    fn a_recursive_cte_renders_through_the_wrapper_only_where_it_is_supported() {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("n", DataType::Int64, true),
+        ]));
+        let working_table = |name: &str| {
+            datafusion::logical_expr::LogicalPlanBuilder::scan(
+                name,
+                Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+                    Arc::clone(&schema),
+                )) as Arc<dyn datafusion::logical_expr::TableSource>,
+                None,
+            )
+            .expect("scan the working table")
+        };
+
+        // `SELECT n FROM counted WHERE n < 5`, the term that reads the working
+        // table by the CTE's own name — the self-reference a recursive CTE needs.
+        let recursive_term = working_table("counted")
+            .filter(col("counted.n").lt(lit(5_i64)))
+            .expect("filter")
+            .project(vec![col("counted.n")])
+            .expect("project")
+            .build()
+            .expect("build");
+        let static_term = working_table("seed")
+            .project(vec![col("seed.n")])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        let plan = datafusion::logical_expr::LogicalPlan::RecursiveQuery(
+            datafusion::logical_expr::RecursiveQuery {
+                name: "counted".to_string(),
+                static_term: Arc::new(static_term),
+                recursive_term: Arc::new(recursive_term),
+                is_distinct: false,
+                schema: Arc::new(
+                    datafusion::common::DFSchema::try_from(Arc::clone(&schema)).expect("schema"),
+                ),
+            },
+        );
+
+        let wrapper = unparse_plan(new_bigquery_dialect().as_ref(), &plan);
+        let dialect = new_bigquery_dialect();
+        let reusable = Unparser::new(dialect.as_ref());
+        assert!(
+            reusable
+                .expr_to_sql(&datafusion::logical_expr::expr_fn::scalar_subquery(
+                    Arc::new(plan.clone())
+                ))
+                .is_err(),
+            "a standalone expression has no statement to hold a recursive CTE"
+        );
+        assert_eq!(
+            reusable
+                .expr_to_sql(&lit(1_i64))
+                .expect("reuse after refusal")
+                .to_string(),
+            "1"
+        );
+        assert!(
+            wrapper.contains("WITH RECURSIVE"),
+            "a recursive CTE has to keep its RECURSIVE keyword: {wrapper}"
+        );
+
+        // Where it sits matters as much as that it is there. `BigQuery` accepts
+        // `WITH RECURSIVE` only at the top of a statement, and a generator is
+        // rarely at the top of a *plan* — joined to a table it is a join input,
+        // which unparses as a derived table. Six corpus statements failed with
+        // "WITH RECURSIVE is only allowed at the top level of the SELECT" once
+        // the CTE started federating, so this pins the position for the shape
+        // that broke: the join nested inside a derived table.
+        let nested = {
+            // Its own column name, so the join condition is unambiguous against
+            // the generator's `n`.
+            let outer_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+                datafusion::arrow::datatypes::Field::new("m", DataType::Int64, true),
+            ]));
+            datafusion::logical_expr::LogicalPlanBuilder::scan(
+                "outer",
+                Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+                    outer_schema,
+                )) as Arc<dyn datafusion::logical_expr::TableSource>,
+                None,
+            )
+            .expect("scan the outer table")
+            .join_on(
+                plan.clone(),
+                datafusion::logical_expr::JoinType::Inner,
+                [col("outer.m").eq(col("n"))],
+            )
+            .expect("join the generator")
+            .project(vec![col("outer.m")])
+            .expect("project")
+            .alias("inner_q")
+            .expect("alias")
+            .project(vec![col("inner_q.m")])
+            .expect("project")
+            .build()
+            .expect("build")
+        };
+        let nested_sql = unparse_plan(new_bigquery_dialect().as_ref(), &nested);
+        assert!(
+            nested_sql.starts_with("WITH RECURSIVE"),
+            "the CTE has to open the statement, not sit inside a derived \
+             table: {nested_sql}"
+        );
+        assert!(
+            !nested_sql.contains("FROM (WITH"),
+            "a WITH inside a derived table is what BigQuery refuses: {nested_sql}"
+        );
+        assert!(
+            wrapper.contains("UNION ALL"),
+            "a non-distinct recursive query joins its terms with UNION ALL: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("`counted`"),
+            "the recursive term's self-reference has to name the CTE: {wrapper}"
+        );
+        assert_eq!(
+            wrapper,
+            unparse_plan(
+                &datafusion::sql::unparser::dialect::BigQueryDialect::new(),
+                &plan
+            ),
+            "the wrapper and the inner BigQuery dialect have to render this the \
+             same way, or a federated recursive CTE diverges from the dialect's \
+             own rendering"
+        );
+
+        // The gate: a dialect that has not opted in still refuses, so nothing
+        // starts reaching an engine that cannot evaluate it.
+        assert!(
+            Unparser::new(&datafusion::sql::unparser::dialect::DefaultDialect {})
+                .plan_to_sql(&plan)
+                .is_err(),
+            "a dialect that does not support recursive CTEs must still refuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_column_list_survives_a_join_alias() -> datafusion::common::Result<()> {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_batch(
+            "join_values",
+            RecordBatch::try_from_iter([(
+                "value",
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            )])?,
+        )?;
+        let query = "WITH RECURSIVE day_grid(hours) AS (\
+                     SELECT CAST(0 AS BIGINT) AS hours UNION ALL \
+                     SELECT hours + 24 FROM day_grid WHERE hours < 72) \
+                     SELECT g.hours FROM day_grid g \
+                     JOIN join_values v ON g.hours = v.value * 24 \
+                     ORDER BY g.hours";
+        let expected = ctx.sql(query).await?.collect().await?;
+        let plan = ctx.sql(query).await?.into_optimized_plan()?;
+        let dialect = new_bigquery_dialect();
+        let sql = Unparser::new(dialect.as_ref())
+            .plan_to_sql(&plan)?
+            .to_string();
+        assert!(sql.starts_with("WITH RECURSIVE"), "{sql}");
+        assert_eq!(sql.matches("WITH RECURSIVE").count(), 1, "{sql}");
+        let actual = ctx.sql(&sql).await?.collect().await?;
+        assert_eq!(actual, expected, "{sql}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn filtered_recursive_join_inputs_keep_their_qualified_columns()
+    -> datafusion::common::Result<()> {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let query = "WITH RECURSIVE g AS (\
+                     SELECT 1 AS n UNION ALL SELECT n + 1 FROM g WHERE n < 3) \
+                     SELECT a.n, b.n FROM (SELECT n FROM g WHERE n > 1) a \
+                     JOIN (SELECT n FROM g WHERE n < 3) b ON a.n = b.n";
+        let expected = ctx.sql(query).await?.collect().await?;
+        let plan = ctx.sql(query).await?.into_optimized_plan()?;
+        let dialect = new_bigquery_dialect();
+        let sql = Unparser::new(dialect.as_ref())
+            .plan_to_sql(&plan)?
+            .to_string();
+        assert!(sql.starts_with("WITH RECURSIVE"), "{sql}");
+        assert_eq!(sql.matches("WITH RECURSIVE").count(), 1, "{sql}");
+        let actual = ctx.sql(&sql).await?.collect().await?;
+        assert_eq!(actual, expected, "{sql}");
+        Ok(())
+    }
+
+    /// Every `BigQuery`-specific rendering the fork's dialect fixes produce has to
+    /// survive the wrapper.
+    ///
+    /// [`the_wrapper_unparses_exactly_as_the_bigquery_dialect_does`] covers the casts,
+    /// quoting and aliasing an ordinary projection reaches. A [`Dialect`] method that
+    /// only some SQL shapes touch is invisible to it: drop the `interval_style` forward
+    /// and that plan still renders identically through both dialects, while a federated
+    /// predicate carrying an interval starts reaching `BigQuery` as `INTERVAL '3 MONS'`,
+    /// which it rejects.
+    ///
+    /// This is the path production takes — [`new_bigquery_dialect`] returns the wrapper,
+    /// so every federated `BigQuery` query unparses through it, while the fork's fixes
+    /// live on the inner dialect.
+    ///
+    /// Each arm asserts the rendering `BigQuery` receives, and that the wrapper and the
+    /// inner dialect agree on it — so the two being wrong together is not a pass.
+    ///
+    /// Removing a forward from [`SpiceBigQueryDialect`] fails the matching arm for
+    /// `interval_style`, `supports_column_alias_in_table_alias`, and the
+    /// `scalar_function_to_sql_overrides` delegation that the extract and `date_trunc`
+    /// arms reach. Two forwards cannot be caught this way, and those arms stand as
+    /// guards on the rendering rather than on the forward: nothing consults a
+    /// *wrapper's* `date_field_extract_style`, because the only caller is a dialect's
+    /// own `scalar_function_to_sql_overrides` reading its own, and
+    /// `timestamp_with_tz_to_string` is indistinguishable from the trait default for as
+    /// long as the inner dialect carries no override of it.
+    #[test]
+    fn the_wrapper_forwards_every_bigquery_specific_rendering() {
+        let timestamp_literal = timestamp_scan()
+            .filter(col("t.ts").gt(lit(ScalarValue::TimestampNanosecond(
+                Some(1_470_513_900_000_000_000),
+                Some("UTC".into()),
+            ))))
+            .expect("filter")
+            .project(vec![col("t.ts")])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        // A cast target carries no precision or scale, so the width has to come from
+        // the type: nine fractional digits fit `NUMERIC` and thirty-eight
+        // `BIGNUMERIC`.
+        let wide_decimal = timestamp_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                lit(1.5_f64),
+                DataType::Decimal128(38, 17),
+            )])
+            .expect("wide decimal projection")
+            .build()
+            .expect("build");
+
+        let extract = timestamp_scan()
+            .project(vec![datafusion::functions::expr_fn::date_part(
+                lit("YEAR"),
+                col("t.ts"),
+            )])
+            .expect("date_part projection")
+            .build()
+            .expect("build");
+
+        let interval = timestamp_scan()
+            .project(vec![
+                col("t.ts")
+                    + lit(ScalarValue::IntervalMonthDayNano(Some(
+                        datafusion::arrow::datatypes::IntervalMonthDayNano::new(3, 0, 0),
+                    ))),
+            ])
+            .expect("interval projection")
+            .build()
+            .expect("build");
+
+        let orders = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("o_orderkey", DataType::Int64, false),
+        ]));
+        let table_alias = datafusion::logical_expr::LogicalPlanBuilder::scan(
+            "orders",
+            Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+                orders,
+            )) as Arc<dyn datafusion::logical_expr::TableSource>,
+            None,
+        )
+        .expect("scan orders")
+        .project(vec![col("orders.o_orderkey")])
+        .expect("inner projection")
+        .project(vec![col("orders.o_orderkey").alias("key")])
+        .expect("renaming projection")
+        .alias("c")
+        .expect("subquery alias")
+        .project(vec![col("c.key")])
+        .expect("outer projection")
+        .build()
+        .expect("build");
+
+        // #212's renderings. Each is a BigQuery type or name fact the fork
+        // carries; a re-cut that drops one leaves the wrapper forwarding to a
+        // dialect that renders generic SQL, which the `missing_trait_methods`
+        // deny cannot see.
+        let date_difference = date_scan()
+            .project(vec![col("d.d") - col("d.e")])
+            .expect("date difference projection")
+            .build()
+            .expect("build");
+
+        let date_to_integer = date_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                col("d.d"),
+                DataType::Int64,
+            )])
+            .expect("date to integer projection")
+            .build()
+            .expect("build");
+
+        let naive_timestamp_cast = date_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                col("d.naive"),
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None),
+            )])
+            .expect("naive timestamp cast projection")
+            .build()
+            .expect("build");
+
+        // Text cast to a timestamp is parsed, not cast: BigQuery's DATETIME cast
+        // refuses every zone marker its TIMESTAMP cast takes, and neither takes
+        // more than six sub-second digits.
+        let text_to_timestamp = date_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                col("d.note"),
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None),
+            )])
+            .expect("text to timestamp projection")
+            .build()
+            .expect("build");
+
+        let constant_group_by = date_scan()
+            .aggregate(
+                vec![lit("POOLED")],
+                vec![datafusion::functions_aggregate::expr_fn::count(lit(1_i64))],
+            )
+            .expect("aggregate on a constant key")
+            .build()
+            .expect("build");
+
+        let truncated = timestamp_scan()
+            .project(vec![datafusion::functions::expr_fn::date_trunc(
+                lit("month"),
+                col("t.ts"),
+            )])
+            .expect("date_trunc projection")
+            .build()
+            .expect("build");
+
+        // A grouped timestamp projected through a wrapper. Nothing else in this
+        // test reaches `group_by_matches_select_subexpressions`, and a wrapper
+        // that inherits its permissive default renders one flat SELECT that
+        // BigQuery refuses with "neither grouped nor aggregated".
+        let wrapped_grouping = {
+            let grouped = timestamp_scan()
+                .aggregate(
+                    vec![datafusion::functions::expr_fn::date_trunc(
+                        lit("week"),
+                        col("t.ts"),
+                    )],
+                    vec![datafusion::functions_aggregate::expr_fn::count(lit(1_i64))],
+                )
+                .expect("aggregate")
+                .build()
+                .expect("build aggregate");
+            let mut outputs = grouped.schema().columns().into_iter();
+            let group_output = outputs.next().expect("the grouping expression's output");
+            let count_output = outputs.next().expect("the aggregate's output");
+            datafusion::logical_expr::LogicalPlanBuilder::from(grouped)
+                .project(vec![
+                    datafusion::logical_expr::cast(
+                        datafusion::logical_expr::Expr::Column(group_output),
+                        DataType::Date32,
+                    )
+                    .alias("week_start"),
+                    datafusion::logical_expr::Expr::Column(count_output).alias("n"),
+                ])
+                .expect("projection over the aggregate")
+                .build()
+                .expect("build")
+        };
+
+        // `SUM(v) OVER (ORDER BY ts)`, whose frame a plan normalizes to RANGE and
+        // whose placement it normalizes to ASC NULLS LAST — the combination
+        // BigQuery refuses. A wrapper inheriting the permissive default renders
+        // the NULLS clause and the statement fails.
+        let range_window = {
+            let windowed = datafusion::logical_expr::Expr::from(
+                datafusion::logical_expr::expr::WindowFunction {
+                    fun: datafusion::logical_expr::WindowFunctionDefinition::AggregateUDF(
+                        datafusion::functions_aggregate::sum::sum_udaf(),
+                    ),
+                    params: datafusion::logical_expr::expr::WindowFunctionParams {
+                        args: vec![col("t.v")],
+                        partition_by: vec![],
+                        order_by: vec![datafusion::logical_expr::expr::Sort::new(
+                            col("t.ts"),
+                            true,
+                            false,
+                        )],
+                        window_frame: datafusion::logical_expr::WindowFrame::new(Some(false)),
+                        null_treatment: None,
+                        filter: None,
+                        distinct: false,
+                    },
+                },
+            );
+            windowed_scan()
+                .window(vec![windowed])
+                .expect("window")
+                .build()
+                .expect("build")
+        };
+
+        // A decimal whose *integer* part overflows `NUMERIC`. `NUMERIC` is
+        // precision 38 scale 9, so it holds 29 integer digits; a thirtieth is
+        // refused outright ("Invalid NUMERIC value", measured), and the width
+        // arrives from arithmetic so no declared column type reveals it.
+        let integral_decimal = timestamp_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                lit(1.5_f64),
+                DataType::Decimal128(38, 0),
+            )])
+            .expect("integral decimal projection")
+            .build()
+            .expect("build");
+
+        // `LEAD` refuses a framing clause where the navigation functions that do
+        // take one keep theirs, so the frame has to be dropped from this and not
+        // from `FIRST_VALUE`.
+        let lead_with_frame = {
+            let windowed = datafusion::logical_expr::Expr::from(
+                datafusion::logical_expr::expr::WindowFunction {
+                    fun: datafusion::logical_expr::WindowFunctionDefinition::WindowUDF(
+                        datafusion::functions_window::lead_lag::lead_udwf(),
+                    ),
+                    params: datafusion::logical_expr::expr::WindowFunctionParams {
+                        args: vec![col("t.v")],
+                        partition_by: vec![],
+                        order_by: vec![datafusion::logical_expr::expr::Sort::new(
+                            col("t.ts"),
+                            true,
+                            false,
+                        )],
+                        window_frame: datafusion::logical_expr::WindowFrame::new_bounds(
+                            datafusion::logical_expr::window_frame::WindowFrameUnits::Rows,
+                            datafusion::logical_expr::window_frame::WindowFrameBound::Preceding(
+                                ScalarValue::UInt64(None),
+                            ),
+                            datafusion::logical_expr::window_frame::WindowFrameBound::CurrentRow,
+                        ),
+                        null_treatment: None,
+                        filter: None,
+                        distinct: false,
+                    },
+                },
+            );
+            windowed_scan()
+                .window(vec![windowed])
+                .expect("window")
+                .build()
+                .expect("build")
+        };
+
+        // The control for the arm above: a navigation function that *does* take a
+        // frame must keep it, or an over-broad re-cut that drops every frame
+        // passes the `LEAD` arm while silently changing which rows each window
+        // covers.
+        let first_value_with_frame = {
+            let windowed = datafusion::logical_expr::Expr::from(
+                datafusion::logical_expr::expr::WindowFunction {
+                    fun: datafusion::logical_expr::WindowFunctionDefinition::WindowUDF(
+                        datafusion::functions_window::nth_value::first_value_udwf(),
+                    ),
+                    params: datafusion::logical_expr::expr::WindowFunctionParams {
+                        args: vec![col("t.v")],
+                        partition_by: vec![],
+                        order_by: vec![datafusion::logical_expr::expr::Sort::new(
+                            col("t.ts"),
+                            true,
+                            false,
+                        )],
+                        window_frame: datafusion::logical_expr::WindowFrame::new_bounds(
+                            datafusion::logical_expr::window_frame::WindowFrameUnits::Rows,
+                            datafusion::logical_expr::window_frame::WindowFrameBound::Preceding(
+                                ScalarValue::UInt64(None),
+                            ),
+                            datafusion::logical_expr::window_frame::WindowFrameBound::CurrentRow,
+                        ),
+                        null_treatment: None,
+                        filter: None,
+                        distinct: false,
+                    },
+                },
+            );
+            windowed_scan()
+                .window(vec![windowed])
+                .expect("window")
+                .build()
+                .expect("build")
+        };
+
+        // BigQuery has no `FILTER (WHERE ...)` — measured, it is a syntax error —
+        // so the predicate has to move inside the aggregate. Which rewriting is
+        // correct depends on the aggregate, so each of these is its own arm.
+        let filtered = |aggregate: datafusion::logical_expr::Expr| {
+            windowed_scan()
+                .aggregate(vec![col("t.ts")], vec![aggregate])
+                .expect("filtered aggregate")
+                .build()
+                .expect("build")
+        };
+        let keeps_rows = col("t.v").gt(lit(1_i64));
+        let filtered_count = filtered(
+            datafusion::functions_aggregate::expr_fn::count(lit(1_i64))
+                .filter(keeps_rows.clone())
+                .build()
+                .expect("filtered count"),
+        );
+        let filtered_sum = filtered(
+            datafusion::functions_aggregate::expr_fn::sum(col("t.v"))
+                .filter(keeps_rows.clone())
+                .build()
+                .expect("filtered sum"),
+        );
+        // `array_agg` keeps null inputs where the rewriting assumes they are
+        // skipped, and still takes the `CASE`: BigQuery refuses to build an array
+        // holding a null at all ("Array cannot have a null element"), so the
+        // rendering is correct whenever it runs and refused whenever it would not
+        // be. Declining would only lose the cases that work, since a federated
+        // statement has no local-execution fallback.
+        let filtered_array_agg = filtered(
+            datafusion::functions_aggregate::expr_fn::array_agg(col("t.v"))
+                .filter(keeps_rows.clone())
+                .build()
+                .expect("filtered array_agg"),
+        );
+        // `COUNT(1)` counts rows but `COUNT(NULL)` counts nothing: measured, 0
+        // where `COUNTIF` over the same rows is 2.
+        let filtered_count_null = filtered(
+            datafusion::functions_aggregate::expr_fn::count(lit(ScalarValue::Null))
+                .filter(keeps_rows.clone())
+                .build()
+                .expect("filtered count of null"),
+        );
+        // What decides a filtered aggregate is the allowlist, not the ordering:
+        // every name on the list is order-insensitive, so the rewriting may drop
+        // an ORDER BY safely, and every name off it declines whether ordered or
+        // not. Both directions are guarded, because an earlier decline keyed on
+        // the ordering instead failed queries that were correct.
+        let ordered_filtered_array_agg = filtered(
+            datafusion::functions_aggregate::expr_fn::array_agg(col("t.v"))
+                .filter(keeps_rows.clone())
+                .order_by(vec![col("t.v").sort(true, false)])
+                .build()
+                .expect("ordered filtered array_agg"),
+        );
+        let filtered_bit_and = filtered(
+            datafusion::functions_aggregate::bit_and_or_xor::bit_and(col("t.v"))
+                .filter(keeps_rows.clone())
+                .build()
+                .expect("filtered bit_and"),
+        );
+        let ordered_filtered_sum = filtered(
+            datafusion::functions_aggregate::expr_fn::sum(col("t.v"))
+                .filter(keeps_rows)
+                .order_by(vec![col("t.v").sort(true, false)])
+                .build()
+                .expect("ordered filtered sum"),
+        );
+
+        let descending_filtered_sum = filtered(
+            datafusion::functions_aggregate::expr_fn::sum(col("t.v"))
+                .filter(col("t.v").is_not_null())
+                .order_by(vec![col("t.v").sort(false, false)])
+                .build()
+                .expect("descending filtered sum"),
+        );
+
+        // The `date_part` fields BigQuery names differently. Without the
+        // rendering these reach it as the DataFusion name and it answers
+        // `Function not found: date_part` — which is why `dow`, the field that
+        // cannot be rendered, is refused federation rather than left to render.
+        let day_of_week = date_scan()
+            .project(vec![datafusion::functions::expr_fn::date_part(
+                lit("dow"),
+                col("d.d"),
+            )])
+            .expect("day of week projection")
+            .build()
+            .expect("build");
+
+        // The trap: BigQuery's bare `WEEK` is Sunday-based and answered 13 where
+        // DataFusion answered 14, so the obvious mapping is a wrong number with
+        // no error.
+        let iso_week = date_scan()
+            .project(vec![datafusion::functions::expr_fn::date_part(
+                lit("week"),
+                col("d.d"),
+            )])
+            .expect("iso week projection")
+            .build()
+            .expect("build");
+
+        // Text narrowed to a date. BigQuery's DATE cast takes only a bare
+        // `YYYY-MM-DD`, so an ISO instant held as text has to be parsed to an
+        // instant first and then narrowed.
+        let text_to_date = date_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                col("d.note"),
+                DataType::Date32,
+            )])
+            .expect("text to date projection")
+            .build()
+            .expect("build");
+
+        // Text compared against a civil timestamp. BigQuery has no implicit
+        // parse and refuses the pair outright.
+        let text_against_timestamp = date_scan()
+            .filter(col("d.note").lt(col("d.naive")))
+            .expect("text against timestamp filter")
+            .project(vec![col("d.note")])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        // A negative Arrow scale widens rather than narrows: `Decimal128(28, -2)`
+        // is 30 integer digits, not 26. The unparser normalises it to
+        // `(30, 0)` before the dialect sees it, so the dialect never meets a
+        // negative scale — guarded here because that normalisation lives in the
+        // fork, and losing it renders `NUMERIC` for a width BigQuery refuses.
+        let negative_scale = timestamp_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                lit(1.5_f64),
+                DataType::Decimal128(28, -2),
+            )])
+            .expect("negative scale projection")
+            .build()
+            .expect("build");
+
+        // The same overflow in a `Decimal256`, where the scale is small and the
+        // *precision* is what exceeds `NUMERIC`. Selecting on scale alone would
+        // render `NUMERIC` and lose every value past 29 integer digits.
+        let wide_precision = timestamp_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                lit(1.5_f64),
+                DataType::Decimal256(76, 2),
+            )])
+            .expect("wide precision projection")
+            .build()
+            .expect("build");
+
+        // A scale wider than BIGNUMERIC's thirty-eight is *rounded away
+        // silently* by BigQuery, unlike an integer overflow, which it refuses
+        // outright — so the widest type is still what gets emitted.
+        let wide_scale = timestamp_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                lit(1.5_f64),
+                DataType::Decimal256(76, 42),
+            )])
+            .expect("wide scale projection")
+            .build()
+            .expect("build");
+
+        // A tz-aware timestamp compared against a date. BigQuery has no common
+        // supertype for `TIMESTAMP` and `DATE` and refuses the pair, but a civil
+        // timestamp does compare with a date, so only the zoned side moves.
+        let instant_vs_date = timestamp_scan()
+            .filter(col("t.ts").gt_eq(lit(ScalarValue::Date32(Some(20_000)))))
+            .expect("instant vs date filter")
+            .project(vec![col("t.ts")])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        // A comparison against `date_trunc(<unit>, <date>)`. The call reads its
+        // granularity from a literal, so its type is answerable only through
+        // `return_field_from_args`; a rendering that cannot read it pushes the
+        // comparison down uncoerced and BigQuery refuses "TIMESTAMP, DATETIME".
+        let truncated_date_comparison = timestamp_scan()
+            .filter(
+                col("t.ts").gt_eq(datafusion::functions::expr_fn::date_trunc(
+                    lit("month"),
+                    datafusion::functions::expr_fn::current_date(),
+                )),
+            )
+            .expect("truncated date comparison filter")
+            .project(vec![col("t.ts")])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        // `bigquery_refuses_only_the_filtered_aggregate_shapes_it_cannot_rewrite`
+        // in `connector-adbc` checks that federation *allows* each allowlisted
+        // name. That is only half of it: the rewrite that has to render them
+        // lives in the fork, behind its own `filter_rewrite_is_exact`. If the
+        // two lists drift — a name dropped there, kept here — federation sends a
+        // `FILTER` clause BigQuery cannot parse, and a test that only asks
+        // whether the call federates stays green. So every name on the mirror
+        // list is rendered here too.
+        let allowlisted: Vec<(&str, datafusion::logical_expr::Expr)> = vec![
+            (
+                "count",
+                datafusion::functions_aggregate::expr_fn::count(col("t.v")),
+            ),
+            (
+                "sum",
+                datafusion::functions_aggregate::expr_fn::sum(col("t.v")),
+            ),
+            (
+                "min",
+                datafusion::functions_aggregate::expr_fn::min(col("t.v")),
+            ),
+            (
+                "max",
+                datafusion::functions_aggregate::expr_fn::max(col("t.v")),
+            ),
+            (
+                "avg",
+                datafusion::functions_aggregate::expr_fn::avg(col("t.v")),
+            ),
+            (
+                "bit_and",
+                datafusion::functions_aggregate::expr_fn::bit_and(col("t.v")),
+            ),
+            (
+                "bit_or",
+                datafusion::functions_aggregate::expr_fn::bit_or(col("t.v")),
+            ),
+            (
+                "bit_xor",
+                datafusion::functions_aggregate::expr_fn::bit_xor(col("t.v")),
+            ),
+        ];
+        assert_eq!(
+            allowlisted
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            super::FILTER_REWRITE_IS_EXACT,
+            "every name on the mirror list needs a rendering case here, or \
+             adding one federates a FILTER the fork may not rewrite"
+        );
+        for (name, aggregate) in allowlisted {
+            let plan = filtered(
+                aggregate
+                    .filter(col("t.v").is_not_null())
+                    .build()
+                    .unwrap_or_else(|e| panic!("filtered {name}: {e}")),
+            );
+            let wrapper = unparse_plan(new_bigquery_dialect().as_ref(), &plan);
+            let inner = unparse_plan(
+                &datafusion::sql::unparser::dialect::BigQueryDialect::new(),
+                &plan,
+            );
+            assert_eq!(
+                wrapper, inner,
+                "{name}: the wrapper and the inner BigQuery dialect disagree"
+            );
+            assert!(
+                !wrapper.contains("FILTER"),
+                "{name} is on the rewrite allowlist, so its FILTER must move \
+                 inside the aggregate; got {wrapper}"
+            );
+            assert!(
+                wrapper.contains("CASE WHEN") || wrapper.contains("COUNTIF("),
+                "{name}: the predicate has to reach the aggregate's argument; \
+                 got {wrapper}"
+            );
+        }
+
+        let integer_hours = windowed_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                col("t.v") / lit(3600_i64),
+                DataType::Int64,
+            )])
+            .expect("integer hour projection")
+            .build()
+            .expect("build");
+
+        for (property, plan, must_contain, must_not_contain) in [
+            (
+                "integer cohort hours",
+                &integer_hours,
+                "DIV(`t`.`v`, 3600)",
+                " / 3600",
+            ),
+            (
+                "timestamp literal offset (fork PR #144)",
+                &timestamp_literal,
+                "20:05:00+00:00",
+                "20:05:00 +00:00",
+            ),
+            (
+                "date field extract style (fork PR #146)",
+                &extract,
+                "EXTRACT(YEAR FROM",
+                "date_part",
+            ),
+            (
+                "interval style (fork PR #146)",
+                &interval,
+                "INTERVAL '3' MONTH",
+                "MONS",
+            ),
+            (
+                "column alias in table alias (fork PR #148)",
+                &table_alias,
+                "AS `key`",
+                "(key)",
+            ),
+            (
+                "wide decimal cast target",
+                &wide_decimal,
+                "AS BIGNUMERIC)",
+                "DECIMAL(38,17)",
+            ),
+            (
+                "date_trunc rewrite (fork PR #169)",
+                &truncated,
+                "TIMESTAMP_TRUNC(`t`.`ts`, MONTH)",
+                "date_trunc",
+            ),
+            (
+                // BigQuery matches a GROUP BY entry against a whole select item
+                // and a column reference and nothing in between, so the aggregate
+                // has to reach it in a scope of its own. `FROM (SELECT` is that
+                // scope; a flat rendering puts the grouping expression in the
+                // outer select list, where the statement is refused.
+                "grouping expression a select item wraps",
+                &wrapped_grouping,
+                "FROM (SELECT",
+                "CAST(TIMESTAMP_TRUNC",
+            ),
+            (
+                // BigQuery accepts no NULL placement but its own inside a RANGE
+                // clause, and an ORDER BY with no explicit frame implies RANGE for
+                // an aggregate. The placement has to be spelled as a leading key;
+                // a surviving NULLS clause is the rendering BigQuery refuses.
+                "RANGE window NULL placement",
+                &range_window,
+                "IS NULL ASC",
+                "NULLS LAST",
+            ),
+            (
+                // DATE - DATE is an INTERVAL in BigQuery and an Int64 day count
+                // in the plan, so a bare `-` hands the next operator a duration.
+                "date difference becomes DATE_DIFF (fork PR #212)",
+                &date_difference,
+                "DATE_DIFF(",
+                "`d`.`d` - `d`.`e`",
+            ),
+            (
+                // BigQuery has no cast from DATE to INT64.
+                "date to integer becomes UNIX_DATE (fork PR #212)",
+                &date_to_integer,
+                "UNIX_DATE(",
+                "AS INT64)",
+            ),
+            (
+                // BigQuery puts no timezone qualifier on a timestamp type:
+                // TIMESTAMP is the instant, DATETIME the civil value, so a naive
+                // operand typed TIMESTAMP has no supertype with a DATETIME column.
+                "a tz-naive timestamp cast is DATETIME (fork PR #212)",
+                &naive_timestamp_cast,
+                "DATETIME",
+                "AS TIMESTAMP)",
+            ),
+            (
+                "text parsed into a timestamp (fork PR #212 follow-up)",
+                &text_to_timestamp,
+                "DATETIME(TIMESTAMP(REGEXP_REPLACE(",
+                "CAST(`d`.`note` AS DATETIME)",
+            ),
+            (
+                // BigQuery refuses a literal grouping key outright, and an engine
+                // reading a bare integer there takes it as a select-list ordinal.
+                "a constant GROUP BY key is cast (fork PR #212)",
+                &constant_group_by,
+                "GROUP BY CAST('POOLED' AS STRING)",
+                "GROUP BY 'POOLED'",
+            ),
+            (
+                // Losing this leaves the comparison at "TIMESTAMP, DATETIME",
+                // which BigQuery refuses with "No matching signature".
+                "an instant compared with a date is brought to DATETIME (fork PR #216)",
+                &instant_vs_date,
+                "DATETIME",
+                "CAST(`t`.`ts` AS TIMESTAMP) >=",
+            ),
+            (
+                // The whole `provable_data_type` chain #216 built stands behind
+                // this one rendering. Losing it leaves the call's type unreadable,
+                // so the comparison is pushed down uncoerced as
+                // `CAST(ts AS TIMESTAMP) >= TIMESTAMP_TRUNC(...)` — an instant
+                // against a civil timestamp, which BigQuery refuses with "No
+                // matching signature for operator >=". Which type the pair is
+                // brought to is the dialect's business; that it is brought to one
+                // at all is what this guards, so the assertion is that the
+                // truncation is cast rather than left bare.
+                "a comparison against a truncated date agrees on one type (fork PR #216)",
+                &truncated_date_comparison,
+                "CAST(TIMESTAMP_TRUNC(",
+                ">= TIMESTAMP_TRUNC(",
+            ),
+            (
+                "a frame on LEAD is dropped (fork PR #216)",
+                &lead_with_frame,
+                "OVER (ORDER BY",
+                "ROWS BETWEEN",
+            ),
+            (
+                "a filtered row count becomes COUNTIF (fork PR #216)",
+                &filtered_count,
+                "COUNTIF(",
+                "FILTER",
+            ),
+            (
+                "a filtered sum guards its argument (fork PR #216)",
+                &filtered_sum,
+                "CASE WHEN",
+                "FILTER",
+            ),
+            (
+                // Off the rewrite allowlist: the `CASE` would give it a null
+                // element for every rejected row, which BigQuery refuses to
+                // build. Declining leaves it for the local engine, which the
+                // federation deny-list is what actually arranges.
+                "a filtered array_agg is declined (fork PR #218)",
+                &filtered_array_agg,
+                "FILTER",
+                "CASE WHEN",
+            ),
+            (
+                // `COUNT(NULL)` is 0, where `COUNTIF` over the same rows is 2 —
+                // a different number with no error at all.
+                // Asserting only the absence of COUNTIF would also pass on a
+                // decline, which is not the behaviour: it still federates, as a
+                // COUNT over a CASE that is always NULL.
+                "a filtered COUNT(NULL) renders CASE, not COUNTIF (fork PR #218)",
+                &filtered_count_null,
+                "CASE WHEN",
+                "COUNTIF(",
+            ),
+            (
+                // Declined for being off the allowlist, exactly as the unordered
+                // one above is — the ORDER BY changes nothing. Guarded so that
+                // relaxing the ordering rule cannot quietly let `array_agg`
+                // through, which is the rewriting BigQuery refuses to build.
+                "an ordered filtered array_agg is declined (fork PR #218)",
+                &ordered_filtered_array_agg,
+                "FILTER",
+                "CASE WHEN",
+            ),
+            (
+                // Order-insensitive: the same rows give the same sum in any
+                // order, so this one must keep federating. Guards the narrowing
+                // of the decline, which otherwise failed correct queries.
+                "an ordered filtered sum still federates (fork PR #218)",
+                &ordered_filtered_sum,
+                "CASE WHEN",
+                "FILTER",
+            ),
+            (
+                // On the allowlist because BigQuery spells it under the same
+                // name; dropping it from the list silently cost this pushdown
+                // once already.
+                "a filtered bit_and guards its argument (fork PR #218)",
+                &filtered_bit_and,
+                "CASE WHEN",
+                "FILTER",
+            ),
+            (
+                // The two halves of a decimal's width get opposite treatment, and
+                // the measurements are why: an integer overflow is refused
+                // outright, so widening fixes a failure; a scale overflow is
+                // rounded away silently, and is accepted rather than declined —
+                // declining would fail the query over the thirty-ninth decimal
+                // place. `Decimal256(76, 42)` is what `bignumeric / numeric`
+                // types as, so this is the shape that actually arises.
+                "a decimal scale past BIGNUMERIC keeps the widest type (fork PR #218)",
+                &wide_scale,
+                "AS BIGNUMERIC)",
+                "DECIMAL(",
+            ),
+            (
+                // The control: a frame here must survive, so "drop every frame"
+                // cannot pass as a fix for the arm above.
+                "a frame on FIRST_VALUE is kept (fork PR #216)",
+                &first_value_with_frame,
+                "ROWS BETWEEN",
+                "first_value(`t`.`v`) OVER (ORDER BY `t`.`ts` ASC NULLS LAST)",
+            ),
+            (
+                // A sum ignores its ordering in either direction, so the
+                // predicate moves inside exactly as it does ascending. This
+                // emitted a generic `FILTER` clause until spiceai/datafusion#219
+                // scoped the dialect's descending check to the percentiles.
+                "a descending filtered sum still rewrites (fork PR #219)",
+                &descending_filtered_sum,
+                "CASE WHEN",
+                "FILTER",
+            ),
+            (
+                // `dow` is the one field the dialect declines. Both spellings of
+                // a weekday arrive under the name `date_part` carrying different
+                // functions — Spark's counts Sunday as 1, DataFusion's 0 — so no
+                // single rendering serves both. The verbatim `date_part` this
+                // leaves behind never reaches BigQuery: `can_translate` refuses
+                // the call, and it stays above the federated scan.
+                "a day-of-week extraction is declined, not rendered (fork PR #219)",
+                &day_of_week,
+                "date_part",
+                "DAYOFWEEK",
+            ),
+            (
+                // Measured: BigQuery's bare WEEK disagrees with DataFusion's ISO
+                // weeks by one at a year boundary, silently.
+                "a week extraction is spelled ISOWEEK, not WEEK (fork PR #219)",
+                &iso_week,
+                "EXTRACT(ISOWEEK FROM",
+                "EXTRACT(WEEK FROM",
+            ),
+            (
+                // The plain cast is refused for every form carrying a time or a
+                // zone, which is every form this column actually holds.
+                "text is parsed into a date, not cast (fork PR #219)",
+                &text_to_date,
+                "TIMESTAMP(REGEXP_REPLACE(",
+                "CAST(`d`.`note` AS DATE)",
+            ),
+            (
+                // Losing this pushes the pair down as written, and BigQuery
+                // refuses "STRING, DATETIME" with "No matching signature".
+                "text compared with a timestamp is brought to one type (fork PR #219)",
+                &text_against_timestamp,
+                "TIMESTAMP(REGEXP_REPLACE(",
+                "`d`.`note` < `d`.`naive`",
+            ),
+            (
+                // 28 digits at scale -2 is a width of 30, so the widest type is
+                // what keeps it: rendering `NUMERIC` would refuse every value
+                // needing a thirtieth integer digit.
+                "a negative decimal scale widens the integer part (fork PR #218)",
+                &negative_scale,
+                "AS BIGNUMERIC)",
+                "AS NUMERIC)",
+            ),
+            (
+                // `Decimal256(76, 2)` is 74 integer digits at scale 2: the scale
+                // fits `NUMERIC` and the precision does not, so this is the arm
+                // that fails if the selector ever reads scale alone.
+                "a wide-precision Decimal256 still widens (fork PR #218)",
+                &wide_precision,
+                "AS BIGNUMERIC)",
+                "AS NUMERIC)",
+            ),
+            (
+                // `NUMERIC` holds 29 integer digits; a value needing a thirtieth
+                // is refused. Selecting on scale alone renders `NUMERIC` here.
+                "a decimal whose integer part overflows NUMERIC (fork PR #218)",
+                &integral_decimal,
+                "AS BIGNUMERIC)",
+                "AS NUMERIC)",
+            ),
+        ] {
+            let wrapper = unparse_plan(new_bigquery_dialect().as_ref(), plan);
+            let inner = unparse_plan(
+                &datafusion::sql::unparser::dialect::BigQueryDialect::new(),
+                plan,
+            );
+
+            assert_eq!(
+                wrapper, inner,
+                "{property}: the wrapper and the inner BigQuery dialect no longer \
+                 render this shape the same way, so federated BigQuery SQL diverges \
+                 from the dialect's own rendering"
+            );
+            assert!(
+                wrapper.contains(must_contain),
+                "{property}: BigQuery needs `{must_contain}` here, so this statement is \
+                 rejected: {wrapper}"
+            );
+            assert!(
+                !wrapper.contains(must_not_contain),
+                "{property}: `{must_not_contain}` is the rendering BigQuery rejects: \
+                 {wrapper}"
+            );
+        }
+    }
+}

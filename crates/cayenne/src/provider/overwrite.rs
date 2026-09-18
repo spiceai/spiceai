@@ -74,7 +74,9 @@ use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit};
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
 use super::mutation_writer::InlineBatchBuffer;
-use super::table::{CayenneTableProvider, InlinedOverwritePublish, serialize_batches_to_ipc};
+use super::table::{
+    CayenneTableProvider, InlinedOverwritePublish, OverwriteRangePlan, serialize_batches_to_ipc,
+};
 use crate::CayenneCatalog;
 use crate::catalog::CatalogResult;
 use crate::metadata::InlinedData;
@@ -233,6 +235,12 @@ impl PreparedOverwrite {
     ///
     /// Returns an error if swapping the listing table fails. Other steps are best-effort.
     pub async fn finish(self) -> Result<u64> {
+        // Finish the secondary index before the visibility flip, which publishes
+        // it together with the snapshot. Finishing it after the flip would leave
+        // a window in which every lookup falls back to a full scan.
+        self.table
+            .stage_lookup_index_for_snapshot(&self.new_snapshot_id)
+            .await;
         // Publish the new snapshot as a single atomic visibility flip under the listing
         // fence (snapshot id + deletion caches + inline cache + listing swap), so a
         // concurrent scan never observes a torn state. Full rationale on
@@ -253,6 +261,35 @@ impl PreparedOverwrite {
                     }),
             )
             .await?;
+
+        // Arm retention the moment the flip commits, the same way an append does (see
+        // `AppendMutationWriter::write_prepared_stream`). An overwrite reloads every
+        // source row, so a `retention_sql` predicate has to run again over the new
+        // snapshot — otherwise the rows it deletes come straight back on each full
+        // refresh and the acceleration keeps data the user asked to be deleted.
+        // `retention_period` is untouched by this: it is a scan-time keep filter, so a
+        // reloaded expired row is hidden from every read without anything deleting it,
+        // and the gate below (`has_retention_delete_filters`) matches that split.
+        //
+        // Scheduled HERE and not at the end: every step below this awaits, so a refresh
+        // cancelled part-way through them would drop this future after the new rows were
+        // already visible and leave the matching ones queryable until some later refresh
+        // happened to arm a pass. Only the flip has to have succeeded for the request to
+        // be owed. Arming is a synchronous flag plus a debounced task, and that task
+        // takes `write_lock` itself, so it simply waits out the guard still held here.
+        if self.table.has_retention_delete_filters() {
+            // Arming only: the flip re-baselines `num_rows` itself, so this call carries
+            // no live-row delta and the claim it must supply is released rather than
+            // queued. Reserving one anyway is how a caller with nothing to persist
+            // satisfies the gate that stops a real delta being claimed after its publish.
+            self.table.schedule_post_write_maintenance(
+                None,
+                false,
+                true,
+                0,
+                self.table.reserve_live_rows_delta().published(),
+            );
+        }
 
         // Drain the metastore WAL on the debounced maintenance tick. An inlined
         // overwrite's whole payload is an Arrow IPC BLOB written straight into
@@ -285,9 +322,7 @@ impl PreparedOverwrite {
             );
         }
 
-        self.table
-            .trigger_old_snapshot_cleanup(&self.new_snapshot_id)
-            .await;
+        self.table.schedule_old_snapshot_cleanup();
 
         // Invalidate the in-memory optimizer cache so a zero-row overwrite
         // leaves the cache empty rather than stale; `persist_table_stats`
@@ -297,9 +332,10 @@ impl PreparedOverwrite {
             .reset_table_stats_after_overwrite(&self.write_stats_acc)
             .await;
 
-        // Drop the write guard last so all visibility-related updates happen
-        // under exclusive table access.
+        // All visibility-related updates above happen under exclusive table access; the
+        // retention pass takes this same lock, so it can only proceed once this drops.
         let _ = self.write_guard;
+
         Ok(self.row_count)
     }
 
@@ -319,6 +355,9 @@ impl PreparedOverwrite {
         // writer can't acquire the lock and start a new commit while the
         // staged snapshot directory is mid-deletion.
         let _write_guard = self.write_guard;
+
+        // The snapshot these postings address is about to be deleted.
+        self.table.discard_lookup_index_build();
 
         // Best-effort cleanup of the new snapshot directory. Object stores
         // (S3) don't have a single "remove dir" call; we leave object-store
@@ -495,6 +534,11 @@ impl CayenneTableProvider {
         data: SendableRecordBatchStream,
         target_partitions: usize,
     ) -> Result<PreparedOverwrite> {
+        // Read the split points off the table being replaced before taking the
+        // write lock, so the sampling scan never holds it. A replace that lands
+        // in the inline tier below ignores the plan.
+        let range_plan = self.overwrite_range_plan(target_partitions).await;
+
         let write_guard = self.write_lock_arc().lock_owned().await;
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
@@ -538,27 +582,57 @@ impl CayenneTableProvider {
         // `warm_inlined_cache_for_overwrite`.
         self.warm_inlined_cache_for_overwrite().await;
 
+        // Order the replacement before it is written, when the table asks for
+        // one. This is the only write a full-refresh table makes, and it is the
+        // only chance to establish that order — see `sort_overwrite_input`.
+        let (data, target_partitions, write_policy) =
+            self.sort_overwrite_input(data, target_partitions)?;
+
         let target_size_bytes = self.target_file_size_bytes();
+        // Build the point-lookup index from the rows this write is already
+        // touching. The sink reports each batch's file and file-local position,
+        // so the index is complete when the write is — no second pass over the
+        // finished files, and nothing to rebuild after the flip.
+        let lookup_index_observer = self.begin_lookup_index_build(&new_snapshot_id);
         // Overwrite replaces the entire table, and anything that reached here did
         // not fit the inline caps, so it is large by definition; shard across the
         // full write concurrency (no size cap on the fan-out). Deliberately NOT
         // sized from the bytes the probe buffered: that is only a lower bound, and
         // under-sharding a multi-GB refresh to one writer would serialize the encode.
-        let (row_count, _files_written, write_stats_acc) = self
-            .write_to_snapshot(
-                data,
-                target_size_bytes,
-                &new_snapshot_id,
-                target_partitions,
-                None,
-                crate::provider::delta_encoding::WritePolicy::MAINTENANCE,
-            )
-            .await?;
-
-        if !is_s3 {
-            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
-            Self::sync_snapshot_dir(&snapshot_dir).await?;
+        //
+        // The shards cover the key ranges `overwrite_range_plan` chose, when it
+        // found a key to split; it declines for the sorted and clustered replaces
+        // above, which keep their single serial writer.
+        let written: Result<_> = async {
+            let written = self
+                .write_to_snapshot_range_partitioned(
+                    data,
+                    target_size_bytes,
+                    &new_snapshot_id,
+                    target_partitions,
+                    None,
+                    write_policy,
+                    range_plan.as_ref().map(OverwriteRangePlan::partitioning),
+                    lookup_index_observer,
+                )
+                .await?;
+            if !is_s3 {
+                let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+                Self::sync_snapshot_dir(&snapshot_dir).await?;
+            }
+            Ok(written)
         }
+        .await;
+        // A write that fails before it is prepared never reaches `rollback`, so
+        // its partial index build is dropped here rather than held until the
+        // next refresh.
+        let (row_count, _files_written, write_stats_acc) = match written {
+            Ok(written) => written,
+            Err(error) => {
+                self.discard_lookup_index_build();
+                return Err(error);
+            }
+        };
 
         // Manifest snapshot model: reserve ONE sequence `S` for this overwrite
         // and AUTHOR the new snapshot's manifest with `[S, S]` — every file was
@@ -712,6 +786,73 @@ mod tests {
             tables.push(provider);
         }
         (temp_dir, catalog, tables)
+    }
+
+    /// A table whose `sort_columns` an operator configured explicitly.
+    async fn setup_sorted(sort_columns: Vec<String>) -> (TempDir, CayenneTableProvider) {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let connection_string = format!(
+            "sqlite://{}",
+            temp_dir.path().join("cayenne.db").to_string_lossy()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"));
+        catalog.init().await.expect("catalog init");
+        let ctx = SessionContext::new();
+        let provider = CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+        )
+        .create(CreateTableOptions {
+            table_name: "sorted_overwrite".to_string(),
+            schema: test_schema(),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                sort_columns,
+                ..VortexConfig::default()
+            },
+        })
+        .await
+        .expect("create table");
+        (temp_dir, provider)
+    }
+
+    /// A sorted whole-table replace must emit ONE sequence of files.
+    ///
+    /// Ordering the stream is not enough by itself: the encode fan-out is
+    /// decided by the write policy, not by the shard count the caller passes.
+    /// Under a `Sized` policy the sorted stream is re-sharded round-robin and
+    /// every output file ends up spanning the whole key range — the layout the
+    /// sort exists to avoid, and one a scan cannot prune.
+    #[tokio::test]
+    async fn sorted_overwrite_writes_one_sequence_of_files() {
+        let (_dir, provider) = setup_sorted(vec!["id".to_string()]).await;
+        let (_stream, shards, policy) = provider
+            .sort_overwrite_input(id_stream(&[3, 1, 2]), 8)
+            .expect("sorted overwrite input");
+        assert_eq!(shards, 1, "a sorted replace must not fan its encode out");
+        assert_eq!(
+            policy.fan_out,
+            crate::provider::table::EncodeFanOut::Serial,
+            "the policy is what the writer honours, not the shard count"
+        );
+    }
+
+    /// An unsorted replace keeps the fan-out it was given: nothing about its
+    /// output order is load-bearing, so serializing it would only cost encode
+    /// throughput.
+    #[tokio::test]
+    async fn unsorted_overwrite_keeps_its_fan_out() {
+        let (_dir, provider) = setup_sorted(vec![]).await;
+        let (_stream, shards, policy) = provider
+            .sort_overwrite_input(id_stream(&[3, 1, 2]), 8)
+            .expect("unsorted overwrite input");
+        assert_eq!(shards, 8);
+        assert_eq!(policy.fan_out, crate::provider::table::EncodeFanOut::Sized);
     }
 
     /// Every id the table currently serves, sorted. Reads through a fresh

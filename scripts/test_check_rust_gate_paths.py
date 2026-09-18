@@ -19,8 +19,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import check_rust_gate_paths  # noqa: E402
 from check_rust_gate_paths import (  # noqa: E402
     coverage_gaps,
+    derived_gate_paths,
     extract_code_change_globs,
     gate_config_errors,
     glob_matches,
@@ -214,6 +216,70 @@ check(
     ["attic", "vendor"],
 )
 
+
+print("derived_gate_paths")
+
+# The guard reads the real Makefile through `lint_recipe`, so the live-tree run
+# below only ever exercises the interpreter spelling today's recipe happens to
+# use. Swapping in a synthetic recipe pins the derivation itself: the failure
+# this harness exists to catch is a regex that quietly stops deriving a guard
+# path, which leaves that path ungated with every check still green.
+
+
+def derived_from(recipe: str) -> list[str]:
+    """Guard paths `derived_gate_paths` reads out of a synthetic `lint-rust` recipe."""
+    original = check_rust_gate_paths.lint_recipe
+    check_rust_gate_paths.lint_recipe = lambda: recipe
+    try:
+        paths, _ = derived_gate_paths([])
+    finally:
+        check_rust_gate_paths.lint_recipe = original
+    # `RUST_SOURCE_PATHS` is seeded unconditionally and derived from nothing, so
+    # dropping it leaves exactly what the recipe contributed.
+    return sorted(set(paths) - set(check_rust_gate_paths.RUST_SOURCE_PATHS))
+
+
+# The recipe invokes the guards through `$(PYTHON)`; a bare `python3` is still
+# accepted so a recipe line written the old way keeps deriving, and the spacing
+# between the interpreter and the script is not significant to make.
+for spelling in ("$(PYTHON)", "${PYTHON}", "python3"):
+    for gap in (" ", "   "):
+        check(
+            f"`{spelling}{gap}scripts/...` derives the guard it runs",
+            derived_from(f"\t{spelling}{gap}scripts/check_crate_layers.py"),
+            ["scripts/check_crate_layers.py"],
+        )
+
+# The two directions are not symmetric, so this only pins the one that bites: a
+# spelling that stops deriving drops a guard from the "must be gated" set and
+# leaves that path ungated with every check still green. (Over-matching only adds
+# a path to the set, which fails closed, so it is not pinned here.)
+for spelling in ("$(PYTHON3)", "${PY}", "$(PYTHON}", "python"):
+    check(
+        f"`{spelling} scripts/...` derives nothing",
+        derived_from(f"\t{spelling} scripts/check_crate_layers.py"),
+        [],
+    )
+
+check(
+    "every guard in a multi-line recipe derives",
+    derived_from(
+        "\t$(PYTHON) scripts/check_crate_layers.py\n"
+        "\t${PYTHON} scripts/check_table_layers.py\n"
+        "\tpython3 scripts/check_fork_patches.py"
+    ),
+    [
+        "scripts/check_crate_layers.py",
+        "scripts/check_fork_patches.py",
+        "scripts/check_table_layers.py",
+    ],
+)
+
+check(
+    "the clippy config directory derives its clippy.toml",
+    derived_from('\tCLIPPY_CONF_DIR=".ci" cargo clippy'),
+    [".ci/clippy.toml"],
+)
 
 print("live tree")
 

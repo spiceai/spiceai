@@ -165,7 +165,36 @@ fn has_transient_http_error_responses(batches: &[RecordBatch]) -> bool {
 /// unrelated business logic.
 #[must_use]
 pub fn batches_cacheable(batches: &[RecordBatch]) -> bool {
-    !has_transient_http_error_responses(batches)
+    if has_transient_http_error_responses(batches) {
+        return false;
+    }
+
+    true
+}
+
+/// Whether an in-memory results-cache entry over `batches` can be bounded by
+/// the configured `max_size`.
+///
+/// Expects batches [`arrow_tools::record_batch::compact_retained_buffers`] has
+/// already been over — it asks what the copy achieved, rather than predicting it
+/// from the column types. Anything still resting on the producer's memory is a
+/// copy that did not decouple, and an entry over it would be billed for the
+/// buffers it declares while pinning the producer's whole chunk.
+///
+/// Deliberately separate from [`batches_cacheable`], which answers a different
+/// question — whether the *origin* produced a result worth storing — and whose
+/// callers treat `false` as a failing origin and keep serving what is cached. A
+/// batch declined here is a perfectly good result; it just cannot be held in a
+/// budgeted cache. Declining is the conservative half of that trade: a repeat
+/// query re-executes, where the alternative is a budget that does not hold.
+///
+/// There is deliberately no log here: this runs once per storable result, which
+/// is as often as the runtime answers a query.
+#[must_use]
+pub fn batches_boundable(batches: &[RecordBatch]) -> bool {
+    !batches
+        .iter()
+        .any(arrow_tools::record_batch::rests_on_unowned_memory)
 }
 
 /// How much larger than the cache limit a raw result may grow while
@@ -180,10 +209,10 @@ const MAX_ENCODING_COMPRESSION_RATIO: usize = 16;
 ///
 /// `read_started_at` is when the query began, and is recorded on the entry so
 /// every later cache hit can check it — see
-/// [`QueryResultsCacheProvider::tables_invalidated_since`], which documents why
+/// [`QueryResultsCacheProvider::tables_changed_since`], which documents why
 /// the comparison is deliberately conservative. It must be the start of the
-/// read, not the moment the result is stored: an invalidation landing in
-/// between has to disqualify the entry too.
+/// read, not the moment the result is stored: a change landing in between has
+/// to disqualify the entry too.
 #[must_use]
 #[expect(clippy::implicit_hasher)]
 pub fn to_cached_record_batch_stream(
@@ -248,14 +277,27 @@ pub fn to_cached_record_batch_stream(
             // `batches_cacheable` is false only when transient HTTP error
             // responses (5xx/429) are present, which requires a non-empty
             // result set — skip the write to avoid caching a partial result.
-            if cache_provider.tables_invalidated_since(&input_tables, read_started_at) {
+            // `batches_boundable` is the separate question of whether the entry
+            // could be billed for what it would hold.
+            if cache_provider.tables_changed_since(&input_tables, read_started_at) {
                 // Not the guard — correctness comes from the check every cache
                 // hit performs. This only avoids encoding and storing a result
                 // already known to be unservable.
                 tracing::debug!(
-                    "A table read by this query was invalidated while it ran, skipping cache storage"
+                    "A table read by this query changed while it ran, skipping cache storage"
                 );
-            } else if batches_cacheable(&records) {
+            } else if !batches_cacheable(&records) {
+                tracing::debug!(
+                    "The result carried transient HTTP error responses (5xx/429), skipping cache storage"
+                );
+            } else if !has_encoder && !batches_boundable(&records) {
+                // Only a raw entry can be pinned by what its batches rested on.
+                // An encoded one keeps the serialized bytes and drops the
+                // arrays, so it holds nothing of the producer's either way.
+                tracing::debug!(
+                    "The result holds a column no copy can decouple from the memory its producer owns, so an entry over it could not be bounded by the cache size limit; skipping cache storage"
+                );
+            } else {
                 // Cache the result, including genuinely empty (0-row / 0-batch)
                 // result sets. The schema is stored separately in
                 // `CachedQueryResult`, so an empty result round-trips with the
@@ -292,10 +334,6 @@ pub fn to_cached_record_batch_stream(
                         tracing::error!("Failed to encode query results for caching: {e}");
                     }
                 }
-            } else {
-                tracing::debug!(
-                    "Transient HTTP error responses were present, skipping cache storage"
-                );
             }
         }
     };
@@ -336,6 +374,197 @@ pub fn get_logical_plan_input_tables(plan: &LogicalPlan) -> HashSet<TableReferen
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// A nested view arriving over Flight must be cacheable.
+    ///
+    /// Every buffer an IPC decode produces is a slice of the gRPC frame's
+    /// `Bytes` — the construction `flight_data_to_arrow_batch` performs on a
+    /// `FlightData` body — so a `Struct<Utf8View>` from a Flight source rests on
+    /// memory the runtime does not own. Before `rebuild_view_leaves` and
+    /// `rebuild_dictionary_leaves` the write path could not copy either off and
+    /// declined the result outright, so such a source never cached anything.
+    ///
+    /// The two are rebuilt on opposite sides of the `MutableArrayData` copy, so
+    /// a column holding both is the case that catches dropping either pass.
+    #[test]
+    fn a_nested_view_and_dictionary_decoded_over_ipc_are_copied_rather_than_declined() {
+        use arrow::array::{
+            Array, ArrayRef, DictionaryArray, ListArray, StringViewArray, StructArray,
+            cast::AsArray,
+        };
+        use arrow::buffer::Buffer;
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{DataType, Field, Fields, Int32Type};
+        use arrow::ipc::reader::StreamDecoder;
+        use arrow::ipc::writer::StreamWriter;
+        use std::sync::Arc;
+
+        // Walks the whole tree: a container's own offsets and validity rest on
+        // the frame just as its children's data buffers do.
+        fn foreign(column: &ArrayRef) -> bool {
+            fn walk(data: &arrow::array::ArrayData) -> bool {
+                data.buffers().iter().any(Buffer::has_custom_allocation)
+                    || data
+                        .nulls()
+                        .is_some_and(|nulls| nulls.inner().inner().has_custom_allocation())
+                    || data.child_data().iter().any(walk)
+            }
+            walk(&column.to_data())
+        }
+
+        // One inline view and one that must live in a data buffer, so the copy
+        // has both cases to carry.
+        let rows: Vec<String> = vec![
+            "a short one".to_string(),
+            "a considerably longer string that will not fit inline at all".to_string(),
+        ];
+        let nested: ArrayRef = Arc::new(StructArray::new(
+            Fields::from(vec![
+                Field::new("s", DataType::Utf8View, false),
+                Field::new_dictionary("d", DataType::Int32, DataType::Utf8, false),
+            ]),
+            vec![
+                Arc::new(StringViewArray::from(rows.clone())) as ArrayRef,
+                // A dictionary below the top level, which `MutableArrayData`
+                // shares rather than narrows: it needs the pre-pass, where the
+                // view beside it needs the pass after the copy.
+                Arc::new(
+                    rows.iter()
+                        .map(|row| Some(row.as_str()))
+                        .collect::<DictionaryArray<Int32Type>>(),
+                ) as ArrayRef,
+            ],
+            None,
+        ));
+        // A list carries offsets, which the copy has to rebase — get that wrong
+        // and a row reads its neighbour's values.
+        let listed: ArrayRef = Arc::new(ListArray::new(
+            Arc::new(Field::new_list_field(DataType::Utf8View, false)),
+            OffsetBuffer::new(vec![0, 1, 2].into()),
+            Arc::new(StringViewArray::from(rows.clone())) as ArrayRef,
+            None,
+        ));
+        let batch =
+            RecordBatch::try_from_iter(vec![("n", nested), ("l", listed)]).expect("a batch");
+
+        let mut encoded = Vec::new();
+        {
+            let mut writer =
+                StreamWriter::try_new(&mut encoded, &batch.schema()).expect("a stream writer");
+            writer.write(&batch).expect("write");
+            writer.finish().expect("finish");
+        }
+        let mut buffer = Buffer::from(bytes::Bytes::from(encoded));
+        let decoded = StreamDecoder::new()
+            .decode(&mut buffer)
+            .expect("decode")
+            .expect("a batch in the stream");
+
+        assert!(
+            decoded.columns().iter().all(foreign),
+            "the fixture must actually rest on the decoded frame, or this proves nothing"
+        );
+        let stored = arrow_tools::record_batch::compact_retained_buffers(&decoded);
+        assert!(
+            batches_boundable(std::slice::from_ref(&stored)),
+            "the copy must decouple the batch, or the write path declines the result"
+        );
+        assert!(
+            !stored.columns().iter().any(foreign),
+            "the stored batch must not keep the decoded frame alive, or `max_size` \
+             cannot bound what the cache holds"
+        );
+
+        let read = |column: &ArrayRef| -> Vec<String> {
+            let views = column.as_string_view();
+            (0..views.len())
+                .map(|row| views.value(row).to_string())
+                .collect()
+        };
+        assert_eq!(
+            read(stored.column(0).as_struct().column(0)),
+            rows,
+            "copying a nested view must not change what the rows say"
+        );
+        let nested_dictionary = stored.column(0).as_struct().column(1);
+        assert_eq!(
+            (0..nested_dictionary.len())
+                .map(
+                    |row| arrow::util::display::array_value_to_string(nested_dictionary, row)
+                        .expect("a displayable value")
+                )
+                .collect::<Vec<_>>(),
+            rows,
+            "rebuilding a nested dictionary must not change what the rows say"
+        );
+        let list = stored.column(1).as_list::<i32>();
+        assert_eq!(
+            (0..list.len())
+                .map(|row| read(&list.value(row)))
+                .collect::<Vec<_>>(),
+            rows.iter().map(|row| vec![row.clone()]).collect::<Vec<_>>(),
+            "rebasing a list's offsets must not change which row owns which value"
+        );
+    }
+
+    /// A batch still resting on the producer's memory must not be stored.
+    ///
+    /// The guard behind [`batches_boundable`], exercised on a batch that has not
+    /// been through `compact_retained_buffers` — which stands in for the case it
+    /// exists to catch: a copy that ran and did not decouple. No arrow type is
+    /// known to do that today, since a dictionary-bearing container goes through
+    /// `take` and every other copy is a `MutableArrayData` extend that exists for
+    /// every type. That is exactly why the check observes the batch instead of
+    /// enumerating types: what a kernel shares is arrow's to change, and a list
+    /// of types would be wrong silently, billing an entry for the buffers it
+    /// declares while it pins the producer's whole chunk.
+    #[test]
+    fn a_batch_still_resting_on_the_producers_memory_is_not_cacheable() {
+        use arrow::array::{ArrayData, ArrayRef, Int32Array, make_array};
+        use arrow::buffer::Buffer;
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+
+        let backing: Arc<Vec<u8>> = Arc::new(7_i32.to_le_bytes().repeat(4));
+        let ptr = std::ptr::NonNull::new(backing.as_ptr().cast_mut()).expect("non-null");
+        // SAFETY: `backing` outlives the buffer through the `Allocation`, and is
+        // never mutated.
+        let foreign = unsafe {
+            Buffer::from_custom_allocation(
+                ptr,
+                backing.len(),
+                Arc::clone(&backing) as Arc<dyn arrow::alloc::Allocation>,
+            )
+        };
+        let column: ArrayRef = make_array(
+            ArrayData::builder(DataType::Int32)
+                .len(4)
+                .add_buffer(foreign)
+                .build()
+                .expect("a valid Int32 array"),
+        );
+        let pinned = RecordBatch::try_from_iter(vec![("v", column)]).expect("a one-column batch");
+
+        assert!(
+            !batches_boundable(std::slice::from_ref(&pinned)),
+            "a batch pinning the producer's allocation must be declined, or it is \
+             stored holding bytes `max_size` cannot see"
+        );
+
+        // And the copy the write path actually takes clears it.
+        let stored = arrow_tools::record_batch::compact_retained_buffers(&pinned);
+        assert!(batches_boundable(std::slice::from_ref(&stored)));
+        assert_eq!(
+            stored
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("still an Int32Array")
+                .values(),
+            &[7_i32; 4],
+            "decoupling must not change the rows"
+        );
+    }
+
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
@@ -1169,8 +1398,9 @@ pub(crate) mod tests {
         );
 
         // Build a batch of highly compressible data (repeated zeros) whose
-        // uncompressed memory size exceeds the 2 KiB cache limit but compresses
-        // well under zstd.
+        // uncompressed memory size exceeds the 2 KiB cache limit. The store
+        // path encodes it, so the entry it writes is the compressed one and
+        // fits (see #8508).
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Int32, false),
@@ -1186,7 +1416,6 @@ pub(crate) mod tests {
             raw_size > cache_max,
             "Test precondition: raw size ({raw_size}) must exceed cache max ({cache_max})"
         );
-
         let raw_cache_key = crate::key::CacheKey::Query("zstd-compressible", None)
             .as_raw_key(cache_provider.hasher());
         let stream = Box::pin(RecordBatchStreamAdapter::new(
@@ -1227,12 +1456,11 @@ pub(crate) mod tests {
         assert_eq!(cached_batches[0].num_rows(), n);
     }
 
-    /// Regression test: with an encoder, accumulation must continue past the
-    /// raw cache limit across **multiple batches**. Previously accumulation
-    /// stopped at the limit while the encoded write still proceeded, caching a
-    /// prefix of the result set that would then be served as a complete result.
+    /// Array bytes can sit under `max_size` while [`CachedQueryResult::memory_size`]
+    /// does not. The store path must still encode those under zstd (#8508 weigher
+    /// boundary).
     #[tokio::test]
-    async fn test_encoded_multi_batch_result_cached_in_full() {
+    async fn test_encoded_result_cached_when_weigher_exceeds_max_size() {
         use arrow::array::{Array, Int32Array};
         use datafusion::error::DataFusionError;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -1252,13 +1480,106 @@ pub(crate) mod tests {
             .expect("valid cache provider"),
         );
 
-        // Two compressible batches, each alone larger than the 2 KiB cache
-        // limit, so the raw limit is crossed before the second batch arrives.
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Int32, false),
         ]));
-        let n = 300; // 300 rows × 2 cols × 4 bytes = 2400 bytes raw > 2048 limit
+        let n = 200; // 200 rows × 2 cols × 4 bytes = 1600 array bytes < 2048
+        let col: Arc<dyn Array> = Arc::new(Int32Array::from(vec![0i32; n]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&col), col])
+            .expect("to create batch");
+
+        let raw_size = batch.get_array_memory_size();
+        let cache_max = usize::try_from(cache_provider.max_size()).unwrap_or(usize::MAX);
+        assert!(
+            raw_size <= cache_max,
+            "Test precondition: array bytes ({raw_size}) must sit under cache max ({cache_max})"
+        );
+        let raw_entry = crate::result::query::CachedQueryResult::new_raw(
+            vec![batch.clone()],
+            Arc::clone(&schema),
+            Arc::new(HashSet::new()),
+            std::time::Instant::now(),
+            std::time::Instant::now(),
+        );
+        assert!(
+            raw_entry.get_memory_size() > cache_max,
+            "Test precondition: weigher ({}) must exceed cache max ({cache_max})",
+            raw_entry.get_memory_size()
+        );
+
+        let raw_cache_key = crate::key::CacheKey::Query("zstd-weigher-boundary", None)
+            .as_raw_key(cache_provider.hasher());
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Ok::<RecordBatch, DataFusionError>(batch)]),
+        ));
+
+        let cached_stream = to_cached_record_batch_stream(
+            Arc::clone(&cache_provider),
+            stream,
+            raw_cache_key,
+            Arc::new(HashSet::from(["test_table".into()])),
+            std::time::Instant::now(),
+        );
+
+        let _output = cached_stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("stream should be collected successfully");
+
+        let cached = cache_provider
+            .get_raw_key(&raw_cache_key)
+            .await
+            .expect("cache lookup should succeed");
+        assert!(
+            cached.is_some(),
+            "Compressed result should be cached when array bytes fit but the weigher does not"
+        );
+        let cached = cached.expect("must be Some");
+        assert!(
+            cached.is_encoded(),
+            "the stored entry must be encoded so the weigher can admit it"
+        );
+        let cached_batches = cached.records().await.expect("cached result should decode");
+        assert_eq!(cached_batches.len(), 1);
+        assert_eq!(cached_batches[0].num_rows(), n);
+    }
+
+    /// Regression test: with an encoder, accumulation must continue past the
+    /// raw cache limit across **multiple batches**. Previously accumulation
+    /// stopped at the limit while the encoded write still proceeded, caching a
+    /// prefix of the result set that would then be served as a complete result.
+    #[tokio::test]
+    async fn test_encoded_multi_batch_result_cached_in_full() {
+        use arrow::array::{Array, Int32Array};
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::TryStreamExt;
+        use spicepod::component::caching::SQLResultsCacheConfig;
+
+        let cache_provider = Arc::new(
+            crate::QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    max_size: Some("4KiB".to_string()),
+                    encoding: spicepod::component::caching::Encoding::Zstd,
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        // Two compressible batches, each alone larger than the 4 KiB cache
+        // limit and the raw-store budget, so the pair is encoded rather than
+        // stored raw (which would not fit). The 4 KiB budget keeps
+        // 16 × 4 KiB above the pair's raw size so accumulation is not abandoned.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let n = 2_500; // 2500 rows × 2 cols × 4 bytes = 20_000 bytes raw per batch
         let make_batch = || {
             let col: Arc<dyn Array> = Arc::new(Int32Array::from(vec![0i32; n]));
             RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&col), col])

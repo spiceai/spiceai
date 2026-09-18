@@ -19,6 +19,7 @@ limitations under the License.
 //! Connects to a database via ADBC (Arrow Database Connectivity)
 //! and provides schema/table discovery using the ADBC metadata API.
 
+use super::federation::{QUERY_FEDERATION_PARAMETER, is_query_federation_enabled};
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::{
     Runtime,
@@ -43,6 +44,8 @@ use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
 use futures::stream::{self, StreamExt};
+use runtime_datafusion::function_support::bigquery_can_evaluate_expression;
+use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -50,6 +53,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 pub const PREFIX: &str = "adbc";
+const BIGQUERY_DRIVER: &str = "bigquery";
 
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("driver")
@@ -74,6 +78,7 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("connection_pool_min_idle")
         .description("The minimum number of idle connections to keep open in the pool.")
         .default("1"),
+    QUERY_FEDERATION_PARAMETER,
 ];
 
 #[derive(Debug, Snafu)]
@@ -172,7 +177,17 @@ impl CatalogConnector for AdbcCatalog {
             }
         })?;
 
-        let table_factory = AdbcTableFactory::new(Arc::clone(&pool));
+        let federation_enabled =
+            is_query_federation_enabled(&self.params.parameters).map_err(|e| {
+                super::Error::InvalidConfigurationNoSource {
+                    connector: PREFIX.to_string(),
+                    connector_component: connector_component.clone(),
+                    message: e.to_string(),
+                }
+            })?;
+
+        let table_factory =
+            build_table_factory(Arc::clone(&pool), federation_enabled, &driver_name);
 
         let provider = Arc::new(AdbcCatalogProvider::new(
             pool,
@@ -192,6 +207,54 @@ impl CatalogConnector for AdbcCatalog {
 
         Ok(provider as Arc<dyn RefreshableCatalogProvider>)
     }
+}
+
+/// Builds the [`AdbcTableFactory`] for a catalog, with the Spice function
+/// deny-list, driver-specific expression restrictions, and the
+/// `query_federation` setting applied.
+///
+/// A bare `AdbcTableFactory::new(pool)` federates unconditionally and installs
+/// no deny-list, so every Spice-only UDF — `json_get_str` and the rest of the
+/// JSON set, the embedding/distance UDFs, every user-registered function — is
+/// unparsed verbatim into the SQL sent to the remote database, which has no
+/// such function and answers with an unknown-function error. Installing the
+/// deny-list makes the table's `can_execute_plan` refuse those plans so
+/// `DataFusion` evaluates the affected expressions locally instead. The exact
+/// lowercase `bigquery` driver also rejects case-insensitive `LIKE`, which
+/// `GoogleSQL` cannot evaluate.
+///
+/// This mirrors the ADBC *dataset* connector's `build_table_factory`; see
+/// issues #10703 and #13664.
+///
+/// Public so `connector-adbc`'s regression tests can drive it: the in-process
+/// stub ADBC driver they need already lives there, and duplicating it here would
+/// cost more than the visibility does.
+///
+/// The `CancellableStatement` bound is what `ADBCPool` and `AdbcTableFactory`
+/// themselves require: an abandoned query is cancelled through the statement, so
+/// a driver whose statements cannot be cancelled cannot back either type.
+#[must_use]
+pub fn build_table_factory<D>(
+    pool: Arc<ADBCPool<D>>,
+    federation_enabled: bool,
+    driver_name: &str,
+) -> AdbcTableFactory<D>
+where
+    D: adbc_core::Database + Send + 'static,
+    D::ConnectionType: adbc_core::Connection + Send + Sync,
+    <D::ConnectionType as adbc_core::Connection>::StatementType:
+        datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement,
+{
+    let function_support = deny_spice_functions_for_table_providers();
+    let function_support = match driver_name {
+        BIGQUERY_DRIVER => {
+            function_support.with_expression_support(Arc::new(bigquery_can_evaluate_expression))
+        }
+        _ => function_support,
+    };
+    AdbcTableFactory::new(pool)
+        .with_federation_enabled(federation_enabled)
+        .with_function_support(function_support)
 }
 
 /// Maximum number of concurrent ADBC table provider creation tasks during catalog discovery.
@@ -561,6 +624,9 @@ mod tests {
         assert!(param_names.contains(&"driver_options"));
         assert!(param_names.contains(&"connection_pool_size"));
         assert!(param_names.contains(&"connection_pool_min_idle"));
+        // The escape hatch: without it a user whose catalog hits an
+        // untranslatable pushdown has no configuration that avoids it.
+        assert!(param_names.contains(&"query_federation"));
     }
 
     #[test]

@@ -259,11 +259,79 @@ jobs:
           grep '^version =' Cargo.toml
 
       - name: Install missing tools
+        # `missing=()` is bash-specific; the default shell is a runner-image property.
+        shell: bash
         run: |
-          brew update
-          brew list cmake || brew install cmake
-          brew install unixodbc
-          echo "RUSTFLAGS=-L /opt/homebrew/lib" >> $GITHUB_ENV
+          # Probe before reaching for brew. On the self-hosted pool the formulas are
+          # already there, so every `brew` call is a no-op that still has to reach brew
+          # first — and any brew-level breakage (an unreadable global lock, a half-written
+          # `brew`) then fails the build over a toolchain it already had (#13463).
+          # `setup-cc` probes the same way for every other macOS job; this step and its
+          # twin in build_and_release.yml are the two that still call brew directly.
+          brew_bin="$(command -v brew || true)"
+          if [ -z "$brew_bin" ]; then
+            echo "::error::'brew' is not on PATH, so cmake and unixodbc cannot be installed or verified on this runner."
+            exit 1
+          fi
+          brew_prefix="$(dirname "$(dirname "$brew_bin")")"
+          missing=()
+          # cmake is invoked by bare name from build scripts, so being in the Cellar is
+          # not enough — the name has to resolve to *this* Homebrew. Matching the prefix
+          # rather than a fixed path stays correct on an Intel runner, and catches an
+          # unlinked keg or a foreign copy earlier on PATH; both route into `brew link`.
+          case "$(command -v cmake 2>/dev/null || true)" in
+            "$brew_prefix"/*) ;;
+            *) missing+=("cmake") ;;
+          esac
+          # unixodbc is consumed through the library search path, never by name, so the
+          # keg being present is the whole requirement.
+          [ -d "$brew_prefix/opt/unixodbc" ] || missing+=("unixodbc")
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "Toolchain incomplete on this runner (${missing[*]}); installing."
+            brew update
+            brew install cmake unixodbc
+            # `brew install` only warns — and still exits 0 — on a formula that is in the
+            # Cellar but unlinked, so its binaries never reach PATH.
+            brew link --overwrite cmake || true
+          else
+            echo "cmake and unixodbc already present under $brew_prefix; skipping brew."
+          fi
+          # Assert unconditionally, so a runner whose install was skipped still fails here
+          # with a named cause rather than deep inside a build script. Only that the name
+          # resolves — deliberately not that it resolves under $brew_prefix — so a runner
+          # building today against a cmake from elsewhere on PATH keeps working.
+          if ! command -v cmake >/dev/null 2>&1; then
+            echo "::error::'cmake' is not on PATH after setup. Run 'brew link --overwrite cmake' on this runner."
+            exit 1
+          fi
+          # Prefix resolved from the located brew rather than hardcoded, so an Intel runner
+          # gets its own; unchanged on Apple Silicon. A derived value carries an injection
+          # surface a literal does not — a two-line `$GITHUB_ENV` entry appends a second
+          # variable to every later step — so refuse one, as `setup-cc` does for its own.
+          rustflags="-L $brew_prefix/lib"
+          if [ "$(printf '%s' "$rustflags" | wc -l | tr -d ' ')" != "0" ]; then
+            echo "::error::Refusing to export a multi-line RUSTFLAGS built from '$brew_prefix'."
+            exit 1
+          fi
+          echo "RUSTFLAGS=$rustflags" >> "$GITHUB_ENV"
+          # The probe above accepts an unlinked unixodbc keg — `$brew_prefix/opt/unixodbc`
+          # exists for a formula that was never linked — and in that state the `-L` above
+          # points at a directory holding no `libodbc.dylib`, so the link dies downstream as
+          # "ld: library 'odbc' not found" (#13475). Before this step probed, `brew install
+          # unixodbc` ran every time and linked it, so the gap is this step's to close.
+          # `setup-cc` covers the same case by publishing the keg's own lib directory, and
+          # deliberately only that one: `$brew_prefix/lib` additionally satisfies -lcrypto,
+          # -lssl and -lzstd, so a crate whose build script emits one of those names would
+          # link a second, differently-built copy. clang expands LIBRARY_PATH into -L entries
+          # after those already on the command line, so this restores the search path without
+          # displacing anything a build script emitted, and it is not a cargo fingerprint
+          # input, so it costs no rebuild.
+          library_path="${LIBRARY_PATH:+$LIBRARY_PATH:}$brew_prefix/opt/unixodbc/lib"
+          if [ "$(printf '%s' "$library_path" | wc -l | tr -d ' ')" != "0" ]; then
+            echo "::error::Refusing to export a multi-line LIBRARY_PATH built from '$brew_prefix'."
+            exit 1
+          fi
+          echo "LIBRARY_PATH=$library_path" >> "$GITHUB_ENV"
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -520,6 +588,13 @@ jobs:
       - name: Update nightly tag
         run: |
           git tag -f nightly
-          git push origin nightly --force
+          # Non-interactive: a credential helper on the runner can otherwise intercept
+          # this push and block on a prompt forever. See
+          # scripts/check_ci_git_push_noninteractive.py.
+          git -c credential.helper='' -c credential.interactive=false \
+            push origin nightly --force
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Never fall back to an interactive prompt; fail fast if auth is rejected.
+          GIT_TERMINAL_PROMPT: '0'
+          GCM_INTERACTIVE: 'never'

@@ -90,7 +90,7 @@ fn reverse_fibonacci_shrink(current: usize) -> usize {
     GATEWAY_SHRINK_MIN_PAGE_SIZE
 }
 
-type UnnestHandler = Box<dyn Fn(&Value) -> Result<Vec<Value>> + Send + Sync>;
+pub(crate) type UnnestHandler = Box<dyn Fn(&Value) -> Result<Vec<Value>> + Send + Sync>;
 
 pub enum UnnestBehavior {
     Depth(usize),
@@ -956,6 +956,28 @@ impl GraphQLClient {
         .await
     }
 
+    /// Runs a query for its error signal alone and discards the payload.
+    ///
+    /// A health check asks one question: does the resource exist, and can these
+    /// credentials see it. Its response is a probe — an id and a name — not a
+    /// row, so parsing it with the table's schema and unnest can only invent
+    /// failures. The probe carries none of the columns the table declares, and
+    /// one the table declares non-null then reads back as an unmasked null,
+    /// failing a dataset whose data is fine. Every check that answers the
+    /// health question runs before the payload is parsed, so stopping there is
+    /// the whole check.
+    pub(crate) async fn execute_health_check(
+        &self,
+        query: &GraphQLQuery,
+        error_checker: Option<ErrorChecker>,
+    ) -> Result<()> {
+        let response = self
+            .fetch_checked(query, None, None, error_checker, None, false, None)
+            .await?;
+
+        check_health_payload(self.resolve_json_pointer(query)?, &response)
+    }
+
     #[expect(clippy::too_many_arguments)]
     async fn execute_inner(
         &self,
@@ -968,8 +990,40 @@ impl GraphQLClient {
         close_connection: bool,
         page_size_override: Option<usize>,
     ) -> Result<GraphQLQueryResult> {
+        let response = self
+            .fetch_checked(
+                query,
+                limit,
+                cursor.as_deref(),
+                error_checker,
+                query_cost,
+                close_connection,
+                page_size_override,
+            )
+            .await?;
+
+        self.process_response(query, schema.as_ref(), limit, cursor.as_deref(), &response)
+    }
+
+    /// Sends one query and returns its decoded response once every check that can
+    /// fail the request as a whole has passed: the HTTP status, the GraphQL
+    /// `errors` array, and the connector's own error checker.
+    ///
+    /// Split from [`Self::execute_inner`] because a health check wants exactly
+    /// this and nothing after it — see [`Self::execute_health_check`].
+    #[expect(clippy::too_many_arguments)]
+    async fn fetch_checked(
+        &self,
+        query: &GraphQLQuery,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+        error_checker: Option<ErrorChecker>,
+        query_cost: Option<u32>,
+        close_connection: bool,
+        page_size_override: Option<usize>,
+    ) -> Result<serde_json::Value> {
         // Validate cursor if present
-        if let Some(ref cursor_val) = cursor {
+        if let Some(cursor_val) = cursor {
             if cursor_val.is_empty() {
                 tracing::warn!("Empty cursor provided, this may cause unexpected behavior");
             }
@@ -1006,8 +1060,11 @@ impl GraphQLClient {
             None
         };
 
-        let query_string =
-            query.to_string_with_page_size(limit, cursor.clone(), page_size_override)?;
+        let query_string = query.to_string_with_page_size(
+            limit,
+            cursor.map(ToString::to_string),
+            page_size_override,
+        )?;
 
         // Validate query string is not empty
         if query_string.trim().is_empty() {
@@ -1118,7 +1175,7 @@ impl GraphQLClient {
             .map(|p| p(&response_headers, &response))
             .transpose()?;
 
-        self.process_response(query, schema.as_ref(), limit, cursor.as_deref(), &response)
+        Ok(response)
     }
 
     /// The result for a page that yielded no rows, keeping whichever schema the table is
@@ -1140,17 +1197,10 @@ impl GraphQLClient {
         })
     }
 
-    /// Turn a decoded GraphQL response body into record batches, resolving the schema each page is
-    /// parsed with. Split out from `execute_inner` so the page-shape handling — null payload, empty
-    /// page, repeated cursor — is reachable without an HTTP round trip.
-    fn process_response(
-        &self,
-        query: &GraphQLQuery,
-        schema: Option<&SchemaRef>,
-        limit: Option<usize>,
-        cursor: Option<&str>,
-        response: &serde_json::Value,
-    ) -> Result<GraphQLQueryResult> {
+    /// The data path a response is read at: the query's own pointer, else the one
+    /// configured on the client. Both the row path and the health check resolve it
+    /// here so they cannot drift.
+    fn resolve_json_pointer<'a>(&'a self, query: &'a GraphQLQuery) -> Result<&'a str> {
         let json_pointer = query
             .json_pointer
             .as_ref()
@@ -1163,6 +1213,22 @@ impl GraphQLClient {
                 pointer: "JSON pointer cannot be empty".to_string(),
             });
         }
+
+        Ok(json_pointer)
+    }
+
+    /// Turn a decoded GraphQL response body into record batches, resolving the schema each page is
+    /// parsed with. Split out from `execute_inner` so the page-shape handling — null payload, empty
+    /// page, repeated cursor — is reachable without an HTTP round trip.
+    fn process_response(
+        &self,
+        query: &GraphQLQuery,
+        schema: Option<&SchemaRef>,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+        response: &serde_json::Value,
+    ) -> Result<GraphQLQueryResult> {
+        let json_pointer = self.resolve_json_pointer(query)?;
 
         let extracted_data = response
             .pointer(json_pointer)
@@ -1487,6 +1553,44 @@ impl GraphQLClient {
     }
 }
 
+/// The health check's claim on the payload: the data path the query declares has
+/// to be present, and it has to name something.
+///
+/// The two ways it can fail are different faults and are reported as such. A path
+/// that does not resolve means the query and the pointer disagree — a
+/// misconfiguration no response will ever fix. A path that resolves to `null` is
+/// the API answering "no such resource", and it has to fail here: the row query
+/// reads a null payload as an empty page, so a name that does not exist would
+/// otherwise attach as a valid, permanently empty dataset instead of telling the
+/// user their path is wrong.
+fn check_health_payload(json_pointer: &str, response: &Value) -> Result<()> {
+    match response.pointer(json_pointer) {
+        Some(Value::Null) => {
+            tracing::debug!(
+                "Health check resolved '{json_pointer}' to null. Full response: {}",
+                serde_json::to_string_pretty(response).unwrap_or_else(|_| format!("{response:?}"))
+            );
+
+            Err(Error::ResourceNotFound {
+                message: "The API answered with no such resource. Verify every name in the dataset's 'from' path exists and the credentials can see it. For details, visit: https://spiceai.org/docs/components/data-connectors/graphql".to_string(),
+            })
+        }
+        Some(_) => Ok(()),
+        None => {
+            tracing::error!(
+                "Health check response has no data at '{json_pointer}'. Full response: {}",
+                serde_json::to_string_pretty(response).unwrap_or_else(|_| format!("{response:?}"))
+            );
+
+            Err(Error::InvalidJsonPointer {
+                pointer: format!(
+                    "Invalid JSON pointer: '{json_pointer}'. The expected data path was not found in the response."
+                ),
+            })
+        }
+    }
+}
+
 /// Resolve the schema a page's rows are parsed with: per-query override, then the schema
 /// configured on the client, then inference from the rows themselves.
 ///
@@ -1740,6 +1844,58 @@ mod tests {
     use crate::graphql::client::GraphQLQuery;
 
     use super::{DuplicateBehavior, PaginationParameters, UnnestBehavior, handle_http_error};
+
+    mod health_check_payload {
+        use serde_json::json;
+
+        use crate::graphql::client::check_health_payload;
+
+        /// The probe carries whatever the health-check query asked for, which is
+        /// never the table's row shape. All the check asks is that the path the
+        /// query declares is there.
+        #[test]
+        fn a_probe_that_resolves_passes() {
+            check_health_payload(
+                "/data/healthCheckProbe",
+                &json!({"data": {"healthCheckProbe": {"id": "ORG_1", "login": "spiceai"}}}),
+            )
+            .expect("a resolved probe is a healthy resource");
+        }
+
+        /// A `null` there is the API answering "no such resource", and it has to
+        /// fail here: the row path reads a null payload as an empty page, so a
+        /// name that does not exist would otherwise attach as a valid,
+        /// permanently empty dataset.
+        #[test]
+        fn a_null_probe_is_a_resource_that_does_not_exist() {
+            let err = check_health_payload(
+                "/data/healthCheckProbe",
+                &json!({"data": {"healthCheckProbe": null}}),
+            )
+            .expect_err("a name that resolves to nothing is not a healthy dataset");
+
+            assert!(
+                matches!(err, super::super::Error::ResourceNotFound { .. }),
+                "a missing resource is reported as such, not as a pointer fault: {err}"
+            );
+        }
+
+        /// A path that does not resolve means the query and the pointer disagree,
+        /// which no response will fix.
+        #[test]
+        fn a_pointer_the_query_does_not_answer_fails() {
+            let err = check_health_payload(
+                "/data/healthCheckProbe",
+                &json!({"data": {"somethingElse": {"id": "ORG_1"}}}),
+            )
+            .expect_err("a pointer the query does not answer is a misconfiguration");
+
+            assert!(
+                err.to_string().contains("/data/healthCheckProbe"),
+                "the message names the path that did not resolve: {err}"
+            );
+        }
+    }
 
     mod empty_page_schema {
         use std::sync::Arc;

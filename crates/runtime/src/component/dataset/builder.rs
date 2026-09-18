@@ -74,15 +74,12 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
     type Error = crate::Error;
 
     fn try_from(dataset: spicepod_dataset::Dataset) -> std::result::Result<Self, Self::Error> {
+        // Honoured here; the deprecation is reported by the load path
+        // (`init::dataset::warn_about_acceleration_block`), not from this conversion, which
+        // read-only callers run too.
         #[expect(deprecated)]
         let ready_state = match dataset.acceleration.as_ref().map(|a| a.ready_state) {
-            Some(Some(ready_state)) => {
-                tracing::warn!(
-                    "{}: `dataset.acceleration.ready_state` is deprecated, use `dataset.ready_state` instead.",
-                    dataset.name
-                );
-                ReadyState::from(ready_state)
-            }
+            Some(Some(ready_state)) => ReadyState::from(ready_state),
             _ => ReadyState::from(dataset.ready_state),
         };
 

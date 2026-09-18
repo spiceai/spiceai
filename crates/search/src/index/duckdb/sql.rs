@@ -262,6 +262,25 @@ mod tests {
         ))
     }
 
+    /// A `docs` schema carrying one timezone-aware microsecond `ts` column — the resolved type
+    /// that declines the UTC normalization, so a guard on the literal sees the literal alone.
+    fn aware_ts_schema() -> SchemaRef {
+        docs_schema(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )])
+    }
+
+    /// A whole-second timestamp literal, whose count DuckDB has to scale to microseconds before it
+    /// can hold it.
+    fn seconds_literal(seconds: i64) -> Expr {
+        lit(ScalarValue::TimestampSecond(
+            Some(seconds),
+            Some("UTC".into()),
+        ))
+    }
+
     /// The flat (filtered) statement for one filter, rendered against `schema`.
     fn flat_sql(schema: &SchemaRef, filter: &Expr) -> DataFusionResult<String> {
         duckdb_vector_sql(
@@ -457,11 +476,7 @@ mod tests {
     /// projects `id` alone, so this also covers a filter on a column the projection drops.
     #[test]
     fn a_timezone_aware_timestamp_filter_is_rendered_without_the_millisecond_truncation() {
-        let schema = docs_schema(vec![Field::new(
-            "ts",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        )]);
+        let schema = aware_ts_schema();
         let filter = col("ts").gt(micros_literal(1_767_225_600_000_999));
 
         let sql = flat_sql(&schema, &filter).expect("SQL should build");
@@ -471,12 +486,89 @@ mod tests {
             "a timezone-aware column needs no normalization, so it must not be rendered through whole milliseconds: {sql}"
         );
         assert!(
-            sql.contains(r#""ts" > "#),
-            "the column must be compared directly: {sql}"
+            sql.contains(r#""ts" > make_timestamptz(1767225600000999)"#),
+            "the column must be compared directly against the microsecond the literal names: {sql}"
         );
+    }
+
+    /// Regression test for #13432: past about 2255-06-05 an epoch-microsecond count exceeds the
+    /// `2^53` up to which an `f64` holds consecutive integers exactly. `TO_TIMESTAMP` takes a
+    /// `DOUBLE`, so rendering through it rounds the count and the literal names a neighbouring
+    /// microsecond — a filter that then selects a row set the query never asked for, silently,
+    /// since a wrong instant is still a valid one. `make_timestamptz` takes a `BIGINT`, so nothing
+    /// is widened.
+    ///
+    /// `2^53 + 1` is the first count an `f64` cannot hold: it rounds to `2^53`, one microsecond
+    /// below. That is the whole error, which is why this pins the literal rather than a tolerance.
+    #[test]
+    fn a_microsecond_count_past_the_double_bound_is_rendered_exactly() {
+        let schema = aware_ts_schema();
+        let past_2255 = 9_007_199_254_740_993_i64;
+        let filter = col("ts").gt(micros_literal(past_2255));
+
+        let sql = flat_sql(&schema, &filter).expect("SQL should build");
+
         assert!(
-            sql.contains(".000999"),
-            "the literal must keep its sub-millisecond digits: {sql}"
+            sql.contains(&format!(r#""ts" > make_timestamptz({past_2255})"#)),
+            "the literal must name the microsecond it holds, not the one an f64 rounds it to: {sql}"
+        );
+    }
+
+    /// DuckDB reserves `i64::MAX` and `-i64::MAX` microseconds as its infinity sentinels and
+    /// refuses both, and a second count large enough to overflow when scaled to microseconds names
+    /// an instant it cannot hold either. None of the three has a literal to render.
+    ///
+    /// The probe promises `Exact` for every filter it accepts, so rendering one of these anyway
+    /// would report the filter pushed down and then fail the statement built from it — which a
+    /// `DELETE` or `UPDATE` reaches only after its SQL is generated. Declining leaves DataFusion
+    /// applying the filter itself, which is correct and merely slower.
+    #[test]
+    fn a_timestamp_duckdb_cannot_hold_is_declined_by_both_the_probe_and_the_statement() {
+        let schema = aware_ts_schema();
+        let seconds_schema = docs_schema(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
+            false,
+        )]);
+
+        let declined_filters = [
+            (&schema, col("ts").gt(micros_literal(i64::MAX))),
+            (&schema, col("ts").gt(micros_literal(-i64::MAX))),
+            (&seconds_schema, col("ts").gt(seconds_literal(i64::MAX))),
+        ];
+
+        for (schema, filter) in &declined_filters {
+            assert_eq!(
+                duckdb_filter_pushdown(schema, filter),
+                TableProviderFilterPushDown::Unsupported,
+                "the probe must not promise a filter it cannot render: {filter}"
+            );
+            assert!(
+                flat_sql(schema, filter).is_err(),
+                "an instant DuckDB refuses must not be rendered: {filter}"
+            );
+        }
+    }
+
+    /// The positive control for the refusal above: `i64::MIN` is not one of the sentinels — the
+    /// fork measures DuckDB round-tripping it as the finite instant it is — so it must still
+    /// render. A guard that only pinned the refusals would be satisfied by a renderer that
+    /// declined every timestamp, and the over-refusal that would cost is silent: the filter simply
+    /// stops being pushed down.
+    #[test]
+    fn the_smallest_microsecond_count_is_finite_and_still_renders() {
+        let schema = aware_ts_schema();
+        let filter = col("ts").gt(micros_literal(i64::MIN));
+
+        assert_eq!(
+            duckdb_filter_pushdown(&schema, &filter),
+            TableProviderFilterPushDown::Exact,
+            "i64::MIN is a finite instant, not a sentinel"
+        );
+        let sql = flat_sql(&schema, &filter).expect("SQL should build");
+        assert!(
+            sql.contains(&format!(r#""ts" > make_timestamptz({})"#, i64::MIN)),
+            "a finite instant must render as the count it is: {sql}"
         );
     }
 
@@ -563,6 +655,130 @@ mod tests {
             assert!(
                 flat_sql(&schema, filter).is_err(),
                 "a filter the probe rejected must not render: {filter}"
+            );
+        }
+    }
+    /// A `docs` schema carrying one `Date32` `dt` column, which is the resolved type that keeps
+    /// the UTC normalization on the column side, so a guard on the literal sees the literal alone.
+    fn date32_schema() -> SchemaRef {
+        docs_schema(vec![Field::new("dt", DataType::Date32, false)])
+    }
+
+    /// A `Date32` literal, whose value is a count of days since the epoch.
+    fn date32_literal(days: i32) -> Expr {
+        lit(ScalarValue::Date32(Some(days)))
+    }
+
+    /// A `Date64` literal, whose value is a count of *milliseconds* since the epoch.
+    fn date64_literal(millis: i64) -> Expr {
+        lit(ScalarValue::Date64(Some(millis)))
+    }
+
+    /// Regression test for #13476: a `Date32` holds a count of days, and scaling it to seconds in
+    /// `i32` overflows for every day past `i32::MAX / 86_400` — 24 855, which is 2038-01-19 — and
+    /// symmetrically below -24 855, which is 1901-12-13. A debug build panics there; a release
+    /// build wraps, so 2038-01-20 renders as 1901-12-14 and the comparison built from it selects a
+    /// row set the query never asked for, silently, because a wrong instant is still a valid one.
+    ///
+    /// The count has to be widened before it is scaled. This pins the seconds each day names, so a
+    /// revert to the `i32` arithmetic fails here rather than inside a generated statement.
+    #[test]
+    fn a_date32_literal_outside_the_i32_second_range_names_the_day_it_holds() {
+        let schema = date32_schema();
+
+        // (days since the epoch, the day that is, the epoch second it names)
+        let past_the_bound = [
+            (24_856_i32, "2038-01-20", 2_147_558_400_i64),
+            (47_482, "2100-01-01", 4_102_444_800),
+            (-24_856, "1901-12-13", -2_147_558_400),
+        ];
+
+        for (days, day, seconds) in past_the_bound {
+            let filter = col("dt").gt(date32_literal(days));
+            let sql = flat_sql(&schema, &filter).expect("SQL should build");
+
+            assert!(
+                sql.contains(&format!("TO_TIMESTAMP({seconds})")),
+                "{day} must render as the second it names, not a wrapped one: {sql}"
+            );
+        }
+    }
+
+    /// Regression test for #13476: Arrow defines `Date64` as the elapsed time since the epoch in
+    /// *milliseconds*, so its count is already an instant and scales down to the second. Scaling it
+    /// up by the length of a day instead reads each millisecond as a day, which puts 1970-01-02
+    /// past the year 238 000 — an instant no row holds, so the comparison matches nothing, and one
+    /// DuckDB refuses outright with *"Epoch seconds out of range for TIMESTAMP WITH TIME ZONE"*.
+    ///
+    /// The second case names the same day as the `Date32` guard above, so the two variants have to
+    /// agree about which instant a date is.
+    #[test]
+    fn a_date64_literal_is_read_as_milliseconds_not_as_days() {
+        let schema = docs_schema(vec![Field::new("dt", DataType::Date64, false)]);
+
+        let days_in_millis = [
+            (86_400_000_i64, "1970-01-02", 86_400_i64),
+            (2_147_558_400_000, "2038-01-20", 2_147_558_400),
+        ];
+
+        for (millis, day, seconds) in days_in_millis {
+            let filter = col("dt").gt(date64_literal(millis));
+            let sql = flat_sql(&schema, &filter).expect("SQL should build");
+
+            assert!(
+                sql.contains(&format!("TO_TIMESTAMP({seconds})")),
+                "{day} must render as the second its milliseconds name: {sql}"
+            );
+        }
+    }
+
+    /// The positive control for the two guards above: a date inside the `i32` second range rendered
+    /// correctly before and must render identically now. Without it a renderer that declined every
+    /// date, or one that shifted every date by a constant, would still satisfy them — and the cost
+    /// of over-refusing is silent, since the filter simply stops being pushed down.
+    #[test]
+    fn a_date32_literal_inside_the_i32_second_range_renders_unchanged() {
+        let schema = date32_schema();
+        let filter = col("dt").gt(date32_literal(19_723)); // 2024-01-01
+
+        assert_eq!(
+            duckdb_filter_pushdown(&schema, &filter),
+            TableProviderFilterPushDown::Exact,
+            "an in-range date is renderable, so the probe must promise it"
+        );
+
+        let sql = flat_sql(&schema, &filter).expect("SQL should build");
+        assert!(
+            sql.contains(r#"TO_TIMESTAMP(EPOCH_MS("dt") / 1000) > TO_TIMESTAMP(1704067200)"#),
+            "2024-01-01 must render as the second it has always named: {sql}"
+        );
+    }
+
+    /// The scaling the two guards above pin is shared by every engine — only the call it is
+    /// formatted into differs — so a revert reaches SQLite's `date(.., 'unixepoch')` rendering as
+    /// well. This repository renders through this function for DuckDB alone, so the sibling arm is
+    /// asserted directly rather than through a call site.
+    #[test]
+    fn the_sqlite_arm_renders_a_date_from_the_same_count() {
+        let schema = date32_schema();
+
+        let same_day = [
+            (date32_literal(24_856), "date(2147558400, 'unixepoch')"), // 2038-01-20
+            (date64_literal(86_400_000), "date(86400, 'unixepoch')"),  // 1970-01-02
+        ];
+
+        for (literal, rendered) in same_day {
+            let filter = col("dt").gt(literal);
+            let sql = expr::to_sql_with_engine_and_schema(
+                &filter,
+                Some(Engine::SQLite),
+                Some(schema.as_ref()),
+            )
+            .expect("SQL should build");
+
+            assert!(
+                sql.contains(rendered),
+                "SQLite must name the same second the DuckDB arm does: {sql}"
             );
         }
     }

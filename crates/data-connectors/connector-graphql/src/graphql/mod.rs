@@ -208,6 +208,22 @@ pub trait GraphQLContext: Send + Sync + std::fmt::Debug {
     fn query_cost(&self) -> Option<u32> {
         None
     }
+
+    /// Whether a SQL `LIMIT` may be pushed into the paginated connection.
+    ///
+    /// Pagination bounds the limit by the *page size of the paginated
+    /// connection*, so pushing a limit down is only sound when one node of that
+    /// connection produces exactly one row. A table that fans a nested
+    /// connection out into many rows per node must return `false`: otherwise
+    /// `LIMIT 20` asks for 20 nodes, and the scan stops after that page having
+    /// emitted however many rows those nodes happened to carry — fewer than 20,
+    /// with no indication that rows were left behind.
+    ///
+    /// Returning `false` costs nothing: the scan streams lazily, so `DataFusion`
+    /// still stops pulling pages once its own `LIMIT` is satisfied.
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

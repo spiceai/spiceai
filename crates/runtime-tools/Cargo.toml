@@ -24,7 +24,20 @@ futures.workspace = true
 itertools.workspace = true
 globset.workspace = true
 http.workspace = true
-rmcp = { workspace = true, optional = true }
+# `client` gates `rmcp::service`, `serve_client`, `RoleClient` and `ClientServiceExt`,
+# which `mcp::catalog` names; `server` gates `RoleServer`, `ServerHandler` and
+# `service::RequestContext`, which `mcp::server` names; the child-process and
+# HTTP client transports are the ones `mcp::catalog` builds a client on;
+# `transport-streamable-http-server` is what the `Mcp-Param-*` header tests
+# drive through `StreamableHttpService`. None are default features, so without
+# them the crate's own `mcp` feature cannot compile it.
+rmcp = { workspace = true, optional = true, features = [
+    "client",
+    "server",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "transport-streamable-http-server",
+] }
 runtime-auth = { path = "../runtime-auth" }
 runtime-query-engine = { path = "../runtime-query-engine" }
 runtime-search = { path = "../runtime-search" }
@@ -46,8 +59,14 @@ util = { path = "../util" }
 
 [features]
 default = []
-mcp = ["dep:rmcp"]
+# `tools/mcp` gates `tools::McpProxy` and `SpiceModelTool::as_mcp_proxy`, both of which
+# `mcp::tool` names, so the crate's MCP code needs it as much as it needs `rmcp` itself.
+mcp = ["dep:rmcp", "tools/mcp"]
 openapi = ["dep:utoipa"]
+
+[dev-dependencies]
+bytes.workspace = true
+http-body-util = "0.1"
 
 [lints]
 workspace = true

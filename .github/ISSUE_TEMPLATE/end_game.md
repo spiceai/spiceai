@@ -60,13 +60,17 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new benchmark run. Specify `trunk` as the branch source, with the following parameters:
        - Workflow to execute: `bench`
        - All other values left empty.
-   - [ ] Verify [E2E Test CLI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_spice_cli.yml) is green on `trunk` and the release branch.
-     - Parameters: Branch: `trunk`
-     - Build CLI: `true`
+   - [ ] Verify [Append Tests](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_append.yml) is green on `trunk` and the release branch.
+     - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new append test run. Specify `trunk` as the branch source, with the following parameters:
+       - Workflow to execute: `append`
+       - All other values left empty.
    - [ ] Verify [Throughput Tests](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_throughput.yml) is green on `trunk` and the release branch.
      - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new throughput run. Specify `trunk` as the branch source, with the following parameters:
        - Workflow to execute: `throughput`
        - All other values left empty.
+   - [ ] Verify [E2E Test CLI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_spice_cli.yml) is green on `trunk` and the release branch.
+     - Parameters: Branch: `trunk`
+     - Build CLI: `true`
 
 1. **Documentation Review**
    - [ ] Update and confirm accuracy of `README.md` and [Spice.ai Docs](https://github.com/spiceai/docs).
@@ -233,6 +237,7 @@ Testing focus DRIs are responsible for:
   - [ ] [spice-java](https://github.com/spiceai/spice-java/releases)
   - [ ] [spice-dotnet](https://github.com/spiceai/spice-dotnet/releases)
   - [ ] [gospice](https://github.com/spiceai/gospice/releases)
+  - [ ] [spiceai/skills](https://github.com/spiceai/skills/releases) — version must match runtime (e.g. `2.3.0` / tag `v2.3.0`)
 
 - [ ] [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml) and cherry-pick schema update PR onto the release branch.
 
@@ -252,6 +257,7 @@ Testing focus DRIs are responsible for:
 - [ ] When binaries are built for the release, edit the GitHub release and select **“Set as latest release”** to trigger the [spiced_docker workflow](https://github.com/spiceai/spiceai/actions/workflows/spiced_docker.yml) so Docker images are built from the published artifacts.
   - [ ] Monitor the spiced_docker workflow (and re-run with **workflow_dispatch** using `release_tag` and optional `target` overrides if a rebuild or partial rebuild is required).
 - [ ] Ensure all newly released SDKs (mentioned in release notes) are published
+- [ ] Publish [spiceai/skills](https://github.com/spiceai/skills) GitHub Release for this runtime version (bump `.claude-plugin/plugin.json` + `marketplace.json` version to match runtime; tag `vX.Y.Z`; confirm [Release Plugin](https://github.com/spiceai/skills/actions/workflows/release.yml) uploaded the zip asset)
 - [ ] Update the [Helm chart](https://github.com/spiceai/spiceai/blob/trunk/deploy/chart) (chart version e.g. `1.8.3` & image.tag e.g. `1.8.3-models`) in the release branch (not in trunk).
   - [ ] If this is a **minor** release, replace the `ghcr.io/spiceai/spiceai-nightly` repository in `values.yaml` with `spiceai/spiceai` and change the tag to the release version (e.g. `1.0.0`).
   - [ ] [Release Chart workflow](https://github.com/spiceai/helm-charts/actions/workflows/release.yml) is triggered using the release branch.
@@ -273,6 +279,7 @@ Testing focus DRIs are responsible for:
 - [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai/actions/workflows/update-formula.yml) after the final build completes.
 - [ ] Remove or mark the released version in the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md).
 - [ ] Update the supported version in `SECURITY.md` if necessary.
+- [ ] Confirm docs/install refs for Skills point at the matching release (or trunk if intentional).
 - [ ] QA DRI: Run SpiceQA via [Github Action](https://github.com/spiceai/cookbook/actions/workflows/spice-qa.yml), with the correct `input.spice_version`.
   - [ ] Build new `spiced` & `spiced-internal` images in Spice.ai Cloud Platform (SCP).
   - [ ] Redeploy the SpiceQA app in the Spice.ai Cloud Platform (SCP). Ensure the deployment is successful.

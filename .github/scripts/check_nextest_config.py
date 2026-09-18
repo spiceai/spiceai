@@ -47,6 +47,10 @@ QUIET_BASELINE_SECONDS = {
     "partition_chunking_test": 247.9,  # ..._timestamp_partition_with_date_part_impl_sqlite
     "layout_pruning_ab_test": 170.1,  # pruning_ab_inferred_vs_authoritative_sort
     "mutation_model_test": 107.1,  # test_exhaustive_composite_single_row_sequences_impl_sqlite
+    # tpcds_and_clickbench_parity_vs_duckdb, measured with fixtures already on
+    # disk. CI regenerates them with `dsdgen` on every fresh runner, so the
+    # baseline is rounded up from the observed 127.7s to cover that.
+    "result_correctness_vs_duckdb_test": 180.0,
 }
 
 # Worst same-test slowdown measured between a quiet pool and a saturated one.
@@ -79,6 +83,9 @@ ZERO_RETRY_BINARIES = frozenset(
         "mutation_property_test",
         "cdc_compaction_delete_race_test",
         "maintained_aggregate_filter_test",
+        # Engine-vs-engine parity: a mismatch is deterministic, so a retry buys
+        # nothing but five more runs of a ~250s binary before the same failure.
+        "result_correctness_vs_duckdb_test",
     }
 )
 

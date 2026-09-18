@@ -62,15 +62,18 @@ use arrow_flight::{FlightClient, FlightDescriptor, Ticket};
 use cache::{
     metrics::CacheMetrics,
     result::{
-        embeddings::CachedEmbeddingResult, query::CachedQueryResult, search::CachedSearchResult,
+        CacheStatus, embeddings::CachedEmbeddingResult, query::CachedQueryResult,
+        search::CachedSearchResult,
     },
 };
 use futures::{StreamExt, TryStreamExt};
 use opentelemetry::global;
 use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
 use runtime::{Runtime, auth::EndpointAuth, config::Config, datafusion::query::QueryBuilder};
+use spicepod::param::Params;
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
+    component::caching::{Caching, SQLResultsCacheConfig},
     component::dataset::{Dataset, TimeFormat},
     component::runtime::{Query, Runtime as SpicepodRuntime, TaskHistory},
 };
@@ -115,6 +118,8 @@ const EXPECTED_DATASET_METRICS: &[&str] = &[
 /// `RUSTFLAGS="--cfg tokio_unstable"`, which no Spice build sets.
 const EXPECTED_RUNTIME_GAUGES: &[&str] = &[
     "process_resident_memory_bytes",
+    "process_resident_anon_bytes",
+    "process_resident_file_bytes",
     "query_memory_pool_used_bytes",
     "cayenne_compaction_memory_pool_used_bytes",
     "cayenne_compaction_memory_pool_bytes",
@@ -341,6 +346,122 @@ fn csv_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
     dataset
 }
 
+/// A Cayenne file-mode dataset whose background maintenance tick fires fast
+/// enough for a test to observe one pass.
+///
+/// The footprint sample runs on that tick, so the interval has to be short; its
+/// own 30-second floor does not suppress the FIRST sample, which is the one this
+/// test reads.
+///
+/// Not built on Windows: the engine crate is a `cfg(not(windows))`
+/// dev-dependency, so the `cayenne` accelerator is unregistered there and a
+/// dataset naming it could never load.
+#[cfg(not(windows))]
+fn cayenne_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
+    let csv = fixture_csv(dir, name);
+    write_fixture_csv(&csv, FIXTURE_EPOCH_SECONDS);
+
+    let mut dataset = Dataset::new(format!("file://{}", csv.display()), name);
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("cayenne".to_string()),
+        mode: Mode::File,
+        refresh_mode: Some(RefreshMode::Full),
+        params: Some(Params::from_string_map(
+            [
+                (
+                    "cayenne_file_path".to_string(),
+                    dir.join(format!("{name}-cayenne")).display().to_string(),
+                ),
+                (
+                    "cayenne_compaction_background_interval_ms".to_string(),
+                    "250".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )),
+        ..Acceleration::default()
+    });
+    dataset
+}
+
+/// Cayenne's maintenance and footprint families that a loaded dataset reports
+/// with no workload at all — every one reachable from the background sample or a
+/// decision the fixture's own tick makes.
+///
+/// Presence is the whole assertion: each is emitted from a decision point or a
+/// sample that had no instrumentation at all, so a refactor that drops the call
+/// site leaves the operator back where they started — reading debug logs — with
+/// nothing failing. The list is therefore exhaustive over the always-sampled
+/// families; the ones that need a specific event are in
+/// [`EVENT_GATED_CAYENNE_MAINTENANCE_METRICS`], and the test asserts they are
+/// *absent* so neither list can silently go stale.
+#[cfg(not(windows))]
+const EXPECTED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
+    "cayenne_compaction_outcome_total",
+    "cayenne_maintenance_outcome_total",
+    "cayenne_maintenance_reclaimed_files_total",
+    "cayenne_maintenance_reclaimed_bytes_total",
+    "cayenne_maintenance_reclaimed_rows_total",
+    // Deliberately a family of its own: it counts rows a pass MARKED deleted,
+    // the opposite event to the tombstone removal `reclaimed_rows` counts, so
+    // one summable series cannot hold both. Registered at zero with the reclaim
+    // family, so its absence here means the call site or the registration went
+    // missing rather than that no retention pass has run.
+    "cayenne_maintenance_tombstoned_rows_total",
+    "cayenne_deletion_index_len",
+    "cayenne_deletion_index_reinserts",
+    "cayenne_deletion_index_bytes",
+    "cayenne_pk_index_format",
+    "cayenne_pk_index_keys",
+    "cayenne_pk_index_bytes",
+    "cayenne_pk_index_budget_bytes",
+    "cayenne_storage_files",
+    "cayenne_storage_bytes",
+    "cayenne_storage_rows",
+    "cayenne_snapshot_manifest_rows",
+    "cayenne_metastore_table_rows",
+    "cayenne_memory_account_bytes",
+    "cayenne_mem_tier_bytes",
+    "cayenne_scan_file_statistics_entries",
+    "cayenne_memory_account_reserved_bytes",
+    "cayenne_inline_cache_bytes",
+    "cayenne_inline_cache_batches",
+    "cayenne_data_dir_bytes",
+    "cayenne_data_dir_files",
+    "cayenne_data_dir_snapshot_dirs",
+    "cayenne_metastore_db_bytes",
+    "cayenne_metastore_wal_bytes",
+    "cayenne_autotune_bake_deletion_index_trigger",
+    // Zeroed rather than skipped while the index is exact, which is what makes
+    // them readable against `cayenne_pk_index_format` instead of retaining a
+    // stale bloom shape.
+    "cayenne_pk_bloom_bits",
+    "cayenne_pk_bloom_insertions",
+    "cayenne_pk_bloom_bits_per_insertion",
+];
+
+/// Families that need an event a freshly-loaded, unwritten dataset cannot
+/// produce, with what each one waits for.
+///
+/// Kept as a list rather than a comment because the test asserts they are absent:
+/// if one starts arriving without a workload it has become always-sampled, and
+/// leaving it here would mean nothing ever checks that its call site survives.
+#[cfg(not(windows))]
+const EVENT_GATED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
+    // Recorded when a threshold actually fires. This fixture holds one inline
+    // file, so every pass declines before any trigger is evaluated.
+    "cayenne_compaction_trigger_total",
+    // Recorded at an encode decision; the fixture's write takes the inline path.
+    "cayenne_write_shape_shards",
+    // Require a keyset to be dropped or carried across a compaction.
+    "cayenne_pk_index_discard_total",
+    "cayenne_pk_index_preserved_total",
+    // Requires a bloom-mode apply to split a batch.
+    "cayenne_pk_bloom_split_rows_total",
+];
+
 async fn wait_until<F, Fut>(timeout: Duration, mut f: F) -> bool
 where
     F: FnMut() -> Fut,
@@ -398,6 +519,7 @@ async fn startup_registrations_export_the_process_and_runtime_gauges() {
     let registry = &*PROMETHEUS;
 
     telemetry::track_process_resident_memory_bytes(1_024, &[]);
+    telemetry::track_process_resident_split(640, 384, &[]);
     telemetry::cayenne::track_query_memory_pool_used_bytes(2_048, &[]);
     telemetry::cayenne::track_compaction_memory_pool_used_bytes(4_096, &[]);
     telemetry::cayenne::track_compaction_memory_pool_bytes(8_192, &[]);
@@ -563,6 +685,140 @@ async fn an_accelerated_dataset_reports_the_query_and_refresh_families() {
         "the source moved {FIXTURE_EPOCH_STEP_SECONDS}s forward, so the refresh lag must be \
          {expected_lag_ms}ms, not {refresh_lag_ms}ms"
     );
+}
+
+/// Cayenne's maintenance and footprint families must reach `/metrics`.
+///
+/// They are emitted from decision points and a background sample that had no
+/// instrumentation at all, and the failure mode is silent: drop the call site
+/// and the operator is back to reading debug logs with nothing failing. So this
+/// asserts the families arrive, which is the one thing a unit test on the label
+/// vocabulary cannot cover.
+///
+/// The dataset sets a 250 ms compaction interval because the footprint sample
+/// rides that tick. Its own 30-second floor does not suppress the first sample,
+/// which is the one read here.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_cayenne_dataset_reports_its_maintenance_and_footprint_families() {
+    let registry = &*PROMETHEUS;
+
+    let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+    let app = AppBuilder::new("metrics_cayenne_dataset")
+        .with_dataset(cayenne_backed_dataset(dir.path(), "cayenne_scores"))
+        .with_runtime(SpicepodRuntime {
+            task_history: TaskHistory {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .build();
+
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    tokio::time::timeout(Duration::from_mins(1), Arc::clone(&rt).load_components())
+        .await
+        .expect("the dataset to load within a minute");
+    assert!(
+        wait_until(Duration::from_mins(1), || async { rt.status().is_ready() }).await,
+        "the runtime never reported ready, so the dataset never loaded"
+    );
+
+    // Poll for the families rather than sleeping the tick out: the sample fires
+    // on a background wake whose exact timing is not ours to predict, and a
+    // fixed sleep would either flake or be needlessly slow.
+    let arrived = wait_until(Duration::from_mins(1), || async {
+        let reported = reported_metric_names(registry);
+        EXPECTED_CAYENNE_MAINTENANCE_METRICS
+            .iter()
+            .all(|metric| reported.contains(*metric))
+    })
+    .await;
+    let reported = reported_metric_names(registry);
+    assert!(
+        arrived,
+        "a loaded Cayenne dataset did not report its maintenance and footprint families"
+    );
+    assert_all_reported(
+        &reported,
+        EXPECTED_CAYENNE_MAINTENANCE_METRICS,
+        "a loaded Cayenne dataset did not report its maintenance and footprint families",
+    );
+
+    // The other half of completeness: every family this PR's instrumentation can
+    // emit is classified as either always-sampled (above) or event-gated (below),
+    // and an event-gated family appearing here means the classification has gone
+    // stale — the family is now always-sampled and belongs in the asserted set,
+    // where a dropped call site would fail.
+    let unexpectedly_present: Vec<&&str> = EVENT_GATED_CAYENNE_MAINTENANCE_METRICS
+        .iter()
+        .filter(|metric| reported.contains(**metric))
+        .collect();
+    assert!(
+        unexpectedly_present.is_empty(),
+        "these families are documented as needing an event this fixture cannot produce, but \
+         arrived anyway — move them into EXPECTED_CAYENNE_MAINTENANCE_METRICS so a dropped \
+         call site fails: {unexpectedly_present:?}"
+    );
+
+    // Presence of the family is not enough for the decision telemetry: its whole
+    // value is the `outcome` label, and a call site rewritten to emit a bare
+    // counter would still satisfy the check above. This fixture's background tick
+    // deterministically declines the current-snapshot pass (one inline file, no
+    // Vortex files to compact), so assert that exact decline is what arrives.
+    let outcomes = compaction_outcomes(registry);
+    let declines = outcomes
+        .get(&(
+            "cayenne_scores".to_string(),
+            "subset_current".to_string(),
+            "declined_below_trigger".to_string(),
+        ))
+        .copied()
+        .unwrap_or(0.0);
+    assert!(
+        declines > 0.0,
+        "the background tick must report WHY it declined, not just that it ran: this fixture \
+         holds one inline file and no Vortex files, so every pass declines below trigger. \
+         Observed: {outcomes:?}"
+    );
+    // Nothing in this fixture can commit a compaction, so a `committed` sample
+    // would mean the outcome labels are being attached to the wrong exits.
+    assert!(
+        !outcomes
+            .keys()
+            .any(|(_, _, outcome)| outcome == "committed"),
+        "no compaction can commit against a single inline file. Observed: {outcomes:?}"
+    );
+}
+
+/// `cayenne_compaction_outcome_total` counts, keyed by `(table, kind, outcome)`.
+///
+/// The table label is part of the key because the registry is shared across the
+/// tests in this file, so a sibling fixture's series must not satisfy an
+/// assertion about this one.
+#[cfg(not(windows))]
+fn compaction_outcomes(registry: &prometheus::Registry) -> HashMap<(String, String, String), f64> {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == "cayenne_compaction_outcome_total")
+        .flat_map(|family| {
+            family.get_metric().iter().map(|metric| {
+                let label = |name: &str| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .find(|l| l.name() == name)
+                        .map(|l| l.value().to_string())
+                        .unwrap_or_default()
+                };
+                (
+                    (label("table"), label("kind"), label("outcome")),
+                    metric.get_counter().value(),
+                )
+            })
+        })
+        .collect()
 }
 
 /// `query_failures{err_code}` must name the condition that failed.
@@ -790,4 +1046,300 @@ async fn each_flight_rpc_records_exactly_one_request() -> Result<(), anyhow::Err
     assert_recorded_once(registry, before, "do_put with no flight data");
 
     Ok(())
+}
+
+/// The sum of every series of a counter family.
+fn counter_total(registry: &prometheus::Registry, name: &str) -> f64 {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == name)
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .map(|metric| metric.get_counter().value())
+        .sum()
+}
+
+/// A runtime serving the `scores` fixture, with the SQL results cache on and task
+/// history off, loaded and ready.
+async fn runtime_with_results_cache(dir: &std::path::Path, app_name: &str) -> Arc<Runtime> {
+    let app = AppBuilder::new(app_name)
+        .with_dataset(csv_backed_dataset(dir, "scores"))
+        .with_runtime(SpicepodRuntime {
+            caching: Caching {
+                sql_results: Some(SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            task_history: TaskHistory {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .build();
+
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    tokio::time::timeout(Duration::from_mins(1), Arc::clone(&rt).load_components())
+        .await
+        .expect("the dataset to load within a minute");
+    assert!(
+        wait_until(Duration::from_mins(1), || async { rt.status().is_ready() }).await,
+        "the runtime never reported ready, so the dataset never loaded"
+    );
+    rt
+}
+
+/// A query looks the results cache up once, however it is answered.
+///
+/// The lookup happens before anything is planned, and a miss found there is handed
+/// to the planned path so it does not look the same key up again. Getting that
+/// handoff wrong changes no response — every query still returns the right rows —
+/// and shows only here, as each miss counted twice.
+///
+/// The early lookup is made under SQL keys from a query's first run, but under plan
+/// keys only once the plan is cached, so each is exercised where it looks up: a
+/// SQL-keyed query from its first run, and a plan-keyed query whose result was
+/// invalidated while its plan stayed cached.
+///
+/// Counts compare before/after deltas, which only `cargo nextest` isolates by giving
+/// the test its own process.
+#[tokio::test]
+async fn a_query_counts_one_results_cache_lookup() {
+    use runtime_request_context::{CacheControl, CacheKeyType, Protocol, RequestContext};
+
+    let registry = &*PROMETHEUS;
+
+    let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+    let rt = runtime_with_results_cache(dir.path(), "metrics_results_cache_lookups").await;
+    let context = |key_type| {
+        Arc::new(
+            RequestContext::builder(Protocol::Http)
+                .with_cache_control(CacheControl::Cache(key_type))
+                .build(),
+        )
+    };
+    let miss_then_hit = [
+        (CacheStatus::CacheMiss, [1.0, 0.0, 1.0]),
+        (CacheStatus::CacheHit, [1.0, 1.0, 0.0]),
+    ];
+
+    // SQL keys: looked up early from the query's first run.
+    let sql_keyed = context(CacheKeyType::Raw);
+    for (status, recorded) in miss_then_hit {
+        assert_lookups(
+            registry,
+            &rt,
+            &sql_keyed,
+            "SELECT id, score FROM scores WHERE id >= 0",
+            status,
+            recorded,
+        )
+        .await;
+    }
+
+    // Plan keys: looked up early only once the plan is cached. The first run caches the
+    // plan and the result; invalidating the result keeps the plan, so the runs after it
+    // look up early.
+    let plan_keyed = context(CacheKeyType::Default);
+    let sql = "SELECT id, score FROM scores";
+    assert_lookups(
+        registry,
+        &rt,
+        &plan_keyed,
+        sql,
+        CacheStatus::CacheMiss,
+        [1.0, 0.0, 1.0],
+    )
+    .await;
+    rt.datafusion()
+        .results_cache_provider()
+        .expect("the results cache is configured")
+        .invalidate_for_table(datafusion::sql::TableReference::bare("scores"))
+        .await
+        .expect("the cached result to be invalidated");
+    for (status, recorded) in miss_then_hit {
+        assert_lookups(registry, &rt, &plan_keyed, sql, status, recorded).await;
+    }
+}
+
+/// Runs `sql` under `request_context`, reads its whole result, and asserts how it was
+/// answered and the `[requests, hits, misses]` it added to the results cache counters.
+async fn assert_lookups(
+    registry: &prometheus::Registry,
+    rt: &Arc<Runtime>,
+    request_context: &Arc<runtime_request_context::RequestContext>,
+    sql: &str,
+    expected_status: CacheStatus,
+    expected: [f64; 3],
+) {
+    let lookups = || {
+        [
+            "results_cache_requests",
+            "results_cache_hits",
+            "results_cache_misses",
+        ]
+        .map(|name| counter_total(registry, name))
+    };
+
+    let before = lookups();
+    let status = Arc::clone(request_context)
+        .scope(async {
+            let mut result = QueryBuilder::new(sql, rt.datafusion())
+                .build()
+                .run()
+                .await
+                .expect("query to run");
+            while let Some(batch) = result.data.next().await {
+                batch.expect("batch to stream without error");
+            }
+            result.cache_status
+        })
+        .await;
+    let after = lookups();
+
+    assert_eq!(status, expected_status, "{sql}");
+    let recorded = [
+        after[0] - before[0],
+        after[1] - before[1],
+        after[2] - before[2],
+    ];
+    assert!(
+        recorded
+            .iter()
+            .zip(expected)
+            .all(|(got, want)| (got - want).abs() < f64::EPSILON),
+        "a {expected_status:?} of {sql} must be one results cache request, recorded [requests, hits, misses] = {recorded:?}, expected {expected:?}"
+    );
+}
+
+/// The number of cache hits `query_duration_ms` has recorded, and the milliseconds
+/// they add up to, over every series.
+fn cache_hit_query_durations(registry: &prometheus::Registry) -> (u64, f64) {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == "query_duration_ms")
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .filter(|metric| {
+            metric
+                .get_label()
+                .iter()
+                .any(|label| label.name() == "tags" && label.value() == "cache-hit")
+        })
+        .fold((0, 0.0), |(count, sum), metric| {
+            let histogram = metric.get_histogram();
+            (
+                count + histogram.get_sample_count(),
+                sum + histogram.get_sample_sum(),
+            )
+        })
+}
+
+/// How long a slow caller waits before reading a cache hit it has been served.
+const SLOW_READER_DELAY: Duration = Duration::from_millis(250);
+
+/// The number of observations and the sum of a histogram family.
+fn histogram_count_and_sum(registry: &prometheus::Registry, name: &str) -> (u64, f64) {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == name)
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .fold((0, 0.0), |(count, sum), metric| {
+            let histogram = metric.get_histogram();
+            (
+                count + histogram.get_sample_count(),
+                sum + histogram.get_sample_sum(),
+            )
+        })
+}
+
+/// A cache hit's duration and returned-output counters are recorded when the
+/// result stream is consumed, matching a miss.
+///
+/// Finalizing at serve time would change `query_duration_ms` and the
+/// task-history duration, and would add every cached batch to
+/// `query_returned_rows` / `query_returned_bytes` before HTTP or Flight read
+/// them. Both are user-facing contracts; neither changes without an Enhancement.
+///
+/// Counts compare before/after deltas, which only `cargo nextest` isolates by giving
+/// the test its own process.
+#[tokio::test]
+async fn a_cache_hit_is_recorded_when_the_stream_is_consumed() {
+    let registry = &*PROMETHEUS;
+
+    let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+    let rt = runtime_with_results_cache(dir.path(), "metrics_served_cache_hit").await;
+    let run = || {
+        QueryBuilder::new("SELECT id, score FROM scores", rt.datafusion())
+            .build()
+            .run()
+    };
+
+    let mut miss = run().await.expect("query to run");
+    assert_eq!(miss.cache_status, CacheStatus::CacheMiss);
+    while let Some(batch) = miss.data.next().await {
+        batch.expect("batch to stream without error");
+    }
+
+    let (hits_before, ms_before) = cache_hit_query_durations(registry);
+    let (rows_before, rows_sum_before) = histogram_count_and_sum(registry, "query_returned_rows");
+    let bytes_before = counter_total(registry, "query_returned_bytes");
+    let mut hit = run().await.expect("query to run");
+    assert_eq!(hit.cache_status, CacheStatus::CacheHit);
+    let (hits_served, _) = cache_hit_query_durations(registry);
+    let (rows_served, _) = histogram_count_and_sum(registry, "query_returned_rows");
+    let bytes_served = counter_total(registry, "query_returned_bytes");
+    assert_eq!(
+        hits_served - hits_before,
+        0,
+        "a cache hit must not record query_duration_ms until its stream is consumed"
+    );
+    assert_eq!(
+        rows_served - rows_before,
+        0,
+        "a cache hit must not record query_returned_rows until its stream is consumed"
+    );
+    assert!(
+        (bytes_served - bytes_before).abs() < f64::EPSILON,
+        "a cache hit must not record query_returned_bytes until its stream is consumed"
+    );
+
+    // The caller's delay is the behavior under test, so it is a fixed sleep.
+    tokio::time::sleep(SLOW_READER_DELAY).await;
+    let mut rows = 0;
+    while let Some(batch) = hit.data.next().await {
+        rows += batch.expect("batch to stream without error").num_rows();
+    }
+    assert!(rows > 0, "the hit must return the fixture's rows");
+
+    let (hits_read, ms_read) = cache_hit_query_durations(registry);
+    let (rows_read, rows_sum_read) = histogram_count_and_sum(registry, "query_returned_rows");
+    let bytes_read = counter_total(registry, "query_returned_bytes");
+    assert_eq!(
+        hits_read - hits_before,
+        1,
+        "consuming a cache hit must record query_duration_ms once"
+    );
+    assert!(
+        rows_read > rows_before,
+        "consuming a cache hit must record query_returned_rows"
+    );
+    assert!(
+        rows_sum_read - rows_sum_before
+            >= f64::from(u32::try_from(rows).expect("the fixture's row count fits in a u32")),
+        "query_returned_rows recorded {} rows, expected at least the {rows} the caller read",
+        rows_sum_read - rows_sum_before
+    );
+    assert!(
+        bytes_read - bytes_before > 0.0,
+        "consuming a cache hit must record query_returned_bytes"
+    );
+    let recorded_ms = ms_read - ms_before;
+    assert!(
+        recorded_ms >= SLOW_READER_DELAY.as_secs_f64() * 1000.0,
+        "the hit recorded {recorded_ms}ms, missing the {SLOW_READER_DELAY:?} its caller took to read it"
+    );
 }

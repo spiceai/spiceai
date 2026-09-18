@@ -42,11 +42,13 @@ limitations under the License.
 
 mod filter_exec;
 mod sink;
-mod vector_io;
+pub(crate) mod vector_io;
 
 // Public API - re-exported in provider/mod.rs
 pub use sink::CayenneDeletionSink;
-pub(crate) use sink::{PreparedDeletionPublish, file_based::FileBasedDeletionSink};
+pub(crate) use sink::{
+    DeleteScanSource, PreparedDeletionPublish, file_based::FileBasedDeletionSink,
+};
 
 // Crate-internal types used by table.rs
 pub(crate) use filter_exec::{

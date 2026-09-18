@@ -11,8 +11,17 @@ version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-rmcp = { workspace = true, optional = true }
+# `client` gates `rmcp::service`, which `mcp::McpProxy` names in its own
+# signature — without it this crate does not compile under its own `mcp`
+# feature, and only compiled at all because `runtime` enables `rmcp/client`
+# for the whole graph. `client` rather than `server` because the proxy calls
+# out to an MCP server rather than serving one.
+rmcp = { workspace = true, optional = true, features = ["client"] }
 serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
 [features]
 mcp = ["dep:rmcp"]
 

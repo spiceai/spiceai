@@ -20,6 +20,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::Read;
+use data_components::duckdb::with_utc_session_timezone;
 use data_components::ducklake::writer::DuckDbFederatedTableWriter;
 use data_components::ducklake::{
     DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
@@ -38,6 +39,7 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 use duckdb::AccessMode;
 use runtime_component::dataset::DatasetSpec;
 use runtime_datafusion::dialect::new_duckdb_dialect;
+use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_table_providers;
 use runtime_parameters::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;
@@ -132,7 +134,7 @@ fn create_ducklake_factory(
     params: &ConnectorParams,
 ) -> AnyErrorResult<(DuckDBTableFactory, Arc<DuckDbConnectionPool>, String)> {
     let pool = if let Some(path) = open_path {
-        Arc::new(
+        Arc::new(with_utc_session_timezone(
             DuckDbConnectionPool::new_file(path, &AccessMode::ReadWrite)
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "ducklake".to_string(),
@@ -144,9 +146,9 @@ fn create_ducklake_factory(
                         .unsupported_type_action
                         .unwrap_or(UnsupportedTypeAction::Error),
                 ),
-        )
+        ))
     } else {
-        Arc::new(
+        Arc::new(with_utc_session_timezone(
             DuckDbConnectionPool::new_memory()
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "ducklake".to_string(),
@@ -158,7 +160,7 @@ fn create_ducklake_factory(
                         .unsupported_type_action
                         .unwrap_or(UnsupportedTypeAction::Error),
                 ),
-        )
+        ))
     };
 
     let conn = Arc::clone(&pool).connect_sync().map_err(|source| {
@@ -258,7 +260,19 @@ fn create_ducklake_factory(
             source: Box::new(e),
         })?;
 
-    let factory = DuckDBTableFactory::new(Arc::clone(&pool)).with_dialect(new_duckdb_dialect());
+    // The dialect was installed without a deny-list, so every Spice-only UDF was
+    // unparsed verbatim into the statement sent to DuckDB. See #10703 / #13664.
+    //
+    // This keeps the DuckDB-flavored deny-list, which carves out the functions
+    // the dialect rewrites -- unlike the DuckLake *catalog*, which uses the plain
+    // one. The difference is what each path does today, not a disagreement about
+    // the carve-out: `cosine_distance` already federates and is already rewritten
+    // here, so carving it out changes nothing about it, whereas on the catalog it
+    // currently errors and carving it out would newly return a different number
+    // (#13728). Fix only what is broken on each path; #13728 settles the rest.
+    let factory = DuckDBTableFactory::new(Arc::clone(&pool))
+        .with_dialect(new_duckdb_dialect())
+        .with_function_support(deny_spice_functions_for_duckdb_table_providers());
     Ok((factory, pool, catalog_name.to_string()))
 }
 

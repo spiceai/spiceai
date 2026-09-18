@@ -1,0 +1,25 @@
+---
+source: crates/runtime/tests/github/mod.rs
+expression: batches_to_string(&result_batches)
+---
++----------------------+---------------+-------------+
+| column_name          | data_type     | is_nullable |
++----------------------+---------------+-------------+
+| id                   | Utf8          | YES         |
+| tag_name             | Utf8          | YES         |
+| name                 | Utf8          | YES         |
+| body                 | Utf8          | YES         |
+| author               | Utf8          | YES         |
+| tag_sha              | Utf8          | YES         |
+| is_draft             | Boolean       | YES         |
+| is_prerelease        | Boolean       | YES         |
+| is_latest            | Boolean       | YES         |
+| created_at           | Timestamp(ms) | YES         |
+| published_at         | Timestamp(ms) | YES         |
+| updated_at           | Timestamp(ms) | YES         |
+| url                  | Utf8          | YES         |
+| assets_count         | Int64         | YES         |
+| total_download_count | Int64         | YES         |
+| owner                | Utf8          | NO          |
+| repo                 | Utf8          | NO          |
++----------------------+---------------+-------------+

@@ -313,14 +313,15 @@ async fn install(
 
     // Resolved, not derived from `$HOME`: `sudo` rewrites `HOME` to `/root`, and
     // the runtime the operator installed is normally under their own home.
-    let spiced_path = ctx.resolve_spiced_path().ok_or_else(|| Error::InvalidArgument {
-        message: format!(
-            "Failed to install the Spice Cloud Connect service: no Spice runtime was found at {}. \
-             Install it with `spice install` and re-run `spice cloud service install`. \
-             See: https://spiceai.org/docs",
-            ctx.spiced_path().display()
-        ),
-    })?;
+    let spiced_path = ctx
+        .resolve_spiced()?
+        .ok_or_else(|| Error::InvalidArgument {
+            message: crate::context::runtime_not_selected_message(
+                "install the Spice Cloud Connect service",
+                &ctx.spiced_path(),
+            ),
+        })?
+        .into_path();
     // Propagated, not defaulted: the manifest records the version installed, so
     // a lookup that failed has to fail the install rather than publish a
     // manifest that claims no version at all.

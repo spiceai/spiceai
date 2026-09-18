@@ -890,6 +890,14 @@ impl PreparedStagedAppend {
         &self.target_snapshot_id
     }
 
+    /// The private staging directory this append's files sit in until it
+    /// publishes — also the key its in-flight registration is held under
+    /// (`CayenneTableProvider::attach_inflight_staged_pk_keys`).
+    #[must_use]
+    pub(crate) fn staging_snapshot_id(&self) -> &str {
+        &self.staging_snapshot_id
+    }
+
     /// Build the fallible listing-table state needed to publish this deferred
     /// append. Call before the cross-partition catalog transaction commits.
     ///
@@ -943,10 +951,8 @@ impl PreparedStagedAppend {
     }
 
     /// Run best-effort maintenance after the deferred snapshot is visible.
-    pub async fn finish_deferred_snapshot_maintenance(&self) {
-        self.table
-            .finish_deferred_append_snapshot(&self.target_snapshot_id)
-            .await;
+    pub fn finish_deferred_snapshot_maintenance(&self) {
+        self.table.finish_deferred_append_snapshot();
         if let Some(source_snapshot_id) = &self.source_snapshot_id {
             self.table
                 .retire_snapshot_dirs(std::iter::once(source_snapshot_id.as_str()));

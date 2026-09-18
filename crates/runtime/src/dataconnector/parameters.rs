@@ -47,7 +47,7 @@ use crate::{
 use runtime_secrets::{Secrets, get_params_with_secrets};
 
 use super::{ConnectorComponent, DATA_CONNECTOR_FACTORY_REGISTRY, DataConnectorError};
-use crate::dataconnector::ODBC_DATACONNECTOR;
+use crate::dataconnector::{ODBC_DATACONNECTOR, SCYLLADB_DATACONNECTOR, SCYLLADB_FEATURE};
 
 // The AWS parameter validators moved down with the contract; the runtime's own
 // in-body connectors (s3, glue, iceberg) still name them. Crate-visible so
@@ -220,6 +220,12 @@ impl ConnectorParamsBuilder {
                     let factory = connector_factory.ok_or_else(|| {
                         if name == ODBC_DATACONNECTOR {
                             DataConnectorError::OdbcNotInstalled {
+                                connector_component: self.component.clone(),
+                            }
+                        } else if name == SCYLLADB_DATACONNECTOR {
+                            DataConnectorError::ConnectorNotInBuild {
+                                dataconnector: name.clone(),
+                                feature: SCYLLADB_FEATURE.to_string(),
                                 connector_component: self.component.clone(),
                             }
                         } else {

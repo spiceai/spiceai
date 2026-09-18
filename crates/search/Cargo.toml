@@ -55,6 +55,7 @@ text_search = ["dep:tantivy", "dep:tantivy_datafusion_filter"]
 insta = { workspace = true, features = ["json"] }
 tempfile.workspace = true
 tokio.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

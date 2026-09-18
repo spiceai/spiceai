@@ -1186,16 +1186,20 @@ pub struct VortexConfig {
     /// `configuration_matches`, so toggling it never recreates the table (the
     /// cold tier is a strict superset of behavior over an unchanged warm tier).
     pub cold_tier_location: Option<String>,
-    /// Liquid-clustering key columns for cold files (multi-column Z-order).
-    /// Empty = fall back to `sort_columns`, then the primary key. Set from
-    /// `cayenne_datalake_clustering_columns`.
-    pub cold_clustering_columns: Vec<String>,
+    /// Hilbert-clustering key columns for warm and datalake files.
+    /// Empty leaves layout selection to the existing automatic policy. Set from
+    /// `cayenne_cluster_by` or a Cayenne DDL `CLUSTER BY` clause.
+    ///
+    /// The alias preserves metadata written by preview builds that stored the
+    /// cold-tier-only field name. New metadata is always written as `cluster_by`.
+    #[serde(alias = "cold_clustering_columns")]
+    pub cluster_by: Vec<String>,
     /// Target size for cold Vortex files in MB. Larger than the warm
     /// `target_vortex_file_size_mb` because object stores favor fewer, larger
     /// objects and cold scans are range reads. Set from
     /// `cayenne_datalake_target_file_size_mb`. Defaults to 512.
     pub cold_target_file_size_mb: usize,
-    /// Max input bytes (in MB) fed to one bounded Z-order sort run during a
+    /// Max input bytes (in MB) fed to one bounded clustering sort run during a
     /// warm-to-datalake move. `None` (the default) derives
     /// [`Self::cold_clustering_run_size_bytes`] as `cold_target_file_size_mb *
     /// 16` — 16 target files' worth of input gives enough locality for good
@@ -1233,7 +1237,7 @@ impl VortexConfig {
             .is_some_and(|s| !s.trim().is_empty())
     }
 
-    /// Effective byte cap for one bounded Z-order sort run during cold
+    /// Effective byte cap for one bounded clustering sort run during cold
     /// promotion: an explicit [`Self::cold_clustering_run_size_mb`], else
     /// derived as `cold_target_file_size_mb * 16`. The single derivation rule
     /// for standalone and runtime paths — never returns 0.
@@ -1566,7 +1570,7 @@ impl Default for VortexConfig {
             force_view_read_schema: false,
             integrity_checksums: false,
             cold_tier_location: None,
-            cold_clustering_columns: Vec::new(),
+            cluster_by: Vec::new(),
             cold_target_file_size_mb: 512,
             cold_clustering_run_size_mb: None,
             cold_tier_warm_max_bytes: 0,
@@ -1987,7 +1991,7 @@ pub struct SnapshotFile {
 ///
 /// The cold tier is the bottom of the storage cascade (RAM mem-tier →
 /// local-disk warm Vortex snapshot → object-store cold). A background promotion
-/// stage rewrites settled/aged warm files as read-optimized (Z-order clustered)
+/// stage rewrites settled/aged warm files as read-optimized (curve-clustered)
 /// Vortex files on the cold object store and records one row here per file.
 ///
 /// Unlike [`SnapshotFile`], cold files are **table-scoped** (not a member of any
@@ -2096,6 +2100,92 @@ pub struct InlinedData {
     pub sequence_number: i64,
     /// ISO 8601 timestamp of when this entry was created
     pub created_at: String,
+}
+
+/// One Cayenne table's disk and metastore footprint, read from the metastore's
+/// own accounting rather than by walking the table directory.
+///
+/// The manifest (`cayenne_snapshot_file`), the deletion-vector catalog, and the
+/// cold-tier manifest already record every file's size and row count, so a
+/// handful of aggregate queries answer "how big is this dataset, and which
+/// layer is growing" without a LIST per snapshot. That matters because the
+/// tables this is sampled on are exactly the ones with thousands of files.
+///
+/// Every field is `i64` because that is what the metastore returns; the callers
+/// that publish these as gauges saturate to `u64` at the boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TableStorageStats {
+    /// Data-file paths the current snapshot references.
+    ///
+    /// PATHS, not inodes: a manifest `file_path` is resolved against its own
+    /// snapshot's directory, so a filename appearing under two snapshots is two
+    /// files as far as every reader is concerned, and subset compaction gets a
+    /// live snapshot its own path by hard-linking. Two paths sharing one inode
+    /// are therefore counted twice — which is also how a `du`-style walk
+    /// (`cayenne_data_dir_bytes`) reads the same directory.
+    pub current_files: i64,
+    /// On-disk bytes of the current snapshot's data files.
+    pub current_bytes: i64,
+    /// Rows in the current snapshot's data files, before deletions apply.
+    pub current_rows: i64,
+    /// Data-file paths referenced by a live protected snapshot — one whose
+    /// sequence is registered and which is not the current snapshot (see
+    /// [`Self::current_files`] for the path-versus-inode rule).
+    pub protected_files: i64,
+    /// On-disk bytes of the protected snapshots' data files.
+    pub protected_bytes: i64,
+    /// Rows in the protected snapshots' data files, before deletions apply.
+    pub protected_rows: i64,
+    /// Manifest rows naming a snapshot that is no longer live — dead weight in
+    /// the metastore until a compaction or overwrite prunes them.
+    pub unreachable_manifest_rows: i64,
+    /// Manifest rows naming a snapshot that is still live.
+    ///
+    /// A row is a `(snapshot, file)` pair, and each pair is one path on disk, so
+    /// this equals [`Self::current_files`] + [`Self::protected_files`]. It is
+    /// published beside the unreachable count because the remainder only means
+    /// something taken against the live rows.
+    pub reachable_manifest_rows: i64,
+    /// Files promoted to the cold object-store tier.
+    pub cold_files: i64,
+    /// Bytes of the cold-tier files.
+    pub cold_bytes: i64,
+    /// Rows in the cold-tier files.
+    pub cold_rows: i64,
+    /// Live deletion-vector files.
+    pub delete_files: i64,
+    /// On-disk bytes of the deletion-vector files.
+    pub delete_file_bytes: i64,
+    /// Tombstones recorded across those deletion-vector files.
+    pub delete_file_tombstones: i64,
+    /// Registered snapshot sequences (the durable protected-snapshot set).
+    pub snapshot_sequences: i64,
+    /// Per-file pruning-statistics rows.
+    pub file_statistics_rows: i64,
+    /// Re-insert records held in the metastore.
+    pub insert_records: i64,
+    /// Inline (level-0) data entries not yet checkpointed to Vortex files.
+    pub inlined_entries: i64,
+    /// Rows held in those inline entries.
+    pub inlined_rows: i64,
+    /// Serialized Arrow IPC bytes held inline.
+    pub inlined_bytes: i64,
+    /// Inline tombstone entries not yet flushed to deletion vectors.
+    pub inlined_delete_entries: i64,
+    /// Tombstones held in those inline entries.
+    pub inlined_delete_rows: i64,
+}
+
+impl TableStorageStats {
+    /// Bytes the live data-file paths describe across the warm tiers.
+    ///
+    /// Safe to add because the tiers partition the live manifest rows. Not a
+    /// physical figure where hard links are in play — see
+    /// [`Self::current_files`].
+    #[must_use]
+    pub const fn live_data_bytes(&self) -> i64 {
+        self.current_bytes + self.protected_bytes
+    }
 }
 
 /// Aggregate size information for the metastore's two inline tables.

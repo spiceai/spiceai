@@ -65,6 +65,7 @@ jobs:
 
       - name: Push snapshots to branch
         if: ${{ !cancelled() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
+        timeout-minutes: 10
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

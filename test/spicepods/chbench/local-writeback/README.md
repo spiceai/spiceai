@@ -12,12 +12,18 @@ serializable-transactions surface (#11870).
   `replication.enabled: true`), with a maintained `SUM(s_quantity)` aggregate on
   `stock` to exercise the IVM path.
 - `direct_write_bench.py` — the driver: concurrent gated stock-decrement
-  transactions to `/v1/sql`, an interleaved upsert filter-DELETE, and three
+  transactions to `/v1/sql` and three
   self-checked invariants (no-lost-updates / IVM-fresh / write-back-converge).
   Stdlib only (needs `python3`, `psql`, and a running spiced).
 
 This is a **correctness** variant, not a perf run — a laptop cannot sustain
 chbench CDC at scale (see the `accelerated/*-cdc-tuned-*` pods for m7a perf runs).
+
+> **This fixture does not load as written.** Its write-back datasets (`district`,
+> `stock`, `oorder`) declare composite primary keys, and durable write-back keys each
+> delivery on a single column, so the runtime refuses them at registration. Reviving
+> this benchmark needs write-back datasets keyed on one column, or composite-key
+> delivery support.
 
 ## What it proves
 
@@ -25,7 +31,7 @@ chbench CDC at scale (see the `accelerated/*-cdc-tuned-*` pods for m7a perf runs
 |-----------|---------------|--------|
 | No lost updates under concurrent disjoint-key transactions | P0-2 (dropped OCC stamps) | observed drop in `SUM(s_quantity)` == sum of committed deltas |
 | Maintained aggregate reflects committed transactions | P1 (fused-txn IVM staleness) | maintained `SUM … GROUP BY` == base-scan `SUM` after each round |
-| Upsert filter-DELETE keeps OCC conflict-correct | P0-3 (stale-present keyset) | run stays lost-update-free with a DELETE interleaved (deterministic proof is the `transaction_has_conflict_degraded_keyset_falls_back_to_per_table` unit test) |
+
 
 The **write-back convergence** check (Spice `SUM` == Postgres `SUM` after the
 delivery worker drains) is reported but does **not** gate the exit code: a

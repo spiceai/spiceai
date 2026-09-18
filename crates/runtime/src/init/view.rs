@@ -20,6 +20,7 @@ use crate::{
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, LogErrors, Result,
     Runtime, UnableToAttachViewSnafu,
     component::view::{View, ViewBuilder},
+    datafusion::DeferredRefreshOutcome,
     secrets::Secrets,
     status, view,
 };
@@ -230,17 +231,17 @@ impl Runtime {
                     // Extract dependencies from the validated statement
                     let dependencies = view::get_dependent_table_names(&statement);
 
-                    // `enabled: false` turns the whole acceleration block off, so anything
-                    // else set in it is read, accepted and then never applied — the same for
-                    // a view as for a dataset (#13514). Reported from here — the load path,
-                    // behind `log_errors` — rather than from `ViewBuilder::try_from`, which
-                    // read-only callers run too.
+                    // What the acceleration block asks for and the runtime will not do as
+                    // written — settings `enabled: false` discards (#13514), the deprecated
+                    // `acceleration.ready_state` (#13749) — is the same for a view as for a
+                    // dataset. Reported from here — the load path, behind `log_errors` —
+                    // rather than from `ViewBuilder::try_from`, which read-only callers run too.
                     //
                     // Last, after every rejection above has had its chance: a view that
                     // collides with a dataset name or fails SQL validation never loads, so
                     // nothing of its acceleration block is silently discarded and warning
                     // about it would only add noise to the error that actually matters.
-                    crate::init::dataset::warn_about_discarded_acceleration_settings(
+                    crate::init::dataset::warn_about_acceleration_block(
                         crate::component::AcceleratedComponent::View,
                         &spicepod_view.name,
                         spicepod_view.acceleration.as_ref(),
@@ -364,21 +365,43 @@ impl Runtime {
 
         let runtime = Arc::clone(&self);
         let view = Arc::clone(view);
+        let df = Arc::clone(&self.df);
 
         tokio::task::spawn(async move {
             let view_name = view.name.clone();
             let notifier = register_task.await;
             match notifier {
-                Ok(Some(completion)) => {
-                    if completion.wait().await.is_abandoned() {
-                        // The accelerated table was dropped before its initial
-                        // refresh landed. Creating the schedule now would
-                        // resurrect one for a view that is no longer there.
-                        tracing::debug!(
-                            "Accelerated view '{view_name}' was removed before its initial refresh completed; not creating a refresh schedule."
-                        );
-                        return;
+                Ok(Some((instance, completion))) => {
+                    // `instance` was captured where the view was registered, so
+                    // the schedule below is checked against the view this task
+                    // actually registered rather than against whatever the name
+                    // resolves to once the refresh lands.
+                    match df
+                        .await_refresh_completion(instance, Some(completion))
+                        .await
+                    {
+                        DeferredRefreshOutcome::Apply => {}
+                        DeferredRefreshOutcome::Abandoned => {
+                            // The accelerated table was dropped before its initial
+                            // refresh landed. Creating the schedule now would
+                            // resurrect one for a view that is no longer there.
+                            tracing::debug!(
+                                "Accelerated view '{view_name}' was removed before its initial refresh completed; not creating a refresh schedule."
+                            );
+                            return;
+                        }
+                        DeferredRefreshOutcome::TableChanged => {
+                            // A `remove_view` landed after the completion was
+                            // recorded, so this would give a removed view a live
+                            // refresh schedule, or a replaced one a schedule built
+                            // from its predecessor's settings.
+                            tracing::debug!(
+                                "Accelerated view '{view_name}' was removed or replaced after its initial refresh completed; not creating a refresh schedule."
+                            );
+                            return;
+                        }
                     }
+
                     if let Err(e) = runtime.create_dataset_or_view_schedule(view).await {
                         tracing::error!(
                             "Failed to create refresh schedule for accelerated view '{view_name}': {e}."

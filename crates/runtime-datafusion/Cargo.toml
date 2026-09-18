@@ -14,12 +14,14 @@ arrow-schema.workspace = true
 arrow_tools = { path = "../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 dashmap = "6.1.0"
 datafusion.workspace = true
 datafusion-catalog.workspace = true
 datafusion-datasource.workspace = true
 datafusion-expr.workspace = true
 datafusion-federation = { workspace = true }
+datafusion-functions-json.workspace = true
 datafusion-table-providers.workspace = true
 futures.workspace = true
 itertools.workspace = true
@@ -46,12 +48,13 @@ util = { path = "../util", features = ["datafusion"] }
 uuid.workspace = true
 
 [dev-dependencies]
-chrono.workspace = true
 criterion = { version = "0.7", features = ["html_reports"] }
+datafusion-spark.workspace = true
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-pruning.workspace = true
 insta.workspace = true
 object_store.workspace = true
+regex.workspace = true
 tokio.workspace = true
 
 [lints]
