@@ -314,6 +314,24 @@ jobs:
             exit 1
           fi
           echo "RUSTFLAGS=$rustflags" >> "$GITHUB_ENV"
+          # The probe above accepts an unlinked unixodbc keg — `$brew_prefix/opt/unixodbc`
+          # exists for a formula that was never linked — and in that state the `-L` above
+          # points at a directory holding no `libodbc.dylib`, so the link dies downstream as
+          # "ld: library 'odbc' not found" (#13475). Before this step probed, `brew install
+          # unixodbc` ran every time and linked it, so the gap is this step's to close.
+          # `setup-cc` covers the same case by publishing the keg's own lib directory, and
+          # deliberately only that one: `$brew_prefix/lib` additionally satisfies -lcrypto,
+          # -lssl and -lzstd, so a crate whose build script emits one of those names would
+          # link a second, differently-built copy. clang expands LIBRARY_PATH into -L entries
+          # after those already on the command line, so this restores the search path without
+          # displacing anything a build script emitted, and it is not a cargo fingerprint
+          # input, so it costs no rebuild.
+          library_path="${LIBRARY_PATH:+$LIBRARY_PATH:}$brew_prefix/opt/unixodbc/lib"
+          if [ "$(printf '%s' "$library_path" | wc -l | tr -d ' ')" != "0" ]; then
+            echo "::error::Refusing to export a multi-line LIBRARY_PATH built from '$brew_prefix'."
+            exit 1
+          fi
+          echo "LIBRARY_PATH=$library_path" >> "$GITHUB_ENV"
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
