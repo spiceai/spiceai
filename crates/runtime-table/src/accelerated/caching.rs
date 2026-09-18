@@ -4285,7 +4285,8 @@ mod tests {
             None,
             Arc::clone(&schema),
             true,
-            false,
+            StaleIfError::Disabled,
+            Duration::ZERO, // max_age (ignored: no expired batches)
             None,
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
