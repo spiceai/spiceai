@@ -1243,7 +1243,7 @@ mod tests {
                     Box::pin(RecordBatchStreamAdapter::new(
                         Arc::clone(&schema),
                         futures::stream::iter(
-                            batches.iter().cloned().map(Ok::<_, DataFusionError>),
+                            batches.clone().into_iter().map(Ok::<_, DataFusionError>),
                         ),
                     )),
                     CacheStatus::CacheHit,
