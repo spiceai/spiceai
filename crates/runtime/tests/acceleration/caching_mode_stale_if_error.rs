@@ -95,6 +95,7 @@ struct Origin {
     addr: SocketAddr,
     fetches: Arc<AtomicUsize>,
     status: Arc<AtomicU16>,
+    empty_fault_body: Arc<std::sync::atomic::AtomicBool>,
     shutdown: oneshot::Sender<()>,
 }
 
@@ -104,6 +105,8 @@ impl Origin {
         let counter = Arc::clone(&fetches);
         let status = Arc::new(AtomicU16::new(200));
         let status_for_handler = Arc::clone(&status);
+        let empty_fault_body = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let empty_fault_body_for_handler = Arc::clone(&empty_fault_body);
         let (tx, rx) = oneshot::channel::<()>();
 
         let app = Router::new().route(
@@ -111,17 +114,19 @@ impl Origin {
             get(move |uri: axum::http::Uri| {
                 let counter = Arc::clone(&counter);
                 let status = Arc::clone(&status_for_handler);
+                let empty_fault_body = Arc::clone(&empty_fault_body_for_handler);
                 async move {
                     counter.fetch_add(1, Ordering::SeqCst);
                     let current_status = status.load(Ordering::SeqCst);
                     if current_status != 200 {
                         let code =
                             StatusCode::from_u16(current_status).expect("a valid HTTP status code");
-                        return (
-                            code,
-                            [("content-type", "text/plain")],
-                            format!("origin fault: status {current_status}"),
-                        );
+                        let body = if empty_fault_body.load(Ordering::SeqCst) {
+                            String::new()
+                        } else {
+                            format!("origin fault: status {current_status}")
+                        };
+                        return (code, [("content-type", "text/plain")], body);
                     }
                     let query = uri.query().unwrap_or_default().to_string();
                     let body = (1..=ROWS)
@@ -154,6 +159,7 @@ impl Origin {
             addr,
             fetches,
             status,
+            empty_fault_body,
             shutdown: tx,
         }
     }
@@ -168,6 +174,16 @@ impl Origin {
     /// a *successful* fetch whose row carries the failing `response_status`
     /// (see `cache::batches_cacheable`), not a send error.
     fn set_status(&self, status: u16) {
+        self.status.store(status, Ordering::SeqCst);
+    }
+
+    /// Like [`Self::set_status`], but the fault body is empty instead of
+    /// `"origin fault: status N"` — the shape that decomposes to zero content
+    /// rows (see `create_batch_from_rows_errors_on_a_retryable_zero_row_5xx_response`
+    /// in `data_components`), as distinct from the one-row-of-nulls shape a
+    /// non-empty, non-JSON body decomposes to.
+    fn set_status_with_empty_body(&self, status: u16) {
+        self.empty_fault_body.store(true, Ordering::SeqCst);
         self.status.store(status, Ordering::SeqCst);
     }
 
@@ -261,6 +277,27 @@ async fn build_runtime(dataset: Dataset, name: &str) -> Arc<Runtime> {
     if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
         sql_cache.enabled = false;
     }
+
+    configure_test_datafusion();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    tokio::select! {
+        () = tokio::time::sleep(Duration::from_mins(2)) => {
+            panic!("timed out waiting for datasets to load");
+        }
+        () = Arc::clone(&rt).load_components() => {}
+    }
+    runtime_ready_check(&rt).await;
+    rt
+}
+
+/// Like [`build_runtime`], but with the SQL results cache left *on* — the
+/// one test below that is actually about that independent cache
+/// (`a_zero_row_5xx_is_not_cached_by_the_sql_results_cache_on_a_non_caching_dataset`)
+/// needs it enabled to exercise `cache::to_cached_record_batch_stream`.
+async fn build_runtime_with_sql_results_cache(dataset: Dataset, name: &str) -> Arc<Runtime> {
+    let mut app = AppBuilder::new(name).with_dataset(dataset).build();
+    app.runtime.caching.sql_results =
+        Some(spicepod::component::caching::SQLResultsCacheConfig::default());
 
     configure_test_datafusion();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
@@ -629,5 +666,94 @@ async fn a_5xx_response_is_recognized_on_a_json_decomposed_dataset() -> Result<(
         failure the fingerprint cannot see is silently indistinguishable from real data \
         decomposing to NULL, which is what #14157 observed as HTTP 200 with an empty body"
     );
+    Ok(())
+}
+
+/// Regression coverage for the independent, runtime-wide SQL results cache
+/// (`runtime.caching.sql_results`): it also calls `cache::batches_cacheable`
+/// on any dataset's query result, regardless of the dataset's own refresh
+/// mode. This dataset is unaccelerated on purpose, so the accelerator's own
+/// stale-if-error machinery is not in play — this is testing the SQL results
+/// cache in isolation.
+///
+/// An empty 503 body still decomposes to exactly one row (the HTTP connector
+/// preserves an empty body as one row of raw content, same as any other
+/// non-JSON body), with every declared business column `NULL` and
+/// `response_status: 503` — a shape `cache::batches_cacheable` correctly
+/// rejects via the field-metadata fingerprint, once that fingerprint
+/// (`HTTP_RESPONSE_STATUS_METADATA_KEY`) is actually present on a schema
+/// that never declared `response_status`, *and* `response_status` survives
+/// to the batch `batches_cacheable` inspects. `SELECT *` guarantees the
+/// latter; it does not for a narrower query.
+///
+/// KNOWN GAP, not fixed by this test or by this PR: a query that does not
+/// reference `response_status` at all — e.g. `SELECT rank FROM http_data
+/// WHERE request_path = '/items'` — lets `DataFusion`'s column-pruning
+/// projection pushdown drop it before `cache::to_cached_record_batch_stream`
+/// ever sees the batch, so the same 503 *is* wrongly cached in that case
+/// (reproduced locally: swapping the query below for that one flips this
+/// test from passing to failing with `cache_status: CacheHit` on the second
+/// attempt). Fixing that needs `response_status` (or an equivalent signal)
+/// to survive an arbitrary user projection before reaching the cache
+/// decision — a separate, larger design than a schema-level fix, tracked as
+/// a follow-up rather than attempted here. Checks `QueryResult::cache_status`
+/// directly, which is the runtime's own record of whether a query was served
+/// from — or written to — the results cache, rather than inferring it
+/// indirectly from row content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_5xx_response_is_not_cached_by_the_sql_results_cache_on_an_unaccelerated_dataset()
+-> Result<(), anyhow::Error> {
+    use futures::TryStreamExt;
+
+    let _tracing = init_tracing(None);
+    register_test_connectors().await;
+
+    let origin = Origin::start().await;
+    origin.set_status_with_empty_body(503);
+
+    let mut dataset = Dataset::new(format!("http://{}", origin.addr), "http_data");
+    dataset.params = Some(Params::from_string_map(
+        [
+            ("file_format", "json"),
+            ("allowed_request_paths", "/items"),
+            ("max_retries", "0"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    ));
+    let dataset = decompose_into_named_columns(dataset);
+
+    let rt =
+        build_runtime_with_sql_results_cache(dataset, "sql_results_cache_5xx_not_cached").await;
+
+    let sql = "SELECT * FROM http_data WHERE request_path = '/items'";
+
+    // Run the same failing query twice. Neither run may report a cache hit:
+    // if the first, failing fetch had been wrongly written to the results
+    // cache, the second, identical query would find it there.
+    for attempt in 1..=2 {
+        let result = rt
+            .datafusion()
+            .query_builder(sql)
+            .build()
+            .run()
+            .await
+            .expect("query planning should succeed");
+        let cache_status = result.cache_status;
+        // Drain the stream so any post-execution cache write (which happens
+        // once the stream completes) has actually run before the next query.
+        let _rows: Vec<_> = result.data.try_collect().await.expect(
+            "the query itself must not error: the failing body decomposes to one row \
+            of NULLs, not a stream error",
+        );
+
+        assert_ne!(
+            cache_status,
+            cache::result::CacheStatus::CacheHit,
+            "attempt {attempt}: a transient 503 must never be served from the SQL results cache \
+            (got {cache_status:?})"
+        );
+    }
     Ok(())
 }

@@ -648,16 +648,6 @@ pub struct HttpTableProvider {
     /// static columns plus a catch-all JSON column. Schema is replaced
     /// with the user-declared columns (all `Utf8`).
     json_nesting: Option<HttpJsonNesting>,
-    /// Whether a retryable failure (5xx/429) whose body decomposes to zero
-    /// rows should still surface as one metadata-carrying placeholder row.
-    /// Set only for `refresh_mode: caching` (see
-    /// `with_synthesize_transient_placeholder_rows`): that placeholder is
-    /// what lets `cache::batches_cacheable` see the failure at all, but it is
-    /// synthetic data with every business field `NULL`, so any other refresh
-    /// mode (`append`, `full`, …) must keep returning a genuinely empty batch
-    /// or it would insert that placeholder into the dataset as if it were a
-    /// real row.
-    synthesize_transient_placeholder_rows: bool,
 }
 
 impl std::fmt::Debug for HttpTableProvider {
@@ -712,7 +702,6 @@ impl HttpTableProvider {
             rate_limiter: None,
             rate_controller: None,
             json_nesting: None,
-            synthesize_transient_placeholder_rows: false,
         }
     }
 
@@ -816,17 +805,6 @@ impl HttpTableProvider {
     pub fn with_json_nesting(mut self, nesting: HttpJsonNesting, schema: SchemaRef) -> Self {
         self.schema = schema;
         self.json_nesting = Some(nesting);
-        self
-    }
-
-    /// See [`Self::synthesize_transient_placeholder_rows`]. The caller
-    /// (`runtime::dataconnector::https`) passes `true` only for
-    /// `refresh_mode: caching`, where `cache::batches_cacheable` needs a row
-    /// to see a status on; every other refresh mode must keep a fully empty,
-    /// zero-row response as genuinely empty.
-    #[must_use]
-    pub fn with_synthesize_transient_placeholder_rows(mut self, enabled: bool) -> Self {
-        self.synthesize_transient_placeholder_rows = enabled;
         self
     }
 
@@ -2268,29 +2246,35 @@ impl HttpExec {
     ) -> DataFusionResult<RecordBatch> {
         // A body that decomposes to zero rows is ambiguous on its own: for a 2xx
         // response it is a legitimate empty result, but for a retryable failure
-        // (5xx/429, e.g. an empty or `[]` error body) it must still surface as one
-        // metadata-carrying row, or `cache::batches_cacheable` has nothing to see
-        // and the failure becomes indistinguishable from a real empty result —
-        // the empty-result shape #14157 was reported against. That placeholder
-        // is synthetic (every business field decomposes to `NULL`), so it is
-        // only safe where something actually reads `response_status` to make a
-        // caching decision: gated on `synthesize_transient_placeholder_rows`,
-        // which the caller sets only for `refresh_mode: caching`. Every other
-        // refresh mode (`append`, `full`, …) would otherwise insert this
-        // placeholder into the dataset as if it were a real fetched row.
-        let placeholder_row = [String::new()];
-        let content_rows: &[String] = if content_rows.is_empty()
-            && self.provider.synthesize_transient_placeholder_rows
-            && HttpTableProvider::is_retryable_status(fetch_result.response_status)
-        {
-            &placeholder_row
-        } else {
-            content_rows
-        };
-
+        // (5xx/429, e.g. an empty or `[]` error body) there are no rows to carry
+        // `response_status` on at all — an empty batch here would be
+        // indistinguishable from a real empty result to `cache::batches_cacheable`
+        // and to any caller, which is the empty-result shape #14157 was reported
+        // against. A row-count-independent signal is needed, and this connector
+        // has no side channel to carry one through `TableProvider::scan` — so
+        // surface it as an actual fetch error instead of a successful empty
+        // batch. `CacheRefreshHelper::handle_cache_miss`'s existing `Err` arm
+        // already implements stale-if-error correctly (serve the cached copy
+        // inside the window, propagate the error past it or with nothing
+        // cached), and for any other refresh mode or an unaccelerated query the
+        // error reaches the caller directly rather than being cached by the
+        // independent SQL results cache as if it were data.
         let num_rows = content_rows.len();
 
         if num_rows == 0 {
+            if HttpTableProvider::is_retryable_status(fetch_result.response_status) {
+                return Err(if fetch_result.response_status == 429 {
+                    Error::RateLimited {
+                        message: "the origin answered 429 Too Many Requests with an empty body"
+                            .to_string(),
+                    }
+                } else {
+                    Error::HttpServerError {
+                        status: fetch_result.response_status,
+                    }
+                }
+                .into());
+            }
             return RecordBatch::try_new(
                 Arc::clone(&self.projected_schema),
                 self.projected_schema
@@ -8469,50 +8453,15 @@ mod tests {
         }
     }
 
-    /// Regression coverage for the zero-row placeholder (#14157): a
-    /// retryable status with no content rows must synthesize exactly one
-    /// metadata-carrying row when the caller opted in
-    /// (`refresh_mode: caching`), so `cache::batches_cacheable` has a
-    /// `response_status` to see.
+    /// Regression coverage for #14157's empty-result shape: a retryable
+    /// status (5xx) whose body decomposes to zero content rows has nothing
+    /// to carry `response_status` on, so a successful empty batch here would
+    /// be indistinguishable from a real empty result to every caller
+    /// (`cache::batches_cacheable`, the independent SQL results cache, and a
+    /// plain unaccelerated query) regardless of refresh mode. Must surface as
+    /// an error instead.
     #[test]
-    fn create_batch_from_rows_synthesizes_a_placeholder_row_for_a_retryable_zero_row_response_when_enabled()
-     {
-        let provider = Arc::new(base_provider().with_synthesize_transient_placeholder_rows(true));
-        let schema = provider.schema();
-        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
-        let fetch_result = HttpFetchResult {
-            response_status: 503,
-            ..empty_fetch_result()
-        };
-
-        let batch = exec
-            .create_batch_from_rows(None, None, None, None, &[], &fetch_result)
-            .expect("batch");
-
-        assert_eq!(
-            batch.num_rows(),
-            1,
-            "a retryable zero-row response must synthesize one placeholder row"
-        );
-        let status_col = batch
-            .column(
-                batch
-                    .schema()
-                    .index_of("response_status")
-                    .expect("response_status column"),
-            )
-            .as_any()
-            .downcast_ref::<UInt16Array>()
-            .expect("response_status is UInt16");
-        assert_eq!(status_col.value(0), 503);
-    }
-
-    /// Without opting in (the default — `append`/`full`/other refresh
-    /// modes), a zero-row response must stay genuinely empty: synthesizing a
-    /// row here would insert it into the dataset as if it were real fetched
-    /// data.
-    #[test]
-    fn create_batch_from_rows_stays_empty_for_a_retryable_zero_row_response_when_disabled() {
+    fn create_batch_from_rows_errors_on_a_retryable_zero_row_5xx_response() {
         let provider = Arc::new(base_provider());
         let schema = provider.schema();
         let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
@@ -8521,34 +8470,64 @@ mod tests {
             ..empty_fetch_result()
         };
 
-        let batch = exec
+        let err = exec
             .create_batch_from_rows(None, None, None, None, &[], &fetch_result)
-            .expect("batch");
-
-        assert_eq!(
-            batch.num_rows(),
-            0,
-            "without opting in, a zero-row response must stay genuinely empty"
+            .expect_err("a zero-row 503 must be an error, not a successful empty batch");
+        assert!(
+            err.to_string().contains("503"),
+            "error should name the status code, got: {err}"
         );
     }
 
-    /// A genuinely empty 2xx result (the origin really has no rows to
-    /// return) must not get a synthetic row even when the caller opted in.
+    /// Same as above for a zero-row 429 (rate limited), which uses a
+    /// different error variant than a 5xx.
     #[test]
-    fn create_batch_from_rows_stays_empty_for_a_genuine_2xx_empty_result_even_when_enabled() {
-        let provider = Arc::new(base_provider().with_synthesize_transient_placeholder_rows(true));
+    fn create_batch_from_rows_errors_on_a_retryable_zero_row_429_response() {
+        let provider = Arc::new(base_provider());
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+        let fetch_result = HttpFetchResult {
+            response_status: 429,
+            ..empty_fetch_result()
+        };
+
+        exec.create_batch_from_rows(None, None, None, None, &[], &fetch_result)
+            .expect_err("a zero-row 429 must be an error, not a successful empty batch");
+    }
+
+    /// A genuinely empty 2xx result (the origin really has no rows to
+    /// return) must stay a successful empty batch.
+    #[test]
+    fn create_batch_from_rows_stays_empty_for_a_genuine_2xx_empty_result() {
+        let provider = Arc::new(base_provider());
         let schema = provider.schema();
         let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
 
         let batch = exec
             .create_batch_from_rows(None, None, None, None, &[], &empty_fetch_result())
-            .expect("batch");
+            .expect("a genuine empty 2xx result must not error");
 
-        assert_eq!(
-            batch.num_rows(),
-            0,
-            "a genuine empty 2xx result must not get a synthetic row"
-        );
+        assert_eq!(batch.num_rows(), 0);
+    }
+
+    /// A non-retryable zero-row status (e.g. a 4xx with an empty body) is not
+    /// this connector's problem to second-guess: stays a successful empty
+    /// batch, matching a 2xx.
+    #[test]
+    fn create_batch_from_rows_stays_empty_for_a_zero_row_4xx_response() {
+        let provider = Arc::new(base_provider());
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None, None)], None);
+        let fetch_result = HttpFetchResult {
+            response_status: 404,
+            ..empty_fetch_result()
+        };
+
+        let batch = exec
+            .create_batch_from_rows(None, None, None, None, &[], &fetch_result)
+            .expect("a zero-row 4xx must not error");
+
+        assert_eq!(batch.num_rows(), 0);
     }
 
     /// Like `nested_exec`, but accepts an explicit Arrow schema so a

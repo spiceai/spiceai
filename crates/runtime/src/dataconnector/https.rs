@@ -1235,8 +1235,7 @@ impl Https {
             message: format!("Invalid health_probe configuration: {e}"),
             connector_component: ConnectorComponent::from(dataset),
             source: e.into(),
-        })?
-        .with_synthesize_transient_placeholder_rows(is_caching_mode(dataset));
+        })?;
 
         if let Some(nesting) = parse_http_json_nesting(dataset)? {
             let schema = build_json_nest_schema(dataset, &nesting).map_err(|e| {
@@ -1540,21 +1539,6 @@ fn static_schema_for_https_dataset(
         // error.
         Err(_) => None,
     }
-}
-
-/// Whether `dataset` uses `refresh_mode: caching`. Unlike `response_status`
-/// itself (force-included in a JSON-decomposed schema for every refresh mode
-/// — see [`parse_http_json_nesting`] — because the runtime-wide SQL results
-/// cache can call `cache::batches_cacheable` on any dataset's query result),
-/// synthesizing a placeholder row for a zero-row transient failure
-/// (`HttpTableProvider::with_synthesize_transient_placeholder_rows`) is only
-/// safe for `refresh_mode: caching`: any other mode would insert that
-/// synthetic row into the dataset as if it were real fetched data.
-fn is_caching_mode(dataset: &DatasetSpec) -> bool {
-    dataset
-        .acceleration
-        .as_ref()
-        .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Caching))
 }
 
 /// Parse `dataset.columns` looking for the `metadata.json_object: "*"`
