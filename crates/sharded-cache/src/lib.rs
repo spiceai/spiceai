@@ -149,12 +149,19 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
 
     /// Insert `value` under `key` with the given byte `weight`.
     ///
-    /// A value heavier than `max_weight` is admitted and then size-evicted, so
-    /// it is not retained. `TinyLFU` may evict a *new* key that would exceed
-    /// the budget if it is less frequent than the overflow victim (the
-    /// lowest-frequency LRU tail across shards).
+    /// A value heavier than `max_weight` is rejected before admission so it
+    /// cannot flush unrelated residents and then self-evict. If `key` already
+    /// has a resident, that stale generation is removed. `TinyLFU` may evict a
+    /// *new* key that would exceed the budget if it is less frequent than the
+    /// overflow victim (the lowest-frequency LRU tail across shards).
     pub fn insert(&self, key: u64, value: V, weight: usize) {
         let weight = u64::try_from(weight).unwrap_or(u64::MAX);
+        if weight > self.max_weight {
+            // Cannot retain this value. Drop any stale generation of the same
+            // key so a failed admit does not leave the previous result cached.
+            drop(self.remove(&key));
+            return;
+        }
         let shard_idx = shard_index(key);
         let mut shard = self.shards[shard_idx].0.lock();
         // Sample TTL after the shard lock so wait time is not charged to the
@@ -323,32 +330,47 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     /// Overflow trim. The outer weight check is a fast path; the limit is
     /// rechecked under `trim` before each victim so two concurrent inserts
     /// cannot each evict after one removal would restore the budget.
+    ///
+    /// Removed values and listener callbacks are applied only after `trim` is
+    /// released. A `Drop` or listener that re-enters [`Self::insert`] would
+    /// otherwise deadlock on this non-reentrant mutex.
     fn evict_to_limit(&self, prefer: usize, admitted: Option<u64>) {
         if self.weight.load(Ordering::Relaxed) <= self.max_weight {
             return;
         }
-        let _trim = self.trim.lock();
-        while self.weight.load(Ordering::Relaxed) > self.max_weight {
-            #[cfg(test)]
-            self.run_before_size_victim();
-            if self.weight.load(Ordering::Relaxed) <= self.max_weight {
-                break;
+        let mut evicted = Vec::new();
+        {
+            let _trim = self.trim.lock();
+            while self.weight.load(Ordering::Relaxed) > self.max_weight {
+                #[cfg(test)]
+                self.run_before_size_victim();
+                if self.weight.load(Ordering::Relaxed) <= self.max_weight {
+                    break;
+                }
+                let progressed = match self.policy {
+                    EvictionPolicy::TinyLfu => self.evict_tinylfu_one(admitted, &mut evicted),
+                    // LRU must not self-evict a just-admitted sole resident while
+                    // an older victim exists on another shard.
+                    EvictionPolicy::Lru => self.evict_others_then_prefer(prefer, &mut evicted),
+                };
+                if !progressed {
+                    break;
+                }
             }
-            let progressed = match self.policy {
-                EvictionPolicy::TinyLfu => self.evict_tinylfu_one(admitted),
-                // LRU must not self-evict a just-admitted sole resident while
-                // an older victim exists on another shard.
-                EvictionPolicy::Lru => self.evict_others_then_prefer(prefer),
-            };
-            if !progressed {
-                break;
-            }
+        }
+        for (value, reason) in evicted {
+            drop(value);
+            L::on_evict(reason);
         }
     }
 
     /// Compare the just-admitted key with the actual overflow victim — the
     /// lowest-frequency LRU tail across shards — and evict the loser.
-    fn evict_tinylfu_one(&self, admitted: Option<u64>) -> bool {
+    fn evict_tinylfu_one(
+        &self,
+        admitted: Option<u64>,
+        evicted: &mut Vec<(V, EvictionReason)>,
+    ) -> bool {
         let Some((victim_shard, victim_key, victim_freq)) = self.lowest_freq_lru_tail() else {
             return false;
         };
@@ -358,11 +380,20 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
                 let shard = self.shards[candidate_shard].0.lock();
                 (shard.contains(candidate), shard.sketch_estimate(candidate))
             };
-            if present && candidate != victim_key && candidate_freq < victim_freq {
-                return self.remove_for_size(candidate_shard, candidate);
+            if present
+                && candidate != victim_key
+                && candidate_freq < victim_freq
+                && self.remove_for_size(candidate_shard, candidate, evicted)
+            {
+                return true;
             }
         }
-        self.remove_for_size(victim_shard, victim_key)
+        if self.remove_for_size(victim_shard, victim_key, evicted) {
+            return true;
+        }
+        // The snapshot victim may have been removed concurrently, leaving
+        // that shard empty. Other shards can still put the cache over budget.
+        self.evict_first_other(victim_shard, evicted)
     }
 
     /// The overflow victim is the LRU tail with the lowest home-shard sketch
@@ -384,7 +415,12 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         best
     }
 
-    fn remove_for_size(&self, shard_idx: usize, key: u64) -> bool {
+    fn remove_for_size(
+        &self,
+        shard_idx: usize,
+        key: u64,
+        evicted: &mut Vec<(V, EvictionReason)>,
+    ) -> bool {
         let mut shard = self.shards[shard_idx].0.lock();
         let now = Instant::now();
         let (expired, expired_weight) = shard.expire_older_than(now, self.ttl);
@@ -393,8 +429,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         }
         if !expired.is_empty() {
             drop(shard);
-            for _ in expired {
-                L::on_evict(EvictionReason::Expired);
+            for value in expired {
+                evicted.push((value, EvictionReason::Expired));
             }
             return true;
         }
@@ -414,8 +450,7 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             return false;
         }
         drop(shard);
-        drop(value);
-        L::on_evict(EvictionReason::Size);
+        evicted.push((value, EvictionReason::Size));
         true
     }
 
@@ -443,31 +478,35 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         }
     }
 
-    fn evict_others_then_prefer(&self, prefer: usize) -> bool {
-        if self.evict_first_other(prefer) {
+    fn evict_others_then_prefer(
+        &self,
+        prefer: usize,
+        evicted: &mut Vec<(V, EvictionReason)>,
+    ) -> bool {
+        if self.evict_first_other(prefer, evicted) {
             return true;
         }
-        self.evict_one_from(prefer)
+        self.evict_one_from(prefer, evicted)
     }
 
     /// Evict from the first other shard in numeric index order that has a
     /// victim. This is not a global LRU comparison: shard 0's tail is tried
     /// before shard 15's even if shard 15's tail is colder.
-    fn evict_first_other(&self, prefer: usize) -> bool {
+    fn evict_first_other(&self, prefer: usize, evicted: &mut Vec<(V, EvictionReason)>) -> bool {
         (0..NUM_SHARDS)
             .filter(|&shard_idx| shard_idx != prefer)
-            .any(|shard_idx| self.evict_one_from(shard_idx))
+            .any(|shard_idx| self.evict_one_from(shard_idx, evicted))
     }
 
-    fn evict_one_from(&self, shard_idx: usize) -> bool {
+    fn evict_one_from(&self, shard_idx: usize, evicted: &mut Vec<(V, EvictionReason)>) -> bool {
         let mut shard = self.shards[shard_idx].0.lock();
         let now = Instant::now();
         let (expired, expired_weight) = shard.expire_older_than(now, self.ttl);
         self.sub_weight(expired_weight);
         if !expired.is_empty() {
             drop(shard);
-            for _ in expired {
-                L::on_evict(EvictionReason::Expired);
+            for value in expired {
+                evicted.push((value, EvictionReason::Expired));
             }
             return true;
         }
@@ -482,8 +521,7 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             return false;
         }
         drop(shard);
-        drop(value);
-        L::on_evict(EvictionReason::Size);
+        evicted.push((value, EvictionReason::Size));
         true
     }
 
@@ -775,6 +813,84 @@ mod tests {
             "the older entry on another shard is the LRU victim"
         );
         assert!(cache.weighted_size() <= 100);
+    }
+
+    #[test]
+    fn insert_rejects_a_value_heavier_than_the_budget() {
+        let cache = cache(100, Duration::from_mins(1));
+        cache.insert(0, TestValue::with_size("small", 60), 60);
+        cache.insert(1, TestValue::with_size("huge", 500), 500);
+        assert_eq!(
+            cache.len(),
+            1,
+            "an uncacheable insert must not flush unrelated entries"
+        );
+        assert!(
+            cache.get(&0).is_some(),
+            "the resident 60-byte entry must survive a 500-byte reject"
+        );
+        assert!(
+            cache.get(&1).is_none(),
+            "a value heavier than max_weight must not be retained"
+        );
+        assert_eq!(cache.weighted_size(), 60);
+    }
+
+    #[test]
+    fn oversized_insert_removes_a_stale_generation_of_the_same_key() {
+        let cache = cache(100, Duration::from_mins(1));
+        cache.insert(1, TestValue::with_size("old", 40), 40);
+        cache.insert(1, TestValue::with_size("huge", 500), 500);
+        assert!(
+            cache.get(&1).is_none(),
+            "rejecting an oversized replacement must not leave the stale generation"
+        );
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.weighted_size(), 0);
+    }
+
+    #[test]
+    fn overflow_trim_drops_values_after_releasing_the_trim_lock() {
+        #[derive(Clone)]
+        struct ReenterInsertOnDrop {
+            cache: Option<Arc<ShardedCache<ReenterInsertOnDrop>>>,
+        }
+        impl Drop for ReenterInsertOnDrop {
+            fn drop(&mut self) {
+                // Nested insert overflows and must take `trim`. Deadlocks if
+                // this Drop runs while the outer trim guard is still held.
+                if let Some(cache) = self.cache.take() {
+                    cache.insert(99, ReenterInsertOnDrop { cache: None }, 80);
+                }
+            }
+        }
+
+        let cache = Arc::new(ShardedCache::<ReenterInsertOnDrop>::new(
+            100,
+            Duration::from_mins(1),
+            EvictionPolicy::Lru,
+        ));
+        cache.insert(
+            0,
+            ReenterInsertOnDrop {
+                cache: Some(Arc::clone(&cache)),
+            },
+            60,
+        );
+
+        let cache_for_thread = Arc::clone(&cache);
+        let (done, waiter) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            cache_for_thread.insert(1, ReenterInsertOnDrop { cache: None }, 60);
+            done.send(()).expect("overflow-trim completion signal");
+        });
+        waiter.recv_timeout(Duration::from_secs(2)).expect(
+            "overflow trim deadlocked: Drop re-entered insert while the trim lock was held",
+        );
+        assert!(
+            cache.weighted_size() <= 100,
+            "re-entrant insert must still respect the budget"
+        );
     }
 
     #[test]
