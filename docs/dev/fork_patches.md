@@ -406,7 +406,8 @@ Upstream [apache/iceberg-rust](https://github.com/apache/iceberg-rust), branch
 | Limit push-down for `IcebergTableProvider` (fork PR #19) | `SELECT … LIMIT n` scans the whole table | silent (perf) | `crates/data_components/src/iceberg/provider.rs::a_scan_given_a_limit_reads_no_more_rows_than_it_asked_for` for the single-node scan, counted at the provider because a `GlobalLimitExec` above it returns the right rows either way; the distributed path is covered by `crates/runtime/src/cluster/datafusion/codec/spice_physical_codec.rs`, which refuses to serialise a scan whose limit it cannot carry |
 | Pinned snapshot reads in `IcebergTableProvider` (fork PR #45) | A scan reads the current snapshot instead of the pinned one — time-travel and repeatable reads silently return live data | silent (wrong data) | `crates/data_components/src/iceberg/provider.rs::a_scan_pinned_to_a_snapshot_reads_that_snapshot_not_the_current_one` |
 | Parallel file scanning with eager task bucketing (fork PR #43) | Iceberg scans lose file-level parallelism | silent (perf) | **GAP** |
-| `IcebergTableProvider::try_new` made public; extended file metadata | No construction path from Spice | build | compile-guarded |
+| `IcebergTableProvider::try_new` made public | No construction path from Spice | build | compile-guarded by `crates/data_components/src/iceberg/provider.rs`, which calls it |
+| Extended file metadata (`FileIO::lister`, `FileMetadata::mode`) — **carries no code** | Nothing. Recorded so the next audit does not go looking: upstream moved opendal out of the core crate, and re-adding a `Lister` and an `EntryMode` there would put the dependency back and break every `Storage` impl. Spice reaches neither — its Hadoop catalog uses its own opendal `Operator::lister()` — so the commit on the branch is a README whitespace change kept for provenance | none | not applicable |
 
 ## async-openai
 
@@ -419,6 +420,9 @@ Upstream [64bit/async-openai](https://github.com/64bit/async-openai).
 | `post`/`post_stream` and the GET operation made public | Non-OpenAI providers built on the same client lose their entry point | build | compile-guarded |
 | Don't serialize nulls; hide `usage` when null (fork PR #32) | Requests carry explicit `null`s that some OpenAI-compatible servers reject | silent (request failure) | `crates/runtime/src/model/wrapper/mod.rs::a_streamed_request_carries_no_null_stream_option`, with `…::unset_stream_options_serialize_to_an_empty_object` pinning the same property at the type |
 | `Eq`/`Hash` on `EmbeddingInput` and `CreateEmbeddingRequest` | Embedding request caching cannot key on the request | build | compile-guarded |
+| `Authorization` is sent only when there is a key to send | Spice builds every OpenAI client through `new_openai_client_with_chat_backend`, which starts from `with_api_key("")` on purpose — so the library cannot pick a key up from the environment — and overrides it only when one was configured. Upstream inserts the header unconditionally, so without this a model with no `api_key` sends `Authorization: Bearer ` with an empty value on every request, and an OpenAI-compatible endpoint that needs no key refuses the malformed credential instead of serving it | silent (request failure) | `crates/llms/src/openai/mod.rs::authorization_header_tests::a_client_with_no_api_key_sends_no_authorization_header`, which drives a health check through that constructor against a one-shot local endpoint and reads the request it received, with `::a_client_with_an_api_key_sends_it_as_a_bearer_token` as the control — otherwise the first would pass on a client that sent no credential at all |
+| `EasyInputMessage::type` is `#[serde(default)]` | The Responses API does not send `type` on every message, and upstream requires the field, so a reply that omits it fails to deserialize and the request errors — on the path `responses_adapter` builds and reads (`InputItem::EasyMessage`) | silent (request failure) | `crates/llms/src/openai/responses_adapter.rs::tests::a_responses_message_deserializes_with_or_without_its_type_field`, which deserializes the field both absent and present, so a default that swallowed the field would not pass |
+| A 404 ends the retry loop instead of being retried | The retry path treats a 404 as permanent, because it means the base URL is wrong rather than that the service is busy. Without it a mistyped `endpoint` is retried through the whole backoff budget before reporting, so a configuration error looks like a slow provider | silent (a configuration error reported late) | **GAP** — the difference is *when* the error arrives rather than what it is, and asserting that is a timing test. `binary(=list_models_errors)` covers the error mapping for the lister, not the retry decision |
 | Aggregated rate-limit retry logging; `retry-after` honoured from the response header (fork PRs #37, #38) | One `WARN` per retried request instead of one per burst; retries ignore the server's back-off hint | silent (log noise, throughput) | **GAP** |
 
 ## clickhouse-rs
@@ -593,7 +597,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**23 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**24 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -628,9 +632,16 @@ writing a test; each says what would unblock it:
 7. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
    there is no behaviour of ours to assert on.
 
+**Reported late rather than wrongly.** The right answer, after an avoidable wait:
+
+8. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
+   `endpoint` is retried through the whole backoff budget before reporting, so a
+   configuration error looks like a slow provider. What changes is *when* the
+   error arrives, and asserting that is a timing test.
+
 **Attribution.** Neither wrong rows nor an outage; someone else gets the credit:
 
-8. `spark-connect-rs` `user_agent` read from the connection string and used to
+9. `spark-connect-rs` `user_agent` read from the connection string and used to
    replace the default (fork PRs #9, #10) — nothing here sets the option yet, so
    there is no behaviour of ours to assert on until it does.
 
@@ -640,9 +651,9 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-9. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
-   `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
-   `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
-   `snowflake-rs` streaming batches (memory, not latency — but see the
-   `snowflake-rs` note above: it is blocked with the rest of that fork);
-   `async-openai` retry-after handling.
+10. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+    `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
+    `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
+    `snowflake-rs` streaming batches (memory, not latency — but see the
+    `snowflake-rs` note above: it is blocked with the rest of that fork);
+    `async-openai` retry-after handling.
