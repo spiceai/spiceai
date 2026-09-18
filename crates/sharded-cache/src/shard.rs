@@ -14,11 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! One shard of the cache: a `HashMap` plus an intrusive LRU list.
+//! One shard of the cache: a `HashMap` plus intrusive region lists.
 //!
-//! Recency is list position. A hit unlinks the node and relinks it at the
-//! head without removing it from the map, so a concurrent reader of the same
-//! key cannot observe a hole.
+//! # Policies
+//!
+//! - **LRU / LFU:** a single list (`probation`) holds every resident. Hits
+//!   promote in place (non-destructive). LFU stores a per-entry frequency
+//!   counter used at eviction time.
+//! - **W-TinyLFU:** three lists — admission **window** (LRU), main
+//!   **probation**, and main **protected** (SLRU). New keys enter the window;
+//!   the window LRU competes with the probation LRU via the Count-Min Sketch
+//!   before entering the main space. A hit on probation promotes into
+//!   protected.
 
 use crate::EvictionPolicy;
 use crate::hasher::IdentityBuildHasher;
@@ -26,16 +33,35 @@ use crate::sketch::CountMinSketch;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// Which SLRU / window segment an entry currently occupies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Region {
+    /// Admission window (W-TinyLFU only).
+    Window,
+    /// Main-space probation (also the sole list for LRU / LFU).
+    Probation,
+    /// Main-space protected (W-TinyLFU only).
+    Protected,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ListEnds {
+    head: Option<u32>,
+    tail: Option<u32>,
+}
+
 pub(crate) struct Shard<V> {
     map: HashMap<u64, u32, IdentityBuildHasher>,
     slots: Vec<Slot<V>>,
     free: Vec<u32>,
-    /// Most-recently-used node.
-    head: Option<u32>,
-    /// Least-recently-used node.
-    tail: Option<u32>,
+    window: ListEnds,
+    probation: ListEnds,
+    protected: ListEnds,
     weight: u64,
+    window_weight: u64,
+    protected_weight: u64,
     sketch: Option<CountMinSketch>,
+    policy: EvictionPolicy,
 }
 
 enum Slot<V> {
@@ -48,6 +74,9 @@ struct Node<V> {
     value: V,
     inserted_at: Instant,
     weight: u64,
+    region: Region,
+    /// Saturating hit count for [`EvictionPolicy::Lfu`].
+    freq: u16,
     prev: Option<u32>,
     next: Option<u32>,
 }
@@ -58,14 +87,27 @@ pub(crate) enum GetOutcome<V> {
     Expired { value: V, weight: u64 },
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct WeightDelta {
     pub(crate) added: u64,
     pub(crate) removed: u64,
+    pub(crate) window_added: u64,
+    pub(crate) window_removed: u64,
+    pub(crate) protected_added: u64,
+    pub(crate) protected_removed: u64,
 }
 
 impl WeightDelta {
     pub(crate) fn net(self) -> i128 {
         i128::from(self.added) - i128::from(self.removed)
+    }
+
+    pub(crate) fn window_net(&self) -> i128 {
+        i128::from(self.window_added) - i128::from(self.window_removed)
+    }
+
+    pub(crate) fn protected_net(&self) -> i128 {
+        i128::from(self.protected_added) - i128::from(self.protected_removed)
     }
 }
 
@@ -75,10 +117,14 @@ impl<V> Shard<V> {
             map: HashMap::with_hasher(IdentityBuildHasher),
             slots: Vec::new(),
             free: Vec::new(),
-            head: None,
-            tail: None,
+            window: ListEnds::default(),
+            probation: ListEnds::default(),
+            protected: ListEnds::default(),
             weight: 0,
+            window_weight: 0,
+            protected_weight: 0,
             sketch: matches!(policy, EvictionPolicy::TinyLfu).then(CountMinSketch::new),
+            policy,
         }
     }
 
@@ -86,12 +132,26 @@ impl<V> Shard<V> {
         self.map.len()
     }
 
+    #[expect(dead_code)]
     pub(crate) fn contains(&self, key: u64) -> bool {
         self.map.contains_key(&key)
     }
 
+    pub(crate) fn window_weight(&self) -> u64 {
+        self.window_weight
+    }
+
+    pub(crate) fn protected_weight(&self) -> u64 {
+        self.protected_weight
+    }
+
+    #[expect(dead_code)]
     pub(crate) fn tail_key(&self) -> Option<u64> {
-        let idx = self.tail?;
+        self.region_tail_key(self.primary_region())
+    }
+
+    pub(crate) fn region_tail_key(&self, region: Region) -> Option<u64> {
+        let idx = self.ends(region).tail?;
         match self.slots.get(idx as usize) {
             Some(Slot::Occupied(node)) => Some(node.key),
             _ => None,
@@ -106,16 +166,60 @@ impl<V> Shard<V> {
         }
     }
 
+    #[expect(dead_code)]
+    pub(crate) fn peek_freq(&self, key: u64) -> Option<u16> {
+        let idx = *self.map.get(&key)?;
+        match self.slots.get(idx as usize) {
+            Some(Slot::Occupied(node)) => Some(node.freq),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn peek_region(&self, key: u64) -> Option<Region> {
+        let idx = *self.map.get(&key)?;
+        match self.slots.get(idx as usize) {
+            Some(Slot::Occupied(node)) => Some(node.region),
+            _ => None,
+        }
+    }
+
     pub(crate) fn peek_tail(&self) -> Option<(u64, u64)> {
-        let idx = self.tail?;
+        self.peek_region_tail(self.primary_region())
+    }
+
+    pub(crate) fn peek_region_tail(&self, region: Region) -> Option<(u64, u64)> {
+        let idx = self.ends(region).tail?;
         match self.slots.get(idx as usize) {
             Some(Slot::Occupied(node)) => Some((node.key, node.weight)),
             _ => None,
         }
     }
 
+    pub(crate) fn peek_lfu_victim(&self) -> Option<(u64, u64, u16)> {
+        let mut best: Option<(u64, u64, u16)> = None;
+        let mut cursor = self.probation.tail;
+        while let Some(idx) = cursor {
+            let Some(Slot::Occupied(node)) = self.slots.get(idx as usize) else {
+                break;
+            };
+            let take = best.is_none_or(|(_, _, freq)| node.freq < freq);
+            if take {
+                best = Some((node.key, node.weight, node.freq));
+            }
+            cursor = node.prev;
+        }
+        best
+    }
+
     pub(crate) fn tail_is_expired(&self, now: Instant, ttl: Duration) -> bool {
-        let Some(idx) = self.tail else {
+        self.region_tail_is_expired(self.primary_region(), now, ttl)
+            || (matches!(self.policy, EvictionPolicy::TinyLfu)
+                && (self.region_tail_is_expired(Region::Window, now, ttl)
+                    || self.region_tail_is_expired(Region::Protected, now, ttl)))
+    }
+
+    fn region_tail_is_expired(&self, region: Region, now: Instant, ttl: Duration) -> bool {
+        let Some(idx) = self.ends(region).tail else {
             return false;
         };
         match self.slots.get(idx as usize) {
@@ -140,11 +244,25 @@ impl<V> Shard<V> {
         self.map.keys().copied()
     }
 
-    /// Keys most-recently-used first. Used to assert that a scan did not
-    /// rewrite recency.
+    /// Keys most-recently-used first. For W-TinyLFU: protected, then probation,
+    /// then window (each list MRU→LRU).
     pub(crate) fn keys_mru_first(&self) -> Vec<u64> {
         let mut keys = Vec::with_capacity(self.map.len());
-        let mut cursor = self.head;
+        match self.policy {
+            EvictionPolicy::TinyLfu => {
+                self.append_list_mru(&mut keys, Region::Protected);
+                self.append_list_mru(&mut keys, Region::Probation);
+                self.append_list_mru(&mut keys, Region::Window);
+            }
+            EvictionPolicy::Lru | EvictionPolicy::Lfu => {
+                self.append_list_mru(&mut keys, Region::Probation);
+            }
+        }
+        keys
+    }
+
+    fn append_list_mru(&self, keys: &mut Vec<u64>, region: Region) {
+        let mut cursor = self.ends(region).head;
         while let Some(idx) = cursor {
             let Some(Slot::Occupied(node)) = self.slots.get(idx as usize) else {
                 break;
@@ -152,7 +270,34 @@ impl<V> Shard<V> {
             keys.push(node.key);
             cursor = node.next;
         }
-        keys
+    }
+
+    fn primary_region(&self) -> Region {
+        let _ = self.policy;
+        Region::Probation
+    }
+
+    fn ends(&self, region: Region) -> &ListEnds {
+        match region {
+            Region::Window => &self.window,
+            Region::Probation => &self.probation,
+            Region::Protected => &self.protected,
+        }
+    }
+
+    fn ends_mut(&mut self, region: Region) -> &mut ListEnds {
+        match region {
+            Region::Window => &mut self.window,
+            Region::Probation => &mut self.probation,
+            Region::Protected => &mut self.protected,
+        }
+    }
+
+    fn admit_region(&self) -> Region {
+        match self.policy {
+            EvictionPolicy::TinyLfu => Region::Window,
+            EvictionPolicy::Lru | EvictionPolicy::Lfu => Region::Probation,
+        }
     }
 }
 
@@ -181,7 +326,10 @@ impl<V: Clone> Shard<V> {
             Some(Slot::Occupied(node)) => node.value.clone(),
             _ => return GetOutcome::Miss,
         };
-        self.promote(idx);
+        if let Some(Slot::Occupied(node)) = self.slots.get_mut(idx as usize) {
+            node.freq = node.freq.saturating_add(1);
+        }
+        self.on_hit(idx);
         GetOutcome::Hit(value)
     }
 
@@ -195,24 +343,33 @@ impl<V: Clone> Shard<V> {
         if let Some(&idx) = self.map.get(&key) {
             return self.replace(idx, value, weight, now);
         }
+        let region = self.admit_region();
         let idx = self.alloc(Node {
             key,
             value,
             inserted_at: now,
             weight,
+            region,
+            freq: 0,
             prev: None,
             next: None,
         });
         self.map.insert(key, idx);
-        self.push_front(idx);
+        self.push_front(idx, region);
         self.weight = self.weight.saturating_add(weight);
-        (
-            WeightDelta {
-                added: weight,
-                removed: 0,
-            },
-            None,
-        )
+        let mut delta = WeightDelta {
+            added: weight,
+            removed: 0,
+            window_added: 0,
+            window_removed: 0,
+            protected_added: 0,
+            protected_removed: 0,
+        };
+        if region == Region::Window {
+            self.window_weight = self.window_weight.saturating_add(weight);
+            delta.window_added = weight;
+        }
+        (delta, None)
     }
 
     pub(crate) fn remove(&mut self, key: u64) -> Option<(V, u64)> {
@@ -226,7 +383,11 @@ impl<V: Clone> Shard<V> {
     }
 
     pub(crate) fn evict_lru(&mut self) -> Option<(u64, V, u64)> {
-        let idx = self.tail?;
+        self.evict_region_lru(self.primary_region())
+    }
+
+    pub(crate) fn evict_region_lru(&mut self, region: Region) -> Option<(u64, V, u64)> {
+        let idx = self.ends(region).tail?;
         let (key, weight) = match self.slots.get(idx as usize) {
             Some(Slot::Occupied(node)) => (node.key, node.weight),
             _ => return None,
@@ -236,73 +397,89 @@ impl<V: Clone> Shard<V> {
         Some((key, value, weight))
     }
 
+    /// Move `key` from window → probation after a successful `TinyLFU` admit.
+    /// Returns false if the key is gone or not in the window.
+    pub(crate) fn move_window_to_probation(&mut self, key: u64) -> bool {
+        let Some(&idx) = self.map.get(&key) else {
+            return false;
+        };
+        let (weight, region) = match self.slots.get(idx as usize) {
+            Some(Slot::Occupied(node)) => (node.weight, node.region),
+            _ => return false,
+        };
+        if region != Region::Window {
+            return false;
+        }
+        self.unlink(idx);
+        if let Some(Slot::Occupied(node)) = self.slots.get_mut(idx as usize) {
+            node.region = Region::Probation;
+        }
+        self.window_weight = self.window_weight.saturating_sub(weight);
+        self.push_front(idx, Region::Probation);
+        true
+    }
+
+    /// Move a probation hit into protected. Caller must demote if over cap.
+    #[expect(dead_code)]
+    pub(crate) fn move_probation_to_protected(&mut self, key: u64) -> Option<u64> {
+        let &idx = self.map.get(&key)?;
+        let (weight, region) = match self.slots.get(idx as usize) {
+            Some(Slot::Occupied(node)) => (node.weight, node.region),
+            _ => return None,
+        };
+        if region != Region::Probation {
+            return None;
+        }
+        self.unlink(idx);
+        if let Some(Slot::Occupied(node)) = self.slots.get_mut(idx as usize) {
+            node.region = Region::Protected;
+        }
+        self.protected_weight = self.protected_weight.saturating_add(weight);
+        self.push_front(idx, Region::Protected);
+        Some(weight)
+    }
+
+    /// Demote protected LRU into probation MRU. Returns demoted weight.
+    pub(crate) fn demote_protected_lru_to_probation(&mut self) -> Option<(u64, u64)> {
+        let idx = self.protected.tail?;
+        let (key, weight) = match self.slots.get(idx as usize) {
+            Some(Slot::Occupied(node)) => (node.key, node.weight),
+            _ => return None,
+        };
+        self.unlink(idx);
+        if let Some(Slot::Occupied(node)) = self.slots.get_mut(idx as usize) {
+            node.region = Region::Probation;
+        }
+        self.protected_weight = self.protected_weight.saturating_sub(weight);
+        self.push_front(idx, Region::Probation);
+        Some((key, weight))
+    }
+
     /// Drop matching entries without promoting survivors. Returns `(values, weight)`.
     pub(crate) fn invalidate_matching<F>(&mut self, predicate: F) -> (Vec<V>, u64)
     where
         F: Fn(&V) -> bool,
     {
-        let mut matched = Vec::new();
-        let mut cursor = self.head;
-        while let Some(idx) = cursor {
-            let (next, key, is_match) = match self.slots.get(idx as usize) {
-                Some(Slot::Occupied(node)) => (node.next, node.key, predicate(&node.value)),
-                _ => break,
-            };
-            if is_match {
-                matched.push((key, idx));
-            }
-            cursor = next;
-        }
-        let mut values = Vec::with_capacity(matched.len());
-        let mut weight: u64 = 0;
-        for (key, idx) in matched {
-            self.map.remove(&key);
-            if let Some(Slot::Occupied(node)) = self.take_slot(idx) {
-                weight = weight.saturating_add(node.weight);
-                self.weight = self.weight.saturating_sub(node.weight);
-                values.push(node.value);
-            }
-        }
-        (values, weight)
+        let matched = self.collect_matching(|node| predicate(&node.value));
+        self.remove_indices(matched)
     }
 
     pub(crate) fn expire_older_than(&mut self, now: Instant, ttl: Duration) -> (Vec<V>, u64) {
-        let mut matched = Vec::new();
-        let mut cursor = self.head;
-        while let Some(idx) = cursor {
-            let (next, key, expired) = match self.slots.get(idx as usize) {
-                Some(Slot::Occupied(node)) => (
-                    node.next,
-                    node.key,
-                    now.saturating_duration_since(node.inserted_at) >= ttl,
-                ),
-                _ => break,
-            };
-            if expired {
-                matched.push((key, idx));
-            }
-            cursor = next;
-        }
-        let mut values = Vec::with_capacity(matched.len());
-        let mut weight: u64 = 0;
-        for (key, idx) in matched {
-            self.map.remove(&key);
-            if let Some(Slot::Occupied(node)) = self.take_slot(idx) {
-                weight = weight.saturating_add(node.weight);
-                self.weight = self.weight.saturating_sub(node.weight);
-                values.push(node.value);
-            }
-        }
-        (values, weight)
+        let matched =
+            self.collect_matching(|node| now.saturating_duration_since(node.inserted_at) >= ttl);
+        self.remove_indices(matched)
     }
 
     pub(crate) fn take_all(&mut self) -> (Vec<V>, u64) {
         let weight = self.weight;
         let mut values = Vec::with_capacity(self.map.len());
         self.map.clear();
-        self.head = None;
-        self.tail = None;
+        self.window = ListEnds::default();
+        self.probation = ListEnds::default();
+        self.protected = ListEnds::default();
         self.weight = 0;
+        self.window_weight = 0;
+        self.protected_weight = 0;
         // Keep indices already in `free` (vacant slots) and add those that
         // were occupied, so a later insert reuses storage instead of
         // appending forever after churn + clear.
@@ -318,6 +495,77 @@ impl<V: Clone> Shard<V> {
         }
         (values, weight)
     }
+
+    fn collect_matching<F>(&self, mut pred: F) -> Vec<(u64, u32)>
+    where
+        F: FnMut(&Node<V>) -> bool,
+    {
+        let mut matched = Vec::new();
+        let regions = match self.policy {
+            EvictionPolicy::TinyLfu => [Region::Window, Region::Probation, Region::Protected],
+            EvictionPolicy::Lru | EvictionPolicy::Lfu => {
+                [Region::Probation, Region::Probation, Region::Probation]
+            }
+        };
+        let mut seen_probation = false;
+        for region in regions {
+            if matches!(self.policy, EvictionPolicy::Lru | EvictionPolicy::Lfu) {
+                if seen_probation {
+                    break;
+                }
+                seen_probation = true;
+            }
+            let mut cursor = self.ends(region).head;
+            while let Some(idx) = cursor {
+                let Some(Slot::Occupied(node)) = self.slots.get(idx as usize) else {
+                    break;
+                };
+                let next = node.next;
+                if pred(node) {
+                    matched.push((node.key, idx));
+                }
+                cursor = next;
+            }
+        }
+        matched
+    }
+
+    fn remove_indices(&mut self, matched: Vec<(u64, u32)>) -> (Vec<V>, u64) {
+        let mut values = Vec::with_capacity(matched.len());
+        let mut weight: u64 = 0;
+        for (key, idx) in matched {
+            self.map.remove(&key);
+            if let Some(Slot::Occupied(node)) = self.take_slot(idx) {
+                weight = weight.saturating_add(node.weight);
+                values.push(node.value);
+            }
+        }
+        (values, weight)
+    }
+
+    fn on_hit(&mut self, idx: u32) {
+        let region = match self.slots.get(idx as usize) {
+            Some(Slot::Occupied(node)) => node.region,
+            _ => return,
+        };
+        match (self.policy, region) {
+            (EvictionPolicy::TinyLfu, Region::Probation) => {
+                // Promote into protected; demotion of protected LRU is handled
+                // by the cache when the global protected cap is exceeded.
+                let weight = match self.slots.get(idx as usize) {
+                    Some(Slot::Occupied(node)) => node.weight,
+                    _ => return,
+                };
+                self.unlink(idx);
+                if let Some(Slot::Occupied(node)) = self.slots.get_mut(idx as usize) {
+                    node.region = Region::Protected;
+                }
+                self.protected_weight = self.protected_weight.saturating_add(weight);
+                self.push_front(idx, Region::Protected);
+            }
+            (_, region) => self.promote(idx, region),
+        }
+    }
 }
 
 impl<V> Shard<V> {
@@ -328,19 +576,24 @@ impl<V> Shard<V> {
         weight: u64,
         now: Instant,
     ) -> (WeightDelta, Option<V>) {
-        let (old_weight, old_value) = match self.slots.get_mut(idx as usize) {
+        let (old_weight, old_value, region) = match self.slots.get_mut(idx as usize) {
             Some(Slot::Occupied(node)) => {
                 let old_weight = node.weight;
                 let old_value = std::mem::replace(&mut node.value, value);
+                let region = node.region;
                 node.weight = weight;
                 node.inserted_at = now;
-                (old_weight, old_value)
+                (old_weight, old_value, region)
             }
             _ => {
                 return (
                     WeightDelta {
                         added: 0,
                         removed: 0,
+                        window_added: 0,
+                        window_removed: 0,
+                        protected_added: 0,
+                        protected_removed: 0,
                     },
                     None,
                 );
@@ -350,43 +603,63 @@ impl<V> Shard<V> {
             .weight
             .saturating_sub(old_weight)
             .saturating_add(weight);
-        self.promote(idx);
-        (
-            WeightDelta {
-                added: weight,
-                removed: old_weight,
-            },
-            Some(old_value),
-        )
+        let mut delta = WeightDelta {
+            added: weight,
+            removed: old_weight,
+            window_added: 0,
+            window_removed: 0,
+            protected_added: 0,
+            protected_removed: 0,
+        };
+        if region == Region::Window {
+            self.window_weight = self
+                .window_weight
+                .saturating_sub(old_weight)
+                .saturating_add(weight);
+            delta.window_added = weight;
+            delta.window_removed = old_weight;
+        } else if region == Region::Protected {
+            self.protected_weight = self
+                .protected_weight
+                .saturating_sub(old_weight)
+                .saturating_add(weight);
+            delta.protected_added = weight;
+            delta.protected_removed = old_weight;
+        }
+        self.promote(idx, region);
+        (delta, Some(old_value))
     }
 
-    fn promote(&mut self, idx: u32) {
-        if self.head == Some(idx) {
+    fn promote(&mut self, idx: u32, region: Region) {
+        if self.ends(region).head == Some(idx) {
             return;
         }
         self.unlink(idx);
-        self.push_front(idx);
+        self.push_front(idx, region);
     }
 
-    fn push_front(&mut self, idx: u32) {
+    fn push_front(&mut self, idx: u32, region: Region) {
+        let head = self.ends(region).head;
         if let Some(Slot::Occupied(node)) = self.slots.get_mut(idx as usize) {
             node.prev = None;
-            node.next = self.head;
+            node.next = head;
+            node.region = region;
         }
-        if let Some(head) = self.head
-            && let Some(Slot::Occupied(node)) = self.slots.get_mut(head as usize)
+        if let Some(head_idx) = head
+            && let Some(Slot::Occupied(node)) = self.slots.get_mut(head_idx as usize)
         {
             node.prev = Some(idx);
         }
-        self.head = Some(idx);
-        if self.tail.is_none() {
-            self.tail = Some(idx);
+        let ends = self.ends_mut(region);
+        ends.head = Some(idx);
+        if ends.tail.is_none() {
+            ends.tail = Some(idx);
         }
     }
 
     fn unlink(&mut self, idx: u32) {
-        let (prev, next) = match self.slots.get(idx as usize) {
-            Some(Slot::Occupied(node)) => (node.prev, node.next),
+        let (prev, next, region) = match self.slots.get(idx as usize) {
+            Some(Slot::Occupied(node)) => (node.prev, node.next, node.region),
             _ => return,
         };
         if let Some(prev_idx) = prev
@@ -394,14 +667,14 @@ impl<V> Shard<V> {
         {
             node.next = next;
         } else {
-            self.head = next;
+            self.ends_mut(region).head = next;
         }
         if let Some(next_idx) = next
             && let Some(Slot::Occupied(node)) = self.slots.get_mut(next_idx as usize)
         {
             node.prev = prev;
         } else {
-            self.tail = prev;
+            self.ends_mut(region).tail = prev;
         }
         if let Some(Slot::Occupied(node)) = self.slots.get_mut(idx as usize) {
             node.prev = None;
@@ -425,13 +698,8 @@ impl<V> Shard<V> {
     }
 
     fn take_value_and_free(&mut self, idx: u32) -> Option<V> {
-        self.unlink(idx);
-        match std::mem::replace(self.slots.get_mut(idx as usize)?, Slot::Vacant) {
-            Slot::Occupied(node) => {
-                self.weight = self.weight.saturating_sub(node.weight);
-                self.free.push(idx);
-                Some(node.value)
-            }
+        match self.take_slot(idx)? {
+            Slot::Occupied(node) => Some(node.value),
             Slot::Vacant => None,
         }
     }
@@ -440,7 +708,17 @@ impl<V> Shard<V> {
         self.unlink(idx);
         let slot = self.slots.get_mut(idx as usize)?;
         let taken = std::mem::replace(slot, Slot::Vacant);
-        if matches!(taken, Slot::Occupied(_)) {
+        if let Slot::Occupied(ref node) = taken {
+            self.weight = self.weight.saturating_sub(node.weight);
+            match node.region {
+                Region::Window => {
+                    self.window_weight = self.window_weight.saturating_sub(node.weight);
+                }
+                Region::Protected => {
+                    self.protected_weight = self.protected_weight.saturating_sub(node.weight);
+                }
+                Region::Probation => {}
+            }
             self.free.push(idx);
         }
         Some(taken)
@@ -455,6 +733,10 @@ mod tests {
 
     fn shard() -> Shard<u32> {
         Shard::new(EvictionPolicy::Lru)
+    }
+
+    fn tinylfu_shard() -> Shard<u32> {
+        Shard::new(EvictionPolicy::TinyLfu)
     }
 
     #[test]
@@ -526,5 +808,29 @@ mod tests {
         );
         assert!(shard.free.is_empty());
         assert_eq!(shard.len(), 100);
+    }
+
+    #[test]
+    fn tinylfu_inserts_into_the_window() {
+        let mut shard = tinylfu_shard();
+        let now = Instant::now();
+        shard.insert(1, 10, 5, now);
+        assert_eq!(shard.peek_region(1), Some(Region::Window));
+        assert_eq!(shard.window_weight(), 5);
+        assert!(shard.move_window_to_probation(1));
+        assert_eq!(shard.peek_region(1), Some(Region::Probation));
+        assert_eq!(shard.window_weight(), 0);
+    }
+
+    #[test]
+    fn tinylfu_probation_hit_promotes_to_protected() {
+        let mut shard = tinylfu_shard();
+        let now = Instant::now();
+        shard.insert(1, 10, 5, now);
+        assert!(shard.move_window_to_probation(1));
+        let got = shard.get(1, now, Duration::from_mins(1));
+        assert!(matches!(got, GetOutcome::Hit(10)));
+        assert_eq!(shard.peek_region(1), Some(Region::Protected));
+        assert_eq!(shard.protected_weight(), 5);
     }
 }

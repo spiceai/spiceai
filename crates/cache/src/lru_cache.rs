@@ -61,6 +61,7 @@ fn warn_ignored_engine(engine: CacheEngine) {
 fn eviction_policy(caching_policy: CachingPolicy) -> EvictionPolicy {
     match caching_policy {
         CachingPolicy::Lru => EvictionPolicy::Lru,
+        CachingPolicy::Lfu => EvictionPolicy::Lfu,
         CachingPolicy::TinyLfu => EvictionPolicy::TinyLfu,
     }
 }
@@ -817,6 +818,7 @@ mod tests {
 
     #[rstest]
     #[case::lru(CachingPolicy::Lru)]
+    #[case::lfu(CachingPolicy::Lfu)]
     #[case::tiny_lfu(CachingPolicy::TinyLfu)]
     #[tokio::test]
     async fn test_cache_with_caching_policy(#[case] caching_policy: CachingPolicy) {

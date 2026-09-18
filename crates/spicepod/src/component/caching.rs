@@ -92,8 +92,11 @@ pub enum CachingPolicy {
     /// Suitable for workloads with strong recency bias, such as streaming data processing.
     #[default]
     Lru,
-    /// `TinyLFU` caching policy.
-    /// Combines LRU eviction with LFU-based admission policy.
+    /// Least Frequently Used caching policy.
+    /// Evicts the lowest hit-count resident; suitable for stable hot-key workloads.
+    Lfu,
+    /// W-`TinyLFU` caching policy.
+    /// Admission window + SLRU main (probation/protected) with Count-Min Sketch.
     /// Suitable for most workloads including database, search, and analytics.
     TinyLfu,
 }

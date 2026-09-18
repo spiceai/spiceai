@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Sharded in-memory cache with LRU and `TinyLFU` eviction.
+//! Sharded in-memory cache with LRU, LFU, and W-`TinyLFU` eviction.
 //!
 //! # Sharding
 //!
@@ -80,10 +80,16 @@ pub enum EvictionPolicy {
     /// the victim is not chosen by a global LRU timestamp comparison.
     #[default]
     Lru,
-    /// `TinyLFU` admission over LRU eviction: a new key that would push the cache
-    /// over `max_weight` is admitted only if it is at least as frequent as the
-    /// overflow victim — the lowest-frequency LRU tail across all shards, which
-    /// is the same entry overflow trim removes.
+    /// Least-frequently-used. Each hit increments a per-entry counter; overflow
+    /// trim removes the lowest-frequency resident (LRU-tail scan per shard,
+    /// other shards first). Ties keep the colder list position.
+    Lfu,
+    /// Full W-`TinyLFU` (Caffeine/Moka shape): a ~1% LRU **window**, a ~99%
+    /// SLRU **main** space split into ~20% **probation** / ~80% **protected**,
+    /// and a Count-Min Sketch. New keys enter the window; the window LRU
+    /// competes with the probation LRU on frequency before entering main. A
+    /// hit on probation promotes into protected; protected overflow demotes
+    /// back to probation.
     TinyLfu,
 }
 
@@ -112,6 +118,10 @@ pub struct ShardedCache<V, L: EvictionListener = NoopListener> {
     ttl: Duration,
     policy: EvictionPolicy,
     weight: AtomicU64,
+    /// Bytes currently in the W-TinyLFU admission window (~1% cap).
+    window_weight: AtomicU64,
+    /// Bytes currently in the W-TinyLFU protected segment (~80% of main).
+    protected_weight: AtomicU64,
     /// Serializes overflow trimming so two concurrent inserts cannot each
     /// evict a victim after a single removal would already restore the budget.
     trim: Mutex<()>,
@@ -143,6 +153,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             ttl,
             policy,
             weight: AtomicU64::new(0),
+            window_weight: AtomicU64::new(0),
+            protected_weight: AtomicU64::new(0),
             trim: Mutex::new(()),
             #[cfg(test)]
             after_publish: Mutex::new(None),
@@ -158,9 +170,9 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     ///
     /// A value heavier than `max_weight` is rejected before admission so it
     /// cannot flush unrelated residents and then self-evict. If `key` already
-    /// has a resident, that stale generation is removed. `TinyLFU` may evict a
-    /// *new* key that would exceed the budget if it is less frequent than the
-    /// overflow victim (the lowest-frequency LRU tail across shards).
+    /// has a resident, that stale generation is removed. Under W-`TinyLFU` the
+    /// key enters the admission window; overflow trim may reject it if the
+    /// window LRU loses the frequency comparison against the probation victim.
     pub fn insert(&self, key: u64, value: V, weight: usize) {
         let weight = u64::try_from(weight).unwrap_or(u64::MAX);
         if weight > self.max_weight {
@@ -177,10 +189,18 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
 
         let mut expired = Vec::new();
         if matches!(self.policy, EvictionPolicy::TinyLfu) {
+            let before_window = shard.window_weight();
+            let before_protected = shard.protected_weight();
             let (values, expired_weight) = shard.expire_older_than(now, self.ttl);
             if expired_weight > 0 {
                 self.sub_weight(expired_weight);
             }
+            self.sync_segment_weights_after_removal(
+                before_window,
+                shard.window_weight(),
+                before_protected,
+                shard.protected_weight(),
+            );
             expired = values;
             shard.increment_sketch(key);
         }
@@ -188,7 +208,7 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         let (delta, replaced) = shard.insert(key, value, weight, now);
         // Publish the weight before releasing the shard so a concurrent
         // remove of this key cannot subtract before the matching add.
-        self.apply_delta(delta.net());
+        self.apply_delta(&delta);
         drop(shard);
         drop(replaced);
         for _ in expired {
@@ -209,11 +229,30 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         if matches!(self.policy, EvictionPolicy::TinyLfu) {
             shard.increment_sketch(*key);
         }
+        let before_window = shard.window_weight();
+        let before_protected = shard.protected_weight();
         match shard.get(*key, now, self.ttl) {
-            GetOutcome::Hit(value) => Some(value),
+            GetOutcome::Hit(value) => {
+                let after_protected = shard.protected_weight();
+                if after_protected > before_protected {
+                    let gained = after_protected - before_protected;
+                    self.protected_weight.fetch_add(gained, Ordering::Relaxed);
+                }
+                drop(shard);
+                if matches!(self.policy, EvictionPolicy::TinyLfu) {
+                    self.demote_protected_if_over_cap();
+                }
+                Some(value)
+            }
             GetOutcome::Miss => None,
             GetOutcome::Expired { value, weight } => {
                 self.sub_weight(weight);
+                self.sync_segment_weights_after_removal(
+                    before_window,
+                    shard.window_weight(),
+                    before_protected,
+                    shard.protected_weight(),
+                );
                 drop(shard);
                 drop(value);
                 L::on_evict(EvictionReason::Expired);
@@ -225,8 +264,16 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     /// Remove `key` if present. This is not an eviction and is not reported.
     pub fn remove(&self, key: &u64) -> Option<V> {
         let mut shard = self.shards[shard_index(*key)].0.lock();
+        let before_window = shard.window_weight();
+        let before_protected = shard.protected_weight();
         let (value, weight) = shard.remove(*key)?;
         self.sub_weight(weight);
+        self.sync_segment_weights_after_removal(
+            before_window,
+            shard.window_weight(),
+            before_protected,
+            shard.protected_weight(),
+        );
         drop(shard);
         Some(value)
     }
@@ -246,6 +293,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             values.extend(shard_values);
         }
         self.sub_weight(removed);
+        self.window_weight.store(0, Ordering::Relaxed);
+        self.protected_weight.store(0, Ordering::Relaxed);
         // Release every shard before dropping values. A value destructor that
         // re-enters the cache would otherwise deadlock on these non-reentrant
         // locks, and large Arrow-backed values would extend the hold.
@@ -312,8 +361,16 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         let mut removed = 0;
         for shard_idx in 0..NUM_SHARDS {
             let mut shard = self.shards[shard_idx].0.lock();
+            let before_window = shard.window_weight();
+            let before_protected = shard.protected_weight();
             let (values, weight) = shard.invalidate_matching(&predicate);
             self.sub_weight(weight);
+            self.sync_segment_weights_after_removal(
+                before_window,
+                shard.window_weight(),
+                before_protected,
+                shard.protected_weight(),
+            );
             drop(shard);
             removed += values.len();
             for _ in values {
@@ -341,17 +398,26 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     /// Removed values and listener callbacks are applied only after `trim` is
     /// released. A `Drop` or listener that re-enters [`Self::insert`] would
     /// otherwise deadlock on this non-reentrant mutex.
+    fn needs_overflow_trim(&self) -> bool {
+        if self.weight.load(Ordering::Relaxed) > self.max_weight {
+            return true;
+        }
+        matches!(self.policy, EvictionPolicy::TinyLfu)
+            && (self.window_weight.load(Ordering::Relaxed) > self.window_cap()
+                || self.protected_weight.load(Ordering::Relaxed) > self.protected_cap())
+    }
+
     fn evict_to_limit(&self, prefer: usize, admitted: Option<u64>) {
-        if self.weight.load(Ordering::Relaxed) <= self.max_weight {
+        if !self.needs_overflow_trim() {
             return;
         }
         let mut evicted = Vec::new();
         {
             let _trim = self.trim.lock();
-            while self.weight.load(Ordering::Relaxed) > self.max_weight {
+            while self.needs_overflow_trim() {
                 #[cfg(test)]
                 self.run_before_size_victim();
-                if self.weight.load(Ordering::Relaxed) <= self.max_weight {
+                if !self.needs_overflow_trim() {
                     break;
                 }
                 // Reclaim expired tails before a live size victim. Peeking 16
@@ -361,7 +427,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
                     continue;
                 }
                 let progressed = match self.policy {
-                    EvictionPolicy::TinyLfu => self.evict_tinylfu_one(admitted, &mut evicted),
+                    EvictionPolicy::TinyLfu => self.evict_wtinylfu_one(admitted, &mut evicted),
+                    EvictionPolicy::Lfu => self.evict_lfu_one(prefer, &mut evicted),
                     // LRU must not self-evict a just-admitted sole resident while
                     // an older victim exists on another shard.
                     EvictionPolicy::Lru => self.evict_others_then_prefer(prefer, &mut evicted),
@@ -377,59 +444,250 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         }
     }
 
-    /// Compare the just-admitted key with the actual overflow victim — the
-    /// lowest-frequency LRU tail across shards — and evict the loser.
-    ///
-    /// A stale snapshot (victim already gone, shard empty, or promoted off
-    /// the tail by a concurrent get) is not treated as trim-complete: re-select
-    /// up to [`NUM_SHARDS`] times while still over budget so another shard's
-    /// tail can still be claimed. Falling back to numeric-order LRU would evict
-    /// a hotter resident than `TinyLFU` chose.
-    fn evict_tinylfu_one(
+    /// Window capacity: ~1% of `max_weight` (at least 1 byte).
+    fn window_cap(&self) -> u64 {
+        (self.max_weight / 100).max(1)
+    }
+
+    /// Protected capacity: ~80% of the main space (main = total − window).
+    fn protected_cap(&self) -> u64 {
+        let main = self.max_weight.saturating_sub(self.window_cap());
+        (main.saturating_mul(80) / 100).max(1)
+    }
+
+    /// Full W-TinyLFU overflow step:
+    /// 1. If the window is over its cap (or the cache is over budget), take the
+    ///    window LRU as a candidate and the probation LRU as the victim.
+    /// 2. Admit the candidate into probation when its CMS estimate is ≥ the
+    ///    victim's; otherwise reject the candidate.
+    /// 3. Demote protected → probation when the protected segment is over cap.
+    /// 4. If still over budget, size-evict a probation (then window) tail.
+    fn evict_wtinylfu_one(
         &self,
-        admitted: Option<u64>,
+        _admitted: Option<u64>,
         evicted: &mut Vec<(V, EvictionReason)>,
     ) -> bool {
+        // Prefer draining an oversized window via admission before cold size trim.
+        if (self.window_weight.load(Ordering::Relaxed) > self.window_cap()
+            || self.weight.load(Ordering::Relaxed) > self.max_weight)
+            && self.wtinylfu_admit_or_reject_window_candidate(evicted)
+        {
+            return true;
+        }
+        if self.protected_weight.load(Ordering::Relaxed) > self.protected_cap()
+            && self.demote_one_protected(evicted)
+        {
+            // Demotion is not a size eviction; keep looping so a later step
+            // can reclaim bytes if still over budget.
+            return true;
+        }
+        // Size-evict from main (probation) first, then the window.
         for _ in 0..NUM_SHARDS {
             if self.weight.load(Ordering::Relaxed) <= self.max_weight {
                 return false;
             }
-            let Some((victim_shard, victim_key, victim_freq)) = self.lowest_freq_lru_tail() else {
-                return false;
-            };
-            if let Some(candidate) = admitted {
-                let candidate_shard = shard_index(candidate);
-                let (present, candidate_freq) = {
-                    let shard = self.shards[candidate_shard].0.lock();
-                    (shard.contains(candidate), shard.sketch_estimate(candidate))
-                };
-                if present
-                    && candidate != victim_key
-                    && candidate_freq < victim_freq
-                    && self.remove_key_for_size(candidate_shard, candidate, evicted)
-                {
+            if let Some((shard_idx, key, _)) = self.lowest_freq_region_tail(shard::Region::Probation)
+            {
+                #[cfg(test)]
+                self.run_before_size_victim();
+                if self.remove_tail_for_size(shard_idx, key, shard::Region::Probation, evicted) {
                     return true;
                 }
+                continue;
             }
-            // After the snapshot is published and before the tail is unlinked,
-            // so a concurrent get can promote that key off the LRU tail.
-            #[cfg(test)]
-            self.run_before_size_victim();
-            if self.remove_tail_for_size(victim_shard, victim_key, evicted) {
-                return true;
+            break;
+        }
+        for _ in 0..NUM_SHARDS {
+            if self.weight.load(Ordering::Relaxed) <= self.max_weight {
+                return false;
             }
+            if let Some((shard_idx, key, _)) = self.lowest_freq_region_tail(shard::Region::Window) {
+                #[cfg(test)]
+                self.run_before_size_victim();
+                if self.remove_tail_for_size(shard_idx, key, shard::Region::Window, evicted) {
+                    return true;
+                }
+                continue;
+            }
+            break;
+        }
+        // Guaranteed-progress fallback: if every TinyLFU snapshot was promoted
+        // off its tail before unlink, fall back to numeric-order LRU so insert
+        // cannot return above max_weight.
+        if self.weight.load(Ordering::Relaxed) > self.max_weight {
+            return self.evict_others_then_prefer(0, evicted);
         }
         false
     }
 
-    /// The overflow victim is the LRU tail with the lowest home-shard sketch
-    /// estimate. Ties keep the lowest shard index. Each lock is taken alone so
-    /// this cannot deadlock with `insert`.
-    fn lowest_freq_lru_tail(&self) -> Option<(usize, u64, u8)> {
+    /// Window LRU vs probation LRU `TinyLFU` comparison.
+    ///
+    /// When the cache still fits `max_weight`, the window LRU is moved into
+    /// probation (no resident leaves). Only when the total is over budget does
+    /// the candidate compete with the probation victim on CMS frequency.
+    fn wtinylfu_admit_or_reject_window_candidate(
+        &self,
+        evicted: &mut Vec<(V, EvictionReason)>,
+    ) -> bool {
+        let Some((cand_shard, cand_key, cand_freq)) =
+            self.lowest_freq_region_tail(shard::Region::Window)
+        else {
+            return false;
+        };
+        // After the snapshot is published and before the candidate is unlinked
+        // or moved, so a concurrent get can promote / change the region.
+        #[cfg(test)]
+        self.run_before_size_victim();
+
+        let total_over = self.weight.load(Ordering::Relaxed) > self.max_weight;
+        let victim = self.lowest_freq_region_tail(shard::Region::Probation);
+
+        if !total_over {
+            // Drain window toward its cap without discarding anyone.
+            return self.promote_window_key(cand_shard, cand_key);
+        }
+
+        match victim {
+            None => self.promote_window_key(cand_shard, cand_key),
+            Some((vic_shard, vic_key, vic_freq)) => {
+                if cand_freq >= vic_freq {
+                    // Evict victim, then promote candidate into probation.
+                    if !self.remove_tail_for_size(
+                        vic_shard,
+                        vic_key,
+                        shard::Region::Probation,
+                        evicted,
+                    ) {
+                        // Victim gone or claim failed; try promoting anyway if
+                        // the budget was restored, else reject nothing this pass.
+                        if self.weight.load(Ordering::Relaxed) <= self.max_weight {
+                            return self.promote_window_key(cand_shard, cand_key);
+                        }
+                        return false;
+                    }
+                    let _ = self.promote_window_key(cand_shard, cand_key);
+                    true
+                } else if cand_key == vic_key {
+                    // Same entry cannot be both; just promote.
+                    self.promote_window_key(cand_shard, cand_key)
+                } else {
+                    // Reject the window candidate.
+                    self.remove_tail_for_size(
+                        cand_shard,
+                        cand_key,
+                        shard::Region::Window,
+                        evicted,
+                    )
+                }
+            }
+        }
+    }
+
+    fn promote_window_key(&self, shard_idx: usize, key: u64) -> bool {
+        let mut shard = self.shards[shard_idx].0.lock();
+        if shard.peek_region(key) != Some(shard::Region::Window) {
+            return false;
+        }
+        let weight = shard.peek_weight(key).unwrap_or(0);
+        if shard.move_window_to_probation(key) {
+            let _ = self.window_weight.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(weight)),
+            );
+            return true;
+        }
+        false
+    }
+
+    fn demote_one_protected(&self, _evicted: &mut Vec<(V, EvictionReason)>) -> bool {
+        // Pick any shard with a protected tail (numeric order).
+        for shard_idx in 0..NUM_SHARDS {
+            let mut shard = self.shards[shard_idx].0.lock();
+            let Some((key, weight)) = shard.demote_protected_lru_to_probation() else {
+                continue;
+            };
+            let _ = key;
+            self.protected_weight.fetch_sub(weight, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// Demote protected → probation while the global protected segment is over cap.
+    ///
+    /// Uses `try_lock` on `trim` so a hit that promotes into protected cannot
+    /// deadlock with an in-flight `insert` that already holds `trim` and is
+    /// waiting on this shard.
+    fn demote_protected_if_over_cap(&self) {
+        let Some(_trim) = self.trim.try_lock() else {
+            return;
+        };
+        while self.protected_weight.load(Ordering::Relaxed) > self.protected_cap() {
+            let mut progressed = false;
+            for shard_idx in 0..NUM_SHARDS {
+                if self.protected_weight.load(Ordering::Relaxed) <= self.protected_cap() {
+                    break;
+                }
+                let mut shard = self.shards[shard_idx].0.lock();
+                let Some((_key, weight)) = shard.demote_protected_lru_to_probation() else {
+                    continue;
+                };
+                self.protected_weight.fetch_sub(weight, Ordering::Relaxed);
+                progressed = true;
+            }
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    /// LFU overflow: remove the lowest-frequency resident, preferring other
+    /// shards first so a just-admitted key is not self-evicted while an older
+    /// colder victim exists.
+    fn evict_lfu_one(
+        &self,
+        prefer: usize,
+        evicted: &mut Vec<(V, EvictionReason)>,
+    ) -> bool {
+        if let Some((shard_idx, key, _)) = self.lowest_freq_entry(Some(prefer)) {
+            return self.remove_key_for_size(shard_idx, key, evicted);
+        }
+        if let Some((shard_idx, key, _)) = self.lowest_freq_entry(None) {
+            return self.remove_key_for_size(shard_idx, key, evicted);
+        }
+        false
+    }
+
+    /// Lowest-frequency entry across shards. When `skip` is set, that shard is
+    /// ignored on the first pass (caller retries with `None`).
+    fn lowest_freq_entry(&self, skip: Option<usize>) -> Option<(usize, u64, u16)> {
+        let mut best: Option<(usize, u64, u16)> = None;
+        for (shard_idx, shard) in self.shards.iter().enumerate() {
+            if skip == Some(shard_idx) {
+                continue;
+            }
+            let shard = shard.0.lock();
+            let Some((key, _weight, freq)) = shard.peek_lfu_victim() else {
+                continue;
+            };
+            let take = best.is_none_or(|(_, _, best_freq)| freq < best_freq);
+            if take {
+                best = Some((shard_idx, key, freq));
+            }
+        }
+        best
+    }
+
+    /// The region-tail with the lowest home-shard sketch estimate.
+    fn lowest_freq_region_tail(
+        &self,
+        region: shard::Region,
+    ) -> Option<(usize, u64, u8)> {
         let mut best: Option<(usize, u64, u8)> = None;
         for (shard_idx, shard) in self.shards.iter().enumerate() {
             let shard = shard.0.lock();
-            let Some(key) = shard.tail_key() else {
+            let Some(key) = shard.region_tail_key(region) else {
                 continue;
             };
             let freq = shard.sketch_estimate(key);
@@ -451,10 +709,18 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             if !shard.tail_is_expired(now, self.ttl) {
                 continue;
             }
+            let before_window = shard.window_weight();
+            let before_protected = shard.protected_weight();
             let (expired, weight) = shard.expire_older_than(now, self.ttl);
             if weight > 0 {
                 self.sub_weight(weight);
             }
+            self.sync_segment_weights_after_removal(
+                before_window,
+                shard.window_weight(),
+                before_protected,
+                shard.protected_weight(),
+            );
             drop(shard);
             if expired.is_empty() {
                 continue;
@@ -467,9 +733,9 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         progressed
     }
 
-    /// Unlink `key` to reclaim its weight. Used only to reject a just-admitted
-    /// `TinyLFU` candidate. Does not fall back to the LRU tail — that would evict
-    /// a different resident than admission compared.
+    /// Unlink `key` to reclaim its weight (LFU victim or rejected `TinyLFU`
+    /// candidate). Does not fall back to an LRU tail — that would evict a
+    /// different resident than selection compared.
     fn remove_key_for_size(
         &self,
         shard_idx: usize,
@@ -478,10 +744,18 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     ) -> bool {
         let mut shard = self.shards[shard_idx].0.lock();
         let now = Instant::now();
+        let before_window = shard.window_weight();
+        let before_protected = shard.protected_weight();
         let (expired, expired_weight) = shard.expire_older_than(now, self.ttl);
         if expired_weight > 0 {
             self.sub_weight(expired_weight);
         }
+        self.sync_segment_weights_after_removal(
+            before_window,
+            shard.window_weight(),
+            before_protected,
+            shard.protected_weight(),
+        );
         if !expired.is_empty() {
             drop(shard);
             for value in expired {
@@ -489,40 +763,85 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             }
             return true;
         }
-        if self.weight.load(Ordering::Relaxed) <= self.max_weight {
+        if self.weight.load(Ordering::Relaxed) <= self.max_weight
+            && !matches!(self.policy, EvictionPolicy::TinyLfu)
+        {
             return false;
         }
+        // W-TinyLFU may reject a window candidate while total weight still fits
+        // but the window segment is over its cap.
+        if matches!(self.policy, EvictionPolicy::TinyLfu)
+            && self.weight.load(Ordering::Relaxed) <= self.max_weight
+            && self.window_weight.load(Ordering::Relaxed) <= self.window_cap()
+        {
+            return false;
+        }
+        let before_window = shard.window_weight();
+        let before_protected = shard.protected_weight();
         let Some(weight) = shard.peek_weight(key) else {
             return false;
         };
         if !self.claim_size_eviction(weight) {
-            return false;
+            // Window-only reject: still allow reclaim when over window cap.
+            if !(matches!(self.policy, EvictionPolicy::TinyLfu)
+                && self.window_weight.load(Ordering::Relaxed) > self.window_cap())
+            {
+                return false;
+            }
+            // Over window cap but under total budget: subtract window weight only.
+            let Some((value, w)) = shard.remove(key) else {
+                return false;
+            };
+            self.sub_weight(w);
+            self.sync_segment_weights_after_removal(
+                before_window,
+                shard.window_weight(),
+                before_protected,
+                shard.protected_weight(),
+            );
+            drop(shard);
+            evicted.push((value, EvictionReason::Size));
+            return true;
         }
         let Some((value, _)) = shard.remove(key) else {
             self.weight.fetch_add(weight, Ordering::Relaxed);
             return false;
         };
+        self.sync_segment_weights_after_removal(
+            before_window,
+            shard.window_weight(),
+            before_protected,
+            shard.protected_weight(),
+        );
         drop(shard);
         evicted.push((value, EvictionReason::Size));
         true
     }
 
-    /// Unlink this shard's LRU tail only when it is still `expected`.
+    /// Unlink this shard's region tail only when it is still `expected`.
     /// A concurrent get can promote the snapshot victim off the tail between
-    /// [`Self::lowest_freq_lru_tail`] and this re-lock; returning false lets
-    /// [`Self::evict_tinylfu_one`] reselect.
+    /// selection and this re-lock; returning false lets the caller reselect.
     fn remove_tail_for_size(
         &self,
         shard_idx: usize,
         expected: u64,
+        region: shard::Region,
         evicted: &mut Vec<(V, EvictionReason)>,
     ) -> bool {
         let mut shard = self.shards[shard_idx].0.lock();
         let now = Instant::now();
+        let before_window = shard.window_weight();
+        let before_protected = shard.protected_weight();
         let (expired, expired_weight) = shard.expire_older_than(now, self.ttl);
         if expired_weight > 0 {
             self.sub_weight(expired_weight);
         }
+        self.sync_segment_weights_after_removal(
+            before_window,
+            shard.window_weight(),
+            before_protected,
+            shard.protected_weight(),
+        );
         if !expired.is_empty() {
             drop(shard);
             for value in expired {
@@ -530,22 +849,38 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             }
             return true;
         }
-        if self.weight.load(Ordering::Relaxed) <= self.max_weight {
+        let over_budget = self.weight.load(Ordering::Relaxed) > self.max_weight;
+        let over_window = matches!(self.policy, EvictionPolicy::TinyLfu)
+            && self.window_weight.load(Ordering::Relaxed) > self.window_cap();
+        if !over_budget && !over_window {
             return false;
         }
-        if shard.tail_key() != Some(expected) {
+        if shard.region_tail_key(region) != Some(expected) {
             return false;
         }
-        let Some((_, weight)) = shard.peek_tail() else {
+        let before_window = shard.window_weight();
+        let before_protected = shard.protected_weight();
+        let Some((_, weight)) = shard.peek_region_tail(region) else {
             return false;
         };
-        if !self.claim_size_eviction(weight) {
-            return false;
+        if over_budget {
+            if !self.claim_size_eviction(weight) {
+                return false;
+            }
+        } else {
+            // Window-cap trim only: total budget already fits.
+            self.sub_weight(weight);
         }
-        let Some((_, value, _)) = shard.evict_lru() else {
+        let Some((_, value, _)) = shard.evict_region_lru(region) else {
             self.weight.fetch_add(weight, Ordering::Relaxed);
             return false;
         };
+        self.sync_segment_weights_after_removal(
+            before_window,
+            shard.window_weight(),
+            before_protected,
+            shard.protected_weight(),
+        );
         drop(shard);
         evicted.push((value, EvictionReason::Size));
         true
@@ -600,8 +935,16 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     fn evict_one_from(&self, shard_idx: usize, evicted: &mut Vec<(V, EvictionReason)>) -> bool {
         let mut shard = self.shards[shard_idx].0.lock();
         let now = Instant::now();
+        let before_window = shard.window_weight();
+        let before_protected = shard.protected_weight();
         let (expired, expired_weight) = shard.expire_older_than(now, self.ttl);
         self.sub_weight(expired_weight);
+        self.sync_segment_weights_after_removal(
+            before_window,
+            shard.window_weight(),
+            before_protected,
+            shard.protected_weight(),
+        );
         if !expired.is_empty() {
             drop(shard);
             for value in expired {
@@ -612,6 +955,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         if self.weight.load(Ordering::Relaxed) <= self.max_weight {
             return false;
         }
+        let before_window = shard.window_weight();
+        let before_protected = shard.protected_weight();
         let Some((_, weight)) = shard.peek_tail() else {
             return false;
         };
@@ -622,12 +967,19 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             self.weight.fetch_add(weight, Ordering::Relaxed);
             return false;
         };
+        self.sync_segment_weights_after_removal(
+            before_window,
+            shard.window_weight(),
+            before_protected,
+            shard.protected_weight(),
+        );
         drop(shard);
         evicted.push((value, EvictionReason::Size));
         true
     }
 
-    fn apply_delta(&self, net: i128) {
+    fn apply_delta(&self, delta: &shard::WeightDelta) {
+        let net = delta.net();
         if net > 0 {
             let add = u64::try_from(net).unwrap_or(u64::MAX);
             self.weight.fetch_add(add, Ordering::Relaxed);
@@ -635,7 +987,47 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             let sub = u64::try_from(-net).unwrap_or(u64::MAX);
             self.sub_weight(sub);
         }
+        Self::apply_segment_delta(&self.window_weight, delta.window_net());
+        Self::apply_segment_delta(&self.protected_weight, delta.protected_net());
     }
+
+    fn apply_segment_delta(counter: &AtomicU64, net: i128) {
+        if net > 0 {
+            let add = u64::try_from(net).unwrap_or(u64::MAX);
+            counter.fetch_add(add, Ordering::Relaxed);
+        } else if net < 0 {
+            let sub = u64::try_from(-net).unwrap_or(u64::MAX);
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(sub))
+            });
+        }
+    }
+
+    fn sync_segment_weights_after_removal(
+        &self,
+        before_window: u64,
+        after_window: u64,
+        before_protected: u64,
+        after_protected: u64,
+    ) {
+        let window_lost = before_window.saturating_sub(after_window);
+        let protected_lost = before_protected.saturating_sub(after_protected);
+        if window_lost > 0 {
+            let _ = self.window_weight.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(window_lost)),
+            );
+        }
+        if protected_lost > 0 {
+            let _ = self.protected_weight.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(protected_lost)),
+            );
+        }
+    }
+
 
     fn sub_weight(&self, amount: u64) {
         // Saturating subtract without a CAS loop: weight only decreases here
@@ -1317,6 +1709,40 @@ mod tests {
             0,
             "every insert's weight must be published before a concurrent remove can subtract"
         );
+    }
+
+
+    #[test]
+    fn lfu_evicts_the_lowest_frequency_key() {
+        let cache: ShardedCache<TestValue> =
+            ShardedCache::new(100, Duration::from_mins(1), EvictionPolicy::Lfu);
+        cache.insert(0, TestValue::with_size("cold", 50), 50);
+        cache.insert(1, TestValue::with_size("hot", 50), 50);
+        for _ in 0..16 {
+            assert!(cache.get(&1).is_some());
+        }
+        // One get on cold so it is not zero, but still colder than hot.
+        assert!(cache.get(&0).is_some());
+        cache.insert(2, TestValue::with_size("new", 50), 50);
+        assert!(
+            cache.get(&0).is_none(),
+            "LFU must evict the colder key"
+        );
+        assert!(cache.get(&1).is_some(), "hot key must survive LFU eviction");
+        assert!(cache.get(&2).is_some());
+    }
+
+    #[test]
+    fn wtinylfu_window_promotes_into_probation_under_budget() {
+        let cache: ShardedCache<TestValue> =
+            ShardedCache::new(10_000, Duration::from_mins(1), EvictionPolicy::TinyLfu);
+        cache.insert(0, TestValue::with_size("a", 40), 40);
+        cache.insert(16, TestValue::with_size("b", 40), 40);
+        // Both fit; window drain moves them to probation without discarding.
+        assert!(cache.get(&0).is_some());
+        assert!(cache.get(&16).is_some());
+        assert_eq!(cache.len(), 2);
+        assert!(cache.weighted_size() <= 10_000);
     }
 
     #[test]

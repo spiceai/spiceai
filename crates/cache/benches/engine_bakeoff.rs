@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Bakeoff: Spice sharded cache vs Moka vs Pingora (when the feature is on).
+//! Bakeoff: Spice (LRU / LFU / W-TinyLFU) vs Moka LRU vs Pingora.
 //!
-//! Compares the `CacheBackend` implementations the results caches used to
-//! select via `engine`. `LruCache` now always uses Spice; these benches
-//! construct the old backends directly so the cutover has numbers.
+//! The headline group targets ~70% hits / 30% misses. Older ~16% and ~100%
+//! groups remain for regression context.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::cast_sign_loss)]
@@ -45,6 +44,9 @@ const PREFILL: u64 = 8_000;
 /// Key space for the near-100% hit-rate group. Prefill writes every key, and
 /// the 8 MiB budget holds all of them (`HOT_KEY_SPACE * 32` bytes).
 const HOT_KEY_SPACE: u64 = 8_000;
+/// Hot set for the ~70% hit group. Fully prefilled and fits in budget; 70% of
+/// gets sample this set and 30% sample the wider `KEY_SPACE` (mostly misses).
+const HIT70_HOT_SET: u64 = 8_000;
 const OPERATIONS_PER_THREAD: usize = 8_000;
 /// Thread counts for every bakeoff group, including the 32/64 contention cells.
 const THREAD_COUNTS: [usize; 5] = [1, 8, 16, 32, 64];
@@ -87,11 +89,11 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("benchmark runtime")
 }
 
-fn spice_backend() -> Arc<SpiceBackend<BenchValue>> {
+fn spice_backend(policy: EvictionPolicy) -> Arc<SpiceBackend<BenchValue>> {
     Arc::new(SpiceBackend::new(
         CACHE_WEIGHT,
         Duration::from_mins(1),
-        EvictionPolicy::Lru,
+        policy,
     ))
 }
 
@@ -125,6 +127,15 @@ async fn prefill_hot<B: CacheBackend<BenchValue>>(backend: &B) {
     }
 }
 
+async fn prefill_hit70<B: CacheBackend<BenchValue>>(backend: &B) {
+    let mut rng = StdRng::seed_from_u64(42);
+    for key in 0..HIT70_HOT_SET {
+        backend
+            .insert(key, BenchValue(random_value(&mut rng)))
+            .await;
+    }
+}
+
 fn run_gets<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
     handle: &tokio::runtime::Handle,
     backend: &Arc<B>,
@@ -140,6 +151,37 @@ fn run_gets<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
                 handle.block_on(async {
                     for _ in 0..OPERATIONS_PER_THREAD {
                         let key = rng.random_range(0..key_space);
+                        black_box(backend.get(&key).await);
+                    }
+                });
+            })
+        })
+        .collect();
+    for join in joins {
+        join.join().expect("worker panicked");
+    }
+}
+
+/// ~70% hits / 30% misses: with probability 0.7 sample the prefilled hot set,
+/// otherwise sample the wide key space (mostly misses).
+fn run_gets_hit70<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
+    handle: &tokio::runtime::Handle,
+    backend: &Arc<B>,
+    threads: usize,
+) {
+    let joins: Vec<_> = (0..threads)
+        .map(|thread_id| {
+            let backend = Arc::clone(backend);
+            let handle = handle.clone();
+            std::thread::spawn(move || {
+                let mut rng = StdRng::seed_from_u64(thread_id as u64 + 100);
+                handle.block_on(async {
+                    for _ in 0..OPERATIONS_PER_THREAD {
+                        let key = if rng.random_bool(0.7) {
+                            rng.random_range(0..HIT70_HOT_SET)
+                        } else {
+                            rng.random_range(0..KEY_SPACE)
+                        };
                         black_box(backend.get(&key).await);
                     }
                 });
@@ -185,14 +227,75 @@ fn run_mixed<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
 }
 
 fn configure_group(group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>) {
-    group.warm_up_time(Duration::from_secs(1));
-    group.measurement_time(Duration::from_secs(4));
-    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(2));
+    group.sample_size(10);
+}
+
+fn bench_id(engine: &str, threads: usize) -> BenchmarkId {
+    BenchmarkId::new(engine, threads)
+}
+
+/// Headline bakeoff: ~70% hit / 30% miss. Spice LRU + LFU + TinyLFU vs Moka LRU
+/// vs Pingora.
+fn bench_concurrent_get_hit70(c: &mut Criterion) {
+    let mut group = c.benchmark_group("engine_bakeoff_get_hit70");
+    configure_group(&mut group);
+    let rt = runtime();
+    let handle = rt.handle().clone();
+
+    for threads in THREAD_COUNTS {
+        group.throughput(Throughput::Elements(
+            (threads * OPERATIONS_PER_THREAD) as u64,
+        ));
+
+        for (name, policy) in [
+            ("spice_lru", EvictionPolicy::Lru),
+            ("spice_lfu", EvictionPolicy::Lfu),
+            ("spice_tinylfu", EvictionPolicy::TinyLfu),
+        ] {
+            group.bench_with_input(bench_id(name, threads), &threads, |b, &n| {
+                b.iter_batched(
+                    || {
+                        let backend = spice_backend(policy);
+                        handle.block_on(prefill_hit70(backend.as_ref()));
+                        backend
+                    },
+                    |backend| run_gets_hit70(&handle, &backend, n),
+                    criterion::BatchSize::LargeInput,
+                );
+            });
+        }
+
+        group.bench_with_input(bench_id("moka_lru", threads), &threads, |b, &n| {
+            b.iter_batched(
+                || {
+                    let backend = moka_backend();
+                    handle.block_on(prefill_hit70(backend.as_ref()));
+                    backend
+                },
+                |backend| run_gets_hit70(&handle, &backend, n),
+                criterion::BatchSize::LargeInput,
+            );
+        });
+
+        #[cfg(feature = "pingora")]
+        group.bench_with_input(bench_id("pingora", threads), &threads, |b, &n| {
+            b.iter_batched(
+                || {
+                    let backend = pingora_backend();
+                    handle.block_on(prefill_hit70(backend.as_ref()));
+                    backend
+                },
+                |backend| run_gets_hit70(&handle, &backend, n),
+                criterion::BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
 }
 
 /// Uniform samples over `KEY_SPACE` after prefilling `PREFILL` keys (~16% hits).
-/// The miss-heavy path is the common results-cache case; [`bench_concurrent_get_hot`]
-/// covers near-100% hits.
 fn bench_concurrent_get(c: &mut Criterion) {
     let mut group = c.benchmark_group("engine_bakeoff_get");
     configure_group(&mut group);
@@ -204,10 +307,10 @@ fn bench_concurrent_get(c: &mut Criterion) {
             (threads * OPERATIONS_PER_THREAD) as u64,
         ));
 
-        group.bench_with_input(BenchmarkId::new("spice", threads), &threads, |b, &n| {
+        group.bench_with_input(bench_id("spice_lru", threads), &threads, |b, &n| {
             b.iter_batched(
                 || {
-                    let backend = spice_backend();
+                    let backend = spice_backend(EvictionPolicy::Lru);
                     handle.block_on(prefill(backend.as_ref()));
                     backend
                 },
@@ -216,7 +319,7 @@ fn bench_concurrent_get(c: &mut Criterion) {
             );
         });
 
-        group.bench_with_input(BenchmarkId::new("moka", threads), &threads, |b, &n| {
+        group.bench_with_input(bench_id("moka_lru", threads), &threads, |b, &n| {
             b.iter_batched(
                 || {
                     let backend = moka_backend();
@@ -229,7 +332,7 @@ fn bench_concurrent_get(c: &mut Criterion) {
         });
 
         #[cfg(feature = "pingora")]
-        group.bench_with_input(BenchmarkId::new("pingora", threads), &threads, |b, &n| {
+        group.bench_with_input(bench_id("pingora", threads), &threads, |b, &n| {
             b.iter_batched(
                 || {
                     let backend = pingora_backend();
@@ -255,10 +358,10 @@ fn bench_concurrent_get_hot(c: &mut Criterion) {
             (threads * OPERATIONS_PER_THREAD) as u64,
         ));
 
-        group.bench_with_input(BenchmarkId::new("spice", threads), &threads, |b, &n| {
+        group.bench_with_input(bench_id("spice_lru", threads), &threads, |b, &n| {
             b.iter_batched(
                 || {
-                    let backend = spice_backend();
+                    let backend = spice_backend(EvictionPolicy::Lru);
                     handle.block_on(prefill_hot(backend.as_ref()));
                     backend
                 },
@@ -267,7 +370,7 @@ fn bench_concurrent_get_hot(c: &mut Criterion) {
             );
         });
 
-        group.bench_with_input(BenchmarkId::new("moka", threads), &threads, |b, &n| {
+        group.bench_with_input(bench_id("moka_lru", threads), &threads, |b, &n| {
             b.iter_batched(
                 || {
                     let backend = moka_backend();
@@ -280,7 +383,7 @@ fn bench_concurrent_get_hot(c: &mut Criterion) {
         });
 
         #[cfg(feature = "pingora")]
-        group.bench_with_input(BenchmarkId::new("pingora", threads), &threads, |b, &n| {
+        group.bench_with_input(bench_id("pingora", threads), &threads, |b, &n| {
             b.iter_batched(
                 || {
                     let backend = pingora_backend();
@@ -306,10 +409,10 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
             (threads * OPERATIONS_PER_THREAD) as u64,
         ));
 
-        group.bench_with_input(BenchmarkId::new("spice", threads), &threads, |b, &n| {
+        group.bench_with_input(bench_id("spice_lru", threads), &threads, |b, &n| {
             b.iter_batched(
                 || {
-                    let backend = spice_backend();
+                    let backend = spice_backend(EvictionPolicy::Lru);
                     handle.block_on(prefill(backend.as_ref()));
                     backend
                 },
@@ -318,7 +421,7 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
             );
         });
 
-        group.bench_with_input(BenchmarkId::new("moka", threads), &threads, |b, &n| {
+        group.bench_with_input(bench_id("moka_lru", threads), &threads, |b, &n| {
             b.iter_batched(
                 || {
                     let backend = moka_backend();
@@ -331,7 +434,7 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
         });
 
         #[cfg(feature = "pingora")]
-        group.bench_with_input(BenchmarkId::new("pingora", threads), &threads, |b, &n| {
+        group.bench_with_input(bench_id("pingora", threads), &threads, |b, &n| {
             b.iter_batched(
                 || {
                     let backend = pingora_backend();
@@ -348,6 +451,7 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    bench_concurrent_get_hit70,
     bench_concurrent_get,
     bench_concurrent_get_hot,
     bench_concurrent_mixed

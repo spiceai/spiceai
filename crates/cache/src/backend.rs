@@ -26,6 +26,10 @@ use std::time::Duration;
 pub mod moka;
 pub mod spice;
 
+#[cfg(all(test, feature = "pingora"))]
+#[allow(dead_code)]
+mod differential;
+
 #[cfg(feature = "pingora")]
 pub mod pingora;
 
