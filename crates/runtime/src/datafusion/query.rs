@@ -996,31 +996,37 @@ impl Query {
                 {
                     let ttl = cache_provider.ttl();
                     let now = std::time::Instant::now();
-                    if !cached_result.is_stale(ttl, now)
-                        && let Some(records) = match cached_result.raw_batches() {
-                            Some(raw) => Some(raw),
-                            None => cached_result.records().await.ok(),
+                    if !cached_result.is_stale(ttl, now) {
+                        let stream = if let Some(raw) = cached_result.raw_batches() {
+                            Some(::cache::result::query::CachedStream::from_raw(
+                                raw,
+                                cached_result.schema.arc(),
+                            ))
+                        } else {
+                            cached_result.records().await.ok().map(|records| {
+                                ::cache::result::query::CachedStream::from_arced(
+                                    records,
+                                    cached_result.schema.arc(),
+                                )
+                            })
+                        };
+                        if let Some(stream) = stream {
+                            tracing::debug!(
+                                job_id,
+                                cache_key = plan_cache_key.as_u64(),
+                                "Returning cached result for distributed query (plan)"
+                            );
+                            return Ok(QueryHandle::new_with_cached_result(
+                                job_id.to_string(),
+                                Arc::clone(logical_plan.schema().inner()),
+                                Arc::clone(&self.df),
+                                None,
+                                Box::pin(stream),
+                                Arc::clone(&request_context),
+                                trace_span,
+                                Arc::clone(&sql_preview),
+                            ));
                         }
-                    {
-                        tracing::debug!(
-                            job_id,
-                            cache_key = plan_cache_key.as_u64(),
-                            "Returning cached result for distributed query (plan)"
-                        );
-                        let stream = ::cache::result::query::CachedStream::from_raw(
-                            records,
-                            cached_result.schema.arc(),
-                        );
-                        return Ok(QueryHandle::new_with_cached_result(
-                            job_id.to_string(),
-                            Arc::clone(logical_plan.schema().inner()),
-                            Arc::clone(&self.df),
-                            None,
-                            Box::pin(stream),
-                            Arc::clone(&request_context),
-                            trace_span,
-                            Arc::clone(&sql_preview),
-                        ));
                     }
                 }
 

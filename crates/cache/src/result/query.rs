@@ -399,6 +399,10 @@ pub struct CachedStream {
     /// Schema representing the data
     schema: SchemaRef,
     index: usize,
+    /// Prefetch the next batch's headers after each poll. Only the Raw
+    /// SQL serve path ([`Self::from_raw`]) sets this; search and
+    /// just-decoded Encoded hits do not.
+    prefetch_next: bool,
 }
 
 impl CachedStream {
@@ -412,13 +416,15 @@ impl CachedStream {
             data: StreamBatches::Shared(data),
             schema,
             index: 0,
+            prefetch_next: false,
         }
     }
 
-    /// Serve a Raw (or just-decoded) pre-`Arc`'d slice.
+    /// Serve a Raw SQL hit from a pre-`Arc`'d slice.
     ///
     /// Prefetches the first batch's data buffers and the next batch's headers
     /// before returning so the caller's first poll / encode sees warm lines.
+    /// Just-decoded Encoded entries should use [`Self::from_arced`] instead.
     #[must_use]
     pub fn from_raw(data: CachedBatches, schema: SchemaRef) -> Self {
         super::prefetch::prefetch_raw_serve_arced(&data);
@@ -426,6 +432,18 @@ impl CachedStream {
             data: StreamBatches::Arced(data),
             schema,
             index: 0,
+            prefetch_next: true,
+        }
+    }
+
+    /// Serve a pre-`Arc`'d slice without prefetch (Encoded decode, tests).
+    #[must_use]
+    pub fn from_arced(data: CachedBatches, schema: SchemaRef) -> Self {
+        Self {
+            data: StreamBatches::Arced(data),
+            schema,
+            index: 0,
+            prefetch_next: false,
         }
     }
 }
@@ -442,7 +460,9 @@ impl Stream for CachedStream {
             return Poll::Ready(None);
         };
         self.index = index + 1;
-        if let Some(next) = self.data.get(self.index) {
+        if self.prefetch_next
+            && let Some(next) = self.data.get(self.index)
+        {
             super::prefetch::prefetch_batch_headers(next);
         }
         Poll::Ready(Some(Ok(batch)))
@@ -1167,6 +1187,21 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("int column");
         assert_eq!(col0.values(), &[1, 2]);
+    }
+
+    /// Encoded-decode serve: same batches and schema, no prefetch.
+    #[test]
+    fn cached_stream_from_arced_multi_batch() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let stored = wrap_raw_batches(vec![int_batch(&schema, &[1]), int_batch(&schema, &[2, 3])]);
+        let yielded = drain_stream(CachedStream::from_arced(
+            Arc::clone(&stored),
+            Arc::clone(&schema),
+        ));
+        assert_eq!(yielded.len(), 2);
+        assert_eq!(yielded[0].num_rows(), 1);
+        assert_eq!(yielded[1].num_rows(), 2);
+        assert!(Arc::ptr_eq(yielded[0].column(0), stored[0].column(0)));
     }
 
     /// Shared-vec serve (search cache) keeps the same stream contract.

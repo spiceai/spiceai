@@ -560,6 +560,17 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
         );
 
         group.bench_with_input(
+            BenchmarkId::new("cached_stream_from_arced", &id),
+            &stored,
+            |b, stored| {
+                b.iter(|| {
+                    let stream = CachedStream::from_arced(Arc::clone(stored), Arc::clone(&schema));
+                    black_box(drain_stream(stream))
+                });
+            },
+        );
+
+        group.bench_with_input(
             BenchmarkId::new("cached_stream_from_raw", &id),
             &stored,
             |b, stored| {

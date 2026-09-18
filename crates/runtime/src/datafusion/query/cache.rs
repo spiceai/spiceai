@@ -1060,11 +1060,11 @@ impl Query {
             );
         }
 
-        let records = if let Some(raw) = cached_result.raw_batches() {
-            raw
+        let stream = if let Some(raw) = cached_result.raw_batches() {
+            CachedStream::from_raw(raw, cached_result.schema.arc())
         } else {
             match cached_result.records().await {
-                Ok(records) => records,
+                Ok(records) => CachedStream::from_arced(records, cached_result.schema.arc()),
                 Err(e) => {
                     tracing::error!("Failed to decode cached query result: {e}");
                     return Served::Undecodable(tracker);
@@ -1092,10 +1092,7 @@ impl Query {
         });
 
         Served::Hit {
-            result: QueryResult::new(
-                Box::pin(CachedStream::from_raw(records, cached_result.schema.arc())),
-                cache_status,
-            ),
+            result: QueryResult::new(Box::pin(stream), cache_status),
             tracker,
         }
     }
