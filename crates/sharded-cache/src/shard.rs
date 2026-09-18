@@ -98,6 +98,32 @@ impl<V> Shard<V> {
         }
     }
 
+    pub(crate) fn peek_weight(&self, key: u64) -> Option<u64> {
+        let idx = *self.map.get(&key)?;
+        match self.slots.get(idx as usize) {
+            Some(Slot::Occupied(node)) => Some(node.weight),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn peek_tail(&self) -> Option<(u64, u64)> {
+        let idx = self.tail?;
+        match self.slots.get(idx as usize) {
+            Some(Slot::Occupied(node)) => Some((node.key, node.weight)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn tail_is_expired(&self, now: Instant, ttl: Duration) -> bool {
+        let Some(idx) = self.tail else {
+            return false;
+        };
+        match self.slots.get(idx as usize) {
+            Some(Slot::Occupied(node)) => now.saturating_duration_since(node.inserted_at) >= ttl,
+            _ => false,
+        }
+    }
+
     pub(crate) fn increment_sketch(&mut self, key: u64) {
         if let Some(sketch) = self.sketch.as_mut() {
             sketch.increment(key);
@@ -443,6 +469,17 @@ mod tests {
         assert!(matches!(got, GetOutcome::Hit(10)));
         assert_eq!(shard.len(), 2, "a hit must not remove the entry");
         assert_eq!(shard.keys_mru_first(), vec![1, 2]);
+    }
+
+    #[test]
+    fn tail_is_expired_uses_insert_time() {
+        let mut shard = shard();
+        let inserted = Instant::now();
+        shard.insert(1, 10, 5, inserted);
+        assert!(!shard.tail_is_expired(inserted, Duration::from_secs(1)));
+        assert!(shard.tail_is_expired(inserted + Duration::from_secs(2), Duration::from_secs(1)));
+        assert_eq!(shard.peek_weight(1), Some(5));
+        assert_eq!(shard.peek_tail(), Some((1, 5)));
     }
 
     #[test]

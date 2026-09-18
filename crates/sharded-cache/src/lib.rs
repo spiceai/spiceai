@@ -347,6 +347,12 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
                 if self.weight.load(Ordering::Relaxed) <= self.max_weight {
                     break;
                 }
+                // Reclaim expired tails before a live size victim. Peeking 16
+                // tails is bounded; `expire_older_than` runs only on shards
+                // whose tail is already stale, not a full-cache scan.
+                if self.expire_expired_tails(&mut evicted) {
+                    continue;
+                }
                 let progressed = match self.policy {
                     EvictionPolicy::TinyLfu => self.evict_tinylfu_one(admitted, &mut evicted),
                     // LRU must not self-evict a just-admitted sole resident while
@@ -423,6 +429,32 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         best
     }
 
+    /// Expire every shard whose LRU tail is already stale. Bounded: one tail
+    /// peek per shard, and a slot walk only on shards that have an expired tail.
+    fn expire_expired_tails(&self, evicted: &mut Vec<(V, EvictionReason)>) -> bool {
+        let now = Instant::now();
+        let mut progressed = false;
+        for shard_idx in 0..NUM_SHARDS {
+            let mut shard = self.shards[shard_idx].0.lock();
+            if !shard.tail_is_expired(now, self.ttl) {
+                continue;
+            }
+            let (expired, weight) = shard.expire_older_than(now, self.ttl);
+            if weight > 0 {
+                self.sub_weight(weight);
+            }
+            drop(shard);
+            if expired.is_empty() {
+                continue;
+            }
+            progressed = true;
+            for value in expired {
+                evicted.push((value, EvictionReason::Expired));
+            }
+        }
+        progressed
+    }
+
     fn remove_for_size(
         &self,
         shard_idx: usize,
@@ -445,18 +477,23 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         if self.weight.load(Ordering::Relaxed) <= self.max_weight {
             return false;
         }
-        let (victim_key, value, weight) = if let Some((value, weight)) = shard.remove(key) {
-            (key, value, weight)
-        } else {
-            let Some((victim_key, value, weight)) = shard.evict_lru() else {
-                return false;
-            };
-            (victim_key, value, weight)
+        let Some(weight) = shard
+            .peek_weight(key)
+            .or_else(|| shard.peek_tail().map(|(_, weight)| weight))
+        else {
+            return false;
         };
         if !self.claim_size_eviction(weight) {
-            let _ = shard.insert(victim_key, value, weight, now);
             return false;
         }
+        let Some((_, value, _)) = shard
+            .remove(key)
+            .map(|(value, weight)| (key, value, weight))
+            .or_else(|| shard.evict_lru())
+        else {
+            self.weight.fetch_add(weight, Ordering::Relaxed);
+            return false;
+        };
         drop(shard);
         evicted.push((value, EvictionReason::Size));
         true
@@ -521,13 +558,16 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         if self.weight.load(Ordering::Relaxed) <= self.max_weight {
             return false;
         }
-        let Some((victim_key, value, weight)) = shard.evict_lru() else {
+        let Some((_, weight)) = shard.peek_tail() else {
             return false;
         };
         if !self.claim_size_eviction(weight) {
-            let _ = shard.insert(victim_key, value, weight, now);
             return false;
         }
+        let Some((_, value, _)) = shard.evict_lru() else {
+            self.weight.fetch_add(weight, Ordering::Relaxed);
+            return false;
+        };
         drop(shard);
         evicted.push((value, EvictionReason::Size));
         true
@@ -1065,6 +1105,68 @@ mod tests {
         );
         assert_eq!(cache.weighted_size(), 60);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn failed_size_claim_does_not_renew_ttl_or_recency() {
+        let cache = Arc::new(cache(100, Duration::from_millis(200)));
+        cache.insert(0, TestValue::with_size("old", 40), 40);
+        cache.insert(16, TestValue::with_size("newer", 20), 20);
+        assert_eq!(
+            cache.keys_in_lru_order(),
+            vec![16, 0],
+            "key 16 is MRU and key 0 is the same-shard LRU tail"
+        );
+
+        let cache_for_hook = Arc::clone(&cache);
+        cache.set_before_size_victim(move || {
+            cache_for_hook.remove(&1);
+        });
+        std::thread::sleep(Duration::from_millis(80));
+        cache.insert(1, TestValue::with_size("overflow", 60), 60);
+
+        assert_eq!(
+            cache.keys_in_lru_order(),
+            vec![16, 0],
+            "a failed size claim must leave the victim at its original LRU position"
+        );
+        assert!(
+            cache.get(&0).is_some(),
+            "the victim must still be present immediately after the failed claim"
+        );
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            cache.get(&0).is_none(),
+            "a failed size claim must not reset the victim's TTL origin"
+        );
+    }
+
+    #[test]
+    fn tinylfu_reclaims_an_expired_cross_shard_tail_before_a_live_victim() {
+        let cache: ShardedCache<TestValue> =
+            ShardedCache::new(100, Duration::from_millis(100), EvictionPolicy::TinyLfu);
+        let expired = 0u64;
+        let live = 1u64;
+        let candidate = 2u64;
+        cache.insert(expired, TestValue::with_size("expired", 50), 50);
+        for _ in 0..64 {
+            assert!(cache.get(&expired).is_some());
+        }
+        std::thread::sleep(Duration::from_millis(70));
+        cache.insert(live, TestValue::with_size("live", 50), 50);
+        std::thread::sleep(Duration::from_millis(50));
+        cache.insert(candidate, TestValue::with_size("new", 10), 10);
+
+        assert!(
+            cache.get(&expired).is_none(),
+            "the expired cross-shard tail must be reclaimed before a live size victim"
+        );
+        assert!(
+            cache.get(&live).is_some(),
+            "a live resident must not be size-evicted while an expired tail still holds budget"
+        );
+        assert!(cache.get(&candidate).is_some());
+        assert!(cache.weighted_size() <= 100);
     }
 
     #[test]
