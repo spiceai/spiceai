@@ -15,8 +15,9 @@ limitations under the License.
 */
 
 //! What serving a results-cache hit costs before any rows move: decoding an encoded entry,
-//! computing a logical-plan key (including for a parameterized statement), and
-//! draining a Raw multi-batch serve stream.
+//! serving that decoded entry through the production wrap+stream path, computing a
+//! logical-plan key (including for a parameterized statement), and draining a Raw
+//! multi-batch serve stream.
 
 #![allow(clippy::expect_used)] // Benchmarks can panic
 
@@ -26,12 +27,14 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use bytes::Bytes;
 use cache::encoding::{Encoder, ZstdEncoder};
 use cache::get_hash_builder;
 use cache::key::CacheKey;
 use cache::result::CacheStatus;
 use cache::result::query::{
     CachedQueryResult, CachedStream, QueryResult, QueryResultSource, SendableCachedRawStream,
+    wrap_raw_batches,
 };
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion::common::{ParamValues, ScalarValue};
@@ -269,6 +272,35 @@ fn bench_parameterized_key(c: &mut Criterion) {
     group.finish();
 }
 
+fn touch_first_int64(batch: &RecordBatch) -> i64 {
+    let Some(values) = batch.column(0).as_any().downcast_ref::<Int64Array>() else {
+        return 0;
+    };
+    let mut sum = 0_i64;
+    for value in values.values() {
+        sum = sum.wrapping_add(*value);
+    }
+    sum
+}
+
+/// Force a read of every numeric column so a working-set scan is sized from
+/// bytes actually touched, not from allocated columns the drain never reads.
+fn touch_numeric_columns(batch: &RecordBatch) -> i64 {
+    let mut sum = 0_i64;
+    for column in batch.columns() {
+        if let Some(values) = column.as_any().downcast_ref::<Int64Array>() {
+            for value in values.values() {
+                sum = sum.wrapping_add(*value);
+            }
+        } else if let Some(values) = column.as_any().downcast_ref::<Float64Array>() {
+            for value in values.values() {
+                sum = sum.wrapping_add(value.to_bits().cast_signed());
+            }
+        }
+    }
+    sum
+}
+
 fn drain_raw_stream<S>(mut stream: S) -> usize
 where
     S: Stream<Item = Result<Arc<RecordBatch>, DataFusionError>> + Unpin,
@@ -300,15 +332,7 @@ where
     loop {
         match Pin::new(&mut stream).poll_next(&mut cx) {
             Poll::Ready(Some(Ok(batch))) => {
-                if let Some(col) = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
-                {
-                    for value in col.values() {
-                        sum = sum.wrapping_add(*value);
-                    }
-                }
+                sum = sum.wrapping_add(touch_first_int64(&batch));
                 black_box(&batch);
             }
             Poll::Ready(None) => break,
@@ -370,15 +394,49 @@ where
     loop {
         match Pin::new(&mut stream).poll_next(&mut cx) {
             Poll::Ready(Some(Ok(batch))) => {
-                if let Some(col) = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
-                {
-                    for value in col.values() {
-                        sum = sum.wrapping_add(*value);
-                    }
-                }
+                sum = sum.wrapping_add(touch_first_int64(&batch));
+                black_box(&batch);
+            }
+            Poll::Ready(None) => break,
+            Poll::Ready(Some(Err(e))) => panic!("stream error: {e}"),
+            Poll::Pending => panic!("serve stream must be immediately ready"),
+        }
+    }
+    sum
+}
+
+fn drain_raw_and_touch_numeric<S>(mut stream: S) -> i64
+where
+    S: Stream<Item = Result<Arc<RecordBatch>, DataFusionError>> + Unpin,
+{
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut sum = 0_i64;
+    loop {
+        match Pin::new(&mut stream).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                sum = sum.wrapping_add(touch_numeric_columns(&batch));
+                black_box(&batch);
+            }
+            Poll::Ready(None) => break,
+            Poll::Ready(Some(Err(e))) => panic!("stream error: {e}"),
+            Poll::Pending => panic!("serve stream must be immediately ready"),
+        }
+    }
+    sum
+}
+
+fn drain_and_touch_numeric<S>(mut stream: S) -> i64
+where
+    S: Stream<Item = Result<RecordBatch, DataFusionError>> + Unpin,
+{
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut sum = 0_i64;
+    loop {
+        match Pin::new(&mut stream).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                sum = sum.wrapping_add(touch_numeric_columns(&batch));
                 black_box(&batch);
             }
             Poll::Ready(None) => break,
@@ -494,8 +552,9 @@ fn run_persistent_concurrent_bench<F>(
 }
 
 /// Distinct Raw entries whose array buffers exceed a large last-level
-/// cache (this host's L3 is 320 MiB). Rotating through the set keeps
-/// the scan off a warm line.
+/// cache (this host's L3 is 320 MiB). Each batch has Int64 + Float64;
+/// the working-set drains read both so scanned bytes match the
+/// allocation. Rotating through the set keeps the scan off a warm line.
 fn numeric_working_set(
     target_bytes: usize,
 ) -> (
@@ -544,7 +603,8 @@ fn numeric_working_set(
 /// `Arc` clone per poll). `legacy_column_clone` and `arc_batch_clone`
 /// isolate the per-batch clone cost without stream construction — they are
 /// not the serve-path comparison. `*_touch_working_set` rotates through
-/// entries larger than LLC so prefetch is not measured on a warm line.
+/// entries larger than LLC and touches every numeric column so prefetch
+/// is not measured on a warm line or on unread buffers.
 /// `concurrent_hits` / `concurrent_legacy_hits` use persistent workers.
 fn bench_raw_stream_serve(c: &mut Criterion) {
     let mut group = c.benchmark_group("raw_stream_serve");
@@ -724,7 +784,7 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
                 let stored = &ws_raw[raw_idx];
                 raw_idx = (raw_idx + 1) % ws_raw.len();
                 let stream = sql_raw_hit_stream(stored, &ws_schema);
-                black_box(drain_raw_and_touch(stream))
+                black_box(drain_raw_and_touch_numeric(stream))
             });
         },
     );
@@ -736,11 +796,111 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
                 let shared = &ws_legacy[legacy_idx];
                 legacy_idx = (legacy_idx + 1) % ws_legacy.len();
                 let stream = LegacyCachedStream::new(Arc::clone(shared), Arc::clone(&ws_schema));
-                black_box(drain_and_touch(stream))
+                black_box(drain_and_touch_numeric(stream))
             });
         },
     );
 
+    group.finish();
+}
+
+/// Encoded SQL hit: decode, wrap, then the same serve path Raw hits use.
+///
+/// `bench_zstd_decode` stops at `encoder.decode`. Production encoded hits
+/// then `wrap_raw_batches` and `QueryResult::from_cached_raw`. This group
+/// matches that contract against decode → `Arc<Vec<_>>` →
+/// `LegacyCachedStream`, including the 16/64/256-small-batch shapes.
+fn bench_encoded_stream_serve(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a tokio runtime");
+    let encoder: Arc<dyn Encoder> = Arc::new(ZstdEncoder::default());
+    let mut group = c.benchmark_group("encoded_stream_serve");
+    let cases = [
+        (16, 1, 1),
+        (64, 1, 1),
+        (256, 1, 1),
+        (256, 0, 1),
+        (8, 64, 20),
+    ];
+    for (batches, rows, text_columns) in cases {
+        let payload: Vec<RecordBatch> = (0..batches).map(|_| batch(rows, text_columns)).collect();
+        let schema = payload[0].schema();
+        let encoded = runtime
+            .block_on(encoder.encode(&payload))
+            .expect("the batches encode");
+        let now = Instant::now();
+        let cached = CachedQueryResult::new(
+            Bytes::from(encoded.bytes.clone()),
+            encoded.decoded_len,
+            Arc::clone(&schema),
+            Arc::new(HashSet::new()),
+            now,
+            now,
+            Some(Arc::clone(&encoder)),
+        );
+        assert!(
+            cached.is_encoded(),
+            "encoded serve benches must start from an encoded entry"
+        );
+        let id = format!(
+            "batches={batches}/rows={rows}/text_columns={text_columns}/ipc_bytes={}/encoded_bytes={}",
+            encoded.decoded_len,
+            encoded.bytes.len()
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("zstd_decode_only", &id),
+            &encoded.bytes,
+            |b, bytes| {
+                b.to_async(&runtime).iter(|| async {
+                    black_box(
+                        encoder
+                            .decode(black_box(bytes))
+                            .await
+                            .expect("the payload decodes"),
+                    )
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("decode_and_wrap", &id),
+            &encoded.bytes,
+            |b, bytes| {
+                b.to_async(&runtime).iter(|| async {
+                    let decoded = encoder
+                        .decode(black_box(bytes))
+                        .await
+                        .expect("the payload decodes");
+                    black_box(wrap_raw_batches(decoded))
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("legacy_encoded_hit", &id),
+            &encoded.bytes,
+            |b, bytes| {
+                b.to_async(&runtime).iter(|| async {
+                    let decoded = encoder
+                        .decode(black_box(bytes))
+                        .await
+                        .expect("the payload decodes");
+                    let stream = LegacyCachedStream::new(Arc::new(decoded), Arc::clone(&schema));
+                    black_box(drain_stream(stream))
+                });
+            },
+        );
+
+        group.bench_function(BenchmarkId::new("encoded_records_serve", &id), |b| {
+            b.to_async(&runtime).iter(|| async {
+                let records = cached.records().await.expect("the payload decodes");
+                let stream = sql_raw_hit_stream(&records, &schema);
+                black_box(drain_raw_stream(stream))
+            });
+        });
+    }
     group.finish();
 }
 
@@ -749,6 +909,7 @@ criterion_group!(
     bench_zstd_decode,
     bench_plan_key,
     bench_parameterized_key,
-    bench_raw_stream_serve
+    bench_raw_stream_serve,
+    bench_encoded_stream_serve
 );
 criterion_main!(benches);

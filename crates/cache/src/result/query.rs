@@ -216,9 +216,10 @@ impl CachedQueryResult {
     /// Decode and return the cached record batches.
     ///
     /// Raw entries return the stored pre-`Arc`'d slice (`Arc::clone` of the
-    /// handle only). Encoded entries wrap the decoded batches the same way so
-    /// the caller can build a [`CachedRawStream`] without a second column-Arc
-    /// pass.
+    /// handle only). Encoded entries decode, then [`wrap_raw_batches`], so
+    /// [`QueryResult::from_cached_raw`] can serve either kind without a second
+    /// column-`Arc` pass. `encoded_stream_serve` in `cache_hit_costs` measures
+    /// that wrap-and-serve against decode-only and the `Arc<Vec<_>>` stream.
     ///
     /// # Errors
     ///

@@ -603,7 +603,7 @@ impl Stream for InlineFlightStream {
                         ))));
                     };
                     match encode_flight_batch(
-                        batch.as_record_batch(),
+                        batch,
                         args.needs_view_cast,
                         &args.schema,
                         &args.encoder,
@@ -697,7 +697,7 @@ fn spawn_flight_encode_stream(
             while let Some(batch_result) = data_stream.next().await {
                 match batch_result {
                     Ok(batch) => match encode_flight_batch(
-                        batch.as_record_batch(),
+                        batch,
                         needs_view_cast,
                         &schema,
                         &encoder,
@@ -741,11 +741,15 @@ fn spawn_flight_encode_stream(
     }
 }
 
-/// Encode one [`RecordBatch`] into its Flight dictionary + record-batch
+/// Encode one served batch into its Flight dictionary + record-batch
 /// messages, applying the `Utf8View`/`BinaryView` → `Large*` cast when the
 /// advertised schema was expanded.
+///
+/// [`ServedFlightBatch::Owned`] is moved into the cast so a non-cache Flight
+/// query does not pay `RecordBatch::clone` before `cast_view_columns`.
+/// [`ServedFlightBatch::Shared`] clones only when that cast is required.
 fn encode_flight_batch(
-    batch: &RecordBatch,
+    batch: ServedFlightBatch,
     needs_view_cast: bool,
     schema: &Arc<Schema>,
     encoder: &IpcDataGenerator,
@@ -753,14 +757,17 @@ fn encode_flight_batch(
     options: &IpcWriteOptions,
     compression_context: &mut CompressionContext,
 ) -> Result<(Vec<FlightData>, FlightData), Status> {
-    // Cast view columns to match the expanded schema we advertised.
     let cast;
     let batch = if needs_view_cast {
-        cast = arrow_tools::schema::cast_view_columns(batch.clone(), schema)
+        let owned = match batch {
+            ServedFlightBatch::Owned(batch) => batch,
+            ServedFlightBatch::Shared(batch) => RecordBatch::clone(batch.as_ref()),
+        };
+        cast = arrow_tools::schema::cast_view_columns(owned, schema)
             .map_err(|e| Status::internal(e.to_string()))?;
         &cast
     } else {
-        batch
+        batch.as_record_batch()
     };
 
     let (dicts, batch_data) = encoder
