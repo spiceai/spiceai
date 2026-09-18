@@ -560,6 +560,9 @@ Upstream [sjrusso8/spark-connect-rs](https://github.com/sjrusso8/spark-connect-r
 |---|---|---|---|
 | Default to the `http` scheme when `use_ssl` is false (fork PR #3) | A non-TLS Spark Connect endpoint is dialled over TLS and the connection fails | silent (connection failure) | `crates/data_components/src/spark_connect.rs::a_non_tls_spark_endpoint_is_dialled_in_plaintext`, which asserts the HTTP/2 preface arrives at a local plaintext listener through the real `SparkSessionBuilder::remote(…).build()` path, and `…::a_non_tls_connection_string_resolves_to_an_http_endpoint` for the mechanism |
 | Edmondo fork changes merged in | Spark Connect features Spice depends on go missing | build | compile-guarded |
+| A TLS endpoint is dialled with a TLS configuration — `ClientTlsConfig::new().with_native_roots()` — and `use_ssl` is exposed to ask (fork PR #7) | `Endpoint::connect` attaches no TLS configuration of its own, so without this a `use_ssl=true` endpoint is either dialled in the clear, which the server rejects, or refused by `tonic` for having no TLS configuration. Every dataset on a Databricks endpoint fails to load either way. The counterpart to the `http`-scheme row above: that one decides the scheme, this one supplies the TLS | build (the `use_ssl` accessor) + silent (connection failure) | `crates/data_components/src/spark_connect.rs::a_tls_spark_endpoint_is_dialled_with_a_tls_handshake`, which dials a listener that speaks no TLS and requires the first bytes to be a TLS handshake record. It pins that TLS is configured at all, not *which* root store was chosen — the roots a client trusts are not observable from its `ClientHello` — so `with_native_roots` itself rests on the accessor, which `::a_non_tls_connection_string_resolves_to_an_http_endpoint` calls and the compiler requires |
+| `SparkSession::set_token`, so a session's bearer token can be replaced without rebuilding it (fork PR #8) | A rotated Databricks token cannot be applied to a live session, so every session has to be torn down and rebuilt when a token refreshes | build | compile-guarded by `crates/data_components/src/spark_connect.rs`, which calls `session.set_token(Some(token))` on refresh |
+| `user_agent` read from the connection string, and used to replace the default rather than extend it (fork PRs #9, #10) | A Spark Connect client identifies itself to the server by user agent, and Databricks meters and attributes traffic by it. Without these the value in a connection string is ignored, or appended to `spark-connect-rs`'s own, so the traffic is attributed to the library | silent (attribution) | **GAP** — and nothing in this repository sets `user_agent=` in a Spark Connect connection string today, so the patches are reachable only through one a user supplies. Worth a guard when Spice starts setting it; `crates/data_components/src/spark_connect.rs`'s `TEST_CONNECTION` already carries the option, but it is parsed by Spice's own factory rather than by the fork's builder |
 
 ## delta-kernel-rs
 
@@ -590,7 +593,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**22 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**23 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -625,13 +628,19 @@ writing a test; each says what would unblock it:
 7. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
    there is no behaviour of ours to assert on.
 
+**Attribution.** Neither wrong rows nor an outage; someone else gets the credit:
+
+8. `spark-connect-rs` `user_agent` read from the connection string and used to
+   replace the default (fork PRs #9, #10) — nothing here sets the option yet, so
+   there is no behaviour of ours to assert on until it does.
+
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
 the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time and
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-8. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+9. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
    `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
    `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
    `snowflake-rs` streaming batches (memory, not latency — but see the
