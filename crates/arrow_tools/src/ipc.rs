@@ -81,7 +81,9 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{ArrayRef, Int32Array, NullArray, RecordBatch};
-    use arrow_ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
+    use arrow_ipc::writer::{
+        CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions,
+    };
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{declared_message_header, declares_ipc_data, declares_record_batch};
@@ -100,7 +102,12 @@ mod tests {
             &options,
         );
         let (dictionaries, encoded) = generator
-            .encode(batch, &mut tracker, &options, &mut Default::default())
+            .encode(
+                batch,
+                &mut tracker,
+                &options,
+                &mut CompressionContext::default(),
+            )
             .expect("encoding a batch");
         assert!(
             dictionaries.is_empty(),
@@ -166,8 +173,7 @@ mod tests {
     /// A zero-row batch also encodes with an empty body, and it too is a record batch.
     #[test]
     fn a_zero_row_batch_declares_a_record_batch_with_an_empty_body() {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let (_, batch_header, batch_body) = encode(&RecordBatch::new_empty(schema));
+        let (_, batch_header, batch_body) = encode(&RecordBatch::new_empty(int_batch().schema()));
 
         assert!(batch_body.is_empty());
         assert_eq!(declares_record_batch(&batch_header), Ok(true));
@@ -187,15 +193,15 @@ mod tests {
     #[test]
     fn an_unparseable_header_is_an_error_not_an_absence() {
         let garbage = [0xff_u8; 8];
-        assert!(declared_message_header(&garbage).is_err());
-        assert!(declares_record_batch(&garbage).is_err());
-        assert!(declares_ipc_data(&garbage).is_err());
+        declared_message_header(&garbage).expect_err("a garbage header should not parse");
+        declares_record_batch(&garbage).expect_err("a garbage header should not parse");
+        declares_ipc_data(&garbage).expect_err("a garbage header should not parse");
     }
 
     /// A truncated header is the shape a keepalive-sized message has: fewer bytes than the
     /// flatbuffer root needs.
     #[test]
     fn a_truncated_header_is_an_error() {
-        assert!(declared_message_header(&[0x01, 0x02]).is_err());
+        declared_message_header(&[0x01, 0x02]).expect_err("a truncated header should not parse");
     }
 }

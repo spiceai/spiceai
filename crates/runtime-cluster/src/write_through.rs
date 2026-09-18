@@ -247,7 +247,7 @@ pub async fn forward_federated_partitioned_write(
     // Decode the first message and build a streaming iterator that yields
     // each subsequent FlightData message as a RecordBatch without buffering.
     let batch_stream = decode_client_batches(
-        first_message,
+        &first_message,
         streaming_flight,
         declared,
         normalizer,
@@ -290,7 +290,7 @@ pub async fn forward_federated_partitioned_write(
 /// three with the Arrow decoder's own wording, which names a flatbuffer range rather than
 /// anything the writer can act on.
 fn decode_client_batches<S>(
-    first_message: FlightData,
+    first_message: &FlightData,
     mut messages: S,
     declared: SchemaRef,
     normalizer: MapEntriesNormalizer,
@@ -299,9 +299,9 @@ fn decode_client_batches<S>(
 where
     S: Stream<Item = std::result::Result<FlightData, tonic::Status>> + Unpin + Send + 'static,
 {
-    let dictionaries_by_id = Arc::new(HashMap::new());
+    let dictionaries_by_id = HashMap::new();
     let first_batch = maybe_read_first_batch(
-        &first_message,
+        first_message,
         Arc::clone(&declared),
         &dictionaries_by_id,
         &table_name,
@@ -311,7 +311,7 @@ where
         if let Some(batch) = first_batch {
             yield normalizer
                 .normalize(batch)
-                .context(MapEntriesNotNormalizableSnafu { table: table_name.clone() })?;
+                .with_context(|_| MapEntriesNotNormalizableSnafu { table: table_name.clone() })?;
         }
         while let Some(result) = messages.next().await {
             let message = result.context(StreamReadSnafu)?;
@@ -320,12 +320,7 @@ where
                 continue;
             }
 
-            let declares_batch = ipc::declares_record_batch(&message.data_header)
-                .map_err(|message| Error::UnreadableMessageHeader {
-                    table: table_name.clone(),
-                    message,
-                })?;
-            if !declares_batch {
+            if !declares_record_batch(&message.data_header, &table_name)? {
                 // `ensure!` cannot be used inside the generator: it expands to a `return`,
                 // which ends the stream rather than failing it.
                 Err::<(), Error>(Error::NonBatchMessage {
@@ -342,9 +337,18 @@ where
             if batch.num_rows() > 0 {
                 yield normalizer
                     .normalize(batch)
-                    .context(MapEntriesNotNormalizableSnafu { table: table_name.clone() })?;
+                    .with_context(|_| MapEntriesNotNormalizableSnafu { table: table_name.clone() })?;
             }
         }
+    })
+}
+
+/// Whether a message's IPC header declares a record batch, reporting an unreadable header as
+/// this module's own failure so that what the writer sees names the dataset.
+fn declares_record_batch(data_header: &[u8], table: &str) -> Result<bool> {
+    ipc::declares_record_batch(data_header).map_err(|message| Error::UnreadableMessageHeader {
+        table: table.to_string(),
+        message,
     })
 }
 
@@ -367,17 +371,10 @@ where
 fn maybe_read_first_batch(
     first_message: &FlightData,
     schema: SchemaRef,
-    dictionaries_by_id: &Arc<HashMap<i64, Arc<dyn Array>>>,
+    dictionaries_by_id: &HashMap<i64, Arc<dyn Array>>,
     table: &str,
 ) -> Result<Option<RecordBatch>> {
-    let declares_batch =
-        ipc::declares_record_batch(&first_message.data_header).map_err(|message| {
-            Error::UnreadableMessageHeader {
-                table: table.to_string(),
-                message,
-            }
-        })?;
-    if !declares_batch {
+    if !declares_record_batch(&first_message.data_header, table)? {
         return Ok(None);
     }
 
@@ -1244,7 +1241,7 @@ mod tests {
     #[test]
     fn test_maybe_read_first_batch_empty_body_returns_none() {
         let schema = test_schema();
-        let dictionaries_by_id = Arc::new(HashMap::new());
+        let dictionaries_by_id = HashMap::new();
 
         // Build a FlightData with schema header but empty body (schema-only message).
         let batch = RecordBatch::try_new(
@@ -1273,7 +1270,7 @@ mod tests {
     #[test]
     fn test_maybe_read_first_batch_with_data_returns_some() {
         let schema = test_schema();
-        let dictionaries_by_id = Arc::new(HashMap::new());
+        let dictionaries_by_id = HashMap::new();
 
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -1319,7 +1316,7 @@ mod tests {
     #[test]
     fn test_maybe_read_first_batch_single_row() {
         let schema = test_schema();
-        let dictionaries_by_id = Arc::new(HashMap::new());
+        let dictionaries_by_id = HashMap::new();
 
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -1351,7 +1348,7 @@ mod tests {
     #[test]
     fn scheduler_seam_conforms_a_nullable_entries_declaration() {
         let declared = map_schema(true);
-        let dictionaries_by_id = Arc::new(HashMap::new());
+        let dictionaries_by_id = HashMap::new();
 
         let batch = map_batch(true, None);
         let flight_data = encode_batch_to_flight_data(&declared, &batch);
@@ -1401,7 +1398,7 @@ mod tests {
     #[test]
     fn scheduler_seam_refuses_entry_nulls_as_invalid_argument() {
         let declared = map_schema(true);
-        let dictionaries_by_id = Arc::new(HashMap::new());
+        let dictionaries_by_id = HashMap::new();
 
         let batch = map_batch(true, Some(NullBuffer::from(vec![true, false])));
         let flight_data = encode_batch_to_flight_data(&declared, &batch);
@@ -1479,13 +1476,8 @@ mod tests {
         schema: &SchemaRef,
     ) -> Result<Vec<RecordBatch>> {
         let stream = decode_client_batches(
-            first,
-            futures::stream::iter(
-                messages
-                    .into_iter()
-                    .map(Ok::<_, tonic::Status>)
-                    .collect::<Vec<_>>(),
-            ),
+            &first,
+            futures::stream::iter(messages.into_iter().map(Ok::<_, tonic::Status>)),
             Arc::clone(schema),
             MapEntriesNormalizer::for_schema(schema),
             "test.s.events".to_string(),
