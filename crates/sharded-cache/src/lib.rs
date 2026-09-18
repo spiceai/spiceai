@@ -119,6 +119,10 @@ pub struct ShardedCache<V, L: EvictionListener = NoopListener> {
     /// two-thread test can force both inserts to observe the overflow.
     #[cfg(test)]
     after_publish: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
+    /// Test-only: run after the overflow check and before a victim is removed
+    /// so a concurrent `remove` can restore the budget first.
+    #[cfg(test)]
+    before_size_victim: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
     _listener: std::marker::PhantomData<L>,
 }
 
@@ -137,6 +141,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             trim: Mutex::new(()),
             #[cfg(test)]
             after_publish: Mutex::new(None),
+            #[cfg(test)]
+            before_size_victim: Mutex::new(None),
             _listener: std::marker::PhantomData,
         }
     }
@@ -322,8 +328,12 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             return;
         }
         let _trim = self.trim.lock();
-        self.expire_all_stale();
         while self.weight.load(Ordering::Relaxed) > self.max_weight {
+            #[cfg(test)]
+            self.run_before_size_victim();
+            if self.weight.load(Ordering::Relaxed) <= self.max_weight {
+                break;
+            }
             let progressed = match self.policy {
                 EvictionPolicy::TinyLfu => self.evict_tinylfu_one(admitted),
                 // LRU must not self-evict a just-admitted sole resident while
@@ -332,23 +342,6 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             };
             if !progressed {
                 break;
-            }
-        }
-    }
-
-    /// Drop every expired entry so stale weight cannot displace a live victim.
-    fn expire_all_stale(&self) {
-        for shard in self.shards.iter() {
-            let mut shard = shard.0.lock();
-            let now = Instant::now();
-            let (expired, weight) = shard.expire_older_than(now, self.ttl);
-            if expired.is_empty() {
-                continue;
-            }
-            self.sub_weight(weight);
-            drop(shard);
-            for _ in expired {
-                L::on_evict(EvictionReason::Expired);
             }
         }
     }
@@ -393,19 +386,61 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
 
     fn remove_for_size(&self, shard_idx: usize, key: u64) -> bool {
         let mut shard = self.shards[shard_idx].0.lock();
-        let (value, weight) = if let Some((value, weight)) = shard.remove(key) {
-            (value, weight)
+        let now = Instant::now();
+        let (expired, expired_weight) = shard.expire_older_than(now, self.ttl);
+        if expired_weight > 0 {
+            self.sub_weight(expired_weight);
+        }
+        if !expired.is_empty() {
+            drop(shard);
+            for _ in expired {
+                L::on_evict(EvictionReason::Expired);
+            }
+            return true;
+        }
+        if self.weight.load(Ordering::Relaxed) <= self.max_weight {
+            return false;
+        }
+        let (victim_key, value, weight) = if let Some((value, weight)) = shard.remove(key) {
+            (key, value, weight)
         } else {
-            let Some((_, value, weight)) = shard.evict_lru() else {
+            let Some((victim_key, value, weight)) = shard.evict_lru() else {
                 return false;
             };
-            (value, weight)
+            (victim_key, value, weight)
         };
-        self.sub_weight(weight);
+        if !self.claim_size_eviction(weight) {
+            let _ = shard.insert(victim_key, value, weight, now);
+            return false;
+        }
         drop(shard);
         drop(value);
         L::on_evict(EvictionReason::Size);
         true
+    }
+
+    /// Subtract `victim_weight` only while the cache is still over budget.
+    /// A concurrent `remove` / `clear` / invalidation can restore the limit
+    /// after the `while` check; a failed claim means this victim stays.
+    fn claim_size_eviction(&self, victim_weight: u64) -> bool {
+        loop {
+            let current = self.weight.load(Ordering::Relaxed);
+            if current <= self.max_weight {
+                return false;
+            }
+            if self
+                .weight
+                .compare_exchange_weak(
+                    current,
+                    current.saturating_sub(victim_weight),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+        }
     }
 
     fn evict_others_then_prefer(&self, prefer: usize) -> bool {
@@ -436,10 +471,16 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             }
             return true;
         }
-        let Some((_key, value, weight)) = shard.evict_lru() else {
+        if self.weight.load(Ordering::Relaxed) <= self.max_weight {
+            return false;
+        }
+        let Some((victim_key, value, weight)) = shard.evict_lru() else {
             return false;
         };
-        self.sub_weight(weight);
+        if !self.claim_size_eviction(weight) {
+            let _ = shard.insert(victim_key, value, weight, now);
+            return false;
+        }
         drop(shard);
         drop(value);
         L::on_evict(EvictionReason::Size);
@@ -481,6 +522,25 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     #[cfg(test)]
     fn set_after_publish_barrier(&self, barrier: std::sync::Arc<std::sync::Barrier>) {
         *self.after_publish.lock() = Some(barrier);
+    }
+
+    #[cfg(test)]
+    fn run_before_size_victim(&self) {
+        let hook = {
+            let guard = self.before_size_victim.lock();
+            guard.as_ref().map(std::sync::Arc::clone)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_before_size_victim<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self.before_size_victim.lock() = Some(std::sync::Arc::new(hook));
     }
 }
 
@@ -860,6 +920,27 @@ mod tests {
                 "trial {trial}: two concurrent overflow inserts must not each evict a victim"
             );
         }
+    }
+
+    #[test]
+    fn overflow_trim_does_not_evict_after_a_remove_restores_the_budget() {
+        let cache = Arc::new(cache(100, Duration::from_mins(1)));
+        cache.insert(0, TestValue::with_size("a", 60), 60);
+        let cache_for_hook = Arc::clone(&cache);
+        cache.set_before_size_victim(move || {
+            cache_for_hook.remove(&0);
+        });
+        cache.insert(1, TestValue::with_size("b", 60), 60);
+        assert!(
+            cache.get(&1).is_some(),
+            "B must stay once A's removal has already restored the 100-byte budget"
+        );
+        assert!(
+            cache.get(&0).is_none(),
+            "the hook removes A before the overflow victim is taken"
+        );
+        assert_eq!(cache.weighted_size(), 60);
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
