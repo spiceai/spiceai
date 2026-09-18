@@ -22,7 +22,7 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
+use arrow::array::{Decimal128Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
@@ -36,6 +36,7 @@ use datafusion_table_providers::util::{
 };
 
 test_with_backends!(test_listing_file_pruning_disjoint_id_ranges_impl);
+test_with_backends!(test_listing_file_pruning_disjoint_decimal_ranges_impl);
 test_with_backends!(test_mem_tier_upsert_point_lookup_not_pruned_by_own_tombstone_impl);
 
 fn files_scanned_from_plan(plan: &str) -> Option<usize> {
@@ -175,6 +176,98 @@ async fn test_listing_file_pruning_disjoint_id_ranges_impl(
         count, 1,
         "high-range point lookup must return exactly one row"
     );
+
+    Ok(())
+}
+
+/// The same listing-time prune as [`test_listing_file_pruning_disjoint_id_ranges_impl`],
+/// but the predicate is on a `Decimal128` column. Bounds used to fall through
+/// `df_scalar_to_vortex` and never reach the stats blob, so a decimal filter
+/// could not drop disjoint files.
+async fn test_listing_file_pruning_disjoint_decimal_ranges_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("amount", DataType::Decimal128(10, 2), false),
+    ]));
+
+    let table_options = CreateTableOptions {
+        table_name: "decimal_pruning_table".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec![],
+        on_conflict: None,
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: VortexConfig {
+            sort_columns: vec!["amount".to_string()],
+            target_vortex_file_size_mb: 1,
+            ..VortexConfig::default()
+        },
+    };
+
+    let ctx = SessionContext::new();
+    let catalog = Arc::clone(&fixture.catalog);
+    let provider = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
+    ctx.register_table(
+        "decimal_pruning_table",
+        Arc::clone(&provider) as Arc<dyn TableProvider>,
+    )?;
+
+    let decimal_batch = |ids: Vec<i64>| -> Result<RecordBatch, Box<dyn std::error::Error>> {
+        let amounts: Vec<i128> = ids.iter().map(|id| i128::from(*id) * 100).collect();
+        let amount = Decimal128Array::from(amounts)
+            .with_precision_and_scale(10, 2)
+            .expect("decimal array");
+        Ok(RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(ids)), Arc::new(amount)],
+        )?)
+    };
+    common::insert_batch(provider.as_ref(), decimal_batch((0..2_000).collect())?).await?;
+    common::insert_batch(
+        provider.as_ref(),
+        decimal_batch((10_000..12_000).collect())?,
+    )
+    .await?;
+
+    let unfiltered = ctx
+        .sql("SELECT id FROM decimal_pruning_table")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let unfiltered_plan = datafusion::physical_plan::displayable(unfiltered.as_ref())
+        .indent(true)
+        .to_string();
+    let unfiltered_files = files_scanned_from_plan(&unfiltered_plan).unwrap_or(0);
+    assert!(
+        unfiltered_files >= 2,
+        "expected at least two Vortex files, got {unfiltered_files} in plan:\n{unfiltered_plan}"
+    );
+
+    let filtered = ctx
+        .sql("SELECT id FROM decimal_pruning_table WHERE amount = CAST(42 AS DECIMAL(10, 2))")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let filtered_plan = datafusion::physical_plan::displayable(filtered.as_ref())
+        .indent(true)
+        .to_string();
+    let filtered_files = files_scanned_from_plan(&filtered_plan).unwrap_or(0);
+    assert!(
+        filtered_files < unfiltered_files,
+        "listing-time pruning should drop disjoint decimal files: unfiltered={unfiltered_files} filtered={filtered_files}\n{filtered_plan}"
+    );
+
+    let rows = ctx
+        .sql("SELECT id FROM decimal_pruning_table WHERE amount = CAST(42 AS DECIMAL(10, 2))")
+        .await?
+        .collect()
+        .await?;
+    let count: usize = rows.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(count, 1, "decimal point lookup must return exactly one row");
 
     Ok(())
 }
