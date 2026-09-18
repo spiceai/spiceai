@@ -469,54 +469,48 @@ impl Stream for CachedRawStream {
     }
 }
 
-/// `DataFusion` adapter over stored [`CachedBatches`]: each poll is
-/// `RecordBatch::clone` (every column `ArrayRef`). Used when a caller still
-/// needs [`SendableRecordBatchStream`] (`QueryEngine`, tests). HTTP and Flight
-/// drain [`QueryResultSource::CachedRaw`] instead.
-struct CachedBatchesAsRecordBatchStream {
-    data: CachedBatches,
-    schema: SchemaRef,
-    index: usize,
+/// Canonical serve stream for a [`QueryResult`].
+///
+/// Raw hits stay on [`Self::CachedRaw`] so HTTP and Flight can take the Arc
+/// path via [`QueryResult::into_source`]. Polling as a [`Stream`] still
+/// yields owned `RecordBatch`s, so `.data` callers share the same
+/// cancellation and tracker wrappers.
+pub enum QueryResultData {
+    /// Planned or search-cache path: `DataFusion`'s owned-batch stream.
+    Stream(SendableRecordBatchStream),
+    /// Raw SQL cache hit: one `Arc` clone per batch on the HTTP/Flight path.
+    CachedRaw {
+        data: SendableCachedRawStream,
+        schema: SchemaRef,
+    },
 }
 
-impl CachedBatchesAsRecordBatchStream {
-    fn new(data: CachedBatches, schema: SchemaRef) -> Self {
-        Self {
-            data,
-            schema,
-            index: 0,
+impl Stream for QueryResultData {
+    type Item = Result<RecordBatch, DataFusionError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            Self::Stream(stream) => Pin::new(stream).poll_next(cx),
+            Self::CachedRaw { data, .. } => Pin::new(data).poll_next(cx).map(|item| {
+                item.map(|result| result.map(|batch| RecordBatch::clone(batch.as_ref())))
+            }),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Stream(stream) => stream.size_hint(),
+            Self::CachedRaw { data, .. } => data.size_hint(),
         }
     }
 }
 
-impl Stream for CachedBatchesAsRecordBatchStream {
-    type Item = Result<RecordBatch, DataFusionError>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        _: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        let index = self.index;
-        let Some(batch) = self
-            .data
-            .get(index)
-            .map(|batch| RecordBatch::clone(batch.as_ref()))
-        else {
-            return Poll::Ready(None);
-        };
-        self.index = index + 1;
-        Poll::Ready(Some(Ok(batch)))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.data.len().saturating_sub(self.index);
-        (remaining, Some(remaining))
-    }
-}
-
-impl RecordBatchStream for CachedBatchesAsRecordBatchStream {
+impl RecordBatchStream for QueryResultData {
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        match self {
+            Self::Stream(stream) => stream.schema(),
+            Self::CachedRaw { schema, .. } => Arc::clone(schema),
+        }
     }
 }
 
@@ -536,22 +530,21 @@ pub enum QueryResultSource {
 }
 
 pub struct QueryResult {
-    pub data: SendableRecordBatchStream,
-    /// Present for a Raw (or just-decoded) SQL cache hit. HTTP and Flight
-    /// drain this via [`Self::into_source`] so a hit does not
-    /// `RecordBatch::clone` every column.
-    cached_raw: Option<SendableCachedRawStream>,
-    cached_schema: Option<SchemaRef>,
+    /// The one serve stream. Wrappers (cancel, tracker, span) attach here
+    /// so `.data` and [`Self::into_source`] observe the same lifetime.
+    pub data: QueryResultData,
     pub cache_status: CacheStatus,
 }
 
 impl std::fmt::Debug for QueryResult {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueryResult")
-            .field("data", &"<stream>")
             .field(
-                "cached_raw",
-                &self.cached_raw.as_ref().map(|_| "<arc-stream>"),
+                "data",
+                &match self.data {
+                    QueryResultData::Stream(_) => "<stream>",
+                    QueryResultData::CachedRaw { .. } => "<arc-stream>",
+                },
             )
             .field("cache_status", &self.cache_status)
             .finish_non_exhaustive()
@@ -562,9 +555,7 @@ impl QueryResult {
     #[must_use]
     pub fn new(data: SendableRecordBatchStream, cache_status: CacheStatus) -> Self {
         Self {
-            data,
-            cached_raw: None,
-            cached_schema: None,
+            data: QueryResultData::Stream(data),
             cache_status,
         }
     }
@@ -572,22 +563,19 @@ impl QueryResult {
     /// Serve pre-`Arc`'d Raw (or just-decoded) batches on the SQL path.
     ///
     /// [`Self::into_source`] yields [`QueryResultSource::CachedRaw`] so HTTP
-    /// and Flight clone one `Arc<RecordBatch>` per poll. [`Self::data`] is a
-    /// `RecordBatch::clone` adapter for callers that still need a DF stream.
+    /// and Flight clone one `Arc<RecordBatch>` per poll. Polling [`Self::data`]
+    /// yields owned batches from that same stream.
     #[must_use]
     pub fn from_cached_raw(
         batches: CachedBatches,
         schema: SchemaRef,
         cache_status: CacheStatus,
     ) -> Self {
-        let cached_raw = CachedRawStream::from_raw(Arc::clone(&batches), Arc::clone(&schema));
         Self {
-            data: Box::pin(CachedBatchesAsRecordBatchStream::new(
-                batches,
-                Arc::clone(&schema),
-            )),
-            cached_raw: Some(Box::pin(cached_raw)),
-            cached_schema: Some(schema),
+            data: QueryResultData::CachedRaw {
+                data: Box::pin(CachedRawStream::from_raw(batches, Arc::clone(&schema))),
+                schema,
+            },
             cache_status,
         }
     }
@@ -595,13 +583,22 @@ impl QueryResult {
     /// Whether this result carries the Arc-clone SQL serve stream.
     #[must_use]
     pub fn has_cached_raw(&self) -> bool {
-        self.cached_raw.is_some()
+        matches!(self.data, QueryResultData::CachedRaw { .. })
+    }
+
+    /// Schema of the result stream.
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        self.data.schema()
     }
 
     /// Schema of the Arc-clone SQL serve stream, when present.
     #[must_use]
     pub fn cached_schema(&self) -> Option<SchemaRef> {
-        self.cached_schema.as_ref().map(Arc::clone)
+        match &self.data {
+            QueryResultData::CachedRaw { schema, .. } => Some(Arc::clone(schema)),
+            QueryResultData::Stream(_) => None,
+        }
     }
 
     /// Replace the Arc-clone SQL serve stream (cancellation / tracker wrap).
@@ -610,8 +607,11 @@ impl QueryResult {
         mut self,
         f: impl FnOnce(SendableCachedRawStream) -> SendableCachedRawStream,
     ) -> Self {
-        if let Some(stream) = self.cached_raw.take() {
-            self.cached_raw = Some(f(stream));
+        if let QueryResultData::CachedRaw { data, schema } = self.data {
+            self.data = QueryResultData::CachedRaw {
+                data: f(data),
+                schema,
+            };
         }
         self
     }
@@ -622,7 +622,9 @@ impl QueryResult {
         mut self,
         f: impl FnOnce(SendableRecordBatchStream) -> SendableRecordBatchStream,
     ) -> Self {
-        self.data = f(self.data);
+        if let QueryResultData::Stream(data) = self.data {
+            self.data = QueryResultData::Stream(f(data));
+        }
         self
     }
 
@@ -630,17 +632,17 @@ impl QueryResult {
     ///
     /// A Raw SQL hit becomes [`QueryResultSource::CachedRaw`] (the wrapped
     /// Arc stream, including cancellation and tracker). Other results stay
-    /// on [`Self::data`].
+    /// on the owned-batch stream.
     #[must_use]
     pub fn into_source(self) -> QueryResultSource {
-        match (self.cached_raw, self.cached_schema) {
-            (Some(data), Some(schema)) => QueryResultSource::CachedRaw {
+        match self.data {
+            QueryResultData::CachedRaw { data, schema } => QueryResultSource::CachedRaw {
                 data,
                 schema,
                 cache_status: self.cache_status,
             },
-            _ => QueryResultSource::Stream {
-                data: self.data,
+            QueryResultData::Stream(data) => QueryResultSource::Stream {
+                data,
                 cache_status: self.cache_status,
             },
         }
@@ -681,6 +683,31 @@ impl QueryResult {
             }
             QueryResultSource::Stream { data, .. } => {
                 futures::TryStreamExt::try_collect(data).await
+            }
+        }
+    }
+
+    /// Poll the stream to completion without retaining batches.
+    ///
+    /// Intermediate transaction statements use this so a large `SELECT` does
+    /// not stay resident until `COMMIT`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first stream error.
+    pub async fn drain(self) -> Result<(), DataFusionError> {
+        match self.into_source() {
+            QueryResultSource::CachedRaw { mut data, .. } => {
+                while let Some(item) = data.next().await {
+                    item?;
+                }
+                Ok(())
+            }
+            QueryResultSource::Stream { mut data, .. } => {
+                while let Some(item) = data.next().await {
+                    item?;
+                }
+                Ok(())
             }
         }
     }
@@ -1396,6 +1423,17 @@ mod tests {
         assert_eq!(col0.values(), &[1, 2]);
     }
 
+    fn poll_query_result_data(data: &mut QueryResultData) -> Option<RecordBatch> {
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match Pin::new(data).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(batch))) => Some(batch),
+            Poll::Ready(None) => None,
+            Poll::Ready(Some(Err(e))) => panic!("QueryResultData yielded an error: {e}"),
+            Poll::Pending => panic!("QueryResultData must be immediately ready"),
+        }
+    }
+
     /// `QueryResult::from_cached_raw` / `into_source` is the SQL serve
     /// contract: HTTP and Flight poll `Arc<RecordBatch>`.
     #[test]
@@ -1435,6 +1473,135 @@ mod tests {
                 panic!("from_cached_raw must produce QueryResultSource::CachedRaw")
             }
         }
+    }
+
+    /// `.data` and `into_source` are the same stream: polling `.data` advances
+    /// the Arc source `into_source` would have handed to HTTP / Flight.
+    #[test]
+    fn from_cached_raw_data_and_into_source_share_one_stream() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let stored = wrap_raw_batches(vec![int_batch(&schema, &[1, 2]), int_batch(&schema, &[3])]);
+        let mut result = QueryResult::from_cached_raw(
+            Arc::clone(&stored),
+            Arc::clone(&schema),
+            CacheStatus::CacheHit,
+        );
+        assert_eq!(result.data.schema(), schema);
+        assert_eq!(result.data.size_hint(), (2, Some(2)));
+
+        let first = poll_query_result_data(&mut result.data).expect("first owned batch");
+        assert_eq!(first.num_rows(), 2);
+        assert!(
+            Arc::ptr_eq(first.column(0), stored[0].column(0)),
+            "the DataFusion adapter must share column arrays with the stored batch"
+        );
+        assert_eq!(result.data.size_hint(), (1, Some(1)));
+
+        match result.into_source() {
+            QueryResultSource::CachedRaw { mut data, .. } => {
+                let waker = futures::task::noop_waker();
+                let mut cx = Context::from_waker(&waker);
+                let remaining = match Pin::new(&mut data).poll_next(&mut cx) {
+                    Poll::Ready(Some(Ok(batch))) => batch,
+                    other => panic!("expected remaining Arc batch, got {other:?}"),
+                };
+                assert!(
+                    Arc::ptr_eq(&remaining, &stored[1]),
+                    "into_source must continue the same CachedRawStream `.data` already polled"
+                );
+                assert!(matches!(
+                    Pin::new(&mut data).poll_next(&mut cx),
+                    Poll::Ready(None)
+                ));
+            }
+            QueryResultSource::Stream { .. } => {
+                panic!("from_cached_raw must produce QueryResultSource::CachedRaw")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn query_result_collect_and_drain_empty_single_and_multi() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+        let empty = QueryResult::from_cached_raw(
+            wrap_raw_batches(Vec::new()),
+            Arc::clone(&schema),
+            CacheStatus::CacheHit,
+        )
+        .collect_batches()
+        .await
+        .expect("empty collect");
+        assert!(empty.is_empty());
+
+        QueryResult::from_cached_raw(
+            wrap_raw_batches(Vec::new()),
+            Arc::clone(&schema),
+            CacheStatus::CacheHit,
+        )
+        .drain()
+        .await
+        .expect("empty drain");
+
+        let single = QueryResult::from_cached_raw(
+            wrap_raw_batches(vec![int_batch(&schema, &[9])]),
+            Arc::clone(&schema),
+            CacheStatus::CacheHit,
+        )
+        .collect_batches()
+        .await
+        .expect("single collect");
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].num_rows(), 1);
+
+        QueryResult::from_cached_raw(
+            wrap_raw_batches(vec![int_batch(&schema, &[9])]),
+            Arc::clone(&schema),
+            CacheStatus::CacheHit,
+        )
+        .drain()
+        .await
+        .expect("single drain");
+
+        let multi = QueryResult::from_cached_raw(
+            wrap_raw_batches(vec![
+                int_batch(&schema, &[1, 2]),
+                int_batch(&schema, &[3]),
+                int_batch(&schema, &[4, 5, 6]),
+            ]),
+            Arc::clone(&schema),
+            CacheStatus::CacheHit,
+        )
+        .collect_batches()
+        .await
+        .expect("multi collect");
+        assert_eq!(
+            multi.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            vec![2, 1, 3]
+        );
+
+        QueryResult::from_cached_raw(
+            wrap_raw_batches(vec![int_batch(&schema, &[1]), int_batch(&schema, &[2, 3])]),
+            Arc::clone(&schema),
+            CacheStatus::CacheHit,
+        )
+        .drain()
+        .await
+        .expect("multi drain");
+
+        QueryResult::new(
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter(vec![
+                    Ok(int_batch(&schema, &[1])),
+                    Ok(int_batch(&schema, &[2, 3])),
+                ]),
+            )),
+            CacheStatus::CacheMiss,
+        )
+        .drain()
+        .await
+        .expect("stream drain");
     }
 
     /// Shared-vec serve (search cache) keeps the same stream contract.

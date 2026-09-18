@@ -1170,9 +1170,8 @@ impl Query {
                 self.run_internal(future_request_context, probe, guards, spans, query_start)
                     .await
                     .map(|query_result| {
-                        // Consume the assembled serve stream. A hopped encoded
-                        // hit carries the tracker on `cached_raw`; taking
-                        // `.data` would drop that stream unpolled.
+                        // Hop the assembled serve stream onto this runtime.
+                        // Cancellation and the tracker wrap that same stream.
                         let cache_status = query_result.cache_status;
                         (cache_status, query_result.into_record_batch_stream())
                     })
@@ -5150,6 +5149,67 @@ mod tests {
                 panic!("from_cached_raw must assemble QueryResultSource::CachedRaw")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_raw_cache_hit_is_observed_on_query_result_data() {
+        use ::cache::result::query::wrap_raw_batches;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![42])) as ArrayRef],
+        )
+        .expect("batch");
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+        let request_context = Arc::new(RequestContextBuilder::new(Protocol::Internal).build());
+        let query_id = Arc::<str>::from(uuid::Uuid::new_v4().to_string());
+        let tracker = QueryTracker {
+            task_history_enabled: false,
+            captured_output_enabled: false,
+            schema: None,
+            query_duration_secs: None,
+            query_execution_duration_secs: None,
+            rows_produced: 0,
+            results_cache_hit: Some(true),
+            is_accelerated: None,
+            error_message: None,
+            error_code: None,
+            query_duration_timer: tokio::time::Instant::now(),
+            query_execution_duration_timer: tokio::time::Instant::now(),
+            datasets: Arc::new(HashSet::new()),
+        };
+        let mut result = assemble_cached_query_result(
+            QueryResult::from_cached_raw(
+                wrap_raw_batches(vec![batch]),
+                Arc::clone(&schema),
+                CacheStatus::CacheHit,
+            ),
+            Some(tracker),
+            request_context,
+            tracing::Span::current(),
+            CachedHitCancel {
+                token: cancel_token,
+                query_id: Arc::clone(&query_id),
+                timeout_state: QueryTimeoutState::default(),
+                guard: (),
+            },
+        );
+        let cancellation = result
+            .data
+            .next()
+            .await
+            .expect("assembled raw hit `.data` should emit cancellation");
+        assert_query_cancelled(
+            cancellation.expect_err("first `.data` item should be cancellation"),
+            &query_id,
+        );
+        assert!(result.data.next().await.is_none());
     }
 
     #[tokio::test]

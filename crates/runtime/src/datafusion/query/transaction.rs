@@ -214,16 +214,16 @@ pub async fn run_transaction(
         // surface as an error, never as a truncated result), so it is materialized
         // here and returned after commit. Intermediate statements (the gate,
         // earlier writes) are drained without keeping their batches.
-        match query_res.collect_batches().await {
-            Ok(batches) => {
-                if index + 1 == statement_count {
-                    last = Some((batches, cache_status));
-                }
-            }
-            Err(e) => {
-                abort_transaction(handle.as_ref()).await;
-                return Err(TransactionError::Stream(e));
-            }
+        let consume = if index + 1 == statement_count {
+            query_res.collect_batches().await.map(|batches| {
+                last = Some((batches, cache_status));
+            })
+        } else {
+            query_res.drain().await
+        };
+        if let Err(e) = consume {
+            abort_transaction(handle.as_ref()).await;
+            return Err(TransactionError::Stream(e));
         }
     }
 
