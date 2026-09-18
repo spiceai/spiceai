@@ -14855,7 +14855,7 @@ impl CayenneTableProvider {
         batches: &[RecordBatch],
         record_count: usize,
     ) -> Result<InlinedData> {
-        let data_ipc = bytes::Bytes::from(serialize_batches_to_ipc(batches)?);
+        let data_ipc = serialize_batches_to_ipc(batches)?;
 
         Ok(InlinedData {
             inlined_id: source.inlined_id.clone(),
@@ -27457,7 +27457,7 @@ impl CayenneTableProvider {
         }
         Ok(InlinedViewEntry {
             batches: filtered_batches,
-            envelope: entry.envelope.clone(),
+            envelope: Arc::clone(&entry.envelope),
             statistics: Arc::clone(&entry.statistics),
         })
     }
@@ -27539,7 +27539,7 @@ impl CayenneTableProvider {
         }
         Ok(InlinedViewEntry {
             batches: filtered_batches,
-            envelope: entry,
+            envelope: Arc::new(entry),
             statistics,
         })
     }

@@ -42,7 +42,14 @@ use std::sync::Arc;
 pub(crate) struct InlinedViewEntry {
     /// Original metastore envelope; provides `inlined_id`, `sequence_number`,
     /// and other fields required to reconstruct a rewrite.
-    pub(crate) envelope: InlinedData,
+    ///
+    /// `Arc<InlinedData>`, not by value: the envelope carries the entry's
+    /// serialized IPC payload, and the scan path clones an entry per visible
+    /// entry per scan (`CayenneTableProvider::pruned_inlined_batches_with_removal`
+    /// and `apply_tombstone_removal_to_entry`), so an envelope clone is a
+    /// refcount bump instead of a copy of that payload. The metastore keeps its
+    /// owned `Vec<u8>` representation; the `Arc` is added here, on cache entry.
+    pub(crate) envelope: Arc<InlinedData>,
     /// Batches already decoded from IPC and filtered through the deletion map.
     /// Empty when all rows in this entry were removed by the deletion filter.
     pub(crate) batches: Vec<RecordBatch>,
