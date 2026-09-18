@@ -477,7 +477,7 @@ impl Stream for CachedRawStream {
 
 /// `DataFusion` adapter over stored [`CachedBatches`]: each poll is
 /// `RecordBatch::clone` (every column `ArrayRef`). Used when a caller still
-/// needs [`SendableRecordBatchStream`] (QueryEngine, tests). HTTP and Flight
+/// needs [`SendableRecordBatchStream`] (`QueryEngine`, tests). HTTP and Flight
 /// drain [`QueryResultSource::CachedRaw`] instead.
 struct CachedBatchesAsRecordBatchStream {
     data: CachedBatches,
@@ -526,7 +526,7 @@ impl RecordBatchStream for CachedBatchesAsRecordBatchStream {
     }
 }
 
-/// How a [`QueryResult`] is consumed by HTTP / Flight / QueryEngine.
+/// How a [`QueryResult`] is consumed by HTTP / Flight / `QueryEngine`.
 pub enum QueryResultSource {
     /// Planned or search-cache path: `DataFusion`'s owned-batch stream.
     Stream {
@@ -611,6 +611,7 @@ impl QueryResult {
     }
 
     /// Replace the Arc-clone SQL serve stream (cancellation / tracker wrap).
+    #[must_use]
     pub fn map_cached_raw(
         mut self,
         f: impl FnOnce(SendableCachedRawStream) -> SendableCachedRawStream,
@@ -621,7 +622,8 @@ impl QueryResult {
         self
     }
 
-    /// Replace the owned-batch `DataFusion` stream (planned path, QueryEngine).
+    /// Replace the owned-batch `DataFusion` stream (planned path, `QueryEngine`).
+    #[must_use]
     pub fn map_data(
         mut self,
         f: impl FnOnce(SendableRecordBatchStream) -> SendableRecordBatchStream,
@@ -653,7 +655,7 @@ impl QueryResult {
     /// Consume as a `DataFusion` owned-batch stream.
     ///
     /// A Raw SQL hit maps each `Arc<RecordBatch>` with `RecordBatch::clone`
-    /// so QueryEngine and tests keep the previous item type. HTTP and Flight
+    /// so `QueryEngine` and tests keep the previous item type. HTTP and Flight
     /// should call [`Self::into_source`] instead.
     #[must_use]
     pub fn into_record_batch_stream(self) -> SendableRecordBatchStream {
