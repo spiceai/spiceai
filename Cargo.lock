@@ -3387,6 +3387,7 @@ dependencies = [
  "pingora-lru",
  "rand 0.10.1",
  "rstest 0.25.0",
+ "sharded-cache",
  "snafu",
  "spicepod",
  "tokio",
