@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::dataconnector::parameters::RuntimeConnectorContext;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -1809,16 +1809,20 @@ impl Runtime {
 
         // Only the datasets this diff loads or updates are initialized: `mode: file_create`
         // deletes the acceleration state on init, and an unchanged dataset keeps serving from
-        // the `AcceleratedTable` it already has.
-        let datasets_to_apply: Vec<Arc<Dataset>> = valid_datasets
-            .into_iter()
+        // the `AcceleratedTable` it already has. The one exception is a `localpod` dataset
+        // whose parent this diff reloads: it reads through the table the parent is about to
+        // replace, so it reloads too, after its parent.
+        let changed_datasets: Vec<Arc<Dataset>> = valid_datasets
+            .iter()
             .filter(|ds| {
                 existing_datasets
                     .iter()
                     .find(|current| current.name == ds.name)
-                    .is_none_or(|current| current != ds)
+                    .is_none_or(|current| current != *ds)
             })
+            .map(Arc::clone)
             .collect();
+        let datasets_to_apply = with_localpod_dependents(changed_datasets, &valid_datasets);
 
         let init_results = self
             .initialize_datasets_accelerators(&datasets_to_apply)
@@ -1862,6 +1866,24 @@ impl Runtime {
             };
 
             if existing_datasets.iter().any(|d| d.name == ds.name) {
+                // A `localpod` dataset whose parent this same diff adds cannot bind to it
+                // until that parent is registered, so it is unloaded here and chained behind
+                // the parent's load below, exactly like a newly added child.
+                if let Some(parent) = localpod_parent(ds)
+                    && added_futures.contains_key(&parent)
+                {
+                    Arc::clone(&self)
+                        .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
+                        .await;
+                    self.status
+                        .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+                    localpod_by_parent
+                        .entry(parent)
+                        .or_default()
+                        .push((Arc::clone(ds), bootstrap_status));
+                    continue;
+                }
+
                 Arc::clone(&self).update_dataset(Arc::clone(ds)).await;
                 continue;
             }
@@ -2460,6 +2482,64 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
 /// Whether a dataset's `drasi:` block is live.
 fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
     drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
+}
+
+/// The dataset a `localpod` dataset reads through, or `None` for any other connector.
+fn localpod_parent(ds: &Dataset) -> Option<TableReference> {
+    (ds.source() == LOCALPOD_DATACONNECTOR).then(|| TableReference::parse_str(ds.path()))
+}
+
+/// Extends the datasets a spicepod apply reloads with every `localpod` dataset that reads
+/// through one of them, transitively, and orders the result so each `localpod` dataset follows
+/// its parent.
+///
+/// A `localpod` dataset binds to the table its parent has registered at the moment it loads:
+/// it reads through that provider and hands its refreshes to that table's refresh task. A parent
+/// reloaded onto a new table therefore leaves an unchanged child on the retired one, answering
+/// rows the parent no longer has and keeping the retired refresh task alive (#3288). Reloading
+/// the child after its parent binds it to the parent's new table.
+fn with_localpod_dependents(
+    mut reloading: Vec<Arc<Dataset>>,
+    all: &[Arc<Dataset>],
+) -> Vec<Arc<Dataset>> {
+    let mut reloading_names: HashSet<TableReference> =
+        reloading.iter().map(|ds| ds.name.clone()).collect();
+
+    // A child of a reloading child reloads too, so iterate to a fixpoint. Each pass adds at
+    // least one dataset or stops, so it runs at most `all.len()` times.
+    let mut added = true;
+    while added {
+        added = false;
+        for ds in all {
+            if !reloading_names.contains(&ds.name)
+                && localpod_parent(ds).is_some_and(|parent| reloading_names.contains(&parent))
+            {
+                reloading_names.insert(ds.name.clone());
+                reloading.push(Arc::clone(ds));
+                added = true;
+            }
+        }
+    }
+
+    // Parents first: a child binds to whatever its parent has registered when it reloads. The
+    // walk up is bounded so a `localpod` cycle, which can never load, cannot spin here.
+    let by_name: HashMap<&TableReference, &Arc<Dataset>> =
+        all.iter().map(|ds| (&ds.name, ds)).collect();
+    let depth = |ds: &Arc<Dataset>| {
+        let mut depth = 0;
+        let mut current = ds;
+        while let Some(parent) = localpod_parent(current)
+            && reloading_names.contains(&parent)
+            && depth < all.len()
+            && let Some(parent_dataset) = by_name.get(&parent)
+        {
+            depth += 1;
+            current = parent_dataset;
+        }
+        depth
+    };
+    reloading.sort_by_cached_key(depth);
+    reloading
 }
 
 #[cfg(test)]
@@ -4104,6 +4184,93 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         assert!(
             on_read.is_empty(),
             "a read must not emit the deprecation notice: {on_read:?}"
+        );
+    }
+
+    /// Build the runtime datasets of `specs` the way `get_valid_datasets` does.
+    fn datasets_of(
+        runtime: &Arc<crate::Runtime>,
+        specs: &[spicepod::component::dataset::Dataset],
+    ) -> Vec<Arc<Dataset>> {
+        let app = Arc::new(
+            specs
+                .iter()
+                .cloned()
+                .fold(app::AppBuilder::new("localpod_dependents"), |b, ds| {
+                    b.with_dataset(ds)
+                })
+                .build(),
+        );
+        specs
+            .iter()
+            .map(|spec| {
+                Arc::new(
+                    DatasetBuilder::try_from(spec.clone())
+                        .expect("valid dataset builder")
+                        .with_app(Arc::clone(&app))
+                        .with_runtime(Arc::clone(runtime))
+                        .build()
+                        .expect("valid runtime dataset"),
+                )
+            })
+            .collect()
+    }
+
+    fn names(datasets: &[Arc<Dataset>]) -> Vec<String> {
+        datasets.iter().map(|ds| ds.name.to_string()).collect()
+    }
+
+    /// A `localpod` dataset reloads whenever the dataset it reads through does — through any
+    /// depth of `localpod` chaining — and after it, whatever order the spicepod lists them in.
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/3288>.
+    #[tokio::test]
+    async fn localpod_dependents_reload_after_their_parent() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let all = datasets_of(
+            &runtime,
+            &[
+                // The grandchild is listed first, so the order below is the function's.
+                spicepod::component::dataset::Dataset::new("localpod:child", "grandchild"),
+                spicepod::component::dataset::Dataset::new("localpod:parent", "child"),
+                spicepod::component::dataset::Dataset::new("file:data.csv", "parent"),
+                spicepod::component::dataset::Dataset::new("localpod:other", "other_child"),
+                spicepod::component::dataset::Dataset::new("file:other.csv", "other"),
+            ],
+        );
+        let parent = Arc::clone(&all[2]);
+
+        let reloading = with_localpod_dependents(vec![parent], &all);
+        assert_eq!(
+            names(&reloading),
+            ["parent", "child", "grandchild"],
+            "the parent's whole localpod chain reloads, parents first; unrelated datasets do not"
+        );
+
+        // A changed child reloads alone: its parent is untouched.
+        let reloading = with_localpod_dependents(vec![Arc::clone(&all[1])], &all);
+        assert_eq!(names(&reloading), ["child", "grandchild"]);
+
+        // Nothing changed, nothing reloads.
+        assert!(with_localpod_dependents(vec![], &all).is_empty());
+    }
+
+    /// Two `localpod` datasets reading through each other can never load; the ordering walk
+    /// must still terminate.
+    #[tokio::test]
+    async fn localpod_dependents_ordering_tolerates_a_cycle() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let all = datasets_of(
+            &runtime,
+            &[
+                spicepod::component::dataset::Dataset::new("localpod:b", "a"),
+                spicepod::component::dataset::Dataset::new("localpod:a", "b"),
+            ],
+        );
+        let reloading = with_localpod_dependents(vec![Arc::clone(&all[0])], &all);
+        assert_eq!(
+            reloading.len(),
+            2,
+            "both datasets of the cycle are selected"
         );
     }
 }
