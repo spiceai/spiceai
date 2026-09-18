@@ -139,8 +139,12 @@ mod tests {
 
     use crate::function_support::{FunctionRestriction, FunctionSupport};
     use async_trait::async_trait;
+    use datafusion::arrow::datatypes::SchemaRef;
     use datafusion::arrow::datatypes::{DataType, Field, IntervalMonthDayNano, Schema, TimeUnit};
     use datafusion::common::Column;
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::config::ConfigOptions;
+    use datafusion::datasource::DefaultTableSource;
     use datafusion::datasource::TableProvider;
     use datafusion::functions::expr_fn::{date_part, date_trunc};
     use datafusion::functions_aggregate::expr_fn::count;
@@ -149,13 +153,17 @@ mod tests {
         TableSource, Volatility, builder::LogicalTableSource, cast, create_udf,
         expr::ScalarFunction,
     };
+    use datafusion::logical_expr::{DmlStatement, WriteOp};
+    use datafusion::optimizer::analyzer::AnalyzerRule;
     use datafusion::prelude::{col, lit};
     use datafusion::scalar::ScalarValue;
+    use datafusion::sql::TableReference;
     use datafusion::sql::unparser::Unparser;
     use datafusion::sql::unparser::dialect::{
         BigQueryDialect, CustomDialect, CustomDialectBuilder, DefaultDialect, DuckDBDialect,
         MySqlDialect, PostgreSqlDialect, SqliteDialect,
     };
+    use datafusion_federation::FederationAnalyzerRule;
     use datafusion_federation::sql::SQLExecutor;
     use datafusion_federation::{FederatedPlanNode, sql::SQLFederationPlanner};
     use datafusion_table_providers::sql::db_connection_pool::{
@@ -2419,5 +2427,107 @@ mod tests {
             7,
             "a value the target type holds still has to come through it"
         );
+    }
+
+    /// A `TableSource` the federation analyzer recognises as federated, so a plan
+    /// built on it is one the analyzer will try to wrap.
+    fn federated_table_source() -> Arc<dyn TableSource> {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        Arc::new(DefaultTableSource::new(Arc::new(
+            create_spice_federated_table_provider(
+                test_sql_table(),
+                schema,
+                TableReference::bare("t"),
+                None,
+            ),
+        )))
+    }
+
+    /// Nothing under a DML plan may be federated.
+    ///
+    /// The analyzer federates the largest sub-tree that draws on one provider,
+    /// and the input of a `DELETE` over a federated table is such a sub-tree. It
+    /// must be left alone: the unparser has no `dml_to_sql`, so a federated node
+    /// under a `Dml` cannot be rendered at all, and `DataFusion`'s physical
+    /// planner dispatches `delete_from`/`update` by matching `LogicalPlan::Dml`,
+    /// which it cannot do once the rows it owns have been replaced by an
+    /// extension node. The fork returns a DML plan untouched (federation PR #73).
+    ///
+    /// The assertion is on the *input*, not on the root, because the root is a
+    /// `Dml` either way — losing the patch federates what is under it rather than
+    /// replacing it. And the input has to be a shape the analyzer really does
+    /// federate, or the assertion holds for the wrong reason; the control
+    /// establishes that, and a `Limit` is used rather than a filter because a
+    /// filter is pushed into the scan before federation runs, collapsing the plan
+    /// to a bare `TableScan` that the adaptor serves itself and the analyzer
+    /// leaves alone.
+    ///
+    /// The fork gives a third reason for the patch — that a wrapped `Dml` is
+    /// invisible to a write-permission validator that walks for it. That is the
+    /// fork's rationale rather than something reproduced here:
+    /// `validate_sql_query_operations` runs on the plan `create_logical_plan`
+    /// returns, and analyzer rules have not run at that point.
+    #[test]
+    fn nothing_under_a_dml_plan_is_federated_by_the_analyzer() {
+        let source = federated_table_source();
+        let rows_to_delete = || {
+            LogicalPlanBuilder::scan("t", Arc::clone(&source), None)
+                .expect("scan the federated table")
+                .limit(0, Some(3))
+                .expect("limit the scan")
+                .build()
+                .expect("build the input plan")
+        };
+
+        let control = FederationAnalyzerRule::new()
+            .analyze(rows_to_delete(), &ConfigOptions::default())
+            .expect("the analyzer accepts a federated plan");
+        assert!(
+            contains_a_federated_node(&control),
+            "the control: this shape is one the analyzer does federate, which is what gives \
+             the assertion below teeth. Shape was:\n{}",
+            control.display_indent()
+        );
+
+        let dml = LogicalPlan::Dml(DmlStatement::new(
+            TableReference::bare("t"),
+            Arc::clone(&source),
+            WriteOp::Delete,
+            Arc::new(rows_to_delete()),
+        ));
+        let analyzed = FederationAnalyzerRule::new()
+            .analyze(dml, &ConfigOptions::default())
+            .expect("the analyzer accepts a DML plan");
+
+        let LogicalPlan::Dml(statement) = &analyzed else {
+            panic!(
+                "a Dml plan has to stay a Dml plan, got:\n{}",
+                analyzed.display_indent()
+            );
+        };
+        assert!(
+            !contains_a_federated_node(statement.input.as_ref()),
+            "a federated node under a Dml is a DELETE that can be neither rendered nor \
+             dispatched. Shape was:\n{}",
+            analyzed.display_indent()
+        );
+    }
+
+    /// Whether any node of `plan` is an extension node, which is what federation
+    /// wraps a sub-tree in.
+    fn contains_a_federated_node(plan: &LogicalPlan) -> bool {
+        let mut found = false;
+        plan.apply(|node| {
+            if matches!(node, LogicalPlan::Extension(_)) {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("walking a logical plan cannot fail");
+        found
     }
 }
