@@ -20,8 +20,39 @@ use super::{CacheBackend, CacheBackendBuilder};
 use crate::Sizeable;
 use crate::key::PassthroughHashBuilder;
 use async_trait::async_trait;
+use moka::Expiry;
 use moka::future::Cache;
+use moka::ops::compute::Op;
 use std::hash::BuildHasher;
+use std::time::{Duration, Instant};
+
+/// TTL policy that matches Moka's `time_to_live` on create and on a normal
+/// overwrite, but keeps the remaining lifetime when the new value is an
+/// in-place rewrite ([`Sizeable::keep_remaining_ttl`]).
+#[derive(Clone, Copy)]
+pub(crate) struct CacheTtl {
+    pub ttl: Duration,
+}
+
+impl<K, V: Sizeable> Expiry<K, V> for CacheTtl {
+    fn expire_after_create(&self, _key: &K, _value: &V, _created_at: Instant) -> Option<Duration> {
+        Some(self.ttl)
+    }
+
+    fn expire_after_update(
+        &self,
+        _key: &K,
+        value: &V,
+        _updated_at: Instant,
+        duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        if value.keep_remaining_ttl() {
+            duration_until_expiry
+        } else {
+            Some(self.ttl)
+        }
+    }
+}
 
 /// Moka-based cache backend implementation
 ///
@@ -47,7 +78,7 @@ where
     /// Creates a new Moka backend with the given configuration.
     pub fn new(builder: &CacheBackendBuilder, hasher: T) -> Self {
         let cache: Cache<u64, V, PassthroughHashBuilder<T>> = Cache::builder()
-            .time_to_live(builder.ttl())
+            .expire_after(CacheTtl { ttl: builder.ttl() })
             .weigher(|_key, value: &V| -> u32 {
                 let val: usize = value.get_memory_size();
                 val.try_into().unwrap_or(u32::MAX)
@@ -89,6 +120,25 @@ where
         self.cache.insert(key, value).await;
     }
 
+    async fn replace_if(
+        &self,
+        key: u64,
+        value: V,
+        should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> bool {
+        let outcome = self
+            .cache
+            .entry(key)
+            .and_compute_with(|current| {
+                let replace = current
+                    .as_ref()
+                    .is_some_and(|entry| should_replace(entry.value()));
+                std::future::ready(if replace { Op::Put(value) } else { Op::Nop })
+            })
+            .await;
+        matches!(outcome, moka::ops::compute::CompResult::ReplacedWith(_))
+    }
+
     async fn get(&self, key: &u64) -> Option<V> {
         self.cache.get(key).await
     }
@@ -117,5 +167,62 @@ where
 
     async fn run_pending_tasks(&self) {
         self.cache.run_pending_tasks().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Sizeable;
+
+    struct KeepTtl(bool);
+
+    impl Sizeable for KeepTtl {
+        fn get_memory_size(&self) -> usize {
+            1
+        }
+
+        fn keep_remaining_ttl(&self) -> bool {
+            self.0
+        }
+    }
+
+    #[test]
+    fn create_uses_the_configured_ttl() {
+        let policy = CacheTtl {
+            ttl: Duration::from_secs(10),
+        };
+        assert_eq!(
+            policy.expire_after_create(&(), &KeepTtl(false), Instant::now()),
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn a_promotion_keeps_the_remaining_ttl() {
+        let policy = CacheTtl {
+            ttl: Duration::from_secs(10),
+        };
+        let remaining = Duration::from_secs(3);
+        assert_eq!(
+            policy.expire_after_update(&(), &KeepTtl(true), Instant::now(), Some(remaining)),
+            Some(remaining)
+        );
+    }
+
+    #[test]
+    fn a_new_result_restarts_ttl() {
+        let policy = CacheTtl {
+            ttl: Duration::from_secs(10),
+        };
+        assert_eq!(
+            policy.expire_after_update(
+                &(),
+                &KeepTtl(false),
+                Instant::now(),
+                Some(Duration::from_secs(3))
+            ),
+            Some(Duration::from_secs(10))
+        );
     }
 }
