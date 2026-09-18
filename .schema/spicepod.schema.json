@@ -754,7 +754,12 @@
           "const": "lru"
         },
         {
-          "description": "`TinyLFU` caching policy.\nCombines LRU eviction with LFU-based admission policy.\nSuitable for most workloads including database, search, and analytics.",
+          "description": "Least Frequently Used caching policy.\nEvicts the lowest hit-count resident; suitable for stable hot-key workloads.",
+          "type": "string",
+          "const": "lfu"
+        },
+        {
+          "description": "W-`TinyLFU` caching policy.\nAdmission window + SLRU main (probation/protected) with Count-Min Sketch.\nSuitable for most workloads including database, search, and analytics.",
           "type": "string",
           "const": "tiny_lfu"
         }

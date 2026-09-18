@@ -84,7 +84,6 @@ struct Node<V> {
     next: Option<u32>,
 }
 
-
 pub(crate) fn into_owned<V: Clone>(value: Arc<V>) -> V {
     Arc::try_unwrap(value).unwrap_or_else(|shared| (*shared).clone())
 }
@@ -93,7 +92,10 @@ pub(crate) enum GetOutcome<V> {
     /// Live hit: `Arc` handle cloned under the shard lock (no list surgery).
     Hit(Arc<V>),
     Miss,
-    Expired { value: V, weight: u64 },
+    Expired {
+        value: V,
+        weight: u64,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -204,9 +206,15 @@ impl<V> Shard<V> {
         }
     }
 
-    pub(crate) fn peek_lfu_victim(&self) -> Option<(u64, u64, u16)> {
+    /// Sample up to `sample` residents from the LRU tail and return the
+    /// lowest-frequency candidate. Bounded O(`sample`) — not a full list walk.
+    pub(crate) fn peek_lfu_victim(&self, sample: usize) -> Option<(u64, u64, u16)> {
+        if sample == 0 {
+            return None;
+        }
         let mut best: Option<(u64, u64, u16)> = None;
         let mut cursor = self.probation.tail;
+        let mut examined = 0usize;
         while let Some(idx) = cursor {
             let Some(Slot::Occupied(node)) = self.slots.get(idx as usize) else {
                 break;
@@ -214,6 +222,10 @@ impl<V> Shard<V> {
             let take = best.is_none_or(|(_, _, freq)| node.freq < freq);
             if take {
                 best = Some((node.key, node.weight, node.freq));
+            }
+            examined += 1;
+            if examined >= sample {
+                break;
             }
             cursor = node.prev;
         }
@@ -859,5 +871,31 @@ mod tests {
         shard.apply_touch(1);
         assert_eq!(shard.peek_region(1), Some(Region::Protected));
         assert_eq!(shard.protected_weight(), 5);
+    }
+
+    #[test]
+    fn peek_lfu_victim_is_bounded_by_sample() {
+        let mut shard = Shard::new(crate::EvictionPolicy::Lfu);
+        let now = Instant::now();
+        // Insert 8 residents; bump freqs so the MRU (last inserted) is hottest
+        // and the LRU tail is coldest.
+        for i in 0..8u64 {
+            shard.insert(i, i, 1, now);
+        }
+        // Hits on keys 1..7 so key 0 (LRU tail after no hits + others promoted
+        // via apply_touch) stays coldest among the tail sample.
+        for key in 1..8u64 {
+            for _ in 0..key {
+                let _ = shard.get(key, now, Duration::from_mins(1));
+                shard.apply_touch(key);
+            }
+        }
+        let full = shard.peek_lfu_victim(usize::MAX).expect("full scan");
+        let sampled = shard.peek_lfu_victim(3).expect("sample");
+        assert_eq!(full.0, 0, "full scan must find key 0 as coldest");
+        // Sample of 3 from the LRU tail still includes key 0.
+        assert_eq!(sampled.0, 0, "tail sample must still see the coldest key");
+        // Sample of 0 yields nothing.
+        assert!(shard.peek_lfu_victim(0).is_none());
     }
 }
