@@ -114,19 +114,12 @@ async fn wait_for_registered_count(
     last
 }
 
-/// Poll `table`'s row count until it reaches `expected` or the timeout elapses, returning the last
+/// [`wait_for_registered_count`] for a table that is registered throughout, returning the last
 /// observed count.
 async fn wait_for_count(rt: &Runtime, table: &str, expected: usize, timeout: Duration) -> usize {
-    let deadline = timeout.as_millis() / 100;
-    let mut last = count_rows(rt, table).await;
-    for _ in 0..deadline {
-        if last == expected {
-            return last;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        last = count_rows(rt, table).await;
-    }
-    last
+    wait_for_registered_count(rt, table, expected, timeout)
+        .await
+        .expect("count query should plan against a registered table")
 }
 
 /// Runs `SELECT COUNT(*)` on `table` through the results-cache-aware query path
@@ -427,21 +420,47 @@ async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Resul
 
 /// Build the issue's Spicepod: a file-backed parent with the default in-memory accelerator, a
 /// `localpod:` child over it, and a `localpod:` grandchild over the child. `refresh_sql` is the
-/// edit the reload applies to the parent. The long results-cache TTL is what lets the tests
-/// observe a stale cached result instead of its expiry.
-fn app_with_parent_refresh_sql(csv_path: &Path, refresh_sql: Option<&str>) -> App {
-    AppBuilder::new("test_localpod_child_follows_parent_hot_reload")
-        .with_sql_cache(long_lived_results_cache())
-        .with_dataset(file_parent(csv_path, refresh_sql))
-        .with_dataset(localpod_dataset(
-            "localpod:time_series",
-            "local_time_series",
-        ))
-        .with_dataset(localpod_dataset(
-            "localpod:local_time_series",
-            "local_local_time_series",
-        ))
-        .build()
+/// edit the reload applies to the parent; `None` for `csv_path` leaves the parent out, so only
+/// the `localpod:` chain remains. The long results-cache TTL is what lets the tests observe a
+/// stale cached result instead of its expiry.
+fn app_with_parent_refresh_sql(csv_path: Option<&Path>, refresh_sql: Option<&str>) -> App {
+    let mut app = AppBuilder::new("test_localpod_child_follows_parent_hot_reload")
+        .with_sql_cache(long_lived_results_cache());
+    if let Some(csv_path) = csv_path {
+        app = app.with_dataset(file_parent(csv_path, refresh_sql));
+    }
+    app.with_dataset(localpod_dataset(
+        "localpod:time_series",
+        "local_time_series",
+    ))
+    .with_dataset(localpod_dataset(
+        "localpod:local_time_series",
+        "local_local_time_series",
+    ))
+    .build()
+}
+
+/// Write five rows to `csv_path`, boot a runtime on the Spicepod `app` builds over it, and wait
+/// for every dataset to load.
+async fn boot_with_five_rows(
+    csv_path: &Path,
+    app: impl FnOnce(&Path) -> App,
+) -> Result<Arc<Runtime>, anyhow::Error> {
+    fs::write(csv_path, format!("{CSV_HEADER}{}", rows(0, 5)))
+        .await
+        .expect("write initial csv");
+
+    configure_test_datafusion();
+    let runtime = Arc::new(Runtime::builder().with_app(app(csv_path)).build().await);
+
+    tokio::select! {
+        () = tokio::time::sleep(Duration::from_secs(30)) => {
+            return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+        }
+        () = Arc::clone(&runtime).load_components() => {}
+    }
+    runtime_ready_check(&runtime).await;
+    Ok(runtime)
 }
 
 /// The CSV-backed, in-memory-accelerated parent `time_series`, with `refresh_sql` as its
@@ -496,21 +515,6 @@ fn long_lived_results_cache() -> SQLResultsCacheConfig {
     }
 }
 
-/// The issue's Spicepod with the parent removed: only the `localpod:` chain remains.
-fn app_with_localpod_chain_only() -> App {
-    AppBuilder::new("test_localpod_child_follows_parent_hot_reload")
-        .with_sql_cache(long_lived_results_cache())
-        .with_dataset(localpod_dataset(
-            "localpod:time_series",
-            "local_time_series",
-        ))
-        .with_dataset(localpod_dataset(
-            "localpod:local_time_series",
-            "local_local_time_series",
-        ))
-        .build()
-}
-
 /// A localpod child must follow its parent through a hot reload instead of serving the table the
 /// parent retired.
 ///
@@ -529,25 +533,10 @@ async fn test_localpod_child_follows_parent_hot_reload() -> Result<(), anyhow::E
         .scope(async {
             let temp_dir = TempDir::new().expect("create temp dir");
             let csv_path = temp_dir.path().join("data.csv");
-            fs::write(&csv_path, format!("{CSV_HEADER}{}", rows(0, 5)))
-                .await
-                .expect("write initial csv");
-
-            configure_test_datafusion();
-            let runtime = Arc::new(
-                Runtime::builder()
-                    .with_app(app_with_parent_refresh_sql(&csv_path, None))
-                    .build()
-                    .await,
-            );
-
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(30)) => {
-                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
-                }
-                () = Arc::clone(&runtime).load_components() => {}
-            }
-            runtime_ready_check(&runtime).await;
+            let runtime = boot_with_five_rows(&csv_path, |csv_path| {
+                app_with_parent_refresh_sql(Some(csv_path), None)
+            })
+            .await?;
 
             assert_eq!(
                 count_rows(&runtime, "time_series").await,
@@ -568,7 +557,7 @@ async fn test_localpod_child_follows_parent_hot_reload() -> Result<(), anyhow::E
             // The issue's edit: a `refresh_sql` on the parent's acceleration, which keeps two of
             // the five rows and replaces the parent's accelerated table on hot reload.
             let edited = Arc::new(app_with_parent_refresh_sql(
-                &csv_path,
+                Some(&csv_path),
                 Some("SELECT * FROM time_series WHERE id < 2"),
             ));
             assert!(
@@ -631,25 +620,10 @@ async fn test_localpod_child_follows_parent_removed_and_added_back() -> Result<(
         .scope(async {
             let temp_dir = TempDir::new().expect("create temp dir");
             let csv_path = temp_dir.path().join("data.csv");
-            fs::write(&csv_path, format!("{CSV_HEADER}{}", rows(0, 5)))
-                .await
-                .expect("write initial csv");
-
-            configure_test_datafusion();
-            let runtime = Arc::new(
-                Runtime::builder()
-                    .with_app(app_with_parent_refresh_sql(&csv_path, None))
-                    .build()
-                    .await,
-            );
-
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(30)) => {
-                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
-                }
-                () = Arc::clone(&runtime).load_components() => {}
-            }
-            runtime_ready_check(&runtime).await;
+            let runtime = boot_with_five_rows(&csv_path, |csv_path| {
+                app_with_parent_refresh_sql(Some(csv_path), None)
+            })
+            .await?;
             assert_eq!(count_rows(&runtime, "local_time_series").await, 5);
             assert_eq!(count_rows(&runtime, "local_local_time_series").await, 5);
 
@@ -663,7 +637,7 @@ async fn test_localpod_child_follows_parent_removed_and_added_back() -> Result<(
             // Remove the parent. Its unload is awaited inside `apply_app`.
             assert!(
                 Arc::clone(&runtime)
-                    .apply_app(Arc::new(app_with_localpod_chain_only()))
+                    .apply_app(Arc::new(app_with_parent_refresh_sql(None, None)))
                     .await,
                 "dropping the parent differs from the booted spicepod, so it must apply"
             );
@@ -682,7 +656,7 @@ async fn test_localpod_child_follows_parent_removed_and_added_back() -> Result<(
             assert!(
                 Arc::clone(&runtime)
                     .apply_app(Arc::new(app_with_parent_refresh_sql(
-                        &csv_path,
+                        Some(&csv_path),
                         Some("SELECT * FROM time_series WHERE id < 2"),
                     )))
                     .await,
@@ -755,25 +729,10 @@ async fn test_localpod_passthrough_child_follows_parent_removed_and_added_back()
         .scope(async {
             let temp_dir = TempDir::new().expect("create temp dir");
             let csv_path = temp_dir.path().join("data.csv");
-            fs::write(&csv_path, format!("{CSV_HEADER}{}", rows(0, 5)))
-                .await
-                .expect("write initial csv");
-
-            configure_test_datafusion();
-            let runtime = Arc::new(
-                Runtime::builder()
-                    .with_app(app_with_passthrough_child(Some(&csv_path), None))
-                    .build()
-                    .await,
-            );
-
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(30)) => {
-                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
-                }
-                () = Arc::clone(&runtime).load_components() => {}
-            }
-            runtime_ready_check(&runtime).await;
+            let runtime = boot_with_five_rows(&csv_path, |csv_path| {
+                app_with_passthrough_child(Some(csv_path), None)
+            })
+            .await?;
 
             // Warm the query path's plan and results caches over the child's current table.
             let (status, count) = cached_count(&runtime, "local_time_series").await;
