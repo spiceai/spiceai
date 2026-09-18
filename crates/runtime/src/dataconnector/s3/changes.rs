@@ -39,8 +39,8 @@ use data_components::cdc::{
     StreamError, build_ready_signal_envelope, shutdown_epoch, wrap_data_as_change_batch,
 };
 use futures::StreamExt;
-use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parking_lot::Mutex;
 use runtime_component::dataset::DatasetSpec;
 use runtime_component::dataset::acceleration::RefreshMode;
@@ -122,6 +122,16 @@ pub enum Error {
         dataset_name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} (s3): `refresh_mode: changes` needs `from` to name an S3 prefix, but '{from}' contains a wildcard. Point `from` at the prefix that holds the objects (for example 's3://bucket/events/') and narrow it with `s3_changes_key_prefix`. See: {S3_DOCS}"
+    ))]
+    FromIsGlob { dataset_name: String, from: String },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} (s3): `refresh_mode: changes` needs `from` to name an S3 prefix, but '{from}' names a single object. Point `from` at the prefix that holds the objects (for example 's3://bucket/events/'), or keep this object on `refresh_mode: full`. See: {S3_DOCS}"
+    ))]
+    FromNamesAnObject { dataset_name: String, from: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -689,7 +699,31 @@ fn bucket_and_key_prefix(dataset: &DatasetSpec) -> Result<(String, String)> {
             from: dataset.from.clone(),
         }
     );
+    // Every key under the prefix is the dataset, so a `from` the listing table
+    // resolves to one object or to a glob has no prefix to derive: appending a
+    // `/` to it produces a prefix nothing is under, which would snapshot an
+    // empty accelerator and put every notification for the object outside the
+    // dataset. Refuse both instead.
+    ensure!(
+        !rest.contains(['*', '?', '[']),
+        FromIsGlobSnafu {
+            dataset_name: dataset.name.to_string(),
+            from: dataset.from.clone(),
+        }
+    );
     Ok((bucket.to_string(), normalize_prefix(rest)))
+}
+
+/// The object key a `from` names outright, if it can name one: S3 has no
+/// directories, so only a trailing `/` marks a path as a prefix for certain.
+/// `None` when `from` already ends in `/`, and for a bucket root.
+fn key_from_may_name(dataset: &DatasetSpec) -> Option<String> {
+    let path = dataset.path().trim_start_matches('/');
+    if path.ends_with('/') {
+        return None;
+    }
+    let (_, rest) = path.split_once('/')?;
+    (!rest.is_empty()).then(|| rest.to_string())
 }
 
 fn normalize_prefix(prefix: &str) -> String {
@@ -910,6 +944,21 @@ pub async fn s3_changes_stream(
         Ok((_, extension)) => ListingFileFilter { extension },
         Err(error) => return Some(error_stream(error)),
     };
+    // Only the object store can say whether a `from` without a trailing `/`
+    // names an object or a prefix, and the two are the same string in S3.
+    if let Some(key) = key_from_may_name(dataset) {
+        match connector.get_object_store(dataset) {
+            Ok(store) => {
+                if store.head(&ObjectPath::from(key.as_str())).await.is_ok() {
+                    return Some(error_stream(Error::FromNamesAnObject {
+                        dataset_name: dataset.name.to_string(),
+                        from: dataset.from.clone(),
+                    }));
+                }
+            }
+            Err(error) => return Some(error_stream(error)),
+        }
+    }
     let client = match build_sqs_client(
         &connector.params,
         &config.region,
@@ -2154,6 +2203,51 @@ mod tests {
             message.contains("ignore") && message.contains("rebuild"),
             "invalid ObjectRemoved action must list ignore|rebuild, got: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_a_glob_from() {
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_auth", "iam_role"),
+        ])
+        .await;
+        let mut dataset = DatasetSpec::new("s3://my-bucket/events/year=*/", "events".into());
+        dataset.acceleration = Some(Acceleration {
+            refresh_mode: Some(RefreshMode::Changes),
+            ..Acceleration::default()
+        });
+        let error = S3ChangesConfig::try_from_params(&params, &dataset)
+            .expect_err("a glob has no prefix to derive");
+        let message = error.to_string();
+        assert!(
+            message.contains("wildcard") && message.contains("s3_changes_key_prefix"),
+            "the error must say what is wrong and what to do instead, got: {message}"
+        );
+    }
+
+    /// A `from` that names one object derives the prefix `<key>/`, which nothing
+    /// is under: the snapshot would mark an empty accelerator ready and every
+    /// notification for the object itself would count as outside the dataset.
+    /// Only the object store can tell the two apart, so the refusal needs the
+    /// key this returns.
+    #[test]
+    fn a_from_without_a_trailing_slash_may_name_an_object() {
+        let object = DatasetSpec::new("s3://my-bucket/events/part-00000.parquet", "events".into());
+        assert_eq!(
+            key_from_may_name(&object).as_deref(),
+            Some("events/part-00000.parquet")
+        );
+
+        let prefix = DatasetSpec::new("s3://my-bucket/events/", "events".into());
+        assert_eq!(
+            key_from_may_name(&prefix),
+            None,
+            "a trailing slash marks a prefix, so there is nothing to check"
+        );
+
+        let bucket_root = DatasetSpec::new("s3://my-bucket", "events".into());
+        assert_eq!(key_from_may_name(&bucket_root), None);
     }
 
     #[tokio::test]
