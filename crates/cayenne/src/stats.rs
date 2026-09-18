@@ -1269,7 +1269,7 @@ mod tests {
     /// A live scale widening infers footer stats at the new scale, then this
     /// helper used to persist them against the frozen open-time schema. Vortex
     /// stores unscaled integers; restoring that blob at scale 2 turned
-    /// 123.4500 (unscaled 1_234_500) into 12345.00. Drop the sum rather than
+    /// 123.4500 (unscaled `1_234_500`) into 12345.00. Drop the sum rather than
     /// let `SUM`/`AVG` fold the mis-scaled value.
     #[test]
     fn decimal_sum_is_dropped_when_persisted_against_a_narrower_scale() {
