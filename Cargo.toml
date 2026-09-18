@@ -505,7 +505,11 @@ split-debuginfo = "packed"
 
 [profile.lint]
 debug = "line-tables-only"
-incremental = true
+# sccache cannot cache an incremental compilation, so leaving this on trades a
+# shared cache for a local one. CI already forces CARGO_INCREMENTAL=0, which
+# takes precedence over this field, so only local `make lint-rust`/`make signoff`
+# runs were paying for it.
+incremental = false
 inherits = "dev"
 lto = "off"
 
