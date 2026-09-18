@@ -28,6 +28,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::execution::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
+use datafusion::sql::planner::IdentNormalizer;
 use datafusion_ddl::{CatalogDdlHandler, CreateSchemaParams, CreateTableParams, DropTableParams};
 
 use crate::ddl::get_cayenne_provider;
@@ -61,6 +62,21 @@ impl CatalogDdlHandler for CayenneDdlHandler {
         catalog_list: Arc<dyn CatalogProviderList>,
         session_state: &SessionState,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let table_ref = format!(
+            "{}.{}.{}",
+            params.catalog_name, params.schema_name, params.table_name
+        );
+        let cluster_by = operations::cluster_by_column_names(
+            &table_ref,
+            &params.extension.cluster_by,
+            &IdentNormalizer::new(
+                session_state
+                    .config()
+                    .options()
+                    .sql_parser
+                    .enable_ident_normalization,
+            ),
+        )?;
         Ok(Arc::new(CayenneCreateTableExec::new(
             operations::CreateTableParams {
                 table_name: params.table_name,
@@ -69,6 +85,7 @@ impl CatalogDdlHandler for CayenneDdlHandler {
                 arrow_schema: params.arrow_schema,
                 primary_key: params.primary_key,
                 partition_expr_sql: params.extension.partition_by.map(|e| e.to_string()),
+                cluster_by,
                 if_not_exists: params.if_not_exists,
                 like_source_table: params.like_source_table,
                 ctx: Some(Arc::new(SessionContext::new_with_state(

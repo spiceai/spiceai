@@ -1,20 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
+use super::write_observer::VortexWriteObserver;
 use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion_common::Result as DFResult;
 use datafusion_common::ScalarValue;
 use datafusion_common::arrow::array::Array;
+use datafusion_common::arrow::array::ArrayRef as ArrowArrayRef;
 use datafusion_common::arrow::array::RecordBatch;
 use datafusion_common::arrow::array::RecordBatchOptions;
 use datafusion_common::arrow::array::UInt32Array;
+use datafusion_common::arrow::compute::SortOptions;
+use datafusion_common::arrow::compute::concat;
+use datafusion_common::arrow::compute::interleave_record_batch;
 use datafusion_common::arrow::compute::kernels::cmp::gt;
+use datafusion_common::arrow::compute::sort_to_indices;
 use datafusion_common::arrow::compute::take;
+use datafusion_common::arrow::datatypes::DataType;
+use datafusion_common::arrow::datatypes::i256;
 use datafusion_common::exec_datafusion_err;
+use datafusion_common::utils::memory::get_record_batch_memory_size;
 use datafusion_common_runtime::{JoinSet, SpawnedTask};
 use datafusion_datasource::ListingTableUrl;
 use datafusion_datasource::file_sink_config::{FileSink, FileSinkConfig};
@@ -23,6 +33,9 @@ use datafusion_datasource::write::demux::DemuxedStreamReceiver;
 use datafusion_datasource::write::get_writer_schema;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_execution::TaskContext;
+use datafusion_execution::memory_pool::MemoryConsumer;
+use datafusion_execution::memory_pool::MemoryPool;
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
@@ -82,10 +95,20 @@ pub(super) enum ShardSpec {
     /// usable: routing whole batches to one shard at a time would idle the other
     /// encoders, because the sink's shard and file channels are depth-1 and the
     /// demux cannot run ahead of the encoder it is currently feeding.
+    ///
+    /// `run_sort_bytes` additionally orders each shard's rows by `expr` in runs
+    /// of at most that many uncompressed bytes before they are encoded. A range
+    /// file then carries a handful of sorted runs instead of arrival order, so
+    /// the zone maps INSIDE it are narrow too and an equality on the key reads
+    /// about one zone per run — at a memory cost of one run per shard, rather
+    /// than the whole write a global sort would buffer. The runs are charged to
+    /// the task's memory pool and cut short when it refuses (see
+    /// [`RunSorter`]), so the sort never takes memory the pool does not have.
     Range {
         expr: PhysicalExprRef,
         bounds: Vec<ScalarValue>,
         partitions: usize,
+        run_sort_bytes: Option<u64>,
     },
     /// `n` writers, rows hash-partitioned by `exprs` (parallel encode + key-clustered files).
     Hash {
@@ -199,7 +222,13 @@ fn range_partition(
     let key = expr.evaluate(&batch)?.into_array(rows)?;
     let mut bucket = vec![0_u32; rows];
     for bound in bounds {
-        let scalar = bound.to_scalar()?;
+        // The comparison kernel needs both sides in one type; bounds read off an
+        // earlier snapshot can carry a sibling string or binary representation.
+        let scalar = if bound.data_type() == *key.data_type() {
+            bound.to_scalar()?
+        } else {
+            bound.cast_to(key.data_type())?.to_scalar()?
+        };
         let greater = gt(&key, &scalar)?;
         for (index, slot) in bucket.iter_mut().enumerate() {
             // `value()` is only defined where the comparison produced a
@@ -258,6 +287,9 @@ struct WriteOutputOptions<'a> {
     partition_column_names: &'a [String],
     keep_partition_by_columns: bool,
     shard_spec: &'a ShardSpec,
+    /// Charged for the rows a range shard buffers to sort.
+    memory_pool: &'a Arc<dyn MemoryPool>,
+    write_observer: Option<&'a Arc<dyn VortexWriteObserver>>,
 }
 
 #[derive(Clone, Copy)]
@@ -323,6 +355,7 @@ pub struct VortexSink {
     session: VortexSession,
     target_file_size: Option<u64>,
     shard_spec: ShardSpec,
+    write_observer: Option<Arc<dyn VortexWriteObserver>>,
 }
 
 impl VortexSink {
@@ -332,6 +365,7 @@ impl VortexSink {
         session: VortexSession,
         target_file_size: Option<u64>,
         shard_spec: ShardSpec,
+        write_observer: Option<Arc<dyn VortexWriteObserver>>,
     ) -> Self {
         Self {
             config,
@@ -339,6 +373,7 @@ impl VortexSink {
             session,
             target_file_size,
             shard_spec,
+            write_observer,
         }
     }
 
@@ -499,6 +534,8 @@ impl DataSink for VortexSink {
                 partition_column_names: &partition_column_names,
                 keep_partition_by_columns: self.config.keep_partition_by_columns,
                 shard_spec: &self.shard_spec,
+                memory_pool: context.memory_pool(),
+                write_observer: self.write_observer.as_ref(),
             },
         )
         .await?;
@@ -553,6 +590,7 @@ async fn write_record_batch_stream_to_files(
     mut data: SendableRecordBatchStream,
     output_options: &WriteOutputOptions<'_>,
 ) -> DFResult<Vec<(Path, WriteSummary)>> {
+    let write_observer = output_options.write_observer.map(Arc::clone);
     let target = output_options.target_file_size.map(|t| t.max(1));
     let single_file_output = !output_options.base_output_path.is_collection()
         && output_options.base_output_path.file_extension().is_some();
@@ -575,6 +613,25 @@ async fn write_record_batch_stream_to_files(
     let mut senders = Vec::with_capacity(num_shards);
     let mut handles = Vec::with_capacity(num_shards);
     let started_paths = Arc::new(Mutex::new(HashSet::new()));
+    // Run sorting only means something when the rows were routed by range: it
+    // orders each range's rows by the same key the routing split on.
+    let run_sort = match output_options.shard_spec {
+        ShardSpec::Range {
+            expr,
+            run_sort_bytes: Some(bytes),
+            ..
+        } if num_shards > 1
+            && *bytes > 0
+            && data
+                .schema()
+                .fields()
+                .iter()
+                .all(|field| run_sort_supports(field.data_type())) =>
+        {
+            Some((Arc::clone(expr), *bytes))
+        }
+        _ => None,
+    };
     for shard_id in 0..num_shards {
         let (tx, rx) = futures::channel::mpsc::channel::<RecordBatch>(1);
         senders.push(tx);
@@ -591,6 +648,16 @@ async fn write_record_batch_stream_to_files(
             shard_id,
             num_shards,
             Arc::clone(&started_paths),
+            write_observer.clone(),
+            run_sort.as_ref().map(|(expr, bytes)| {
+                RunSorter::new(
+                    Arc::clone(expr),
+                    *bytes,
+                    MemoryConsumer::new(format!("VortexRunSort[{shard_id}]"))
+                        .with_can_spill(true)
+                        .register(output_options.memory_pool),
+                )
+            }),
         )));
     }
 
@@ -687,6 +754,281 @@ async fn write_record_batch_stream_to_files(
     Ok(results)
 }
 
+/// Rows per batch a sorted run is written in: `DataFusion`'s default batch size,
+/// so the file writer and its size-based roll see the same granularity they do
+/// for an unsorted shard.
+const RUN_SORT_OUTPUT_ROWS: usize = 8192;
+
+/// Whether a column of this type can be emitted from a sorted run, which
+/// interleaves rows from every batch the run buffered.
+///
+/// Types the kernel copies value by value qualify, and containers of them.
+/// Dictionaries do not: interleaving merges the batches' dictionaries, which
+/// fails once a narrow key type cannot address the merged values and otherwise
+/// rescans every buffered dictionary for each emitted batch. Nor do run-end
+/// encoded, union and list-view columns, or any type not named here. A write
+/// carrying one still routes rows by range; it just writes each range unsorted.
+fn run_sort_supports(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Null
+        | DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Timestamp(..)
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Duration(_)
+        | DataType::Interval(_)
+        | DataType::Binary
+        | DataType::FixedSizeBinary(_)
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Decimal32(..)
+        | DataType::Decimal64(..)
+        | DataType::Decimal128(..)
+        | DataType::Decimal256(..) => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => run_sort_supports(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .all(|field| run_sort_supports(field.data_type())),
+        _ => false,
+    }
+}
+
+/// What `sort_to_indices` allocates per row of a key of `data_type`, beside the
+/// key itself: its `(row index, sort value)` pair, and the row-index vectors it
+/// partitions the rows into and emits, which overlap the pairs.
+fn sort_scratch_bytes_per_row(data_type: &DataType) -> usize {
+    use std::mem::size_of;
+
+    let pair = match data_type {
+        DataType::Decimal256(..) => size_of::<(u32, i256)>(),
+        DataType::Decimal128(..) | DataType::Utf8View | DataType::BinaryView => {
+            size_of::<(u32, u128)>()
+        }
+        DataType::FixedSizeBinary(_) => size_of::<(u32, &[u8])>(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+            size_of::<(u32, u32, u64)>()
+        }
+        // Every other key a range can be split on is a native of at most 8 bytes.
+        _ => size_of::<(u32, u64)>(),
+    };
+    pair + 2 * size_of::<u32>()
+}
+
+/// Buffers one shard's rows up to a byte budget, then emits them sorted by the
+/// shard key. See [`ShardSpec::Range`].
+///
+/// Each batch is charged to the task's memory pool on arrival, together with
+/// the scratch its share of the sort will need, so a run that was admitted can
+/// always be sorted. When the pool refuses a batch, the run is sealed with what
+/// it holds and that batch is written as it arrived: a full pool shortens runs,
+/// it never fails the write or holds rows the pool did not grant.
+///
+/// A sealed run is emitted a batch at a time, interleaved from the buffered
+/// batches, so it never holds a second, sorted copy of itself.
+struct RunSorter {
+    expr: PhysicalExprRef,
+    max_bytes: usize,
+    reservation: MemoryReservation,
+    buffered: Vec<RecordBatch>,
+    /// The sort key of each buffered batch.
+    keys: Vec<ArrowArrayRef>,
+    /// Pool bytes of the buffered batches, which the byte budget counts.
+    buffered_bytes: usize,
+    /// Pool bytes reserved for sorting the buffered batches.
+    scratch_bytes: usize,
+    /// The run being emitted.
+    sealed: Option<SortedRun>,
+    /// Batches to emit as they arrived, after `sealed`.
+    unsorted: VecDeque<RecordBatch>,
+}
+
+/// A run's batches with the order to emit their rows in.
+struct SortedRun {
+    batches: Vec<RecordBatch>,
+    /// Row offset of each batch within the run, ascending from 0.
+    starts: Vec<usize>,
+    /// Rows of the run in key order, as offsets within the run.
+    order: UInt32Array,
+    emitted: usize,
+}
+
+impl SortedRun {
+    fn next_batch(&mut self) -> DFResult<Option<RecordBatch>> {
+        let rows = self.order.len();
+        if self.emitted >= rows {
+            return Ok(None);
+        }
+        let end = rows.min(self.emitted.saturating_add(RUN_SORT_OUTPUT_ROWS));
+        let positions = self.order.values()[self.emitted..end]
+            .iter()
+            .map(|&row| {
+                let row = row as usize;
+                // The batch holding `row` is the last one starting at or before
+                // it; `starts[0]` is 0, so there always is one.
+                let batch = self
+                    .starts
+                    .partition_point(|&start| start <= row)
+                    .saturating_sub(1);
+                (batch, row - self.starts[batch])
+            })
+            .collect::<Vec<_>>();
+        let batches: Vec<&RecordBatch> = self.batches.iter().collect();
+        let batch = interleave_record_batch(&batches, &positions)?;
+        self.emitted = end;
+        Ok(Some(batch))
+    }
+}
+
+impl RunSorter {
+    fn new(expr: PhysicalExprRef, max_bytes: u64, reservation: MemoryReservation) -> Self {
+        Self {
+            expr,
+            max_bytes: usize::try_from(max_bytes).unwrap_or(usize::MAX),
+            reservation,
+            buffered: Vec::new(),
+            keys: Vec::new(),
+            buffered_bytes: 0,
+            scratch_bytes: 0,
+            sealed: None,
+            unsorted: VecDeque::new(),
+        }
+    }
+
+    /// Adds `batch` to the current run, sealing the run once it reaches its byte
+    /// budget or the pool refuses the batch. Drain [`Self::next_output`] before
+    /// pushing again.
+    fn push(&mut self, batch: RecordBatch) -> DFResult<()> {
+        self.ensure_drained()?;
+        let rows = batch.num_rows();
+        let key = self.expr.evaluate(&batch)?.into_array(rows)?;
+        let bytes = get_record_batch_memory_size(&batch);
+        // Sorting concatenates the keys, so each one is copied once.
+        let scratch = key
+            .get_array_memory_size()
+            .saturating_add(rows.saturating_mul(sort_scratch_bytes_per_row(key.data_type())));
+        if self
+            .reservation
+            .try_grow(bytes.saturating_add(scratch))
+            .is_err()
+        {
+            self.seal()?;
+            self.unsorted.push_back(batch);
+            return Ok(());
+        }
+        self.buffered.push(batch);
+        self.keys.push(key);
+        self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
+        self.scratch_bytes = self.scratch_bytes.saturating_add(scratch);
+        if self.buffered_bytes >= self.max_bytes {
+            self.seal()?;
+        }
+        Ok(())
+    }
+
+    /// Seals whatever the current run holds; the input has ended.
+    fn finish(&mut self) -> DFResult<()> {
+        self.ensure_drained()?;
+        self.seal()
+    }
+
+    /// Sealing replaces the emitted run, so one still being written would lose
+    /// its rows; refuse rather than drop them.
+    fn ensure_drained(&self) -> DFResult<()> {
+        if self.sealed.is_some() || !self.unsorted.is_empty() {
+            return Err(exec_datafusion_err!(
+                "Vortex run sort received more rows before its previous run was written"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Next batch to write, or `None` once everything sealed has been emitted.
+    fn next_output(&mut self) -> DFResult<Option<RecordBatch>> {
+        if let Some(run) = self.sealed.as_mut() {
+            if let Some(batch) = run.next_batch()? {
+                return Ok(Some(batch));
+            }
+            self.sealed = None;
+        }
+        if let Some(batch) = self.unsorted.pop_front() {
+            return Ok(Some(batch));
+        }
+        // Everything emitted belongs to the file writer now; only a run still
+        // being buffered stays reserved.
+        let held = self.buffered_bytes.saturating_add(self.scratch_bytes);
+        self.reservation
+            .shrink(self.reservation.size().saturating_sub(held));
+        Ok(None)
+    }
+
+    /// Moves the buffered batches into `sealed` with their rows ordered by the
+    /// key. NULL keys sort first, which is where the range router put them.
+    fn seal(&mut self) -> DFResult<()> {
+        let batches = std::mem::take(&mut self.buffered);
+        let keys = std::mem::take(&mut self.keys);
+        let scratch = std::mem::take(&mut self.scratch_bytes);
+        self.buffered_bytes = 0;
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let mut starts = Vec::with_capacity(batches.len());
+        let mut rows = 0_usize;
+        for batch in &batches {
+            starts.push(rows);
+            rows = rows.saturating_add(batch.num_rows());
+        }
+        if u32::try_from(rows).is_err() {
+            // More rows than a sort index can address: write them as they came.
+            self.reservation.shrink(scratch);
+            self.unsorted.extend(batches);
+            return Ok(());
+        }
+        let order = {
+            let keys: Vec<&dyn Array> = keys.iter().map(AsRef::as_ref).collect();
+            let key = concat(&keys)?;
+            sort_to_indices(
+                &key,
+                Some(SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                }),
+                None,
+            )?
+        };
+        drop(keys);
+        // The concatenated key and the sort's pairs are freed; the order is kept
+        // until the run has been emitted.
+        self.reservation
+            .shrink(scratch.saturating_sub(order.get_array_memory_size()));
+        self.sealed = Some(SortedRun {
+            batches,
+            starts,
+            order,
+            emitted: 0,
+        });
+        Ok(())
+    }
+}
+
 /// A single shard writer: drains its receiver, rolling output files by
 /// estimated compressed size (independent per shard), and returns the files it
 /// wrote. On error it cleans up its own active + finished files before
@@ -705,75 +1047,119 @@ async fn run_shard_writer(
     shard_id: usize,
     num_shards: usize,
     started_paths: Arc<Mutex<HashSet<Path>>>,
+    write_observer: Option<Arc<dyn VortexWriteObserver>>,
+    mut run_sort: Option<RunSorter>,
 ) -> DFResult<Vec<(Path, WriteSummary)>> {
     let mut results: Vec<(Path, WriteSummary)> = Vec::new();
     let mut active_writer: Option<ActiveFileWriter> = None;
     let mut uncompressed_bytes_in_file = 0_u64;
+    // Physical rows already appended to the ACTIVE file. Reset with the file, so
+    // it is the file-local position of the next batch's first row.
+    let mut rows_in_file = 0_u64;
     let mut file_index = 0_usize;
     let mut compression_estimate = CompressionEstimate::identity();
 
     let write_result: DFResult<()> = async {
-        while let Some(batch) = receiver.next().await {
-            if active_writer.is_none() {
-                let file_path = output_file_path(
-                    &base_output_path,
-                    file_index,
-                    &extension,
-                    single_file_output,
-                    &write_id,
-                    shard_id,
-                    num_shards,
-                );
-                started_paths.lock().await.insert(file_path.clone());
-                active_writer = Some(start_file_writer(
-                    &session,
-                    Arc::clone(&object_store),
-                    file_path,
-                    dtype.clone(),
-                ));
+        loop {
+            let incoming = receiver.next().await;
+            let drained = incoming.is_none();
+            let mut arrived = None;
+            match (run_sort.as_mut(), incoming) {
+                (None, batch) => arrived = batch,
+                (Some(sorter), Some(batch)) => sorter.push(batch)?,
+                (Some(sorter), None) => sorter.finish()?,
             }
 
-            let batch_bytes = batch_uncompressed_bytes(&batch)?;
-            send_batch_to_active_writer(&mut active_writer, batch).await?;
-            let active_path = active_writer
-                .as_ref()
-                .ok_or_else(|| {
-                    exec_datafusion_err!(
-                        "Missing active file writer while updating sink byte counter"
-                    )
-                })?
-                .path
-                .as_ref();
-            uncompressed_bytes_in_file = uncompressed_bytes_in_file
-                .checked_add(batch_bytes)
-                .ok_or_else(|| {
-                    exec_datafusion_err!(
-                        "Uncompressed byte counter overflow for sink output file {active_path}"
-                    )
-                })?;
+            loop {
+                let next = match run_sort.as_mut() {
+                    Some(sorter) => sorter.next_output()?,
+                    None => arrived.take(),
+                };
+                let Some(batch) = next else {
+                    break;
+                };
+                if active_writer.is_none() {
+                    let file_path = output_file_path(
+                        &base_output_path,
+                        file_index,
+                        &extension,
+                        single_file_output,
+                        &write_id,
+                        shard_id,
+                        num_shards,
+                    );
+                    started_paths.lock().await.insert(file_path.clone());
+                    active_writer = Some(start_file_writer(
+                        &session,
+                        Arc::clone(&object_store),
+                        file_path,
+                        dtype.clone(),
+                    ));
+                }
 
-            if let Some(target) = target {
-                let estimated_compressed =
-                    compression_estimate.estimate_compressed_size(uncompressed_bytes_in_file)?;
-                if estimated_compressed >= target {
-                    let writer = active_writer.take().ok_or_else(|| {
+                let batch_bytes = batch_uncompressed_bytes(&batch)?;
+                // Report placement BEFORE the append: the position is decided by
+                // the order batches are written in, and a failed send fails the
+                // whole write, so an observer can never be left holding positions
+                // for rows that were not written.
+                if let Some(observer) = write_observer.as_ref() {
+                    let writer = active_writer.as_ref().ok_or_else(|| {
+                        exec_datafusion_err!("Missing active file writer while observing a batch")
+                    })?;
+                    observer.batch_written(&writer.path, rows_in_file, &batch);
+                }
+                rows_in_file = rows_in_file
+                    .checked_add(batch.num_rows() as u64)
+                    .ok_or_else(|| {
+                        exec_datafusion_err!("Row counter overflow for sink output file")
+                    })?;
+                send_batch_to_active_writer(&mut active_writer, batch).await?;
+                let active_path = active_writer
+                    .as_ref()
+                    .ok_or_else(|| {
                         exec_datafusion_err!(
-                            "Missing active file writer while finalizing rotated output file"
+                            "Missing active file writer while updating sink byte counter"
+                        )
+                    })?
+                    .path
+                    .as_ref();
+                uncompressed_bytes_in_file = uncompressed_bytes_in_file
+                    .checked_add(batch_bytes)
+                    .ok_or_else(|| {
+                        exec_datafusion_err!(
+                            "Uncompressed byte counter overflow for sink output file {active_path}"
                         )
                     })?;
-                    let file_path = writer.path.clone();
-                    let summary = finish_file_writer(writer).await?;
-                    if uncompressed_bytes_in_file > 0 {
-                        compression_estimate = CompressionEstimate::from_file_sizes(
-                            summary.size(),
-                            uncompressed_bytes_in_file,
-                        )?;
-                    }
 
-                    results.push((file_path, summary));
-                    uncompressed_bytes_in_file = 0;
-                    file_index += 1;
+                if let Some(target) = target {
+                    let estimated_compressed = compression_estimate
+                        .estimate_compressed_size(uncompressed_bytes_in_file)?;
+                    if estimated_compressed >= target {
+                        let writer = active_writer.take().ok_or_else(|| {
+                            exec_datafusion_err!(
+                                "Missing active file writer while finalizing rotated output file"
+                            )
+                        })?;
+                        let file_path = writer.path.clone();
+                        let summary = finish_file_writer(writer).await?;
+                        if uncompressed_bytes_in_file > 0 {
+                            compression_estimate = CompressionEstimate::from_file_sizes(
+                                summary.size(),
+                                uncompressed_bytes_in_file,
+                            )?;
+                        }
+
+                        results.push((file_path, summary));
+                        uncompressed_bytes_in_file = 0;
+                        // Positions are file-local, so the counter resets with the file.
+                        rows_in_file = 0;
+                        file_index += 1;
+                    }
                 }
+            }
+
+            if drained {
+                break;
             }
         }
 
@@ -1045,6 +1431,10 @@ mod tests {
     use arrow_schema::SchemaRef;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_execution::SendableRecordBatchStream;
+    use datafusion_execution::memory_pool::GreedyMemoryPool;
+    use datafusion_execution::memory_pool::MemoryConsumer;
+    use datafusion_execution::memory_pool::MemoryPool;
+    use datafusion_execution::memory_pool::UnboundedMemoryPool;
     use datafusion_physical_expr::PhysicalExprRef;
     use datafusion_physical_expr::expressions::Column;
     use object_store::path::Path;
@@ -1058,10 +1448,15 @@ mod tests {
     use crate::persistent::VortexFormatFactory;
     use crate::persistent::VortexTableOptions;
     use crate::persistent::sink::ActiveFileWriter;
+    use crate::persistent::sink::RUN_SORT_OUTPUT_ROWS;
+    use crate::persistent::sink::RunSorter;
     use crate::persistent::sink::ShardSpec;
     use crate::persistent::sink::WriteOutputOptions;
     use crate::persistent::sink::finish_file_writer;
+    use crate::persistent::sink::get_record_batch_memory_size;
     use crate::persistent::sink::range_partition;
+    use crate::persistent::sink::run_sort_supports;
+    use crate::persistent::sink::sort_scratch_bytes_per_row;
     use crate::persistent::sink::write_record_batch_stream_to_files;
 
     fn split_path(
@@ -2458,6 +2853,18 @@ mod tests {
         target_file_size: Option<u64>,
         shard_spec: ShardSpec,
     ) -> datafusion_common::Result<Vec<(Path, WriteSummary)>> {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        run_sharded_write_with_pool(store, schema, data, target_file_size, shard_spec, &pool).await
+    }
+
+    async fn run_sharded_write_with_pool(
+        store: Arc<dyn object_store::ObjectStore>,
+        schema: SchemaRef,
+        data: SendableRecordBatchStream,
+        target_file_size: Option<u64>,
+        shard_spec: ShardSpec,
+        memory_pool: &Arc<dyn MemoryPool>,
+    ) -> datafusion_common::Result<Vec<(Path, WriteSummary)>> {
         let dtype = DType::from_arrow(Arc::clone(&schema));
         let base = ListingTableUrl::parse("file:///table/")
             .expect("file:///table/ should parse as a listing url");
@@ -2474,6 +2881,8 @@ mod tests {
                 partition_column_names: &[],
                 keep_partition_by_columns: false,
                 shard_spec: &shard_spec,
+                memory_pool,
+                write_observer: None,
             },
         )
         .await
@@ -2714,6 +3123,7 @@ mod tests {
                     ScalarValue::Int64(Some(144)),
                 ],
                 partitions: 4,
+                run_sort_bytes: None,
             },
         )
         .await?;
@@ -2734,6 +3144,377 @@ mod tests {
                 .map(|(p, _)| p.to_string())
                 .collect::<Vec<_>>()
         );
+        Ok(())
+    }
+
+    fn int64_values(batches: &[RecordBatch]) -> Vec<Option<i64>> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("a column should be Int64Array");
+                column.iter().collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn run_sorter(max_bytes: u64, pool: &Arc<dyn MemoryPool>) -> RunSorter {
+        RunSorter::new(
+            Arc::new(Column::new("a", 0)),
+            max_bytes,
+            MemoryConsumer::new("test run sort").register(pool),
+        )
+    }
+
+    fn drain(sorter: &mut RunSorter) -> anyhow::Result<Vec<RecordBatch>> {
+        let mut out = Vec::new();
+        while let Some(batch) = sorter.next_output()? {
+            out.push(batch);
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn run_sorter_emits_each_run_sorted_with_nulls_first() -> anyhow::Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let batch = |values: Vec<Option<i64>>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(values))],
+            )
+        };
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let mut sorter = run_sorter(u64::MAX, &pool);
+
+        sorter.push(batch(vec![Some(5), None, Some(1)])?)?;
+        assert!(drain(&mut sorter)?.is_empty(), "a run under budget is held");
+        sorter.push(batch(vec![Some(3), Some(9), None])?)?;
+        assert!(drain(&mut sorter)?.is_empty(), "a run under budget is held");
+        assert!(pool.reserved() > 0, "held rows are charged to the pool");
+
+        sorter.finish()?;
+        assert_eq!(
+            int64_values(&drain(&mut sorter)?),
+            vec![None, None, Some(1), Some(3), Some(5), Some(9)]
+        );
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "an emitted run releases its reservation"
+        );
+
+        // The run is consumed: finishing again emits nothing.
+        sorter.finish()?;
+        assert!(drain(&mut sorter)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn run_sorter_emits_a_run_once_it_reaches_its_byte_budget() -> anyhow::Result<()> {
+        let schema = one_col_schema();
+        let budget = get_record_batch_memory_size(&one_col_batch(&schema, (0..100).collect()))
+            .saturating_mul(2);
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let mut sorter = run_sorter(u64::try_from(budget)?, &pool);
+
+        sorter.push(one_col_batch(&schema, (100..200).rev().collect()))?;
+        assert!(drain(&mut sorter)?.is_empty());
+        sorter.push(one_col_batch(&schema, (0..100).rev().collect()))?;
+        let out = drain(&mut sorter)?;
+        assert_eq!(
+            int64_values(&out),
+            (0..200).map(Some).collect::<Vec<_>>(),
+            "the second batch fills the budget and seals one sorted run"
+        );
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
+    /// A run is emitted in `RUN_SORT_OUTPUT_ROWS` slices interleaved from every
+    /// buffered batch, not as one sorted copy of the run.
+    #[test]
+    fn run_sorter_interleaves_a_large_run_in_output_sized_batches() -> anyhow::Result<()> {
+        let schema = one_col_schema();
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let mut sorter = run_sorter(u64::MAX, &pool);
+        let total = i64::try_from(RUN_SORT_OUTPUT_ROWS * 2 + 7)?;
+        // Scramble the keys across 64 batches so every output slice draws on many.
+        let keys: Vec<i64> = (0..total).map(|i| (i * 7919) % total).collect();
+        for chunk in keys.chunks(keys.len().div_ceil(64)) {
+            sorter.push(one_col_batch(&schema, chunk.to_vec()))?;
+            assert!(drain(&mut sorter)?.is_empty());
+        }
+        sorter.finish()?;
+        let out = drain(&mut sorter)?;
+        assert_eq!(
+            out.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            vec![RUN_SORT_OUTPUT_ROWS, RUN_SORT_OUTPUT_ROWS, 7]
+        );
+        assert_eq!(int64_values(&out), (0..total).map(Some).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    /// When the pool refuses a batch, the rows already admitted are still sorted
+    /// and the refused batch is written as it arrived — nothing is lost and
+    /// nothing is held beyond the pool.
+    #[test]
+    fn run_sorter_writes_a_refused_batch_as_it_arrived() -> anyhow::Result<()> {
+        let schema = one_col_schema();
+        let first = one_col_batch(&schema, vec![3, 1, 2]);
+        let second = one_col_batch(&schema, vec![9, 7, 8]);
+
+        // What one batch reserves, measured rather than re-derived.
+        let probe: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let mut sorter = run_sorter(u64::MAX, &probe);
+        sorter.push(first.clone())?;
+        let one_batch = probe.reserved();
+
+        // Room for one batch and its sort, not two.
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(one_batch * 3 / 2));
+        let mut sorter = run_sorter(u64::MAX, &pool);
+        sorter.push(first)?;
+        assert!(drain(&mut sorter)?.is_empty());
+        sorter.push(second)?;
+        let out = drain(&mut sorter)?;
+        assert_eq!(
+            int64_values(&out),
+            vec![Some(1), Some(2), Some(3), Some(9), Some(7), Some(8)],
+            "the admitted run sorted, then the refused batch in arrival order"
+        );
+        assert_eq!(pool.reserved(), 0);
+
+        // A pool too small for any batch passes every batch through.
+        let empty: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(0));
+        let mut sorter = run_sorter(u64::MAX, &empty);
+        sorter.push(one_col_batch(&schema, vec![6, 4, 5]))?;
+        assert_eq!(
+            int64_values(&drain(&mut sorter)?),
+            vec![Some(6), Some(4), Some(5)]
+        );
+        sorter.finish()?;
+        assert!(drain(&mut sorter)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn run_sorter_refuses_rows_while_a_run_is_unwritten() -> anyhow::Result<()> {
+        let schema = one_col_schema();
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let mut sorter = run_sorter(1, &pool);
+        sorter.push(one_col_batch(&schema, vec![2, 1]))?;
+        assert!(
+            sorter.push(one_col_batch(&schema, vec![4, 3])).is_err(),
+            "a sealed run that was not drained must not be replaced"
+        );
+        assert_eq!(int64_values(&drain(&mut sorter)?), vec![Some(1), Some(2)]);
+        Ok(())
+    }
+
+    /// Range routing with run sorting must still write every row exactly once,
+    /// and each shard's file must hold only its own slice of the key domain, in
+    /// sorted runs.
+    #[tokio::test]
+    async fn test_range_sharding_with_run_sort_round_trips_every_row() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        let schema = one_col_schema();
+        // 0..1000 in a scrambled arrival order, 100 rows per batch.
+        let scrambled: Vec<i64> = (0..1000).map(|i| (i * 7919) % 1000).collect();
+        let batches: Vec<RecordBatch> = scrambled
+            .chunks(100)
+            .map(|chunk| one_col_batch(&schema, chunk.to_vec()))
+            .collect();
+        let per_run = u64::try_from(get_record_batch_memory_size(&batches[0]) * 3)?;
+
+        let results = run_sharded_write(
+            ctx.store.clone(),
+            Arc::clone(&schema),
+            batches_to_stream(Arc::clone(&schema), batches),
+            None,
+            ShardSpec::Range {
+                expr: Arc::new(Column::new("a", 0)),
+                bounds: vec![ScalarValue::Int64(Some(499))],
+                partitions: 2,
+                run_sort_bytes: Some(per_run),
+            },
+        )
+        .await?;
+
+        let total_rows: u64 = results.iter().map(|(_, s)| s.row_count()).sum();
+        assert_eq!(total_rows, 1000, "no row may be dropped or duplicated");
+        assert_eq!(results.len(), 2, "one file per range shard");
+
+        let got = ctx
+            .session
+            .sql("SELECT a FROM '/table/' ORDER BY a")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(int64_values(&got), (0..1000).map(Some).collect::<Vec<_>>());
+
+        for (path, _) in &results {
+            let values = int64_values(
+                &ctx.session
+                    .sql(&format!("SELECT a FROM '/{path}'"))
+                    .await?
+                    .collect()
+                    .await?,
+            );
+            let low_shard = path.as_ref().contains("_p000_");
+            assert!(
+                values
+                    .iter()
+                    .all(|v| v.is_some_and(|v| (v <= 499) == low_shard)),
+                "{path} holds a key outside its range"
+            );
+        }
+        Ok(())
+    }
+
+    /// A memory pool with no room must cost the write its sort order only: every
+    /// row still lands once, in the file for its range, and nothing stays
+    /// reserved.
+    #[tokio::test]
+    async fn test_range_sharding_with_run_sort_under_an_exhausted_pool_writes_every_row()
+    -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        let schema = one_col_schema();
+        let scrambled: Vec<i64> = (0..1000).map(|i| (i * 7919) % 1000).collect();
+        let batches: Vec<RecordBatch> = scrambled
+            .chunks(100)
+            .map(|chunk| one_col_batch(&schema, chunk.to_vec()))
+            .collect();
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(0));
+
+        let results = run_sharded_write_with_pool(
+            ctx.store.clone(),
+            Arc::clone(&schema),
+            batches_to_stream(Arc::clone(&schema), batches),
+            None,
+            ShardSpec::Range {
+                expr: Arc::new(Column::new("a", 0)),
+                bounds: vec![ScalarValue::Int64(Some(499))],
+                partitions: 2,
+                run_sort_bytes: Some(1024 * 1024),
+            },
+            &pool,
+        )
+        .await?;
+
+        let total_rows: u64 = results.iter().map(|(_, s)| s.row_count()).sum();
+        assert_eq!(total_rows, 1000, "no row may be dropped or duplicated");
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "the write must release its reservations"
+        );
+        let got = ctx
+            .session
+            .sql("SELECT a FROM '/table/' ORDER BY a")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(int64_values(&got), (0..1000).map(Some).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[test]
+    fn run_sort_supports_value_types_and_containers_of_them() {
+        let utf8 = Arc::new(Field::new("item", DataType::Utf8, true));
+        let dictionary = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        assert!(run_sort_supports(&DataType::Decimal256(76, 10)));
+        assert!(run_sort_supports(&DataType::List(Arc::clone(&utf8))));
+        assert!(run_sort_supports(&DataType::Struct(
+            vec![Field::new("s", DataType::Utf8View, true)].into()
+        )));
+        assert!(!run_sort_supports(&dictionary));
+        assert!(!run_sort_supports(&DataType::List(Arc::new(Field::new(
+            "item", dictionary, true
+        )))));
+        assert!(!run_sort_supports(&DataType::ListView(utf8)));
+    }
+
+    /// The scratch charged per row must cover the widest pair the sort builds
+    /// for each key type, including `Decimal256`'s 32-byte native.
+    #[test]
+    fn sort_scratch_covers_the_pair_for_each_key_type() {
+        use std::mem::size_of;
+
+        use datafusion::arrow::datatypes::i256;
+
+        let index = size_of::<u32>();
+        for (data_type, pair) in [
+            (DataType::Int64, size_of::<(u32, i64)>()),
+            (DataType::Float64, size_of::<(u32, f64)>()),
+            (DataType::Decimal128(38, 2), size_of::<(u32, i128)>()),
+            (DataType::Decimal256(76, 2), size_of::<(u32, i256)>()),
+            (DataType::Utf8, size_of::<(u32, u32, u64)>()),
+            (DataType::Utf8View, size_of::<(u32, u128)>()),
+            (DataType::FixedSizeBinary(16), size_of::<(u32, &[u8])>()),
+        ] {
+            assert!(
+                sort_scratch_bytes_per_row(&data_type) >= pair + index,
+                "{data_type}: {} bytes per row does not cover a {pair}-byte pair and its index",
+                sort_scratch_bytes_per_row(&data_type)
+            );
+        }
+    }
+
+    /// A dictionary payload column must not fail a range-routed write. Emitting
+    /// a sorted run interleaves its batches, which merges their dictionaries, and
+    /// four batches whose `Int8` dictionaries hold 100 distinct values each put
+    /// about 200 in each range: more than an `Int8` key can address. Such a
+    /// write routes by range and leaves each range unsorted.
+    #[tokio::test]
+    async fn test_range_sharding_with_run_sort_writes_dictionary_payloads() -> anyhow::Result<()> {
+        use datafusion::arrow::array::DictionaryArray;
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::datatypes::Int8Type;
+
+        let ctx = TestSessionContext::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new(
+                "label",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]));
+        let batch = |offset: i64| -> anyhow::Result<RecordBatch> {
+            let keys = Int8Array::from_iter_values((0..100).map(|i| i8::try_from(i).unwrap_or(0)));
+            let values =
+                StringArray::from_iter_values((0..100).map(|i| format!("v{}", offset + i)));
+            let labels = DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values))?;
+            Ok(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(
+                        (0..100).map(|i| (i * 7) % 200),
+                    )),
+                    Arc::new(labels),
+                ],
+            )?)
+        };
+        let batches = vec![batch(0)?, batch(100)?, batch(200)?, batch(300)?];
+
+        let results = run_sharded_write(
+            ctx.store.clone(),
+            Arc::clone(&schema),
+            batches_to_stream(Arc::clone(&schema), batches),
+            None,
+            ShardSpec::Range {
+                expr: Arc::new(Column::new("a", 0)),
+                bounds: vec![ScalarValue::Int64(Some(99))],
+                partitions: 2,
+                run_sort_bytes: Some(1024 * 1024),
+            },
+        )
+        .await?;
+
+        let total_rows: u64 = results.iter().map(|(_, s)| s.row_count()).sum();
+        assert_eq!(total_rows, 400, "no row may be dropped or duplicated");
         Ok(())
     }
 
