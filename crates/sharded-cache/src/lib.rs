@@ -201,12 +201,18 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         // Lock order is shard 0..N so a concurrent `clear` cannot deadlock.
         let mut guards: Vec<_> = self.shards.iter().map(|s| s.0.lock()).collect();
         let mut removed: u64 = 0;
+        let mut values = Vec::new();
         for guard in &mut guards {
-            let (_, weight) = guard.take_all();
+            let (shard_values, weight) = guard.take_all();
             removed = removed.saturating_add(weight);
+            values.extend(shard_values);
         }
         self.sub_weight(removed);
+        // Release every shard before dropping values. A value destructor that
+        // re-enters the cache would otherwise deadlock on these non-reentrant
+        // locks, and large Arrow-backed values would extend the hold.
         drop(guards);
+        drop(values);
     }
 
     /// Keys currently held, in shard order. May include entries that have
@@ -686,6 +692,57 @@ mod tests {
             "the older entry on another shard is the LRU victim"
         );
         assert!(cache.weighted_size() <= 100);
+    }
+
+    #[test]
+    fn clear_drops_values_after_releasing_shard_locks() {
+        #[derive(Clone)]
+        struct ReenterOnDrop {
+            cache: Arc<ShardedCache<ReenterOnDrop>>,
+            dropped: Arc<AtomicU64>,
+        }
+        impl Drop for ReenterOnDrop {
+            fn drop(&mut self) {
+                // `parking_lot::Mutex` is not reentrant. Re-entering `len`
+                // deadlocks if any shard lock is still held.
+                let _ = self.cache.len();
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let cache = Arc::new(ShardedCache::new(
+            1024,
+            Duration::from_mins(1),
+            EvictionPolicy::Lru,
+        ));
+        let dropped = Arc::new(AtomicU64::new(0));
+        cache.insert(
+            1,
+            ReenterOnDrop {
+                cache: Arc::clone(&cache),
+                dropped: Arc::clone(&dropped),
+            },
+            1,
+        );
+
+        let finished = Arc::new(AtomicU64::new(0));
+        let cache_for_clear = Arc::clone(&cache);
+        let finished_for_clear = Arc::clone(&finished);
+        std::thread::spawn(move || {
+            cache_for_clear.clear();
+            finished_for_clear.store(1, Ordering::Relaxed);
+        });
+
+        let start = Instant::now();
+        while finished.load(Ordering::Relaxed) == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "clear deadlocked because values were dropped while shard locks were held"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert!(cache.is_empty());
     }
 
     #[test]
