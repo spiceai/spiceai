@@ -117,7 +117,11 @@ readonly REQUIRED_CHECKS=(
   "Integration Tests (part 2)"
   "Integration Tests (part 3)"
   "ADBC Integration Tests"   # integration_adbc.yml
-  "Features Check"           # features.yml
+  # `Features Check` (features.yml) is deliberately absent. That workflow is
+  # disabled, so no run reports the context, and a required check nothing
+  # reports blocks every pull request rather than passing it — which is what
+  # happened the one time it was required (added to the ruleset 2026-07-10
+  # 05:00, reverted 05:06). Re-enable the workflow before listing it again.
   "Check Rust Licenses"      # license_check.yml
   "E2E Test CI"              # e2e_test_ci.yml (gate job)
   # verus_verify.yml. The only check that reads the Verus proofs (hash-index
