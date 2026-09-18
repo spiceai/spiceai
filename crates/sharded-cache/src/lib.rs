@@ -147,8 +147,10 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         }
 
         let delta = shard.insert(key, value, weight, now);
-        drop(shard);
+        // Publish the weight before releasing the shard so a concurrent
+        // remove of this key cannot subtract before the matching add.
         self.apply_delta(delta.net());
+        drop(shard);
         self.evict_to_limit(shard_idx);
     }
 
@@ -166,8 +168,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             GetOutcome::Hit(value) => Some(value),
             GetOutcome::Miss => None,
             GetOutcome::Expired { weight } => {
-                drop(shard);
                 self.sub_weight(weight);
+                drop(shard);
                 L::on_evict(EvictionReason::Expired);
                 None
             }
@@ -178,8 +180,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     pub fn remove(&self, key: &u64) -> Option<V> {
         let mut shard = self.shards[shard_index(*key)].0.lock();
         let (value, weight) = shard.remove(*key)?;
-        drop(shard);
         self.sub_weight(weight);
+        drop(shard);
         Some(value)
     }
 
@@ -192,8 +194,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
             let (_, weight) = guard.take_all();
             removed = removed.saturating_add(weight);
         }
-        drop(guards);
         self.sub_weight(removed);
+        drop(guards);
     }
 
     /// Keys currently held, in shard order. May include entries that have
@@ -231,8 +233,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         for shard_idx in 0..NUM_SHARDS {
             let mut shard = self.shards[shard_idx].0.lock();
             let (expired, weight) = shard.expire_older_than(now, self.ttl);
-            drop(shard);
             self.sub_weight(weight);
+            drop(shard);
             for _ in expired {
                 L::on_evict(EvictionReason::Expired);
             }
@@ -243,6 +245,11 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     /// Drop every entry whose value satisfies `predicate`.
     ///
     /// Survivors are not promoted. Returns how many entries were removed.
+    ///
+    /// Each shard is unlocked before the next is scanned, so a write that
+    /// lands in an already-walked shard can survive this return. That is the
+    /// same window Pingora and Moka leave. SQL results close it with a
+    /// table-change clock on the write path; search results do not.
     pub fn invalidate_matching<F>(&self, predicate: F) -> usize
     where
         F: Fn(&V) -> bool,
@@ -251,8 +258,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         for shard_idx in 0..NUM_SHARDS {
             let mut shard = self.shards[shard_idx].0.lock();
             let (values, weight) = shard.invalidate_matching(&predicate);
-            drop(shard);
             self.sub_weight(weight);
+            drop(shard);
             removed += values.len();
             for _ in values {
                 L::on_evict(EvictionReason::Invalidated);
@@ -286,10 +293,10 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     }
 
     fn evict_to_limit(&self, prefer: usize) {
+        // Evict other shards first. The inserting shard's LRU tail is often
+        // the key that was just admitted (the only resident), and dropping it
+        // while an older victim exists on another shard would invert LRU.
         while self.weight.load(Ordering::Relaxed) > self.max_weight {
-            if self.evict_one_from(prefer) {
-                continue;
-            }
             let mut progressed = false;
             for shard_idx in 0..NUM_SHARDS {
                 if shard_idx == prefer {
@@ -300,7 +307,7 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
                     break;
                 }
             }
-            if !progressed {
+            if !progressed && !self.evict_one_from(prefer) {
                 break;
             }
         }
@@ -311,8 +318,8 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         let Some((_key, _value, weight)) = shard.evict_lru() else {
             return false;
         };
-        drop(shard);
         self.sub_weight(weight);
+        drop(shard);
         L::on_evict(EvictionReason::Size);
         true
     }
@@ -553,6 +560,72 @@ mod tests {
         assert!(
             SIZE_EVICTIONS.load(Ordering::Relaxed) > 0,
             "crossing max_weight must report a size eviction"
+        );
+    }
+
+    #[test]
+    fn insert_evicts_an_older_entry_on_another_shard() {
+        let cache = cache(100, Duration::from_mins(1));
+        cache.insert(0, TestValue::with_size("old", 60), 60);
+        cache.insert(1, TestValue::with_size("new", 60), 60);
+        assert!(
+            cache.get(&1).is_some(),
+            "the just-admitted key must not self-evict while an older victim exists"
+        );
+        assert!(
+            cache.get(&0).is_none(),
+            "the older entry on another shard is the LRU victim"
+        );
+        assert!(cache.weighted_size() <= 100);
+    }
+
+    #[test]
+    fn clear_after_partial_remove_reuses_the_budget() {
+        let cache = cache(10_000, Duration::from_mins(1));
+        for i in 0..200u64 {
+            cache.insert(i, TestValue::with_size("x", 10), 10);
+        }
+        for i in 0..100u64 {
+            cache.remove(&i);
+        }
+        cache.clear();
+        assert_eq!(cache.weighted_size(), 0);
+        for i in 0..200u64 {
+            cache.insert(i + 1_000, TestValue::with_size("y", 10), 10);
+        }
+        assert_eq!(cache.len(), 200);
+        assert_eq!(cache.weighted_size(), 2_000);
+    }
+
+    #[test]
+    fn concurrent_insert_remove_leaves_zero_weight_when_empty() {
+        let cache = Arc::new(cache(10_000_000, Duration::from_mins(1)));
+        let mut handles = Vec::new();
+        for thread_id in 0..8u64 {
+            let cache = Arc::clone(&cache);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..2_000u64 {
+                    let key = thread_id.saturating_mul(10_000) + (i % 64);
+                    cache.insert(key, TestValue::with_size("x", 10), 10);
+                    if i.is_multiple_of(3) {
+                        cache.remove(&key);
+                    } else if i.is_multiple_of(2) {
+                        cache.insert(key, TestValue::with_size("y", 7), 7);
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("thread panicked");
+        }
+        for key in cache.iter_keys() {
+            cache.remove(&key);
+        }
+        assert_eq!(cache.len(), 0);
+        assert_eq!(
+            cache.weighted_size(),
+            0,
+            "every insert's weight must be published before a concurrent remove can subtract"
         );
     }
 }

@@ -64,7 +64,7 @@ where
     #[must_use]
     #[expect(
         dead_code,
-        reason = "retained for P4 Moka call sites and engine bakeoff helpers"
+        reason = "retained for leftover Moka call sites and the engine bakeoff"
     )]
     pub(crate) fn from_cache(cache: Cache<u64, V, PassthroughHashBuilder<T>>) -> Self {
         Self { cache }
@@ -76,7 +76,7 @@ where
     /// the [`CacheBackend`] trait, so table invalidation reaches for the cache itself.
     #[expect(
         dead_code,
-        reason = "retained for P4 Moka call sites until LruCache-only leftovers migrate"
+        reason = "retained for leftover Moka call sites that still reach the inner cache"
     )]
     pub(crate) fn cache(&self) -> &Cache<u64, V, PassthroughHashBuilder<T>> {
         &self.cache

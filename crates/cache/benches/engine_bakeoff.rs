@@ -42,6 +42,9 @@ use cache::PingoraBackend;
 const CACHE_WEIGHT: u64 = 8 * 1024 * 1024;
 const KEY_SPACE: u64 = 50_000;
 const PREFILL: u64 = 8_000;
+/// Key space for the near-100% hit-rate group. Prefill writes every key, and
+/// the 8 MiB budget holds all of them (`HOT_KEY_SPACE * 32` bytes).
+const HOT_KEY_SPACE: u64 = 8_000;
 const OPERATIONS_PER_THREAD: usize = 8_000;
 
 #[derive(Clone)]
@@ -111,10 +114,20 @@ async fn prefill<B: CacheBackend<BenchValue>>(backend: &B) {
     }
 }
 
+async fn prefill_hot<B: CacheBackend<BenchValue>>(backend: &B) {
+    let mut rng = StdRng::seed_from_u64(42);
+    for key in 0..HOT_KEY_SPACE {
+        backend
+            .insert(key, BenchValue(random_value(&mut rng)))
+            .await;
+    }
+}
+
 fn run_gets<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
     handle: &tokio::runtime::Handle,
     backend: &Arc<B>,
     threads: usize,
+    key_space: u64,
 ) {
     let joins: Vec<_> = (0..threads)
         .map(|thread_id| {
@@ -124,7 +137,7 @@ fn run_gets<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
                 let mut rng = StdRng::seed_from_u64(thread_id as u64);
                 handle.block_on(async {
                     for _ in 0..OPERATIONS_PER_THREAD {
-                        let key = rng.random_range(0..KEY_SPACE);
+                        let key = rng.random_range(0..key_space);
                         black_box(backend.get(&key).await);
                     }
                 });
@@ -175,6 +188,9 @@ fn configure_group(group: &mut criterion::BenchmarkGroup<'_, criterion::measurem
     group.sample_size(20);
 }
 
+/// Uniform samples over `KEY_SPACE` after prefilling `PREFILL` keys (~16% hits).
+/// The miss-heavy path is the common results-cache case; [`bench_concurrent_get_hot`]
+/// covers near-100% hits.
 fn bench_concurrent_get(c: &mut Criterion) {
     let mut group = c.benchmark_group("engine_bakeoff_get");
     configure_group(&mut group);
@@ -193,7 +209,7 @@ fn bench_concurrent_get(c: &mut Criterion) {
                     handle.block_on(prefill(backend.as_ref()));
                     backend
                 },
-                |backend| run_gets(&handle, &backend, n),
+                |backend| run_gets(&handle, &backend, n, KEY_SPACE),
                 criterion::BatchSize::LargeInput,
             );
         });
@@ -205,7 +221,7 @@ fn bench_concurrent_get(c: &mut Criterion) {
                     handle.block_on(prefill(backend.as_ref()));
                     backend
                 },
-                |backend| run_gets(&handle, &backend, n),
+                |backend| run_gets(&handle, &backend, n, KEY_SPACE),
                 criterion::BatchSize::LargeInput,
             );
         });
@@ -218,7 +234,58 @@ fn bench_concurrent_get(c: &mut Criterion) {
                     handle.block_on(prefill(backend.as_ref()));
                     backend
                 },
-                |backend| run_gets(&handle, &backend, n),
+                |backend| run_gets(&handle, &backend, n, KEY_SPACE),
+                criterion::BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+fn bench_concurrent_get_hot(c: &mut Criterion) {
+    let mut group = c.benchmark_group("engine_bakeoff_get_hot");
+    configure_group(&mut group);
+    let rt = runtime();
+    let handle = rt.handle().clone();
+
+    for threads in [1, 8, 16] {
+        group.throughput(Throughput::Elements(
+            (threads * OPERATIONS_PER_THREAD) as u64,
+        ));
+
+        group.bench_with_input(BenchmarkId::new("spice", threads), &threads, |b, &n| {
+            b.iter_batched(
+                || {
+                    let backend = spice_backend();
+                    handle.block_on(prefill_hot(backend.as_ref()));
+                    backend
+                },
+                |backend| run_gets(&handle, &backend, n, HOT_KEY_SPACE),
+                criterion::BatchSize::LargeInput,
+            );
+        });
+
+        group.bench_with_input(BenchmarkId::new("moka", threads), &threads, |b, &n| {
+            b.iter_batched(
+                || {
+                    let backend = moka_backend();
+                    handle.block_on(prefill_hot(backend.as_ref()));
+                    backend
+                },
+                |backend| run_gets(&handle, &backend, n, HOT_KEY_SPACE),
+                criterion::BatchSize::LargeInput,
+            );
+        });
+
+        #[cfg(feature = "pingora")]
+        group.bench_with_input(BenchmarkId::new("pingora", threads), &threads, |b, &n| {
+            b.iter_batched(
+                || {
+                    let backend = pingora_backend();
+                    handle.block_on(prefill_hot(backend.as_ref()));
+                    backend
+                },
+                |backend| run_gets(&handle, &backend, n, HOT_KEY_SPACE),
                 criterion::BatchSize::LargeInput,
             );
         });
@@ -277,5 +344,10 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_concurrent_get, bench_concurrent_mixed);
+criterion_group!(
+    benches,
+    bench_concurrent_get,
+    bench_concurrent_get_hot,
+    bench_concurrent_mixed
+);
 criterion_main!(benches);

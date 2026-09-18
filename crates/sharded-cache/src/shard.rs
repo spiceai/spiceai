@@ -20,9 +20,9 @@ limitations under the License.
 //! head without removing it from the map, so a concurrent reader of the same
 //! key cannot observe a hole.
 
+use crate::EvictionPolicy;
 use crate::hasher::IdentityBuildHasher;
 use crate::sketch::CountMinSketch;
-use crate::EvictionPolicy;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -105,7 +105,9 @@ impl<V> Shard<V> {
     }
 
     pub(crate) fn sketch_estimate(&self, key: u64) -> u8 {
-        self.sketch.as_ref().map_or(0, |sketch| sketch.estimate(key))
+        self.sketch
+            .as_ref()
+            .map_or(0, |sketch| sketch.estimate(key))
     }
 
     pub(crate) fn keys(&self) -> impl Iterator<Item = u64> + '_ {
@@ -151,13 +153,7 @@ impl<V: Clone> Shard<V> {
         GetOutcome::Hit(value)
     }
 
-    pub(crate) fn insert(
-        &mut self,
-        key: u64,
-        value: V,
-        weight: u64,
-        now: Instant,
-    ) -> WeightDelta {
+    pub(crate) fn insert(&mut self, key: u64, value: V, weight: u64, now: Instant) -> WeightDelta {
         if let Some(&idx) = self.map.get(&key) {
             return self.replace(idx, value, weight, now);
         }
@@ -266,7 +262,9 @@ impl<V: Clone> Shard<V> {
         self.head = None;
         self.tail = None;
         self.weight = 0;
-        self.free.clear();
+        // Keep indices already in `free` (vacant slots) and add those that
+        // were occupied, so a later insert reuses storage instead of
+        // appending forever after churn + clear.
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if let Slot::Occupied(node) = std::mem::replace(slot, Slot::Vacant) {
                 values.push(node.value);
@@ -282,13 +280,7 @@ impl<V: Clone> Shard<V> {
 }
 
 impl<V> Shard<V> {
-    fn replace(
-        &mut self,
-        idx: u32,
-        value: V,
-        weight: u64,
-        now: Instant,
-    ) -> WeightDelta {
+    fn replace(&mut self, idx: u32, value: V, weight: u64, now: Instant) -> WeightDelta {
         let old_weight = match self.slots.get_mut(idx as usize) {
             Some(Slot::Occupied(node)) => {
                 let old = node.weight;
@@ -304,7 +296,10 @@ impl<V> Shard<V> {
                 };
             }
         };
-        self.weight = self.weight.saturating_sub(old_weight).saturating_add(weight);
+        self.weight = self
+            .weight
+            .saturating_sub(old_weight)
+            .saturating_add(weight);
         self.promote(idx);
         WeightDelta {
             added: weight,
@@ -390,10 +385,7 @@ impl<V> Shard<V> {
 
     fn take_value_and_free(&mut self, idx: u32) -> Option<V> {
         self.unlink(idx);
-        match std::mem::replace(
-            self.slots.get_mut(idx as usize)?,
-            Slot::Vacant,
-        ) {
+        match std::mem::replace(self.slots.get_mut(idx as usize)?, Slot::Vacant) {
             Slot::Occupied(node) => {
                 self.weight = self.weight.saturating_sub(node.weight);
                 self.free.push(idx);
@@ -448,5 +440,39 @@ mod tests {
         assert!(matches!(got, GetOutcome::Expired { weight: 5 }));
         assert_eq!(shard.len(), 0);
         assert_eq!(shard.weight, 0);
+    }
+
+    #[test]
+    fn take_all_reuses_vacant_and_occupied_slots() {
+        let mut shard = shard();
+        let now = Instant::now();
+        for i in 0..100u64 {
+            shard.insert(i, u32::try_from(i).expect("fits u32"), 1, now);
+        }
+        for i in 0..50u64 {
+            shard.remove(i);
+        }
+        assert_eq!(shard.slots.len(), 100);
+        assert_eq!(shard.free.len(), 50);
+
+        let (_values, weight) = shard.take_all();
+        assert_eq!(weight, 50);
+        assert_eq!(shard.slots.len(), 100);
+        assert_eq!(
+            shard.free.len(),
+            100,
+            "vacant indices plus newly vacated occupied ones must stay reusable"
+        );
+
+        for i in 0..100u64 {
+            shard.insert(i + 1_000, 1, 1, now);
+        }
+        assert_eq!(
+            shard.slots.len(),
+            100,
+            "a refill after churn + clear must not append new slots"
+        );
+        assert!(shard.free.is_empty());
+        assert_eq!(shard.len(), 100);
     }
 }

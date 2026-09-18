@@ -60,10 +60,11 @@ impl CacheBackendBuilder {
     }
 }
 
-/// Trait abstraction for cache backend implementations (Moka, Pingora-LRU, etc.)
+/// Trait for cache backend implementations.
 ///
-/// This trait allows runtime selection between different cache engines via configuration.
-/// Implementations must be thread-safe and support TTL-based eviction.
+/// [`LruCache`](`crate::LruCache`) uses [`SpiceBackend`] only. [`MokaBackend`]
+/// remains for leftover call sites and the engine bakeoff. `PingoraBackend` is
+/// compiled only with the `pingora` feature.
 #[async_trait]
 pub trait CacheBackend<V: Sizeable>: Send + Sync {
     /// Insert a value into the cache with the given key and size

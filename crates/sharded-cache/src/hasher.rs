@@ -39,7 +39,10 @@ impl Hasher for IdentityHasher {
 
     fn write(&mut self, bytes: &[u8]) {
         for byte in bytes {
-            self.hash = self.hash.wrapping_mul(0x0100_0000_01b3).wrapping_add(u64::from(*byte));
+            self.hash = self
+                .hash
+                .wrapping_mul(0x0100_0000_01b3)
+                .wrapping_add(u64::from(*byte));
         }
     }
 

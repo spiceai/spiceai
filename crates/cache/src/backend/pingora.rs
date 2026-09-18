@@ -319,6 +319,7 @@ where
     /// the scan and then rewritten by a concurrent `insert` is removed on the strength of
     /// the value the scan saw, so a fresh entry can be dropped — a cache miss, never a
     /// stale hit.
+    #[cfg(test)]
     pub(crate) fn invalidate_matching<F>(&self, predicate: F) -> usize
     where
         F: Fn(&V) -> bool,

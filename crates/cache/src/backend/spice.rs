@@ -25,6 +25,7 @@ use crate::metrics::{CacheMetrics, EvictionReason};
 use async_trait::async_trait;
 use sharded_cache::{EvictionListener, EvictionPolicy, ShardedCache};
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Maps the crate-local eviction reason onto the metric label.
@@ -47,7 +48,7 @@ impl<V: CacheMetrics + Send + Sync + 'static> EvictionListener for MetricsListen
 
 /// Spice sharded cache implementing [`CacheBackend`].
 pub struct SpiceBackend<V: CacheMetrics + Clone + Send + Sync + 'static> {
-    cache: ShardedCache<V, MetricsListener<V>>,
+    cache: Arc<ShardedCache<V, MetricsListener<V>>>,
 }
 
 impl<V> SpiceBackend<V>
@@ -58,7 +59,7 @@ where
     #[must_use]
     pub fn new(max_capacity: u64, ttl: Duration, policy: EvictionPolicy) -> Self {
         Self {
-            cache: ShardedCache::new(max_capacity, ttl, policy),
+            cache: Arc::new(ShardedCache::new(max_capacity, ttl, policy)),
         }
     }
 
@@ -112,7 +113,10 @@ where
     }
 
     async fn run_pending_tasks(&self) {
-        self.cache.run_pending_tasks();
+        let cache = Arc::clone(&self.cache);
+        if let Err(err) = tokio::task::spawn_blocking(move || cache.run_pending_tasks()).await {
+            tracing::debug!("Spice cache maintenance task did not finish: {err}");
+        }
     }
 
     async fn invalidate_matching(

@@ -320,12 +320,13 @@ impl<
     }
 
     async fn size_bytes(&self) -> u64 {
-        self.backend.run_pending_tasks().await;
+        // Spice evicts on insert. Expired entries stay in the weight until a
+        // get or `checkpoint` observes them; do not scan every shard on the
+        // metrics path (that would stall the Tokio worker).
         self.backend.weighted_size().await
     }
 
     async fn item_count(&self) -> u64 {
-        self.backend.run_pending_tasks().await;
         self.backend.len().await as u64
     }
 
@@ -351,6 +352,11 @@ impl<
         // The walk is proportional to the cache size and never yields, so it
         // runs on the blocking pool. Survivors are not promoted: the scan
         // inspects values in place (spiceai/spiceai#12674).
+        //
+        // Each shard is unlocked before the next is scanned, so a write that
+        // lands in an already-walked shard can survive this return — the same
+        // window Pingora and Moka leave. SQL results close it with
+        // `TableChangeClock`; search results do not.
         let backend = Arc::clone(&self.backend);
         let removed = tokio::task::spawn_blocking(move || {
             backend.invalidate_matching(|value| {
