@@ -1382,6 +1382,28 @@ mod tests {
         response
     }
 
+    /// Same as [`respond`], but the batches arrive as a Raw cache hit.
+    fn respond_cached_raw(
+        schema: &SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> BoxStream<'static, Result<FlightData, Status>> {
+        use cache::result::query::wrap_raw_batches;
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let (response, _) = Service::query_result_to_flight_stream(
+            QueryResult::from_cached_raw(
+                wrap_raw_batches(batches),
+                Arc::clone(schema),
+                CacheStatus::CacheHit,
+            ),
+            IpcWriteOptions::default(),
+            None,
+            &pool,
+            Arc::new(RequestContext::builder(Protocol::FlightSQL).build()),
+        );
+        response
+    }
+
     async fn sent(mut response: BoxStream<'static, Result<FlightData, Status>>) -> Sent {
         let mut messages = Vec::new();
         while let Some(item) = response.next().await {
@@ -1897,5 +1919,126 @@ mod tests {
         assert!(error.is_none(), "{error:?}");
         assert!(!messages.is_empty());
         assert_eq!(pool.reserved(), 0);
+    }
+
+    /// A Raw cache hit must produce the same Flight messages as the owned
+    /// stream for the success cases the encode path already covers.
+    #[tokio::test]
+    async fn cached_raw_flight_sends_what_the_owned_stream_sends() {
+        let plain: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let views: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::Utf8View,
+            true,
+        )]));
+        let dictionary: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "vendor",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let rows = |ids: Vec<Option<i64>>, names: Vec<Option<&str>>| {
+            batch(
+                &plain,
+                vec![
+                    Arc::new(Int64Array::from(ids)) as ArrayRef,
+                    Arc::new(StringArray::from(names)) as ArrayRef,
+                ],
+            )
+        };
+
+        let cases: Vec<(&str, &SchemaRef, Vec<RecordBatch>)> = vec![
+            (
+                "several batches, one empty, with NULLs",
+                &plain,
+                vec![
+                    rows(vec![Some(1), None], vec![Some("a"), None]),
+                    rows(vec![], vec![]),
+                    rows(vec![Some(3)], vec![Some("c")]),
+                ],
+            ),
+            ("an empty result", &plain, vec![]),
+            (
+                "view columns cast to the advertised types",
+                &views,
+                vec![batch(
+                    &views,
+                    vec![Arc::new(StringViewArray::from(vec![
+                        Some("x"),
+                        None,
+                        Some("a string longer than twelve bytes"),
+                    ])) as ArrayRef],
+                )],
+            ),
+            (
+                "a dictionary column",
+                &dictionary,
+                vec![batch(
+                    &dictionary,
+                    vec![Arc::new(DictionaryArray::<Int32Type>::from_iter([
+                        Some("alpha"),
+                        None,
+                        Some("alpha"),
+                        Some("bravo"),
+                    ])) as ArrayRef],
+                )],
+            ),
+        ];
+
+        for (case, schema, batches) in cases {
+            let owned_items: Vec<Result<RecordBatch, DataFusionError>> =
+                batches.iter().cloned().map(Ok).collect();
+            let owned = sent(respond(schema, owned_items, true)).await;
+            let cached = sent(respond_cached_raw(schema, batches)).await;
+            assert!(!owned.0.is_empty(), "{case}: the schema is always sent");
+            assert_eq!(owned, cached, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_raw_inline_flight_charges_queued_messages_against_the_memory_pool() {
+        use cache::result::query::wrap_raw_batches;
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batches = vec![batch(
+            &schema,
+            vec![Arc::new(Int64Array::from(vec![Some(1), Some(2)])) as ArrayRef],
+        )];
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024));
+        let (response, _) = Service::query_result_to_flight_stream(
+            QueryResult::from_cached_raw(
+                wrap_raw_batches(batches),
+                Arc::clone(&schema),
+                CacheStatus::CacheHit,
+            ),
+            IpcWriteOptions::default(),
+            None,
+            &pool,
+            Arc::new(RequestContext::builder(Protocol::FlightSQL).build()),
+        );
+
+        assert!(
+            pool.reserved() > 0,
+            "the schema queued at construction must be charged against runtime.query.memory_limit"
+        );
+
+        let (messages, error) = sent(response).await;
+        assert!(
+            error.is_none(),
+            "the cached-raw result must encode: {error:?}"
+        );
+        assert!(
+            messages.len() >= 2,
+            "schema plus at least one batch must be sent"
+        );
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "every queued FlightData reservation must be released once the response is consumed"
+        );
     }
 }

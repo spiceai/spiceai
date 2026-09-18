@@ -826,7 +826,7 @@ fn arrow_to_vnd_sql_json_v1(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::scalar::ScalarValue;
     use std::sync::Arc;
@@ -1199,5 +1199,87 @@ mod tests {
             response.body().size_hint().exact().is_none(),
             "JSON responses must stream; an exact size hint is a Content-Length body"
         );
+    }
+
+    /// HTTP JSON and buffered CSV from `QueryResult::from_cached_raw` must
+    /// match the owned-stream path: same status, cache header, and body bytes.
+    #[tokio::test]
+    async fn cached_raw_http_response_matches_owned_stream() {
+        use cache::result::query::wrap_raw_batches;
+        use datafusion::error::DataFusionError;
+        use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let make = |ids: Vec<Option<i64>>, names: Vec<Option<&str>>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)) as ArrayRef,
+                    Arc::new(StringArray::from(names)) as ArrayRef,
+                ],
+            )
+            .expect("record batch")
+        };
+
+        let cases: Vec<Vec<RecordBatch>> = vec![
+            vec![
+                make(vec![Some(1), None], vec![Some("a"), Some("b")]),
+                make(vec![], vec![]),
+                make(vec![Some(3)], vec![None]),
+            ],
+            vec![],
+            vec![make(vec![], vec![])],
+            vec![make(vec![Some(1)], vec![Some("a")])],
+        ];
+
+        for batches in cases {
+            for format in [ResponseMimeType::Json, ResponseMimeType::Csv] {
+                let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+                let owned = QueryResult::new(
+                    Box::pin(RecordBatchStreamAdapter::new(
+                        Arc::clone(&schema),
+                        futures::stream::iter(
+                            batches.iter().cloned().map(Ok::<_, DataFusionError>),
+                        ),
+                    )),
+                    CacheStatus::CacheHit,
+                );
+                let raw = QueryResult::from_cached_raw(
+                    wrap_raw_batches(batches.clone()),
+                    Arc::clone(&schema),
+                    CacheStatus::CacheHit,
+                );
+
+                let owned_response =
+                    query_result_to_http_response(owned, format, Arc::clone(&pool)).await;
+                let raw_response = query_result_to_http_response(raw, format, pool).await;
+
+                assert_eq!(
+                    owned_response.status(),
+                    raw_response.status(),
+                    "{format:?}: status"
+                );
+                assert_eq!(
+                    owned_response.headers().get("Results-Cache-Status"),
+                    raw_response.headers().get("Results-Cache-Status"),
+                    "{format:?}: Results-Cache-Status"
+                );
+
+                let owned_body = axum::body::to_bytes(owned_response.into_body(), 64 * 1024)
+                    .await
+                    .expect("owned body");
+                let raw_body = axum::body::to_bytes(raw_response.into_body(), 64 * 1024)
+                    .await
+                    .expect("raw body");
+                assert_eq!(
+                    owned_body, raw_body,
+                    "{format:?}: body bytes must match the owned-stream path"
+                );
+            }
+        }
     }
 }
