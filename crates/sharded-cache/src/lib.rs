@@ -119,8 +119,8 @@ pub struct ShardedCache<V, L: EvictionListener = NoopListener> {
     /// two-thread test can force both inserts to observe the overflow.
     #[cfg(test)]
     after_publish: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
-    /// Test-only: run after the overflow check and before a victim is removed
-    /// so a concurrent `remove` can restore the budget first.
+    /// Test-only: run at the start of each overflow-trim iteration, and again
+    /// after `TinyLFU` snapshots a tail and before that tail is unlinked.
     #[cfg(test)]
     before_size_victim: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
     /// Test-only: run after a size victim is chosen and before its budget is
@@ -380,10 +380,11 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
     /// Compare the just-admitted key with the actual overflow victim — the
     /// lowest-frequency LRU tail across shards — and evict the loser.
     ///
-    /// A stale snapshot (victim already gone, shard empty) is not treated as
-    /// trim-complete: re-select up to [`NUM_SHARDS`] times while still over
-    /// budget so another shard's tail can still be claimed. Falling back to
-    /// numeric-order LRU would evict a hotter resident than `TinyLFU` chose.
+    /// A stale snapshot (victim already gone, shard empty, or promoted off
+    /// the tail by a concurrent get) is not treated as trim-complete: re-select
+    /// up to [`NUM_SHARDS`] times while still over budget so another shard's
+    /// tail can still be claimed. Falling back to numeric-order LRU would evict
+    /// a hotter resident than `TinyLFU` chose.
     fn evict_tinylfu_one(
         &self,
         admitted: Option<u64>,
@@ -405,12 +406,16 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
                 if present
                     && candidate != victim_key
                     && candidate_freq < victim_freq
-                    && self.remove_for_size(candidate_shard, candidate, evicted)
+                    && self.remove_key_for_size(candidate_shard, candidate, evicted)
                 {
                     return true;
                 }
             }
-            if self.remove_for_size(victim_shard, victim_key, evicted) {
+            // After the snapshot is published and before the tail is unlinked,
+            // so a concurrent get can promote that key off the LRU tail.
+            #[cfg(test)]
+            self.run_before_size_victim();
+            if self.remove_tail_for_size(victim_shard, victim_key, evicted) {
                 return true;
             }
         }
@@ -462,7 +467,10 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         progressed
     }
 
-    fn remove_for_size(
+    /// Unlink `key` to reclaim its weight. Used only to reject a just-admitted
+    /// `TinyLFU` candidate. Does not fall back to the LRU tail — that would evict
+    /// a different resident than admission compared.
+    fn remove_key_for_size(
         &self,
         shard_idx: usize,
         key: u64,
@@ -484,20 +492,57 @@ impl<V: Clone + Send + 'static, L: EvictionListener> ShardedCache<V, L> {
         if self.weight.load(Ordering::Relaxed) <= self.max_weight {
             return false;
         }
-        let Some(weight) = shard
-            .peek_weight(key)
-            .or_else(|| shard.peek_tail().map(|(_, weight)| weight))
-        else {
+        let Some(weight) = shard.peek_weight(key) else {
             return false;
         };
         if !self.claim_size_eviction(weight) {
             return false;
         }
-        let Some((_, value, _)) = shard
-            .remove(key)
-            .map(|(value, weight)| (key, value, weight))
-            .or_else(|| shard.evict_lru())
-        else {
+        let Some((value, _)) = shard.remove(key) else {
+            self.weight.fetch_add(weight, Ordering::Relaxed);
+            return false;
+        };
+        drop(shard);
+        evicted.push((value, EvictionReason::Size));
+        true
+    }
+
+    /// Unlink this shard's LRU tail only when it is still `expected`.
+    /// A concurrent get can promote the snapshot victim off the tail between
+    /// [`Self::lowest_freq_lru_tail`] and this re-lock; returning false lets
+    /// [`Self::evict_tinylfu_one`] reselect.
+    fn remove_tail_for_size(
+        &self,
+        shard_idx: usize,
+        expected: u64,
+        evicted: &mut Vec<(V, EvictionReason)>,
+    ) -> bool {
+        let mut shard = self.shards[shard_idx].0.lock();
+        let now = Instant::now();
+        let (expired, expired_weight) = shard.expire_older_than(now, self.ttl);
+        if expired_weight > 0 {
+            self.sub_weight(expired_weight);
+        }
+        if !expired.is_empty() {
+            drop(shard);
+            for value in expired {
+                evicted.push((value, EvictionReason::Expired));
+            }
+            return true;
+        }
+        if self.weight.load(Ordering::Relaxed) <= self.max_weight {
+            return false;
+        }
+        if shard.tail_key() != Some(expected) {
+            return false;
+        }
+        let Some((_, weight)) = shard.peek_tail() else {
+            return false;
+        };
+        if !self.claim_size_eviction(weight) {
+            return false;
+        }
+        let Some((_, value, _)) = shard.evict_lru() else {
             self.weight.fetch_add(weight, Ordering::Relaxed);
             return false;
         };
@@ -1167,6 +1212,51 @@ mod tests {
             cache.get(&0).is_none(),
             "a failed size claim must not reset the victim's TTL origin"
         );
+    }
+
+    #[test]
+    fn tinylfu_does_not_evict_a_promoted_snapshot_victim() {
+        let cache = Arc::new(ShardedCache::<TestValue>::new(
+            100,
+            Duration::from_mins(1),
+            EvictionPolicy::TinyLfu,
+        ));
+        cache.insert(0, TestValue::with_size("tail", 40), 40);
+        cache.insert(16, TestValue::with_size("mru", 40), 40);
+        assert_eq!(
+            cache.keys_in_lru_order(),
+            vec![16, 0],
+            "key 16 is MRU and key 0 is the same-shard LRU tail"
+        );
+
+        let calls = AtomicU64::new(0);
+        let cache_for_hook = Arc::clone(&cache);
+        cache.set_before_size_victim(move || {
+            // Call 0 is the evict-loop entry. Call 1 is after TinyLFU snapshots
+            // the tail and before that key is unlinked.
+            if calls.fetch_add(1, Ordering::Relaxed) == 1 {
+                assert!(
+                    cache_for_hook.get(&0).is_some(),
+                    "the snapshot victim must still be present so get can promote it"
+                );
+            }
+        });
+        cache.insert(1, TestValue::with_size("new", 40), 40);
+
+        assert!(
+            cache.get(&0).is_some(),
+            "a get that promoted the snapshot victim off the tail must keep that key"
+        );
+        assert!(
+            cache.get(&1).is_some(),
+            "the overflow insert must stay once the real tail can still be reclaimed"
+        );
+        assert!(
+            cache.get(&16).is_none(),
+            "the key that remains the LRU tail after the promotion is the overflow victim"
+        );
+        assert_eq!(cache.weighted_size(), 80);
+        assert_eq!(cache.len(), 2);
     }
 
     #[test]
