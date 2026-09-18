@@ -197,9 +197,10 @@ datasets:
       params:
         <<: *cayenne_params
         # The two selective CH-benCH predicates over the heaviest table: q8
-        # `ol_i_id < 1000` (1 item in 100,000) and q19's `ol_w_id IN (...)` lists
-        # (3 warehouses of the scale factor; degenerate at SF1, where the whole
-        # table is one warehouse). ol_w_id also leads the primary key.
+        # `ol_i_id < 1000` (999 of the 100,000 item ids the seed draws from, ~1% of
+        # rows) and q19's `ol_w_id IN (...)` lists (3 warehouses of the scale factor;
+        # degenerate at SF1, where the whole table is one warehouse). ol_w_id also
+        # leads the primary key.
         cayenne_cluster_by: ol_w_id,ol_i_id
       # Predicate-aware maintained aggregates for the two single-table CH-benCH
       # queries over order_line (the heaviest table) — q1 and q6. Each view's
