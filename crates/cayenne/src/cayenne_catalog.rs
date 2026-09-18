@@ -31,6 +31,7 @@ use super::metastore::{
 };
 use arrow_tools::map_entries::conforming_schema;
 use async_trait::async_trait;
+use bytes::Bytes;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use std::collections::HashMap;
 use std::path::Path;
@@ -2740,7 +2741,7 @@ impl MetadataCatalog for CayenneCatalog {
             txn.execute(ExecuteParams {
                 sql: "UPDATE cayenne_inlined_data SET data_ipc = ?1, record_count = ?2 WHERE table_id = ?3 AND inlined_id = ?4",
                 params: vec![
-                    MetastoreValue::Blob(updated.data_ipc.clone()),
+                    MetastoreValue::Blob(updated.data_ipc.to_vec()),
                     MetastoreValue::Integer(updated.record_count),
                     MetastoreValue::Text(table_id.to_string()),
                     MetastoreValue::Text(updated.inlined_id.clone()),
@@ -4167,7 +4168,7 @@ impl MetadataCatalog for CayenneCatalog {
                         inlined_id: row.get_string(0)?,
                         table_id: row.get_string(1)?,
                         partition_key: row.get_optional_string(2)?,
-                        data_ipc: row.get_blob(3)?,
+                        data_ipc: Bytes::from(row.get_blob(3)?),
                         record_count: row.get_i64(4)?,
                         sequence_number: row.get_i64(5)?,
                         created_at: row.get_string(6)?,
@@ -4206,7 +4207,7 @@ impl MetadataCatalog for CayenneCatalog {
                         inlined_id: row.get_string(0)?,
                         table_id: row.get_string(1)?,
                         partition_key: row.get_optional_string(2)?,
-                        data_ipc: row.get_blob(3)?,
+                        data_ipc: Bytes::from(row.get_blob(3)?),
                         record_count: row.get_i64(4)?,
                         sequence_number: row.get_i64(5)?,
                         created_at: row.get_string(6)?,
@@ -4240,7 +4241,7 @@ impl MetadataCatalog for CayenneCatalog {
                         inlined_id: row.get_string(0)?,
                         table_id: row.get_string(1)?,
                         partition_key: row.get_optional_string(2)?,
-                        data_ipc: row.get_blob(3)?,
+                        data_ipc: Bytes::from(row.get_blob(3)?),
                         record_count: row.get_i64(4)?,
                         sequence_number: row.get_i64(5)?,
                         created_at: row.get_string(6)?,
@@ -4650,7 +4651,7 @@ impl MetadataCatalog for CayenneCatalog {
                     WHERE table_id = ?3 AND inlined_id = ?4
                     ",
                     params: vec![
-                        MetastoreValue::Blob(updated.data_ipc.clone()),
+                        MetastoreValue::Blob(updated.data_ipc.to_vec()),
                         MetastoreValue::Integer(updated.record_count),
                         MetastoreValue::Text(table_id.to_string()),
                         MetastoreValue::Text(updated.inlined_id.clone()),
@@ -5386,7 +5387,6 @@ fn sql_text_literal(value: &str) -> String {
 /// applies on top, so a caller that needs to know what is actually on disk can ask.
 fn deserialize_schema_ipc_base64(schema_json: &str) -> CatalogResult<arrow_schema::Schema> {
     use base64::Engine;
-    use bytes::Bytes;
 
     let schema_bytes = base64::engine::general_purpose::STANDARD
         .decode(schema_json)
@@ -5485,7 +5485,7 @@ fn inlined_data_insert(
         MetastoreValue::Text(inlined_id.clone()),
         MetastoreValue::Text(table_id.to_string()),
         data.partition_key.into(),
-        MetastoreValue::Blob(data.data_ipc),
+        MetastoreValue::Blob(data.data_ipc.to_vec()),
         MetastoreValue::Integer(data.record_count),
         MetastoreValue::Integer(sequence_number),
     ];
@@ -7196,7 +7196,7 @@ mod tests {
                 inlined_id: String::new(),
                 table_id: table_id.clone(),
                 partition_key: None,
-                data_ipc: vec![1, 2, 3],
+                data_ipc: Bytes::from(vec![1, 2, 3]),
                 record_count: 1,
                 sequence_number: 1,
                 created_at: String::new(),
@@ -7224,7 +7224,7 @@ mod tests {
                     inlined_id: uuid::Uuid::now_v7().to_string(),
                     table_id: table_id.clone(),
                     partition_key: None,
-                    data_ipc: vec![9, 9, 9],
+                    data_ipc: Bytes::from(vec![9, 9, 9]),
                     record_count: 1,
                     sequence_number: 1,
                     created_at: String::new(),
@@ -7247,7 +7247,7 @@ mod tests {
             .expect("get inline rows after rollback");
         assert_eq!(stored_inline.len(), 1);
         assert_eq!(stored_inline[0].inlined_id, existing_inline_id);
-        assert_eq!(stored_inline[0].data_ipc, vec![1, 2, 3]);
+        assert_eq!(stored_inline[0].data_ipc.to_vec(), vec![1, 2, 3]);
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
@@ -9319,7 +9319,7 @@ mod tests {
                 inlined_id: String::new(),
                 table_id: table_id.clone(),
                 partition_key: None,
-                data_ipc: vec![1, 2, 3],
+                data_ipc: Bytes::from(vec![1, 2, 3]),
                 record_count: 3,
                 sequence_number: 1,
                 created_at: String::new(),
@@ -9414,7 +9414,7 @@ mod tests {
                 inlined_id: String::new(),
                 table_id: table_id.clone(),
                 partition_key: None,
-                data_ipc: vec![1, 2, 3],
+                data_ipc: Bytes::from(vec![1, 2, 3]),
                 record_count: 3,
                 sequence_number: 1,
                 created_at: String::new(),

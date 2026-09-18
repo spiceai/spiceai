@@ -17,6 +17,7 @@ limitations under the License.
 //! Data structures for Cayenne metadata.
 
 use arrow_schema::SchemaRef;
+use bytes::Bytes;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use serde::{Deserialize, Serialize};
 // Re-exported so callers configuring a `VortexConfig` (the runtime's Cayenne
@@ -2092,8 +2093,16 @@ pub struct InlinedData {
     pub table_id: String,
     /// Partition key (for partitioned tables), `None` for non-partitioned
     pub partition_key: Option<String>,
-    /// Arrow IPC serialized `RecordBatch`
-    pub data_ipc: Vec<u8>,
+    /// Arrow IPC serialized `RecordBatch`.
+    ///
+    /// `Bytes`, not `Vec<u8>`: the inline cache keeps this envelope next to
+    /// each entry's decoded batches, and the scan path clones an entry per
+    /// visible entry per scan (`CayenneTableProvider::pruned_inlined_batches_with_removal`
+    /// and `apply_tombstone_removal_to_entry`), so an envelope clone bumps a
+    /// refcount instead of copying the serialized payload. Nothing mutates
+    /// this in place; a caller that needs an owned `Vec<u8>` (persisting via
+    /// `MetastoreValue::Blob`) calls `.to_vec()` explicitly.
+    pub data_ipc: Bytes,
     /// Number of rows in this batch
     pub record_count: i64,
     /// Sequence number when this data was inlined
@@ -2244,7 +2253,7 @@ impl InlinedData {
             inlined_id: String::new(),
             table_id,
             partition_key,
-            data_ipc,
+            data_ipc: Bytes::from(data_ipc),
             record_count,
             sequence_number: 0,
             created_at: String::new(),

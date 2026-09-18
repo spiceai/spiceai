@@ -30,10 +30,14 @@ use std::sync::Arc;
 /// without a second metastore round-trip) with the pre-decoded,
 /// deletion-filtered `RecordBatch`es for that entry.
 ///
-/// `Clone` is cheap: the envelope is small metadata and each `RecordBatch`
-/// shares its Arrow buffers via `Arc`. The append-only inline-cache delta path
-/// clones the base view's entries (structural sharing of the buffers) before
-/// appending the newly decoded entries.
+/// Stored in [`InlinedCache::view`] as `Arc<InlinedViewEntry>`, not by value:
+/// `batches: Vec<RecordBatch>` is a real per-entry allocation (one `Vec` plus
+/// one `RecordBatch` clone per element), so cloning an *entry* is not free the
+/// way cloning one already-Arc'd `RecordBatch` is. The append-only inline-cache
+/// delta path (`CayenneTableProvider::extend_inlined_cache_delta`) extends the
+/// base view on every scan that observes a new write, so entry-level `Clone`
+/// cost is paid once per entry per scan — sharing entries via `Arc` turns that
+/// into a refcount bump instead.
 #[derive(Clone)]
 pub(crate) struct InlinedViewEntry {
     /// Original metastore envelope; provides `inlined_id`, `sequence_number`,
@@ -107,7 +111,13 @@ pub(crate) struct InlinedCache {
     pub(crate) batches: Arc<Vec<RecordBatch>>,
     /// Per-entry view used by the upsert-rewrite path to avoid a second
     /// metastore round-trip and re-decode.
-    pub(crate) view: Arc<Vec<InlinedViewEntry>>,
+    ///
+    /// `Arc<InlinedViewEntry>` per element, not by value: extending this cache
+    /// with new entries (`CayenneTableProvider::extend_inlined_cache_delta`)
+    /// clones the outer `Vec`, and an element clone that is itself a refcount
+    /// bump is what keeps that an O(entries)-pointers operation instead of
+    /// O(entries)-allocations.
+    pub(crate) view: Arc<Vec<Arc<InlinedViewEntry>>>,
 }
 
 /// Outcome of a durable inlined-data commit that has not yet been published to the in-memory caches.

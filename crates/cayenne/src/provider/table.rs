@@ -1227,7 +1227,7 @@ struct RawScanInput {
     protected_map: Arc<HashMap<String, i64>>,
     /// Inline-memtable view captured under `scan_state_lock.read()` via the bounded
     /// (`MAX_SCAN_CAPTURE_ATTEMPTS`) retry that rebuilds a stale cache and retries.
-    inlined_view: Arc<Vec<InlinedViewEntry>>,
+    inlined_view: Arc<Vec<Arc<InlinedViewEntry>>>,
     /// Current snapshot id captured under the read fence and pinned against GC
     /// by [`Self::scan_guard`]. Its directory can still receive in-place appends.
     current_snapshot_id: String,
@@ -14855,7 +14855,7 @@ impl CayenneTableProvider {
         batches: &[RecordBatch],
         record_count: usize,
     ) -> Result<InlinedData> {
-        let data_ipc = serialize_batches_to_ipc(batches)?;
+        let data_ipc = bytes::Bytes::from(serialize_batches_to_ipc(batches)?);
 
         Ok(InlinedData {
             inlined_id: source.inlined_id.clone(),
@@ -27013,16 +27013,16 @@ impl CayenneTableProvider {
         (cached.generation == current_gen).then(|| (*cached.batches).clone())
     }
 
-    fn try_read_inlined_view_cached(&self) -> Option<Arc<Vec<InlinedViewEntry>>> {
+    fn try_read_inlined_view_cached(&self) -> Option<Arc<Vec<Arc<InlinedViewEntry>>>> {
         let current_gen = self.inlined_generation.load(Ordering::Acquire);
         let cached = self.inlined_cache.load();
         (cached.generation == current_gen).then(|| Arc::clone(&cached.view))
     }
 
-    fn try_read_inlined_view_for_scan(&self) -> Option<Arc<Vec<InlinedViewEntry>>> {
+    fn try_read_inlined_view_for_scan(&self) -> Option<Arc<Vec<Arc<InlinedViewEntry>>>> {
         // Empty captures share one identity in `ScanViewKey`, just as nonempty
         // captures retain the cached view's identity until its contents change.
-        static EMPTY_VIEW: std::sync::LazyLock<Arc<Vec<InlinedViewEntry>>> =
+        static EMPTY_VIEW: std::sync::LazyLock<Arc<Vec<Arc<InlinedViewEntry>>>> =
             std::sync::LazyLock::new(|| Arc::new(Vec::new()));
         if self.cached_inlined_row_count() <= 0 {
             return Some(Arc::clone(&EMPTY_VIEW));
@@ -27067,7 +27067,7 @@ impl CayenneTableProvider {
     /// including the original [`InlinedData`] envelope — enabling the upsert-
     /// rewrite path to reconstruct updated entries without a second metastore
     /// round-trip or IPC re-decode.
-    async fn cached_inlined_view(&self) -> Result<Arc<Vec<InlinedViewEntry>>> {
+    async fn cached_inlined_view(&self) -> Result<Arc<Vec<Arc<InlinedViewEntry>>>> {
         let current_gen = self.inlined_generation.load(Ordering::Acquire);
         {
             let cached = self.inlined_cache.load();
@@ -27261,7 +27261,7 @@ impl CayenneTableProvider {
             .get_inlined_data(&self.table_metadata.table_id)
             .await?;
 
-        let view: Vec<InlinedViewEntry> = if inlined.is_empty() {
+        let view: Vec<Arc<InlinedViewEntry>> = if inlined.is_empty() {
             Vec::new()
         } else {
             let inlined_deletions = self.load_inlined_deletion_maps().await?;
@@ -27275,7 +27275,9 @@ impl CayenneTableProvider {
                 if entry.sequence_number > materialized_through_sequence {
                     continue;
                 }
-                view.push(self.decode_and_filter_inlined_entry(entry, &inlined_deletions)?);
+                view.push(Arc::new(
+                    self.decode_and_filter_inlined_entry(entry, &inlined_deletions)?,
+                ));
             }
             view
         };
@@ -27391,13 +27393,18 @@ impl CayenneTableProvider {
         // `base`; re-filtering against just the new removal map removes exactly the
         // rows the newly published tombstones hide (entries with `sequence_number
         // <= delete_sequence` whose PK is in the removal).
-        let mut view: Vec<InlinedViewEntry> = if has_tombstone_delta {
+        let mut view: Vec<Arc<InlinedViewEntry>> = if has_tombstone_delta {
             let mut filtered = Vec::with_capacity(base.view.len());
             for entry in base.view.iter() {
-                filtered.push(self.apply_tombstone_removal_to_entry(entry, &removal_map)?);
+                filtered.push(Arc::new(
+                    self.apply_tombstone_removal_to_entry(entry, &removal_map)?,
+                ));
             }
             filtered
         } else {
+            // Cheap: cloning `Vec<Arc<InlinedViewEntry>>` is one refcount bump
+            // per existing entry, not a deep copy of each entry's decoded
+            // batches — see `InlinedCache::view`'s doc comment.
             (*base.view).clone()
         };
 
@@ -27412,7 +27419,9 @@ impl CayenneTableProvider {
                 if entry.sequence_number > new_watermark {
                     continue;
                 }
-                view.push(self.decode_and_filter_inlined_entry(entry, &inlined_deletions)?);
+                view.push(Arc::new(
+                    self.decode_and_filter_inlined_entry(entry, &inlined_deletions)?,
+                ));
             }
         }
 
@@ -27542,7 +27551,7 @@ impl CayenneTableProvider {
         structural_epoch: u64,
         materialized_through_sequence: i64,
         tombstone_delta_seq: u64,
-        view: Vec<InlinedViewEntry>,
+        view: Vec<Arc<InlinedViewEntry>>,
     ) -> InlinedCache {
         let batches: Vec<RecordBatch> = view
             .iter()
@@ -28586,7 +28595,7 @@ impl CayenneTableProvider {
 
     fn pruned_inlined_batches(
         &self,
-        view: &[InlinedViewEntry],
+        view: &[Arc<InlinedViewEntry>],
         mem_tier: &crate::provider::mem_tier::MemTier,
         pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Vec<RecordBatch>> {
@@ -28608,7 +28617,7 @@ impl CayenneTableProvider {
     /// same removal map the single-tier path built.
     fn pruned_inlined_batches_with_removal(
         &self,
-        view: &[InlinedViewEntry],
+        view: &[Arc<InlinedViewEntry>],
         removal: Option<&InlinedDeletionMaps>,
         pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Vec<RecordBatch>> {
@@ -28625,7 +28634,9 @@ impl CayenneTableProvider {
             } else if entry.batches.is_empty() {
                 continue;
             } else {
-                entry.clone()
+                // `entry: &Arc<InlinedViewEntry>` here; deref past the Arc so
+                // this stays a plain `InlinedViewEntry` like the other arm.
+                (**entry).clone()
             };
 
             if visible.batches.is_empty() {

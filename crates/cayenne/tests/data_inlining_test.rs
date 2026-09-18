@@ -151,7 +151,7 @@ async fn test_inlined_data_crud(
             inlined_id: String::new(),
             table_id: table_id.clone(),
             partition_key: None,
-            data_ipc: ipc_buf,
+            data_ipc: ipc_buf.into(),
             record_count: 3,
             sequence_number: 0,
             created_at: String::new(),
