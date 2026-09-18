@@ -46,9 +46,10 @@ name: mysql-cayenne[file]-adaptive
 # Clustering is not free. It replaces the inference-derived sort order on these tables (the
 # two cannot be combined), so a whole-snapshot write — the initial CDC bootstrap and the
 # ordered compaction rewrite — orders rows along the curve through ONE writer instead of the
-# range-routed parallel write, which lengthens the bootstrap the `ready_wait` in the dispatch
-# config has to cover. QPH, freshness and replication lag can all move. Whether that pays for
-# itself at SF1000 is what this arm measures.
+# range-routed parallel write. On the scheduled SF1000 arms that costs nothing at load time
+# (the bootstrap there is bound by reading the source, not by encoding), but it does move the
+# steady state: the mysql arm traded roughly half its QPH for ~6x better worst-table
+# freshness, while the postgres arm moved within its run-to-run spread on both.
 
 # All `refresh_mode: changes` datasets coalesce onto ONE shared binlog dump
 # (server_id derived from the connection identity - the engine default). The

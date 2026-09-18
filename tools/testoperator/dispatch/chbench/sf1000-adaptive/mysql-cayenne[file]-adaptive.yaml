@@ -5,10 +5,6 @@ tests:
     scale_factor: 1000
     terminals: 100
     duration: 1800
-    # More headroom than the unpinned arms: `cayenne_cluster_by` writes the initial CDC
-    # bootstrap of the clustered tables through one ordered writer instead of the
-    # range-routed parallel write, which lengthens the load phase on a table the size of
-    # SF1000 order_line. This is a timeout, not a wait, so a healthy run pays nothing for it.
-    ready_wait: 1200
+    ready_wait: 900
     query_overrides: chbench-skip-slow
     rate: 9250
