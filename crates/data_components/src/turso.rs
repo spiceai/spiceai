@@ -544,6 +544,7 @@ impl TursoTableProvider {
             columns.push(Self::column_from_turso_values(
                 rows,
                 col_idx,
+                field.name(),
                 field.data_type(),
             )?);
         }
@@ -558,7 +559,9 @@ impl TursoTableProvider {
     /// The inverse of [`scalar_value_to_turso`], and it must stay one: a type that function stores
     /// but this one cannot rebuild is a column that writes without error and cannot be read back.
     ///
-    /// Recurses for `Dictionary`, whose values the write path stores unwrapped.
+    /// Recurses for `Dictionary`, whose values the write path stores unwrapped. `column` is the
+    /// field's name, so an error names the column at fault rather than leaving a dataset with
+    /// several columns of the same type to guess.
     #[expect(
         clippy::too_many_lines,
         clippy::match_same_arms,
@@ -568,6 +571,7 @@ impl TursoTableProvider {
     fn column_from_turso_values(
         rows: &[Vec<TursoValue>],
         col_idx: usize,
+        column: &str,
         data_type: &DataType,
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
         let column: ArrayRef = match data_type {
@@ -778,7 +782,7 @@ impl TursoTableProvider {
             // reads as NULL rather than being padded or truncated to fit.
             DataType::FixedSizeBinary(width) => {
                 let expected = usize::try_from(*width).map_err(|_| {
-                        format!("Failed to read a column from Turso: {width} is not a valid fixed-size binary width")
+                        format!("Failed to read the column '{column}' from Turso: {width} is not a valid fixed-size binary width")
                     })?;
                 let values = rows.iter().map(|row| match row.get(col_idx) {
                     Some(TursoValue::Blob(b)) if b.len() == expected => Some(b.as_slice()),
@@ -1136,15 +1140,15 @@ impl TursoTableProvider {
             // `cast` packs only primitive, string and binary value types, so a dictionary over a
             // list, map, boolean, duration or interval column would write but fail every scan.
             DataType::Dictionary(key_type, value_type) => {
-                let values = Self::column_from_turso_values(rows, col_idx, value_type)?;
-                dictionary_encode(&values, key_type, data_type)?
+                let values = Self::column_from_turso_values(rows, col_idx, column, value_type)?;
+                dictionary_encode(&values, key_type, data_type, column)?
             }
             // Rebuilding an unhandled type as a string only defers the failure to
             // `RecordBatch::try_new`, which reports it as a mismatch against whichever column
             // it compares first, so name the type here instead.
             other => {
                 return Err(format!(
-                        "Failed to read a column from Turso: the {other} type is not supported by the Turso accelerator. \
+                        "Failed to read the column '{column}' from Turso: the {other} type is not supported by the Turso accelerator. \
                         Cast the column to a supported type, or accelerate this dataset with a different engine. \
                         See: https://spiceai.org/docs/components/data-accelerators/turso"
                     )
@@ -2458,12 +2462,13 @@ struct DecodedMaps {
 /// so the dictionary is as compact as `cast` makes one and the keys a scan needs grow with the
 /// distinct values, not the row count; a value type the row format cannot express at all gets
 /// one entry per row. Either way a NULL stays a NULL key, and a column with more entries than
-/// `key_type` can index is refused with an error that names the key type rather than an
-/// Arrow-internal one.
+/// `key_type` can index is refused with an error that names the column and the key type rather
+/// than an Arrow-internal one.
 fn dictionary_encode(
     values: &ArrayRef,
     key_type: &DataType,
     dictionary_type: &DataType,
+    column: &str,
 ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
     let (keys, distinct): (Vec<Option<u64>>, ArrayRef) =
         if let Some(encodable) = row_encodable(values) {
@@ -2504,7 +2509,7 @@ fn dictionary_encode(
     )
     .map_err(|e| {
         format!(
-            "Failed to read a dictionary column from Turso: its {} entries do not fit the {key_type} keys the column declares ({e}). \
+            "Failed to read the dictionary column '{column}' from Turso: its {} entries do not fit the {key_type} keys the column declares ({e}). \
             Re-create the dataset with a wider dictionary key type, or accelerate it with a different engine. \
             See: https://spiceai.org/docs/components/data-accelerators/turso",
             distinct.len()
@@ -4814,8 +4819,10 @@ mod tests {
         };
         let message = e.to_string();
         assert!(
-            message.contains("Int8") && message.contains("129 entries"),
-            "the error should name the key type and the entry count: {message}"
+            message.contains("column 'c'")
+                && message.contains("Int8")
+                && message.contains("129 entries"),
+            "the error should name the column, the key type and the entry count: {message}"
         );
     }
 
