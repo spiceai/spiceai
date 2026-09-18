@@ -489,6 +489,14 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
         now,
     );
     let stored = cached.raw_batches().expect("raw entry");
+    let wide_shared = Arc::new(
+        stored
+            .iter()
+            .map(|batch| RecordBatch::clone(batch))
+            .collect::<Vec<_>>(),
+    );
+    // Absolute times include thread spawn/join; the pair isolates the
+    // serve-path delta under the same concurrency.
     group.bench_function(
         BenchmarkId::new("concurrent_hits", "threads=4/batches=8/rows=64/text_columns=20"),
         |b| {
@@ -506,14 +514,29 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
             });
         },
     );
+    group.bench_function(
+        BenchmarkId::new(
+            "concurrent_legacy_hits",
+            "threads=4/batches=8/rows=64/text_columns=20",
+        ),
+        |b| {
+            b.iter(|| {
+                std::thread::scope(|scope| {
+                    for _ in 0..4 {
+                        let shared = Arc::clone(&wide_shared);
+                        let schema = Arc::clone(&schema);
+                        scope.spawn(move || {
+                            let stream = LegacyCachedStream::new(shared, schema);
+                            black_box(drain_stream(stream))
+                        });
+                    }
+                });
+            });
+        },
+    );
 
-    // Same payload served through `CachedStream::new` (shared vec) so the
-    // search-cache path stays in the comparison. That constructor now
-    // prefetches; use `legacy_stream` above for the pre-change path.
-    let shared_vec = {
-        let batches: Vec<RecordBatch> = stored.iter().map(|b| RecordBatch::clone(b)).collect();
-        Arc::new(batches)
-    };
+    // Search-cache path: `CachedStream::new` does not prefetch.
+    let shared_vec = wide_shared;
     group.bench_function(
         BenchmarkId::new(
             "cached_stream_from_shared_vec",

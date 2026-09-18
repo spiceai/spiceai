@@ -24,7 +24,9 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::array::{Array, RecordBatch};
+use arrow::array::{
+    Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+};
 
 /// Cache-line size used when walking a buffer. Prefetch is a hint; being off
 /// by a line only wastes a prefetch, it does not change results.
@@ -85,19 +87,8 @@ pub(crate) fn prefetch_read_data(ptr: *const u8) {
 
 /// Prefetch the first batch's data buffers and the next batch's headers.
 ///
-/// Called when building the Raw serve stream, before it is returned to the
-/// caller. Empty input is a no-op.
-pub(crate) fn prefetch_raw_serve(batches: &[RecordBatch]) {
-    let Some((first, rest)) = batches.split_first() else {
-        return;
-    };
-    prefetch_batch_data(first);
-    if let Some(next) = rest.first() {
-        prefetch_batch_headers(next);
-    }
-}
-
-/// Same as [`prefetch_raw_serve`] for pre-`Arc`'d batches.
+/// Called from [`super::query::CachedStream::from_raw`] before the stream
+/// is returned. Empty input is a no-op.
 pub(crate) fn prefetch_raw_serve_arced(batches: &[Arc<RecordBatch>]) {
     let Some((first, rest)) = batches.split_first() else {
         return;
@@ -130,15 +121,43 @@ fn prefetch_batch_data(batch: &RecordBatch) {
     }
 }
 
+/// Touch value (and null) buffers without `Array::to_data`, which would
+/// clone every `Buffer` `Arc` on the serve path.
 fn prefetch_array_buffers(array: &dyn Array) {
-    // `to_data` clones `ArrayData` (buffer `Arc`s). Once per Raw hit, on the
-    // first few columns only — not on the poll path.
-    let data = array.to_data();
-    for buffer in data.buffers() {
-        prefetch_buffer_bytes(buffer.as_slice());
-    }
-    if let Some(nulls) = data.nulls() {
+    if let Some(nulls) = array.nulls() {
         prefetch_buffer_bytes(nulls.validity());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
+        prefetch_typed_values(arr.values());
+        return;
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Int32Array>() {
+        prefetch_typed_values(arr.values());
+        return;
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
+        prefetch_typed_values(arr.values());
+        return;
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<UInt64Array>() {
+        prefetch_typed_values(arr.values());
+        return;
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+        prefetch_buffer_bytes(arr.values());
+    }
+    // Unknown physical type: headers + null bitmap only. Do not call
+    // `to_data()` — that clones buffer `Arc`s on every Raw hit.
+}
+
+fn prefetch_typed_values<T>(values: &[T]) {
+    if values.is_empty() {
+        return;
+    }
+    let ptr = std::ptr::from_ref(&values[0]).cast::<u8>();
+    prefetch_read_data(ptr);
+    if std::mem::size_of_val(values) > CACHE_LINE {
+        prefetch_read_data(ptr.wrapping_add(CACHE_LINE));
     }
 }
 
@@ -159,7 +178,7 @@ fn prefetch_buffer_bytes(bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{prefetch_batch_headers, prefetch_raw_serve, prefetch_raw_serve_arced};
+    use super::{prefetch_batch_headers, prefetch_raw_serve_arced};
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -175,11 +194,9 @@ mod tests {
 
     #[test]
     fn prefetch_of_empty_and_columnless_batches_does_not_panic() {
-        prefetch_raw_serve(&[]);
         prefetch_raw_serve_arced(&[]);
 
         let empty = RecordBatch::new_empty(Arc::new(Schema::empty()));
-        prefetch_raw_serve(std::slice::from_ref(&empty));
         prefetch_batch_headers(&empty);
         prefetch_raw_serve_arced(&[Arc::new(empty)]);
     }
@@ -188,7 +205,6 @@ mod tests {
     fn prefetch_of_a_populated_batch_does_not_panic_or_change_rows() {
         let first = batch(8);
         let second = batch(3);
-        prefetch_raw_serve(&[first.clone(), second.clone()]);
         prefetch_raw_serve_arced(&[Arc::new(first.clone()), Arc::new(second.clone())]);
         assert_eq!(first.num_rows(), 8);
         assert_eq!(second.num_rows(), 3);

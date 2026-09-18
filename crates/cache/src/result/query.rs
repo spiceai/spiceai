@@ -404,12 +404,10 @@ pub struct CachedStream {
 impl CachedStream {
     /// Serve a shared `Arc<Vec<RecordBatch>>` (search cache, tests).
     ///
-    /// Indexes the vec in place and prefetches the first batch. Prefer
-    /// [`Self::from_raw`] for SQL Raw hits, where batches are already
-    /// pre-`Arc`'d.
+    /// Indexes the vec in place. Does not prefetch — search hits stay on
+    /// the pre-change path. SQL Raw hits use [`Self::from_raw`].
     #[must_use]
     pub fn new(data: Arc<Vec<RecordBatch>>, schema: SchemaRef) -> Self {
-        super::prefetch::prefetch_raw_serve(data.as_slice());
         Self {
             data: StreamBatches::Shared(data),
             schema,
