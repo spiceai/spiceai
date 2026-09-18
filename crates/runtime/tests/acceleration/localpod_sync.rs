@@ -430,6 +430,23 @@ async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Resul
 /// edit the reload applies to the parent. The long results-cache TTL is what lets the tests
 /// observe a stale cached result instead of its expiry.
 fn app_with_parent_refresh_sql(csv_path: &Path, refresh_sql: Option<&str>) -> App {
+    AppBuilder::new("test_localpod_child_follows_parent_hot_reload")
+        .with_sql_cache(long_lived_results_cache())
+        .with_dataset(file_parent(csv_path, refresh_sql))
+        .with_dataset(localpod_dataset(
+            "localpod:time_series",
+            "local_time_series",
+        ))
+        .with_dataset(localpod_dataset(
+            "localpod:local_time_series",
+            "local_local_time_series",
+        ))
+        .build()
+}
+
+/// The CSV-backed, in-memory-accelerated parent `time_series`, with `refresh_sql` as its
+/// hot-reload edit.
+fn file_parent(csv_path: &Path, refresh_sql: Option<&str>) -> Dataset {
     let mut parent = Dataset::new(format!("file://{}", csv_path.display()), "time_series");
     parent.params = Some(Params::from_string_map(
         vec![
@@ -445,18 +462,18 @@ fn app_with_parent_refresh_sql(csv_path: &Path, refresh_sql: Option<&str>) -> Ap
         refresh_sql: refresh_sql.map(str::to_string),
         ..Acceleration::default()
     });
+    parent
+}
 
-    AppBuilder::new("test_localpod_child_follows_parent_hot_reload")
-        .with_sql_cache(long_lived_results_cache())
-        .with_dataset(parent)
-        .with_dataset(localpod_dataset(
-            "localpod:time_series",
-            "local_time_series",
-        ))
-        .with_dataset(localpod_dataset(
-            "localpod:local_time_series",
-            "local_local_time_series",
-        ))
+/// A Spicepod whose `localpod:` child is *not* accelerated — a pass-through over the parent's
+/// table — with the parent present (`Some(csv_path)`) or removed (`None`).
+fn app_with_passthrough_child(csv_path: Option<&Path>, refresh_sql: Option<&str>) -> App {
+    let mut app = AppBuilder::new("test_localpod_passthrough_child")
+        .with_sql_cache(long_lived_results_cache());
+    if let Some(csv_path) = csv_path {
+        app = app.with_dataset(file_parent(csv_path, refresh_sql));
+    }
+    app.with_dataset(Dataset::new("localpod:time_series", "local_time_series"))
         .build()
 }
 
@@ -712,6 +729,98 @@ async fn test_localpod_child_follows_parent_removed_and_added_back() -> Result<(
                 cached, 2,
                 "the query path should answer from the child's new table, not from a plan or \
                  result cached over its previous one"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// A pass-through `localpod` child (no acceleration of its own) must also answer from the
+/// re-added parent through the query path's caches.
+///
+/// Regression test for the cache half of <https://github.com/spiceai/spiceai/issues/3288>: an
+/// in-place `update_dataset` clears cached plans and invalidates cached results around its swap,
+/// and an accelerated child's initial refresh does the same on completion — but a pass-through
+/// child re-queued behind its re-added parent has neither, so a plan cached over the removed
+/// parent's table would keep answering with its rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_localpod_passthrough_child_follows_parent_removed_and_added_back()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,runtime_table::accelerated=trace",
+    ));
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = TempDir::new().expect("create temp dir");
+            let csv_path = temp_dir.path().join("data.csv");
+            fs::write(&csv_path, format!("{CSV_HEADER}{}", rows(0, 5)))
+                .await
+                .expect("write initial csv");
+
+            configure_test_datafusion();
+            let runtime = Arc::new(
+                Runtime::builder()
+                    .with_app(app_with_passthrough_child(Some(&csv_path), None))
+                    .build()
+                    .await,
+            );
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&runtime).load_components() => {}
+            }
+            runtime_ready_check(&runtime).await;
+
+            // Warm the query path's plan and results caches over the child's current table.
+            let (status, count) = cached_count(&runtime, "local_time_series").await;
+            assert_eq!((status, count), (CacheStatus::CacheMiss, 5));
+            let (status, count) = cached_count(&runtime, "local_time_series").await;
+            assert_eq!((status, count), (CacheStatus::CacheHit, 5));
+
+            assert!(
+                Arc::clone(&runtime)
+                    .apply_app(Arc::new(app_with_passthrough_child(None, None)))
+                    .await,
+                "dropping the parent differs from the booted spicepod, so it must apply"
+            );
+            assert!(
+                Arc::clone(&runtime)
+                    .apply_app(Arc::new(app_with_passthrough_child(
+                        Some(&csv_path),
+                        Some("SELECT * FROM time_series WHERE id < 2"),
+                    )))
+                    .await,
+                "re-adding the parent differs from the child-only spicepod, so it must apply"
+            );
+            assert_eq!(
+                wait_for_registered_count(&runtime, "time_series", 2, Duration::from_secs(30))
+                    .await,
+                Some(2),
+                "the re-added parent should serve only the rows its refresh_sql keeps"
+            );
+            assert_eq!(
+                wait_for_registered_count(
+                    &runtime,
+                    "local_time_series",
+                    2,
+                    Duration::from_secs(30)
+                )
+                .await,
+                Some(2),
+                "the pass-through child should read the re-added parent's rows"
+            );
+
+            // The query path must answer from the new table too, not from the plan or result
+            // cached over the removed parent's.
+            let (_, cached) = cached_count(&runtime, "local_time_series").await;
+            assert_eq!(
+                cached, 2,
+                "the query path should answer from the re-added parent's rows, not from a plan \
+                 or result cached over the removed parent's table"
             );
 
             Ok(())

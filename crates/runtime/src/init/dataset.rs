@@ -1880,6 +1880,12 @@ impl Runtime {
                 if let Some(parent) = localpod_parent(ds)
                     && (added_futures.contains_key(&parent) || queued_localpods.contains(&parent))
                 {
+                    // What `update_dataset` does around its own swap: a plan or result cached
+                    // over the table being unloaded must not answer once the chain below
+                    // registers its replacement. An accelerated dataset's initial refresh
+                    // invalidates again on completion; a pass-through one has only this.
+                    self.df.clear_cached_plans().await;
+                    self.invalidate_cached_results_for(&ds.name).await;
                     Arc::clone(&self)
                         .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
                         .await;
@@ -2020,8 +2026,15 @@ impl Runtime {
             .collect();
         let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
         Box::pin(async move {
-            self.load_dataset(ds, bootstrap_status, load_semaphore)
+            let name = ds.name.clone();
+            Arc::clone(&self)
+                .load_dataset(ds, bootstrap_status, load_semaphore)
                 .await;
+            // The registration this dataset reads through has just been replaced, so mark its
+            // results-cache clock again, as `update_dataset` does after its swap: a result read
+            // from the previous registration after the mark above must not be stored as fresh.
+            // For a dataset new to this apply the mark is a no-op.
+            self.invalidate_cached_results_for(&name).await;
             join_all(children).await;
         })
     }
