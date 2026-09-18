@@ -25,20 +25,22 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cache::encoding::{Encoder, ZstdEncoder};
 use cache::get_hash_builder;
 use cache::key::CacheKey;
 use cache::result::query::{CachedQueryResult, CachedStream};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use datafusion::common::{ParamValues, ScalarValue};
+use datafusion::error::DataFusionError;
+use datafusion::execution::RecordBatchStream;
+use datafusion::logical_expr::{LogicalPlan, col, placeholder, table_scan};
 use futures::Stream;
+use spicepod::component::caching::HashingAlgorithm;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
-use datafusion::common::{ParamValues, ScalarValue};
-use datafusion::logical_expr::{LogicalPlan, col, placeholder, table_scan};
-use spicepod::component::caching::HashingAlgorithm;
 
 fn batch(rows: usize, text_columns: usize) -> RecordBatch {
     let mut fields = vec![
@@ -263,7 +265,10 @@ fn bench_parameterized_key(c: &mut Criterion) {
     group.finish();
 }
 
-fn drain_cached_stream(mut stream: CachedStream) -> usize {
+fn drain_stream<S>(mut stream: S) -> usize
+where
+    S: Stream<Item = Result<RecordBatch, DataFusionError>> + Unpin,
+{
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
     let mut rows = 0;
@@ -275,14 +280,17 @@ fn drain_cached_stream(mut stream: CachedStream) -> usize {
             }
             Poll::Ready(None) => break,
             Poll::Ready(Some(Err(e))) => panic!("stream error: {e}"),
-            Poll::Pending => panic!("CachedStream must be immediately ready"),
+            Poll::Pending => panic!("serve stream must be immediately ready"),
         }
     }
     rows
 }
 
 /// Touch column values so prefetch of data buffers can show up in wall time.
-fn drain_and_touch(mut stream: CachedStream) -> i64 {
+fn drain_and_touch<S>(mut stream: S) -> i64
+where
+    S: Stream<Item = Result<RecordBatch, DataFusionError>> + Unpin,
+{
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
     let mut sum = 0_i64;
@@ -302,19 +310,65 @@ fn drain_and_touch(mut stream: CachedStream) -> i64 {
             }
             Poll::Ready(None) => break,
             Poll::Ready(Some(Err(e))) => panic!("stream error: {e}"),
-            Poll::Pending => panic!("CachedStream must be immediately ready"),
+            Poll::Pending => panic!("serve stream must be immediately ready"),
         }
     }
     sum
 }
 
+/// Pre-change `CachedStream`: `Arc<Vec<RecordBatch>>`, no prefetch,
+/// `RecordBatch::clone` on each poll. Bench-local so construct+drain and
+/// construct+drain+touch isolate the storage/prefetch change from the
+/// production path (`CachedStream::from_raw`, which now prefetches).
+struct LegacyCachedStream {
+    data: Arc<Vec<RecordBatch>>,
+    schema: SchemaRef,
+    index: usize,
+}
+
+impl LegacyCachedStream {
+    fn new(data: Arc<Vec<RecordBatch>>, schema: SchemaRef) -> Self {
+        Self {
+            data,
+            schema,
+            index: 0,
+        }
+    }
+}
+
+impl Stream for LegacyCachedStream {
+    type Item = Result<RecordBatch, DataFusionError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(if self.index < self.data.len() {
+            let index = self.index;
+            let batch = self.data.get(index).cloned().map(Ok);
+            self.index += 1;
+            batch
+        } else {
+            None
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.data.len(), Some(self.data.len()))
+    }
+}
+
+impl RecordBatchStream for LegacyCachedStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
 /// Raw multi-batch hit: construct the serve stream and drain it.
 ///
-/// `legacy_column_clone` is today's `poll_next` (`RecordBatch::clone` per
-/// batch: schema Arc + every column `ArrayRef`). `arc_batch_clone` is the
-/// pre-`Arc`'d handoff (one atomic per batch). `cached_stream_from_raw` is
-/// the production serve path (prefetch + `Arc::clone` + the owned
-/// `RecordBatch` `DataFusion` still requires).
+/// `legacy_stream` / `legacy_stream_touch` are the old end-to-end path
+/// (`LegacyCachedStream`: `Arc<Vec<_>>`, no prefetch, `RecordBatch::clone`
+/// on poll). `cached_stream_from_raw` / `cached_stream_from_raw_touch` are
+/// the production path (prefetch + pre-`Arc`'d slice). `legacy_column_clone`
+/// and `arc_batch_clone` isolate the per-batch clone cost without stream
+/// construction.
 fn bench_raw_stream_serve(c: &mut Criterion) {
     let mut group = c.benchmark_group("raw_stream_serve");
     let cases = [
@@ -337,6 +391,12 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
             now,
         );
         let stored = cached.raw_batches().expect("raw entry");
+        let shared_vec = Arc::new(
+            stored
+                .iter()
+                .map(|batch| RecordBatch::clone(batch))
+                .collect::<Vec<_>>(),
+        );
         let id = format!("batches={batches}/rows={rows}/text_columns={text_columns}");
 
         group.bench_with_input(
@@ -372,12 +432,34 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
         );
 
         group.bench_with_input(
+            BenchmarkId::new("legacy_stream", &id),
+            &shared_vec,
+            |b, shared_vec| {
+                b.iter(|| {
+                    let stream = LegacyCachedStream::new(Arc::clone(shared_vec), Arc::clone(&schema));
+                    black_box(drain_stream(stream))
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("legacy_stream_touch", &id),
+            &shared_vec,
+            |b, shared_vec| {
+                b.iter(|| {
+                    let stream = LegacyCachedStream::new(Arc::clone(shared_vec), Arc::clone(&schema));
+                    black_box(drain_and_touch(stream))
+                });
+            },
+        );
+
+        group.bench_with_input(
             BenchmarkId::new("cached_stream_from_raw", &id),
             &stored,
             |b, stored| {
                 b.iter(|| {
                     let stream = CachedStream::from_raw(Arc::clone(stored), Arc::clone(&schema));
-                    black_box(drain_cached_stream(stream))
+                    black_box(drain_stream(stream))
                 });
             },
         );
@@ -417,7 +499,7 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
                         let schema = Arc::clone(&schema);
                         scope.spawn(move || {
                             let stream = CachedStream::from_raw(stored, schema);
-                            black_box(drain_cached_stream(stream))
+                            black_box(drain_stream(stream))
                         });
                     }
                 });
@@ -426,7 +508,8 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
     );
 
     // Same payload served through `CachedStream::new` (shared vec) so the
-    // search-cache path stays in the comparison.
+    // search-cache path stays in the comparison. That constructor now
+    // prefetches; use `legacy_stream` above for the pre-change path.
     let shared_vec = {
         let batches: Vec<RecordBatch> = stored.iter().map(|b| RecordBatch::clone(b)).collect();
         Arc::new(batches)
@@ -439,7 +522,7 @@ fn bench_raw_stream_serve(c: &mut Criterion) {
         |b| {
             b.iter(|| {
                 let stream = CachedStream::new(Arc::clone(&shared_vec), Arc::clone(&schema));
-                black_box(drain_cached_stream(stream))
+                black_box(drain_stream(stream))
             });
         },
     );
