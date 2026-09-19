@@ -2095,7 +2095,11 @@ mod tests {
 
         cache.insert(16, TestValue::with_size("b", 8), 8);
 
-        assert_eq!(cache.len(), 2, "nothing is over budget, so nothing is evicted");
+        assert_eq!(
+            cache.len(),
+            2,
+            "nothing is over budget, so nothing is evicted"
+        );
         assert!(
             cache.window_weight_for_test() <= window_cap,
             "an oversized window must drain to its {window_cap}-byte cap even when a \
