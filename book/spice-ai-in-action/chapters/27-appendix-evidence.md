@@ -144,9 +144,9 @@ No production latency, throughput, memory reduction, recovery-time objective, or
 
 ## A.9 Final configuration checks
 
-The final listings quote connector parameter values such as `csv_has_header: "true"` and use array notation for search row identities, `row_id: [article_id]`. The source checkout's Draft 2020-12 schema accepts the seven non-authentication companion Spicepods. The authentication file uses `api_key` and a string secret reference. Its real runtime checks returned HTTP 401 without the key and HTTP 200 with it.
+The final listings quote connector parameter values such as `csv_has_header: "true"` and use array notation for search row identities, `row_id: [article_id]`. The source checkout's Draft 2020-12 schema accepts all eight companion Spicepods, including the authentication file. That file uses `api_key` and a string secret reference. Its real runtime checks returned HTTP 401 without the key and HTTP 200 with it.
 
-The generated schema rejects that string API-key entry because it describes the enum's object representation. The inspected `ApiKey` implementation has custom string deserialization. This is an example of why schema validation and runtime acceptance are separate observations; the book retains the runtime-accepted authentication syntax. `config-validation.json` records the schema result, while `final-config/` retains the final configuration runs. No runtime behavior was changed to obtain these results.
+The generated schema's `ApiKey` definition matches the runtime's custom string deserializer: keys are strings, with an optional `:ro` (default) or `:rw` suffix selecting capability. `config-validation.json` records the schema result, while `final-config/` retains the final configuration runs.
 
 ## A.10 Enterprise additions
 

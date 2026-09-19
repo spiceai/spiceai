@@ -8,10 +8,8 @@
     },
     {
       "file": "spicepod.auth.yaml",
-      "valid": false,
-      "errors": [
-        "{'api_key': {'enabled': True, 'keys': ['${ env:BOOK_API_KEY }']}} is not valid under any of the given schemas"
-      ]
+      "valid": true,
+      "errors": []
     },
     {
       "file": "spicepod.cayenne.yaml",
@@ -44,5 +42,5 @@
       "errors": []
     }
   ],
-  "note": "The generated schema represents ApiKey as enum objects, while the inspected custom deserializer and the actual runtime accept strings. Authentication passed real unauthorized/authorized requests; schema rejection alone is not a runtime rejection."
+  "note": "The generated schema's ApiKey definition is a string, matching the custom deserializer and runtime-accepted syntax (optional :ro/:rw suffix). Authentication passed real unauthorized/authorized requests."
 }

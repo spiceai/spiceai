@@ -54,7 +54,7 @@ The teaching service binds to loopback and demonstrates fixed, tenant-scoped ope
 
 ## Runtime authentication
 
-Set `BOOK_API_KEY` to your own lab secret, then launch `spicepod.auth.yaml`. Use the `X-API-Key` HTTP header. The application service supports `SPICE_API_KEY` for its upstream requests. The standalone SQL verifier targets the unauthenticated loopback labs and does not inject a runtime key. The generated schema's API-key representation differs from the runtime's accepted string syntax; see `evidence/config-validation.json` and Appendix A.
+Set `BOOK_API_KEY` to your own lab secret, then launch `spicepod.auth.yaml`. Use the `X-API-Key` HTTP header. The application service supports `SPICE_API_KEY` for its upstream requests. The standalone SQL verifier targets the unauthenticated loopback labs and does not inject a runtime key. API keys are configured as strings (optional `:ro` / `:rw` suffix); see `evidence/config-validation.json` and Appendix A.
 
 ## Evidence and scope
 
