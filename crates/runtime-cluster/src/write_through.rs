@@ -324,8 +324,15 @@ where
             // decodes it or fails loudly. The predicate is `declares_ipc_data` rather than
             // `declares_record_batch` because a dictionary is client data too: the batches
             // referring to it carry nothing without it, so a tagged dictionary must be refused
-            // rather than dropped.
+            // rather than dropped. The empty body is a floor under that: the header can only
+            // ever add to what the body already establishes, never narrow it. `declares_ipc_data`
+            // answers `false` for a schema message, a trailer, a `Tensor` and any IPC header a
+            // later Arrow adds, so without the floor a sentinel-tagged message of those kinds
+            // would take its body with it and the write would still report success. A real
+            // heartbeat carries neither header nor body. `do_put.rs`'s discarded-message count
+            // keeps the same floor, for the same reason.
             if message.app_metadata.as_ref() == KEEPALIVE_APP_METADATA
+                && message.data_body.is_empty()
                 && !declares_ipc_data(&message.data_header, &table_name)?
             {
                 continue;
@@ -1763,5 +1770,51 @@ mod tests {
 
         let batches = decode(first, vec![], &schema).await.expect("no batches");
         assert!(batches.is_empty());
+    }
+    /// A message wearing the keepalive sentinel whose header declares something other than IPC
+    /// data — a schema re-declaration, a trailer, a `Tensor`, any header a later Arrow adds —
+    /// but which carries a body, is client data, not a heartbeat.
+    ///
+    /// `declares_ipc_data` answers `false` for all of those, so the sentinel check alone would
+    /// skip the message and take its body with it while the write still reported success: the
+    /// exact silent-row-loss shape this PR exists to remove, reintroduced one layer up. The
+    /// empty-body floor is what refuses it. `do_put.rs`'s discarded-message count keeps the same
+    /// floor for the same reason, so the two receivers agree.
+    ///
+    /// A schema message is used because it is the shape a real client is likeliest to send; the
+    /// arm it exercises is shared by every non-data header.
+    #[tokio::test]
+    async fn a_sentinel_tagged_message_carrying_a_body_is_not_skipped_as_a_heartbeat() {
+        let schema = client_schema();
+        let mut msgs = encode_batch_to_flight_data(&schema, &client_batch(vec!["US"], vec![1]));
+        let first = msgs.remove(0);
+
+        let mut tagged = arrow_flight::utils::batches_to_flight_data(
+            &Schema::new(vec![Field::new("id", DataType::Int32, false)]),
+            vec![],
+        )
+        .expect("encoding a schema as flight data")
+        .remove(0);
+        tagged.data_body = (&b"rows the client sent"[..]).into();
+        tagged.app_metadata = bytes::Bytes::from_static(KEEPALIVE_APP_METADATA);
+
+        // Asserted so the case cannot quietly stop exercising the confusion: it needs a header
+        // that parses into a non-data kind, and a body under it.
+        assert_eq!(
+            ipc::declares_ipc_data(&tagged.data_header),
+            Ok(false),
+            "the case needs a header that declares something other than IPC data"
+        );
+        assert!(
+            !tagged.data_body.is_empty(),
+            "the case needs a body; without one this is a real heartbeat"
+        );
+
+        let err = decode(first, vec![msgs.remove(0), tagged], &schema)
+            .await
+            .expect_err("a sentinel-tagged message carrying a body must not be skipped");
+
+        assert!(matches!(err, Error::NonBatchMessage { .. }), "{err:?}");
+        assert!(err.to_string().contains("'test.s.events'"), "{err}");
     }
 }
