@@ -97,6 +97,11 @@ pub enum EvictionPolicy {
     /// competes with the probation LRU on frequency before entering main. A
     /// hit on probation promotes into protected; protected overflow demotes
     /// back to probation.
+    ///
+    /// Segment caps (`window_cap` / `protected_cap`) and the matching weight
+    /// counters are **cache-wide**, derived from the global `max_weight`, not
+    /// per-shard. Sharding still partitions the lists and locks; only the
+    /// capacity accounting is shared.
     TinyLfu,
 }
 
@@ -211,17 +216,32 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
     /// window LRU loses the frequency comparison against the probation victim.
     pub fn insert(&self, key: u64, value: V, weight: usize) {
         let weight = u64::try_from(weight).unwrap_or(u64::MAX);
-        if weight > self.max_weight {
-            // Cannot retain this value. Drop any stale generation of the same
-            // key so a failed admit does not leave the previous result cached.
-            drop(self.remove(&key));
-            return;
-        }
         let shard_idx = shard_index(key);
         // Apply deferred get-path promotes before admission so eviction sees
         // up-to-date region / frequency state for this shard.
         self.drain_touches_blocking(shard_idx);
         let mut shard = self.shards[shard_idx].0.lock();
+        if weight > self.max_weight {
+            // Reject under the shard lock. A concurrent fitting insert of the
+            // same key must not land between the weight check and this remove,
+            // or an uncacheable admit would delete a newer valid result.
+            let before_window = shard.window_weight();
+            let before_protected = shard.protected_weight();
+            let removed = shard.remove(key);
+            if let Some((old, old_weight)) = removed {
+                self.sub_weight(old_weight);
+                self.sync_segment_weights_after_removal(
+                    before_window,
+                    shard.window_weight(),
+                    before_protected,
+                    shard.protected_weight(),
+                );
+                drop(shard);
+                drop(old);
+            }
+            drop(value);
+            return;
+        }
         // Sample TTL after the shard lock so wait time is not charged to the
         // entry (and so TinyLFU can expire this shard before admission).
         let now = Instant::now();

@@ -62,12 +62,12 @@ struct EmbedQueryAdapter(Arc<dyn Embed>);
 #[async_trait]
 impl QueryEmbedder for EmbedQueryAdapter {
     async fn embed_query(&self, query: &str) -> Result<Vec<f32>, DataFusionError> {
-        let mut vectors = self
+        let vectors = self
             .0
             .embed(llms::embeddings::EmbeddingInput::String(query.to_string()))
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        vectors.pop().ok_or_else(|| {
+        vectors.first().cloned().ok_or_else(|| {
             DataFusionError::Execution("No embedding vector computed for query".to_string())
         })
     }

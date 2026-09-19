@@ -84,8 +84,15 @@ where
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
 {
     async fn insert(&self, key: u64, value: V) {
+        // Admission may expire a shard and walk LFU victims; keep that off the
+        // Tokio worker the way `clear` / `run_pending_tasks` already do.
         let weight = value.get_memory_size();
-        self.cache.insert(key, value, weight);
+        let cache = Arc::clone(&self.cache);
+        if let Err(err) =
+            tokio::task::spawn_blocking(move || cache.insert(key, value, weight)).await
+        {
+            tracing::debug!("Spice cache insert task did not finish: {err}");
+        }
     }
 
     async fn replace_if(

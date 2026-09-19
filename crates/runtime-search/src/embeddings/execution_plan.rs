@@ -1021,18 +1021,21 @@ mod tests {
             -1
         }
 
-        async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, embeddings::Error> {
+        async fn embed(
+            &self,
+            input: EmbeddingInput,
+        ) -> Result<std::sync::Arc<Vec<Vec<f32>>>, embeddings::Error> {
             match input {
                 EmbeddingInput::String(s) => {
                     let v = self.map.get(&s).cloned().unwrap_or_default();
-                    Ok(vec![v])
+                    Ok(std::sync::Arc::new(vec![v]))
                 }
                 EmbeddingInput::StringArray(arr) => {
                     let v = arr
                         .iter()
                         .map(|s| self.map.get(s).cloned().unwrap_or_default())
                         .collect();
-                    Ok(v)
+                    Ok(std::sync::Arc::new(v))
                 }
                 _ => Err(embeddings::Error::FailedToCreateEmbedding {
                     source: Box::<dyn std::error::Error + Send + Sync>::from(
