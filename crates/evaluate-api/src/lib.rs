@@ -345,12 +345,6 @@ pub trait Evaluate: Send + Sync + Debug {
     /// should substitute their upstream model id before calling the remote API.
     async fn evaluate(&self, request: EvaluateRequest) -> Result<EvaluateResponse>;
 
-    /// Spicepod / runtime name of this model.
-    fn model_name(&self) -> &str;
-
-    /// Upstream provider model id (e.g. `jev-latest`).
-    fn provider_model_id(&self) -> &str;
-
     /// Optional health check (e.g. list models). Default is a no-op.
     async fn health(&self) -> Result<()> {
         Ok(())

@@ -172,7 +172,10 @@ pub(crate) async fn post(
                 if evaluate_models.read().await.contains_key(&model_id) {
                     (
                         StatusCode::BAD_REQUEST,
-                        llms::typesafe::chat_not_supported_message(&model_id),
+                        llms::chat::Error::EvaluateOnlyModel {
+                            model: model_id.clone(),
+                        }
+                        .to_string(),
                     )
                         .into_response()
                 } else {

@@ -21,7 +21,6 @@ limitations under the License.
 use llms::chat::Error as LlmError;
 use llms::evaluate::Evaluate;
 use llms::typesafe::TypeSafe;
-use runtime_parameters_typed::TypedParams;
 use runtime_rate_control::RateController;
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
@@ -30,6 +29,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use super::chat::typed_params;
 use super::params::typesafe::TypeSafeModelParams;
 use super::rate_limit::build_model_rate_controller;
 
@@ -65,16 +65,8 @@ async fn typesafe(
     params: &HashMap<String, secrecy::SecretString>,
     secrets: &Arc<RwLock<Secrets>>,
 ) -> Result<(Arc<dyn Evaluate>, Arc<RateController>), LlmError> {
-    let typed = TypeSafeModelParams::try_from_params(
-        &format!("model {}", ModelSource::TypeSafe),
-        params.clone(),
-        secrets,
-    )
-    .await
-    .map_err(|e| LlmError::ModelParameterFailed {
-        model: component.name.clone(),
-        source: Box::new(e),
-    })?;
+    let typed: TypeSafeModelParams =
+        typed_params(component, params, ModelSource::TypeSafe, secrets).await?;
 
     let api_key = match typed.api_key.as_ref().map(ExposeSecret::expose_secret) {
         Some(key) => key.to_string(),

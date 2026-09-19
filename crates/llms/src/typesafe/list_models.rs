@@ -23,6 +23,7 @@ use std::collections::HashMap;
 
 use crate::provider::{
     ListModels, ListModelsError, ListModelsResult, create_http_client, get_required_param,
+    map_status_to_error,
 };
 
 use super::DEFAULT_BASE_URL;
@@ -31,11 +32,9 @@ const PROVIDER_NAME: &str = "TypeSafe";
 
 #[derive(Debug, Deserialize)]
 struct ModelsResponse {
-    #[serde(default)]
+    /// `alias` accepts the OpenAI-style `{ "data": [...] }` envelope as well.
+    #[serde(default, alias = "data")]
     models: Vec<ModelCard>,
-    /// Some gateways return OpenAI-style `{ data: [...] }`.
-    #[serde(default)]
-    data: Vec<ModelCard>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,7 +45,7 @@ struct ModelCard {
 
 /// `TypeSafe` model lister (`GET /v1/models`).
 pub struct TypeSafeModelLister {
-    api_key: String,
+    api_key: SecretString,
     base_url: String,
 }
 
@@ -68,20 +67,9 @@ impl TypeSafeModelLister {
         );
 
         Ok(Self {
-            api_key: api_key.expose_secret().to_string(),
+            api_key: api_key.clone(),
             base_url: base_url.trim_end_matches('/').to_string(),
         })
-    }
-
-    #[must_use]
-    pub fn new(api_key: &SecretString, base_url: Option<&str>) -> Self {
-        Self {
-            api_key: api_key.expose_secret().to_string(),
-            base_url: base_url
-                .unwrap_or(DEFAULT_BASE_URL)
-                .trim_end_matches('/')
-                .to_string(),
-        }
     }
 }
 
@@ -99,7 +87,7 @@ impl ListModels for TypeSafeModelLister {
 
         let response = client
             .get(format!("{}/v1/models", self.base_url))
-            .bearer_auth(&self.api_key)
+            .bearer_auth(self.api_key.expose_secret())
             .send()
             .await
             .map_err(|e| ListModelsError::NetworkError {
@@ -107,23 +95,8 @@ impl ListModels for TypeSafeModelLister {
                 message: e.to_string(),
             })?;
 
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(ListModelsError::InvalidCredentials {
-                provider: PROVIDER_NAME.to_string(),
-            });
-        }
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(ListModelsError::RateLimited {
-                provider: PROVIDER_NAME.to_string(),
-            });
-        }
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(ListModelsError::ProviderRefused {
-                provider: PROVIDER_NAME.to_string(),
-                message: format!("HTTP {status}: {body}"),
-            });
+        if !response.status().is_success() {
+            return Err(map_status_to_error(response.status(), PROVIDER_NAME));
         }
 
         let parsed: ModelsResponse =
@@ -135,15 +108,7 @@ impl ListModels for TypeSafeModelLister {
                     message: e.to_string(),
                 })?;
 
-        let mut names: Vec<String> = parsed
-            .models
-            .into_iter()
-            .chain(parsed.data)
-            .map(|m| m.name)
-            .collect();
-        names.sort();
-        names.dedup();
-        Ok(names)
+        Ok(parsed.models.into_iter().map(|m| m.name).collect())
     }
 }
 
@@ -158,6 +123,18 @@ mod tests {
             TypeSafeModelLister::from_params(&params),
             Err(ListModelsError::MissingParameter { .. })
         ));
+    }
+
+    /// Both the TypeSafe shape and the OpenAI-style envelope land in one field.
+    #[test]
+    fn models_response_accepts_either_envelope() {
+        let native: ModelsResponse =
+            serde_json::from_str(r#"{"models":[{"name":"jev-latest"}]}"#).expect("native");
+        assert_eq!(native.models[0].name, "jev-latest");
+
+        let openai_style: ModelsResponse =
+            serde_json::from_str(r#"{"data":[{"id":"jev-1.13.0"}]}"#).expect("openai style");
+        assert_eq!(openai_style.models[0].name, "jev-1.13.0");
     }
 
     #[test]

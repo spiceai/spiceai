@@ -145,7 +145,7 @@ impl Evaluate for TypeSafe {
             .acquire()
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-            .context(RatePermitFailedSnafu {
+            .with_context(|_| RatePermitFailedSnafu {
                 model: self.name.clone(),
             })?;
 
@@ -156,12 +156,11 @@ impl Evaluate for TypeSafe {
             .client
             .post(self.systemone_url())
             .bearer_auth(&self.api_key)
-            .header("Content-Type", "application/json")
             .json(&request)
             .send()
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-            .context(ModelCallFailedSnafu {
+            .with_context(|_| ModelCallFailedSnafu {
                 model: self.name.clone(),
             })?;
 
@@ -170,7 +169,7 @@ impl Evaluate for TypeSafe {
             .text()
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-            .context(ModelCallFailedSnafu {
+            .with_context(|_| ModelCallFailedSnafu {
                 model: self.name.clone(),
             })?;
 
@@ -201,13 +200,9 @@ impl Evaluate for TypeSafe {
                 message: body,
             }
             .fail(),
-            StatusCode::TOO_MANY_REQUESTS => RateLimitedSnafu {
-                model: self.name.clone(),
-                message: body,
-            }
-            .fail(),
+
             // TypeSafe documents 529 Overloaded alongside 429 for backoff.
-            s if s.as_u16() == 529 => RateLimitedSnafu {
+            s if s == StatusCode::TOO_MANY_REQUESTS || s.as_u16() == 529 => RateLimitedSnafu {
                 model: self.name.clone(),
                 message: body,
             }
@@ -219,14 +214,6 @@ impl Evaluate for TypeSafe {
         }
     }
 
-    fn model_name(&self) -> &str {
-        &self.name
-    }
-
-    fn provider_model_id(&self) -> &str {
-        &self.model_id
-    }
-
     async fn health(&self) -> Result<()> {
         let response = self
             .client
@@ -235,7 +222,7 @@ impl Evaluate for TypeSafe {
             .send()
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-            .context(HealthCheckFailedSnafu)?;
+            .with_context(|_| HealthCheckFailedSnafu)?;
 
         if response.status().is_success() {
             Ok(())
@@ -247,16 +234,6 @@ impl Evaluate for TypeSafe {
             })
         }
     }
-}
-
-/// Clear error when a caller attempts chat completions against a `TypeSafe` model.
-#[must_use]
-pub fn chat_not_supported_message(model_name: &str) -> String {
-    format!(
-        "Model '{model_name}' is a TypeSafe System One evaluation model (Jev) and does not support chat completions. \
-         Use POST /v1/evaluate with `state` and typed `questions` instead. \
-         See https://spiceai.org/docs/components/models/typesafe and https://docs.typesafe.ai/api."
-    )
 }
 
 #[cfg(test)]
@@ -485,12 +462,5 @@ mod tests {
             .await
             .expect_err("404");
         assert!(matches!(err, evaluate_api::Error::ModelNotFound { .. }));
-    }
-
-    #[test]
-    fn chat_rejection_mentions_evaluate() {
-        let msg = chat_not_supported_message("jev");
-        assert!(msg.contains("POST /v1/evaluate"));
-        assert!(msg.contains("does not support chat"));
     }
 }

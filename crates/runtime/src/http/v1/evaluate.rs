@@ -140,14 +140,6 @@ mod tests {
                 }),
             })
         }
-
-        fn model_name(&self) -> &str {
-            &self.name
-        }
-
-        fn provider_model_id(&self) -> &str {
-            "jev-latest"
-        }
     }
 
     fn request_with_question(model: &str) -> EvaluateRequest {
