@@ -81,8 +81,8 @@ pub const OPENAI_COMMON: &[PassthroughParam] = &openai_common();
 pub const PREFIXED_COMMON: &[PassthroughParam] = &prefixed_common();
 
 /// Rate-control tunables for evaluation-only providers (credentials/endpoint are
-/// typed fields). Omits chat-only settings (`tools`, `system_prompt`, temperature,
-/// tool_choice, deprecated `openai_*` overrides) that evaluation loaders ignore.
+/// typed fields). Omits chat-only settings (`tools`, `system_prompt`, `temperature`,
+/// `tool_choice`, deprecated `openai_*` overrides) that evaluation loaders ignore.
 pub const EVALUATE_RATE_CONTROLS: &[PassthroughParam] = &[
     PassthroughParam::runtime("max_concurrency").description(
         "Maximum number of concurrent requests for this model. Overrides provider defaults.",
