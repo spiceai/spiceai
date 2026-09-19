@@ -42,6 +42,21 @@ pub fn legacy_partition_child_table_name(parent: &str, partition_values: &[Strin
     format!("{}_{}", parent, partition_values.join("_"))
 }
 
+/// The lookup that resolves a partition's child `cayenne_table` row.
+///
+/// Two callers need the same rule: the catalog resolves children to drop them
+/// with their parent, and the metastore snapshot resolves them to export them
+/// with it. A name match alone is not enough — the legacy convention
+/// (`{parent}_{values}`) can also spell an unrelated table an operator happens
+/// to have accelerated into the same metastore, so the row's `path` must equal
+/// the partition's before it counts as a child. Sharing the predicate keeps the
+/// two callers from disagreeing about what a child is.
+///
+/// Binds, in order: the modern child name ([`partition_child_table_name`]), the
+/// legacy one ([`legacy_partition_child_table_name`]), and the partition's path.
+pub(crate) const PARTITION_CHILD_LOOKUP_SQL: &str = "SELECT table_id FROM cayenne_table \
+              WHERE table_name IN (?1, ?2) AND path = ?3";
+
 fn encode_identifier_hex(value: &str) -> String {
     use std::fmt::Write as _;
 

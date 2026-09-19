@@ -53,8 +53,33 @@ use super::{
 };
 use crate::catalog::{CatalogError, CatalogResult};
 
-/// Current slice format version. Incremented on incompatible format changes.
-pub const SLICE_FORMAT_VERSION: u32 = 1;
+/// Slice format that carries one dataset and no per-partition child tables.
+pub const SLICE_FORMAT_BASE: u32 = 1;
+
+/// Slice format that additionally carries the dataset's per-partition child
+/// `cayenne_table` rows and their dependent rows.
+///
+/// A reader that understands only [`SLICE_FORMAT_BASE`] would import the parent
+/// and its `cayenne_partition` rows while dropping the children on the floor,
+/// which is precisely the unrestorable state this format exists to prevent — so
+/// a slice that carries children declares this version and an older reader
+/// refuses it outright.
+pub const SLICE_FORMAT_PARTITIONED: u32 = 2;
+
+/// Newest slice format this build writes. A slice is written at the *lowest*
+/// version that can express it (see [`export_dataset`]), so an unpartitioned
+/// dataset still produces a [`SLICE_FORMAT_BASE`] slice that older readers
+/// accept.
+pub const SLICE_FORMAT_VERSION: u32 = SLICE_FORMAT_PARTITIONED;
+
+/// Oldest slice format this build reads.
+pub const SLICE_FORMAT_MIN_SUPPORTED: u32 = SLICE_FORMAT_BASE;
+
+/// Whether this build can read a slice written at `format_version`.
+#[must_use]
+pub fn slice_format_is_supported(format_version: u32) -> bool {
+    (SLICE_FORMAT_MIN_SUPPORTED..=SLICE_FORMAT_VERSION).contains(&format_version)
+}
 
 /// Engine identifier embedded in slices to detect cross-engine misuse.
 pub const SLICE_ENGINE: &str = "cayenne";
@@ -158,10 +183,10 @@ impl DatasetMetastoreSlice {
         let slice: Self = serde_json::from_slice(bytes).map_err(|e| CatalogError::Database {
             message: format!("failed to parse metastore slice JSON: {e}"),
         })?;
-        if slice.format_version != SLICE_FORMAT_VERSION {
+        if !slice_format_is_supported(slice.format_version) {
             return Err(CatalogError::Database {
                 message: format!(
-                    "unsupported metastore slice format_version {} (this build understands only {SLICE_FORMAT_VERSION})",
+                    "unsupported metastore slice format_version {} (this build understands {SLICE_FORMAT_MIN_SUPPORTED}..={SLICE_FORMAT_VERSION})",
                     slice.format_version
                 ),
             });
@@ -254,6 +279,147 @@ async fn lookup_table_id(
     Ok(rows.into_iter().next())
 }
 
+/// Column index of `table_name` in a `cayenne_table` row. Follows
+/// [`EXPECTED_TABLES`]' column order.
+const CAYENNE_TABLE_NAME_INDEX: usize = 1;
+/// Column index of `path` in a `cayenne_table` row.
+const CAYENNE_TABLE_PATH_INDEX: usize = 2;
+/// Column index of `path` in a `cayenne_partition` row.
+const CAYENNE_PARTITION_PATH_INDEX: usize = 5;
+
+/// One partition of a partitioned table, as much of it as child-table discovery
+/// and slice validation need.
+struct PartitionRef {
+    /// Composite key recorded in `cayenne_partition.partition_key`.
+    partition_key: String,
+    /// The partition's value strings, for the legacy child-table name.
+    partition_values: Vec<String>,
+    /// The partition's own directory. A child table is rooted at it.
+    path: String,
+}
+
+/// The partitions `dataset_name` owns, in metastore order.
+async fn partitions_of(
+    metastore: &impl MetastoreBackend,
+    table_id: &str,
+) -> CatalogResult<Vec<PartitionRef>> {
+    let raw: Vec<(String, String, String)> = metastore
+        .query(
+            QueryParams {
+                sql: "SELECT partition_key, partition_values_json, path FROM cayenne_partition WHERE table_id = ?",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            },
+            |row| Ok((row.get_string(0)?, row.get_string(1)?, row.get_string(2)?)),
+        )
+        .await?;
+
+    raw.into_iter()
+        .map(|(partition_key, values_json, path)| {
+            // A partition whose value list will not parse cannot be matched to
+            // its child table, and a slice that silently omits a child is the
+            // defect this discovery exists to close — so refuse rather than
+            // export an incomplete slice.
+            let partition_values: Vec<String> =
+                serde_json::from_str(&values_json).map_err(|e| CatalogError::Database {
+                    message: format!(
+                        "cannot export metastore slice: partition '{partition_key}' has unreadable partition_values_json: {e}"
+                    ),
+                })?;
+            Ok(PartitionRef {
+                partition_key,
+                partition_values,
+                path,
+            })
+        })
+        .collect()
+}
+
+/// `table_id`s of `dataset_name`'s per-partition child tables.
+///
+/// A partitioned table's partitions are catalog tables of their own: each has
+/// its own `cayenne_table` row, its own `table_id`, and its own dependent rows.
+/// Matched by [`crate::partition_naming::PARTITION_CHILD_LOOKUP_SQL`], the same
+/// rule the catalog drops children by, so export and drop cannot disagree about
+/// what belongs to the dataset. Empty for an unpartitioned table.
+async fn partition_child_table_ids(
+    metastore: &impl MetastoreBackend,
+    dataset_name: &str,
+    partitions: &[PartitionRef],
+) -> CatalogResult<Vec<String>> {
+    let mut child_ids = Vec::new();
+    for partition in partitions {
+        let matched: Vec<String> = metastore
+            .query(
+                QueryParams {
+                    sql: crate::partition_naming::PARTITION_CHILD_LOOKUP_SQL,
+                    params: vec![
+                        MetastoreValue::Text(crate::partition_naming::partition_child_table_name(
+                            dataset_name,
+                            &partition.partition_key,
+                        )),
+                        MetastoreValue::Text(
+                            crate::partition_naming::legacy_partition_child_table_name(
+                                dataset_name,
+                                &partition.partition_values,
+                            ),
+                        ),
+                        MetastoreValue::Text(partition.path.clone()),
+                    ],
+                },
+                |row| row.get_string(0),
+            )
+            .await?;
+        // `cayenne_table(table_name)` is unique and a partition owns its
+        // directory, so a child matches at most one partition — but exporting
+        // one twice would duplicate its rows and fail the import's INSERT on
+        // that same uniqueness, so do not depend on it holding.
+        for id in matched {
+            if !child_ids.contains(&id) {
+                child_ids.push(id);
+            }
+        }
+    }
+    Ok(child_ids)
+}
+
+/// Read every row of `expected` belonging to `table_id`, as slice rows.
+async fn rows_for_table_id(
+    metastore: &impl MetastoreBackend,
+    expected: &super::ExpectedTable,
+    table_id: &str,
+) -> CatalogResult<Vec<SliceRow>> {
+    let n_columns = expected.columns.len();
+    // `cayenne_insert_record.table_id` is stored as the raw-UUID-bytes BLOB
+    // (see `metastore::table_id_to_key_bytes`), so its filter must bind a BLOB
+    // — a TEXT bind never matches a BLOB column in SQLite. Every other table
+    // keeps `table_id` as TEXT.
+    let table_id_param = if expected.name == "cayenne_insert_record" {
+        MetastoreValue::Blob(super::table_id_to_key_bytes(table_id))
+    } else {
+        MetastoreValue::Text(table_id.to_string())
+    };
+    let sql = format!(
+        "SELECT {} FROM {} WHERE table_id = ?",
+        expected.columns.join(", "),
+        expected.name
+    );
+    metastore
+        .query(
+            QueryParams {
+                sql: &sql,
+                params: vec![table_id_param],
+            },
+            move |row| {
+                let mut out = Vec::with_capacity(n_columns);
+                for i in 0..n_columns {
+                    out.push(SliceValue::from(&row.get_value(i)?));
+                }
+                Ok(out)
+            },
+        )
+        .await
+}
+
 /// Export this dataset's rows from the metastore as a versioned slice.
 ///
 /// Path columns are rewritten relative to `data_dir_anchor` so the resulting
@@ -277,81 +443,136 @@ pub async fn export_dataset(
             ),
         })?;
 
+    // A partitioned table's partitions are catalog tables of their own, so the
+    // slice must span the parent *and* every child: restoring the parent alone
+    // leaves `cayenne_partition` rows whose child tables do not exist, and the
+    // dataset then fails to open at `infer_existing_partitions` with
+    // `TableNotFound`.
+    let partitions = partitions_of(metastore, &table_id).await?;
+    let child_ids = partition_child_table_ids(metastore, dataset_name, &partitions).await?;
+
+    // Parent first, so the parent's `cayenne_table` row leads the slice.
+    let table_ids: Vec<&str> = std::iter::once(table_id.as_str())
+        .chain(child_ids.iter().map(String::as_str))
+        .collect();
+
     let mut tables: BTreeMap<String, Vec<SliceRow>> = BTreeMap::new();
 
     for expected in EXPECTED_TABLES {
-        let n_columns = expected.columns.len();
-        let (sql, params) = if expected.name == "cayenne_table" {
-            (
-                format!(
-                    "SELECT {} FROM {} WHERE table_name = ?",
-                    expected.columns.join(", "),
-                    expected.name
-                ),
-                vec![MetastoreValue::Text(dataset_name.to_string())],
-            )
-        } else {
-            // `cayenne_insert_record.table_id` is stored as the raw-UUID-bytes
-            // BLOB (see `metastore::table_id_to_key_bytes`), so its filter must
-            // bind a BLOB — a TEXT bind never matches a BLOB column in SQLite.
-            // Every other child table keeps `table_id` as TEXT.
-            let table_id_param = if expected.name == "cayenne_insert_record" {
-                MetastoreValue::Blob(super::table_id_to_key_bytes(&table_id))
-            } else {
-                MetastoreValue::Text(table_id.clone())
-            };
-            (
-                format!(
-                    "SELECT {} FROM {} WHERE table_id = ?",
-                    expected.columns.join(", "),
-                    expected.name
-                ),
-                vec![table_id_param],
-            )
-        };
-
-        let path_cols = path_columns_for_table(expected.name);
-
-        let rows: Vec<SliceRow> = metastore
-            .query(QueryParams { sql: &sql, params }, move |row| {
-                let mut out = Vec::with_capacity(n_columns);
-                for i in 0..n_columns {
-                    out.push(SliceValue::from(&row.get_value(i)?));
-                }
-                Ok(out)
-            })
-            .await?;
+        let mut rows: Vec<SliceRow> = Vec::new();
+        for id in &table_ids {
+            rows.extend(rows_for_table_id(metastore, expected, id).await?);
+        }
 
         // Rewrite path columns to be relative to anchor. If `make_relative`
         // could not strip the anchor (path is outside `data_dir_anchor`), it
         // returns the original absolute path — in that case we leave
         // `path_is_relative=false` so the slice stays internally consistent.
-        let rows: Vec<SliceRow> = if let Some((path_idx, rel_idx)) = path_cols {
-            rows.into_iter()
-                .map(|mut r| {
-                    if let Some(SliceValue::Text(abs)) = r.get(path_idx).cloned() {
-                        let rel = make_relative(&abs, data_dir_anchor);
-                        let is_relative = rel != abs;
-                        r[path_idx] = SliceValue::Text(rel);
-                        r[rel_idx] = SliceValue::Bool(is_relative);
-                    }
-                    r
-                })
-                .collect()
-        } else {
-            rows
-        };
+        if let Some((path_idx, rel_idx)) = path_columns_for_table(expected.name) {
+            for r in &mut rows {
+                if let Some(SliceValue::Text(abs)) = r.get(path_idx).cloned() {
+                    let rel = make_relative(&abs, data_dir_anchor);
+                    let is_relative = rel != abs;
+                    r[path_idx] = SliceValue::Text(rel);
+                    r[rel_idx] = SliceValue::Bool(is_relative);
+                }
+            }
+        }
 
         tables.insert(expected.name.to_string(), rows);
     }
 
+    // Write at the lowest version that can express this slice, so a dataset
+    // with no partition children still produces a slice an older reader reads.
+    let format_version = if child_ids.is_empty() {
+        SLICE_FORMAT_BASE
+    } else {
+        SLICE_FORMAT_PARTITIONED
+    };
+
     Ok(DatasetMetastoreSlice {
-        format_version: SLICE_FORMAT_VERSION,
+        format_version,
         engine: SLICE_ENGINE.to_string(),
         dataset_name: dataset_name.to_string(),
         exported_at_ms: chrono::Utc::now().timestamp_millis(),
         tables,
     })
+}
+
+/// The `table_name`s carried by the slice's `cayenne_table` rows, parent first.
+///
+/// Import replaces whole tables, so these are exactly the local rows it must
+/// clear before inserting. `slice.dataset_name` is included even when the slice
+/// carries no `cayenne_table` row for it, so a malformed slice still clears the
+/// dataset it claims to replace rather than merging into it.
+fn table_names_in_slice(slice: &DatasetMetastoreSlice) -> Vec<String> {
+    let mut names = vec![slice.dataset_name.clone()];
+    for row in slice.tables.get("cayenne_table").into_iter().flatten() {
+        if let Some(SliceValue::Text(name)) = row.get(CAYENNE_TABLE_NAME_INDEX)
+            && !names.contains(name)
+        {
+            names.push(name.clone());
+        }
+    }
+    names
+}
+
+/// Refuse a slice whose partitions have no child tables to be restored with.
+///
+/// Every `cayenne_partition` row names a directory that a child `cayenne_table`
+/// row is rooted at. A slice carrying the partition but not the child restores
+/// to a dataset that cannot open — `infer_existing_partitions` propagates
+/// `TableNotFound` — so this refuses before the transaction opens rather than
+/// leaving that state behind. Slices written before the child rows were
+/// exported (format [`SLICE_FORMAT_BASE`], from a partitioned dataset) fail
+/// here, which is the honest outcome: they were never restorable.
+fn validate_partition_children(slice: &DatasetMetastoreSlice) -> CatalogResult<()> {
+    let partition_paths: Vec<&String> = slice
+        .tables
+        .get("cayenne_partition")
+        .into_iter()
+        .flatten()
+        .filter_map(|row| match row.get(CAYENNE_PARTITION_PATH_INDEX) {
+            Some(SliceValue::Text(path)) => Some(path),
+            _ => None,
+        })
+        .collect();
+    if partition_paths.is_empty() {
+        return Ok(());
+    }
+
+    // Both sides were rewritten relative to the exporter's anchor, so the
+    // child's path is comparable to its partition's without re-anchoring.
+    let child_paths: Vec<&String> = slice
+        .tables
+        .get("cayenne_table")
+        .into_iter()
+        .flatten()
+        .filter(|row| {
+            !matches!(
+                row.get(CAYENNE_TABLE_NAME_INDEX),
+                Some(SliceValue::Text(name)) if *name == slice.dataset_name
+            )
+        })
+        .filter_map(|row| match row.get(CAYENNE_TABLE_PATH_INDEX) {
+            Some(SliceValue::Text(path)) => Some(path),
+            _ => None,
+        })
+        .collect();
+
+    if let Some(orphan) = partition_paths
+        .iter()
+        .find(|path| !child_paths.contains(path))
+    {
+        return Err(CatalogError::Database {
+            message: format!(
+                "refusing to import metastore slice for dataset '{}': its partition at '{orphan}' has no child table row in the slice, so the restored dataset could not be opened. Re-create the snapshot with a runtime that exports partition child tables (slice format {SLICE_FORMAT_PARTITIONED})",
+                slice.dataset_name
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 /// Atomically import a dataset slice into the metastore.
@@ -371,10 +592,10 @@ pub async fn import_dataset(
     slice: &DatasetMetastoreSlice,
     data_dir_anchor: &Path,
 ) -> CatalogResult<()> {
-    if slice.format_version != SLICE_FORMAT_VERSION {
+    if !slice_format_is_supported(slice.format_version) {
         return Err(CatalogError::Database {
             message: format!(
-                "refusing to import metastore slice: unsupported format_version {}",
+                "refusing to import metastore slice: unsupported format_version {} (this build understands {SLICE_FORMAT_MIN_SUPPORTED}..={SLICE_FORMAT_VERSION})",
                 slice.format_version
             ),
         });
@@ -388,37 +609,70 @@ pub async fn import_dataset(
         });
     }
 
+    validate_partition_children(slice)?;
+
+    // The reader's own copy of this dataset may be partitioned differently from
+    // the slice's: a child whose partition the slice does not carry is named
+    // after a key the slice never mentions, so clearing by the slice's table
+    // names alone would leave it behind, holding a stale schema and a file
+    // manifest whose files the restore replaced. Resolve those children the
+    // same way the catalog does when it drops a partitioned table. Read before
+    // the transaction opens, as `drop_table` does, so a partition created
+    // concurrently with a restore can still be missed.
+    let mut stale_child_ids: Vec<String> = Vec::new();
+    if let Some(local_parent_id) = lookup_table_id(metastore, &slice.dataset_name).await? {
+        let local_partitions = partitions_of(metastore, &local_parent_id).await?;
+        stale_child_ids =
+            partition_child_table_ids(metastore, &slice.dataset_name, &local_partitions).await?;
+    }
+
     let txn = metastore.begin_transaction().await?;
 
-    // Wholesale-replace any existing rows for this dataset. `cayenne_table`'s
-    // `ON DELETE CASCADE` clears the dependent rows of every child table whose
-    // foreign key still references it — but `cayenne_insert_record` no longer
-    // has that foreign key (its `table_id` is a raw-bytes BLOB; see
-    // `metastore::table_id_to_key_bytes`), so resolve the existing `table_id`
-    // and clear its insert-records explicitly first, inside the same
-    // transaction, before the parent row is removed.
-    if let Ok(values) = txn
-        .query_row_values(QueryRowParams {
-            sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?",
-            params: vec![MetastoreValue::Text(slice.dataset_name.clone())],
-        })
-        .await
-        && let Some(MetastoreValue::Text(existing_table_id)) = values.into_iter().next()
-    {
+    for child_id in &stale_child_ids {
         txn.execute(ExecuteParams {
             sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?",
-            params: vec![MetastoreValue::Blob(super::table_id_to_key_bytes(
-                &existing_table_id,
-            ))],
+            params: vec![MetastoreValue::Blob(super::table_id_to_key_bytes(child_id))],
+        })
+        .await?;
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_table WHERE table_id = ?",
+            params: vec![MetastoreValue::Text(child_id.clone())],
         })
         .await?;
     }
 
-    txn.execute(ExecuteParams {
-        sql: "DELETE FROM cayenne_table WHERE table_name = ?",
-        params: vec![MetastoreValue::Text(slice.dataset_name.clone())],
-    })
-    .await?;
+    // Wholesale-replace any existing rows for every table the slice carries —
+    // the dataset and, for a partitioned dataset, each of its per-partition
+    // child tables. `cayenne_table`'s `ON DELETE CASCADE` clears the dependent
+    // rows of every table whose foreign key still references it — but
+    // `cayenne_insert_record` no longer has that foreign key (its `table_id` is
+    // a raw-bytes BLOB; see `metastore::table_id_to_key_bytes`), so resolve each
+    // existing `table_id` and clear its insert-records explicitly first, inside
+    // the same transaction, before the row is removed.
+    for table_name in table_names_in_slice(slice) {
+        if let Ok(values) = txn
+            .query_row_values(QueryRowParams {
+                sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?",
+                params: vec![MetastoreValue::Text(table_name.clone())],
+            })
+            .await
+            && let Some(MetastoreValue::Text(existing_table_id)) = values.into_iter().next()
+        {
+            txn.execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?",
+                params: vec![MetastoreValue::Blob(super::table_id_to_key_bytes(
+                    &existing_table_id,
+                ))],
+            })
+            .await?;
+        }
+
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_table WHERE table_name = ?",
+            params: vec![MetastoreValue::Text(table_name)],
+        })
+        .await?;
+    }
 
     for expected in EXPECTED_TABLES {
         let Some(rows) = slice.tables.get(expected.name) else {
@@ -531,7 +785,23 @@ mod tests {
         ]
     }
 
+    /// A partitioned dataset as it really exists: the parent plus, for each
+    /// partition, the child `cayenne_table` row rooted at the partition's own
+    /// directory. Use [`insert_dataset_without_children`] to build the broken
+    /// shape deliberately.
     async fn insert_dataset(
+        ms: &SqliteMetastore,
+        dataset: &str,
+        anchor: &Path,
+        partitions: &[(&str, &str, &str)], // (partition_id, partition_key, file)
+    ) {
+        insert_dataset_without_children(ms, dataset, anchor, partitions).await;
+        for (_pid, pk, file) in partitions {
+            insert_partition_child(ms, dataset, pk, anchor, file).await;
+        }
+    }
+
+    async fn insert_dataset_without_children(
         ms: &SqliteMetastore,
         dataset: &str,
         anchor: &Path,
@@ -577,9 +847,13 @@ mod tests {
         let slice = export_dataset(ms_a.as_ref(), "trips", anchor_a)
             .await
             .expect("export");
-        assert_eq!(slice.format_version, SLICE_FORMAT_VERSION);
+        assert_eq!(slice.format_version, SLICE_FORMAT_PARTITIONED);
         assert_eq!(slice.engine, SLICE_ENGINE);
-        assert_eq!(slice.tables["cayenne_table"].len(), 1);
+        assert_eq!(
+            slice.tables["cayenne_table"].len(),
+            3,
+            "the parent plus one child per partition"
+        );
         assert_eq!(slice.tables["cayenne_partition"].len(), 2);
 
         for row in &slice.tables["cayenne_partition"] {
@@ -641,6 +915,14 @@ mod tests {
                     .iter()
                     .map(SliceValue::from)
                     .collect(),
+                sample_table_row(
+                    "tid-trips-newk",
+                    &crate::partition_naming::partition_child_table_name("trips", "newk"),
+                    "new1",
+                )
+                .iter()
+                .map(SliceValue::from)
+                .collect(),
             ],
         );
         tables.insert(
@@ -842,5 +1124,241 @@ mod tests {
         let parsed = DatasetMetastoreSlice::from_json_bytes(&bytes).expect("from_json");
         assert_eq!(parsed.dataset_name, "trips");
         assert_eq!(parsed.tables.len(), slice.tables.len());
+    }
+    /// Insert a per-partition child table: its own `cayenne_table` row, named
+    /// by the partition-naming derivation and rooted at the partition's own
+    /// directory, exactly as the partition creator writes it.
+    async fn insert_partition_child(
+        ms: &SqliteMetastore,
+        parent: &str,
+        partition_key: &str,
+        anchor: &Path,
+        dir: &str,
+    ) -> String {
+        let child_name = crate::partition_naming::partition_child_table_name(parent, partition_key);
+        let child_id = format!("tid-child-{parent}-{partition_key}");
+        let child_path = anchor.join(dir).to_string_lossy().into_owned();
+        ms.execute(ExecuteParams {
+            sql: "INSERT INTO cayenne_table (table_id, table_name, path, path_is_relative, schema_json, primary_key_json, on_conflict_json, current_snapshot_id, partition_column, vortex_config_json, current_sequence_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params: sample_table_row(&child_id, &child_name, &child_path),
+        })
+        .await
+        .expect("insert child table");
+        ms.execute(ExecuteParams {
+            sql: "INSERT INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?, ?, ?)",
+            params: vec![
+                MetastoreValue::Text(child_id.clone()),
+                MetastoreValue::Text(format!("snap-{partition_key}")),
+                MetastoreValue::Integer(7),
+            ],
+        })
+        .await
+        .expect("insert child snapshot sequence");
+        child_name
+    }
+
+    async fn table_names(ms: &SqliteMetastore) -> Vec<String> {
+        ms.query(
+            QueryParams {
+                sql: "SELECT table_name FROM cayenne_table ORDER BY table_name",
+                params: vec![],
+            },
+            |row| row.get_string(0),
+        )
+        .await
+        .expect("query table names")
+    }
+
+    /// Regression test for #13241: the slice must span the partition child
+    /// tables, or a restored partitioned dataset has `cayenne_partition` rows
+    /// whose child tables do not exist and cannot open.
+    #[tokio::test]
+    async fn round_trip_restores_a_partitioned_dataset_with_its_child_tables() {
+        let (ms_a, tmp_a) = fresh_metastore().await;
+        let anchor_a = tmp_a.path();
+        insert_dataset(
+            &ms_a,
+            "events",
+            anchor_a,
+            &[("p1", "k1", "events.dir/k1"), ("p2", "k2", "events.dir/k2")],
+        )
+        .await;
+        let child_k1 = crate::partition_naming::partition_child_table_name("events", "k1");
+        let child_k2 = crate::partition_naming::partition_child_table_name("events", "k2");
+
+        let slice = export_dataset(ms_a.as_ref(), "events", anchor_a)
+            .await
+            .expect("export");
+
+        assert_eq!(
+            slice.format_version, SLICE_FORMAT_PARTITIONED,
+            "a slice carrying child tables must declare the partitioned format so an older reader refuses it"
+        );
+        let exported: Vec<String> = slice.tables["cayenne_table"]
+            .iter()
+            .filter_map(|r| match &r[CAYENNE_TABLE_NAME_INDEX] {
+                SliceValue::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            exported,
+            vec!["events".to_string(), child_k1.clone(), child_k2.clone()],
+            "slice must carry the parent and both children, parent first"
+        );
+        assert_eq!(
+            slice.tables["cayenne_snapshot_sequence"].len(),
+            2,
+            "each child's dependent rows travel with it"
+        );
+
+        let (ms_b, tmp_b) = fresh_metastore().await;
+        import_dataset(ms_b.as_ref(), &slice, tmp_b.path())
+            .await
+            .expect("import");
+
+        let mut want = vec!["events".to_string(), child_k1, child_k2];
+        want.sort();
+        assert_eq!(table_names(ms_b.as_ref()).await, want);
+
+        // The children's paths are re-anchored at the reader's data directory,
+        // which is what makes the restored dataset openable there.
+        let child_paths: Vec<String> = ms_b
+            .query(
+                QueryParams {
+                    sql: "SELECT path FROM cayenne_table WHERE table_name != 'events' ORDER BY table_name",
+                    params: vec![],
+                },
+                |row| row.get_string(0),
+            )
+            .await
+            .expect("query child paths");
+        let anchor_b = tmp_b.path().to_string_lossy().to_string();
+        for path in &child_paths {
+            assert!(
+                path.starts_with(&anchor_b),
+                "child path {path} should be under {anchor_b}"
+            );
+        }
+
+        // Every partition's directory is claimed by one restored child table,
+        // which is the condition `infer_existing_partitions` needs to open them.
+        let partition_paths: Vec<String> = ms_b
+            .query(
+                QueryParams {
+                    sql: "SELECT path FROM cayenne_partition ORDER BY partition_key",
+                    params: vec![],
+                },
+                |row| row.get_string(0),
+            )
+            .await
+            .expect("query partition paths");
+        for path in &partition_paths {
+            assert!(
+                child_paths.contains(path),
+                "partition at {path} has no restored child table; children are {child_paths:?}"
+            );
+        }
+    }
+
+    /// A re-import must replace the children too, not merge into whatever the
+    /// reader already had under those names.
+    #[tokio::test]
+    async fn importing_over_an_existing_partitioned_dataset_replaces_its_children() {
+        let (ms_a, tmp_a) = fresh_metastore().await;
+        insert_dataset(
+            &ms_a,
+            "events",
+            tmp_a.path(),
+            &[("p1", "k1", "events.dir/k1")],
+        )
+        .await;
+        let slice = export_dataset(ms_a.as_ref(), "events", tmp_a.path())
+            .await
+            .expect("export");
+
+        // The reader already holds the same dataset, with a stale extra row on
+        // the child that the slice does not carry.
+        let (ms_b, tmp_b) = fresh_metastore().await;
+        insert_dataset(
+            &ms_b,
+            "events",
+            tmp_b.path(),
+            &[("p1", "k1", "events.dir/k1")],
+        )
+        .await;
+        ms_b.execute(ExecuteParams {
+            sql: "INSERT INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?, ?, ?)",
+            params: vec![
+                MetastoreValue::Text("tid-child-events-k1".to_string()),
+                MetastoreValue::Text("stale".to_string()),
+                MetastoreValue::Integer(99),
+            ],
+        })
+        .await
+        .expect("insert stale child row");
+
+        import_dataset(ms_b.as_ref(), &slice, tmp_b.path())
+            .await
+            .expect("import");
+
+        let snapshot_ids: Vec<String> = ms_b
+            .query(
+                QueryParams {
+                    sql: "SELECT snapshot_id FROM cayenne_snapshot_sequence ORDER BY snapshot_id",
+                    params: vec![],
+                },
+                |row| row.get_string(0),
+            )
+            .await
+            .expect("query");
+        assert_eq!(
+            snapshot_ids,
+            vec!["snap-k1".to_string()],
+            "the stale child row must be cleared, not merged with the slice's"
+        );
+    }
+
+    /// A slice written before child tables were exported is refused rather than
+    /// restored into a dataset that cannot open.
+    #[tokio::test]
+    async fn refuses_a_partitioned_slice_with_no_child_tables() {
+        let (ms_a, tmp_a) = fresh_metastore().await;
+        insert_dataset_without_children(
+            &ms_a,
+            "events",
+            tmp_a.path(),
+            &[("p1", "k1", "events.dir/k1")],
+        )
+        .await;
+        let slice = export_dataset(ms_a.as_ref(), "events", tmp_a.path())
+            .await
+            .expect("export");
+        assert_eq!(
+            slice.format_version, SLICE_FORMAT_BASE,
+            "a dataset whose partitions have no child tables is still a base-format slice"
+        );
+
+        let (ms_b, tmp_b) = fresh_metastore().await;
+        let err = import_dataset(ms_b.as_ref(), &slice, tmp_b.path())
+            .await
+            .expect_err("a partition with no child table must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("has no child table row in the slice"),
+            "err={message}"
+        );
+        assert!(
+            table_names(ms_b.as_ref()).await.is_empty(),
+            "a refused import must leave the reader's metastore untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_a_base_format_slice_and_refuses_a_newer_one() {
+        assert!(slice_format_is_supported(SLICE_FORMAT_BASE));
+        assert!(slice_format_is_supported(SLICE_FORMAT_PARTITIONED));
+        assert!(!slice_format_is_supported(SLICE_FORMAT_VERSION + 1));
+        assert!(!slice_format_is_supported(0));
     }
 }

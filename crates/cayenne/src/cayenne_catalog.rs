@@ -1993,8 +1993,7 @@ impl CayenneCatalog {
                 .metastore
                 .query_helper(
                     QueryParams {
-                        sql: "SELECT table_id FROM cayenne_table \
-                              WHERE table_name IN (?1, ?2) AND path = ?3",
+                        sql: crate::partition_naming::PARTITION_CHILD_LOOKUP_SQL,
                         params: vec![
                             MetastoreValue::Text(
                                 crate::partition_naming::partition_child_table_name(
