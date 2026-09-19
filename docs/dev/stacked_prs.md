@@ -208,7 +208,7 @@ before the script existed:
 - **A mode disagreement.** Copying content leaves the destination's mode alone, so a
   `100644` vs `100755` conflict resolved to your mode and quietly dropped an executable
   bit `trunk` added — and a symlink destination is *followed*, so resolving a conflicted
-  `CLAUDE.md` that way overwrote `.github/copilot-instructions.md` while the link itself
+  `CLAUDE.md` that way overwrote `AGENTS.md` while the link itself
   still looked untouched.
 - **A missing side.** The parent rewrites a file, the child deletes it, `trunk` squashes
   the parent: there is then no stage 2 while stage 3 matches `$STACKBASE` exactly, so a
