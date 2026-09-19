@@ -578,25 +578,6 @@ mod tests {
             .unwrap_or_else(|error| panic!("the table {table_name} is created: {error}"));
     }
 
-    /// Recursively copy `from` to `to` — the data files a snapshot ships
-    /// alongside the metastore slice.
-    fn copy_dir_all(from: &std::path::Path, to: &std::path::Path) {
-        std::fs::create_dir_all(to).expect("the destination directory is created");
-        for entry in std::fs::read_dir(from).expect("the source directory is readable") {
-            let entry = entry.expect("the directory entry is readable");
-            let target = to.join(entry.file_name());
-            if entry
-                .file_type()
-                .expect("the entry type is readable")
-                .is_dir()
-            {
-                copy_dir_all(&entry.path(), &target);
-            } else {
-                std::fs::copy(entry.path(), &target).expect("the file is copied");
-            }
-        }
-    }
-
     fn bucket(value: &str) -> ScalarValue {
         ScalarValue::Utf8(Some(value.to_string()))
     }
@@ -760,11 +741,11 @@ mod tests {
             .await
             .expect("the partitioned dataset exports");
 
-        // A fresh node: its own metastore, its own data directory, carrying
-        // only the data files the snapshot would have shipped.
+        // A fresh node: its own metastore, its own data directory. Nothing is
+        // copied across — the slice alone has to describe the dataset well
+        // enough for every partition to open.
         let restored_tmp = TempDir::new().expect("tempdir");
         let restored_anchor = restored_tmp.path().to_path_buf();
-        copy_dir_all(&source.base_path, &restored_anchor.join(TABLE));
         let restored_catalog: Arc<dyn MetadataCatalog> = Arc::new(
             CayenneCatalog::new(format!(
                 "sqlite://{}",
@@ -791,7 +772,7 @@ mod tests {
             table_id: restored_table_id,
             schema: Arc::clone(&source.schema),
             base_path: restored_anchor.join(TABLE),
-            runtime_env: SessionContext::new().runtime_env(),
+            runtime_env: Arc::clone(&source.runtime_env),
             _tmp: restored_tmp,
         };
 

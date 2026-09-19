@@ -76,6 +76,28 @@ pub fn ensure_supported_schema_version(stored_version: i64) -> CatalogResult<()>
     Ok(())
 }
 
+/// How a metadata table stores its `table_id` column.
+///
+/// A `TEXT` bind against a `BLOB` column is not an error in `SQLite` — the
+/// comparison simply never matches — so a filter that guesses wrong reads zero
+/// rows and reports nothing. Every consumer that binds a `table_id` reads this
+/// off the [`ExpectedTable`] it is already holding, so a new table cannot be
+/// added without deciding which encoding it uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableIdEncoding {
+    /// The 36-character hyphenated UUID, bound as `MetastoreValue::Text`.
+    Text,
+    /// The 16 raw UUID bytes of [`table_id_to_key_bytes`], bound as
+    /// `MetastoreValue::Blob`.
+    ///
+    /// Used by the high-write per-key marker tables to cut WAL volume on hot
+    /// upsert bursts. The encoding and a foreign key to `cayenne_table` are
+    /// mutually exclusive — `SQLite` never equates a `BLOB` child value to a
+    /// `TEXT`-affinity parent key — so a table keyed this way is also outside
+    /// `cayenne_table`'s `ON DELETE CASCADE` and must be cleared explicitly.
+    RawUuidBlob,
+}
+
 /// Expected column definitions for a metadata table.
 ///
 /// Used by [`validate_existing_schema`] to compare the actual schema of an existing
@@ -86,6 +108,8 @@ pub fn ensure_supported_schema_version(stored_version: i64) -> CatalogResult<()>
 pub struct ExpectedTable {
     /// The table name (e.g., `"cayenne_table"`).
     pub name: &'static str,
+    /// How this table stores `table_id`; see [`TableIdEncoding`].
+    pub table_id_encoding: TableIdEncoding,
     /// The ordered list of expected column names.
     pub columns: &'static [&'static str],
 }
@@ -97,6 +121,7 @@ pub struct ExpectedTable {
 pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     ExpectedTable {
         name: "cayenne_table",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "table_id",
             "table_name",
@@ -113,6 +138,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_delete_file",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "delete_file_id",
             "table_id",
@@ -130,6 +156,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_partition",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "partition_id",
             "table_id",
@@ -144,6 +171,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_insert_record",
+        table_id_encoding: TableIdEncoding::RawUuidBlob,
         // Composite-PK table keyed on (table_id, pk_bytes); the former
         // `insert_record_id` UUID column was never read and is dropped. SQLite
         // declares it `WITHOUT ROWID`; Turso uses a plain rowid table because it
@@ -163,14 +191,17 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         // cayenne_insert_record plus first_marked_at (lag metric). Never cleared
         // at checkpoint/overwrite.
         name: "cayenne_pending_write_back",
+        table_id_encoding: TableIdEncoding::RawUuidBlob,
         columns: &["table_id", "pk_bytes", "sequence_number", "first_marked_at"],
     },
     ExpectedTable {
         name: "cayenne_snapshot_sequence",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &["table_id", "snapshot_id", "sequence_number"],
     },
     ExpectedTable {
         name: "cayenne_table_statistics",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "table_id",
             "statistics_blob",
@@ -181,6 +212,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_snapshot_file_statistics",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "table_id",
             "snapshot_id",
@@ -196,6 +228,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         // node inherits the complete file set. Column order MUST match the DDL
         // in `sqlite.rs`/`turso.rs` and the export/import column order.
         name: "cayenne_snapshot_file",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "table_id",
             "snapshot_id",
@@ -214,6 +247,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         // Column order MUST match the DDL in `sqlite.rs`/`turso.rs` and the
         // export/import column order.
         name: "cayenne_cold_tier_file",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "table_id",
             "file_url",
@@ -227,10 +261,12 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_pk_index",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &["table_id", "snapshot_id", "index_blob"],
     },
     ExpectedTable {
         name: "cayenne_inlined_data",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "inlined_id",
             "table_id",
@@ -243,6 +279,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_inlined_delete",
+        table_id_encoding: TableIdEncoding::Text,
         columns: &[
             "inlined_id",
             "table_id",
@@ -300,30 +337,58 @@ pub fn table_id_to_key_bytes(table_id: &str) -> Vec<u8> {
     }
 }
 
-/// The metadata tables whose `table_id` column holds the raw-UUID-bytes `BLOB`
-/// of [`table_id_to_key_bytes`] rather than the 36-char text.
+/// The value to bind for a `WHERE table_id = ?` filter against a table using
+/// `encoding`.
 ///
-/// Both are the high-write per-key marker sets, encoded that way to cut WAL
-/// volume on hot upsert bursts; neither carries a foreign key back to
-/// `cayenne_table`, so neither is reached by its `ON DELETE CASCADE`. A caller
-/// filtering or clearing one of them by `table_id` therefore has to bind a
-/// `BLOB` *and* clear it explicitly — and because those are two obligations on
-/// the same set, the set is named once here. A `TEXT` bind against a `BLOB`
-/// column is not an error in `SQLite`: the comparison simply never matches, so
-/// the filter silently reads zero rows.
-pub const BLOB_KEYED_TABLE_ID_TABLES: &[&str] =
-    &["cayenne_insert_record", "cayenne_pending_write_back"];
-
-/// The value to bind for a `WHERE table_id = ?` filter against `table`.
-///
-/// See [`BLOB_KEYED_TABLE_ID_TABLES`] for why the encoding is per-table.
+/// Read the encoding off the [`ExpectedTable`] rather than deciding it by name:
+/// that is what keeps the filter and the schema from drifting apart.
 #[must_use]
-pub fn table_id_filter_value(table: &str, table_id: &str) -> MetastoreValue {
-    if BLOB_KEYED_TABLE_ID_TABLES.contains(&table) {
-        MetastoreValue::Blob(table_id_to_key_bytes(table_id))
-    } else {
-        MetastoreValue::Text(table_id.to_string())
+pub(crate) fn table_id_filter_value(encoding: TableIdEncoding, table_id: &str) -> MetastoreValue {
+    match encoding {
+        TableIdEncoding::Text => MetastoreValue::Text(table_id.to_string()),
+        TableIdEncoding::RawUuidBlob => MetastoreValue::Blob(table_id_to_key_bytes(table_id)),
     }
+}
+
+/// Every metadata table that keys `table_id` as [`TableIdEncoding::RawUuidBlob`]
+/// — which is exactly the set outside `cayenne_table`'s `ON DELETE CASCADE`, so
+/// it is also the set a caller deleting a table has to clear by hand.
+pub(crate) fn blob_keyed_tables() -> impl Iterator<Item = &'static ExpectedTable> {
+    EXPECTED_TABLES
+        .iter()
+        .filter(|table| table.table_id_encoding == TableIdEncoding::RawUuidBlob)
+}
+
+/// Delete the rows `table_id` owns in every [`blob_keyed_tables`] table.
+///
+/// Those are the tables `cayenne_table`'s `ON DELETE CASCADE` cannot reach, so
+/// both callers that remove a table's rows — the catalog dropping it and the
+/// snapshot import replacing it — have to clear them by hand, and they do it
+/// through here so a table added to one is not missed by the other.
+///
+/// # Errors
+///
+/// Returns an error naming the table whose rows could not be deleted.
+pub(crate) async fn clear_blob_keyed_marker_rows(
+    transaction: &dyn MetastoreTransaction,
+    table_id: &str,
+) -> CatalogResult<()> {
+    for table in blob_keyed_tables() {
+        transaction
+            .execute(ExecuteParams {
+                sql: &format!("DELETE FROM {} WHERE table_id = ?", table.name),
+                params: vec![table_id_filter_value(table.table_id_encoding, table_id)],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: format!(
+                    "Failed to delete the rows of {} for the table being removed.",
+                    table.name
+                ),
+                source: Box::new(e),
+            })?;
+    }
+    Ok(())
 }
 
 /// Resolve the `table_id`s of `parent_name`'s per-partition child tables.

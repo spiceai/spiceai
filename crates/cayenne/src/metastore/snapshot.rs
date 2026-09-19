@@ -280,34 +280,6 @@ fn slice_rows<'a>(slice: &'a DatasetMetastoreSlice, table: &str) -> &'a [SliceRo
     slice.tables.get(table).map_or(&[], Vec::as_slice)
 }
 
-/// Clear the rows `table_id` owns in every table of
-/// [`metastore::BLOB_KEYED_TABLE_ID_TABLES`][super::BLOB_KEYED_TABLE_ID_TABLES].
-///
-/// Import replaces a dataset wholesale, and those tables are the ones
-/// `cayenne_table`'s `ON DELETE CASCADE` does not reach — they carry no foreign
-/// key back to it. Left behind, their rows outlive the `cayenne_table` row they
-/// describe and are then re-owned by whatever the restore inserts under the same
-/// `table_id`: for `cayenne_pending_write_back`, write-back markers for keys the
-/// restored table never committed, which the delivery worker would try to
-/// reconcile to the federated source.
-///
-/// # Errors
-///
-/// Returns an error if any delete fails.
-async fn clear_blob_keyed_marker_rows(
-    txn: &dyn MetastoreTransaction,
-    table_id: &str,
-) -> CatalogResult<()> {
-    for table in super::BLOB_KEYED_TABLE_ID_TABLES {
-        txn.execute(ExecuteParams {
-            sql: &format!("DELETE FROM {table} WHERE table_id = ?"),
-            params: vec![super::table_id_filter_value(table, table_id)],
-        })
-        .await?;
-    }
-    Ok(())
-}
-
 /// Read every row of `expected` belonging to `table_id`, as slice rows.
 ///
 /// `sql` is built once per table by the caller rather than per `table_id`: a
@@ -319,11 +291,7 @@ async fn rows_for_table_id(
     table_id: &str,
 ) -> CatalogResult<Vec<SliceRow>> {
     let n_columns = expected.columns.len();
-    // The per-key marker tables store `table_id` as the raw-UUID-bytes BLOB, so
-    // their filter must bind a BLOB — a TEXT bind never matches a BLOB column in
-    // SQLite, it just reads zero rows. `metastore::table_id_filter_value` owns
-    // which tables those are.
-    let table_id_param = super::table_id_filter_value(expected.name, table_id);
+    let table_id_param = super::table_id_filter_value(expected.table_id_encoding, table_id);
     metastore
         .query(
             QueryParams {
@@ -609,7 +577,7 @@ pub async fn import_dataset(
     let txn = metastore.begin_transaction().await?;
 
     for child_id in &stale_child_ids {
-        clear_blob_keyed_marker_rows(txn.as_ref(), child_id).await?;
+        super::clear_blob_keyed_marker_rows(txn.as_ref(), child_id).await?;
         txn.execute(ExecuteParams {
             sql: "DELETE FROM cayenne_table WHERE table_id = ?",
             params: vec![MetastoreValue::Text(child_id.clone())],
@@ -633,7 +601,7 @@ pub async fn import_dataset(
             .await
             && let Some(MetastoreValue::Text(existing_table_id)) = values.into_iter().next()
         {
-            clear_blob_keyed_marker_rows(txn.as_ref(), &existing_table_id).await?;
+            super::clear_blob_keyed_marker_rows(txn.as_ref(), &existing_table_id).await?;
         }
 
         txn.execute(ExecuteParams {
@@ -1471,14 +1439,20 @@ mod tests {
         assert_eq!(payroll_id, vec!["tid-payroll".to_string()]);
     }
 
-    /// Insert one `cayenne_pending_write_back` marker for `table_id`, written
-    /// exactly as the production path writes it (`insert_record_table_id_value`
-    /// binds the raw-UUID-bytes BLOB).
+    /// Insert one `cayenne_pending_write_back` marker for `table_id`, keyed as
+    /// the production writer keys it: `cayenne_catalog`'s
+    /// `blob_keyed_table_id_value`, i.e. the raw UUID bytes.
+    ///
+    /// Deliberately spelled out rather than read off the table's
+    /// `table_id_encoding`. Taking the bind from the registry the exporter also
+    /// reads would make this test agree with the exporter whatever the registry
+    /// says — declaring this table `Text` then writes text, reads text, and
+    /// passes, which is precisely the bug these tests exist to catch.
     async fn insert_write_back_marker(ms: &SqliteMetastore, table_id: &str, sequence_number: i64) {
         ms.execute(ExecuteParams {
             sql: "INSERT INTO cayenne_pending_write_back (table_id, pk_bytes, sequence_number) VALUES (?, ?, ?)",
             params: vec![
-                MetastoreValue::Blob(super::super::table_id_to_key_bytes(table_id)),
+                MetastoreValue::Blob(crate::metastore::table_id_to_key_bytes(table_id)),
                 MetastoreValue::Blob(vec![1_u8, 2, 3]),
                 MetastoreValue::Integer(sequence_number),
             ],
@@ -1499,12 +1473,10 @@ mod tests {
         .expect("read write-back markers")
     }
 
-    /// `cayenne_pending_write_back` keys `table_id` as a BLOB just as
-    /// `cayenne_insert_record` does, so a slice must filter it with a BLOB bind
-    /// and clear it explicitly on import. A TEXT bind is not an error in `SQLite`
-    /// — it matches nothing — so the export used to read zero markers and carry
-    /// none, silently dropping every acknowledged-but-undelivered federated
-    /// write from the snapshot.
+    /// A slice must carry the undelivered write-back markers of the dataset it
+    /// describes. The export used to read zero of them — it bound `TEXT` against
+    /// this table's `BLOB` `table_id`, which matches nothing — so every
+    /// acknowledged-but-undelivered federated write vanished from the snapshot.
     #[tokio::test]
     async fn round_trip_carries_durable_write_back_markers() {
         let (ms_a, tmp_a) = fresh_metastore().await;
@@ -1537,12 +1509,10 @@ mod tests {
         );
     }
 
-    /// Import replaces a dataset wholesale, and `cayenne_pending_write_back`
-    /// carries no foreign key back to `cayenne_table`, so its rows are not
-    /// reached by the `ON DELETE CASCADE`. A marker left behind outlives the
-    /// row it described and is re-owned by whatever the restore inserts under
-    /// the same `table_id` — a key the restored table never committed, which
-    /// the delivery worker would reconcile to the federated source.
+    /// A reader's own write-back markers must not survive an import of the
+    /// dataset they described; see
+    /// [`metastore::clear_blob_keyed_marker_rows`][super::clear_blob_keyed_marker_rows]
+    /// for why nothing else removes them.
     #[tokio::test]
     async fn import_clears_the_reader_s_own_write_back_markers() {
         let (ms_a, tmp_a) = fresh_metastore().await;

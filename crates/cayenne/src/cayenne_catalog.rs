@@ -1164,7 +1164,7 @@ impl CayenneCatalog {
                     sql.push_str(", ");
                 }
                 let _ = write!(sql, "(?{}, ?{}, ?{})", base, base + 1, base + 2);
-                params.push(insert_record_table_id_value(table_id));
+                params.push(blob_keyed_table_id_value(table_id));
                 params.push(MetastoreValue::Blob(pk_bytes.clone()));
                 params.push(MetastoreValue::Integer(sequence_number));
             }
@@ -1189,7 +1189,7 @@ impl CayenneCatalog {
         limit: usize,
         after: Option<&(i64, Vec<u8>)>,
     ) -> CatalogResult<Vec<(Vec<u8>, i64)>> {
-        let table_id_value = insert_record_table_id_value(table_id);
+        let table_id_value = blob_keyed_table_id_value(table_id);
         let limit_value = MetastoreValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX));
         let params = match after {
             None => QueryParams {
@@ -1229,7 +1229,7 @@ impl CayenneCatalog {
             return Ok(());
         }
         let txn = self.metastore.begin_transaction().await?;
-        let table_id_value = insert_record_table_id_value(table_id);
+        let table_id_value = blob_keyed_table_id_value(table_id);
         for (pk_bytes, claimed_seq) in keys {
             txn.execute(ExecuteParams {
                 sql: "DELETE FROM cayenne_pending_write_back \
@@ -1253,7 +1253,7 @@ impl CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: "SELECT COUNT(*) FROM cayenne_pending_write_back WHERE table_id = ?1",
-                    params: vec![insert_record_table_id_value(table_id)],
+                    params: vec![blob_keyed_table_id_value(table_id)],
                 },
                 |row| row.get_i64(0),
             )
@@ -1547,7 +1547,7 @@ impl CayenneCatalog {
             }
             // `write!` into a `String` is infallible.
             let _ = write!(sql, "(?{}, ?{}, ?{})", base, base + 1, base + 2);
-            params.push(insert_record_table_id_value(table_id));
+            params.push(blob_keyed_table_id_value(table_id));
             params.push(MetastoreValue::Blob(pk_bytes.clone()));
             params.push(MetastoreValue::Integer(sequence_number));
         }
@@ -2002,35 +2002,12 @@ impl CayenneCatalog {
         transaction: &dyn crate::metastore::MetastoreTransaction,
         table_id: &str,
     ) -> CatalogResult<()> {
-        // Delete all related metadata in order. `cayenne_insert_record` no
-        // longer has a foreign key (its `table_id` is a raw-bytes BLOB; see
-        // `insert_record_table_id_value`), so it must be cleared explicitly
-        // here rather than via ON DELETE CASCADE.
-        // 1. Delete insert records
-        transaction
-            .execute(ExecuteParams {
-                sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?1",
-                params: vec![insert_record_table_id_value(table_id)],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete insert records.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        // 1b. Delete durable write-back markers (#11838). Unlike the other
-        // tables this is never cleared at checkpoint/overwrite, so drop_table is
-        // the only place its rows are removed.
-        transaction
-            .execute(ExecuteParams {
-                sql: "DELETE FROM cayenne_pending_write_back WHERE table_id = ?1",
-                params: vec![insert_record_table_id_value(table_id)],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete pending write-back markers.".to_string(),
-                source: Box::new(e),
-            })?;
+        // The BLOB-keyed marker tables are outside `cayenne_table`'s
+        // `ON DELETE CASCADE`, so their rows go first and explicitly. For
+        // `cayenne_pending_write_back` this is the only place they are ever
+        // removed — unlike the other tables it is never cleared at
+        // checkpoint/overwrite.
+        crate::metastore::clear_blob_keyed_marker_rows(transaction, table_id).await?;
 
         // 2. Delete snapshot sequences
         transaction
@@ -2985,7 +2962,7 @@ impl MetadataCatalog for CayenneCatalog {
             .execute_helper(ExecuteParams {
                 sql: "INSERT OR REPLACE INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES (?1, ?2, ?3)",
                 params: vec![
-                    insert_record_table_id_value(table_id),
+                    blob_keyed_table_id_value(table_id),
                     MetastoreValue::Blob(pk_bytes),
                     MetastoreValue::Integer(sequence_number),
                 ],
@@ -3068,7 +3045,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: "SELECT pk_bytes, sequence_number FROM cayenne_insert_record WHERE table_id = ?1",
-                    params: vec![insert_record_table_id_value(table_id)],
+                    params: vec![blob_keyed_table_id_value(table_id)],
                 },
                 |row| {
                     let pk_bytes = row.get_blob(0)?;
@@ -3096,7 +3073,7 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?1",
-                params: vec![insert_record_table_id_value(table_id)],
+                params: vec![blob_keyed_table_id_value(table_id)],
             })
             .await
             .map_err(|e| CatalogError::InvalidOperation {
@@ -4375,7 +4352,7 @@ impl MetadataCatalog for CayenneCatalog {
                     ",
                     params: vec![
                         MetastoreValue::Text(table_id.to_string()),
-                        insert_record_table_id_value(table_id),
+                        blob_keyed_table_id_value(table_id),
                     ],
                 },
                 |row| {
@@ -5392,18 +5369,23 @@ fn serialize_schema_ipc_base64(schema: &arrow_schema::Schema) -> CatalogResult<S
     ))
 }
 
-/// Encode a `table_id` UUID string as the compact `BLOB` key value bound into
-/// `cayenne_insert_record` (the 16 raw UUID bytes, not the 36-char text). See
-/// [`crate::metastore::table_id_to_key_bytes`] for the encoding contract and
-/// why this cuts WAL volume on hot upsert bursts.
-fn insert_record_table_id_value(table_id: &str) -> MetastoreValue {
-    MetastoreValue::Blob(crate::metastore::table_id_to_key_bytes(table_id))
+/// Encode a `table_id` UUID string as the compact `BLOB` key value the
+/// [`RawUuidBlob`][crate::metastore::TableIdEncoding::RawUuidBlob] tables bind
+/// — `cayenne_insert_record` and `cayenne_pending_write_back` — rather than the
+/// 36-char text. These call sites know their table statically; a caller that
+/// only knows an [`ExpectedTable`][crate::metastore::ExpectedTable] reads the
+/// encoding off it instead.
+fn blob_keyed_table_id_value(table_id: &str) -> MetastoreValue {
+    crate::metastore::table_id_filter_value(
+        crate::metastore::TableIdEncoding::RawUuidBlob,
+        table_id,
+    )
 }
 
 /// SQL `BLOB` literal (`x'<hex>'`) of the `cayenne_insert_record` `table_id`
 /// key for the batch paths that interpolate it (`commit_compaction_in_txn`,
 /// `commit_overwrite_in_txn`) rather than binding a parameter. The bytes are
-/// the same raw-UUID encoding as [`insert_record_table_id_value`]; the callers
+/// the same raw-UUID encoding as [`blob_keyed_table_id_value`]; the callers
 /// already validate `table_id` is a well-formed UUID before interpolating.
 fn insert_record_table_id_blob_literal(table_id: &str) -> String {
     use std::fmt::Write as _;
