@@ -19,7 +19,7 @@ use arrow_tools::record_batch;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{Constraints, Statistics};
+use datafusion::common::{ColumnStatistics, Constraints, Statistics};
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
@@ -192,6 +192,62 @@ impl SchemaCastScanExec {
             .project(&mapping, Arc::clone(output_schema))
             .with_constraints(Constraints::default())
     }
+
+    /// Projects the child's per-column statistics onto this exec's output schema.
+    ///
+    /// [`Statistics::column_statistics`] must hold exactly one entry per field of
+    /// the schema the statistics describe — DataFusion indexes it positionally,
+    /// and a parent `FilterExec`'s boundary analysis reads
+    /// `column_statistics[col_index]` for the filtered column. This exec advertises
+    /// `output_schema`, which may drop, reorder, or retype the child's columns, so
+    /// forwarding the child's vector unchanged leaves it longer than the schema and
+    /// that indexing runs off the end. A caching accelerator scan carries hidden
+    /// storage columns this exec strips, which is when the length diverges: an
+    /// integer-column filter over such a dataset failed with `ExprBoundaries ...
+    /// col_index has gone out of bounds` (regression test for #14144).
+    ///
+    /// Each output column takes the child statistic for the input column of the
+    /// same name, and unknown statistics when the name is absent or ambiguous — the
+    /// same by-name, unambiguous-only mapping [`Self::output_equivalence_properties`]
+    /// uses, and for the same reason: a repeated name could otherwise attach one
+    /// column's statistics to another column's values. Row and byte-size estimates
+    /// carry over unchanged; this exec casts values in place and does not change the
+    /// row count.
+    fn project_statistics(&self, input_stats: &Statistics) -> Statistics {
+        let input_schema = self.input.schema();
+        let occurs_once = |schema: &SchemaRef, name: &str| {
+            schema
+                .fields()
+                .iter()
+                .filter(|field| field.name() == name)
+                .count()
+                == 1
+        };
+
+        let column_statistics = self
+            .output_schema
+            .fields()
+            .iter()
+            .map(|output_field| {
+                let name = output_field.name();
+                if !occurs_once(&self.output_schema, name) || !occurs_once(&input_schema, name) {
+                    return ColumnStatistics::new_unknown();
+                }
+                input_schema
+                    .index_of(name)
+                    .ok()
+                    .and_then(|idx| input_stats.column_statistics.get(idx))
+                    .cloned()
+                    .unwrap_or_else(ColumnStatistics::new_unknown)
+            })
+            .collect();
+
+        Statistics {
+            num_rows: input_stats.num_rows,
+            total_byte_size: input_stats.total_byte_size,
+            column_statistics,
+        }
+    }
 }
 
 impl DisplayAs for SchemaCastScanExec {
@@ -321,7 +377,8 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+        let input_stats = self.input.partition_statistics(partition)?;
+        Ok(Arc::new(self.project_statistics(&input_stats)))
     }
 
     // Allow optimizer to push limits through to inputs
@@ -444,6 +501,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::common::Constraint;
+    use datafusion::common::stats::Precision;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::logical_expr::TableProviderFilterPushDown;
@@ -1229,6 +1287,187 @@ mod tests {
                 .ordering_satisfy(ascending_on(&schema, "b"))
                 .expect("ordering satisfaction"),
             "every ordering the child can discharge a requirement with must survive"
+        );
+    }
+
+    // ── projected statistics (#14144) ──
+
+    /// An input column statistic, distinguished from the others by its `max_value`.
+    fn column_stat_with_max(max: i64) -> ColumnStatistics {
+        ColumnStatistics {
+            max_value: Precision::Exact(ScalarValue::Int64(Some(max))),
+            ..ColumnStatistics::new_unknown()
+        }
+    }
+
+    /// The child reports one statistic per input column; this exec must report one
+    /// per *output* column, taken by name — so dropping and reordering columns
+    /// leaves a statistics vector the length of the output schema, each entry the
+    /// input column of the matching name. Regression test for #14144, where a
+    /// longer-than-schema vector ran a parent filter's boundary analysis off the
+    /// end.
+    #[test]
+    fn statistics_are_projected_onto_the_output_schema_by_name() {
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new("_hidden", DataType::Int64, true),
+        ]));
+        let input = Arc::new(EmptyExec::new(Arc::clone(&input_schema)));
+
+        // Output drops `_hidden` and puts `value` before `id`.
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let schema_cast = SchemaCastScanExec::new(input, target_schema);
+
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(3),
+            total_byte_size: Precision::Inexact(64),
+            // id, value, _hidden — in input-schema order.
+            column_statistics: vec![
+                column_stat_with_max(3),
+                column_stat_with_max(30),
+                column_stat_with_max(300),
+            ],
+        };
+
+        let projected = schema_cast.project_statistics(&input_stats);
+
+        assert_eq!(
+            projected.column_statistics.len(),
+            2,
+            "one statistic per output column, not per input column"
+        );
+        // A cast changes neither the row count nor the byte-size estimate.
+        assert_eq!(projected.num_rows, Precision::Exact(3));
+        assert_eq!(projected.total_byte_size, Precision::Inexact(64));
+        assert_eq!(
+            projected.column_statistics[0].max_value,
+            Precision::Exact(ScalarValue::Int64(Some(30))),
+            "output column 0 is `value`, carrying `value`'s bounds"
+        );
+        assert_eq!(
+            projected.column_statistics[1].max_value,
+            Precision::Exact(ScalarValue::Int64(Some(3))),
+            "output column 1 is `id`, carrying `id`'s bounds"
+        );
+    }
+
+    /// A `TableProvider` whose scan returns hidden storage columns that
+    /// [`SchemaCastScanExec`] strips — the shape a `refresh_mode: caching`
+    /// accelerator produces (its `_fetched_at` / `__spice_cache_namespace` columns
+    /// live in the accelerator but not in the user-facing schema).
+    #[derive(Debug)]
+    struct HiddenColumnScan {
+        storage: Vec<Vec<RecordBatch>>,
+        storage_schema: SchemaRef,
+        user_schema: SchemaRef,
+    }
+
+    #[async_trait]
+    impl TableProvider for HiddenColumnScan {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.user_schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> Result<Vec<TableProviderFilterPushDown>> {
+            // Inexact, like the caching accelerator, so the optimizer keeps a
+            // `FilterExec` above the scan — the node whose boundary analysis reads
+            // the statistics this exec advertises.
+            Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            // The storage scan always carries the hidden column; the user-facing
+            // output is the requested projection of the user schema.
+            let input = MemorySourceConfig::try_new_exec(
+                &self.storage,
+                Arc::clone(&self.storage_schema),
+                None,
+            )?;
+            let target_schema = match projection {
+                Some(indices) => Arc::new(Schema::new_with_metadata(
+                    indices
+                        .iter()
+                        .filter_map(|&i| {
+                            self.user_schema.fields().get(i).map(|f| f.as_ref().clone())
+                        })
+                        .collect::<Vec<_>>(),
+                    self.user_schema.metadata().clone(),
+                )),
+                None => Arc::clone(&self.user_schema),
+            };
+            Ok(Arc::new(SchemaCastScanExec::new(input, target_schema)))
+        }
+    }
+
+    /// An integer-column filter over a scan that hides storage columns must plan
+    /// and return the matching rows (regression test for #14144).
+    ///
+    /// Before the statistics were projected onto the output schema, the scan
+    /// advertised a two-column schema while forwarding three column statistics, and
+    /// the `id = 1` filter's boundary analysis indexed `col_index = 2` into that
+    /// two-field schema — `Internal error: Could not create ExprBoundaries ...
+    /// col_index has gone out of bounds`.
+    #[tokio::test]
+    async fn an_integer_filter_plans_when_the_scan_hides_storage_columns() {
+        let storage_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new("_hidden", DataType::Int64, true),
+        ]));
+        let user_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&storage_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+            ],
+        )
+        .expect("valid storage batch");
+
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "t",
+            Arc::new(HiddenColumnScan {
+                storage: vec![vec![batch]],
+                storage_schema,
+                user_schema,
+            }),
+        )
+        .expect("table registered");
+
+        let batches = collect(&ctx, "SELECT value FROM t WHERE id = 1")
+            .await
+            .expect("an integer-column filter must plan and execute");
+        assert_batches_eq!(
+            [
+                "+-------+",
+                "| value |",
+                "+-------+",
+                "| 10    |",
+                "+-------+",
+            ],
+            &batches
         );
     }
 }
