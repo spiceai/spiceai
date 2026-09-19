@@ -107,6 +107,14 @@ pub enum Error {
     ))]
     NonBatchMessage { table: String },
 
+    #[snafu(display(
+        "Failed to write to dataset '{table}': the first Arrow message of the stream carries \
+        data that no record batch describes, so nothing was written. \
+        Send the schema on its own, then the rows as record batch messages. \
+        See: https://spiceai.org/docs/api/arrow-flight-sql"
+    ))]
+    FirstMessageBodyWithoutBatch { table: String },
+
     #[snafu(display("Stream error while reading FlightData: {source}"))]
     StreamRead { source: tonic::Status },
 
@@ -198,7 +206,10 @@ impl From<Error> for tonic::Status {
             // client sent it, and no retry of the same stream can succeed.
             Error::MapEntriesNotNormalizable { .. }
             | Error::UnreadableMessageHeader { .. }
-            | Error::NonBatchMessage { .. } => tonic::Status::invalid_argument(err.to_string()),
+            | Error::NonBatchMessage { .. }
+            | Error::FirstMessageBodyWithoutBatch { .. } => {
+                tonic::Status::invalid_argument(err.to_string())
+            }
             _ => tonic::Status::internal(err.to_string()),
         }
     }
@@ -404,6 +415,15 @@ fn maybe_read_first_batch(
     table: &str,
 ) -> Result<Option<RecordBatch>> {
     if !declares_record_batch(&first_message.data_header, table)? {
+        // The same floor the subsequent-message loop keeps: a body the client streamed is data
+        // whatever the header above it declares, so reading the header alone must not narrow
+        // what the body already establishes. Without this, a schema-headed first message with a
+        // body answers `None` and those bytes are dropped while the write reports success --
+        // which counting by body length, the test this replaced, got right.
+        ensure!(
+            first_message.data_body.is_empty(),
+            FirstMessageBodyWithoutBatchSnafu { table }
+        );
         return Ok(None);
     }
 
@@ -1821,5 +1841,49 @@ mod tests {
 
         assert!(matches!(err, Error::NonBatchMessage { .. }), "{err:?}");
         assert!(err.to_string().contains("'test.s.events'"), "{err}");
+    }
+    /// A first message whose header declares a schema but which carries a body is lost client
+    /// data, not an absent batch.
+    ///
+    /// This is the half of the body/header swap that could *regress* rather than repair: reading
+    /// the header alone answers `None` here, so those bytes would be dropped and an otherwise
+    /// empty stream acknowledged as a complete write. Counting by body length -- the test this
+    /// branch replaced -- got this case right, because a non-empty body reached
+    /// `flight_data_to_arrow_batch`, which refuses a schema header. So the floor is a property
+    /// to preserve, not a new one to add, and it matches what the subsequent-message loop does.
+    #[tokio::test]
+    async fn a_first_message_carrying_a_body_under_a_schema_header_is_refused() {
+        let schema = client_schema();
+        let mut first =
+            encode_batch_to_flight_data(&schema, &client_batch(vec!["US"], vec![1])).remove(0);
+        first.data_body = bytes::Bytes::from_static(b"rows the client sent");
+
+        // Asserted so the case cannot quietly stop exercising the confusion.
+        assert_eq!(
+            ipc::declares_record_batch(&first.data_header),
+            Ok(false),
+            "the case needs the leading schema message, whose header declares no batch"
+        );
+        assert!(!first.data_body.is_empty(), "the case needs a body");
+
+        let err = maybe_read_first_batch(&first, schema, &HashMap::new(), "test.s.events")
+            .expect_err("a body no batch describes must not be silently dropped");
+
+        assert!(
+            matches!(err, Error::FirstMessageBodyWithoutBatch { .. }),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("'test.s.events'"), "{message}");
+        assert!(message.contains("no record batch describes"), "{message}");
+        assert!(
+            message.contains("https://spiceai.org/docs/api/arrow-flight-sql"),
+            "{message}"
+        );
+        assert_eq!(
+            tonic::Status::from(err).code(),
+            tonic::Code::InvalidArgument,
+            "the client sent it, so no retry of the same stream can succeed"
+        );
     }
 }
