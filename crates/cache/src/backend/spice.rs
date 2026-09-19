@@ -84,12 +84,15 @@ where
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
 {
     async fn insert(&self, key: u64, value: V) {
-        // Admission may expire a shard and walk LFU victims; keep that off the
-        // Tokio worker the way `clear` / `run_pending_tasks` already do.
-        let weight = value.get_memory_size();
+        // Admission may expire a shard and walk LFU victims; keep that (and
+        // O(result-size) `get_memory_size` for CachedQueryResult) off the Tokio
+        // worker the way `clear` / `run_pending_tasks` already do.
         let cache = Arc::clone(&self.cache);
-        if let Err(err) =
-            tokio::task::spawn_blocking(move || cache.insert(key, value, weight)).await
+        if let Err(err) = tokio::task::spawn_blocking(move || {
+            let weight = value.get_memory_size();
+            cache.insert(key, value, weight);
+        })
+        .await
         {
             tracing::debug!("Spice cache insert task did not finish: {err}");
         }
@@ -101,10 +104,15 @@ where
         value: V,
         should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
     ) -> bool {
-        let weight = value.get_memory_size();
-        let keep_ttl = value.keep_remaining_ttl();
-        self.cache
-            .replace_if(key, value, weight, keep_ttl, should_replace)
+        // Predicate is borrowed for the call, so use `block_in_place` rather
+        // than `spawn_blocking`. Size + replace/evict stay off the cooperative
+        // async scheduler the same way as `insert`.
+        let cache = Arc::clone(&self.cache);
+        tokio::task::block_in_place(|| {
+            let weight = value.get_memory_size();
+            let keep_ttl = value.keep_remaining_ttl();
+            cache.replace_if(key, value, weight, keep_ttl, should_replace)
+        })
     }
 
     async fn get(&self, key: &u64) -> Option<Arc<V>> {
