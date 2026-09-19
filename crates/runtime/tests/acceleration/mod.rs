@@ -26,6 +26,7 @@ mod caching_mode_constraints;
 mod caching_mode_per_principal;
 #[cfg(feature = "duckdb")]
 mod caching_mode_post_filter;
+mod caching_mode_stale_if_error;
 #[cfg(not(target_os = "windows"))]
 mod cayenne_append_overlap;
 #[cfg(not(target_os = "windows"))]

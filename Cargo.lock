@@ -3993,6 +3993,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "criterion 0.7.0",
  "snafu",
+ "tempfile",
  "text-splitter",
  "tiktoken-rs 0.9.1",
  "tokenizers 0.21.4",
@@ -17656,6 +17657,7 @@ dependencies = [
  "opentelemetry",
  "parking_lot",
  "regex",
+ "regex-syntax",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
  "runtime-object-store",

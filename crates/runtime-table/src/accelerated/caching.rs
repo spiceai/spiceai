@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, SystemTime};
 
@@ -27,6 +28,8 @@ use arrow_tools::format::SchemaDisplay;
 use datafusion::common::{DataFusionError, Result as DataFusionResult, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
+use datafusion::execution::context::SessionState;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::{Expr, dml::InsertOp, not};
 use datafusion::logical_expr::{col, lit};
 use datafusion::physical_plan::execution_plan::EmissionType;
@@ -44,6 +47,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 
+use runtime_acceleration::acceleration::StaleIfError;
 use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_request_context::CacheNamespace;
@@ -365,10 +369,11 @@ pub const CACHE_REFRESHED_AT_COLUMN: &str = "_fetched_at";
 
 /// How long a cached entry stays fresh when the dataset sets no `caching_ttl`.
 ///
-/// Read by both the scan that decides whether a row may be served and the sweep
-/// that decides whether it may be kept. One constant, because a sweep with a
+/// Read by the scan that decides whether a row may be served, the sweep that
+/// decides whether it may be kept, and the Spicepod parser that checks the
+/// caching windows fit a `Duration`. One constant, because a sweep with a
 /// shorter default than the scan would delete rows the scan still calls fresh.
-pub const DEFAULT_CACHING_TTL: Duration = Duration::from_secs(30);
+pub use runtime_acceleration::acceleration::DEFAULT_CACHING_TTL;
 
 /// The TTL a caching scan actually applies, filling in [`DEFAULT_CACHING_TTL`]
 /// for a dataset that configured none.
@@ -937,6 +942,59 @@ fn get_first_fetched_at_timestamp(batch: &RecordBatch) -> Option<i64> {
     Some(ts_array.value(0))
 }
 
+/// The oldest `_fetched_at` value across every row of every batch, as
+/// nanoseconds since the epoch, normalizing the column's stored precision
+/// first — an accelerator may store it at a coarser resolution (Cayenne keeps
+/// microseconds), which a bare nanosecond downcast would silently miss.
+/// `None` when any batch is missing the column or any row's value is null —
+/// the same fail-closed contract `check_cache_freshness` applies when scanning
+/// the same column, so the two agree on how stale the worst row is.
+fn oldest_fetched_at_nanos(batches: &[RecordBatch]) -> Option<i64> {
+    let mut oldest: Option<i64> = None;
+    for batch in batches {
+        let (idx, _) = batch.schema().column_with_name(CACHE_REFRESHED_AT_COLUMN)?;
+        let ns_array = as_timestamp_nanosecond_array(batch.column(idx)).ok()?;
+        let ts_array = ns_array
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()?;
+        for i in 0..ts_array.len() {
+            if ts_array.is_null(i) {
+                return None;
+            }
+            let ts = ts_array.value(i);
+            oldest = Some(oldest.map_or(ts, |o: i64| o.min(ts)));
+        }
+    }
+    oldest
+}
+
+/// How stale a cached entry is *past the point it went stale* — `now -
+/// fetched_at - max_age`, saturating at zero — or `None` when the entry carries
+/// no usable fetch time (missing/null `_fetched_at`), computed from the oldest
+/// row across every batch so a single stale row in a multi-batch response
+/// cannot be masked by fresher rows ahead of it.
+///
+/// This is the staleness `StaleIfError::within_error_window` gates on: a `For(N)`
+/// window is measured from the stale point (past `caching_ttl`), not from the
+/// fetch. `None` makes a finite window fail closed and leaves `Enabled`
+/// unaffected, exactly the read-path decision the caller needs.
+fn staleness_past_max_age(batches: &[RecordBatch], max_age: Duration) -> Option<Duration> {
+    let fetched_at = oldest_fetched_at_nanos(batches)?;
+    let now_nanos = i64::try_from(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()?
+            .as_nanos(),
+    )
+    .ok()?;
+    let max_age_nanos = i64::try_from(max_age.as_nanos()).ok()?;
+    let past = now_nanos
+        .saturating_sub(fetched_at)
+        .saturating_sub(max_age_nanos)
+        .max(0);
+    Some(Duration::from_nanos(u64::try_from(past).ok()?))
+}
+
 /// Represents the freshness state of cached data
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheFreshness {
@@ -1143,14 +1201,12 @@ impl CacheRefreshHelper {
     pub async fn refresh_all_stale_rows(
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
+        session_state: Arc<SessionState>,
         dataset_name: &str,
         ttl: Duration,
         accelerator_write_mutex: Arc<Mutex<()>>,
         in_flight_revalidations: InFlightRevalidations,
     ) -> DataFusionResult<usize> {
-        let ctx = SessionContext::new();
-        let state = ctx.state();
-
         // Data fetched before this threshold is considered stale
         #[expect(clippy::cast_possible_truncation)] // Safe: nanoseconds won't exceed i64::MAX
         let stale_threshold = (SystemTime::now() - ttl)
@@ -1172,7 +1228,9 @@ impl CacheRefreshHelper {
                 ))),
             ];
 
-        let plan = accelerator.scan(&state, None, &filters, None).await?;
+        let plan = accelerator
+            .scan(session_state.as_ref(), None, &filters, None)
+            .await?;
         let task_ctx = Arc::new(TaskContext::default());
 
         // Collect all stale rows from accelerator
@@ -1197,6 +1255,7 @@ impl CacheRefreshHelper {
         let refresh_futures = stale_entries.into_iter().map(|entry| {
             let federated = Arc::clone(&federated);
             let accelerator = Arc::clone(&accelerator);
+            let session_state = Arc::clone(&session_state);
             let dataset_name = dataset_name.to_string();
             let accelerator_write_mutex = Arc::clone(&accelerator_write_mutex);
             let in_flight_revalidations = Arc::clone(&in_flight_revalidations);
@@ -1232,8 +1291,14 @@ impl CacheRefreshHelper {
                     row_filters.len()
                 );
 
-                let batches =
-                    Self::fetch_from_source(&federated, &dataset_name, &row_filters, None).await?;
+                let batches = Self::fetch_from_source(
+                    &federated,
+                    &session_state,
+                    &dataset_name,
+                    &row_filters,
+                    None,
+                )
+                .await?;
 
                 // A miss for this entry that arrives while the claim is held
                 // follows it; hand it these rows now rather than after the
@@ -1328,6 +1393,7 @@ impl CacheRefreshHelper {
     /// this entry, or if the refreshed rows cannot be queued for write.
     pub async fn refresh_entry(
         federated: Arc<dyn TableProvider>,
+        session_state: &SessionState,
         dataset_name: &str,
         filters: &[Expr],
         namespace: CacheNamespace,
@@ -1340,7 +1406,8 @@ impl CacheRefreshHelper {
         );
 
         // Fetch fresh data for this specific entry
-        let batches = Self::fetch_from_source(&federated, dataset_name, filters, None).await?;
+        let batches =
+            Self::fetch_from_source(&federated, session_state, dataset_name, filters, None).await?;
 
         // A miss for this key that arrives while the claim is held follows it;
         // hand it these rows now rather than after the write is queued, so it
@@ -2020,6 +2087,7 @@ impl CacheRefreshHelper {
     /// Fetch data from federated source for given filters
     async fn fetch_from_source(
         federated: &Arc<dyn TableProvider>,
+        session_state: &SessionState,
         dataset_name: &str,
         filters: &[Expr],
         limit: Option<usize>,
@@ -2032,12 +2100,9 @@ impl CacheRefreshHelper {
             tracing::debug!("Source fetch filter {i}: {}", filter.human_display());
         }
 
-        let ctx = SessionContext::new();
-        let state = ctx.state();
-
         // Query source with same filters/limit but all columns
         tracing::debug!("About to scan federated source for dataset={dataset_name}");
-        let plan = federated.scan(&state, None, filters, limit).await?;
+        let plan = federated.scan(session_state, None, filters, limit).await?;
         tracing::debug!(
             "Federated source SCAN successful for dataset={dataset_name}, plan has {} partitions",
             plan.properties().output_partitioning().partition_count()
@@ -2077,12 +2142,14 @@ impl CacheRefreshHelper {
     #[expect(clippy::too_many_arguments)]
     async fn handle_cache_miss(
         federated: Arc<dyn TableProvider>,
+        session_state: &SessionState,
         dataset_name: &str,
         filters: &[Expr],
         limit: Option<usize>,
         fallback_schema: SchemaRef,
         is_expired: bool,
-        stale_if_error: bool,
+        stale_if_error: StaleIfError,
+        max_age: Duration,
         expired_batches: Option<Vec<RecordBatch>>,
         io_runtime: &Handle,
         synchronized_children: SynchronizedChildren,
@@ -2124,7 +2191,8 @@ impl CacheRefreshHelper {
             }
         };
 
-        match Self::fetch_from_source(&federated, dataset_name, filters, limit).await {
+        match Self::fetch_from_source(&federated, session_state, dataset_name, filters, limit).await
+        {
             Ok(batches) if !batches.is_empty() => {
                 let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
                 tracing::debug!(
@@ -2150,16 +2218,24 @@ impl CacheRefreshHelper {
                 // for `caching_stale_if_error` would get the origin's error
                 // body instead of the cached response they asked to fall back
                 // to.
-                if !batches_cacheable
-                    && stale_if_error
-                    && let Some(stale) = expired_batches.filter(|b| !b.is_empty())
+                if !batches_cacheable && let Some(stale) = expired_batches.filter(|b| !b.is_empty())
                 {
-                    tracing::warn!(
-                        "Origin for dataset '{dataset_name}' answered with a transient failure, so the expired cached response is being served instead because `caching_stale_if_error` is enabled."
+                    let staleness = staleness_past_max_age(&stale, max_age);
+                    if stale_if_error.within_error_window(staleness) {
+                        tracing::warn!(
+                            "Origin for dataset '{dataset_name}' answered with a transient failure, so the expired cached response is being served instead because `caching_stale_if_error` allows it."
+                        );
+                        let batch_schema = stale[0].schema();
+                        let batch_stream = futures::stream::iter(stale.into_iter().map(Ok));
+                        return Box::pin(RecordBatchStreamAdapter::new(batch_schema, batch_stream));
+                    }
+                    // Past the `caching_stale_if_error` window, or its age is
+                    // unknown and the window is finite (fail closed): hand the
+                    // caller the origin's transient response rather than a copy
+                    // too stale to promise.
+                    tracing::debug!(
+                        "Stale entry for dataset '{dataset_name}' is {staleness:?} past the stale-if-error window ({stale_if_error}), returning the origin's transient response."
                     );
-                    let batch_schema = stale[0].schema();
-                    let batch_stream = futures::stream::iter(stale.into_iter().map(Ok));
-                    return Box::pin(RecordBatchStreamAdapter::new(batch_schema, batch_stream));
                 }
 
                 // Each arm that does not enqueue drops the claim, which releases
@@ -2251,19 +2327,22 @@ impl CacheRefreshHelper {
             }
             Err(e) => {
                 // Check if we should serve stale (expired) data on error
-                if stale_if_error
-                    && let Some(batches) = expired_batches
-                    && !batches.is_empty()
-                {
-                    tracing::warn!(
-                        "Cache miss fetch failed for dataset {}, serving stale data due to stale_if_error: {}",
-                        dataset_name,
-                        e
+                if let Some(batches) = expired_batches.filter(|b| !b.is_empty()) {
+                    let staleness = staleness_past_max_age(&batches, max_age);
+                    if stale_if_error.within_error_window(staleness) {
+                        tracing::warn!(
+                            "Origin fetch for dataset '{dataset_name}' failed, so the expired cached response is being served instead because `caching_stale_if_error` allows it. Cause: {e}"
+                        );
+                        let batch_schema = batches[0].schema();
+                        let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
+                        let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
+                        return Box::pin(adapter);
+                    }
+                    // Outside the finite window, or its age is unknown (fail
+                    // closed): fall through and propagate the origin error.
+                    tracing::debug!(
+                        "Stale entry for dataset '{dataset_name}' is {staleness:?} past the stale-if-error window ({stale_if_error}), propagating the origin error."
                     );
-                    let batch_schema = batches[0].schema();
-                    let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
-                    let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
-                    return Box::pin(adapter);
                 }
 
                 tracing::error!(
@@ -2379,6 +2458,7 @@ impl CacheRefreshHelper {
     fn handle_cache_hit(
         cached_batches: Vec<RecordBatch>,
         federated: &Arc<dyn TableProvider>,
+        session_state: &Arc<SessionState>,
         dataset_name: &str,
         max_age: Option<Duration>,
         stale_while_revalidate: Option<Duration>,
@@ -2439,6 +2519,7 @@ impl CacheRefreshHelper {
                             }
 
                             let federated_clone = Arc::clone(federated);
+                            let session_state_clone = Arc::clone(session_state);
                             let dataset_name_clone = dataset_name.to_string();
                             let filters_for_refresh: Vec<Expr> = filters.to_vec();
                             let batch_write_tx_clone = batch_write_tx;
@@ -2450,6 +2531,7 @@ impl CacheRefreshHelper {
                             );
                             let result = Self::refresh_entry(
                                 federated_clone,
+                                &session_state_clone,
                                 &dataset_name_clone,
                                 &filters_for_refresh,
                                 namespace_clone,
@@ -2512,6 +2594,13 @@ impl CacheRefreshHelper {
 /// Type alias for synchronized child accelerators
 pub type SynchronizedChildren = Arc<RwLock<Vec<Arc<dyn TableProvider>>>>;
 
+/// Shared across every `CachingAccelerationScanExec`: the filters passed into `scan()` are
+/// arbitrary caller `Expr`s, so full default features are kept rather than a stripped-down
+/// set, but the registry itself never varies by dataset or query, so it's built once for the
+/// process instead of once per exec.
+pub(crate) static SHARED_SESSION_STATE: LazyLock<Arc<SessionState>> =
+    LazyLock::new(|| Arc::new(SessionStateBuilder::new().with_default_features().build()));
+
 /// Caching acceleration execution plan that checks staleness and triggers background refresh
 pub struct CachingAccelerationScanExec {
     input: Arc<dyn ExecutionPlan>,
@@ -2520,8 +2609,9 @@ pub struct CachingAccelerationScanExec {
     max_age: Option<Duration>,
     /// Time window after `max_age` during which stale data can be served while revalidating
     stale_while_revalidate: Option<Duration>,
-    /// If true, serve expired cached data when upstream source returns an error
-    stale_if_error: bool,
+    /// How expired cached data is served when the upstream source fails: never,
+    /// always, or within a finite staleness window.
+    stale_if_error: StaleIfError,
     federated: Arc<dyn TableProvider>,
     accelerator: Arc<dyn TableProvider>,
     dataset_name: String,
@@ -2537,6 +2627,8 @@ pub struct CachingAccelerationScanExec {
     synchronized_children: SynchronizedChildren,
     /// Sender for batched cache writes
     batch_write_tx: CacheWriteSender,
+    /// Built once instead of a fresh `SessionContext` per fetch.
+    session_state: Arc<SessionState>,
 }
 
 impl CachingAccelerationScanExec {
@@ -2545,7 +2637,7 @@ impl CachingAccelerationScanExec {
         input: Arc<dyn ExecutionPlan>,
         max_age: Option<Duration>,
         stale_while_revalidate: Option<Duration>,
-        stale_if_error: bool,
+        stale_if_error: StaleIfError,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         dataset_name: String,
@@ -2569,6 +2661,8 @@ impl CachingAccelerationScanExec {
                 .with_partitioning(Partitioning::UnknownPartitioning(1)),
         );
 
+        let session_state = Arc::clone(&SHARED_SESSION_STATE);
+
         Self {
             input,
             plan_properties,
@@ -2586,6 +2680,7 @@ impl CachingAccelerationScanExec {
             in_flight_revalidations,
             synchronized_children,
             batch_write_tx,
+            session_state,
         }
     }
 }
@@ -2685,6 +2780,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         let schema_clone = Arc::clone(&schema);
 
         let federated = Arc::clone(&self.federated);
+        let session_state = Arc::clone(&self.session_state);
         let dataset_name = self.dataset_name.clone();
         let filters = self.filters.clone();
         let limit = self.limit;
@@ -2755,20 +2851,26 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         tracing::debug!(
                             "Data is expired for dataset={dataset_name}, treating as cache miss (upsert)"
                         );
-                        // Pass the expired batches for stale_if_error fallback
-                        let expired_batches = if stale_if_error {
+                        // Keep the expired batches to fall back to unless the
+                        // fallback is off entirely. Whether the entry is still
+                        // *inside* the window is decided at error time, against
+                        // its `_fetched_at` — collecting them here does not
+                        // commit to serving them.
+                        let expired_batches = if stale_if_error.serves_stale_on_error() {
                             Some(cached_batches)
                         } else {
                             None
                         };
                         return CacheRefreshHelper::handle_cache_miss(
                             federated,
+                            &session_state,
                             &dataset_name,
                             &filters,
                             limit,
                             Arc::clone(&schema_clone),
                             true, // is_expired = true, will upsert
                             stale_if_error,
+                            max_age,
                             expired_batches,
                             &io_runtime,
                             Arc::clone(&synchronized_children),
@@ -2784,6 +2886,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 CacheRefreshHelper::handle_cache_hit(
                     cached_batches,
                     &federated,
+                    &session_state,
                     &dataset_name,
                     max_age,
                     stale_while_revalidate,
@@ -2801,13 +2904,15 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 );
                 CacheRefreshHelper::handle_cache_miss(
                     federated,
+                    &session_state,
                     &dataset_name,
                     &filters,
                     limit,
                     Arc::clone(&schema_clone),
-                    false, // is_expired = false, will insert (append)
-                    false, // stale_if_error = false, no expired data to fall back to
-                    None,  // no expired batches
+                    false,                  // is_expired = false, will insert (append)
+                    StaleIfError::Disabled, // no cached entry to fall back to
+                    max_age.unwrap_or_default(), // unused: no expired batches
+                    None,                   // no expired batches
                     &io_runtime,
                     synchronized_children,
                     batch_write_tx,
@@ -2980,6 +3085,11 @@ mod tests {
     use parking_lot::RwLock;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
+
+    /// Test-only stand-in for the shared `Arc<SessionState>`.
+    fn test_session_state() -> Arc<SessionState> {
+        Arc::new(SessionStateBuilder::new().with_default_features().build())
+    }
 
     /// Mock `TableProvider` that records filters passed to `scan()` for verification.
     #[derive(Debug)]
@@ -4299,6 +4409,7 @@ mod tests {
         let _stream = CacheRefreshHelper::handle_cache_hit(
             vec![stale_cached_data],
             &(Arc::clone(&federated) as Arc<dyn TableProvider>),
+            &test_session_state(),
             "test_dataset",
             max_age,
             stale_while_revalidate,
@@ -4465,12 +4576,14 @@ mod tests {
         // --- 500 request ---
         let mut stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source_500) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))],
             None,
             Arc::clone(&schema),
             false,
-            false,
+            StaleIfError::Disabled,
+            Duration::ZERO,
             None,
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
@@ -4504,12 +4617,14 @@ mod tests {
 
         let mut stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source_429) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))],
             None,
             Arc::clone(&schema),
             false,
-            false,
+            StaleIfError::Disabled,
+            Duration::ZERO,
             None,
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
@@ -4593,13 +4708,15 @@ mod tests {
 
         let stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))],
             None,
             Arc::clone(&schema),
-            true,              // is_expired
-            true,              // stale_if_error enabled
-            Some(vec![stale]), // the expired entry to fall back to
+            true,                  // is_expired
+            StaleIfError::Enabled, // stale_if_error enabled (∞)
+            Duration::ZERO,        // max_age (ignored by Enabled)
+            Some(vec![stale]),     // the expired entry to fall back to
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
             batch_write_tx,
@@ -4639,12 +4756,14 @@ mod tests {
 
         let stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))],
             None,
             Arc::clone(&schema),
             true,
-            false, // stale_if_error disabled
+            StaleIfError::Disabled, // stale_if_error disabled
+            Duration::ZERO,         // max_age (ignored by Disabled)
             Some(vec![stale]),
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
@@ -4663,6 +4782,236 @@ mod tests {
         assert_eq!(content.value(0), "upstream down");
     }
 
+    /// Nanoseconds since the epoch, for placing a cached entry a known distance
+    /// in the past.
+    fn now_nanos() -> i64 {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos(),
+        )
+        .expect("nanoseconds fit i64")
+    }
+
+    /// A whole number of seconds as nanoseconds, as an `i64` timestamp offset.
+    fn secs_nanos(secs: u64) -> i64 {
+        i64::try_from(Duration::from_secs(secs).as_nanos()).expect("nanoseconds fit i64")
+    }
+
+    /// A stale cached response in the `MockHttpTableProvider` shape, with an
+    /// explicit `_fetched_at` (or a null one when `fetched_at` is `None`).
+    fn stale_batch_with_fetched_at(
+        schema: &SchemaRef,
+        content: &str,
+        fetched_at: Option<i64>,
+    ) -> RecordBatch {
+        use arrow::array::{StringArray, TimestampNanosecondArray, UInt16Array};
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/api"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+                Arc::new(StringArray::from(vec![content])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![fetched_at])) as ArrayRef,
+            ],
+        )
+        .expect("batch")
+    }
+
+    /// Read the single `content` cell of a served batch.
+    fn served_content(batch: &RecordBatch) -> String {
+        batch
+            .column_by_name("content")
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>())
+            .map(|c| c.value(0).to_string())
+            .expect("content column")
+    }
+
+    /// Drive `handle_cache_miss` through the transient-5xx arm: a 503 origin plus
+    /// the given expired entry and `stale_if_error`/`max_age`. Returns the one
+    /// served content cell — the stale copy when served, the origin body when not.
+    async fn transient_5xx_outcome(
+        stale: RecordBatch,
+        stale_if_error: StaleIfError,
+        max_age: Duration,
+    ) -> String {
+        let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = http_source.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+        let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        let stream = CacheRefreshHelper::handle_cache_miss(
+            Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
+            "test_dataset",
+            &[col("content").eq(lit("test"))],
+            None,
+            Arc::clone(&schema),
+            true,
+            stale_if_error,
+            max_age,
+            Some(vec![stale]),
+            &tokio::runtime::Handle::current(),
+            Arc::new(vec![].into()),
+            batch_write_tx,
+            CacheNamespace::Public,
+            Arc::clone(&in_flight),
+        )
+        .await;
+
+        let served = drain(stream).await;
+        assert_eq!(served.len(), 1, "exactly one batch is served");
+        served_content(&served[0])
+    }
+
+    /// A finite `caching_stale_if_error` window serves an entry whose staleness is
+    /// inside it and refuses one past it — the RFC 5861 `stale-if-error=N` core.
+    #[tokio::test]
+    async fn a_finite_window_serves_inside_and_propagates_outside() {
+        let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = http_source.schema();
+        let max_age = Duration::from_secs(10);
+        let window = StaleIfError::For(Duration::from_mins(1));
+
+        // Staleness = now - fetched_at - max_age. 30s past the stale point is
+        // inside a 60s window: the cached copy is served.
+        let inside = stale_batch_with_fetched_at(
+            &schema,
+            "cached response",
+            Some(now_nanos() - secs_nanos(10 + 30)),
+        );
+        assert_eq!(
+            transient_5xx_outcome(inside, window, max_age).await,
+            "cached response",
+            "an entry 30s past the stale point is inside a 60s window"
+        );
+
+        // 90s past the stale point is outside a 60s window: the origin's
+        // transient response is returned instead of a copy too stale to promise.
+        let outside = stale_batch_with_fetched_at(
+            &schema,
+            "cached response",
+            Some(now_nanos() - secs_nanos(10 + 90)),
+        );
+        assert_eq!(
+            transient_5xx_outcome(outside, window, max_age).await,
+            "upstream down",
+            "an entry 90s past the stale point is outside a 60s window"
+        );
+    }
+
+    /// `For(N)` fails closed when the entry's age cannot be proven — a missing or
+    /// null `_fetched_at` — so it cannot serve a copy of unknown staleness.
+    #[tokio::test]
+    async fn a_finite_window_fails_closed_on_unknown_staleness() {
+        use arrow::array::{StringArray, UInt16Array};
+
+        let window = StaleIfError::For(Duration::from_mins(1));
+        let max_age = Duration::from_secs(10);
+
+        // A null `_fetched_at` value.
+        let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = http_source.schema();
+        let null_ts = stale_batch_with_fetched_at(&schema, "cached response", None);
+        assert_eq!(
+            transient_5xx_outcome(null_ts, window, max_age).await,
+            "upstream down",
+            "a null fetch time cannot prove the entry is inside the window"
+        );
+
+        // A batch with no `_fetched_at` column at all.
+        let schema_no_ts: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("content", DataType::Utf8, true),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+        ]));
+        let no_column = RecordBatch::try_new(
+            Arc::clone(&schema_no_ts),
+            vec![
+                Arc::new(StringArray::from(vec!["/api"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["cached response"])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        assert_eq!(
+            transient_5xx_outcome(no_column, window, max_age).await,
+            "upstream down",
+            "a missing fetch-time column cannot prove the entry is inside the window"
+        );
+    }
+
+    /// `Enabled` has no bound to check, so it serves even when the entry's age is
+    /// unknown — the fail-open behavior a finite window deliberately drops.
+    #[tokio::test]
+    async fn enabled_serves_even_when_staleness_is_unknown() {
+        let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = http_source.schema();
+        let null_ts = stale_batch_with_fetched_at(&schema, "cached response", None);
+        assert_eq!(
+            transient_5xx_outcome(null_ts, StaleIfError::Enabled, Duration::ZERO).await,
+            "cached response",
+            "Enabled fails open on an unknown fetch time"
+        );
+    }
+
+    /// Cayenne stores `_fetched_at` in microseconds. The read path must
+    /// normalize its precision, or a finite window could never prove an entry is
+    /// inside `N` and would always fail closed on such an accelerator.
+    #[tokio::test]
+    async fn a_finite_window_reads_a_microsecond_fetched_at() {
+        use arrow::array::{StringArray, TimestampMicrosecondArray, UInt16Array};
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("content", DataType::Utf8, true),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+            Field::new(
+                CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]));
+
+        // 30s past a 10s stale point is inside a 60s window. Stored in micros,
+        // as Cayenne would.
+        let fetched_at_micros = (now_nanos() - secs_nanos(10 + 30)) / 1_000;
+        let stale = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/api"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["cached response"])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(
+                    fetched_at_micros,
+                )])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+
+        assert_eq!(
+            transient_5xx_outcome(
+                stale,
+                StaleIfError::For(Duration::from_mins(1)),
+                Duration::from_secs(10)
+            )
+            .await,
+            "cached response",
+            "a microsecond fetch time must be normalized and read as inside the window"
+        );
+    }
+
     #[tokio::test]
     async fn a_revalidation_reports_a_failing_origin_rather_than_zero_rows() {
         let http_source = Arc::new(MockHttpTableProvider::with_status(429, "slow down"));
@@ -4676,6 +5025,7 @@ mod tests {
 
         let outcome = CacheRefreshHelper::refresh_entry(
             Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))],
             CacheNamespace::Public,
@@ -4734,12 +5084,14 @@ mod tests {
 
         let mut stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &filters,
             None,
             Arc::clone(&schema),
             false,
-            false,
+            StaleIfError::Disabled,
+            Duration::ZERO,
             None,
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
@@ -5355,6 +5707,7 @@ mod tests {
         let refreshed = CacheRefreshHelper::refresh_all_stale_rows(
             Arc::clone(&origin) as Arc<dyn TableProvider>,
             Arc::clone(&accelerator),
+            test_session_state(),
             "test_dataset",
             Duration::from_secs(1),
             Arc::new(Mutex::new(())),
@@ -5391,12 +5744,14 @@ mod tests {
 
         let mut stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))],
             None,
             Arc::clone(&schema),
             false,
-            false,
+            StaleIfError::Disabled,
+            Duration::ZERO,
             None,
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
@@ -5458,6 +5813,7 @@ mod tests {
         let refreshed = CacheRefreshHelper::refresh_all_stale_rows(
             Arc::clone(&origin) as Arc<dyn TableProvider>,
             Arc::clone(&accelerator),
+            test_session_state(),
             "test_dataset",
             Duration::from_secs(1),
             Arc::new(Mutex::new(())),
@@ -5522,13 +5878,15 @@ mod tests {
         // 2. Call handle_cache_miss - this is what happens when user queries and cache is empty
         let mut stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &test_session_state(),
             "test_dataset",
             &[col("content").eq(lit("test"))], // filters
             None,                              // limit
             Arc::clone(&schema),
-            false, // is_expired
-            false, // stale_if_error
-            None,  // expired_batches
+            false,                  // is_expired
+            StaleIfError::Disabled, // stale_if_error
+            Duration::ZERO,         // max_age (ignored: no expired batches)
+            None,                   // expired_batches
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()), // synchronized_children
             batch_write_tx,
@@ -5587,6 +5945,233 @@ mod tests {
             cached_status.value(0),
             404,
             "Cached response should have status 404"
+        );
+    }
+
+    /// Mock source that records the `DataFusion` session id each `scan()` is planned under, so a
+    /// test can tell one shared `SessionState` from a fresh one per fetch.
+    #[derive(Debug)]
+    struct SessionTrackingTableProvider {
+        schema: SchemaRef,
+        data: Vec<RecordBatch>,
+        session_ids: Arc<RwLock<Vec<String>>>,
+    }
+
+    impl SessionTrackingTableProvider {
+        fn new(schema: SchemaRef, data: Vec<RecordBatch>) -> Self {
+            Self {
+                schema,
+                data,
+                session_ids: Arc::new(RwLock::new(Vec::new())),
+            }
+        }
+
+        fn recorded_session_ids(&self) -> Vec<String> {
+            self.session_ids.read().clone()
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for SessionTrackingTableProvider {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.session_ids
+                .write()
+                .push(state.session_id().to_string());
+            Ok(Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(
+                    std::slice::from_ref(&self.data),
+                    Arc::clone(&self.schema),
+                    None,
+                )?,
+            ))))
+        }
+    }
+
+    /// The columns a cached HTTP response carries, `cache_refreshed_at` included.
+    fn http_cache_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("content", DataType::Utf8, true),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+            Field::new(
+                CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]))
+    }
+
+    /// One 200 response row whose `cache_refreshed_at` is `refreshed_at` (Unix nanoseconds).
+    fn http_row(schema: &SchemaRef, refreshed_at: i64, content: &str) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/api/test"])),
+                Arc::new(StringArray::from(vec!["q=test"])),
+                Arc::new(StringArray::from(vec![content])),
+                Arc::new(UInt16Array::from(vec![200_u16])),
+                Arc::new(TimestampNanosecondArray::from(vec![Some(refreshed_at)])),
+            ],
+        )
+        .expect("http response row")
+    }
+
+    /// Unix nanoseconds for `ago` before `now_nanos`.
+    fn nanos_ago(now_nanos: i64, ago: Duration) -> i64 {
+        now_nanos - i64::try_from(ago.as_nanos()).expect("duration fits in i64 nanoseconds")
+    }
+
+    /// Regression guard for the shared `SessionState`. Every query plans its own
+    /// `CachingAccelerationScanExec` (through `scan_plan`, and again through
+    /// `with_new_children` on a plan rewrite), and each source fetch that exec issues — a cache
+    /// miss, an expired entry re-fetched inline, and a stale-while-revalidate refresh in the
+    /// background — must plan under the one process-wide session. A fresh `SessionContext` per
+    /// fetch, or a fresh `SessionState` per exec, gives every `scan()` its own session id; this
+    /// asserts on the ids rather than on timings, so it holds on a loaded CI runner.
+    #[tokio::test]
+    async fn source_fetches_across_execs_and_paths_share_one_session_state() {
+        let schema = http_cache_schema();
+        let now_nanos = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos(),
+        )
+        .expect("now fits in i64 nanoseconds");
+        let max_age = Duration::from_mins(1);
+        let stale_while_revalidate = Duration::from_mins(5);
+
+        let source = Arc::new(SessionTrackingTableProvider::new(
+            Arc::clone(&schema),
+            vec![http_row(&schema, now_nanos, "from source")],
+        ));
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight_revalidations: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let (batch_write_tx, _consumer_handle) =
+            spawn_test_cache_write_consumer(&accelerator, &in_flight_revalidations);
+
+        let build_exec = |input: Arc<dyn ExecutionPlan>, filters: Vec<Expr>| {
+            Arc::new(CachingAccelerationScanExec::new(
+                input,
+                Some(max_age),
+                Some(stale_while_revalidate),
+                StaleIfError::Disabled,
+                Arc::clone(&source) as Arc<dyn TableProvider>,
+                Arc::clone(&accelerator) as Arc<dyn TableProvider>,
+                "test_dataset".to_string(),
+                Handle::current(),
+                filters,
+                None,
+                None,
+                Arc::new(Mutex::new(())),
+                Arc::clone(&in_flight_revalidations),
+                Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                batch_write_tx.clone(),
+            ))
+        };
+        let cached_input = |rows: Vec<RecordBatch>| -> Arc<dyn ExecutionPlan> {
+            Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&[rows], Arc::clone(&schema), None)
+                    .expect("cached rows as a memory source"),
+            )))
+        };
+
+        // What the accelerator holds for each query: nothing (miss, twice), a row past
+        // `max_age + stale_while_revalidate` (expired: re-fetched inline), and a row past
+        // `max_age` but inside the window (stale: served, refreshed in the background).
+        let expired_at = nanos_ago(
+            now_nanos,
+            max_age + stale_while_revalidate + Duration::from_mins(1),
+        );
+        let stale_at = nanos_ago(now_nanos, max_age + Duration::from_mins(1));
+        let cases: Vec<(&str, Vec<RecordBatch>)> = vec![
+            ("miss", vec![]),
+            ("second miss", vec![]),
+            ("expired", vec![http_row(&schema, expired_at, "expired")]),
+            ("stale", vec![http_row(&schema, stale_at, "stale")]),
+        ];
+
+        for (i, (case, cached_rows)) in cases.into_iter().enumerate() {
+            // One key per case, so no case is skipped for a write another case still has pending.
+            let filters = vec![col("request_path").eq(lit(format!("/api/{i}")))];
+            let exec = build_exec(cached_input(cached_rows), filters);
+            let rows: Vec<RecordBatch> = exec
+                .execute(0, Arc::new(TaskContext::default()))
+                .expect("execute")
+                .try_collect()
+                .await
+                .expect("collect");
+            assert!(!rows.is_empty(), "{case}: the scan must return rows");
+        }
+
+        // A plan rewrite rebuilds the exec through `with_new_children`; that copy fetches too.
+        let rewritten = build_exec(
+            cached_input(vec![]),
+            vec![col("request_path").eq(lit("/api/rewritten"))],
+        )
+        .with_new_children(vec![cached_input(vec![])])
+        .expect("with_new_children");
+        let rows: Vec<RecordBatch> = rewritten
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute rewritten exec")
+            .try_collect()
+            .await
+            .expect("collect rewritten exec");
+        assert!(
+            !rows.is_empty(),
+            "rewritten exec: the scan must return rows"
+        );
+
+        // Four fetches happen inline before their streams end; the stale case's refresh runs on
+        // the io runtime, so wait for it — bounded, and naming what was seen if it never lands.
+        let expected_fetches = 5;
+        let refresh_landed = tokio::time::timeout(Duration::from_secs(10), async {
+            while source.recorded_session_ids().len() < expected_fetches {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            refresh_landed.is_ok(),
+            "the stale-while-revalidate refresh never reached the source: saw {} of {expected_fetches} fetches",
+            source.recorded_session_ids().len()
+        );
+
+        let session_ids = source.recorded_session_ids();
+        assert_eq!(
+            session_ids.len(),
+            expected_fetches,
+            "one source fetch per case, got {session_ids:?}"
+        );
+        let distinct: HashSet<&str> = session_ids.iter().map(String::as_str).collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "every fetch must plan under one shared session state; saw {distinct:?}"
+        );
+        assert_eq!(
+            session_ids[0],
+            SHARED_SESSION_STATE.session_id(),
+            "fetches must use the process-wide state, not a copy built per exec"
         );
     }
 
