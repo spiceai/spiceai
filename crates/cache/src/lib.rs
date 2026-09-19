@@ -269,6 +269,19 @@ pub trait TabledCacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
     ///
     /// If the cache invalidation fails.
     async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()>;
+
+    /// Returns `true` if any of `tables` was invalidated at or after `since`.
+    ///
+    /// Default is `false` (no table-generation clock). [`crate::lru_cache::LruCache`]
+    /// records invalidations and rejects mid-flight search publishes / hits.
+    fn tables_changed_since(
+        &self,
+        tables: &HashSet<TableReference>,
+        since: std::time::Instant,
+    ) -> bool {
+        let _ = (tables, since);
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -632,7 +645,7 @@ impl Caching {
 /// self-healing (later changes repopulate per-table entries), at the cost
 /// of some lost cache entries in the moments after a collapse.
 #[derive(Default)]
-struct TableChangeClock {
+pub(crate) struct TableChangeClock {
     state: parking_lot::RwLock<TableChangeState>,
 }
 
@@ -643,7 +656,7 @@ struct TableChangeClock {
 const MAX_TRACKED_TABLES: usize = 4096;
 
 #[derive(Default)]
-struct TableChangeState {
+pub(crate) struct TableChangeState {
     changed_at: std::collections::HashMap<u64, std::time::Instant>,
     /// Stands in for every table dropped from `changed_at`. Holds the
     /// newest instant among the dropped entries, which is `>=` the true
@@ -680,7 +693,7 @@ impl TableChangeClock {
         hasher.finish()
     }
 
-    fn record_change(&self, table_ref: &TableReference, at: std::time::Instant) {
+    pub(crate) fn record_change(&self, table_ref: &TableReference, at: std::time::Instant) {
         let key = Self::resolved_key(table_ref);
         let mut state = self.state.write();
 
@@ -727,7 +740,7 @@ impl TableChangeClock {
     /// Ties count as changed: a change recorded in the same instant
     /// as the read began must be assumed to have happened first, since serving
     /// stale data is worse than losing a cache entry.
-    fn changed_since<S: std::hash::BuildHasher>(
+    pub(crate) fn changed_since<S: std::hash::BuildHasher>(
         &self,
         tables: &HashSet<TableReference, S>,
         since: std::time::Instant,

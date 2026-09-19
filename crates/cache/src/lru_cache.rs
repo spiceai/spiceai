@@ -81,6 +81,9 @@ pub struct LruCache<
     initial_instant: Instant,
     hits: AtomicU64,
     total_requests: AtomicU64,
+    /// Table-generation clock so search (and other tabled) entries whose read
+    /// started before an invalidation cannot publish or hit afterward.
+    table_changes: crate::TableChangeClock,
 }
 
 impl<
@@ -193,6 +196,7 @@ impl<
             initial_instant: Instant::now(),
             hits: AtomicU64::new(0),
             total_requests: AtomicU64::new(0),
+            table_changes: crate::TableChangeClock::default(),
         }
     }
 
@@ -360,6 +364,11 @@ impl<
     async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
         let table_name = crate::invalidated_table_name(&table_ref);
 
+        // Stamp before the scan so a search that started before this point and
+        // tries to publish afterward is rejected by `tables_changed_since`.
+        self.table_changes
+            .record_change(&table_ref, Instant::now());
+
         // The walk is proportional to the cache size and never yields, so it
         // runs on the blocking pool. Survivors are not promoted: the scan
         // inspects values in place (spiceai/spiceai#12674).
@@ -378,6 +387,14 @@ impl<
 
         tracing::debug!("Invalidated {removed} cache entries by scanning the shards in place");
         Ok(())
+    }
+
+    fn tables_changed_since(
+        &self,
+        tables: &std::collections::HashSet<TableReference>,
+        since: Instant,
+    ) -> bool {
+        self.table_changes.changed_since(tables, since)
     }
 }
 
@@ -461,6 +478,7 @@ mod tests {
             Arc::new(HashSet::from([TableReference::Bare {
                 table: Arc::from("test_table"),
             }])),
+            Instant::now(),
         )
     }
 

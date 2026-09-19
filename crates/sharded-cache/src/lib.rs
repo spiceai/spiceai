@@ -399,7 +399,9 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             drop(old);
             replaced
         };
-        if replaced && self.weight.load(Ordering::Relaxed) > self.max_weight {
+        // Segment caps (window/protected) can require trim even when total
+        // weight is still under max_weight — same predicate as insert overflow.
+        if replaced && self.needs_overflow_trim() {
             self.evict_to_limit(shard_idx, Some(key));
         }
         replaced
@@ -419,7 +421,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             shard.protected_weight(),
         );
         drop(shard);
-        Some(value)
+        Some(shard::into_owned(value))
     }
 
     /// Drop every entry. Not reported as evictions.
@@ -525,28 +527,27 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
     ///
     /// Survivors are not promoted. Returns how many entries were removed.
     ///
-    /// Shards are still unlocked between steps of a single pass (so readers
-    /// and writers on other shards are not stalled for the whole walk), but
-    /// the pass re-runs until `write_epoch` is stable under `invalidate_gate`.
-    /// An insert into an already-scanned shard therefore cannot survive this
-    /// return: either it published before the stable check (rescan removes
-    /// it) or it is blocked on the gate until after return (post-invalidation
-    /// write).
+    /// Shards are unlocked between steps of a single pass so readers/writers on
+    /// other shards are not stalled for the whole walk. One optimistic pass runs
+    /// first; if `write_epoch` moved (unrelated inserts also bump it), a single
+    /// final pass runs while holding the write gate so invalidation always
+    /// completes — never retries forever under steady write load.
     pub fn invalidate_matching<F>(&self, predicate: F) -> usize
     where
         F: Fn(&V) -> bool,
     {
-        let mut removed = 0;
-        loop {
-            let start = self.write_epoch.load(Ordering::Acquire);
-            removed += self.invalidate_matching_once(&predicate);
-            // Wait for in-flight writers and block new publishes before the
-            // epoch comparison so nothing can land between "stable" and return.
-            let _gate = self.invalidate_gate.write();
-            if self.write_epoch.load(Ordering::Acquire) == start {
-                return removed;
-            }
+        let start = self.write_epoch.load(Ordering::Acquire);
+        let mut removed = self.invalidate_matching_once(&predicate);
+        // Wait for in-flight writers and block new publishes before the
+        // epoch comparison so nothing can land between "stable" and return.
+        let _gate = self.invalidate_gate.write();
+        if self.write_epoch.load(Ordering::Acquire) == start {
+            return removed;
         }
+        // Epoch moved during the optimistic pass: one gated final pass.
+        // Writers are blocked on the gate, so this pass observes a stable set.
+        removed += self.invalidate_matching_once(&predicate);
+        removed
     }
 
     fn invalidate_matching_once<F>(&self, predicate: &F) -> usize
@@ -1092,7 +1093,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             }
             progressed = true;
             for value in expired {
-                evicted.push((value, EvictionReason::Expired));
+                evicted.push((shard::into_owned(value), EvictionReason::Expired));
             }
         }
         progressed
@@ -1130,7 +1131,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             if !expired.is_empty() {
                 drop(shard);
                 for value in expired {
-                    evicted.push((value, EvictionReason::Expired));
+                    evicted.push((shard::into_owned(value), EvictionReason::Expired));
                 }
                 return true;
             }
@@ -1170,7 +1171,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             shard.protected_weight(),
         );
         drop(shard);
-        evicted.push((value, EvictionReason::Size));
+        evicted.push((shard::into_owned(value), EvictionReason::Size));
         true
     }
 
@@ -1206,7 +1207,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             if !expired.is_empty() {
                 drop(shard);
                 for value in expired {
-                    evicted.push((value, EvictionReason::Expired));
+                    evicted.push((shard::into_owned(value), EvictionReason::Expired));
                 }
                 return true;
             }
@@ -1244,7 +1245,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             shard.protected_weight(),
         );
         drop(shard);
-        evicted.push((value, EvictionReason::Size));
+        evicted.push((shard::into_owned(value), EvictionReason::Size));
         true
     }
 
@@ -1322,7 +1323,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             if !expired.is_empty() {
                 drop(shard);
                 for value in expired {
-                    evicted.push((value, EvictionReason::Expired));
+                    evicted.push((shard::into_owned(value), EvictionReason::Expired));
                 }
                 return true;
             }
@@ -1356,7 +1357,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             shard.protected_weight(),
         );
         drop(shard);
-        evicted.push((value, EvictionReason::Size));
+        evicted.push((shard::into_owned(value), EvictionReason::Size));
         true
     }
 
@@ -1695,6 +1696,9 @@ mod tests {
             "seed matching entry must be removed"
         );
     }
+
+
+
 
     #[test]
     fn tinylfu_put_and_get() {

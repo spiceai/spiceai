@@ -93,7 +93,8 @@ pub(crate) enum GetOutcome<V> {
     Hit(Arc<V>),
     Miss,
     Expired {
-        value: V,
+        /// Still an `Arc` so expiry under the shard lock never deep-clones `V`.
+        value: Arc<V>,
         weight: u64,
     },
 }
@@ -363,7 +364,7 @@ impl<V: Clone> Shard<V> {
         value: V,
         weight: u64,
         now: Instant,
-    ) -> (WeightDelta, Option<V>) {
+    ) -> (WeightDelta, Option<Arc<V>>) {
         if let Some(&idx) = self.map.get(&key) {
             return self.replace(idx, value, weight, now);
         }
@@ -396,7 +397,7 @@ impl<V: Clone> Shard<V> {
         (delta, None)
     }
 
-    pub(crate) fn remove(&mut self, key: u64) -> Option<(V, u64)> {
+    pub(crate) fn remove(&mut self, key: u64) -> Option<(Arc<V>, u64)> {
         let idx = self.map.remove(&key)?;
         let weight = match self.slots.get(idx as usize) {
             Some(Slot::Occupied(node)) => node.weight,
@@ -406,7 +407,7 @@ impl<V: Clone> Shard<V> {
         Some((value, weight))
     }
 
-    pub(crate) fn evict_region_lru(&mut self, region: Region) -> Option<(u64, V, u64)> {
+    pub(crate) fn evict_region_lru(&mut self, region: Region) -> Option<(u64, Arc<V>, u64)> {
         let idx = self.ends(region).tail?;
         let (key, weight) = match self.slots.get(idx as usize) {
             Some(Slot::Occupied(node)) => (node.key, node.weight),
@@ -476,7 +477,7 @@ impl<V: Clone> Shard<V> {
     }
 
     /// Drop matching entries without promoting survivors. Returns `(values, weight)`.
-    pub(crate) fn invalidate_matching<F>(&mut self, predicate: F) -> (Vec<V>, u64)
+    pub(crate) fn invalidate_matching<F>(&mut self, predicate: F) -> (Vec<Arc<V>>, u64)
     where
         F: Fn(&V) -> bool,
     {
@@ -484,13 +485,13 @@ impl<V: Clone> Shard<V> {
         self.remove_indices(matched)
     }
 
-    pub(crate) fn expire_older_than(&mut self, now: Instant, ttl: Duration) -> (Vec<V>, u64) {
+    pub(crate) fn expire_older_than(&mut self, now: Instant, ttl: Duration) -> (Vec<Arc<V>>, u64) {
         let matched =
             self.collect_matching(|node| now.saturating_duration_since(node.inserted_at) >= ttl);
         self.remove_indices(matched)
     }
 
-    pub(crate) fn take_all(&mut self) -> (Vec<V>, u64) {
+    pub(crate) fn take_all(&mut self) -> (Vec<Arc<V>>, u64) {
         let weight = self.weight;
         let mut values = Vec::with_capacity(self.map.len());
         self.map.clear();
@@ -505,7 +506,7 @@ impl<V: Clone> Shard<V> {
         // appending forever after churn + clear.
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if let Slot::Occupied(node) = std::mem::replace(slot, Slot::Vacant) {
-                values.push(into_owned(node.value));
+                values.push(node.value);
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "slot index fits in u32; the cache cannot hold u32::MAX entries"
@@ -550,14 +551,14 @@ impl<V: Clone> Shard<V> {
         matched
     }
 
-    fn remove_indices(&mut self, matched: Vec<(u64, u32)>) -> (Vec<V>, u64) {
+    fn remove_indices(&mut self, matched: Vec<(u64, u32)>) -> (Vec<Arc<V>>, u64) {
         let mut values = Vec::with_capacity(matched.len());
         let mut weight: u64 = 0;
         for (key, idx) in matched {
             self.map.remove(&key);
             if let Some(Slot::Occupied(node)) = self.take_slot(idx) {
                 weight = weight.saturating_add(node.weight);
-                values.push(into_owned(node.value));
+                values.push(node.value);
             }
         }
         (values, weight)
@@ -595,11 +596,11 @@ impl<V: Clone> Shard<V> {
         value: V,
         weight: u64,
         now: Instant,
-    ) -> (WeightDelta, Option<V>) {
+    ) -> (WeightDelta, Option<Arc<V>>) {
         let (old_weight, old_value, region) = match self.slots.get_mut(idx as usize) {
             Some(Slot::Occupied(node)) => {
                 let old_weight = node.weight;
-                let old_value = into_owned(std::mem::replace(&mut node.value, Arc::new(value)));
+                let old_value = std::mem::replace(&mut node.value, Arc::new(value));
                 let region = node.region;
                 node.weight = weight;
                 node.inserted_at = now;
@@ -662,7 +663,7 @@ impl<V: Clone> Shard<V> {
         now: Instant,
         keep_ttl: bool,
         should_replace: F,
-    ) -> Option<(bool, WeightDelta, Option<V>)>
+    ) -> Option<(bool, WeightDelta, Option<Arc<V>>)>
     where
         F: FnOnce(&V) -> bool,
     {
@@ -677,7 +678,7 @@ impl<V: Clone> Shard<V> {
         let (old_weight, old_value, region) = match self.slots.get_mut(idx as usize) {
             Some(Slot::Occupied(node)) => {
                 let old_weight = node.weight;
-                let old_value = into_owned(std::mem::replace(&mut node.value, Arc::new(value)));
+                let old_value = std::mem::replace(&mut node.value, Arc::new(value));
                 let region = node.region;
                 node.weight = weight;
                 if !keep_ttl {
@@ -786,9 +787,11 @@ impl<V: Clone> Shard<V> {
         }
     }
 
-    fn take_value_and_free(&mut self, idx: u32) -> Option<V> {
+    fn take_value_and_free(&mut self, idx: u32) -> Option<Arc<V>> {
         match self.take_slot(idx)? {
-            Slot::Occupied(node) => Some(into_owned(node.value)),
+            // Keep the Arc until the caller releases the shard lock — cloning
+            // a large V under the mutex stalls concurrent hits on this shard.
+            Slot::Occupied(node) => Some(node.value),
             Slot::Vacant => None,
         }
     }
