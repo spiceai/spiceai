@@ -38,13 +38,15 @@ limitations under the License.
 //! # Table invalidation
 //!
 //! [`ShardedCache::invalidate_matching`] scans each shard in place and does not
-//! promote survivors, so a refresh cannot rewrite recency as scan order.
+//! promote survivors, so a refresh cannot rewrite recency as scan order. A
+//! write-epoch plus `invalidate_gate` handshake re-scans until stable so an
+//! insert into an already-walked shard cannot survive the return.
 
 mod hasher;
 mod shard;
 mod sketch;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use shard::{GetOutcome, Shard};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -157,6 +159,13 @@ pub struct ShardedCache<V, L: EvictionListener = NoopListener> {
     /// Serializes overflow trimming so two concurrent inserts cannot each
     /// evict a victim after a single removal would already restore the budget.
     trim: Mutex<()>,
+    /// Bumped after a write publishes a new resident (`insert` / successful
+    /// `replace_if`). [`Self::invalidate_matching`] re-scans while this moves.
+    write_epoch: AtomicU64,
+    /// Shared by writers (`read`) and the stable-check at the end of
+    /// [`Self::invalidate_matching`] (`write`) so an in-flight insert cannot
+    /// publish between the last scan and return.
+    invalidate_gate: RwLock<()>,
     /// Rotating start shard for cross-shard eviction / demotion / expired-tail
     /// scans so shard 0 does not permanently absorb eviction pressure.
     hand: AtomicUsize,
@@ -173,6 +182,10 @@ pub struct ShardedCache<V, L: EvictionListener = NoopListener> {
     /// that used to unlink-then-rollback.
     #[cfg(test)]
     before_claim_size: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only: run after each shard is invalidated and unlocked, so a test
+    /// can insert into an already-scanned shard during the multi-shard walk.
+    #[cfg(test)]
+    after_invalidate_shard: Mutex<Option<std::sync::Arc<dyn Fn(usize) + Send + Sync>>>,
     _listener: std::marker::PhantomData<L>,
 }
 
@@ -196,6 +209,8 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             window_weight: AtomicU64::new(0),
             protected_weight: AtomicU64::new(0),
             trim: Mutex::new(()),
+            write_epoch: AtomicU64::new(0),
+            invalidate_gate: RwLock::new(()),
             hand: AtomicUsize::new(0),
             #[cfg(test)]
             after_publish: Mutex::new(None),
@@ -203,6 +218,8 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             before_size_victim: Mutex::new(None),
             #[cfg(test)]
             before_claim_size: Mutex::new(None),
+            #[cfg(test)]
+            after_invalidate_shard: Mutex::new(None),
             _listener: std::marker::PhantomData,
         }
     }
@@ -217,66 +234,72 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
     pub fn insert(&self, key: u64, value: V, weight: usize) {
         let weight = u64::try_from(weight).unwrap_or(u64::MAX);
         let shard_idx = shard_index(key);
-        // Apply deferred get-path promotes before admission so eviction sees
-        // up-to-date region / frequency state for this shard.
-        self.drain_touches_blocking(shard_idx);
-        let mut shard = self.shards[shard_idx].0.lock();
-        if weight > self.max_weight {
-            // Reject under the shard lock. A concurrent fitting insert of the
-            // same key must not land between the weight check and this remove,
-            // or an uncacheable admit would delete a newer valid result.
-            let before_window = shard.window_weight();
-            let before_protected = shard.protected_weight();
-            let removed = shard.remove(key);
-            if let Some((_, old_weight)) = &removed {
-                self.sub_weight(*old_weight);
+        // Hold the invalidate gate across publish so `invalidate_matching`
+        // cannot observe a stable epoch while this write is still invisible.
+        {
+            let _gate = self.invalidate_gate.read();
+            // Apply deferred get-path promotes before admission so eviction sees
+            // up-to-date region / frequency state for this shard.
+            self.drain_touches_blocking(shard_idx);
+            let mut shard = self.shards[shard_idx].0.lock();
+            if weight > self.max_weight {
+                // Reject under the shard lock. A concurrent fitting insert of the
+                // same key must not land between the weight check and this remove,
+                // or an uncacheable admit would delete a newer valid result.
+                let before_window = shard.window_weight();
+                let before_protected = shard.protected_weight();
+                let removed = shard.remove(key);
+                if let Some((_, old_weight)) = &removed {
+                    self.sub_weight(*old_weight);
+                    self.sync_segment_weights_after_removal(
+                        before_window,
+                        shard.window_weight(),
+                        before_protected,
+                        shard.protected_weight(),
+                    );
+                }
+                // Release the shard before dropping V (stale and/or rejected) so a
+                // costly or re-entrant Drop cannot stall this shard.
+                drop(shard);
+                drop(removed);
+                drop(value);
+                return;
+            }
+            // Sample TTL after the shard lock so wait time is not charged to the
+            // entry (and so TinyLFU can expire this shard before admission).
+            let now = Instant::now();
+
+            let mut expired = Vec::new();
+            if matches!(self.policy, EvictionPolicy::TinyLfu) {
+                let before_window = shard.window_weight();
+                let before_protected = shard.protected_weight();
+                let (values, expired_weight) = shard.expire_older_than(now, self.ttl);
+                if expired_weight > 0 {
+                    self.sub_weight(expired_weight);
+                }
                 self.sync_segment_weights_after_removal(
                     before_window,
                     shard.window_weight(),
                     before_protected,
                     shard.protected_weight(),
                 );
+                expired = values;
+                shard.increment_sketch(key);
             }
-            // Release the shard before dropping V (stale and/or rejected) so a
-            // costly or re-entrant Drop cannot stall this shard.
+
+            let (delta, replaced) = shard.insert(key, value, weight, now);
+            // Publish the weight before releasing the shard so a concurrent
+            // remove of this key cannot subtract before the matching add.
+            self.apply_delta(&delta);
             drop(shard);
-            drop(removed);
-            drop(value);
-            return;
-        }
-        // Sample TTL after the shard lock so wait time is not charged to the
-        // entry (and so TinyLFU can expire this shard before admission).
-        let now = Instant::now();
-
-        let mut expired = Vec::new();
-        if matches!(self.policy, EvictionPolicy::TinyLfu) {
-            let before_window = shard.window_weight();
-            let before_protected = shard.protected_weight();
-            let (values, expired_weight) = shard.expire_older_than(now, self.ttl);
-            if expired_weight > 0 {
-                self.sub_weight(expired_weight);
+            self.note_write();
+            drop(replaced);
+            for _ in expired {
+                L::on_evict(EvictionReason::Expired);
             }
-            self.sync_segment_weights_after_removal(
-                before_window,
-                shard.window_weight(),
-                before_protected,
-                shard.protected_weight(),
-            );
-            expired = values;
-            shard.increment_sketch(key);
+            #[cfg(test)]
+            self.wait_after_publish();
         }
-
-        let (delta, replaced) = shard.insert(key, value, weight, now);
-        // Publish the weight before releasing the shard so a concurrent
-        // remove of this key cannot subtract before the matching add.
-        self.apply_delta(&delta);
-        drop(shard);
-        drop(replaced);
-        for _ in expired {
-            L::on_evict(EvictionReason::Expired);
-        }
-        #[cfg(test)]
-        self.wait_after_publish();
         self.evict_to_limit(shard_idx, Some(key));
     }
 
@@ -358,19 +381,24 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             return false;
         }
         let shard_idx = shard_index(key);
-        self.drain_touches_blocking(shard_idx);
-        let mut shard = self.shards[shard_idx].0.lock();
-        let now = Instant::now();
-        let Some((replaced, delta, old)) =
-            shard.replace_if(key, value, weight, now, keep_ttl, should_replace)
-        else {
-            return false;
+        let replaced = {
+            let _gate = self.invalidate_gate.read();
+            self.drain_touches_blocking(shard_idx);
+            let mut shard = self.shards[shard_idx].0.lock();
+            let now = Instant::now();
+            let Some((replaced, delta, old)) =
+                shard.replace_if(key, value, weight, now, keep_ttl, should_replace)
+            else {
+                return false;
+            };
+            if replaced {
+                self.apply_delta(&delta);
+                self.note_write();
+            }
+            drop(shard);
+            drop(old);
+            replaced
         };
-        if replaced {
-            self.apply_delta(&delta);
-        }
-        drop(shard);
-        drop(old);
         if replaced && self.weight.load(Ordering::Relaxed) > self.max_weight {
             self.evict_to_limit(shard_idx, Some(key));
         }
@@ -497,11 +525,31 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
     ///
     /// Survivors are not promoted. Returns how many entries were removed.
     ///
-    /// Each shard is unlocked before the next is scanned, so a write that
-    /// lands in an already-walked shard can survive this return. That is the
-    /// same window Pingora and Moka leave. SQL results close it with a
-    /// table-change clock on the write path; search results do not.
+    /// Shards are still unlocked between steps of a single pass (so readers
+    /// and writers on other shards are not stalled for the whole walk), but
+    /// the pass re-runs until `write_epoch` is stable under `invalidate_gate`.
+    /// An insert into an already-scanned shard therefore cannot survive this
+    /// return: either it published before the stable check (rescan removes
+    /// it) or it is blocked on the gate until after return (post-invalidation
+    /// write).
     pub fn invalidate_matching<F>(&self, predicate: F) -> usize
+    where
+        F: Fn(&V) -> bool,
+    {
+        let mut removed = 0;
+        loop {
+            let start = self.write_epoch.load(Ordering::Acquire);
+            removed += self.invalidate_matching_once(&predicate);
+            // Wait for in-flight writers and block new publishes before the
+            // epoch comparison so nothing can land between "stable" and return.
+            let _gate = self.invalidate_gate.write();
+            if self.write_epoch.load(Ordering::Acquire) == start {
+                return removed;
+            }
+        }
+    }
+
+    fn invalidate_matching_once<F>(&self, predicate: &F) -> usize
     where
         F: Fn(&V) -> bool,
     {
@@ -510,7 +558,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             let mut shard = self.shards[shard_idx].0.lock();
             let before_window = shard.window_weight();
             let before_protected = shard.protected_weight();
-            let (values, weight) = shard.invalidate_matching(&predicate);
+            let (values, weight) = shard.invalidate_matching(predicate);
             self.sub_weight(weight);
             self.sync_segment_weights_after_removal(
                 before_window,
@@ -519,12 +567,20 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
                 shard.protected_weight(),
             );
             drop(shard);
+            #[cfg(test)]
+            self.run_after_invalidate_shard(shard_idx);
             removed += values.len();
             for _ in values {
                 L::on_evict(EvictionReason::Invalidated);
             }
         }
         removed
+    }
+
+    /// Record that a resident was published so [`Self::invalidate_matching`]
+    /// can detect a concurrent write and rescan.
+    fn note_write(&self) {
+        self.write_epoch.fetch_add(1, Ordering::Release);
     }
 
     /// Keys most-recently-used first within each shard, concatenated in shard
@@ -1418,6 +1474,25 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
     {
         *self.before_claim_size.lock() = Some(std::sync::Arc::new(hook));
     }
+
+    #[cfg(test)]
+    fn run_after_invalidate_shard(&self, shard_idx: usize) {
+        let hook = {
+            let guard = self.after_invalidate_shard.lock();
+            guard.as_ref().map(std::sync::Arc::clone)
+        };
+        if let Some(hook) = hook {
+            hook(shard_idx);
+        }
+    }
+
+    #[cfg(test)]
+    fn set_after_invalidate_shard<F>(&self, hook: F)
+    where
+        F: Fn(usize) + Send + Sync + 'static,
+    {
+        *self.after_invalidate_shard.lock() = Some(std::sync::Arc::new(hook));
+    }
 }
 
 #[cfg(test)]
@@ -1582,6 +1657,42 @@ mod tests {
             cache.keys_in_lru_order(),
             vec![16, 80, 64, 32],
             "survivors must keep the recency they had before the scan"
+        );
+    }
+
+    /// A matching insert into an already-scanned shard during the multi-shard
+    /// walk must not survive `invalidate_matching`'s return. Without the
+    /// write-epoch / gate rescan, the hook below leaves key 0 resident.
+    #[test]
+    fn invalidate_matching_rescans_insert_into_already_scanned_shard() {
+        let cache = Arc::new(cache(1024, Duration::from_mins(1)));
+        // Seed a match on shard 1 so the walk continues past shard 0.
+        cache.insert(1, TestValue::new("stale"), 1);
+        let cache_for_hook = Arc::clone(&cache);
+        let inserted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        cache.set_after_invalidate_shard(move |shard_idx| {
+            if shard_idx == 0
+                && !inserted.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                // Publish into the shard that was just unlocked. The first
+                // pass has already left shard 0; the epoch bump forces a
+                // rescan that must drop this entry before return. Insert
+                // only once so the rescan itself does not loop forever.
+                cache_for_hook.insert(0, TestValue::new("stale"), 1);
+            }
+        });
+        let removed = cache.invalidate_matching(|value| value.data == "stale");
+        assert!(
+            removed >= 2,
+            "seed on shard 1 plus mid-scan insert on shard 0 must both be removed, got {removed}"
+        );
+        assert!(
+            cache.get(&0).is_none(),
+            "matching entry inserted into an already-scanned shard must not survive invalidation"
+        );
+        assert!(
+            cache.get(&1).is_none(),
+            "seed matching entry must be removed"
         );
     }
 

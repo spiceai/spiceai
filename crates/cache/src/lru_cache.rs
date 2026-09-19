@@ -364,10 +364,9 @@ impl<
         // runs on the blocking pool. Survivors are not promoted: the scan
         // inspects values in place (spiceai/spiceai#12674).
         //
-        // Each shard is unlocked before the next is scanned, so a write that
-        // lands in an already-walked shard can survive this return — the same
-        // window Pingora and Moka leave. SQL results close it with
-        // `TableChangeClock`; search results do not.
+        // The Spice backend re-scans until its write-epoch is stable under an
+        // invalidate gate, so a concurrent insert into an already-walked shard
+        // cannot survive this return.
         let backend = Arc::clone(&self.backend);
         let removed = tokio::task::spawn_blocking(move || {
             backend.invalidate_matching(|value| {
