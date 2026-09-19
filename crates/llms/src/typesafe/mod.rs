@@ -33,8 +33,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use evaluate_api::{
     AuthenticationFailedSnafu, Evaluate, EvaluateRequest, EvaluateResponse, HealthCheckFailedSnafu,
-    InvalidRequestSnafu, ModelCallFailedSnafu, ModelNotFoundSnafu, RateLimitedSnafu,
-    RatePermitFailedSnafu, Result,
+    InvalidRequestSnafu, ModelCallFailedSnafu, ModelNotFoundSnafu, PermissionDeniedSnafu,
+    RateLimitedSnafu, RatePermitFailedSnafu, Result,
 };
 use reqwest::{Client, StatusCode};
 use runtime_rate_control::RateController;
@@ -181,7 +181,12 @@ impl Evaluate for TypeSafe {
                     response: format!("{e}; body={body}"),
                 }
             }),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => AuthenticationFailedSnafu {
+            StatusCode::UNAUTHORIZED => AuthenticationFailedSnafu {
+                model: self.name.clone(),
+                message: body,
+            }
+            .fail(),
+            StatusCode::FORBIDDEN => PermissionDeniedSnafu {
                 model: self.name.clone(),
                 message: body,
             }
@@ -257,7 +262,7 @@ pub fn chat_not_supported_message(model_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use evaluate_api::{Answer, EntryType, Question};
+    use evaluate_api::{Answer, EntryType, EvaluateState, Question};
     use serde_json::json;
     use std::collections::BTreeMap;
     use wiremock::matchers::{header, method, path};
@@ -311,14 +316,14 @@ mod tests {
         questions.insert(
             "is_urgent".to_string(),
             Question::Noul {
-                instructions: "Does this convey urgency?".into(),
+                instructions: Some("Does this convey urgency?".into()),
                 criteria: None,
             },
         );
         questions.insert(
             "department".to_string(),
             Question::Choice {
-                instructions: "Which team should handle this?".into(),
+                instructions: Some("Which team should handle this?".into()),
                 criteria: BTreeMap::from([
                     ("billing".into(), EntryType::from("Payments")),
                     ("technical".into(), EntryType::from("Bugs")),
@@ -329,7 +334,7 @@ mod tests {
         questions.insert(
             "frustration".to_string(),
             Question::Score {
-                instructions: "How frustrated is the customer?".into(),
+                instructions: Some("How frustrated is the customer?".into()),
                 criteria: vec!["Calm".into(), "Frustrated".into(), "Very angry".into()],
             },
         );
@@ -337,7 +342,7 @@ mod tests {
         let resp = client
             .evaluate(EvaluateRequest {
                 model: "jev".into(), // spicepod name; provider replaces with jev-latest
-                state: json!("Help! My payouts have been failing for 3 days."),
+                state: EvaluateState::from("Help! My payouts have been failing for 3 days."),
                 questions,
             })
             .await
@@ -372,7 +377,7 @@ mod tests {
         let err = client
             .evaluate(EvaluateRequest {
                 model: "jev".into(),
-                state: json!("x"),
+                state: EvaluateState::from("x"),
                 questions: BTreeMap::new(),
             })
             .await
@@ -397,7 +402,7 @@ mod tests {
         questions.insert(
             "q".into(),
             Question::Noul {
-                instructions: "yes?".into(),
+                instructions: Some("yes?".into()),
                 criteria: None,
             },
         );
@@ -405,7 +410,7 @@ mod tests {
         let err = client
             .evaluate(EvaluateRequest {
                 model: "jev".into(),
-                state: json!("s"),
+                state: EvaluateState::from("s"),
                 questions,
             })
             .await
@@ -414,6 +419,39 @@ mod tests {
             err,
             evaluate_api::Error::AuthenticationFailed { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn evaluate_maps_403() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "key")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let mut questions = BTreeMap::new();
+        questions.insert(
+            "q".into(),
+            Question::Noul {
+                instructions: Some("yes?".into()),
+                criteria: None,
+            },
+        );
+
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::from("s"),
+                questions,
+            })
+            .await
+            .expect_err("403");
+        assert!(matches!(err, evaluate_api::Error::PermissionDenied { .. }));
     }
 
     #[tokio::test]
@@ -433,7 +471,7 @@ mod tests {
         questions.insert(
             "q".into(),
             Question::Noul {
-                instructions: "yes?".into(),
+                instructions: Some("yes?".into()),
                 criteria: None,
             },
         );
@@ -441,7 +479,7 @@ mod tests {
         let err = client
             .evaluate(EvaluateRequest {
                 model: "jev".into(),
-                state: json!("s"),
+                state: EvaluateState::from("s"),
                 questions,
             })
             .await

@@ -83,11 +83,15 @@ fn evaluate_error_response(err: EvaluateError) -> Response {
         EvaluateError::AuthenticationFailed { message, .. } => {
             (StatusCode::UNAUTHORIZED, message.clone())
         }
+        EvaluateError::PermissionDenied { message, .. } => (StatusCode::FORBIDDEN, message.clone()),
         EvaluateError::ModelNotFound { message, .. } => (StatusCode::NOT_FOUND, message.clone()),
         EvaluateError::RateLimited { message, .. } => {
             (StatusCode::TOO_MANY_REQUESTS, message.clone())
         }
-        EvaluateError::RatePermitFailed { .. } => (StatusCode::TOO_MANY_REQUESTS, err.to_string()),
+        // Acquire failures are controller/internal faults, not provider 429s.
+        EvaluateError::RatePermitFailed { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+        }
         other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     };
     (status, Json(serde_json::json!({ "error": message }))).into_response()
@@ -98,7 +102,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use evaluate_api::{
-        Answer, EntryType, Evaluate, EvaluateRequest, EvaluateResponse, Question, Usage,
+        Answer, EntryType, Evaluate, EvaluateRequest, EvaluateResponse, EvaluateState, Question,
+        Usage,
     };
     use http_body_util::BodyExt;
     use serde_json::json;
@@ -149,13 +154,13 @@ mod tests {
         questions.insert(
             "is_urgent".into(),
             Question::Noul {
-                instructions: EntryType::from("urgent?"),
+                instructions: Some(EntryType::from("urgent?")),
                 criteria: None,
             },
         );
         EvaluateRequest {
             model: model.into(),
-            state: json!("hello"),
+            state: EvaluateState::from("hello"),
             questions,
         }
     }
@@ -194,7 +199,7 @@ mod tests {
             Extension(models),
             Json(EvaluateRequest {
                 model: "jev".into(),
-                state: json!("x"),
+                state: EvaluateState::from("x"),
                 questions: BTreeMap::new(),
             }),
         )

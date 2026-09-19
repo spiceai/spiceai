@@ -65,6 +65,9 @@ pub enum Error {
     #[snafu(display("Authentication failed for evaluation model '{model}': {message}"))]
     AuthenticationFailed { model: String, message: String },
 
+    #[snafu(display("Permission denied for evaluation model '{model}': {message}"))]
+    PermissionDenied { model: String, message: String },
+
     #[snafu(display("Rate limited by evaluation provider for model '{model}': {message}"))]
     RateLimited { model: String, message: String },
 
@@ -115,19 +118,22 @@ impl From<String> for EntryType {
 pub enum Question {
     /// Yes/no probability question. Answer is `noul` in \[0, 1\] (P(yes)).
     Noul {
-        instructions: EntryType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<EntryType>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         criteria: Option<NoulCriteria>,
     },
     /// Closed-set selection. Answer is the highest-probability option plus the full distribution.
     Choice {
-        instructions: EntryType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<EntryType>,
         /// Option id → description (`EntryType`, or JSON null).
         criteria: BTreeMap<String, EntryType>,
     },
     /// Ordered rubric score. Answer is a probability-weighted value across levels.
     Score {
-        instructions: EntryType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<EntryType>,
         criteria: Vec<EntryType>,
     },
 }
@@ -142,6 +148,28 @@ pub struct NoulCriteria {
     pub false_meaning: Option<EntryType>,
 }
 
+/// Evaluation `state`: string, object, or array (not bool/number/null).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum EvaluateState {
+    String(String),
+    Array(Vec<Value>),
+    Object(Map<String, Value>),
+}
+
+impl From<&str> for EvaluateState {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_string())
+    }
+}
+
+impl From<String> for EvaluateState {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
 /// Request body for `POST /v1/evaluate` and provider System One calls.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -149,7 +177,7 @@ pub struct EvaluateRequest {
     /// Spicepod model name (runtime) or provider model id (provider forward).
     pub model: String,
     /// State for the model to evaluate: string, object, or array.
-    pub state: Value,
+    pub state: EvaluateState,
     /// Questions keyed by caller-selected identifiers.
     pub questions: BTreeMap<String, Question>,
 }
@@ -177,7 +205,7 @@ pub enum Answer {
     },
     Score {
         score: f64,
-        legend: BTreeMap<String, String>,
+        legend: BTreeMap<String, EntryType>,
         probabilities: BTreeMap<String, f64>,
         confidence: f64,
     },
@@ -230,7 +258,7 @@ mod tests {
         assert!(matches!(
             as_string,
             Question::Noul {
-                instructions: EntryType::String(_),
+                instructions: Some(EntryType::String(_)),
                 ..
             }
         ));
@@ -243,7 +271,7 @@ mod tests {
         assert!(matches!(
             as_object,
             Question::Noul {
-                instructions: EntryType::Object(_),
+                instructions: Some(EntryType::Object(_)),
                 ..
             }
         ));
@@ -257,12 +285,81 @@ mod tests {
         assert!(matches!(
             as_array,
             Question::Choice {
-                instructions: EntryType::Array(_),
+                instructions: Some(EntryType::Array(_)),
                 ..
             }
         ));
         if let Question::Choice { criteria, .. } = as_array {
             assert!(matches!(criteria.get("billing"), Some(EntryType::Null)));
+        }
+    }
+
+    #[test]
+    fn instructions_optional_and_null() {
+        let omitted: Question = serde_json::from_value(json!({ "type": "noul" })).expect("omit");
+        assert!(matches!(
+            omitted,
+            Question::Noul {
+                instructions: None,
+                ..
+            }
+        ));
+
+        // `Option` + serde: JSON null deserializes as `None` (nullable ≡ omit).
+        let null_instr: Question = serde_json::from_value(json!({
+            "type": "noul",
+            "instructions": null
+        }))
+        .expect("null");
+        assert!(matches!(
+            null_instr,
+            Question::Noul {
+                instructions: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn evaluate_state_rejects_bool_number_null() {
+        for bad in [json!(true), json!(1), json!(null)] {
+            let err = serde_json::from_value::<EvaluateRequest>(json!({
+                "model": "m",
+                "state": bad,
+                "questions": {}
+            }));
+            assert!(err.is_err(), "expected reject for {bad}");
+        }
+
+        let ok: EvaluateRequest = serde_json::from_value(json!({
+            "model": "m",
+            "state": "hello",
+            "questions": {}
+        }))
+        .expect("string state");
+        assert!(matches!(ok.state, EvaluateState::String(_)));
+    }
+
+    #[test]
+    fn score_legend_accepts_entry_types() {
+        let answer: Answer = serde_json::from_value(json!({
+            "type": "score",
+            "score": 1.5,
+            "legend": {
+                "0": "low",
+                "1": { "label": "mid" },
+                "2": ["high", "detail"]
+            },
+            "probabilities": { "0": 0.1, "1": 0.2, "2": 0.7 },
+            "confidence": 0.9
+        }))
+        .expect("legend");
+        if let Answer::Score { legend, .. } = answer {
+            assert!(matches!(legend.get("0"), Some(EntryType::String(_))));
+            assert!(matches!(legend.get("1"), Some(EntryType::Object(_))));
+            assert!(matches!(legend.get("2"), Some(EntryType::Array(_))));
+        } else {
+            panic!("expected Score");
         }
     }
 }

@@ -125,6 +125,16 @@ impl Runtime {
                         let mut map = store.write().await;
                         map.insert(m.name.clone(), evaluate_model);
                         drop(map);
+                        let responses_api_support_store =
+                            self.llm_runtime_stores.responses_api_support();
+                        let mut responses_support_map = responses_api_support_store.write().await;
+                        responses_support_map.insert(
+                            m.name.clone(),
+                            crate::model::ResponsesApiSupport::UnsupportedProvider {
+                                provider: "typesafe".to_string(),
+                            },
+                        );
+                        drop(responses_support_map);
                         let model_rate_controllers = self.model_rate_controllers();
                         let mut rc_map = model_rate_controllers.write().await;
                         rc_map.insert(m.name.clone(), rate_controller);

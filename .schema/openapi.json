@@ -13102,8 +13102,7 @@
           {
             "type": "object",
             "required": [
-              "type",
-              "instructions"
+              "type"
             ],
             "properties": {
               "type": {
@@ -13113,7 +13112,12 @@
                 ]
               },
               "instructions": {
-                "$ref": "#/components/schemas/EntryType"
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/EntryType"
+                  }
+                ],
+                "nullable": true
               },
               "criteria": {
                 "allOf": [
@@ -13129,7 +13133,6 @@
             "type": "object",
             "required": [
               "type",
-              "instructions",
               "criteria"
             ],
             "properties": {
@@ -13140,7 +13143,12 @@
                 ]
               },
               "instructions": {
-                "$ref": "#/components/schemas/EntryType"
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/EntryType"
+                  }
+                ],
+                "nullable": true
               },
               "criteria": {
                 "type": "object",
@@ -13154,7 +13162,6 @@
             "type": "object",
             "required": [
               "type",
-              "instructions",
               "criteria"
             ],
             "properties": {
@@ -13165,7 +13172,12 @@
                 ]
               },
               "instructions": {
-                "$ref": "#/components/schemas/EntryType"
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/EntryType"
+                  }
+                ],
+                "nullable": true
               },
               "criteria": {
                 "type": "array",
@@ -13193,7 +13205,7 @@
             "description": "Spicepod model name"
           },
           "state": {
-            "description": "State to evaluate: string, object, or array"
+            "$ref": "#/components/schemas/EvaluateState"
           },
           "questions": {
             "type": "object",
@@ -13279,7 +13291,7 @@
               "legend": {
                 "type": "object",
                 "additionalProperties": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/EntryType"
                 }
               },
               "probabilities": {
@@ -13344,6 +13356,22 @@
             "nullable": true
           }
         }
+      },
+      "EvaluateState": {
+        "description": "Evaluation state: string, object, or array.",
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": true
+          }
+        ]
       }
     }
   },

@@ -16,7 +16,7 @@ limitations under the License.
 
 //! System One evaluation model loader (TypeSafe Jev).
 
-#![allow(clippy::implicit_hasher)]
+#![expect(clippy::implicit_hasher)]
 
 use llms::chat::Error as LlmError;
 use llms::evaluate::Evaluate;
