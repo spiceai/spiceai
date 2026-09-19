@@ -507,7 +507,10 @@ mod tests {
             "criteria": { "true": null, "false": "not urgent" }
         }))
         .expect("noul");
-        let Question::Noul { criteria: Some(c), .. } = q else {
+        let Question::Noul {
+            criteria: Some(c), ..
+        } = q
+        else {
             panic!("expected noul with criteria");
         };
         assert!(matches!(c.true_meaning, NullableEntry::Null));
@@ -525,5 +528,4 @@ mod tests {
         let omitted_json = serde_json::to_value(&omitted).expect("ser");
         assert!(omitted_json.as_object().unwrap().is_empty());
     }
-
 }
