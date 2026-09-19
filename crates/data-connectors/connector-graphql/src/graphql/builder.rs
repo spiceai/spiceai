@@ -37,6 +37,7 @@ pub struct GraphQLClientBuilder {
     rate_controller: Option<Arc<RateController>>,
     semaphore: Option<Arc<Semaphore>>,
     auth_header: Option<reqwest::header::HeaderName>,
+    nested_pager: Option<super::client::NestedConnectionPager>,
 }
 
 impl GraphQLClientBuilder {
@@ -54,6 +55,7 @@ impl GraphQLClientBuilder {
             rate_controller: None,
             semaphore: None,
             auth_header: None,
+            nested_pager: None,
         }
     }
 
@@ -111,8 +113,17 @@ impl GraphQLClientBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_nested_pager(
+        mut self,
+        pager: Option<super::client::NestedConnectionPager>,
+    ) -> Self {
+        self.nested_pager = pager;
+        self
+    }
+
     pub fn build(self, client: reqwest::Client) -> Result<GraphQLClient> {
-        GraphQLClient::new(
+        let graphql_client = GraphQLClient::new(
             client,
             self.endpoint,
             self.json_pointer.as_deref(),
@@ -125,6 +136,7 @@ impl GraphQLClientBuilder {
             self.rate_controller,
             self.semaphore,
             self.auth_header,
-        )
+        )?;
+        Ok(graphql_client.with_nested_pager(self.nested_pager))
     }
 }

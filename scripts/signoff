@@ -87,6 +87,16 @@ JJ_REMOTE_URL=""
 # Packages excluded from workspace lint (must match Makefile lint-rust excludes).
 readonly LINT_EXCLUDED_PACKAGES="libnfs lopdf ttf-parser pdf-extract"
 
+# Build under the same cargo profile the merge queue uses: `pr.yml` sets
+# RUST_PROFILE to `lint`, while the Makefile's fallback is `dev`. Two costs come
+# with that fallback. `dev` carries full debug info, which the clippy passes
+# generate and then throw away because they only ever emit metadata. And the two
+# profiles write to different target directories, so a runner that has just
+# built a pull request shares nothing with the sign-off that follows it.
+# Matching the merge queue also makes the attestation describe the build that
+# actually gates the merge. An explicit RUST_PROFILE still wins.
+export RUST_PROFILE="${RUST_PROFILE:-lint}"
+
 # True when running under the Remote Sign-off workflow. Drives pending/failure
 # statuses, "via remote" descriptions, and the GitHub Actions step summary.
 # GITHUB_ACTIONS alone is not enough — other workflows must not inherit this.
