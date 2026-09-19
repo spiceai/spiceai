@@ -330,7 +330,8 @@ where
             // later Arrow adds, so without the floor a sentinel-tagged message of those kinds
             // would take its body with it and the write would still report success. A real
             // heartbeat carries neither header nor body. `do_put.rs`'s discarded-message count
-            // keeps the same floor, for the same reason.
+            // keeps the same header-vs-body floor, for the same reason -- though it applies the
+            // floor only *after* its own sentinel check, which still skips unconditionally.
             if message.app_metadata.as_ref() == KEEPALIVE_APP_METADATA
                 && message.data_body.is_empty()
                 && !declares_ipc_data(&message.data_header, &table_name)?
@@ -1589,7 +1590,6 @@ mod tests {
                     .expect("the region column is a string")
                     .iter()
                     .map(|region| region.expect("no nulls in the fixture").to_string())
-                    .collect::<Vec<_>>()
             })
             .collect();
         assert_eq!(
@@ -1637,15 +1637,18 @@ mod tests {
                 &mut CompressionContext::default(),
             )
             .expect("encoding a dictionary batch");
-        let encoded_dictionary = dictionaries.first().expect("a dictionary message");
+        let encoded_dictionary = dictionaries
+            .into_iter()
+            .next()
+            .expect("a dictionary message");
 
         let first = FlightData {
-            data_header: schema_message.ipc_message.clone().into(),
+            data_header: schema_message.ipc_message.into(),
             ..Default::default()
         };
         let dictionary = FlightData {
-            data_header: encoded_dictionary.ipc_message.clone().into(),
-            data_body: encoded_dictionary.arrow_data.clone().into(),
+            data_header: encoded_dictionary.ipc_message.into(),
+            data_body: encoded_dictionary.arrow_data.into(),
             app_metadata: bytes::Bytes::from_static(KEEPALIVE_APP_METADATA),
             ..Default::default()
         };
@@ -1771,6 +1774,7 @@ mod tests {
         let batches = decode(first, vec![], &schema).await.expect("no batches");
         assert!(batches.is_empty());
     }
+
     /// A message wearing the keepalive sentinel whose header declares something other than IPC
     /// data — a schema re-declaration, a trailer, a `Tensor`, any header a later Arrow adds —
     /// but which carries a body, is client data, not a heartbeat.
@@ -1778,8 +1782,9 @@ mod tests {
     /// `declares_ipc_data` answers `false` for all of those, so the sentinel check alone would
     /// skip the message and take its body with it while the write still reported success: the
     /// exact silent-row-loss shape this PR exists to remove, reintroduced one layer up. The
-    /// empty-body floor is what refuses it. `do_put.rs`'s discarded-message count keeps the same
-    /// floor for the same reason, so the two receivers agree.
+    /// empty-body floor is what refuses it. `do_put.rs` keeps the same header-vs-body floor in
+    /// its discarded-message count, but reaches it only past a sentinel check that still skips
+    /// unconditionally, so on that one point the two receivers do not yet agree.
     ///
     /// A schema message is used because it is the shape a real client is likeliest to send; the
     /// arm it exercises is shared by every non-data header.
@@ -1789,13 +1794,13 @@ mod tests {
         let mut msgs = encode_batch_to_flight_data(&schema, &client_batch(vec!["US"], vec![1]));
         let first = msgs.remove(0);
 
-        let mut tagged = arrow_flight::utils::batches_to_flight_data(
+        let mut tagged = batches_to_flight_data(
             &Schema::new(vec![Field::new("id", DataType::Int32, false)]),
             vec![],
         )
         .expect("encoding a schema as flight data")
         .remove(0);
-        tagged.data_body = (&b"rows the client sent"[..]).into();
+        tagged.data_body = bytes::Bytes::from_static(b"rows the client sent");
         tagged.app_metadata = bytes::Bytes::from_static(KEEPALIVE_APP_METADATA);
 
         // Asserted so the case cannot quietly stop exercising the confusion: it needs a header
