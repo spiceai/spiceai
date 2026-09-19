@@ -125,7 +125,7 @@ mod tests {
         ));
     }
 
-    /// Both the TypeSafe shape and the OpenAI-style envelope land in one field.
+    /// Both the `TypeSafe` shape and the `OpenAI`-style envelope land in one field.
     #[test]
     fn models_response_accepts_either_envelope() {
         let native: ModelsResponse =

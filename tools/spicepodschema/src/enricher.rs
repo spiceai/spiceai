@@ -363,7 +363,7 @@ fn create_catalog_specific_schema(
 
 /// `from` pattern aligned with [`spicepod::component::model::ModelSource`] parsing.
 ///
-/// Most providers match `name:…`. TypeSafe also accepts bare `typesafe` and slash
+/// Most providers match `name:…`. `TypeSafe` also accepts bare `typesafe` and slash
 /// form `typesafe/…` (but not typos like `typesafely:…`).
 fn model_source_from_pattern(name: &str) -> String {
     if name == "typesafe" {
