@@ -149,6 +149,9 @@
               }
             }
           },
+          "400": {
+            "description": "The specified model is an evaluation model; use POST /v1/evaluate"
+          },
           "404": {
             "description": "The specified model was not found"
           },
@@ -342,7 +345,7 @@
           "Datasets"
         ],
         "summary": "Refresh Dataset",
-        "description": "Trigger an on-demand refresh for an accelerated dataset.\n\nThe refresh only applies to `full` and `append` refresh modes (not\n`changes` mode). Datasets without acceleration return 400 \u2014 the\nprevious `load: on_demand` flow has been removed; deferred datasets\n(declared schema + `ready_state: on_registration`) are materialised\nautomatically on first query and do not need a manual trigger.",
+        "description": "Trigger an on-demand refresh for an accelerated dataset.\n\nThe refresh only applies to `full` and `append` refresh modes (not\n`changes` mode). Datasets without acceleration return 400 — the\nprevious `load: on_demand` flow has been removed; deferred datasets\n(declared schema + `ready_state: on_registration`) are materialised\nautomatically on first query and do not need a manual trigger.",
         "operationId": "post_dataset_refresh",
         "parameters": [
           {
@@ -433,13 +436,13 @@
           "Datasets"
         ],
         "summary": "Ingest Debezium CDC changes",
-        "description": "Push Debezium change events (JSON or Avro) directly into an accelerated\ndataset configured with `from: cdc:\u2026` and `refresh_mode: changes`. No Kafka\nis required \u2014 use this as a Debezium Server / Embedded Engine sink.",
+        "description": "Push Debezium change events (JSON or Avro) directly into an accelerated\ndataset configured with `from: cdc:…` and `refresh_mode: changes`. No Kafka\nis required — use this as a Debezium Server / Embedded Engine sink.",
         "operationId": "post_dataset_cdc",
         "parameters": [
           {
             "name": "name",
             "in": "path",
-            "description": "Dataset name (must match a `from: cdc:\u2026` dataset)",
+            "description": "Dataset name (must match a `from: cdc:…` dataset)",
             "required": true,
             "schema": {
               "type": "string"
@@ -589,6 +592,59 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/v1/evaluate": {
+      "post": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Evaluate",
+        "description": "Evaluate unstructured `state` against a map of typed System One questions\n(noul / choice / score). Returns structured answers with calibrated\nprobabilities and confidence. Chat completions are not supported for these\nmodels — use this endpoint instead of `/v1/chat/completions`.",
+        "operationId": "post_evaluate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvaluateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Evaluation succeeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvaluateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Upstream authentication failed"
+          },
+          "403": {
+            "description": "Upstream permission denied"
+          },
+          "404": {
+            "description": "Model not found"
+          },
+          "422": {
+            "description": "Malformed JSON request body (Axum Json extractor)"
+          },
+          "429": {
+            "description": "Rate limited"
+          },
+          "500": {
+            "description": "Evaluation failed"
           }
         }
       }
@@ -912,13 +968,13 @@
           "mcp"
         ],
         "summary": "Open an MCP server-to-client SSE stream",
-        "description": "Open a long-lived server-to-client SSE stream for the current MCP session as defined by the Streamable HTTP transport. The `Mcp-Session-Id` header must identify an existing session created via `POST /v1/mcp`.",
+        "description": "Legacy-era only (`2025-11-25` and earlier). Open a long-lived server-to-client SSE stream for an MCP session created via `POST /v1/mcp`. `2026-07-28` clients do not use GET; they POST `subscriptions/listen` instead. The `Mcp-Session-Id` header must identify an existing legacy session.",
         "operationId": "mcp_stream",
         "parameters": [
           {
             "name": "Mcp-Session-Id",
             "in": "header",
-            "description": "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            "description": "Legacy-era only (`2025-11-25` and earlier). Session identifier returned on `initialize` and required on subsequent requests in that session. Ignored for `2026-07-28` requests, which are sessionless.",
             "required": false
           }
         ],
@@ -930,7 +986,7 @@
             "description": "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod and retry with credentials."
           },
           "403": {
-            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list."
+            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list, or the `Origin` header is not in `runtime.cors.allowed_origins`. Host `[\"*\"]` disables the Host check. Origin `[\"*\"]` expands to localhost defaults — it does not accept every Origin."
           },
           "404": {
             "description": "Unknown or expired `Mcp-Session-Id`."
@@ -942,13 +998,37 @@
           "mcp"
         ],
         "summary": "Send a Model Context Protocol message",
-        "description": "Send a JSON-RPC message to the Spice MCP server using the MCP Streamable HTTP transport. The response is either a single JSON-RPC response (`application/json`) or an SSE stream (`text/event-stream`), selected via the `Accept` header. Session continuity is carried via the `Mcp-Session-Id` header.",
+        "description": "Send a JSON-RPC message to the Spice MCP server using the MCP Streamable HTTP transport. Spice is dual-era: `2026-07-28` clients call `server/discover` and tools without a session; legacy clients may still `initialize` and use `Mcp-Session-Id`. The response is either a single JSON-RPC response (`application/json`) or an SSE stream (`text/event-stream`), selected via the `Accept` header.",
         "operationId": "mcp_message",
         "parameters": [
           {
+            "name": "MCP-Protocol-Version",
+            "in": "header",
+            "description": "Required for `2026-07-28` requests. Must match `_meta['io.modelcontextprotocol/protocolVersion']` in the JSON-RPC body. Spice serves `2026-07-28` and remains dual-era for legacy `initialize` clients.",
+            "required": false
+          },
+          {
+            "name": "Mcp-Method",
+            "in": "header",
+            "description": "Required for `2026-07-28` requests. Must match the JSON-RPC `method` (e.g. `server/discover`, `tools/list`, `tools/call`). Header/body mismatches are rejected with HTTP 400 and JSON-RPC `-32020`.",
+            "required": false
+          },
+          {
+            "name": "Mcp-Name",
+            "in": "header",
+            "description": "Required for `2026-07-28` `tools/call` (and `resources/read` / `prompts/get`) requests. Must match `params.name` or `params.uri`.",
+            "required": false
+          },
+          {
+            "name": "Mcp-Param-*",
+            "in": "header",
+            "description": "For `2026-07-28` `tools/call` requests, one header per tool argument annotated with `x-mcp-header`. The header name is `Mcp-Param-` plus the annotation value (for example `Mcp-Param-Region`). The value must match the corresponding argument in the JSON-RPC body; mismatches are rejected with HTTP 400 and JSON-RPC `-32020`.",
+            "required": false
+          },
+          {
             "name": "Mcp-Session-Id",
             "in": "header",
-            "description": "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            "description": "Legacy-era only (`2025-11-25` and earlier). Session identifier returned on `initialize` and required on subsequent requests in that session. Ignored for `2026-07-28` requests, which are sessionless.",
             "required": false
           }
         ],
@@ -960,16 +1040,16 @@
             "description": "Message accepted (for JSON-RPC notifications / responses that do not require a reply)."
           },
           "400": {
-            "description": "Malformed JSON-RPC payload."
+            "description": "Malformed JSON-RPC payload, unsupported protocol version (`-32022` lists supported versions), or Streamable HTTP header/body mismatch (`-32020`)."
           },
           "401": {
             "description": "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod and retry with credentials."
           },
           "403": {
-            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list. Configure `runtime.mcp.allowed_hosts` or set it to `[\"*\"]` to allow all hosts."
+            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list, or the `Origin` header is not in `runtime.cors.allowed_origins`. Configure `runtime.mcp.allowed_hosts` or `runtime.cors.allowed_origins`. Host `[\"*\"]` disables the Host check. Origin `[\"*\"]` expands to localhost defaults — it does not accept every Origin. A concrete Origin list 403s a mismatched `Origin`."
           },
           "404": {
-            "description": "Unknown or expired `Mcp-Session-Id`."
+            "description": "Unknown method, or unknown/expired `Mcp-Session-Id` on a legacy-era request."
           },
           "413": {
             "description": "Payload too large. Maximum allowed size is 32 MiB."
@@ -981,13 +1061,13 @@
           "mcp"
         ],
         "summary": "Terminate an MCP Streamable HTTP session",
-        "description": "Terminate the MCP session identified by the `Mcp-Session-Id` header. Subsequent requests bearing the same session id will receive `404 Not Found`.",
+        "description": "Legacy-era only (`2025-11-25` and earlier). Terminate the MCP session identified by the `Mcp-Session-Id` header. `2026-07-28` requests are sessionless and do not use DELETE. Subsequent legacy requests bearing the same session id will receive `404 Not Found`.",
         "operationId": "mcp_terminate_session",
         "parameters": [
           {
             "name": "Mcp-Session-Id",
             "in": "header",
-            "description": "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            "description": "Legacy-era only (`2025-11-25` and earlier). Session identifier returned on `initialize` and required on subsequent requests in that session. Ignored for `2026-07-28` requests, which are sessionless.",
             "required": false
           }
         ],
@@ -999,7 +1079,7 @@
             "description": "Unauthorized. The `/v1/mcp` endpoint requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod and retry with credentials."
           },
           "403": {
-            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list."
+            "description": "Forbidden. The `Host` header value is not in the `runtime.mcp.allowed_hosts` list, or the `Origin` header is not in `runtime.cors.allowed_origins`. Host `[\"*\"]` disables the Host check. Origin `[\"*\"]` expands to localhost defaults — it does not accept every Origin."
           },
           "404": {
             "description": "Unknown or already-terminated `Mcp-Session-Id`."
@@ -1589,7 +1669,7 @@
           {
             "name": "min_ready_executors",
             "in": "query",
-            "description": "Minimum number of currently-ready executors required for the probe to succeed. \"Ready\"\nmeans the scheduler has a live `FlightSQL` client for the executor \u2014 i.e. it can route\nqueries to it. A value of `0` is treated as \"gate disabled\" and never blocks. Requires\nscheduler role; supplying a non-zero value outside scheduler role returns `400`.",
+            "description": "Minimum number of currently-ready executors required for the probe to succeed. \"Ready\"\nmeans the scheduler has a live `FlightSQL` client for the executor — i.e. it can route\nqueries to it. A value of `0` is treated as \"gate disabled\" and never blocks. Requires\nscheduler role; supplying a non-zero value outside scheduler role returns `400`.",
             "required": false,
             "schema": {
               "type": [
@@ -2510,95 +2590,6 @@
           }
         }
       }
-    },
-    "/v1/evaluate": {
-      "post": {
-        "tags": [
-          "AI"
-        ],
-        "operationId": "post_evaluate",
-        "summary": "Evaluate",
-        "description": "Evaluate unstructured `state` against a map of typed System One questions (noul / choice / score). Returns structured answers with calibrated probabilities and confidence. Chat completions are not supported for these models \u2014 use this endpoint instead of `/v1/chat/completions`.",
-        "requestBody": {
-          "description": "System One evaluation request (`model`, `state`, typed `questions`)",
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/EvaluateRequest"
-              },
-              "example": {
-                "model": "jev",
-                "state": "Help! My payouts have been failing for 3 days.",
-                "questions": {
-                  "is_urgent": {
-                    "type": "noul",
-                    "instructions": "Does this convey urgency?"
-                  }
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Evaluation succeeded",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/EvaluateResponse"
-                },
-                "example": {
-                  "model": "jev-1.13.0",
-                  "answers": {
-                    "is_urgent": {
-                      "type": "noul",
-                      "noul": 0.92
-                    }
-                  },
-                  "usage": {
-                    "input_tokens": 312,
-                    "output_tokens": 48
-                  }
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "401": {
-            "description": "Upstream authentication failed"
-          },
-          "403": {
-            "description": "Upstream permission denied"
-          },
-          "404": {
-            "description": "Model not found"
-          },
-          "429": {
-            "description": "Rate limited"
-          },
-          "500": {
-            "description": "Evaluation failed"
-          },
-          "422": {
-            "description": "Malformed JSON request body (Axum Json extractor)",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "api_key": []
-          }
-        ]
-      }
     }
   },
   "components": {
@@ -2710,6 +2701,109 @@
             "description": "A path to a file."
           }
         ]
+      },
+      "Answer": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "noul",
+              "type"
+            ],
+            "properties": {
+              "noul": {
+                "type": "number",
+                "format": "double"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "noul"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "choice",
+              "probabilities",
+              "confidence",
+              "type"
+            ],
+            "properties": {
+              "choice": {
+                "type": "string"
+              },
+              "confidence": {
+                "type": "number",
+                "format": "double"
+              },
+              "probabilities": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "number",
+                  "format": "double"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "choice"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "score",
+              "legend",
+              "probabilities",
+              "confidence",
+              "type"
+            ],
+            "properties": {
+              "confidence": {
+                "type": "number",
+                "format": "double"
+              },
+              "legend": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/EntryType"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
+              },
+              "probabilities": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "number",
+                  "format": "double"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
+              },
+              "score": {
+                "type": "number",
+                "format": "double"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "score"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A typed answer returned for one question."
       },
       "ApplyPatchCallOutputStatus": {
         "type": "string",
@@ -5169,7 +5263,7 @@
             }
           }
         ],
-        "description": "Represents all user\u2010triggered actions."
+        "description": "Represents all user‐triggered actions."
       },
       "ComputerCallOutputItemParam": {
         "type": "object",
@@ -6677,6 +6771,29 @@
           "base64"
         ]
       },
+      "EntryType": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null",
+            "default": null
+          }
+        ],
+        "description": "`TypeSafe` `EntryType`: string, object, array, or null.\n\nUsed for `instructions` and structured criteria descriptions.\nSee <https://docs.typesafe.ai/primitives/advanced>."
+      },
       "ErrorObject": {
         "type": "object",
         "description": "Error returned by the API when a request fails.",
@@ -6694,6 +6811,87 @@
             "description": "A human-readable description of the error."
           }
         }
+      },
+      "EvaluateRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/evaluate` and provider System One calls.",
+        "required": [
+          "model",
+          "state",
+          "questions"
+        ],
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "Spicepod model name (runtime) or provider model id (provider forward)."
+          },
+          "questions": {
+            "type": "object",
+            "description": "Questions keyed by caller-selected identifiers. At least one is required.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Question"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "state": {
+            "$ref": "#/components/schemas/EvaluateState",
+            "description": "State for the model to evaluate: string, object, or array."
+          }
+        }
+      },
+      "EvaluateResponse": {
+        "type": "object",
+        "description": "Response body for evaluation: typed answers plus provider metadata.",
+        "required": [
+          "model",
+          "answers"
+        ],
+        "properties": {
+          "answers": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Answer"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "model": {
+            "type": "string",
+            "description": "Versioned model id that answered (e.g. `jev-1.13.0`), when the provider reports it."
+          },
+          "usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Usage"
+              }
+            ]
+          }
+        }
+      },
+      "EvaluateState": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        ],
+        "description": "Evaluation `state`: string, object, or array (not bool/number/null)."
       },
       "FileCitationBody": {
         "type": "object",
@@ -9480,6 +9678,37 @@
           }
         }
       },
+      "NonNullEntry": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        ],
+        "description": "Non-null `EntryType` values: string, object, or array (not JSON null).\n\nUsed for score rubric levels so the `OpenAPI` contract matches `TypeSafe`'s\nnon-empty `list[str | object | array]` criteria shape."
+      },
+      "NoulCriteria": {
+        "type": "object",
+        "description": "Optional yes/no rubric for a noul question.\n\n`true` / `false` use [`NullableEntry`] so explicit JSON `null` is preserved when\nforwarding to `TypeSafe` (unlike `Option<EntryType>`, which drops nulls).",
+        "properties": {
+          "false": {
+            "$ref": "#/components/schemas/NullableEntry"
+          },
+          "true": {
+            "$ref": "#/components/schemas/NullableEntry"
+          }
+        }
+      },
       "NsqlColumnContext": {
         "type": "object",
         "required": [
@@ -10012,6 +10241,36 @@
             "minimum": 0
           }
         }
+      },
+      "NullableEntry": {
+        "oneOf": [
+          {
+            "type": "null"
+          },
+          {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {}
+              },
+              {
+                "type": "object",
+                "additionalProperties": {},
+                "propertyNames": {
+                  "type": "string"
+                }
+              },
+              {
+                "type": "null",
+                "default": null
+              }
+            ],
+            "description": "`TypeSafe` `EntryType`: string, object, array, or null.\n\nUsed for `instructions` and structured criteria descriptions.\nSee <https://docs.typesafe.ai/primitives/advanced>."
+          }
+        ]
       },
       "OutputItem": {
         "oneOf": [
@@ -10668,6 +10927,95 @@
             "minimum": 0
           }
         }
+      },
+      "Question": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Yes/no probability question. Answer is `noul` in \\[0, 1\\] (P(yes)).",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "criteria": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/NoulCriteria"
+                  }
+                ]
+              },
+              "instructions": {
+                "$ref": "#/components/schemas/NullableEntry"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "noul"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Closed-set selection. Answer is the highest-probability option plus the full distribution.",
+            "required": [
+              "criteria",
+              "type"
+            ],
+            "properties": {
+              "criteria": {
+                "type": "object",
+                "description": "Option id → description (`EntryType`, or JSON null).",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/EntryType"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
+              },
+              "instructions": {
+                "$ref": "#/components/schemas/NullableEntry"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "choice"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Ordered rubric score. Answer is a probability-weighted value across levels.",
+            "required": [
+              "criteria",
+              "type"
+            ],
+            "properties": {
+              "criteria": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/NonNullEntry"
+                },
+                "description": "At least two non-null rubric levels; TypeSafe documents score criteria as an\narray of two or more levels (<https://docs.typesafe.ai/primitives/score>).",
+                "minItems": 2
+              },
+              "instructions": {
+                "$ref": "#/components/schemas/NullableEntry"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "score"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A typed question sent to a System One evaluation model.\n\n`instructions` uses [`NullableEntry`] so an explicit JSON `null` survives the round\ntrip to TypeSafe instead of collapsing into an omitted field."
       },
       "RankVersionType": {
         "type": "string",
@@ -12596,6 +12944,23 @@
           }
         }
       },
+      "Usage": {
+        "type": "object",
+        "description": "Token usage reported by the provider.",
+        "properties": {
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Defaulted: the provider may report one count without the other, and a partial\n`usage` block must not fail an otherwise successful evaluation.",
+            "minimum": 0
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "UserFunctionContextEntry": {
         "type": "object",
         "required": [
@@ -13069,339 +13434,6 @@
             "description": "The type of the response (always `list`)"
           }
         }
-      },
-      "EntryType": {
-        "description": "TypeSafe EntryType: string, object, array, or null.",
-        "oneOf": [
-          {
-            "type": "string"
-          },
-          {
-            "type": "array",
-            "items": {}
-          },
-          {
-            "type": "object",
-            "additionalProperties": true
-          },
-          {
-            "type": "null"
-          }
-        ]
-      },
-      "NoulCriteria": {
-        "type": "object",
-        "properties": {
-          "true": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/EntryType"
-              }
-            ],
-            "nullable": true
-          },
-          "false": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/EntryType"
-              }
-            ],
-            "nullable": true
-          }
-        }
-      },
-      "Question": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "type"
-            ],
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "noul"
-                ]
-              },
-              "instructions": {
-                "allOf": [
-                  {
-                    "$ref": "#/components/schemas/EntryType"
-                  }
-                ],
-                "nullable": true
-              },
-              "criteria": {
-                "allOf": [
-                  {
-                    "$ref": "#/components/schemas/NoulCriteria"
-                  }
-                ],
-                "nullable": true
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "type",
-              "criteria"
-            ],
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "choice"
-                ]
-              },
-              "instructions": {
-                "allOf": [
-                  {
-                    "$ref": "#/components/schemas/EntryType"
-                  }
-                ],
-                "nullable": true
-              },
-              "criteria": {
-                "type": "object",
-                "additionalProperties": {
-                  "$ref": "#/components/schemas/EntryType"
-                }
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "type",
-              "criteria"
-            ],
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "score"
-                ]
-              },
-              "instructions": {
-                "allOf": [
-                  {
-                    "$ref": "#/components/schemas/EntryType"
-                  }
-                ],
-                "nullable": true
-              },
-              "criteria": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/NonNullEntry"
-                },
-                "minItems": 1
-              }
-            }
-          }
-        ],
-        "discriminator": {
-          "propertyName": "type"
-        }
-      },
-      "EvaluateRequest": {
-        "type": "object",
-        "required": [
-          "model",
-          "state",
-          "questions"
-        ],
-        "properties": {
-          "model": {
-            "type": "string",
-            "description": "Spicepod model name"
-          },
-          "state": {
-            "$ref": "#/components/schemas/EvaluateState"
-          },
-          "questions": {
-            "type": "object",
-            "additionalProperties": {
-              "$ref": "#/components/schemas/Question"
-            },
-            "description": "Typed questions keyed by caller-selected identifiers"
-          }
-        }
-      },
-      "Answer": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "type",
-              "noul"
-            ],
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "noul"
-                ]
-              },
-              "noul": {
-                "type": "number",
-                "format": "double"
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "type",
-              "choice",
-              "probabilities",
-              "confidence"
-            ],
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "choice"
-                ]
-              },
-              "choice": {
-                "type": "string"
-              },
-              "probabilities": {
-                "type": "object",
-                "additionalProperties": {
-                  "type": "number",
-                  "format": "double"
-                }
-              },
-              "confidence": {
-                "type": "number",
-                "format": "double"
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "type",
-              "score",
-              "legend",
-              "probabilities",
-              "confidence"
-            ],
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "score"
-                ]
-              },
-              "score": {
-                "type": "number",
-                "format": "double"
-              },
-              "legend": {
-                "type": "object",
-                "additionalProperties": {
-                  "$ref": "#/components/schemas/EntryType"
-                }
-              },
-              "probabilities": {
-                "type": "object",
-                "additionalProperties": {
-                  "type": "number",
-                  "format": "double"
-                }
-              },
-              "confidence": {
-                "type": "number",
-                "format": "double"
-              }
-            }
-          }
-        ],
-        "discriminator": {
-          "propertyName": "type"
-        }
-      },
-      "Usage": {
-        "type": "object",
-        "required": [
-          "input_tokens",
-          "output_tokens"
-        ],
-        "properties": {
-          "input_tokens": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "output_tokens": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          }
-        }
-      },
-      "EvaluateResponse": {
-        "type": "object",
-        "required": [
-          "model",
-          "answers"
-        ],
-        "properties": {
-          "model": {
-            "type": "string"
-          },
-          "answers": {
-            "type": "object",
-            "additionalProperties": {
-              "$ref": "#/components/schemas/Answer"
-            }
-          },
-          "usage": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/Usage"
-              }
-            ],
-            "nullable": true
-          }
-        }
-      },
-      "EvaluateState": {
-        "description": "Evaluation state: string, object, or array.",
-        "oneOf": [
-          {
-            "type": "string"
-          },
-          {
-            "type": "array",
-            "items": {}
-          },
-          {
-            "type": "object",
-            "additionalProperties": true
-          }
-        ]
-      },
-      "NonNullEntry": {
-        "description": "Non-null EntryType: string, object, or array (score rubric levels).",
-        "oneOf": [
-          {
-            "type": "string"
-          },
-          {
-            "type": "array",
-            "items": {}
-          },
-          {
-            "type": "object",
-            "additionalProperties": true
-          }
-        ]
       }
     }
   },

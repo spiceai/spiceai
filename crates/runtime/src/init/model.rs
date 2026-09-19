@@ -131,7 +131,7 @@ impl Runtime {
                         responses_support_map.insert(
                             m.name.clone(),
                             crate::model::ResponsesApiSupport::EvaluateOnly {
-                                provider: "typesafe".to_string(),
+                                provider: ModelSource::TypeSafe.to_string(),
                             },
                         );
                         drop(responses_support_map);

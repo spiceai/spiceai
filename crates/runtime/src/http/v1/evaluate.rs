@@ -31,6 +31,9 @@ use evaluate_api::EvaluateResponse;
 use evaluate_api::{Error as EvaluateError, EvaluateRequest};
 use tokio::sync::RwLock;
 
+use runtime_request_context::{AsyncMarker, RequestContext};
+use tracing_futures::Instrument;
+
 use crate::model::EvaluateModelStore;
 
 /// Evaluate
@@ -60,6 +63,20 @@ pub(crate) async fn post(
     Extension(models): Extension<Arc<RwLock<EvaluateModelStore>>>,
     Json(req): Json<EvaluateRequest>,
 ) -> Response {
+    let context = RequestContext::current(AsyncMarker::new().await);
+
+    // Mirrors `/v1/chat/completions`: evaluations are billable inference and belong in
+    // `runtime.task_history` with their model label and trace correlation.
+    let span = tracing::span!(
+        target: "task_history",
+        tracing::Level::INFO,
+        "ai_evaluate",
+        input = %serde_json::to_string(&req).unwrap_or_default()
+    );
+    span.in_scope(|| tracing::info!(target: "task_history", model = %req.model, "labels"));
+    crate::task_history::correlation::record_task_history_trace_id(&span, &context);
+
+    async move {
     let model_id = req.model.clone();
     let Some(model) = models.read().await.get(&model_id).cloned() else {
         return (
@@ -77,6 +94,9 @@ pub(crate) async fn post(
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => evaluate_error_response(&e),
     }
+    }
+    .instrument(span.clone())
+    .await
 }
 
 fn evaluate_error_response(err: &EvaluateError) -> Response {
@@ -147,7 +167,7 @@ mod tests {
         questions.insert(
             "is_urgent".into(),
             Question::Noul {
-                instructions: Some(EntryType::from("urgent?")),
+                instructions: "urgent?".into(),
                 criteria: None,
             },
         );

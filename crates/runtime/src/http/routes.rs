@@ -476,7 +476,10 @@ pub(crate) fn routes(
                 post(v1::responses::post).layer(ModelContextLayer),
             )
             .route("/v1/embeddings", post(v1::embeddings::post))
-            .route("/v1/evaluate", post(v1::evaluate::post))
+            .route(
+                "/v1/evaluate",
+                post(v1::evaluate::post).layer(ModelContextLayer),
+            )
             .route("/v1/search", post(v1::search::post))
             .merge(tools_router)
             .route("/v1/workers", get(v1::workers::get))

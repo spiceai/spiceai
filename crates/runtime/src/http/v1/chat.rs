@@ -109,6 +109,7 @@ pub static KEEP_ALIVE_INTERVAL: u64 = 30;
                 }
             })
         ))),
+        (status = 400, description = "The specified model is an evaluation model; use POST /v1/evaluate"),
         (status = 404, description = "The specified model was not found"),
         (status = 500, description = "An internal server error occurred while processing the chat completion", content((
             serde_json::Value = "application/json",

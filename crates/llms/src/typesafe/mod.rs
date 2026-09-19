@@ -25,16 +25,18 @@ limitations under the License.
 
 mod list_models;
 
+use list_models::ModelsResponse;
 pub use list_models::TypeSafeModelLister;
 
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use evaluate_api::{
-    AuthenticationFailedSnafu, Evaluate, EvaluateRequest, EvaluateResponse, HealthCheckFailedSnafu,
-    InvalidRequestSnafu, ModelCallFailedSnafu, ModelNotFoundSnafu, PermissionDeniedSnafu,
-    RateLimitedSnafu, RatePermitFailedSnafu, Result,
+    Answer, AuthenticationFailedSnafu, Evaluate, EvaluateRequest, EvaluateResponse,
+    HealthCheckFailedSnafu, InvalidRequestSnafu, ModelCallFailedSnafu, ModelNotFoundSnafu,
+    PermissionDeniedSnafu, Question, RateLimitedSnafu, RatePermitFailedSnafu, Result,
 };
 use reqwest::{Client, StatusCode};
 use runtime_rate_control::RateController;
@@ -116,6 +118,76 @@ impl TypeSafe {
     fn models_url(&self) -> String {
         format!("{}/v1/models", self.base_url)
     }
+
+    /// Every question asked must come back answered, with an answer of the matching
+    /// kind. A 200 that silently drops or re-types an answer is a wrong result, not a
+    /// success, so it is surfaced as an unparseable response rather than published.
+    fn ensure_answers_match(
+        &self,
+        asked: &BTreeMap<String, &'static str>,
+        response: &EvaluateResponse,
+    ) -> Result<()> {
+        let missing: Vec<&str> = asked
+            .keys()
+            .filter(|id| !response.answers.contains_key(*id))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            return Err(evaluate_api::Error::UnparseableResponse {
+                model: self.name.clone(),
+                response: format!("no answer for question(s): {}", missing.join(", ")),
+            });
+        }
+
+        for (id, answer) in &response.answers {
+            let Some(expected) = asked.get(id) else {
+                return Err(evaluate_api::Error::UnparseableResponse {
+                    model: self.name.clone(),
+                    response: format!("answer for question '{id}', which was not asked"),
+                });
+            };
+            let got = answer_kind(answer);
+            if got != *expected {
+                return Err(evaluate_api::Error::UnparseableResponse {
+                    model: self.name.clone(),
+                    response: format!(
+                        "question '{id}' is a {expected} question but the answer is a {got}"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether the id names an explicit version (`jev-1.13.0`) rather than an alias.
+///
+/// TypeSafe accepts versioned pins that `GET /v1/models` need not list, so a pin is
+/// never treated as missing.
+fn is_version_pinned(model_id: &str) -> bool {
+    model_id.rsplit_once('-').is_some_and(|(_, tail)| {
+        tail.split('.')
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+            && tail.contains('.')
+    })
+}
+
+/// The primitive a question asks for, used to check the answer that comes back.
+fn question_kind(question: &Question) -> &'static str {
+    match question {
+        Question::Noul { .. } => "noul",
+        Question::Choice { .. } => "choice",
+        Question::Score { .. } => "score",
+    }
+}
+
+/// The primitive an answer carries.
+fn answer_kind(answer: &Answer) -> &'static str {
+    match answer {
+        Answer::Noul { .. } => "noul",
+        Answer::Choice { .. } => "choice",
+        Answer::Score { .. } => "score",
+    }
 }
 
 /// Map Spicepod model id suffixes onto `TypeSafe` aliases.
@@ -152,6 +224,12 @@ impl Evaluate for TypeSafe {
         // Always send the upstream model id, not the Spicepod component name.
         request.model = self.model_id.clone();
 
+        let asked: BTreeMap<String, &'static str> = request
+            .questions
+            .iter()
+            .map(|(id, q)| (id.clone(), question_kind(q)))
+            .collect();
+
         let response = self
             .client
             .post(self.systemone_url())
@@ -174,12 +252,16 @@ impl Evaluate for TypeSafe {
             })?;
 
         match status {
-            StatusCode::OK => serde_json::from_str::<EvaluateResponse>(&body).map_err(|e| {
-                evaluate_api::Error::UnparseableResponse {
-                    model: self.name.clone(),
-                    response: format!("{e}; body={body}"),
-                }
-            }),
+            StatusCode::OK => {
+                let parsed = serde_json::from_str::<EvaluateResponse>(&body).map_err(|e| {
+                    evaluate_api::Error::UnparseableResponse {
+                        model: self.name.clone(),
+                        response: format!("{e}; body={body}"),
+                    }
+                })?;
+                self.ensure_answers_match(&asked, &parsed)?;
+                Ok(parsed)
+            }
             StatusCode::UNAUTHORIZED => AuthenticationFailedSnafu {
                 model: self.name.clone(),
                 message: body,
@@ -224,15 +306,38 @@ impl Evaluate for TypeSafe {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
             .with_context(|_| HealthCheckFailedSnafu)?;
 
-        if response.status().is_success() {
-            Ok(())
-        } else {
+        if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            Err(evaluate_api::Error::HealthCheckFailed {
+            return Err(evaluate_api::Error::HealthCheckFailed {
                 source: format!("HTTP {status}: {body}").into(),
-            })
+            });
         }
+
+        // A reachable endpoint is not the same as a usable model: without this, a typo
+        // such as `typesafe:jev-does-not-exist` loads Ready and fails every evaluation.
+        let listed = response
+            .json::<ModelsResponse>()
+            .await
+            .map(|parsed| parsed.into_names())
+            .unwrap_or_default();
+
+        // An empty or unreadable list is not evidence the model is missing, and a
+        // versioned pin is accepted by TypeSafe even when only aliases are listed.
+        if listed.is_empty() || is_version_pinned(&self.model_id) {
+            return Ok(());
+        }
+        if listed.iter().any(|name| name == &self.model_id) {
+            return Ok(());
+        }
+        Err(evaluate_api::Error::HealthCheckFailed {
+            source: format!(
+                "model '{}' is not offered by TypeSafe for this account (available: {}). Set `from:` to one of those, or to a versioned pin such as `typesafe:jev-1.13.0`. See: https://docs.typesafe.ai/models",
+                self.model_id,
+                listed.join(", ")
+            )
+            .into(),
+        })
     }
 }
 
@@ -293,14 +398,14 @@ mod tests {
         questions.insert(
             "is_urgent".to_string(),
             Question::Noul {
-                instructions: Some("Does this convey urgency?".into()),
+                instructions: "Does this convey urgency?".into(),
                 criteria: None,
             },
         );
         questions.insert(
             "department".to_string(),
             Question::Choice {
-                instructions: Some("Which team should handle this?".into()),
+                instructions: "Which team should handle this?".into(),
                 criteria: BTreeMap::from([
                     ("billing".into(), EntryType::from("Payments")),
                     ("technical".into(), EntryType::from("Bugs")),
@@ -311,7 +416,7 @@ mod tests {
         questions.insert(
             "frustration".to_string(),
             Question::Score {
-                instructions: Some("How frustrated is the customer?".into()),
+                instructions: "How frustrated is the customer?".into(),
                 criteria: vec!["Calm".into(), "Frustrated".into(), "Very angry".into()],
             },
         );
@@ -379,7 +484,7 @@ mod tests {
         questions.insert(
             "q".into(),
             Question::Noul {
-                instructions: Some("yes?".into()),
+                instructions: "yes?".into(),
                 criteria: None,
             },
         );
@@ -415,7 +520,7 @@ mod tests {
         questions.insert(
             "q".into(),
             Question::Noul {
-                instructions: Some("yes?".into()),
+                instructions: "yes?".into(),
                 criteria: None,
             },
         );
@@ -448,7 +553,7 @@ mod tests {
         questions.insert(
             "q".into(),
             Question::Noul {
-                instructions: Some("yes?".into()),
+                instructions: "yes?".into(),
                 criteria: None,
             },
         );
@@ -462,5 +567,115 @@ mod tests {
             .await
             .expect_err("404");
         assert!(matches!(err, evaluate_api::Error::ModelNotFound { .. }));
+    }
+    fn noul_question(id: &str) -> BTreeMap<String, Question> {
+        BTreeMap::from([(
+            id.to_string(),
+            Question::Noul {
+                instructions: "urgent?".into(),
+                criteria: None,
+            },
+        )])
+    }
+
+    async fn systemone_returning(server: &MockServer, body: serde_json::Value) {
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    /// A 200 that omits an answer is a wrong result, not a success.
+    #[tokio::test]
+    async fn evaluate_rejects_a_response_missing_an_answer() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"other": {"type": "noul", "noul": 0.5}}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: noul_question("q"),
+            })
+            .await
+            .expect_err("a missing answer must not be published as success");
+        let msg = err.to_string();
+        assert!(msg.contains("no answer for question(s): q"), "{msg}");
+    }
+
+    /// An answer of the wrong primitive is equally a wrong result.
+    #[tokio::test]
+    async fn evaluate_rejects_an_answer_of_the_wrong_kind() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "choice", "choice": "a",
+                "probabilities": {"a": 1.0}, "confidence": 0.9
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: noul_question("q"),
+            })
+            .await
+            .expect_err("a mismatched answer kind must not be published as success");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("is a noul question but the answer is a choice"),
+            "{msg}"
+        );
+    }
+
+    /// Health must reject a configured model the account cannot use, rather than
+    /// marking it Ready and failing every later evaluation.
+    #[tokio::test]
+    async fn health_rejects_a_model_the_account_does_not_have() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"models": [{"name": "jev-latest"}, {"name": "jev-preview"}]}),
+            ))
+            .mount(&server)
+            .await;
+
+        let bad = TypeSafe::try_new("jev", Some("jev-does-not-exist"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+        let err = bad
+            .health()
+            .await
+            .expect_err("unlisted model must fail health");
+        assert!(
+            err.to_string().contains("is not offered by TypeSafe"),
+            "{err}"
+        );
+
+        let good = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+        good.health().await.expect("a listed alias is healthy");
+
+        // TypeSafe accepts versioned pins that the listing need not advertise.
+        let pinned = TypeSafe::try_new("jev", Some("jev-1.13.0"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+        pinned.health().await.expect("a versioned pin is healthy");
     }
 }

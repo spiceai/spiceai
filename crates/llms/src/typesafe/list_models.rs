@@ -31,10 +31,17 @@ use super::DEFAULT_BASE_URL;
 const PROVIDER_NAME: &str = "TypeSafe";
 
 #[derive(Debug, Deserialize)]
-struct ModelsResponse {
+pub(super) struct ModelsResponse {
     /// `alias` accepts the OpenAI-style `{ "data": [...] }` envelope as well.
     #[serde(default, alias = "data")]
     models: Vec<ModelCard>,
+}
+
+impl ModelsResponse {
+    /// Model ids and aliases, one per listed entry.
+    pub(super) fn into_names(self) -> Vec<String> {
+        self.models.into_iter().map(|m| m.name).collect()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,7 +115,7 @@ impl ListModels for TypeSafeModelLister {
                     message: e.to_string(),
                 })?;
 
-        Ok(parsed.models.into_iter().map(|m| m.name).collect())
+        Ok(parsed.into_names())
     }
 }
 

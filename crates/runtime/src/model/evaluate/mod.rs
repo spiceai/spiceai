@@ -81,7 +81,7 @@ async fn typesafe(
             .await
             .map(|s| s.expose_secret().to_string())
             .ok_or_else(|| LlmError::FailedToLoadModel {
-                source: "No `typesafe_api_key` (or `typesafe_ai_api_key` / TYPESAFE_AI_API_KEY) provided for TypeSafe model. Set the param or export TYPESAFE_API_KEY.".into(),
+                source: "No TypeSafe API key provided. Set the `typesafe_api_key` param (alias `typesafe_ai_api_key`), or export one of TYPESAFE_API_KEY or TYPESAFE_AI_API_KEY. See: https://spiceai.org/docs/components/models".into(),
             })?
         }
     };
