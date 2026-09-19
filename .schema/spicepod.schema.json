@@ -487,10 +487,116 @@
         "prefix": "spiceai",
         "paramsRef": "#/$defs/SpiceaiModelParams",
         "schemaRef": "#/$defs/SpiceaiModel"
+      },
+      {
+        "name": "typesafe",
+        "prefix": "typesafe",
+        "paramsRef": "#/$defs/TypeSafeModelParams",
+        "schemaRef": "#/$defs/TypeSafeModel"
       }
     ]
   },
   "$defs": {
+    "TypeSafeModelParams": {
+      "title": "TypeSafeParams",
+      "type": "object",
+      "properties": {
+        "typesafe_api_key": {
+          "description": "TypeSafe API key. Autoloads from secret stores as typesafe_api_key (env TYPESAFE_API_KEY). Alias typesafe_ai_api_key / TYPESAFE_AI_API_KEY is also accepted.",
+          "type": "string",
+          "x-secret": true
+        },
+        "typesafe_ai_api_key": {
+          "description": "Alias for typesafe_api_key (AI SDK env TYPESAFE_AI_API_KEY).",
+          "type": "string",
+          "x-secret": true
+        },
+        "typesafe_endpoint": {
+          "description": "TypeSafe API base URL. Defaults to the direct API (https://api.typesafe.ai), not the Vercel AI gateway.",
+          "type": "string",
+          "default": "https://api.typesafe.ai",
+          "examples": [
+            "https://api.typesafe.ai"
+          ]
+        },
+        "max_concurrency": {
+          "description": "Maximum number of concurrent requests for this model. Overrides provider defaults.",
+          "type": "string"
+        },
+        "requests_per_minute_limit": {
+          "description": "Maximum requests per minute for this model. Overrides provider defaults.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TypeSafeModel": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/evaluate.",
+          "type": "string",
+          "pattern": "^typesafe($|:|/)"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Configuration parameters for the TypeSafe evaluation model provider.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TypeSafeModelParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ModelFile"
+          }
+        },
+        "datasets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
     "SpicepodVersion": {
       "description": "Spicepod schema version. Supported majors: v1, v2. Examples: 'v1', 'v2', 'v2.0', 'v2.0.0', 'v2.0.0-rc.1'.",
       "type": "string",
@@ -995,7 +1101,7 @@
       ]
     },
     "ClientAuthMode": {
-      "description": "How the runtime treats client certificates on the public TLS\nendpoints (HTTP, Flight, Metrics).\n\n`None` is the out-of-the-box default and disables client-cert\nauthentication entirely — the server runs `with_no_client_auth()`\nat the rustls layer and does not send a `CertificateRequest`. A\nnon-conforming client that nonetheless presents a cert is rejected\nby rustls as a protocol violation.\n\n`Request` opts in to *optional* mTLS: the server sends\n`CertificateRequest` and accepts both no-cert and cert-bearing\nhandshakes. Presented certs must be signed by\n`client_auth_ca` / `client_auth_ca_file` (an invalid cert is still\nrejected at the handshake). When a cert is presented it is\npromoted to the request's auth principal under\n`IdentitySource::Channel`; when absent the request runs as the\nanonymous principal. Useful for migration windows and for\naudit-only deployments where every cert seen should be recorded\nbut not enforced.\n\n`Required` enables strict mTLS: the server demands a valid client\ncert (verified against `client_auth_ca` / `client_auth_ca_file`)\nfor every connection on the Flight listener; on the HTTP and\nmetrics listeners the TLS handshake admits no-cert connections so\nKubernetes liveness / readiness probes and Prometheus scrapes work\nwithout a client cert, but the HTTP route layer 401s any\nnon-probe request whose connection has no verified client cert.\n\nWhether a presented cert *also* becomes the request's auth\nprincipal is determined separately by whether `runtime.auth` is\nconfigured — see the `IdentitySource` enum at the binary\nentrypoint. Briefly:\n\n- `client_auth_mode: required` and no `runtime.auth`\n  → mTLS-as-identity (the cert is the principal).\n- `client_auth_mode: required` plus `runtime.auth`\n  → mTLS-as-channel (the cert protects the channel; the\n  API key / OIDC token is the principal).",
+      "description": "How the runtime treats client certificates on the public TLS\nendpoints (HTTP, Flight, Metrics).\n\n`None` is the out-of-the-box default and disables client-cert\nauthentication entirely \u2014 the server runs `with_no_client_auth()`\nat the rustls layer and does not send a `CertificateRequest`. A\nnon-conforming client that nonetheless presents a cert is rejected\nby rustls as a protocol violation.\n\n`Request` opts in to *optional* mTLS: the server sends\n`CertificateRequest` and accepts both no-cert and cert-bearing\nhandshakes. Presented certs must be signed by\n`client_auth_ca` / `client_auth_ca_file` (an invalid cert is still\nrejected at the handshake). When a cert is presented it is\npromoted to the request's auth principal under\n`IdentitySource::Channel`; when absent the request runs as the\nanonymous principal. Useful for migration windows and for\naudit-only deployments where every cert seen should be recorded\nbut not enforced.\n\n`Required` enables strict mTLS: the server demands a valid client\ncert (verified against `client_auth_ca` / `client_auth_ca_file`)\nfor every connection on the Flight listener; on the HTTP and\nmetrics listeners the TLS handshake admits no-cert connections so\nKubernetes liveness / readiness probes and Prometheus scrapes work\nwithout a client cert, but the HTTP route layer 401s any\nnon-probe request whose connection has no verified client cert.\n\nWhether a presented cert *also* becomes the request's auth\nprincipal is determined separately by whether `runtime.auth` is\nconfigured \u2014 see the `IdentitySource` enum at the binary\nentrypoint. Briefly:\n\n- `client_auth_mode: required` and no `runtime.auth`\n  \u2192 mTLS-as-identity (the cert is the principal).\n- `client_auth_mode: required` plus `runtime.auth`\n  \u2192 mTLS-as-channel (the cert protects the channel; the\n  API key / OIDC token is the principal).",
       "type": "string",
       "enum": [
         "none",
@@ -1041,7 +1147,7 @@
           "default": {}
         },
         "metric_prefix": {
-          "description": "Optional prefix prepended to every exported metric name.\n\nUseful for namespacing Spice metrics in shared backends (e.g. Datadog,\nGrafana Cloud) so they don't collide with metrics from other services.\nFor example, with `metric_prefix: \"spiceai.\"` the runtime metric\n`query_duration_ms` is exported as `spiceai.query_duration_ms`.\n\nThe prefix is applied via an `OpenTelemetry` `View` on the runtime's\n`MeterProvider`, so it affects every metric reader attached to that\nprovider — the Prometheus scrape endpoint (`--metrics`), the cluster\non-demand OTLP reader, and the `otel_exporter` push reader.\n`OpenTelemetry` 0.31's SDK does not support per-reader name transforms,\nso this knob is intentionally placed at the telemetry level rather\nthan under any single exporter.\n\nValidated against the `OpenTelemetry` instrument name syntax so prefixed\nnames stay valid for OTLP backends and remain sanitizable to Prometheus\nlegacy names (`[a-zA-Z_:][a-zA-Z0-9_:]*`). Must start with an ASCII\nletter, contain only ASCII letters, digits, `_`, `.`, `-`, or `/`, and\nbe at most [`METRIC_PREFIX_MAX_LEN`] characters (128; ≥127 characters of\nheadroom remain under the 255-char `OpenTelemetry` instrument name\nlimit for the base metric name). A trailing `.` or `_` is recommended\n(e.g. `spiceai.`).\nSee: <https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix>",
+          "description": "Optional prefix prepended to every exported metric name.\n\nUseful for namespacing Spice metrics in shared backends (e.g. Datadog,\nGrafana Cloud) so they don't collide with metrics from other services.\nFor example, with `metric_prefix: \"spiceai.\"` the runtime metric\n`query_duration_ms` is exported as `spiceai.query_duration_ms`.\n\nThe prefix is applied via an `OpenTelemetry` `View` on the runtime's\n`MeterProvider`, so it affects every metric reader attached to that\nprovider \u2014 the Prometheus scrape endpoint (`--metrics`), the cluster\non-demand OTLP reader, and the `otel_exporter` push reader.\n`OpenTelemetry` 0.31's SDK does not support per-reader name transforms,\nso this knob is intentionally placed at the telemetry level rather\nthan under any single exporter.\n\nValidated against the `OpenTelemetry` instrument name syntax so prefixed\nnames stay valid for OTLP backends and remain sanitizable to Prometheus\nlegacy names (`[a-zA-Z_:][a-zA-Z0-9_:]*`). Must start with an ASCII\nletter, contain only ASCII letters, digits, `_`, `.`, `-`, or `/`, and\nbe at most [`METRIC_PREFIX_MAX_LEN`] characters (128; \u2265127 characters of\nheadroom remain under the 255-char `OpenTelemetry` instrument name\nlimit for the base metric name). A trailing `.` or `_` is recommended\n(e.g. `spiceai.`).\nSee: <https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix>",
           "type": [
             "string",
             "null"
@@ -1115,7 +1221,7 @@
       "description": "Aggregation temporality preference for the OTEL metrics push exporter.\n\nControls how counter and histogram values are encoded on the wire:\n\n- **`Delta`** (default): each export contains the change since the previous\n  export. Required by Datadog's OTLP intake and recommended by AWS\n  `CloudWatch`, New Relic, and most push-based `SaaS` backends. Aligns with the\n  `OpenTelemetry` guidance for push exporters.\n- **`Cumulative`**: each export carries the running total since process\n  start. Use this for `OTel` collectors that downstream into Prometheus or\n  other pull-based / cumulative-native backends.\n- **`LowMemory`**: counters use cumulative, histograms use delta. Reduces\n  the SDK's in-process state for histogram-heavy workloads.\n\nThis setting only affects the OTLP push exporter; the runtime's Prometheus\nscrape endpoint always exposes cumulative metrics regardless of this value.",
       "oneOf": [
         {
-          "description": "Delta temporality. Default — required by Datadog and recommended for\npush-based backends.",
+          "description": "Delta temporality. Default \u2014 required by Datadog and recommended for\npush-based backends.",
           "type": "string",
           "const": "delta"
         },
@@ -1430,7 +1536,7 @@
           "minimum": 0
         },
         "max_concurrent_queries": {
-          "description": "Bounds the number of query-executing plans that may run concurrently —\nordinary queries, DDL/DML, and `EXECUTE`; lightweight session-state\nstatements (`PREPARE`/`DEALLOCATE`/`SET`) are not gated. Excess plans wait\n(admission control) rather than oversubscribing the shared query runtime\nand memory pool and starving each other under load (e.g. analytical\nqueries alongside CDC ingestion and compaction). The permit is held for\nthe plan's full execution and result-streaming lifetime; a results-cache\nhit is never gated.\n\nUnset sizes the bound from the CPU budget (four plans per core). `0` opts\nout and leaves admission unbounded. Any other value is that limit.",
+          "description": "Bounds the number of query-executing plans that may run concurrently \u2014\nordinary queries, DDL/DML, and `EXECUTE`; lightweight session-state\nstatements (`PREPARE`/`DEALLOCATE`/`SET`) are not gated. Excess plans wait\n(admission control) rather than oversubscribing the shared query runtime\nand memory pool and starving each other under load (e.g. analytical\nqueries alongside CDC ingestion and compaction). The permit is held for\nthe plan's full execution and result-streaming lifetime; a results-cache\nhit is never gated.\n\nUnset sizes the bound from the CPU budget (four plans per core). `0` opts\nout and leaves admission unbounded. Any other value is that limit.",
           "type": [
             "integer",
             "null"
@@ -1471,7 +1577,7 @@
           "minimum": 0
         },
         "timeout": {
-          "description": "Maximum wall-clock duration a query may run before it is automatically\ncancelled, as a human-readable duration (e.g. `30s`, `5m`). The clock\ncovers the query's full lifetime: planning, admission-control waits\n(`max_concurrent_queries`), execution, and streaming results to the\nclient. Applies to queries issued through the runtime's query APIs\n(HTTP, Flight, Flight SQL); internal runtime queries (acceleration\nrefreshes, health checks) are exempt. Enforcement is cooperative\n(best-effort): the query is cancelled at its next cancellation\ncheckpoint, so actual runtime can slightly exceed the configured\nvalue. On expiry the query fails with a timeout error: HTTP 504 /\ngRPC `DEADLINE_EXCEEDED` when the timeout is observed before the\nresponse starts; once results are already streaming the status can\nno longer change, so the in-progress stream is terminated with the\nerror instead — data streamed before expiry will have been\ndelivered, but the stream never ends silently as if complete.\nUnset = no timeout.",
+          "description": "Maximum wall-clock duration a query may run before it is automatically\ncancelled, as a human-readable duration (e.g. `30s`, `5m`). The clock\ncovers the query's full lifetime: planning, admission-control waits\n(`max_concurrent_queries`), execution, and streaming results to the\nclient. Applies to queries issued through the runtime's query APIs\n(HTTP, Flight, Flight SQL); internal runtime queries (acceleration\nrefreshes, health checks) are exempt. Enforcement is cooperative\n(best-effort): the query is cancelled at its next cancellation\ncheckpoint, so actual runtime can slightly exceed the configured\nvalue. On expiry the query fails with a timeout error: HTTP 504 /\ngRPC `DEADLINE_EXCEEDED` when the timeout is observed before the\nresponse starts; once results are already streaming the status can\nno longer change, so the in-progress stream is terminated with the\nerror instead \u2014 data streamed before expiry will have been\ndelivered, but the stream never ends silently as if complete.\nUnset = no timeout.",
           "type": [
             "string",
             "null"
@@ -1492,7 +1598,7 @@
       "type": "object",
       "properties": {
         "cores": {
-          "description": "The CPU entitlement, as a Kubernetes CPU quantity: `4`, `3.5`, `3500m`.\n`auto` (the default) detects it. Applied at startup only — the thread\npools it sizes cannot be resized on a spicepod reload.",
+          "description": "The CPU entitlement, as a Kubernetes CPU quantity: `4`, `3.5`, `3500m`.\n`auto` (the default) detects it. Applied at startup only \u2014 the thread\npools it sizes cannot be resized on a spicepod reload.",
           "anyOf": [
             {
               "$ref": "#/$defs/CpuQuantity"
@@ -1506,7 +1612,7 @@
       "additionalProperties": false
     },
     "CpuQuantity": {
-      "description": "A CPU quantity, held verbatim so it can be echoed back in an error message.\n\nAccepts a YAML number (`cores: 4`, `cores: 3.5`) or a string\n(`cores: 3500m`, `cores: auto`); it always serializes as a string, so\n`--set-runtime cpu.cores=…` round-trips through YAML unchanged. Validation\nlives in `cpu_budget`, which is where the value is used.",
+      "description": "A CPU quantity, held verbatim so it can be echoed back in an error message.\n\nAccepts a YAML number (`cores: 4`, `cores: 3.5`) or a string\n(`cores: 3500m`, `cores: auto`); it always serializes as a string, so\n`--set-runtime cpu.cores=\u2026` round-trips through YAML unchanged. Validation\nlives in `cpu_budget`, which is where the value is used.",
       "type": "string"
     },
     "Metrics": {
@@ -1933,7 +2039,7 @@
       ]
     },
     "CatalogAcceleration": {
-      "description": "Acceleration configuration for an entire [`Catalog`]: bootstraps and\nCDC-accelerates every table the catalog connector discovers (subject to\n`include`/`exclude`), without per-table configuration.\n\nEach table is accelerated according to its source `REPLICA IDENTITY`:\n`DEFAULT` (primary key) and `USING INDEX` (a nominated unique index)\nreplicate normally, `FULL` replicates but is heavier (logged as a warning).\nA table with no usable CDC key (`NOTHING`, or `DEFAULT`/`FULL` without a key)\nis skipped with a warning and left out of the catalog's namespace, rather\nthan failing the whole catalog. Use `include`/`exclude` to narrow scope and\nsuppress the skip warning for tables you'll handle another way (federation\nand/or a per-dataset `refresh_mode: full`).\n\nDeliberately excludes per-table-only concepts (`primary_key`,\n`on_conflict`, `indexes`, per-table overrides) — those remain exclusively\non a dataset's own `acceleration` block.",
+      "description": "Acceleration configuration for an entire [`Catalog`]: bootstraps and\nCDC-accelerates every table the catalog connector discovers (subject to\n`include`/`exclude`), without per-table configuration.\n\nEach table is accelerated according to its source `REPLICA IDENTITY`:\n`DEFAULT` (primary key) and `USING INDEX` (a nominated unique index)\nreplicate normally, `FULL` replicates but is heavier (logged as a warning).\nA table with no usable CDC key (`NOTHING`, or `DEFAULT`/`FULL` without a key)\nis skipped with a warning and left out of the catalog's namespace, rather\nthan failing the whole catalog. Use `include`/`exclude` to narrow scope and\nsuppress the skip warning for tables you'll handle another way (federation\nand/or a per-dataset `refresh_mode: full`).\n\nDeliberately excludes per-table-only concepts (`primary_key`,\n`on_conflict`, `indexes`, per-table overrides) \u2014 those remain exclusively\non a dataset's own `acceleration` block.",
       "type": "object",
       "properties": {
         "engine": {
@@ -1945,7 +2051,7 @@
           "$ref": "#/$defs/CatalogRefreshMode"
         },
         "mode": {
-          "description": "Storage mode applied to every table this catalog accelerates, with the\nsame meaning as a dataset's `acceleration.mode`.\n\nDefaults to `memory`, which is **not durable**: nothing is written to\ndisk, so the accelerator starts empty on every restart and each table\nre-runs its initial snapshot from the source. Use a file mode (with\n`params.cayenne_file_path`) to keep the acceleration across restarts and\nresume from the replication slot instead of re-snapshotting.\n\nNot to be confused with `params.cayenne_cdc_durability: memory`, which\nkeeps a *file-backed* acceleration and only defers its durable write —\nCDC changes buffer in RAM but still drain to disk. `mode` decides whether\nthe acceleration is persisted at all; `cayenne_cdc_durability` decides\nwhen. For RAM-speed writes that survive a restart, use a file `mode`\ntogether with `cayenne_cdc_durability: memory`.",
+          "description": "Storage mode applied to every table this catalog accelerates, with the\nsame meaning as a dataset's `acceleration.mode`.\n\nDefaults to `memory`, which is **not durable**: nothing is written to\ndisk, so the accelerator starts empty on every restart and each table\nre-runs its initial snapshot from the source. Use a file mode (with\n`params.cayenne_file_path`) to keep the acceleration across restarts and\nresume from the replication slot instead of re-snapshotting.\n\nNot to be confused with `params.cayenne_cdc_durability: memory`, which\nkeeps a *file-backed* acceleration and only defers its durable write \u2014\nCDC changes buffer in RAM but still drain to disk. `mode` decides whether\nthe acceleration is persisted at all; `cayenne_cdc_durability` decides\nwhen. For RAM-speed writes that survive a restart, use a file `mode`\ntogether with `cayenne_cdc_durability: memory`.",
           "$ref": "#/$defs/Mode",
           "default": "memory"
         },
@@ -2847,7 +2953,7 @@
       }
     },
     "EmbeddingAggregation": {
-      "description": "Aggregation strategy applied when a multi-vector (list-typed) column\nis queried. Each list element produces its own embedding; at query\ntime the per-element similarities are combined into a single per-row\nscore using this aggregation.\n\n`Max` is the ColBERT-style `MaxSim` default — a row scores as high as\nits best-matching element.",
+      "description": "Aggregation strategy applied when a multi-vector (list-typed) column\nis queried. Each list element produces its own embedding; at query\ntime the per-element similarities are combined into a single per-row\nscore using this aggregation.\n\n`Max` is the ColBERT-style `MaxSim` default \u2014 a row scores as high as\nits best-matching element.",
       "type": "string",
       "enum": [
         "max",
@@ -3429,7 +3535,7 @@
           }
         },
         "filter_sql": {
-          "description": "Optional SQL row predicate (a `WHERE` expression over the dataset's\ncolumns, e.g. `ol_delivery_d > '2007-01-02'`) selecting which rows\ncontribute to the view. When set, an accelerator that supports it\nmaintains the aggregate over only the matching rows and serves a query\ncarrying the identical predicate from that maintained state — letting a\nfiltered analytical query (the common dashboard shape) be answered from\nthe incrementally-maintained view instead of a full re-scan.",
+          "description": "Optional SQL row predicate (a `WHERE` expression over the dataset's\ncolumns, e.g. `ol_delivery_d > '2007-01-02'`) selecting which rows\ncontribute to the view. When set, an accelerator that supports it\nmaintains the aggregate over only the matching rows and serves a query\ncarrying the identical predicate from that maintained state \u2014 letting a\nfiltered analytical query (the common dashboard shape) be answered from\nthe incrementally-maintained view instead of a full re-scan.",
           "type": [
             "string",
             "null"
@@ -3474,7 +3580,7 @@
           "const": "min"
         },
         {
-          "description": "`MAX(column)` — mirror of [`Self::Min`].",
+          "description": "`MAX(column)` \u2014 mirror of [`Self::Min`].",
           "type": "string",
           "const": "max"
         }
@@ -3773,7 +3879,7 @@
           ]
         },
         "params": {
-          "description": "Engine-specific connection parameters.\n\nFor `engine: elasticsearch`:\n- `endpoint` (required) — Elasticsearch cluster URL, e.g. `https://localhost:9200`\n- `index` (optional) — ES index name; defaults to the dataset name\n- `user` / `pass` (optional) — HTTP Basic Auth credentials\n- `client_timeout` / `connect_timeout` (optional) — timeout durations, e.g. `30s`",
+          "description": "Engine-specific connection parameters.\n\nFor `engine: elasticsearch`:\n- `endpoint` (required) \u2014 Elasticsearch cluster URL, e.g. `https://localhost:9200`\n- `index` (optional) \u2014 ES index name; defaults to the dataset name\n- `user` / `pass` (optional) \u2014 HTTP Basic Auth credentials\n- `client_timeout` / `connect_timeout` (optional) \u2014 timeout durations, e.g. `30s`",
           "anyOf": [
             {
               "$ref": "#/$defs/Params"
@@ -4078,6 +4184,18 @@
           "then": {
             "$ref": "#/$defs/SpiceaiModel"
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^typesafe($|:|/)"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/TypeSafeModel"
+          }
         }
       ]
     },
@@ -4292,7 +4410,7 @@
           ]
         },
         "as_sql": {
-          "description": "Whether this tool is also callable as a SQL UDF. Defaults to\n`false`; set to `true` to also register a `DataFusion` `ScalarUDF`\nthat invokes this tool per-row.\n\nRequires [`Self::signature`] to be set with typed Arrow arg /\nreturn types — a tool's free-form JSON Schema does not uniquely\nmap to a SQL signature, so the author must pin types explicitly.\nAlso requires `runtime.functions.enabled: true`.",
+          "description": "Whether this tool is also callable as a SQL UDF. Defaults to\n`false`; set to `true` to also register a `DataFusion` `ScalarUDF`\nthat invokes this tool per-row.\n\nRequires [`Self::signature`] to be set with typed Arrow arg /\nreturn types \u2014 a tool's free-form JSON Schema does not uniquely\nmap to a SQL signature, so the author must pin types explicitly.\nAlso requires `runtime.functions.enabled: true`.",
           "type": "boolean",
           "default": false
         },
@@ -4550,7 +4668,7 @@
           "default": "scalar"
         },
         "volatility": {
-          "description": "Volatility class — governs caching, acceleration pushdown, and\nwhether the optimizer may evaluate the function at plan time.\nDefaults to [`Volatility::Volatile`] — the safe choice.",
+          "description": "Volatility class \u2014 governs caching, acceleration pushdown, and\nwhether the optimizer may evaluate the function at plan time.\nDefaults to [`Volatility::Volatile`] \u2014 the safe choice.",
           "$ref": "#/$defs/Volatility",
           "default": "volatile"
         },
@@ -4601,7 +4719,7 @@
           ]
         },
         "as_tool": {
-          "description": "Whether this scalar function is also exposed as an LLM tool. Defaults\nto `true` — scalar functions automatically become callable both via SQL\n(`SELECT my_fn(x)`) and via the tool registry (LLM tool-calling,\n`POST /v1/tools/<name>`, `/v1/tools` listing). Table functions are\nalways SQL-only.\n\nSet to `false` to keep the function SQL-only.",
+          "description": "Whether this scalar function is also exposed as an LLM tool. Defaults\nto `true` \u2014 scalar functions automatically become callable both via SQL\n(`SELECT my_fn(x)`) and via the tool registry (LLM tool-calling,\n`POST /v1/tools/<name>`, `/v1/tools` listing). Table functions are\nalways SQL-only.\n\nSet to `false` to keep the function SQL-only.",
           "type": "boolean",
           "default": true
         }
@@ -4622,7 +4740,7 @@
       ]
     },
     "Volatility": {
-      "description": "Function volatility — mirrors [`datafusion_expr::Volatility`].\n\nThe default is [`Volatility::Volatile`] because it is the safest:\nvolatile functions are never constant-folded, never cached, and never\npushed across distributed executors without pinning. Authors opt into\nstronger guarantees explicitly by declaring `immutable` or `stable`.",
+      "description": "Function volatility \u2014 mirrors [`datafusion_expr::Volatility`].\n\nThe default is [`Volatility::Volatile`] because it is the safest:\nvolatile functions are never constant-folded, never cached, and never\npushed across distributed executors without pinning. Authors opt into\nstronger guarantees explicitly by declaring `immutable` or `stable`.",
       "oneOf": [
         {
           "description": "Same inputs always yield the same output (e.g. `abs`, `upper`). Safe\nto constant-fold and cache.",
@@ -5134,7 +5252,7 @@
           ]
         },
         "client_timeout": {
-          "description": "HTTP client request timeout. In 'delta_lake' mode, applies to the object store client. In 'sql_warehouse' mode, applies per-HTTP-call (statement submit, status poll, chunk fetch) — set to the longest expected single call, not total query duration. Accepts durations like '30s' or '5m'. Default: 30s.",
+          "description": "HTTP client request timeout. In 'delta_lake' mode, applies to the object store client. In 'sql_warehouse' mode, applies per-HTTP-call (statement submit, status poll, chunk fetch) \u2014 set to the longest expected single call, not total query duration. Accepts durations like '30s' or '5m'. Default: 30s.",
           "type": "string"
         },
         "connect_timeout": {
@@ -6826,7 +6944,7 @@
           "type": "string"
         },
         "auth_grant_type": {
-          "description": "OAuth2 grant type: 'refresh_token' (default, RFC 6749 §6) or 'client_credentials' (RFC 6749 §4.4). client_credentials authenticates with client_id/client_secret and issues no refresh token, re-exchanging before expiry (e.g. Shopify Admin API).",
+          "description": "OAuth2 grant type: 'refresh_token' (default, RFC 6749 \u00a76) or 'client_credentials' (RFC 6749 \u00a74.4). client_credentials authenticates with client_id/client_secret and issues no refresh token, re-exchanging before expiry (e.g. Shopify Admin API).",
           "type": "string",
           "enum": [
             "refresh_token",
@@ -6857,7 +6975,7 @@
           "type": "string"
         },
         "auth_client_auth": {
-          "description": "How client credentials are sent to the token endpoint: 'basic' (HTTP Basic header, default per RFC 6749 §2.3.1) or 'body' (client_id/client_secret in the form body). Case-insensitive.",
+          "description": "How client credentials are sent to the token endpoint: 'basic' (HTTP Basic header, default per RFC 6749 \u00a72.3.1) or 'body' (client_id/client_secret in the form body). Case-insensitive.",
           "type": "string"
         },
         "max_concurrent_requests": {
@@ -7188,7 +7306,7 @@
           "type": "string"
         },
         "auth_grant_type": {
-          "description": "OAuth2 grant type: 'refresh_token' (default, RFC 6749 §6) or 'client_credentials' (RFC 6749 §4.4). client_credentials authenticates with client_id/client_secret and issues no refresh token, re-exchanging before expiry (e.g. Shopify Admin API).",
+          "description": "OAuth2 grant type: 'refresh_token' (default, RFC 6749 \u00a76) or 'client_credentials' (RFC 6749 \u00a74.4). client_credentials authenticates with client_id/client_secret and issues no refresh token, re-exchanging before expiry (e.g. Shopify Admin API).",
           "type": "string",
           "enum": [
             "refresh_token",
@@ -7219,7 +7337,7 @@
           "type": "string"
         },
         "auth_client_auth": {
-          "description": "How client credentials are sent to the token endpoint: 'basic' (HTTP Basic header, default per RFC 6749 §2.3.1) or 'body' (client_id/client_secret in the form body). Case-insensitive.",
+          "description": "How client credentials are sent to the token endpoint: 'basic' (HTTP Basic header, default per RFC 6749 \u00a72.3.1) or 'body' (client_id/client_secret in the form body). Case-insensitive.",
           "type": "string"
         },
         "max_concurrent_requests": {
@@ -7924,7 +8042,7 @@
           "type": "string"
         },
         "pg_connection_pool_min_idle": {
-          "description": "The minimum number of idle connections to keep open in the pool. Default: 1 (0 for `refresh_mode: changes` datasets, which use the pool only for schema probes — replication runs over dedicated connections).\n\nSee: https://spiceai.org/docs/components/data-connectors/postgres",
+          "description": "The minimum number of idle connections to keep open in the pool. Default: 1 (0 for `refresh_mode: changes` datasets, which use the pool only for schema probes \u2014 replication runs over dedicated connections).\n\nSee: https://spiceai.org/docs/components/data-connectors/postgres",
           "type": "string",
           "default": "1"
         },
@@ -8991,7 +9109,7 @@
           ]
         },
         "cayenne_datalake_location": {
-          "description": "Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background tiering loop moves warm local-disk data to read-optimized, Hilbert-clustered Vortex files on this store, and queries span warm + datalake with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported.",
+          "description": "Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' \u2014 the storage-cascade bottom tier. When set, a background tiering loop moves warm local-disk data to read-optimized, Hilbert-clustered Vortex files on this store, and queries span warm + datalake with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported.",
           "type": "string"
         },
         "cayenne_cluster_by": {
@@ -9126,7 +9244,7 @@
           "type": "string"
         },
         "cayenne_write_concurrency": {
-          "description": "Writer partition override (parallel encoders) for unsorted Cayenne ingests. 'auto' (or unset) uses a small fixed default of 4, capped at the runtime's CPU budget (= runtime.query.target_partitions) and the process-global encode budget — deliberately not the full core count, because each table is sized independently and the per-table values sum across tables under concurrent CDC. Raise it explicitly for a table that needs more encode parallelism.",
+          "description": "Writer partition override (parallel encoders) for unsorted Cayenne ingests. 'auto' (or unset) uses a small fixed default of 4, capped at the runtime's CPU budget (= runtime.query.target_partitions) and the process-global encode budget \u2014 deliberately not the full core count, because each table is sized independently and the per-table values sum across tables under concurrent CDC. Raise it explicitly for a table that needs more encode parallelism.",
           "type": "string"
         },
         "cayenne_compaction_trigger_files": {
@@ -9156,7 +9274,7 @@
           "default": "32"
         },
         "cayenne_compaction_background_interval_ms": {
-          "description": "Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 10000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 30000 otherwise.",
+          "description": "Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task \u2014 inline compaction on writes still runs. Default: 10000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 30000 otherwise.",
           "type": "string"
         },
         "cayenne_inline_max_rows": {
@@ -9193,7 +9311,7 @@
           ]
         },
         "cayenne_cdc_mem_tier_max_bytes": {
-          "description": "Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. Auto-derived from host memory (~1/64 of RAM, clamped to 256 MiB - 1 GiB; 256 MiB on hosts at or under 16 GiB) — a rare backstop now that the non-fence-blocking background checkpointer is the primary flush. Set 0 to disable the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill.",
+          "description": "Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. Auto-derived from host memory (~1/64 of RAM, clamped to 256 MiB - 1 GiB; 256 MiB on hosts at or under 16 GiB) \u2014 a rare backstop now that the non-fence-blocking background checkpointer is the primary flush. Set 0 to disable the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill.",
           "type": "string"
         },
         "cayenne_cdc_mem_tier_max_age_ms": {
@@ -9209,11 +9327,11 @@
           "type": "string"
         },
         "cayenne_cdc_mem_tier_shards": {
-          "description": "Number of PK-hash shards the in-RAM CDC tier is partitioned into, in cdc_durability: memory mode only (non-partitioned, key-based merge-on-read tables). Each shard is an independent serial validate->append domain keyed by the RowConverter OwnedRow bytes, so disjoint keys validate and append in parallel within one apply (intra-apply fan-out) while a key's whole version history — upserts AND delete tombstones — stays confined to its one owning shard (last-writer-wins preserved). Checkpoints are always all-shards-atomic on a single source-position axis. Default 1 (the byte-identical serial path). Raise (e.g. 4) on update/insert-heavy CDC tables to lift the per-apply serialization ceiling.",
+          "description": "Number of PK-hash shards the in-RAM CDC tier is partitioned into, in cdc_durability: memory mode only (non-partitioned, key-based merge-on-read tables). Each shard is an independent serial validate->append domain keyed by the RowConverter OwnedRow bytes, so disjoint keys validate and append in parallel within one apply (intra-apply fan-out) while a key's whole version history \u2014 upserts AND delete tombstones \u2014 stays confined to its one owning shard (last-writer-wins preserved). Checkpoints are always all-shards-atomic on a single source-position axis. Default 1 (the byte-identical serial path). Raise (e.g. 4) on update/insert-heavy CDC tables to lift the per-apply serialization ceiling.",
           "type": "string"
         },
         "cayenne_tuning": {
-          "description": "Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'auto' — except that a configured cayenne_goal_* SLO implies 'adaptive' unless you set 'auto' explicitly. Set 'cayenne_tuning: adaptive' explicitly to enable the closed loop without a goal. Schema inference is always attempted and sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for it — without inferred metadata the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).",
+          "description": "Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) \u2014 no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'auto' \u2014 except that a configured cayenne_goal_* SLO implies 'adaptive' unless you set 'auto' explicitly. Set 'cayenne_tuning: adaptive' explicitly to enable the closed loop without a goal. Schema inference is always attempted and sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for it \u2014 without inferred metadata the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).",
           "type": "string",
           "enum": [
             "auto",
@@ -9225,7 +9343,7 @@
           "type": "string"
         },
         "cayenne_goal_freshness": {
-          "description": "Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s'). Settable globally at runtime.params and overridden here per-dataset.",
+          "description": "Goal-driven adaptive tuning: target data freshness \u2014 age of the newest queryable data \u2014 as a duration (e.g. '30s'). Settable globally at runtime.params and overridden here per-dataset.",
           "type": "string"
         },
         "cayenne_goal_query_latency": {
@@ -9233,7 +9351,7 @@
           "type": "string"
         },
         "cayenne_goal_convergence_window": {
-          "description": "Advanced: the control-loop pacing window — the time budget over which the loop steps toward the configured cayenne_goal_* SLOs, as a duration (e.g. '1m'). Default 60s. This paces HOW fast the loop chases the goals, not a target outcome; it is a per-dataset knob, not part of the global SLO surface.",
+          "description": "Advanced: the control-loop pacing window \u2014 the time budget over which the loop steps toward the configured cayenne_goal_* SLOs, as a duration (e.g. '1m'). Default 60s. This paces HOW fast the loop chases the goals, not a target outcome; it is a per-dataset knob, not part of the global SLO surface.",
           "type": "string"
         },
         "cdc_prefetch_buffer": {
@@ -9641,7 +9759,7 @@
           "default": "spark_connect"
         },
         "client_timeout": {
-          "description": "HTTP client request timeout. In 'delta_lake' mode, applies to the object store client. In 'sql_warehouse' mode, applies per-HTTP-call (statement submit, status poll, chunk fetch) — set to the longest expected single call, not total query duration. Accepts durations like '30s' or '5m'. Default: 30s.",
+          "description": "HTTP client request timeout. In 'delta_lake' mode, applies to the object store client. In 'sql_warehouse' mode, applies per-HTTP-call (statement submit, status poll, chunk fetch) \u2014 set to the longest expected single call, not total query duration. Accepts durations like '30s' or '5m'. Default: 30s.",
           "type": "string"
         },
         "connect_timeout": {

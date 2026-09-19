@@ -342,7 +342,7 @@
           "Datasets"
         ],
         "summary": "Refresh Dataset",
-        "description": "Trigger an on-demand refresh for an accelerated dataset.\n\nThe refresh only applies to `full` and `append` refresh modes (not\n`changes` mode). Datasets without acceleration return 400 — the\nprevious `load: on_demand` flow has been removed; deferred datasets\n(declared schema + `ready_state: on_registration`) are materialised\nautomatically on first query and do not need a manual trigger.",
+        "description": "Trigger an on-demand refresh for an accelerated dataset.\n\nThe refresh only applies to `full` and `append` refresh modes (not\n`changes` mode). Datasets without acceleration return 400 \u2014 the\nprevious `load: on_demand` flow has been removed; deferred datasets\n(declared schema + `ready_state: on_registration`) are materialised\nautomatically on first query and do not need a manual trigger.",
         "operationId": "post_dataset_refresh",
         "parameters": [
           {
@@ -433,13 +433,13 @@
           "Datasets"
         ],
         "summary": "Ingest Debezium CDC changes",
-        "description": "Push Debezium change events (JSON or Avro) directly into an accelerated\ndataset configured with `from: cdc:…` and `refresh_mode: changes`. No Kafka\nis required — use this as a Debezium Server / Embedded Engine sink.",
+        "description": "Push Debezium change events (JSON or Avro) directly into an accelerated\ndataset configured with `from: cdc:\u2026` and `refresh_mode: changes`. No Kafka\nis required \u2014 use this as a Debezium Server / Embedded Engine sink.",
         "operationId": "post_dataset_cdc",
         "parameters": [
           {
             "name": "name",
             "in": "path",
-            "description": "Dataset name (must match a `from: cdc:…` dataset)",
+            "description": "Dataset name (must match a `from: cdc:\u2026` dataset)",
             "required": true,
             "schema": {
               "type": "string"
@@ -1589,7 +1589,7 @@
           {
             "name": "min_ready_executors",
             "in": "query",
-            "description": "Minimum number of currently-ready executors required for the probe to succeed. \"Ready\"\nmeans the scheduler has a live `FlightSQL` client for the executor — i.e. it can route\nqueries to it. A value of `0` is treated as \"gate disabled\" and never blocks. Requires\nscheduler role; supplying a non-zero value outside scheduler role returns `400`.",
+            "description": "Minimum number of currently-ready executors required for the probe to succeed. \"Ready\"\nmeans the scheduler has a live `FlightSQL` client for the executor \u2014 i.e. it can route\nqueries to it. A value of `0` is treated as \"gate disabled\" and never blocks. Requires\nscheduler role; supplying a non-zero value outside scheduler role returns `400`.",
             "required": false,
             "schema": {
               "type": [
@@ -2509,6 +2509,95 @@
             }
           }
         }
+      }
+    },
+    "/v1/evaluate": {
+      "post": {
+        "tags": [
+          "AI"
+        ],
+        "operationId": "post_evaluate",
+        "summary": "Evaluate",
+        "description": "Evaluate unstructured `state` against a map of typed System One questions (noul / choice / score). Returns structured answers with calibrated probabilities and confidence. Chat completions are not supported for these models \u2014 use this endpoint instead of `/v1/chat/completions`.",
+        "requestBody": {
+          "description": "System One evaluation request (`model`, `state`, typed `questions`)",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvaluateRequest"
+              },
+              "example": {
+                "model": "jev",
+                "state": "Help! My payouts have been failing for 3 days.",
+                "questions": {
+                  "is_urgent": {
+                    "type": "noul",
+                    "instructions": "Does this convey urgency?"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Evaluation succeeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvaluateResponse"
+                },
+                "example": {
+                  "model": "jev-1.13.0",
+                  "answers": {
+                    "is_urgent": {
+                      "type": "noul",
+                      "noul": 0.92
+                    }
+                  },
+                  "usage": {
+                    "input_tokens": 312,
+                    "output_tokens": 48
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Upstream authentication failed"
+          },
+          "403": {
+            "description": "Upstream permission denied"
+          },
+          "404": {
+            "description": "Model not found"
+          },
+          "429": {
+            "description": "Rate limited"
+          },
+          "500": {
+            "description": "Evaluation failed"
+          },
+          "422": {
+            "description": "Malformed JSON request body (Axum Json extractor)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
       }
     }
   },
@@ -5080,7 +5169,7 @@
             }
           }
         ],
-        "description": "Represents all user‐triggered actions."
+        "description": "Represents all user\u2010triggered actions."
       },
       "ComputerCallOutputItemParam": {
         "type": "object",
@@ -12980,6 +13069,339 @@
             "description": "The type of the response (always `list`)"
           }
         }
+      },
+      "EntryType": {
+        "description": "TypeSafe EntryType: string, object, array, or null.",
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": true
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "NoulCriteria": {
+        "type": "object",
+        "properties": {
+          "true": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EntryType"
+              }
+            ],
+            "nullable": true
+          },
+          "false": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EntryType"
+              }
+            ],
+            "nullable": true
+          }
+        }
+      },
+      "Question": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "noul"
+                ]
+              },
+              "instructions": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/EntryType"
+                  }
+                ],
+                "nullable": true
+              },
+              "criteria": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/NoulCriteria"
+                  }
+                ],
+                "nullable": true
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type",
+              "criteria"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "choice"
+                ]
+              },
+              "instructions": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/EntryType"
+                  }
+                ],
+                "nullable": true
+              },
+              "criteria": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/EntryType"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type",
+              "criteria"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "score"
+                ]
+              },
+              "instructions": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/EntryType"
+                  }
+                ],
+                "nullable": true
+              },
+              "criteria": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/NonNullEntry"
+                },
+                "minItems": 1
+              }
+            }
+          }
+        ],
+        "discriminator": {
+          "propertyName": "type"
+        }
+      },
+      "EvaluateRequest": {
+        "type": "object",
+        "required": [
+          "model",
+          "state",
+          "questions"
+        ],
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "Spicepod model name"
+          },
+          "state": {
+            "$ref": "#/components/schemas/EvaluateState"
+          },
+          "questions": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Question"
+            },
+            "description": "Typed questions keyed by caller-selected identifiers"
+          }
+        }
+      },
+      "Answer": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "type",
+              "noul"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "noul"
+                ]
+              },
+              "noul": {
+                "type": "number",
+                "format": "double"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type",
+              "choice",
+              "probabilities",
+              "confidence"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "choice"
+                ]
+              },
+              "choice": {
+                "type": "string"
+              },
+              "probabilities": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "number",
+                  "format": "double"
+                }
+              },
+              "confidence": {
+                "type": "number",
+                "format": "double"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type",
+              "score",
+              "legend",
+              "probabilities",
+              "confidence"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "score"
+                ]
+              },
+              "score": {
+                "type": "number",
+                "format": "double"
+              },
+              "legend": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/EntryType"
+                }
+              },
+              "probabilities": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "number",
+                  "format": "double"
+                }
+              },
+              "confidence": {
+                "type": "number",
+                "format": "double"
+              }
+            }
+          }
+        ],
+        "discriminator": {
+          "propertyName": "type"
+        }
+      },
+      "Usage": {
+        "type": "object",
+        "required": [
+          "input_tokens",
+          "output_tokens"
+        ],
+        "properties": {
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "EvaluateResponse": {
+        "type": "object",
+        "required": [
+          "model",
+          "answers"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "answers": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Answer"
+            }
+          },
+          "usage": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Usage"
+              }
+            ],
+            "nullable": true
+          }
+        }
+      },
+      "EvaluateState": {
+        "description": "Evaluation state: string, object, or array.",
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": true
+          }
+        ]
+      },
+      "NonNullEntry": {
+        "description": "Non-null EntryType: string, object, or array (score rubric levels).",
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": true
+          }
+        ]
       }
     }
   },

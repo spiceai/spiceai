@@ -92,6 +92,7 @@ pub enum ModelSource {
     File,
     Databricks,
     Bedrock,
+    TypeSafe,
 }
 
 /// The prefixes that select [`ModelSource::SpiceAI`]. `spice.ai` matches how the Spice.ai Cloud
@@ -226,6 +227,12 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::Databricks)
         } else if value.starts_with("bedrock") {
             Ok(ModelSource::Bedrock)
+        } else if value == "typesafe"
+            || value.starts_with("typesafe:")
+            || value.starts_with("typesafe/")
+        {
+            // Bare / colon / slash forms; schema pattern `^typesafe($|:|/)` matches these.
+            Ok(ModelSource::TypeSafe)
         } else {
             Err("Unknown prefix")
         }
@@ -246,6 +253,7 @@ impl Display for ModelSource {
             ModelSource::SpiceAI => write!(f, "spiceai"),
             ModelSource::Databricks => write!(f, "databricks"),
             ModelSource::Bedrock => write!(f, "bedrock"),
+            ModelSource::TypeSafe => write!(f, "typesafe"),
         }
     }
 }
@@ -264,6 +272,7 @@ impl ModelSource {
             ModelSource::SpiceAI => "spiceai",
             ModelSource::Databricks => "databricks",
             ModelSource::Bedrock => "bedrock",
+            ModelSource::TypeSafe => "typesafe",
         }
     }
 }
@@ -492,6 +501,52 @@ pub(crate) fn is_llm_file(p: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn typesafe_from_parses_jev_aliases() {
+        for from in [
+            "typesafe",
+            "typesafe:",
+            "typesafe/",
+            "typesafe:jev",
+            "typesafe/jev",
+            "typesafe:jev-latest",
+            "typesafe:jev-preview",
+            "typesafe:jev-1.13.0",
+        ] {
+            let model = Model::new(from, "jev");
+            assert_eq!(
+                model.get_source(),
+                Some(ModelSource::TypeSafe),
+                "expected TypeSafe for {from}"
+            );
+        }
+        assert_eq!(
+            Model::new("typesafe:jev", "jev").get_model_id().as_deref(),
+            Some("jev")
+        );
+        assert_eq!(
+            Model::new("typesafe/jev", "jev").get_model_id().as_deref(),
+            Some("jev")
+        );
+        assert_eq!(Model::new("typesafe", "jev").get_model_id(), None);
+        // Bare separator forms yield an empty id today (caller normalizes to jev-latest).
+        assert_eq!(
+            Model::new("typesafe:", "jev").get_model_id().as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            Model::new("typesafe/", "jev").get_model_id().as_deref(),
+            Some("")
+        );
+
+        // Require a complete `typesafe` / `typesafe:` / `typesafe/` prefix — do not
+        // accept lookalikes such as `typesafely:…`.
+        let lookalike = Model::new("typesafely:jev", "jev");
+        assert_eq!(lookalike.get_source(), None);
+        assert_eq!(lookalike.get_model_id(), None);
+    }
+
     use super::*;
 
     #[test]

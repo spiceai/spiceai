@@ -122,6 +122,11 @@ pub enum Error {
     ))]
     UnsupportedTaskForModel { from: String, task: String },
 
+    #[snafu(display(
+        "Model '{model}' is an evaluation model and does not support chat completions. Use POST /v1/evaluate with `state` and typed `questions` instead. See: https://spiceai.org/docs/components/models/typesafe"
+    ))]
+    EvaluateOnlyModel { model: String },
+
     #[snafu(display("Invalid value for parameter {param}. {message}"))]
     InvalidParamValueError { param: String, message: String },
 
@@ -476,5 +481,27 @@ pub trait Chat: Sync + Send {
             usage: None,
             service_tier: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The only place this wording lives; `/v1/chat/completions` renders this variant
+    /// rather than composing its own sentence.
+    #[test]
+    fn evaluate_only_model_names_the_endpoint_to_use() {
+        let message = Error::EvaluateOnlyModel {
+            model: "jev".to_string(),
+        }
+        .to_string();
+        assert!(message.contains("'jev'"), "{message}");
+        assert!(message.contains("POST /v1/evaluate"), "{message}");
+        assert!(
+            message.contains("does not support chat completions"),
+            "{message}"
+        );
+        assert!(message.contains("https://spiceai.org/docs"), "{message}");
     }
 }

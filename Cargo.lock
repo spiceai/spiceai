@@ -8210,6 +8210,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "evaluate-api"
+version = "2.4.0-unstable"
+dependencies = [
+ "async-trait",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "utoipa",
+]
+
+[[package]]
 name = "event-listener"
 version = "2.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11739,6 +11752,7 @@ dependencies = [
  "dotenv 2.4.0-unstable",
  "either",
  "embed-api",
+ "evaluate-api",
  "futures",
  "google-genai",
  "governor",
@@ -11777,6 +11791,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "util",
+ "wiremock",
 ]
 
 [[package]]
@@ -17204,6 +17219,7 @@ dependencies = [
  "duckdb",
  "duration-parse",
  "elasticsearch",
+ "evaluate-api",
  "event_stream",
  "flight_client",
  "fundu",
