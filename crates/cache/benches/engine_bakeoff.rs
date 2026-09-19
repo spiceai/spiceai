@@ -227,6 +227,11 @@ fn run_mixed<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
 }
 
 /// Sorted-sample percentile of individual get latencies (nanoseconds).
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "sample counts are bench-sized; a rank is clamped to the slice below"
+)]
 fn percentile_ns(sorted: &[u64], p: f64) -> u64 {
     if sorted.is_empty() {
         return 0;
@@ -278,6 +283,10 @@ fn measure_hit70_latency<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
     }
     let wall = wall_start.elapsed().as_secs_f64().max(1e-9);
     all.sort_unstable();
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "bench op counts are far below f64's 53-bit exact range"
+    )]
     let total_ops = (threads * OPERATIONS_PER_THREAD) as f64;
     Hit70Latency {
         mops: (total_ops / wall) / 1_000_000.0,
@@ -339,7 +348,7 @@ fn bench_id(engine: &str, threads: usize) -> BenchmarkId {
     BenchmarkId::new(engine, threads)
 }
 
-/// Headline bakeoff: ~70% hit / 30% miss. Spice LRU + LFU + TinyLFU vs Moka LRU
+/// Headline bakeoff: ~70% hit / 30% miss. Spice LRU + LFU + `TinyLFU` vs Moka LRU
 /// vs Pingora.
 fn bench_concurrent_get_hit70(c: &mut Criterion) {
     let mut group = c.benchmark_group("engine_bakeoff_get_hit70");

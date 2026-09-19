@@ -659,11 +659,11 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
 
         if !total_over {
             // Drain window toward its cap without discarding anyone.
-            return self.promote_window_key(cand_shard, cand_key);
+            return self.promote_window_tail(cand_shard, cand_key);
         }
 
         match victim {
-            None => self.promote_window_key(cand_shard, cand_key),
+            None => self.promote_window_tail(cand_shard, cand_key),
             Some((vic_shard, vic_key, vic_freq)) => {
                 if cand_freq >= vic_freq {
                     // Evict victim, then promote candidate into probation.
@@ -684,13 +684,38 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
                     true
                 } else if cand_key == vic_key {
                     // Same entry cannot be both; just promote.
-                    self.promote_window_key(cand_shard, cand_key)
+                    self.promote_window_tail(cand_shard, cand_key)
                 } else {
                     // Reject the window candidate.
                     self.remove_tail_for_size(cand_shard, cand_key, shard::Region::Window, evicted)
                 }
             }
         }
+    }
+
+    /// Move a window resident into probation, re-snapshotting the window tail
+    /// when a concurrent hit moves `key` off it.
+    ///
+    /// [`Self::promote_window_key`] refuses a stale snapshot so the caller can
+    /// retry. Handing that `false` straight back to [`Self::evict_to_limit`]
+    /// reads as "no progress" and breaks the trim loop, leaving the window
+    /// above `window_cap` until some later operation happens to trim it. Retry
+    /// against the current tail instead, bounded by the shard count.
+    fn promote_window_tail(&self, shard_idx: usize, key: u64) -> bool {
+        if self.promote_window_key(shard_idx, key) {
+            return true;
+        }
+        for _ in 0..NUM_SHARDS {
+            let Some((next_shard, next_key, _)) =
+                self.lowest_freq_region_tail(shard::Region::Window)
+            else {
+                return false;
+            };
+            if self.promote_window_key(next_shard, next_key) {
+                return true;
+            }
+        }
+        false
     }
 
     fn promote_window_key(&self, shard_idx: usize, key: u64) -> bool {
@@ -1977,6 +2002,53 @@ mod tests {
         assert!(cache.get(&0).is_none(), "LFU must evict the colder key");
         assert!(cache.get(&1).is_some(), "hot key must survive LFU eviction");
         assert!(cache.get(&2).is_some());
+    }
+
+    #[test]
+    fn wtinylfu_drains_an_oversized_window_after_a_concurrent_touch() {
+        // Total weight fits `max_weight`, but the window is over `window_cap`.
+        // A concurrent hit moves the snapshotted window candidate off the tail,
+        // so `promote_window_key` refuses it; reporting that refusal as "no
+        // progress" breaks the trim loop and strands the window over cap.
+        let cache = Arc::new(ShardedCache::<TestValue>::new(
+            1_000,
+            Duration::from_mins(1),
+            EvictionPolicy::TinyLfu,
+        ));
+        let window_cap = 1_000 / 100;
+        // Weight 8 so one resident fits the 10-byte window (no trim) and two do
+        // not — the trim then runs with two keys still in the window, which is
+        // what gives the refused candidate a different tail to fall back to.
+        // Keys 0 and 16 share a shard, so that shard holds the only window tail.
+        cache.insert(0, TestValue::with_size("a", 8), 8);
+        assert_eq!(
+            cache.window_weight_for_test(),
+            8,
+            "one 8-byte resident must sit in the window under the 10-byte cap"
+        );
+
+        let fired = AtomicU64::new(0);
+        let cache_for_hook = Arc::clone(&cache);
+        cache.set_before_size_victim(move || {
+            // Call 0 is the trim-loop entry; call 1 is after the window tail is
+            // snapshotted and before it is moved — the racy window.
+            if fired.fetch_add(1, Ordering::Relaxed) == 1 {
+                assert!(
+                    cache_for_hook.get(&0).is_some(),
+                    "the snapshot candidate must still be present so get can move it"
+                );
+            }
+        });
+
+        cache.insert(16, TestValue::with_size("b", 8), 8);
+
+        assert_eq!(cache.len(), 2, "nothing is over budget, so nothing is evicted");
+        assert!(
+            cache.window_weight_for_test() <= window_cap,
+            "an oversized window must drain to its {window_cap}-byte cap even when a \
+             concurrent touch moves the snapshot candidate, got {}",
+            cache.window_weight_for_test()
+        );
     }
 
     #[test]

@@ -28,7 +28,10 @@ pub mod moka;
 pub mod spice;
 
 #[cfg(all(test, feature = "pingora"))]
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "the shared harness builds all three engines; a given test uses a subset"
+)]
 mod differential;
 
 #[cfg(feature = "pingora")]
