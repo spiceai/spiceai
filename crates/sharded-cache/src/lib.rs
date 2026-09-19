@@ -575,7 +575,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
                 }
                 let progressed = match self.policy {
                     EvictionPolicy::TinyLfu => self.evict_wtinylfu_one(admitted, &mut evicted),
-                    EvictionPolicy::Lfu => self.evict_lfu_one(prefer, &mut evicted),
+                    EvictionPolicy::Lfu => self.evict_lfu_one(prefer, admitted, &mut evicted),
                     // LRU must not self-evict a just-admitted sole resident while
                     // an older victim exists on another shard.
                     EvictionPolicy::Lru => self.evict_others_then_prefer(prefer, &mut evicted),
@@ -933,10 +933,20 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
     /// shards first so a just-admitted key is not self-evicted while an older
     /// colder victim exists. Retries when a concurrent hit raises the selected
     /// key's frequency between snapshot and unlink.
-    fn evict_lfu_one(&self, prefer: usize, evicted: &mut Vec<(V, EvictionReason)>) -> bool {
+    fn evict_lfu_one(
+        &self,
+        prefer: usize,
+        admitted: Option<u64>,
+        evicted: &mut Vec<(V, EvictionReason)>,
+    ) -> bool {
         for _ in 0..NUM_SHARDS {
+            // Every shard is compared on every pass, because `caching_policy:
+            // lfu` promises the global lowest hit-count resident. Only the key
+            // just admitted is held back — excluding its whole shard would pass
+            // over the coldest resident whenever it happens to live there — and
+            // even that is reconsidered when nothing else can be reclaimed.
             let victim = self
-                .lowest_freq_entry(Some(prefer))
+                .lowest_freq_entry(admitted)
                 .or_else(|| self.lowest_freq_entry(None));
             let Some((shard_idx, key, freq)) = victim else {
                 return false;
@@ -952,19 +962,17 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
         self.evict_others_then_prefer(prefer, evicted)
     }
 
-    /// Lowest-frequency entry across shards (full per-shard scan). When `skip`
-    /// is set, that shard is ignored on the first pass (caller retries with
-    /// `None`). Shard walk starts at the rotating hand.
-    fn lowest_freq_entry(&self, skip: Option<usize>) -> Option<(usize, u64, u16)> {
+    /// Lowest-frequency entry across every shard (full per-shard scan). When
+    /// `exclude_key` is set, that one key is passed over on the first pass so
+    /// admission does not self-evict; the caller retries with `None` when
+    /// nothing else can be reclaimed. Shard walk starts at the rotating hand.
+    fn lowest_freq_entry(&self, exclude_key: Option<u64>) -> Option<(usize, u64, u16)> {
         let mut best: Option<(usize, u64, u16)> = None;
         let start = self.next_hand_start();
         for offset in 0..NUM_SHARDS {
             let shard_idx = (start + offset) % NUM_SHARDS;
-            if skip == Some(shard_idx) {
-                continue;
-            }
             let shard = self.shards[shard_idx].0.lock();
-            let Some((key, _weight, freq)) = shard.peek_lfu_victim() else {
+            let Some((key, _weight, freq)) = shard.peek_lfu_victim(exclude_key) else {
                 continue;
             };
             let take = best.is_none_or(|(_, _, best_freq)| freq < best_freq);
@@ -1080,7 +1088,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             return false;
         }
         // Also refuse if another resident on this shard is now strictly colder.
-        if let Some((_, _, victim_freq)) = shard.peek_lfu_victim()
+        if let Some((_, _, victim_freq)) = shard.peek_lfu_victim(Some(key))
             && victim_freq < current_freq
         {
             return false;
@@ -2048,6 +2056,39 @@ mod tests {
         assert!(cache.get(&0).is_none(), "LFU must evict the colder key");
         assert!(cache.get(&1).is_some(), "hot key must survive LFU eviction");
         assert!(cache.get(&2).is_some());
+    }
+
+    #[test]
+    fn lfu_evicts_the_cold_resident_on_the_inserting_shard_over_a_hot_one_elsewhere() {
+        // `caching_policy: lfu` promises the global lowest hit-count resident.
+        // Skipping the whole inserting shard on the first pass breaks that: the
+        // shard holding the coldest key is excluded, so a far hotter resident
+        // elsewhere is evicted instead. Only the just-admitted key needs
+        // protecting from self-eviction, not everything sharing its shard.
+        let cache: ShardedCache<TestValue> =
+            ShardedCache::new(100, Duration::from_mins(1), EvictionPolicy::Lfu);
+        // Keys 0 and 16 share shard 0; key 1 is alone on shard 1.
+        cache.insert(0, TestValue::with_size("cold", 40), 40);
+        cache.insert(1, TestValue::with_size("hot", 40), 40);
+        for _ in 0..32 {
+            assert!(cache.get(&1).is_some());
+        }
+
+        // Admitting on shard 0 makes shard 0 the `prefer` shard.
+        cache.insert(16, TestValue::with_size("new", 40), 40);
+
+        assert!(
+            cache.get(&1).is_some(),
+            "a freq-32 resident must not be evicted while a freq-0 resident exists"
+        );
+        assert!(
+            cache.get(&0).is_none(),
+            "the coldest resident is the victim even when it shares the inserting shard"
+        );
+        assert!(
+            cache.get(&16).is_some(),
+            "the just-admitted key must not be self-evicted"
+        );
     }
 
     #[test]

@@ -204,13 +204,18 @@ impl<V> Shard<V> {
     /// Walk the entire probation list and return the lowest-frequency resident
     /// (true LFU within this shard). Ties keep the colder (closer-to-tail) key
     /// because the walk starts at the LRU end.
-    pub(crate) fn peek_lfu_victim(&self) -> Option<(u64, u64, u16)> {
+    /// `exclude` is the key admission is protecting from self-eviction, if any.
+    pub(crate) fn peek_lfu_victim(&self, exclude: Option<u64>) -> Option<(u64, u64, u16)> {
         let mut best: Option<(u64, u64, u16)> = None;
         let mut cursor = self.probation.tail;
         while let Some(idx) = cursor {
             let Some(Slot::Occupied(node)) = self.slots.get(idx as usize) else {
                 break;
             };
+            if exclude == Some(node.key) {
+                cursor = node.prev;
+                continue;
+            }
             let take = best.is_none_or(|(_, _, freq)| node.freq < freq);
             if take {
                 best = Some((node.key, node.weight, node.freq));
@@ -941,7 +946,7 @@ mod tests {
         }
         // key 19 is MRU with freq 0; keys 0..18 were touched (freq >= 1) and
         // promoted toward MRU, so the LRU tail is a freq-1 key.
-        let victim = shard.peek_lfu_victim().expect("victim");
+        let victim = shard.peek_lfu_victim(None).expect("victim");
         assert_eq!(
             victim.0, 19,
             "full LFU scan must find the cold MRU, not a hotter LRU-tail sample"
