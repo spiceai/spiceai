@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `POST /v1/evaluate` — System One evaluation (TypeSafe Jev and similar).
+//! `POST /v1/evaluate` — System One evaluation (`TypeSafe` Jev and similar).
 //!
 //! Not a chat-completions endpoint. Request carries `model`, `state`, and a
 //! map of typed `questions`; response returns typed `answers` with confidence.
@@ -73,12 +73,12 @@ pub(crate) async fn post(
 
     match model.evaluate(req).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(e) => evaluate_error_response(e),
+        Err(e) => evaluate_error_response(&e),
     }
 }
 
-fn evaluate_error_response(err: EvaluateError) -> Response {
-    let (status, message) = match &err {
+fn evaluate_error_response(err: &EvaluateError) -> Response {
+    let (status, message) = match err {
         EvaluateError::InvalidRequest { message, .. } => (StatusCode::BAD_REQUEST, message.clone()),
         EvaluateError::AuthenticationFailed { message, .. } => {
             (StatusCode::UNAUTHORIZED, message.clone())
