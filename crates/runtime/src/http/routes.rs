@@ -126,7 +126,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::packages::generate,
     ),
 
-    components(schemas(DatasetQueryParams, DatasetFilter, Format)) // These schemas, for some reason, weren't getting picked up.
+    components(schemas(DatasetQueryParams, DatasetFilter, Format, evaluate_api::EvaluateRequest, evaluate_api::EvaluateResponse)) // These schemas, for some reason, weren't getting picked up.
 )]
 pub(crate) struct ApiDoc;
 

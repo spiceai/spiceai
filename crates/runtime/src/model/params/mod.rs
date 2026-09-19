@@ -35,8 +35,8 @@ pub mod google;
 pub mod huggingface;
 pub mod openai;
 pub mod spiceai;
-pub mod xai;
 pub mod typesafe;
+pub mod xai;
 
 use std::sync::LazyLock;
 

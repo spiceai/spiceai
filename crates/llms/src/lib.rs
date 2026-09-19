@@ -22,6 +22,7 @@ pub mod chat;
 pub mod config;
 pub mod databricks;
 pub mod embeddings;
+pub mod evaluate;
 pub mod google;
 #[cfg(feature = "local_embed")]
 pub mod model2vec;
@@ -32,9 +33,8 @@ pub mod rerank;
 pub mod responses;
 pub mod spiceai;
 pub mod streaming_utils;
-pub mod xai;
-pub mod evaluate;
 pub mod typesafe;
+pub mod xai;
 
 pub enum HealthCheck {
     Required,

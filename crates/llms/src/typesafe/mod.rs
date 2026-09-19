@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! TypeSafe System One evaluation provider (Jev).
+//! `TypeSafe` System One evaluation provider (Jev).
 //!
 //! Jev is **not** a chat LLM. It evaluates `state` against typed questions via
 //! `POST https://api.typesafe.ai/v1/systemone` and returns structured answers
@@ -28,23 +28,26 @@ mod list_models;
 pub use list_models::TypeSafeModelLister;
 
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use evaluate_api::{
     AuthenticationFailedSnafu, Evaluate, EvaluateRequest, EvaluateResponse, HealthCheckFailedSnafu,
-    InvalidRequestSnafu, ModelCallFailedSnafu, RateLimitedSnafu, Result,
+    InvalidRequestSnafu, ModelCallFailedSnafu, ModelNotFoundSnafu, RateLimitedSnafu,
+    RatePermitFailedSnafu, Result,
 };
 use reqwest::{Client, StatusCode};
+use runtime_rate_control::RateController;
 use snafu::ResultExt;
 
 use crate::provider::create_http_client;
 
-/// Default TypeSafe API base URL (direct API, not the Vercel AI gateway).
+/// Default `TypeSafe` API base URL (direct API, not the Vercel AI gateway).
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 /// Default model alias when the Spicepod uses `from: typesafe:jev`.
 pub const DEFAULT_MODEL: &str = "jev-latest";
 
-/// TypeSafe System One client implementing [`Evaluate`].
+/// `TypeSafe` System One client implementing [`Evaluate`].
 pub struct TypeSafe {
     client: Client,
     base_url: String,
@@ -53,6 +56,7 @@ pub struct TypeSafe {
     /// Upstream model id sent in the System One request body.
     model_id: String,
     api_key: String,
+    rate_controller: Arc<RateController>,
 }
 
 impl Debug for TypeSafe {
@@ -66,7 +70,11 @@ impl Debug for TypeSafe {
 }
 
 impl TypeSafe {
-    /// Build a TypeSafe client.
+    /// Build a `TypeSafe` client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`evaluate_api::Error::HttpClientCreationFailed`] when the HTTP client cannot be built.
     ///
     /// `model_id` is the Spicepod `from:` suffix (`jev`, `jev-latest`,
     /// `jev-1.13.0`, …). Bare `jev` is normalized to [`DEFAULT_MODEL`].
@@ -85,12 +93,19 @@ impl TypeSafe {
             name,
             model_id: normalize_model_id(model_id),
             api_key: api_key.into(),
+            rate_controller: RateController::builder().build(),
         })
     }
 
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    #[must_use]
+    pub fn with_rate_controller(mut self, rate_controller: Arc<RateController>) -> Self {
+        self.rate_controller = rate_controller;
         self
     }
 
@@ -103,7 +118,7 @@ impl TypeSafe {
     }
 }
 
-/// Map Spicepod model id suffixes onto TypeSafe aliases.
+/// Map Spicepod model id suffixes onto `TypeSafe` aliases.
 ///
 /// `jev` → `jev-latest`; other ids (including versioned pins) pass through.
 #[must_use]
@@ -124,6 +139,15 @@ impl Evaluate for TypeSafe {
             }
             .fail();
         }
+
+        let _permit = self
+            .rate_controller
+            .acquire()
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            .context(RatePermitFailedSnafu {
+                model: self.name.clone(),
+            })?;
 
         // Always send the upstream model id, not the Spicepod component name.
         request.model = self.model_id.clone();
@@ -158,6 +182,11 @@ impl Evaluate for TypeSafe {
                 }
             }),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => AuthenticationFailedSnafu {
+                model: self.name.clone(),
+                message: body,
+            }
+            .fail(),
+            StatusCode::NOT_FOUND => ModelNotFoundSnafu {
                 model: self.name.clone(),
                 message: body,
             }
@@ -215,7 +244,7 @@ impl Evaluate for TypeSafe {
     }
 }
 
-/// Clear error when a caller attempts chat completions against a TypeSafe model.
+/// Clear error when a caller attempts chat completions against a `TypeSafe` model.
 #[must_use]
 pub fn chat_not_supported_message(model_name: &str) -> String {
     format!(
@@ -228,7 +257,7 @@ pub fn chat_not_supported_message(model_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use evaluate_api::{Answer, Question};
+    use evaluate_api::{Answer, EntryType, Question};
     use serde_json::json;
     use std::collections::BTreeMap;
     use wiremock::matchers::{header, method, path};
@@ -291,9 +320,9 @@ mod tests {
             Question::Choice {
                 instructions: "Which team should handle this?".into(),
                 criteria: BTreeMap::from([
-                    ("billing".into(), Some("Payments".into())),
-                    ("technical".into(), Some("Bugs".into())),
-                    ("sales".into(), None),
+                    ("billing".into(), EntryType::from("Payments")),
+                    ("technical".into(), EntryType::from("Bugs")),
+                    ("sales".into(), EntryType::Null),
                 ]),
             },
         );
@@ -385,6 +414,39 @@ mod tests {
             err,
             evaluate_api::Error::AuthenticationFailed { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn evaluate_maps_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("model not found"))
+            .mount(&server)
+            .await;
+
+        let client = TypeSafe::try_new("jev", Some("jev-does-not-exist"), "key")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let mut questions = BTreeMap::new();
+        questions.insert(
+            "q".into(),
+            Question::Noul {
+                instructions: "yes?".into(),
+                criteria: None,
+            },
+        );
+
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: json!("s"),
+                questions,
+            })
+            .await
+            .expect_err("404");
+        assert!(matches!(err, evaluate_api::Error::ModelNotFound { .. }));
     }
 
     #[test]

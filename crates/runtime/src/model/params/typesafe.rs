@@ -21,15 +21,19 @@ use secrecy::SecretString;
 ///
 /// Chat completions are not supported. Use `POST /v1/evaluate`.
 #[derive(TypedParams)]
-#[params(prefix = "typesafe", emit_specs)]
+#[params(
+    prefix = "typesafe",
+    passthrough = crate::model::params::common::PREFIXED_COMMON,
+    emit_specs
+)]
 pub struct TypeSafeModelParams {
-    /// TypeSafe API key. Autoloads from secret stores as `typesafe_api_key`
-    /// (env `TYPESAFE_API_KEY`). Alias `ai_api_key` accepts `typesafe_ai_api_key`
-    /// / `TYPESAFE_AI_API_KEY` used by some AI SDK integrations.
+    /// `TypeSafe` API key. Autoloads from secret stores as `typesafe_api_key`
+    /// (env `TYPESAFE_API_KEY`). Alias `ai_api_key` accepts spicepod param
+    /// `typesafe_ai_api_key`; env `TYPESAFE_AI_API_KEY` is also tried at load time.
     #[param(autoload_secret, alias = "ai_api_key")]
     pub api_key: Option<SecretString>,
-    /// TypeSafe API base URL. Defaults to the direct API (`https://api.typesafe.ai`),
-    /// not the Vercel AI gateway.
-    #[param(runtime, default = "https://api.typesafe.ai")]
+    /// `TypeSafe` API base URL. Defaults to the direct API (`https://api.typesafe.ai`),
+    /// not the Vercel AI gateway. Spicepod key: `typesafe_endpoint`.
+    #[param(default = "https://api.typesafe.ai")]
     pub endpoint: String,
 }

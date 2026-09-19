@@ -26,6 +26,8 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+#[cfg(feature = "openapi")]
+use evaluate_api::EvaluateResponse;
 use evaluate_api::{Error as EvaluateError, EvaluateRequest};
 use tokio::sync::RwLock;
 
@@ -42,33 +44,9 @@ use crate::model::EvaluateModelStore;
     path = "/v1/evaluate",
     operation_id = "post_evaluate",
     tag = "AI",
-    request_body(
-        description = "System One evaluation request (`model`, `state`, typed `questions`)",
-        content((
-            serde_json::Value = "application/json",
-            example = json!({
-                "model": "jev",
-                "state": "Help! My payouts have been failing for 3 days.",
-                "questions": {
-                    "is_urgent": {
-                        "type": "noul",
-                        "instructions": "Does this convey urgency?"
-                    }
-                }
-            })
-        ))
-    ),
+    request_body = EvaluateRequest,
     responses(
-        (status = 200, description = "Evaluation succeeded", content((
-            serde_json::Value = "application/json",
-            example = json!({
-                "model": "jev-1.13.0",
-                "answers": {
-                    "is_urgent": { "type": "noul", "noul": 0.92 }
-                },
-                "usage": { "input_tokens": 312, "output_tokens": 48 }
-            })
-        ))),
+        (status = 200, description = "Evaluation succeeded", body = EvaluateResponse),
         (status = 404, description = "Model not found"),
         (status = 400, description = "Invalid request"),
         (status = 401, description = "Upstream authentication failed"),
@@ -105,9 +83,11 @@ fn evaluate_error_response(err: EvaluateError) -> Response {
         EvaluateError::AuthenticationFailed { message, .. } => {
             (StatusCode::UNAUTHORIZED, message.clone())
         }
+        EvaluateError::ModelNotFound { message, .. } => (StatusCode::NOT_FOUND, message.clone()),
         EvaluateError::RateLimited { message, .. } => {
             (StatusCode::TOO_MANY_REQUESTS, message.clone())
         }
+        EvaluateError::RatePermitFailed { .. } => (StatusCode::TOO_MANY_REQUESTS, err.to_string()),
         other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     };
     (status, Json(serde_json::json!({ "error": message }))).into_response()

@@ -8219,6 +8219,7 @@ dependencies = [
  "serde_json",
  "snafu",
  "tokio",
+ "utoipa",
 ]
 
 [[package]]

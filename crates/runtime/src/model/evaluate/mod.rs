@@ -22,6 +22,7 @@ use llms::chat::Error as LlmError;
 use llms::evaluate::Evaluate;
 use llms::typesafe::TypeSafe;
 use runtime_parameters_typed::TypedParams;
+use runtime_rate_control::RateController;
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
 use spicepod::component::model::{Model, ModelSource};
@@ -30,6 +31,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::params::typesafe::TypeSafeModelParams;
+use super::rate_limit::build_model_rate_controller;
 
 pub use llms::evaluate::EvaluateModelStore;
 
@@ -37,11 +39,14 @@ pub use llms::evaluate::EvaluateModelStore;
 ///
 /// Only [`ModelSource::TypeSafe`] is supported today. Other sources should use
 /// chat / embeddings / responses loaders.
+///
+/// Returns the evaluation model and the rate controller that should also be
+/// registered in the runtime's model rate-controller map.
 pub async fn try_to_evaluate_model(
     component: &Model,
     params: &HashMap<String, secrecy::SecretString>,
     secrets: &Arc<RwLock<Secrets>>,
-) -> Result<Arc<dyn Evaluate>, LlmError> {
+) -> Result<(Arc<dyn Evaluate>, Arc<RateController>), LlmError> {
     let source = component.get_source().ok_or(LlmError::UnknownModelSource {
         from: component.from.clone(),
     })?;
@@ -59,7 +64,7 @@ async fn typesafe(
     component: &Model,
     params: &HashMap<String, secrecy::SecretString>,
     secrets: &Arc<RwLock<Secrets>>,
-) -> Result<Arc<dyn Evaluate>, LlmError> {
+) -> Result<(Arc<dyn Evaluate>, Arc<RateController>), LlmError> {
     let typed = TypeSafeModelParams::try_from_params(
         &format!("model {}", ModelSource::TypeSafe),
         params.clone(),
@@ -71,23 +76,37 @@ async fn typesafe(
         source: Box::new(e),
     })?;
 
-    let Some(api_key) = typed.api_key.as_ref().map(ExposeSecret::expose_secret) else {
-        return Err(LlmError::FailedToLoadModel {
-            source: "No `typesafe_api_key` (or `typesafe_ai_api_key`) provided for TypeSafe model. Set the param or export TYPESAFE_API_KEY.".into(),
-        });
+    let api_key = match typed.api_key.as_ref().map(ExposeSecret::expose_secret) {
+        Some(key) => key.to_string(),
+        None => {
+            // TypedParams autoload covers `typesafe_api_key` only; also accept
+            // the documented AI SDK env alias `TYPESAFE_AI_API_KEY`.
+            runtime_parameters_typed::autoload_secret(
+                secrets,
+                &format!("model {}", ModelSource::TypeSafe),
+                "typesafe_ai_api_key",
+            )
+            .await
+            .map(|s| s.expose_secret().to_string())
+            .ok_or_else(|| LlmError::FailedToLoadModel {
+                source: "No `typesafe_api_key` (or `typesafe_ai_api_key` / TYPESAFE_AI_API_KEY) provided for TypeSafe model. Set the param or export TYPESAFE_API_KEY.".into(),
+            })?
+        }
     };
 
     let model_id = component.get_model_id();
+    let rate_controller = build_model_rate_controller(component, params);
     let mut client = TypeSafe::try_new(component.name.clone(), model_id.as_deref(), api_key)
         .map_err(|e| LlmError::FailedToLoadModel {
             source: e.to_string().into(),
-        })?;
+        })?
+        .with_rate_controller(Arc::clone(&rate_controller));
 
     if typed.endpoint != llms::typesafe::DEFAULT_BASE_URL {
         client = client.with_base_url(typed.endpoint);
     }
 
-    Ok(Arc::new(client) as Arc<dyn Evaluate>)
+    Ok((Arc::new(client) as Arc<dyn Evaluate>, rate_controller))
 }
 
 /// Whether this Spicepod model is an evaluation-only (non-chat) source.

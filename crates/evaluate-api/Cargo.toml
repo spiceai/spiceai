@@ -25,12 +25,17 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+default = []
+openapi = ["dep:utoipa"]
+
 [dependencies]
 async-trait.workspace = true
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true
+utoipa = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio.workspace = true

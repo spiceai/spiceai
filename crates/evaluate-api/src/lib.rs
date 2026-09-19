@@ -22,7 +22,7 @@ limitations under the License.
 //! runtime's `POST /v1/evaluate` endpoint — which never names a provider.
 //!
 //! Deliberately separate from chat completions: System One models such as
-//! TypeSafe Jev do not generate strings and must not be faked as OpenAI chat.
+//! `TypeSafe` Jev do not generate strings and must not be faked as `OpenAI` chat.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -31,10 +31,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use snafu::Snafu;
 
-/// Name → evaluation model map. Holds System One providers (e.g. TypeSafe Jev).
+/// Name → evaluation model map. Holds System One providers (e.g. `TypeSafe` Jev).
 pub type EvaluateModelStore = std::collections::HashMap<String, Arc<dyn Evaluate>>;
 
 #[derive(Debug, Snafu)]
@@ -46,9 +46,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(
-        "Evaluation model '{model}' returned an unparseable response: {response}"
-    ))]
+    #[snafu(display("Evaluation model '{model}' returned an unparseable response: {response}"))]
     UnparseableResponse { model: String, response: String },
 
     #[snafu(display(
@@ -61,57 +59,92 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(
-        "Invalid evaluation request for model '{model}': {message}"
-    ))]
+    #[snafu(display("Invalid evaluation request for model '{model}': {message}"))]
     InvalidRequest { model: String, message: String },
 
-    #[snafu(display(
-        "Authentication failed for evaluation model '{model}': {message}"
-    ))]
+    #[snafu(display("Authentication failed for evaluation model '{model}': {message}"))]
     AuthenticationFailed { model: String, message: String },
 
-    #[snafu(display(
-        "Rate limited by evaluation provider for model '{model}': {message}"
-    ))]
+    #[snafu(display("Rate limited by evaluation provider for model '{model}': {message}"))]
     RateLimited { model: String, message: String },
+
+    #[snafu(display("Evaluation model '{model}' was not found upstream: {message}"))]
+    ModelNotFound { model: String, message: String },
+
+    #[snafu(display(
+        "Failed to acquire rate-limit permit for evaluation model '{model}': {source}"
+    ))]
+    RatePermitFailed {
+        model: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// `TypeSafe` `EntryType`: string, object, array, or null.
+///
+/// Used for `instructions` and structured criteria descriptions.
+/// See <https://docs.typesafe.ai/primitives/advanced>.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum EntryType {
+    String(String),
+    Array(Vec<Value>),
+    Object(Map<String, Value>),
+    Null,
+}
+
+impl From<&str> for EntryType {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_string())
+    }
+}
+
+impl From<String> for EntryType {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
 /// A typed question sent to a System One evaluation model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Question {
     /// Yes/no probability question. Answer is `noul` in \[0, 1\] (P(yes)).
     Noul {
-        instructions: String,
+        instructions: EntryType,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         criteria: Option<NoulCriteria>,
     },
     /// Closed-set selection. Answer is the highest-probability option plus the full distribution.
     Choice {
-        instructions: String,
-        criteria: BTreeMap<String, Option<String>>,
+        instructions: EntryType,
+        /// Option id → description (`EntryType`, or JSON null).
+        criteria: BTreeMap<String, EntryType>,
     },
     /// Ordered rubric score. Answer is a probability-weighted value across levels.
     Score {
-        instructions: String,
-        criteria: Vec<String>,
+        instructions: EntryType,
+        criteria: Vec<EntryType>,
     },
 }
 
 /// Optional yes/no rubric for a noul question.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct NoulCriteria {
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "true")]
-    pub true_meaning: Option<String>,
+    pub true_meaning: Option<EntryType>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "false")]
-    pub false_meaning: Option<String>,
+    pub false_meaning: Option<EntryType>,
 }
 
 /// Request body for `POST /v1/evaluate` and provider System One calls.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct EvaluateRequest {
     /// Spicepod model name (runtime) or provider model id (provider forward).
     pub model: String,
@@ -123,6 +156,7 @@ pub struct EvaluateRequest {
 
 /// Token usage reported by the provider.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -130,6 +164,7 @@ pub struct Usage {
 
 /// A typed answer returned for one question.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Answer {
     Noul {
@@ -150,6 +185,7 @@ pub enum Answer {
 
 /// Response body for evaluation: typed answers plus provider metadata.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct EvaluateResponse {
     /// Versioned model id that answered (e.g. `jev-1.13.0`), when the provider reports it.
     pub model: String,
@@ -176,5 +212,57 @@ pub trait Evaluate: Send + Sync + Debug {
     /// Optional health check (e.g. list models). Default is a no-op.
     async fn health(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn instructions_accept_string_object_and_array() {
+        let as_string: Question = serde_json::from_value(json!({
+            "type": "noul",
+            "instructions": "Is this urgent?"
+        }))
+        .expect("string");
+        assert!(matches!(
+            as_string,
+            Question::Noul {
+                instructions: EntryType::String(_),
+                ..
+            }
+        ));
+
+        let as_object: Question = serde_json::from_value(json!({
+            "type": "noul",
+            "instructions": { "question": "Is this urgent?", "focus": "timing" }
+        }))
+        .expect("object");
+        assert!(matches!(
+            as_object,
+            Question::Noul {
+                instructions: EntryType::Object(_),
+                ..
+            }
+        ));
+
+        let as_array: Question = serde_json::from_value(json!({
+            "type": "choice",
+            "instructions": ["Pick a team", "Prefer technical when ambiguous"],
+            "criteria": { "technical": "Bugs", "billing": null }
+        }))
+        .expect("array");
+        assert!(matches!(
+            as_array,
+            Question::Choice {
+                instructions: EntryType::Array(_),
+                ..
+            }
+        ));
+        if let Question::Choice { criteria, .. } = as_array {
+            assert!(matches!(criteria.get("billing"), Some(EntryType::Null)));
+        }
     }
 }

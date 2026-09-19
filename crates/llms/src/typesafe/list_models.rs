@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Model listing for TypeSafe (`GET /v1/models`).
+//! Model listing for `TypeSafe` (`GET /v1/models`).
 
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
@@ -44,7 +44,7 @@ struct ModelCard {
     name: String,
 }
 
-/// TypeSafe model lister (`GET /v1/models`).
+/// `TypeSafe` model lister (`GET /v1/models`).
 pub struct TypeSafeModelLister {
     api_key: String,
     base_url: String,
@@ -52,14 +52,20 @@ pub struct TypeSafeModelLister {
 
 impl TypeSafeModelLister {
     /// Required parameter: `typesafe_api_key`. Optional: `typesafe_endpoint`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ListModelsError::MissingParameter`] when neither `typesafe_api_key`
+    /// nor `typesafe_ai_api_key` is present in `params`.
     pub fn from_params(params: &HashMap<String, SecretString>) -> ListModelsResult<Self> {
         let api_key = match get_required_param(params, "typesafe_api_key") {
             Ok(k) => k,
             Err(_) => get_required_param(params, "typesafe_ai_api_key")?,
         };
-        let base_url = params
-            .get("typesafe_endpoint")
-            .map_or_else(|| DEFAULT_BASE_URL.to_string(), |s| s.expose_secret().to_string());
+        let base_url = params.get("typesafe_endpoint").map_or_else(
+            || DEFAULT_BASE_URL.to_string(),
+            |s| s.expose_secret().to_string(),
+        );
 
         Ok(Self {
             api_key: api_key.expose_secret().to_string(),
@@ -71,7 +77,10 @@ impl TypeSafeModelLister {
     pub fn new(api_key: &SecretString, base_url: Option<&str>) -> Self {
         Self {
             api_key: api_key.expose_secret().to_string(),
-            base_url: base_url.unwrap_or(DEFAULT_BASE_URL).trim_end_matches('/').to_string(),
+            base_url: base_url
+                .unwrap_or(DEFAULT_BASE_URL)
+                .trim_end_matches('/')
+                .to_string(),
         }
     }
 }
@@ -117,12 +126,14 @@ impl ListModels for TypeSafeModelLister {
             });
         }
 
-        let parsed: ModelsResponse = response.json().await.map_err(|e| {
-            ListModelsError::NetworkError {
-                provider: PROVIDER_NAME.to_string(),
-                message: e.to_string(),
-            }
-        })?;
+        let parsed: ModelsResponse =
+            response
+                .json()
+                .await
+                .map_err(|e| ListModelsError::NetworkError {
+                    provider: PROVIDER_NAME.to_string(),
+                    message: e.to_string(),
+                })?;
 
         let mut names: Vec<String> = parsed
             .models

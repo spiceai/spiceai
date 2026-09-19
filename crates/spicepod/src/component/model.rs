@@ -508,7 +508,10 @@ mod tests {
         ] {
             let model = Model::new(from, "jev");
             assert_eq!(model.get_source(), Some(ModelSource::TypeSafe));
-            assert!(model.get_model_id().is_some(), "expected model id for {from}");
+            assert!(
+                model.get_model_id().is_some(),
+                "expected model id for {from}"
+            );
         }
         let bare = Model::new("typesafe:jev", "jev");
         assert_eq!(bare.get_model_id().as_deref(), Some("jev"));

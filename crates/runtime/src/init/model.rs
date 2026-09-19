@@ -16,18 +16,18 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
+use crate::model::{is_evaluate_only, try_to_evaluate_model};
 use crate::{
     Runtime, model::ENABLE_MODEL_SUPPORT_MESSAGE,
     model::provider_models::get_available_models_hint, status,
 };
 use app::App;
+use llms::evaluate::Evaluate;
 use opentelemetry::KeyValue;
 use runtime_metrics as metrics;
 use runtime_secrets::get_params_with_secrets;
 use snafu::prelude::*;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource};
-use crate::model::{is_evaluate_only, try_to_evaluate_model};
-use llms::evaluate::Evaluate;
 use telemetry::timing::TimeMeasurement;
 
 #[derive(Debug, Snafu)]
@@ -114,15 +114,13 @@ impl Runtime {
 
         let result: Result<(), Error> = if is_evaluate_only(m) {
             match try_to_evaluate_model(m, &params, &self.secrets()).await {
-                Ok(evaluate_model) => {
+                Ok((evaluate_model, rate_controller)) => {
                     if let Err(e) = Evaluate::health(evaluate_model.as_ref()).await {
                         Err(Error::FailedToLoadLLM {
                             name: m.name.clone(),
                             source: Box::new(e),
                         })
                     } else {
-                        let rate_controller =
-                            crate::model::rate_limit::build_model_rate_controller(m, &params);
                         let store = self.llm_runtime_stores.evaluate_models();
                         let mut map = store.write().await;
                         map.insert(m.name.clone(), evaluate_model);
@@ -155,7 +153,8 @@ impl Runtime {
                         responses_llm_map.insert(m.name.clone(), responses_model);
                     }
 
-                    let responses_api_support_store = self.llm_runtime_stores.responses_api_support();
+                    let responses_api_support_store =
+                        self.llm_runtime_stores.responses_api_support();
                     let mut responses_support_map = responses_api_support_store.write().await;
                     responses_support_map.insert(m.name.clone(), responses_api_support);
                     drop(responses_support_map);

@@ -18,13 +18,13 @@ use tokio::sync::RwLock;
 
 mod chat;
 mod embed;
+pub mod evaluate;
 pub(crate) mod metrics;
 mod model_context;
 pub(crate) mod nsql;
 pub mod params;
 pub(crate) mod provider_models;
 pub(crate) mod rate_limit;
-pub mod evaluate;
 pub mod rerank;
 mod responses;
 mod tool_use;

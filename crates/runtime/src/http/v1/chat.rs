@@ -475,9 +475,14 @@ mod tests {
 
         let _enter = span.enter();
 
-        let response = post(Extension(llms), Extension(evaluate_models), headers, Json(req_payload))
-            .instrument(span.clone())
-            .await;
+        let response = post(
+            Extension(llms),
+            Extension(evaluate_models),
+            headers,
+            Json(req_payload),
+        )
+        .instrument(span.clone())
+        .await;
 
         let body_bytes = response
             .into_body()
