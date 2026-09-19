@@ -162,7 +162,7 @@ impl TypeSafe {
 
 /// Whether the id names an explicit version (`jev-1.13.0`) rather than an alias.
 ///
-/// TypeSafe accepts versioned pins that `GET /v1/models` need not list, so a pin is
+/// `TypeSafe` accepts versioned pins that `GET /v1/models` need not list, so a pin is
 /// never treated as missing.
 fn is_version_pinned(model_id: &str) -> bool {
     model_id.rsplit_once('-').is_some_and(|(_, tail)| {
@@ -319,7 +319,7 @@ impl Evaluate for TypeSafe {
         let listed = response
             .json::<ModelsResponse>()
             .await
-            .map(|parsed| parsed.into_names())
+            .map(ModelsResponse::into_names)
             .unwrap_or_default();
 
         // An empty or unreadable list is not evidence the model is missing, and a

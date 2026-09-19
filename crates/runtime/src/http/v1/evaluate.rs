@@ -124,8 +124,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use evaluate_api::{
-        Answer, EntryType, Evaluate, EvaluateRequest, EvaluateResponse, EvaluateState, Question,
-        Usage,
+        Answer, Evaluate, EvaluateRequest, EvaluateResponse, EvaluateState, Question, Usage,
     };
     use http_body_util::BodyExt;
     use std::collections::BTreeMap;

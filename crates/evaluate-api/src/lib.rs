@@ -204,7 +204,7 @@ fn nullable_entry_is_absent(value: &NullableEntry) -> bool {
 /// A typed question sent to a System One evaluation model.
 ///
 /// `instructions` uses [`NullableEntry`] so an explicit JSON `null` survives the round
-/// trip to TypeSafe instead of collapsing into an omitted field.
+/// trip to `TypeSafe` instead of collapsing into an omitted field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -227,7 +227,7 @@ pub enum Question {
     Score {
         #[serde(default, skip_serializing_if = "nullable_entry_is_absent")]
         instructions: NullableEntry,
-        /// At least two non-null rubric levels; TypeSafe documents score criteria as an
+        /// At least two non-null rubric levels; `TypeSafe` documents score criteria as an
         /// array of two or more levels (<https://docs.typesafe.ai/primitives/score>).
         #[serde(deserialize_with = "deserialize_score_criteria")]
         #[schemars(length(min = 2))]
@@ -272,7 +272,7 @@ where
     Ok(criteria)
 }
 
-/// TypeSafe requires at least one question per request, so reject an empty map here
+/// `TypeSafe` requires at least one question per request, so reject an empty map here
 /// rather than after a round trip to the provider.
 fn deserialize_nonempty_questions<'de, D>(
     deserializer: D,
@@ -579,7 +579,7 @@ mod tests {
         }
     }
     /// Regression: `Option<EntryType>` collapsed an explicit `null` to `None`, and
-    /// `skip_serializing_if` then dropped the key, so TypeSafe could not tell an
+    /// `skip_serializing_if` then dropped the key, so `TypeSafe` could not tell an
     /// explicit null from an omitted field.
     #[test]
     fn instructions_preserve_explicit_null_when_forwarded() {
@@ -609,7 +609,7 @@ mod tests {
         );
     }
 
-    /// TypeSafe documents score criteria as two or more levels.
+    /// `TypeSafe` documents score criteria as two or more levels.
     #[test]
     fn score_criteria_requires_two_levels() {
         let one = serde_json::from_value::<Question>(
