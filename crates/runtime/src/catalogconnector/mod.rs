@@ -190,13 +190,12 @@ pub mod databricks;
 pub mod deferred;
 #[cfg(feature = "duckdb")]
 pub mod ducklake;
-// The ADBC and PostgreSQL catalog connectors read the `query_federation`
-// parameter; the MySQL, DuckLake and Snowflake catalogs install their deny-list
-// with no opt-out. Only the ADBC *dataset* connector offers the parameter, so
-// `pg` is the first catalog to have it without its dataset counterpart having
-// it too -- one spelling either way, which is what this module exists to keep.
-// See #13664.
-#[cfg(any(feature = "adbc", feature = "postgres"))]
+// Only the ADBC catalog connector reads the `query_federation` parameter today,
+// because only its dataset connector offers one. The MySQL, PostgreSQL, DuckLake
+// and Snowflake catalogs install their deny-list with no opt-out, matching
+// theirs. Offering the PostgreSQL catalog the parameter is user-facing surface
+// and needs a signed-off Enhancement first -- see #14228.
+#[cfg(feature = "adbc")]
 mod federation;
 pub mod glue;
 pub mod iceberg;

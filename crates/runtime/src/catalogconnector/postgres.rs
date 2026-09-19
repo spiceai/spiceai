@@ -19,7 +19,6 @@ limitations under the License.
 //! Connects to a `PostgreSQL` (or Redshift) database and provides schema/table
 //! discovery via `information_schema` queries.
 
-use super::federation::{QUERY_FEDERATION_PARAMETER, is_query_federation_enabled};
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::catalogconnector::postgres_accelerated::{
     AcceleratedCatalogProvider, NoEligibleTablesError, SlotInUseError,
@@ -131,11 +130,10 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("sslmode").description("The SSL mode for the connection."),
     ParameterSpec::component("sslrootcert")
         .description("The path to, or inline PEM content for, the SSL root certificate."),
-    QUERY_FEDERATION_PARAMETER,
 ];
 
 /// A [`Read`] for `PostgreSQL` catalog tables that installs the Spice function
-/// deny-list and honours `query_federation`.
+/// deny-list.
 ///
 /// `PostgresTableFactory` carries no function-support seam: both of its read
 /// constructors hand to a private `finish_table_provider` that applies the
@@ -153,7 +151,6 @@ pub const PARAMETERS: &[ParameterSpec] = &[
 /// per table. See issues #10703 and #13664.
 struct FederatedPostgresTableFactory {
     pool: Arc<DynPostgresConnectionPool>,
-    federation_enabled: bool,
     /// Built once per catalog rather than per table: the policy is the same for
     /// every table, and deriving it walks the nested-function list and takes a
     /// read lock on the user-function registry each time. Building it once also
@@ -173,9 +170,6 @@ impl FederatedPostgresTableFactory {
         table_reference: TableReference,
     ) -> Arc<dyn TableProvider + 'static> {
         let table = Arc::new(table.with_dialect(Arc::new(PostgreSqlDialect {})));
-        if !self.federation_enabled {
-            return table;
-        }
         let schema = table.schema();
         Arc::new(create_spice_federated_table_provider(
             table,
@@ -222,21 +216,16 @@ impl Read for FederatedPostgresTableFactory {
 }
 
 /// The read path a `PostgreSQL` catalog's tables are built through, with the
-/// Spice function deny-list installed and the catalog's `query_federation`
-/// setting applied.
+/// Spice function deny-list installed.
 ///
 /// Public so the integration tests in `tests/postgres/catalog.rs` build their
 /// providers the way the connector does. A test holding a bare
 /// `PostgresTableFactory` asserts against a provider no user is given, which
 /// is how this gap survived the connector's own test suite.
 #[must_use]
-pub fn build_table_factory(
-    pool: Arc<PostgresConnectionPool>,
-    federation_enabled: bool,
-) -> Arc<dyn Read> {
+pub fn build_table_factory(pool: Arc<PostgresConnectionPool>) -> Arc<dyn Read> {
     Arc::new(FederatedPostgresTableFactory {
         pool,
-        federation_enabled,
         function_support: deny_spice_functions_for_postgres_table_providers(),
     })
 }
@@ -275,17 +264,6 @@ impl CatalogConnector for PostgresCatalog {
                 message,
             })?;
 
-        // Parsed before the pool is created, so a misspelled value is reported
-        // without first opening a connection to the database.
-        let federation_enabled =
-            is_query_federation_enabled(&self.params.parameters).map_err(|e| {
-                super::Error::InvalidConfigurationNoSource {
-                    connector: PREFIX.to_string(),
-                    connector_component: connector_component.clone(),
-                    message: e.to_string(),
-                }
-            })?;
-
         let pool = PostgresConnectionPool::new(self.params.parameters.to_secret_map())
             .await
             .map_err(|e| super::Error::UnableToGetCatalogProvider {
@@ -309,7 +287,7 @@ impl CatalogConnector for PostgresCatalog {
             if let Some(acceleration) = catalog.acceleration.as_ref() {
                 Arc::new(AcceleratedCatalogProvider::new(catalog, acceleration, pool))
             } else {
-                let table_factory = build_table_factory(Arc::clone(&pool), federation_enabled);
+                let table_factory = build_table_factory(Arc::clone(&pool));
                 Arc::new(PostgresCatalogProvider::new(
                     catalog.name.clone(),
                     pool,
@@ -438,19 +416,6 @@ mod tests {
             })
             .is_none(),
             "the cause is carried as text, so the catalog error that wraps this cannot append it after the documentation link"
-        );
-    }
-
-    /// The catalog must offer the same escape hatch the dataset connector
-    /// offers, spelled the same way, so one value means one thing. Without it a
-    /// user who needs a plan evaluated locally has no configuration that avoids
-    /// federation at all. See #13664.
-    #[test]
-    fn the_parameter_list_offers_query_federation() {
-        let names: Vec<&str> = PARAMETERS.iter().map(|p| p.name).collect();
-        assert!(
-            names.contains(&"query_federation"),
-            "the PostgreSQL catalog connector must accept `query_federation`: {names:?}"
         );
     }
 }

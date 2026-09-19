@@ -145,7 +145,14 @@ async fn seed_partitioned_schema(port: usize) -> Result<(), anyhow::Error> {
 
 /// Build a `PostgreSQL` catalog against the seeded database.
 fn pg_catalog(port: usize) -> Catalog {
-    pg_catalog_with(port, vec![])
+    let mut catalog = Catalog::new("pg:postgres".to_string(), CATALOG_NAME.to_string());
+    catalog.params = Some(Params::from_string_map(
+        get_pg_params(port)
+            .into_iter()
+            .map(|(k, v)| (k, v.expose_secret().to_string()))
+            .collect::<HashMap<String, String>>(),
+    ));
+    catalog
 }
 
 /// The `(column_name, data_type)` pairs the catalog reports for `table`, ordered
@@ -902,7 +909,7 @@ async fn refreshable_catalog(
         Arc::clone(&pool),
         // The connector's own seam, not a bare `PostgresTableFactory`: a test
         // holding the latter asserts against a provider no user is given.
-        build_table_factory(pool, true),
+        build_table_factory(pool),
         TableSelector::select_all(),
     ));
 
@@ -1344,7 +1351,7 @@ async fn test_refresh_registers_nothing_when_include_matches_no_table() -> Resul
             let provider = PostgresCatalogProvider::new(
                 CATALOG_NAME.to_string(),
                 Arc::clone(&pool),
-                build_table_factory(pool, true),
+                build_table_factory(pool),
                 TableSelector::new(Some(globset_of(&["public.absent"])), None)
                     .with_include_patterns(&["public.absent".to_string()]),
             );
@@ -1439,21 +1446,6 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
     }
 }
 
-/// A catalog over `port` with extra `params` on top of the connection
-/// settings, for the `query_federation` cases.
-fn pg_catalog_with(port: usize, extra: Vec<(&str, &str)>) -> Catalog {
-    let mut catalog = Catalog::new("pg:postgres".to_string(), CATALOG_NAME.to_string());
-    let mut params = get_pg_params(port)
-        .into_iter()
-        .map(|(k, v)| (k, v.expose_secret().to_string()))
-        .collect::<HashMap<String, String>>();
-    for (k, v) in extra {
-        params.insert(k.to_string(), v.to_string());
-    }
-    catalog.params = Some(Params::from_string_map(params));
-    catalog
-}
-
 /// A `TEXT` column of JSON documents, which the Spice-only UDF below reads.
 /// `TEXT` rather than `JSONB` so the column arrives as `Utf8` whatever
 /// `unsupported_type_action` says, keeping the test about pushdown.
@@ -1538,63 +1530,6 @@ async fn test_catalog_evaluates_a_spice_only_udf_locally() -> Result<(), anyhow:
             assert!(
                 pushed.contains("upper"),
                 "upper() must still federate to PostgreSQL; pushed SQL was: {pushed}"
-            );
-
-            Ok(())
-        })
-        .await
-}
-
-/// `query_federation: disabled` turns federation off for the whole catalog, so
-/// no scan sends SQL beyond the table read itself.
-#[tokio::test]
-async fn test_catalog_query_federation_disabled_pushes_nothing_down() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-
-    test_request_context()
-        .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
-
-            seed_json_documents(port).await?;
-            let rt = start_runtime(pg_catalog_with(
-                port,
-                vec![("query_federation", "disabled")],
-            ))
-            .await?;
-
-            let pushed = pushed_down_sql(
-                &run_query(
-                    &rt,
-                    &format!("EXPLAIN SELECT upper(body) FROM {CATALOG_NAME}.public.documents"),
-                )
-                .await?,
-            )?;
-            assert!(
-                pushed.is_empty(),
-                "nothing should federate with query_federation: disabled; pushed SQL was: {pushed}"
-            );
-
-            // The tables still answer -- disabling federation changes where the
-            // work happens, not whether the catalog is usable.
-            let rows = run_query(
-                &rt,
-                &format!(
-                    "SELECT id, json_get_str(body, 'color') AS color \
-                     FROM {CATALOG_NAME}.public.documents ORDER BY id"
-                ),
-            )
-            .await?;
-            assert_batches_eq!(
-                &[
-                    "+----+-------+",
-                    "| id | color |",
-                    "+----+-------+",
-                    "| 1  | red   |",
-                    "| 2  | blue  |",
-                    "+----+-------+",
-                ],
-                &rows
             );
 
             Ok(())
