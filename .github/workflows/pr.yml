@@ -651,7 +651,7 @@ jobs:
   # Run Rust linting
   lint-rust:
     name: Rust Lint
-    runs-on: spiceai-macos
+    runs-on: spiceai-macos-large
     # Slowest observed success in the 2026-07-25..08-08 window: 126 min.
     timeout-minutes: 300
     needs: check_changes
@@ -752,7 +752,7 @@ jobs:
   # Build and test
   build-test:
     name: Build and Test
-    runs-on: spiceai-macos
+    runs-on: spiceai-macos-large
     # Slowest observed success in the 2026-07-25..08-08 window: 117 min.
     timeout-minutes: 300
     needs: [check_changes]
@@ -948,7 +948,7 @@ jobs:
   # Release-profile installs (make install, install-cli, install-spiced)
   build-install-release:
     name: Build (release profile)
-    runs-on: spiceai-macos
+    runs-on: spiceai-macos-large
     # Slowest observed success in the 2026-07-25..08-08 window: 106 min.
     timeout-minutes: 300
     needs: [check_changes]
