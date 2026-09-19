@@ -50,11 +50,11 @@ use super::maintenance_metrics::{
 use super::manifest::{ManifestSequenceTag, SeqPrefixPlan};
 use super::mutation_writer::AppendMutationWriter;
 use super::on_conflict::{
-    BatchValidationResult, CheckpointCorpusKeys, ExtractedPrimaryKeys, InlineAwareDeletionSink,
-    InlinedDataRewrite, Int64DeletionDelta, OnConflictContext, OnConflictDeletionUpdate,
-    OnConflictDeletions, OnConflictUpdate, OnConflictValidationStream, PendingTombstoneDeltas,
-    PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink, PreparedInsertStream,
-    PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
+    BatchValidationResult, CheckpointCorpusKeys, DeletionSinkSource, ExtractedPrimaryKeys,
+    InlineAwareDeletionSink, InlinedDataRewrite, Int64DeletionDelta, OnConflictContext,
+    OnConflictDeletionUpdate, OnConflictDeletions, OnConflictUpdate, OnConflictValidationStream,
+    PendingTombstoneDeltas, PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink,
+    PreparedInsertStream, PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
     PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
     RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyResult,
     pk_deletion_snapshot_for_strategy,
@@ -32011,7 +32011,7 @@ impl CayenneTableProvider {
     /// `lock_current_snapshot_for_apply`. Waiting for that registration to clear
     /// under the held lock therefore blocks the publish being waited for, and a
     /// DELETE that raced one could only end in the drain's timeout.
-    async fn checkpoint_mem_tier_for_delete(&self) -> datafusion_common::Result<()> {
+    pub(crate) async fn checkpoint_mem_tier_for_delete(&self) -> datafusion_common::Result<()> {
         self.checkpoint_mem_tier_holding_write_lock()
             .await
             .map(|_rows| ())
@@ -35764,32 +35764,15 @@ impl TableProvider for CayenneTableProvider {
         // branches above materialize inline rows; once durable, the rows are
         // subject to the sink's own tier-aware liveness rule.
         //
-        // The checkpoint and the scan-source capture share ONE `write_lock` hold,
-        // so no CDC apply can land between them. They are not separable: a
-        // checkpoint publishes its rows as a PROTECTED snapshot, and
-        // `build_deletion_vector_sink` freezes the protected set the sink will scan
-        // (the sink re-reads only the main listing at execution), so a checkpoint
-        // that lands after the capture is invisible to this delete. Nothing under
-        // the sink builder takes `write_lock`, so holding it across the build
-        // cannot deadlock.
-        //
-        // This lock is released before `DeletionExec` runs the sink, which takes
-        // `write_lock` again; a CDC apply between the two is still invisible to the
-        // scan sources frozen here (#13828). Closing that window means building the
-        // sink inside the execution-time critical section, not here.
-        let file_sink = {
-            let _guard = self.write_lock.lock().await;
-            // A no-op in `mode: memory`, which has no Vortex tier to checkpoint
-            // into — there the sink reconciles the tier itself at execution time
-            // (`delete_mem_tier_rows_matching`).
-            self.checkpoint_mem_tier_for_delete().await?;
-            self.build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
-                .await?
-        };
+        // The checkpoint and the scan-source capture belong in the hold the DELETE
+        // itself runs under, so both are deferred to
+        // `InlineAwareDeletionSink::delete_from` rather than done here — a plan is
+        // built and executed as two steps, and an apply landing between them was
+        // invisible to sources frozen at build (#13828). See [`DeletionSinkSource`].
         Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
             Arc::new(InlineAwareDeletionSink {
                 table: self.clone_for_write(),
-                file_sink,
+                file_sink: DeletionSinkSource::BuildAtExecution(DeletionRequestSource::User),
                 filters,
             }),
         ))))
@@ -35921,7 +35904,7 @@ fn active_transaction(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeletionRequestSource {
+pub(crate) enum DeletionRequestSource {
     User,
     Cdc,
 }
@@ -36081,7 +36064,7 @@ impl CayenneTableProvider {
     /// User-visible deletes require a verified deleted-row count because the SQL
     /// client receives "rows affected". CDC deletes discard that count, so they
     /// can use count-skipping key-delete paths when the filter shape supports it.
-    async fn build_deletion_vector_sink(
+    pub(crate) async fn build_deletion_vector_sink(
         &self,
         filters: &[Expr],
         write_lock: Option<Arc<tokio::sync::Mutex<()>>>,
@@ -36199,7 +36182,7 @@ impl CayenneTableProvider {
             .await?;
         let sink = InlineAwareDeletionSink {
             table: self.clone_for_write(),
-            file_sink,
+            file_sink: DeletionSinkSource::Prebuilt(Box::new(file_sink)),
             filters: filters.to_vec(),
         };
         let deleted = sink
@@ -54966,6 +54949,17 @@ mod tests {
         rows
     }
 
+    /// Apply one batch through the real CDC append path, so a `cdc_durability: memory`
+    /// table with an armed slot advancer lands it in the RAM mem-tier rather than
+    /// durably (`insert_into` does not reach that path).
+    async fn cdc_apply(provider: &CayenneTableProvider, batch: RecordBatch) {
+        let ctx = SessionContext::new();
+        let _cdc_write = provider
+            .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+            .await
+            .expect("cdc append");
+    }
+
     /// Retention must delete every row its predicate matches and NOTHING else, and a
     /// second pass over the result must be a no-op. Deleting too much is silent data
     /// loss; deleting too little leaves rows the operator asked to have removed.
@@ -55377,6 +55371,92 @@ mod tests {
             !persisted.num_rows_exact,
             "a retention delete must taint the persisted count, or a distributed COUNT(*) folds {} as the answer",
             persisted.num_rows
+        );
+    }
+
+    /// A CDC apply landing between a `DELETE`'s plan build and its execution must not
+    /// destroy the row it wrote, and must not escape the predicate.
+    ///
+    /// The deletion sink captures the tiers it will scan when it is BUILT, and
+    /// re-reads only the main listing at execution. Building it at plan time therefore
+    /// judged the delete against a snapshot of the table taken before the apply:
+    ///
+    /// - `(8, 20)` arrives after the capture, matches `value < 50`, and is in no scan
+    ///   source — so the predicate never sees it and it survives a delete that names it.
+    /// - `(7, 60)` supersedes the durable `(7, 10)`, which the capture still holds and
+    ///   which DOES match. A key tombstone written from that retired version hides the
+    ///   KEY, taking the live replacement with it — silent loss of a row the predicate
+    ///   never matched, the shape #13574 closed one tier over (#13828).
+    ///
+    /// Verified to fail with the sink built at plan time: the delete leaves
+    /// `[(8, 20), (9, 90)]` — it destroyed the live `(7, 60)` and kept the `(8, 20)`
+    /// its predicate names.
+    #[tokio::test]
+    async fn a_cdc_apply_between_plan_build_and_execution_is_judged_by_the_delete() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "delete_cdc_apply_gap",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        // The RAM path is armed by the runtime installing a slot advancer; without one
+        // the write silently takes the durable path and this test covers nothing.
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        assert!(
+            provider.is_cdc_memory_mode() && provider.has_slot_advancer(),
+            "precondition: the applies must take the in-memory CDC path this test is about"
+        );
+
+        // `(7, 10)` matches `value < 50`; `(9, 90)` is the untouched control.
+        cdc_apply(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7, 9], &[10, 90]),
+        )
+        .await;
+
+        let delete_plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("value").lt(datafusion_expr::lit(50_i64))],
+            )
+            .await
+            .expect("delete plan");
+
+        // THE GAP: an apply between plan build and execution upserts key 7 out of the
+        // predicate and inserts key 8 into it.
+        cdc_apply(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7, 8], &[60, 20]),
+        )
+        .await;
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 60), (8, 20), (9, 90)],
+            "precondition: the apply is visible to readers before the delete executes"
+        );
+        assert!(
+            !provider.mem_tier.is_empty(),
+            "precondition: the apply must still be RAM-resident, which is the tier a \
+             plan-time capture cannot see"
+        );
+
+        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("delete executed");
+
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 60), (9, 90)],
+            "the delete must be judged against the table as it is when it RUNS: `(8, 20)` \
+             matches `value < 50` and goes, `(7, 60)` does not match and must survive — a \
+             key tombstone drawn from the superseded `(7, 10)` would take it with it"
         );
     }
 
