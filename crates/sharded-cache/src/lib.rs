@@ -926,7 +926,10 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             }
             // Selected key got hotter under a concurrent hit; reselect.
         }
-        false
+        // Every attempt lost its revalidation race. Fall back to the same
+        // guaranteed-progress path W-`TinyLFU` uses, so an insert cannot
+        // return with the cache still above `max_weight`.
+        self.evict_others_then_prefer(prefer, evicted)
     }
 
     /// Lowest-frequency entry across shards (full per-shard scan). When `skip`
@@ -1244,9 +1247,9 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
         let before_window = shard.window_weight();
         let before_protected = shard.protected_weight();
         // This is the guaranteed-progress fallback, so it must be able to
-        // reclaim from whichever region still holds residents. `peek_tail`
-        // alone is the probation list, which under W-`TinyLFU` can be empty
-        // while the window or protected segments are not.
+        // reclaim from whichever region still holds residents: the probation
+        // list alone, which is all this used to read, can be empty under
+        // W-`TinyLFU` while the window or protected segments are not.
         let Some((region, weight)) = FALLBACK_EVICT_ORDER
             .into_iter()
             .find_map(|region| shard.peek_region_tail(region).map(|(_, w)| (region, w)))

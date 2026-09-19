@@ -193,10 +193,6 @@ impl<V> Shard<V> {
         }
     }
 
-    pub(crate) fn peek_tail(&self) -> Option<(u64, u64)> {
-        self.peek_region_tail(self.primary_region())
-    }
-
     pub(crate) fn peek_region_tail(&self, region: Region) -> Option<(u64, u64)> {
         let idx = self.ends(region).tail?;
         match self.slots.get(idx as usize) {
@@ -403,10 +399,6 @@ impl<V: Clone> Shard<V> {
         };
         let value = self.take_value_and_free(idx)?;
         Some((value, weight))
-    }
-
-    pub(crate) fn evict_lru(&mut self) -> Option<(u64, V, u64)> {
-        self.evict_region_lru(self.primary_region())
     }
 
     pub(crate) fn evict_region_lru(&mut self, region: Region) -> Option<(u64, V, u64)> {
@@ -855,7 +847,7 @@ mod tests {
         assert!(!shard.tail_is_expired(inserted, Duration::from_secs(1)));
         assert!(shard.tail_is_expired(inserted + Duration::from_secs(2), Duration::from_secs(1)));
         assert_eq!(shard.peek_weight(1), Some(5));
-        assert_eq!(shard.peek_tail(), Some((1, 5)));
+        assert_eq!(shard.peek_region_tail(Region::Probation), Some((1, 5)));
     }
 
     #[test]

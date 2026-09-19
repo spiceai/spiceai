@@ -237,9 +237,13 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
             .collect();
 
         let batches = try_join_all(embed_futures).await?;
-        if batches.len() == 1 {
-            return Ok(batches.into_iter().next().expect("len checked"));
-        }
+        // A single batch is handed back as-is so the shared handle survives.
+        // `try_from` gives the element back by value on the one-element case
+        // and returns the vector otherwise, so no `expect` is needed.
+        let batches = match <[_; 1]>::try_from(batches) {
+            Ok([single]) => return Ok(single),
+            Err(batches) => batches,
+        };
         let combined: Vec<Vec<f32>> = batches
             .iter()
             .flat_map(|batch| batch.iter().cloned())

@@ -1333,19 +1333,21 @@ mod tests {
                 }
             };
 
-            Ok(texts
-                .iter()
-                .map(|text| {
-                    let normalized = normalize_text(text);
-                    if normalized.contains("forecast") || normalized.contains("weather") {
-                        vec![1.0, 0.0]
-                    } else if normalized.contains("sql") || normalized.contains("query") {
-                        vec![0.0, 1.0]
-                    } else {
-                        vec![0.1, 0.1]
-                    }
-                })
-                .collect())
+            Ok(std::sync::Arc::new(
+                texts
+                    .iter()
+                    .map(|text| {
+                        let normalized = normalize_text(text);
+                        if normalized.contains("forecast") || normalized.contains("weather") {
+                            vec![1.0, 0.0]
+                        } else if normalized.contains("sql") || normalized.contains("query") {
+                            vec![0.0, 1.0]
+                        } else {
+                            vec![0.1, 0.1]
+                        }
+                    })
+                    .collect(),
+            ))
         }
 
         fn size(&self) -> i32 {

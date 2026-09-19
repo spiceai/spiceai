@@ -291,7 +291,7 @@ mod tests {
         ) -> EmbedResult<std::sync::Arc<Vec<Vec<f32>>>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(50)).await;
-            Ok(vec![vec![1.0, 2.0]])
+            Ok(std::sync::Arc::new(vec![vec![1.0, 2.0]]))
         }
 
         fn size(&self) -> i32 {
