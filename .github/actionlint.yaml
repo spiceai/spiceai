@@ -17,6 +17,8 @@ self-hosted-runner:
   labels:
     # The self-hosted Apple Silicon fleet that builds and signs off macOS.
     - spiceai-macos
+    # The subset of that fleet carved out for the longest macOS jobs (#14229).
+    - spiceai-macos-large
     # The self-hosted Linux pool.
     - spiceai-dev-runners
     # The hosted Linux aarch64 pool.
@@ -28,9 +30,11 @@ self-hosted-runner:
 # shrinks as that issue is worked; nothing else is suppressed.
 #
 # They live here rather than as `-ignore` flags in the workflow so that a bare
-# `actionlint` run in a checkout gives the same verdict CI does. With the block
-# below removed, this tree reports 17 findings and CI reports none — a gap that
-# trains people to ignore their local run.
+# `actionlint` run in a checkout gives the same verdict CI does: with the block
+# below in place both report none, and with it deleted both report the same 17.
+# Putting those 17 on the workflow's command line instead is what would split
+# them — a local run would report 17 while CI reported none, a gap that trains
+# people to ignore their local run.
 #
 # Each entry names one workflow, never a glob over `.github/workflows/`. An
 # `ignore` under a wildcard path applies to every workflow actionlint reads, so
