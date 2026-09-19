@@ -1672,9 +1672,7 @@ mod tests {
         let cache_for_hook = Arc::clone(&cache);
         let inserted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         cache.set_after_invalidate_shard(move |shard_idx| {
-            if shard_idx == 0
-                && !inserted.swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
+            if shard_idx == 0 && !inserted.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 // Publish into the shard that was just unlocked. The first
                 // pass has already left shard 0; the epoch bump forces a
                 // rescan that must drop this entry before return. Insert
@@ -1696,9 +1694,6 @@ mod tests {
             "seed matching entry must be removed"
         );
     }
-
-
-
 
     #[test]
     fn tinylfu_put_and_get() {

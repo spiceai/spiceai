@@ -17,8 +17,8 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use std::collections::HashSet;
-use std::{collections::HashMap, sync::Arc};
 use std::time::Instant;
+use std::{collections::HashMap, sync::Arc};
 
 use super::embeddings::table::EmbeddingTable;
 use crate::candidate::vector::ChunkedNonIndexVectorGeneration;
@@ -503,8 +503,10 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
             let cached = cache_provider
                 .get_raw_key_validated(&raw_cache_key.as_u64(), &|value| {
-                    !cache_provider
-                        .tables_changed_since(value.as_table_refs().as_ref(), value.read_started_at())
+                    !cache_provider.tables_changed_since(
+                        value.as_table_refs().as_ref(),
+                        value.read_started_at(),
+                    )
                 })
                 .await;
             match (cache_control, cached) {
@@ -894,9 +896,7 @@ fn wrap_cache_to_result(
         // publish a stale result (the gate alone only orders concurrent inserts
         // against the scan, not work that started earlier and finishes later).
         if cache_provider.tables_changed_since(&expected_keys, read_started_at) {
-            tracing::trace!(
-                "Skipping search cache put; a table changed since the search began"
-            );
+            tracing::trace!("Skipping search cache put; a table changed since the search began");
             return;
         }
 

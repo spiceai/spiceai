@@ -366,8 +366,7 @@ impl<
 
         // Stamp before the scan so a search that started before this point and
         // tries to publish afterward is rejected by `tables_changed_since`.
-        self.table_changes
-            .record_change(&table_ref, Instant::now());
+        self.table_changes.record_change(&table_ref, Instant::now());
 
         // The walk is proportional to the cache size and never yields, so it
         // runs on the blocking pool. Survivors are not promoted: the scan
