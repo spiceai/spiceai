@@ -167,6 +167,11 @@ async fn construct_model(
     })?;
 
     let model = match source {
+        ModelSource::TypeSafe => {
+            return Err(LlmError::ResponsesNotSupported {
+                from: ModelSource::TypeSafe,
+            });
+        }
         ModelSource::OpenAi => {
             let p = typed_params::<OpenAiModelParams>(component, params, source.clone(), secrets)
                 .await?;

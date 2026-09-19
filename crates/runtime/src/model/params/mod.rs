@@ -36,6 +36,7 @@ pub mod huggingface;
 pub mod openai;
 pub mod spiceai;
 pub mod xai;
+pub mod typesafe;
 
 use std::sync::LazyLock;
 
@@ -58,6 +59,7 @@ source_specs!(XAI_SPEC, xai::XaiModelParams);
 source_specs!(BEDROCK_SPEC, bedrock::BedrockModelParams);
 source_specs!(SPICEAI_SPEC, spiceai::SpiceAiModelParams);
 source_specs!(GOOGLE_SPEC, google::GoogleModelParams);
+source_specs!(TYPESAFE_SPEC, typesafe::TypeSafeModelParams);
 
 /// Returns the parameter specifications for a given model source, generated
 /// from that source's `#[derive(TypedParams)]` struct (the single source of
@@ -76,6 +78,7 @@ pub fn get_params_spec(source: &ModelSource) -> &'static [ParameterSpec] {
         ModelSource::Bedrock => &BEDROCK_SPEC,
         ModelSource::SpiceAI => &SPICEAI_SPEC,
         ModelSource::Google => &GOOGLE_SPEC,
+        ModelSource::TypeSafe => &TYPESAFE_SPEC,
     }
 }
 
@@ -225,6 +228,7 @@ mod tests {
             (ModelSource::Bedrock, bedrock::BedrockModelParams::PREFIX),
             (ModelSource::SpiceAI, spiceai::SpiceAiModelParams::PREFIX),
             (ModelSource::Google, google::GoogleModelParams::PREFIX),
+            (ModelSource::TypeSafe, typesafe::TypeSafeModelParams::PREFIX),
         ] {
             assert_eq!(
                 prefix,

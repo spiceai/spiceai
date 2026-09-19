@@ -164,6 +164,9 @@ pub async fn construct_model(
     })?;
 
     let model = match source {
+        ModelSource::TypeSafe => Err(LlmError::EvaluateOnlyModel {
+            model: component.name.clone(),
+        }),
         #[cfg(feature = "models")]
         ModelSource::HuggingFace => {
             let p =

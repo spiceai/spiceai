@@ -21,7 +21,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::model::LLMChatCompletionsModelStore;
+use crate::model::{EvaluateModelStore, LLMChatCompletionsModelStore};
 #[cfg(feature = "openapi")]
 use async_openai::types::chat::CreateChatCompletionResponse;
 use async_openai::{
@@ -120,6 +120,7 @@ pub static KEEP_ALIVE_INTERVAL: u64 = 30;
 ))]
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
+    Extension(evaluate_models): Extension<Arc<RwLock<EvaluateModelStore>>>,
     headers: HeaderMap,
     Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
@@ -167,7 +168,17 @@ pub(crate) async fn post(
                     }
                 }
             }
-            None => (StatusCode::NOT_FOUND, format!("model '{model_id}' not found")).into_response(),
+            None => {
+                if evaluate_models.read().await.contains_key(&model_id) {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        llms::typesafe::chat_not_supported_message(&model_id),
+                    )
+                        .into_response()
+                } else {
+                    (StatusCode::NOT_FOUND, format!("model '{model_id}' not found")).into_response()
+                }
+            }
         }
     }
     .instrument(span)
@@ -438,6 +449,7 @@ mod tests {
         let mut store = LLMChatCompletionsModelStore::new();
         store.insert("dummy".to_string(), Arc::new(DummyChat {}));
         let llms = Arc::new(RwLock::new(store));
+        let evaluate_models = Arc::new(RwLock::new(EvaluateModelStore::new()));
 
         let mut headers = HeaderMap::new();
         if let Some(v) = progress_header {
@@ -463,7 +475,7 @@ mod tests {
 
         let _enter = span.enter();
 
-        let response = post(Extension(llms), headers, Json(req_payload))
+        let response = post(Extension(llms), Extension(evaluate_models), headers, Json(req_payload))
             .instrument(span.clone())
             .await;
 

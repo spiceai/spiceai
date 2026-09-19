@@ -105,6 +105,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::status::get,
         v1::spicepods::get,
         v1::embeddings::post,
+        v1::evaluate::post,
         v1::search::post,
         v1::chat::post,
         v1::responses::post,
@@ -475,10 +476,12 @@ pub(crate) fn routes(
                 post(v1::responses::post).layer(ModelContextLayer),
             )
             .route("/v1/embeddings", post(v1::embeddings::post))
+            .route("/v1/evaluate", post(v1::evaluate::post))
             .route("/v1/search", post(v1::search::post))
             .merge(tools_router)
             .route("/v1/workers", get(v1::workers::get))
             .layer(Extension(rt.completion_llms()))
+            .layer(Extension(rt.evaluate_models()))
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))

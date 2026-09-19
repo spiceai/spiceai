@@ -122,6 +122,11 @@ pub enum Error {
     ))]
     UnsupportedTaskForModel { from: String, task: String },
 
+    #[snafu(display(
+        "Model '{model}' is a TypeSafe System One evaluation model (Jev) and does not support chat completions. Use POST /v1/evaluate with `state` and typed `questions` instead. See https://spiceai.org/docs/components/models/typesafe."
+    ))]
+    EvaluateOnlyModel { model: String },
+
     #[snafu(display("Invalid value for parameter {param}. {message}"))]
     InvalidParamValueError { param: String, message: String },
 

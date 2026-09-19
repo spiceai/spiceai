@@ -26,6 +26,8 @@ use runtime_metrics as metrics;
 use runtime_secrets::get_params_with_secrets;
 use snafu::prelude::*;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource};
+use crate::model::{is_evaluate_only, try_to_evaluate_model};
+use llms::evaluate::Evaluate;
 use telemetry::timing::TimeMeasurement;
 
 #[derive(Debug, Snafu)]
@@ -110,36 +112,64 @@ impl Runtime {
             }
         }
 
-        let result: Result<(), Error> = match self.load_llm(m.clone(), params.clone()).await {
-            Ok((completions_model, responses_model, responses_api_support)) => {
-                let rate_controller =
-                    crate::model::rate_limit::build_model_rate_controller(m, &params);
-
-                let completion_llms = self.completion_llms();
-                let mut llm_map = completion_llms.write().await;
-                llm_map.insert(m.name.clone(), completions_model);
-                drop(llm_map);
-
-                if let Some(responses_model) = responses_model {
-                    let responses_llms = self.responses_llms();
-                    let mut responses_llm_map = responses_llms.write().await;
-                    responses_llm_map.insert(m.name.clone(), responses_model);
+        let result: Result<(), Error> = if is_evaluate_only(m) {
+            match try_to_evaluate_model(m, &params, &self.secrets()).await {
+                Ok(evaluate_model) => {
+                    if let Err(e) = Evaluate::health(evaluate_model.as_ref()).await {
+                        Err(Error::FailedToLoadLLM {
+                            name: m.name.clone(),
+                            source: Box::new(e),
+                        })
+                    } else {
+                        let rate_controller =
+                            crate::model::rate_limit::build_model_rate_controller(m, &params);
+                        let store = self.llm_runtime_stores.evaluate_models();
+                        let mut map = store.write().await;
+                        map.insert(m.name.clone(), evaluate_model);
+                        drop(map);
+                        let model_rate_controllers = self.model_rate_controllers();
+                        let mut rc_map = model_rate_controllers.write().await;
+                        rc_map.insert(m.name.clone(), rate_controller);
+                        Ok(())
+                    }
                 }
-
-                let responses_api_support_store = self.llm_runtime_stores.responses_api_support();
-                let mut responses_support_map = responses_api_support_store.write().await;
-                responses_support_map.insert(m.name.clone(), responses_api_support);
-                drop(responses_support_map);
-
-                let model_rate_controllers = self.model_rate_controllers();
-                let mut rc_map = model_rate_controllers.write().await;
-                rc_map.insert(m.name.clone(), rate_controller);
-                Ok(())
+                Err(e) => Err(Error::FailedToLoadLLM {
+                    name: m.name.clone(),
+                    source: Box::new(e),
+                }),
             }
-            Err(e) => Err(Error::FailedToLoadLLM {
-                name: m.name.clone(),
-                source: Box::new(e),
-            }),
+        } else {
+            match self.load_llm(m.clone(), params.clone()).await {
+                Ok((completions_model, responses_model, responses_api_support)) => {
+                    let rate_controller =
+                        crate::model::rate_limit::build_model_rate_controller(m, &params);
+
+                    let completion_llms = self.completion_llms();
+                    let mut llm_map = completion_llms.write().await;
+                    llm_map.insert(m.name.clone(), completions_model);
+                    drop(llm_map);
+
+                    if let Some(responses_model) = responses_model {
+                        let responses_llms = self.responses_llms();
+                        let mut responses_llm_map = responses_llms.write().await;
+                        responses_llm_map.insert(m.name.clone(), responses_model);
+                    }
+
+                    let responses_api_support_store = self.llm_runtime_stores.responses_api_support();
+                    let mut responses_support_map = responses_api_support_store.write().await;
+                    responses_support_map.insert(m.name.clone(), responses_api_support);
+                    drop(responses_support_map);
+
+                    let model_rate_controllers = self.model_rate_controllers();
+                    let mut rc_map = model_rate_controllers.write().await;
+                    rc_map.insert(m.name.clone(), rate_controller);
+                    Ok(())
+                }
+                Err(e) => Err(Error::FailedToLoadLLM {
+                    name: m.name.clone(),
+                    source: Box::new(e),
+                }),
+            }
         };
         match result {
             Ok(()) => {
@@ -190,6 +220,11 @@ impl Runtime {
         let mut responses_map = responses_llms.write().await;
         responses_map.remove(&m.name);
         drop(responses_map);
+
+        let evaluate_models = self.llm_runtime_stores.evaluate_models();
+        let mut evaluate_map = evaluate_models.write().await;
+        evaluate_map.remove(&m.name);
+        drop(evaluate_map);
 
         let responses_api_support = self.llm_runtime_stores.responses_api_support();
         let mut responses_support_map = responses_api_support.write().await;

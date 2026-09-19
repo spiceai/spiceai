@@ -24,6 +24,7 @@ pub(crate) mod nsql;
 pub mod params;
 pub(crate) mod provider_models;
 pub(crate) mod rate_limit;
+pub mod evaluate;
 pub mod rerank;
 mod responses;
 mod tool_use;
@@ -33,6 +34,7 @@ mod wrapper;
 
 pub use chat::{LLMChatCompletionsModelStore, try_to_chat_model};
 pub use embed::{EmbeddingModelStore, try_to_embedding};
+pub use evaluate::{EvaluateModelStore, is_evaluate_only, try_to_evaluate_model};
 pub use model_context::{
     ModelContextExtension, ModelContextLayer, add_tools_used, track_ai_inferences_with_spice_count,
 };
@@ -45,6 +47,7 @@ pub use tool_use_responses::ToolUsingResponses;
 pub struct LlmRuntimeStores {
     completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
     responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
+    evaluate_models: Arc<RwLock<EvaluateModelStore>>,
     rate_controllers: Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>>,
     responses_api_support: Arc<RwLock<HashMap<String, ResponsesApiSupport>>>,
 }
@@ -54,6 +57,7 @@ impl Default for LlmRuntimeStores {
         Self {
             completion_llms: Arc::new(RwLock::new(HashMap::new())),
             responses_llms: Arc::new(RwLock::new(HashMap::new())),
+            evaluate_models: Arc::new(RwLock::new(HashMap::new())),
             rate_controllers: Arc::new(RwLock::new(HashMap::new())),
             responses_api_support: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -69,6 +73,11 @@ impl LlmRuntimeStores {
     #[must_use]
     pub fn responses_llms(&self) -> Arc<RwLock<LLMResponsesModelStore>> {
         Arc::clone(&self.responses_llms)
+    }
+
+    #[must_use]
+    pub fn evaluate_models(&self) -> Arc<RwLock<EvaluateModelStore>> {
+        Arc::clone(&self.evaluate_models)
     }
 
     #[must_use]

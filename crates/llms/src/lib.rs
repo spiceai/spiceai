@@ -33,6 +33,8 @@ pub mod responses;
 pub mod spiceai;
 pub mod streaming_utils;
 pub mod xai;
+pub mod evaluate;
+pub mod typesafe;
 
 pub enum HealthCheck {
     Required,

@@ -487,10 +487,51 @@
         "prefix": "spiceai",
         "paramsRef": "#/$defs/SpiceaiModelParams",
         "schemaRef": "#/$defs/SpiceaiModel"
+      },
+      {
+        "name": "typesafe",
+        "prefix": "typesafe",
+        "paramsRef": "#/$defs/TypeSafeModelParams",
+        "schemaRef": "#/$defs/TypeSafeModel"
       }
     ]
   },
   "$defs": {
+    "TypeSafeModelParams": {
+      "title": "TypeSafeParams",
+      "type": "object",
+      "properties": {
+        "typesafe_api_key": {
+          "description": "TypeSafe API key. Autoloads from secret stores as typesafe_api_key (env TYPESAFE_API_KEY). Alias typesafe_ai_api_key / TYPESAFE_AI_API_KEY is also accepted.",
+          "type": "string"
+        },
+        "typesafe_ai_api_key": {
+          "description": "Alias for typesafe_api_key (AI SDK env TYPESAFE_AI_API_KEY).",
+          "type": "string"
+        },
+        "typesafe_endpoint": {
+          "description": "TypeSafe API base URL. Defaults to https://api.typesafe.ai (direct API, not the Vercel gateway).",
+          "type": "string",
+          "default": "https://api.typesafe.ai"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TypeSafeModel": {
+      "title": "TypeSafeModel",
+      "type": "object",
+      "required": ["from", "name"],
+      "properties": {
+        "from": {
+          "type": "string",
+          "description": "Model source. Use typesafe:jev, typesafe:jev-latest, typesafe:jev-preview, or a versioned id such as typesafe:jev-1.13.0. Chat completions are not supported; use POST /v1/evaluate."
+        },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "params": { "$ref": "#/$defs/TypeSafeModelParams" }
+      },
+      "additionalProperties": true
+    },
     "SpicepodVersion": {
       "description": "Spicepod schema version. Supported majors: v1, v2. Examples: 'v1', 'v2', 'v2.0', 'v2.0.0', 'v2.0.0-rc.1'.",
       "type": "string",
