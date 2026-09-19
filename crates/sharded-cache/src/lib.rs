@@ -142,6 +142,15 @@ struct TouchBuffer {
 #[repr(align(64))]
 struct CachePadded<T>(T);
 
+/// A test hook installed at a named point in the write path, or `None` when
+/// the point runs uninstrumented.
+#[cfg(test)]
+type TestHook = Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>;
+
+/// A [`TestHook`] that is handed the shard the write path just finished with.
+#[cfg(test)]
+type TestShardHook = Mutex<Option<std::sync::Arc<dyn Fn(usize) + Send + Sync>>>;
+
 /// Sharded cache keyed by pre-hashed `u64` values.
 pub struct ShardedCache<V, L: EvictionListener = NoopListener> {
     shards: Box<[CachePadded<Mutex<Shard<V>>>; NUM_SHARDS]>,
@@ -176,16 +185,16 @@ pub struct ShardedCache<V, L: EvictionListener = NoopListener> {
     /// Test-only: run at the start of each overflow-trim iteration, and again
     /// after `TinyLFU` snapshots a tail and before that tail is unlinked.
     #[cfg(test)]
-    before_size_victim: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    before_size_victim: TestHook,
     /// Test-only: run after a size victim is chosen and before its budget is
     /// claimed, so a concurrent `remove` can restore the limit in the window
     /// that used to unlink-then-rollback.
     #[cfg(test)]
-    before_claim_size: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    before_claim_size: TestHook,
     /// Test-only: run after each shard is invalidated and unlocked, so a test
     /// can insert into an already-scanned shard during the multi-shard walk.
     #[cfg(test)]
-    after_invalidate_shard: Mutex<Option<std::sync::Arc<dyn Fn(usize) + Send + Sync>>>,
+    after_invalidate_shard: TestShardHook,
     _listener: std::marker::PhantomData<L>,
 }
 

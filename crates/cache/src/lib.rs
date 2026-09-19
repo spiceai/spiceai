@@ -1611,6 +1611,58 @@ mod tests {
         .expect("valid cached result")
     }
 
+    /// Two stores of the same key race, and the *older* result lands last.
+    ///
+    /// No cache engine orders concurrent writes to one key — the store that
+    /// reaches the shard last wins, whichever query started first — so the
+    /// resident entry can be the older of two results. Read-time validation is
+    /// what makes that harmless: the entry carries its own `read_started_at`,
+    /// and an entry whose table changed at or after that instant is never
+    /// served, no matter which store deposited it.
+    #[tokio::test]
+    async fn get_raw_key_rejects_an_older_generation_that_overwrote_a_newer_one() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        let key = RawCacheKey::new(42);
+
+        // Query A starts, reading `customer`.
+        let old_read_started_at = Instant::now();
+        // `customer` changes while A is still running.
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+        // Query B starts after the change and stores first.
+        let new_read_started_at = Instant::now();
+
+        provider
+            .put_raw_key(
+                &key,
+                cached_result_for("customer", new_read_started_at).await,
+            )
+            .await
+            .expect("cache access should succeed");
+        // A's older result lands last and overwrites B's.
+        provider
+            .put_raw_key(
+                &key,
+                cached_result_for("customer", old_read_started_at).await,
+            )
+            .await
+            .expect("cache access should succeed");
+
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_none(),
+            "an older generation that overwrote a newer one must not be servable once its table has changed"
+        );
+    }
+
     /// A result stored *after* its table was invalidated must never be served.
     ///
     /// This is the interleaving no write-side check can cover: the invalidation
