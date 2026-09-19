@@ -311,6 +311,8 @@ pub struct AcceleratedTable {
     accelerator_write_mutex: Arc<Mutex<()>>,
     /// Tracks in-flight revalidation requests to avoid duplicate upstream requests during SWR window
     in_flight_revalidations: caching::InFlightRevalidations,
+    /// Bounds concurrent per-entry SWR background refreshes (caching mode only, spiceai/spiceai#14102)
+    swr_refresh_semaphore: Arc<Semaphore>,
     /// Timestamp (milliseconds since epoch) of the last `insert_into` operation.
     /// `None` if no insert has occurred yet (and no bootstrap timestamp was provided).
     /// Shared with `RefreshTask`
@@ -970,6 +972,12 @@ impl Builder {
         // Create the in-flight revalidations tracker to avoid duplicate upstream requests during SWR window.
         let in_flight_revalidations: caching::InFlightRevalidations =
             Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+        // Shared across every scan of this dataset so the bound holds
+        // regardless of how many distinct keys go stale concurrently
+        // (spiceai/spiceai#14102).
+        let swr_refresh_semaphore: Arc<Semaphore> = Arc::new(tokio::sync::Semaphore::new(
+            caching::MAX_CONCURRENT_SWR_REFRESHES,
+        ));
         // Create last_updated_at atomic to track insert_into timestamps, shared with Refresher for snapshots.
         // Initialize from bootstrap metadata if available.
         let last_updated_at = Arc::new(
@@ -1324,6 +1332,7 @@ impl Builder {
             io_runtime: self.io_runtime,
             accelerator_write_mutex: self.accelerator_write_mutex,
             in_flight_revalidations,
+            swr_refresh_semaphore,
             last_updated_at,
             batch_write_tx,
             cluster_role: self.cluster_role,
@@ -1883,6 +1892,7 @@ impl AcceleratedTable {
                     Arc::clone(&self.in_flight_revalidations),
                     Arc::clone(&self.synchronized_children),
                     batch_write_tx,
+                    Arc::clone(&self.swr_refresh_semaphore),
                 ))
             }
             (false, ZeroResultsAction::ReturnEmpty) => input.ok_or_else(|| {
