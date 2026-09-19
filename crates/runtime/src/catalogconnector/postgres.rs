@@ -41,6 +41,7 @@ use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::postgres::DynPostgresConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
+use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
 use snafu::Snafu;
 use std::any::Any;
@@ -151,8 +152,15 @@ pub const PARAMETERS: &[ParameterSpec] = &[
 /// only [`Read::table_provider`] would turn discovery back into a round trip
 /// per table. See issues #10703 and #13664.
 struct FederatedPostgresTableFactory {
-    pool: Arc<PostgresConnectionPool>,
+    pool: Arc<DynPostgresConnectionPool>,
     federation_enabled: bool,
+    /// Built once per catalog rather than per table: the policy is the same for
+    /// every table, and deriving it walks the nested-function list and takes a
+    /// read lock on the user-function registry each time. Building it once also
+    /// means every table in a catalog federates under the same snapshot of the
+    /// registered user functions, instead of whichever one its own turn in the
+    /// refresh happened to see.
+    function_support: FunctionSupport,
 }
 
 impl FederatedPostgresTableFactory {
@@ -173,7 +181,7 @@ impl FederatedPostgresTableFactory {
             table,
             schema,
             table_reference,
-            Some(deny_spice_functions_for_postgres_table_providers()),
+            Some(self.function_support.clone()),
         ))
     }
 }
@@ -184,11 +192,9 @@ impl Read for FederatedPostgresTableFactory {
         &self,
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        let pool = Arc::clone(&self.pool);
-        let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
         let table = SqlTable::new(
             "postgres",
-            &dyn_pool,
+            &self.pool,
             table_reference.clone(),
             Some(Engine::Postgres),
         )
@@ -203,11 +209,9 @@ impl Read for FederatedPostgresTableFactory {
         table_reference: TableReference,
         schema: SchemaRef,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        let pool = Arc::clone(&self.pool);
-        let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
         let table = SqlTable::new_with_schema(
             "postgres",
-            &dyn_pool,
+            &self.pool,
             schema,
             table_reference.clone(),
             Some(Engine::Postgres),
@@ -233,6 +237,7 @@ pub fn build_table_factory(
     Arc::new(FederatedPostgresTableFactory {
         pool,
         federation_enabled,
+        function_support: deny_spice_functions_for_postgres_table_providers(),
     })
 }
 
@@ -270,8 +275,8 @@ impl CatalogConnector for PostgresCatalog {
                 message,
             })?;
 
-        // Both parsed before the pool is created, so a misspelled value is
-        // reported without first opening a connection to the database.
+        // Parsed before the pool is created, so a misspelled value is reported
+        // without first opening a connection to the database.
         let federation_enabled =
             is_query_federation_enabled(&self.params.parameters).map_err(|e| {
                 super::Error::InvalidConfigurationNoSource {

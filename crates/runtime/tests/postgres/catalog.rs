@@ -48,7 +48,10 @@ use spicepod::{component::catalog::Catalog, param::Params};
 use crate::{
     configure_test_datafusion, init_tracing,
     postgres::common::{self, get_pg_params},
-    utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
+    utils::{
+        pushed_down_sql, register_test_connectors, run_query, runtime_ready_check,
+        test_request_context,
+    },
 };
 use data_components::Read;
 use data_components::RefreshableCatalogProvider;
@@ -142,14 +145,7 @@ async fn seed_partitioned_schema(port: usize) -> Result<(), anyhow::Error> {
 
 /// Build a `PostgreSQL` catalog against the seeded database.
 fn pg_catalog(port: usize) -> Catalog {
-    let mut catalog = Catalog::new("pg:postgres".to_string(), CATALOG_NAME.to_string());
-    catalog.params = Some(Params::from_string_map(
-        get_pg_params(port)
-            .into_iter()
-            .map(|(k, v)| (k, v.expose_secret().to_string()))
-            .collect::<HashMap<String, String>>(),
-    ));
-    catalog
+    pg_catalog_with(port, vec![])
 }
 
 /// The `(column_name, data_type)` pairs the catalog reports for `table`, ordered
@@ -1458,25 +1454,6 @@ fn pg_catalog_with(port: usize, extra: Vec<(&str, &str)>) -> Catalog {
     catalog
 }
 
-/// The SQL each federated scan in `plan` sends to `PostgreSQL`, one per line,
-/// and empty when nothing federated.
-///
-/// `base_sql` is the only part of an `EXPLAIN` that says what the server is
-/// asked to evaluate -- the logical plan above it names the `DataFusion`
-/// function whether or not it was pushed down -- so the tests below read it
-/// rather than the whole plan.
-fn pushed_down_sql(plan: &[RecordBatch]) -> String {
-    let rendered = arrow::util::pretty::pretty_format_batches(plan)
-        .map(|d| d.to_string())
-        .unwrap_or_default();
-    rendered
-        .split("base_sql=")
-        .skip(1)
-        .map(|tail| tail.split('\n').next().unwrap_or_default().to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// A `TEXT` column of JSON documents, which the Spice-only UDF below reads.
 /// `TEXT` rather than `JSONB` so the column arrives as `Utf8` whatever
 /// `unsupported_type_action` says, keeping the test about pushdown.
@@ -1543,7 +1520,7 @@ async fn test_catalog_evaluates_a_spice_only_udf_locally() -> Result<(), anyhow:
                     ),
                 )
                 .await?,
-            );
+            )?;
             assert!(
                 !pushed.contains("json_get_str"),
                 "json_get_str must not reach PostgreSQL; pushed SQL was: {pushed}"
@@ -1557,7 +1534,7 @@ async fn test_catalog_evaluates_a_spice_only_udf_locally() -> Result<(), anyhow:
                     &format!("EXPLAIN SELECT upper(body) FROM {CATALOG_NAME}.public.documents"),
                 )
                 .await?,
-            );
+            )?;
             assert!(
                 pushed.contains("upper"),
                 "upper() must still federate to PostgreSQL; pushed SQL was: {pushed}"
@@ -1592,7 +1569,7 @@ async fn test_catalog_query_federation_disabled_pushes_nothing_down() -> Result<
                     &format!("EXPLAIN SELECT upper(body) FROM {CATALOG_NAME}.public.documents"),
                 )
                 .await?,
-            );
+            )?;
             assert!(
                 pushed.is_empty(),
                 "nothing should federate with query_federation: disabled; pushed SQL was: {pushed}"
