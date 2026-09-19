@@ -5554,9 +5554,9 @@ pub fn is_schema_mismatch(error: &runtime_query_engine::query_engine::Error) -> 
         .is_some_and(|e| matches!(e, Error::SchemaMismatch { .. }))
 }
 
-// Normalizes a table reference to a full table reference with catalog, schema, and table name
-// so it can be used for comparison.
-fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
+/// Normalizes a table reference to a full table reference with catalog, schema, and table name
+/// so it can be used for comparison.
+pub(crate) fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
     table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
 }
 
