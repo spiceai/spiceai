@@ -5113,7 +5113,7 @@ impl DataFusion {
                 && let Some(plan) = cache.get_raw_key(&cache_key.as_u64()).await
             {
                 tracing::trace!("using cached plan for {sql}");
-                return Ok(plan);
+                return Ok(std::sync::Arc::unwrap_or_clone(plan));
             }
             plans_cache
         } else {

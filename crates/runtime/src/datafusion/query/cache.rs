@@ -935,6 +935,7 @@ impl Query {
         let plan = plans_cache
             .get_raw_key(&Self::cached_plan_key(df, sql, Some(namespace)).as_u64())
             .await?;
+        let plan = std::sync::Arc::unwrap_or_clone(plan);
         match parameters {
             Some(parameters) => plan.with_param_values(parameters.clone()).ok(),
             None => Some(plan),

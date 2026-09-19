@@ -122,19 +122,23 @@ impl<
     H: Hasher + Send + Sync + 'static,
 > CacheProvider<V> for SimpleCache<V, T, H>
 {
-    async fn get_raw_key(&self, key: &u64) -> Option<V> {
-        self.cache.get(key).await
+    async fn get_raw_key(&self, key: &u64) -> Option<std::sync::Arc<V>> {
+        self.cache.get(key).await.map(std::sync::Arc::new)
     }
 
     async fn get_raw_key_validated(
         &self,
         key: &u64,
         is_valid: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
-    ) -> Option<V> {
+    ) -> Option<std::sync::Arc<V>> {
         // This cache records no hit/miss metrics, so there is nothing to
         // misattribute; filtering the value is all that is needed.
-        let value = self.cache.get(key).await?;
-        if is_valid(&value) { Some(value) } else { None }
+        let value = self.cache.get(key).await.map(std::sync::Arc::new)?;
+        if is_valid(value.as_ref()) {
+            Some(value)
+        } else {
+            None
+        }
     }
 
     async fn put_raw_key(&self, key: &u64, value: V) {

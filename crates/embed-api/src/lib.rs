@@ -163,7 +163,7 @@ pub fn encode_embedding(format: &EncodingFormat, array: Vec<f32>) -> EmbeddingVe
 
 #[async_trait]
 pub trait Embed: Debug + Sync + Send {
-    async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
+    async fn embed(&self, input: EmbeddingInput) -> Result<Arc<Vec<Vec<f32>>>>;
 
     fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
         None
@@ -185,12 +185,14 @@ pub trait Embed: Debug + Sync + Send {
         }
     }
 
-    async fn get_cached_embed(&self, key: CacheKey<'_>) -> Option<CachedEmbeddingResult> {
+    async fn get_cached_embed(&self, key: CacheKey<'_>) -> Option<Arc<CachedEmbeddingResult>> {
         if let Some(embeddings_cache) = self.cache()
             && let Some(cached) = embeddings_cache
                 .get_raw_key(&key.as_raw_key(embeddings_cache.hasher()).as_u64())
                 .await
         {
+            // Return the shared `Arc` so hit paths can `Arc::clone` the inner
+            // payload without deep-cloning while the cache still holds a ref.
             return Some(cached);
         }
 
@@ -211,7 +213,7 @@ pub trait Embed: Debug + Sync + Send {
     /// # Errors
     ///
     /// Returns whatever [`Self::embed`] returns.
-    fn embed_sync(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+    fn embed_sync(&self, input: EmbeddingInput) -> Result<Arc<Vec<Vec<f32>>>> {
         task::block_in_place(move || Handle::current().block_on(self.embed(input)))
     }
 
@@ -255,26 +257,29 @@ pub trait Embed: Debug + Sync + Send {
     /// An OpenAI-compatible interface for the embedding trait. If not implemented, the default
     /// implementation will be constructed based on the trait's [`embed`] method.
     #[expect(clippy::cast_possible_truncation)]
-    async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
+    async fn embed_request(
+        &self,
+        req: CreateEmbeddingRequest,
+    ) -> Result<Arc<CreateEmbeddingResponse>> {
         let format = req.encoding_format.unwrap_or_default();
         let result = self.embed(req.input).await?;
 
-        Ok(CreateEmbeddingResponse {
+        Ok(Arc::new(CreateEmbeddingResponse {
             object: "list".to_string(),
             model: req.model.clone(),
             data: result
-                .into_iter()
+                .iter()
                 .enumerate()
                 .map(|(i, emb)| Embedding {
                     index: i as u32,
                     object: "embedding".to_string(),
-                    embedding: encode_embedding(&format, emb),
+                    embedding: encode_embedding(&format, emb.clone()),
                 })
                 .collect(),
             usage: EmbeddingUsage {
                 prompt_tokens: 0,
                 total_tokens: 0,
             },
-        })
+        }))
     }
 }

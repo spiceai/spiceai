@@ -49,6 +49,7 @@ pub mod result;
 pub use backend::CacheBackend;
 pub use backend::CacheBackendBuilder;
 pub use backend::MokaBackend;
+pub use backend::SpiceBackend;
 
 #[cfg(feature = "pingora")]
 pub use backend::PingoraBackend;
@@ -223,7 +224,7 @@ pub(crate) fn invalidated_table_name(table_ref: &TableReference) -> Arc<str> {
 pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
     HashProvider + std::fmt::Debug + std::fmt::Display
 {
-    async fn get_raw_key(&self, key: &u64) -> Option<V>;
+    async fn get_raw_key(&self, key: &u64) -> Option<std::sync::Arc<V>>;
     /// Looks up `key`, treating a value that `is_valid` rejects as a miss —
     /// including for hit/miss metrics, so the hit ratio reflects results
     /// actually served rather than entries merely found.
@@ -236,7 +237,7 @@ pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
         &self,
         key: &u64,
         is_valid: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
-    ) -> Option<V>;
+    ) -> Option<std::sync::Arc<V>>;
     async fn put_raw_key(&self, key: &u64, value: V);
     /// Replace the value at `key` only when `should_replace` accepts the
     /// currently stored value. See [`crate::backend::CacheBackend::replace_if`].
@@ -268,6 +269,19 @@ pub trait TabledCacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
     ///
     /// If the cache invalidation fails.
     async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()>;
+
+    /// Returns `true` if any of `tables` was invalidated at or after `since`.
+    ///
+    /// Default is `false` (no table-generation clock). [`crate::lru_cache::LruCache`]
+    /// records invalidations and rejects mid-flight search publishes / hits.
+    fn tables_changed_since(
+        &self,
+        tables: &HashSet<TableReference>,
+        since: std::time::Instant,
+    ) -> bool {
+        let _ = (tables, since);
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -558,10 +572,11 @@ impl Caching {
         Ok(())
     }
 
-    /// Drives moka housekeeping on every configured cache. `moka::future::Cache`
-    /// has no background maintenance thread, so invalidation predicates and
-    /// expired entries on a cache with no `get`/`insert` traffic are only
-    /// reclaimed when this runs.
+    /// Drives housekeeping on every configured cache. SQL results expire stale
+    /// entries via `run_pending_tasks` (Spice shard walk on the blocking pool)
+    /// and then refresh size gauges. Plans, search, and embeddings run
+    /// `checkpoint`. Expired entries on a cache with no `get`/`insert` traffic
+    /// are only reclaimed when this runs.
     pub async fn run_pending_maintenance(&self) {
         // The interner pools are reclaimed here rather than by the runtime,
         // because this crate is the only thing that populates them: every value
@@ -630,7 +645,7 @@ impl Caching {
 /// self-healing (later changes repopulate per-table entries), at the cost
 /// of some lost cache entries in the moments after a collapse.
 #[derive(Default)]
-struct TableChangeClock {
+pub(crate) struct TableChangeClock {
     state: parking_lot::RwLock<TableChangeState>,
 }
 
@@ -641,7 +656,7 @@ struct TableChangeClock {
 const MAX_TRACKED_TABLES: usize = 4096;
 
 #[derive(Default)]
-struct TableChangeState {
+pub(crate) struct TableChangeState {
     changed_at: std::collections::HashMap<u64, std::time::Instant>,
     /// Stands in for every table dropped from `changed_at`. Holds the
     /// newest instant among the dropped entries, which is `>=` the true
@@ -678,7 +693,7 @@ impl TableChangeClock {
         hasher.finish()
     }
 
-    fn record_change(&self, table_ref: &TableReference, at: std::time::Instant) {
+    pub(crate) fn record_change(&self, table_ref: &TableReference, at: std::time::Instant) {
         let key = Self::resolved_key(table_ref);
         let mut state = self.state.write();
 
@@ -725,7 +740,7 @@ impl TableChangeClock {
     /// Ties count as changed: a change recorded in the same instant
     /// as the read began must be assumed to have happened first, since serving
     /// stale data is worse than losing a cache entry.
-    fn changed_since<S: std::hash::BuildHasher>(
+    pub(crate) fn changed_since<S: std::hash::BuildHasher>(
         &self,
         tables: &HashSet<TableReference, S>,
         since: std::time::Instant,
@@ -958,7 +973,7 @@ impl QueryResultsCacheProvider {
         let validity = EntryValidity::from_u8(observed.load(std::sync::atomic::Ordering::Relaxed));
 
         if let Some(result) = result {
-            Some((result, validity))
+            Some((std::sync::Arc::unwrap_or_clone(result), validity))
         } else {
             let reason = match validity {
                 // Nothing the clock ruled on; the key simply was not there.
@@ -1289,8 +1304,9 @@ impl QueryResultsCacheProvider {
     }
 
     /// Re-reports the size and item-count gauges from the cache's current
-    /// state. Both accessors drive `moka` housekeeping first, so this reflects
-    /// entries already dropped by invalidation or expiry.
+    /// state. Size and item count read the Spice backend's live counters (no
+    /// expiry scan); call `run_pending_tasks` / `checkpoint` first when the
+    /// gauges should exclude unobserved TTL entries.
     pub async fn report_size_metrics(&self) {
         CachedQueryResult::record_item_count(self.item_count().await);
         CachedQueryResult::record_size(self.size().await);

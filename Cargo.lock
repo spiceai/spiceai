@@ -3387,6 +3387,7 @@ dependencies = [
  "pingora-lru",
  "rand 0.10.1",
  "rstest 0.25.0",
+ "sharded-cache",
  "snafu",
  "spicepod",
  "tokio",
@@ -19273,6 +19274,13 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "digest 0.11.3",
+]
+
+[[package]]
+name = "sharded-cache"
+version = "2.4.0-unstable"
+dependencies = [
+ "parking_lot",
 ]
 
 [[package]]

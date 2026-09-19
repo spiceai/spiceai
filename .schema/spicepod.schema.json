@@ -730,7 +730,8 @@
         },
         "engine": {
           "$ref": "#/$defs/CacheEngine",
-          "default": "moka"
+          "default": "moka",
+          "description": "Cache backend selector retained for spicepod compatibility and ignored at runtime. Values `moka` and `pingora` still deserialize; the runtime always uses the Spice sharded-cache backend for SQL, search, and embeddings `LruCache` paths. `engine: pingora` no longer selects Pingora (a one-time warning is logged).\n\nMigration: remove `engine` from the spicepod, or leave it unchanged for compatibility. See https://spiceai.org/docs/features/caching."
         },
         "max_stale_while_revalidate": {
           "description": "Maximum stale-while-revalidate duration to add to the cache TTL.",
@@ -754,7 +755,12 @@
           "const": "lru"
         },
         {
-          "description": "`TinyLFU` caching policy.\nCombines LRU eviction with LFU-based admission policy.\nSuitable for most workloads including database, search, and analytics.",
+          "description": "Least Frequently Used caching policy.\n\nEvicts the lowest hit-count resident; suitable for stable hot-key\nworkloads where frequency beats recency. Prefer `lru` for\nstreaming/recency-biased traffic and `tiny_lfu` as the general\ndefault for mixed database/search/analytics. User-facing docs and\nPM/DX acceptance for shipping this value are tracked in\nhttps://github.com/spiceai/spiceai/issues/14211.",
+          "type": "string",
+          "const": "lfu"
+        },
+        {
+          "description": "W-`TinyLFU` caching policy.\nAdmission window + SLRU main (probation/protected) with Count-Min Sketch.\nSuitable for most workloads including database, search, and analytics.",
           "type": "string",
           "const": "tiny_lfu"
         }
@@ -782,12 +788,12 @@
     "CacheEngine": {
       "oneOf": [
         {
-          "description": "Moka cache engine (default) - stable, built-in TTL, no race conditions",
+          "description": "Historical default (`moka`). Accepted for spicepod compatibility and ignored at runtime: SQL, search, and embeddings `LruCache` paths always use the Spice sharded-cache backend.\n\nMigration: leave `engine: moka` in place (no behavior change) or remove the field; neither value selects a backend.",
           "type": "string",
           "const": "moka"
         },
         {
-          "description": "Pingora-LRU cache engine - 2-3x faster, sharded architecture, manual TTL handling with a rare race condition. Note: table-specific invalidation scans the cache in place, so its cost is proportional to the number of cached entries.",
+          "description": "Historical Pingora-LRU option (`pingora`). Accepted for spicepod compatibility and ignored at runtime; a one-time warning is logged. SQL, search, and embeddings caches always use the Spice sharded-cache backend — `engine: pingora` no longer selects Pingora.\n\nMigration: remove `engine: pingora` from the spicepod, or leave it (it is ignored). Use `caching_policy` to choose eviction behavior.",
           "type": "string",
           "const": "pingora"
         }
@@ -862,7 +868,8 @@
         },
         "engine": {
           "$ref": "#/$defs/CacheEngine",
-          "default": "moka"
+          "default": "moka",
+          "description": "Cache backend selector retained for spicepod compatibility and ignored at runtime. Values `moka` and `pingora` still deserialize; the runtime always uses the Spice sharded-cache backend for SQL, search, and embeddings `LruCache` paths. `engine: pingora` no longer selects Pingora (a one-time warning is logged).\n\nMigration: remove `engine` from the spicepod, or leave it unchanged for compatibility. See https://spiceai.org/docs/features/caching."
         },
         "stale_while_revalidate_ttl": {
           "description": "Maximum age for serving stale cached results while revalidating in the background.\nWhen set, cached results past their TTL (but within this additional window) will be\nserved immediately while a background refresh is triggered.\nFormat: duration string (e.g., \"30s\", \"5m\"). This is a response directive.",
@@ -919,7 +926,8 @@
         },
         "engine": {
           "$ref": "#/$defs/CacheEngine",
-          "default": "moka"
+          "default": "moka",
+          "description": "Cache backend selector retained for spicepod compatibility and ignored at runtime. Values `moka` and `pingora` still deserialize; the runtime always uses the Spice sharded-cache backend for SQL, search, and embeddings `LruCache` paths. `engine: pingora` no longer selects Pingora (a one-time warning is logged).\n\nMigration: remove `engine` from the spicepod, or leave it unchanged for compatibility. See https://spiceai.org/docs/features/caching."
         },
         "eviction_policy": {
           "$ref": "#/$defs/CachingPolicy",
