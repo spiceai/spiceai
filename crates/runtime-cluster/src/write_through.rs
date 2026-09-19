@@ -316,7 +316,18 @@ where
         while let Some(result) = messages.next().await {
             let message = result.context(StreamReadSnafu)?;
 
-            if message.app_metadata.as_ref() == KEEPALIVE_APP_METADATA {
+            // The sentinel alone cannot decide this. On this path `app_metadata` is the
+            // client's to set, so a message carrying data can wear it, and skipping on the
+            // metadata alone discards that data while the write still reports success. A
+            // heartbeat declares no IPC data at all, so requiring that too keeps the skip to
+            // real heartbeats and sends anything data-bearing on to the check below, which
+            // decodes it or fails loudly. The predicate is `declares_ipc_data` rather than
+            // `declares_record_batch` because a dictionary is client data too: the batches
+            // referring to it carry nothing without it, so a tagged dictionary must be refused
+            // rather than dropped.
+            if message.app_metadata.as_ref() == KEEPALIVE_APP_METADATA
+                && !declares_ipc_data(&message.data_header, &table_name)?
+            {
                 continue;
             }
 
@@ -340,6 +351,16 @@ where
                     .with_context(|_| MapEntriesNotNormalizableSnafu { table: table_name.clone() })?;
             }
         }
+    })
+}
+
+/// Whether a message's IPC header declares data the client sent — a record batch, or a
+/// dictionary the batches referencing it cannot be decoded without — reporting an unreadable
+/// header the same way [`declares_record_batch`] does.
+fn declares_ipc_data(data_header: &[u8], table: &str) -> Result<bool> {
+    ipc::declares_ipc_data(data_header).map_err(|message| Error::UnreadableMessageHeader {
+        table: table.to_string(),
+        message,
     })
 }
 
@@ -1168,9 +1189,12 @@ async fn forward_batches_to_executor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayData, ArrayRef, Int32Array, MapArray, StringArray, StructArray};
+    use arrow::array::{
+        ArrayData, ArrayRef, Int32Array, MapArray, StringArray, StringDictionaryBuilder,
+        StructArray,
+    };
     use arrow::buffer::{Buffer, NullBuffer};
-    use arrow::datatypes::{Field, Fields, Schema};
+    use arrow::datatypes::{DataType, Field, Fields, Int32Type, Schema};
     use arrow_flight::utils::batches_to_flight_data;
 
     fn test_schema() -> SchemaRef {
@@ -1515,6 +1539,120 @@ mod tests {
 
         assert_eq!(batches.len(), 2);
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    }
+
+    /// On this path `app_metadata` is set by the Flight client — the function's own comment
+    /// calls this "the scheduler's own decode of the client stream" — so the sentinel is not a
+    /// private channel between our scheduler and our executor, and a writer is free to put it on
+    /// a message that also carries a batch. Skipping on the metadata alone drops those rows and
+    /// still reports the write a success: the same silent row loss the header discriminator
+    /// exists to close, reopened by a different door.
+    #[tokio::test]
+    async fn a_data_bearing_message_wearing_the_keepalive_sentinel_is_not_skipped() {
+        let schema = client_schema();
+        let mut messages = encode_batch_to_flight_data(&schema, &client_batch(vec!["US"], vec![1]));
+        let first = messages.remove(0);
+        let mut second = encode_batch_to_flight_data(&schema, &client_batch(vec!["EU"], vec![2]))
+            .pop()
+            .expect("a batch message");
+        second.app_metadata = bytes::Bytes::from_static(KEEPALIVE_APP_METADATA);
+
+        // The fixture really does declare a batch: the sentinel is the only thing separating it
+        // from the message the keepalive case sends. Asserted so the test cannot pass by
+        // accidentally carrying nothing.
+        assert!(
+            declares_record_batch(&second.data_header, "test.s.events").expect("a readable header"),
+            "the fixture must declare a record batch for this case to mean anything"
+        );
+
+        let batches = decode(first, vec![messages.remove(0), second], &schema)
+            .await
+            .expect("a data-bearing message should decode, not be skipped");
+
+        // Asserted by value, not by count: a count alone passes on code that drops the tagged
+        // row and duplicates the untagged one, which is the wrong behaviour wearing the right
+        // total.
+        let regions: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("the region column is a string")
+                    .iter()
+                    .map(|region| region.expect("no nulls in the fixture").to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            regions,
+            vec!["US".to_string(), "EU".to_string()],
+            "the row carried by the sentinel-tagged message was dropped"
+        );
+    }
+
+    /// A dictionary is client data too — the batches referring to it carry nothing without it —
+    /// so a dictionary message wearing the sentinel must not be skipped either. This decoder
+    /// does not ingest dictionaries, so what matters is that one is refused loudly rather than
+    /// discarded while the write reports success.
+    #[tokio::test]
+    async fn a_dictionary_message_wearing_the_keepalive_sentinel_is_refused_not_skipped() {
+        use arrow::ipc::writer::{
+            CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions,
+        };
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "region",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        )]));
+        let mut values = StringDictionaryBuilder::<Int32Type>::new();
+        values.append_value("US");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(values.finish()) as ArrayRef],
+        )
+        .expect("a dictionary batch");
+
+        // Encoded the way a writer does, so the dictionary message is a real one rather than a
+        // header this test built to agree with itself.
+        let generator = IpcDataGenerator::default();
+        let options = IpcWriteOptions::default();
+        let mut tracker = DictionaryTracker::new(false);
+        let schema_message =
+            generator.schema_to_bytes_with_dictionary_tracker(&schema, &mut tracker, &options);
+        let (dictionaries, _encoded) = generator
+            .encode(
+                &batch,
+                &mut tracker,
+                &options,
+                &mut CompressionContext::default(),
+            )
+            .expect("encoding a dictionary batch");
+        let encoded_dictionary = dictionaries.first().expect("a dictionary message");
+
+        let first = FlightData {
+            data_header: schema_message.ipc_message.clone().into(),
+            ..Default::default()
+        };
+        let dictionary = FlightData {
+            data_header: encoded_dictionary.ipc_message.clone().into(),
+            data_body: encoded_dictionary.arrow_data.clone().into(),
+            app_metadata: bytes::Bytes::from_static(KEEPALIVE_APP_METADATA),
+            ..Default::default()
+        };
+        assert!(
+            ipc::declares_ipc_data(&dictionary.data_header).expect("a readable header")
+                && !ipc::declares_record_batch(&dictionary.data_header).expect("a readable header"),
+            "the fixture must be a dictionary message for this case to mean anything"
+        );
+
+        let err = decode(first, vec![dictionary], &schema)
+            .await
+            .expect_err("a tagged dictionary should be refused, not silently skipped");
+
+        assert!(matches!(err, Error::NonBatchMessage { .. }), "{err:?}");
     }
 
     /// A message that declares no record batch means the stream has gone out of step with what
