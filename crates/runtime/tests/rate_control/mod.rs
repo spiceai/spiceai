@@ -67,6 +67,7 @@ fn rps_config(rps: u32) -> HttpRateControlConfig {
         requests_per_minute: None,
         jitter_min: Duration::ZERO,
         jitter_max: Duration::ZERO,
+        adaptive_rate_control: data_http_rate_control::AdaptiveRateControl::Disabled,
     }
 }
 
