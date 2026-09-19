@@ -525,8 +525,11 @@ mod tests {
 
         let omitted: NoulCriteria = serde_json::from_value(json!({})).expect("omit");
         assert!(matches!(omitted.true_meaning, NullableEntry::Absent));
-        let omitted_json = serde_json::to_value(&omitted).expect("ser");
-        let obj = omitted_json.as_object().expect("object");
-        assert!(obj.is_empty());
+        let omitted_json = serde_json::to_value(&omitted);
+        assert!(omitted_json.is_ok(), "serialize omitted criteria");
+        match omitted_json.ok().and_then(|v| v.as_object().cloned()) {
+            Some(obj) => assert!(obj.is_empty()),
+            None => panic!("expected empty JSON object"),
+        }
     }
 }
