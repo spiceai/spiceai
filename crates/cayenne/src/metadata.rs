@@ -263,6 +263,27 @@ pub struct PartitionMetadata {
     pub file_size_bytes: i64,
 }
 
+/// The composite key string for a partition's ordered values.
+///
+/// Components are length-prefixed so tuple boundaries are unambiguous even for
+/// legacy values containing separators.
+///
+/// A free function rather than only a method, because the key is derived in two
+/// places that do not both hold a [`PartitionMetadata`]: reopening a partition
+/// derives it from the metadata, and resolving a partition's child table
+/// (`crate::metastore::partition_child_table_ids`) derives it from the values
+/// read out of `cayenne_partition`. They must agree, so they share this.
+#[must_use]
+pub fn composite_partition_key(partition_values: &[String]) -> String {
+    let mut composite = String::from("v1:");
+    for value in partition_values {
+        composite.push_str(&value.len().to_string());
+        composite.push(':');
+        composite.push_str(value);
+    }
+    composite
+}
+
 impl PartitionMetadata {
     /// Returns a composite key string for this partition.
     ///
@@ -270,13 +291,7 @@ impl PartitionMetadata {
     /// for legacy values containing separators.
     #[must_use]
     pub fn composite_key(&self) -> String {
-        let mut composite = String::from("v1:");
-        for value in &self.partition_values {
-            composite.push_str(&value.len().to_string());
-            composite.push(':');
-            composite.push_str(value);
-        }
-        composite
+        composite_partition_key(&self.partition_values)
     }
 
     /// Creates a new `PartitionMetadata` for a single partition column (legacy compatibility).

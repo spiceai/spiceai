@@ -1968,61 +1968,28 @@ impl CayenneCatalog {
 
     /// `table_id`s of the per-partition child tables of `table_name`.
     ///
-    /// Matched by the same derivation the partition creator uses to open them
-    /// ([`crate::partition_naming`]), including the legacy name a partition
-    /// created by an older runtime still answers to.
-    ///
-    /// A name match alone is not enough to delete by: the legacy convention
-    /// (`{parent}_{values}`) can also spell an unrelated table an operator
-    /// happens to have accelerated into the same metastore — partitioning
-    /// `events` by year spells `events_2024`. A child is rooted at its
-    /// partition's own directory, so the row's `path` must equal the partition's
-    /// before it counts as one. A child whose path somehow differs is left
-    /// behind rather than deleted, which is the safe direction to be wrong in.
-    ///
-    /// A child never has partitions of its own, so this does not recurse. Empty
-    /// for an unpartitioned table, which has no `cayenne_partition` rows.
+    /// Delegates to [`crate::metastore::partition_child_table_ids`], which is
+    /// shared with the metastore snapshot's export and import so a dataset
+    /// cannot be dropped by one definition of "child" and exported by another.
+    /// Its doc comment carries the matching rule.
     async fn partition_child_table_ids(
         &self,
         table_name: &str,
         table_id: &str,
     ) -> CatalogResult<Vec<String>> {
-        let mut child_ids = Vec::new();
-        for partition in self.get_partitions(table_id).await? {
-            let matched: Vec<String> = self
-                .metastore
-                .query_helper(
-                    QueryParams {
-                        sql: crate::partition_naming::PARTITION_CHILD_LOOKUP_SQL,
-                        params: vec![
-                            MetastoreValue::Text(
-                                crate::partition_naming::partition_child_table_name(
-                                    table_name,
-                                    &partition.composite_key(),
-                                ),
-                            ),
-                            MetastoreValue::Text(
-                                crate::partition_naming::legacy_partition_child_table_name(
-                                    table_name,
-                                    &partition.partition_values,
-                                ),
-                            ),
-                            MetastoreValue::Text(partition.path.clone()),
-                        ],
-                    },
-                    |row| row.get_string(0),
-                )
-                .await
-                .map_err(|e| CatalogError::FailedToGetPartitions {
-                    source: Box::new(e),
-                })?;
-
-            // `cayenne_table(table_name)` is unique and a partition owns its
-            // directory, so a child can match at most one partition.
-            child_ids.extend(matched);
+        self.metastore.note_query();
+        match &self.metastore.backend {
+            MetastoreBackendImpl::Sqlite(m) => {
+                crate::metastore::partition_child_table_ids(m, table_name, table_id).await
+            }
+            #[cfg(feature = "turso")]
+            MetastoreBackendImpl::Turso(m) => {
+                crate::metastore::partition_child_table_ids(m, table_name, table_id).await
+            }
         }
-
-        Ok(child_ids)
+        .map_err(|e| CatalogError::FailedToGetPartitions {
+            source: Box::new(e),
+        })
     }
 
     /// Delete every metastore row belonging to `table_id`, ending with the

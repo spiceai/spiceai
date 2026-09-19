@@ -300,6 +300,103 @@ pub fn table_id_to_key_bytes(table_id: &str) -> Vec<u8> {
     }
 }
 
+/// Resolve the `table_id`s of `parent_name`'s per-partition child tables.
+///
+/// A partitioned Cayenne table's partitions are catalog tables of their own:
+/// each has its own `cayenne_table` row, its own `table_id`, and its own
+/// dependent rows. Three callers need that set and must agree on it — the
+/// catalog drops the children with their parent, the metastore snapshot exports
+/// them with it, and the snapshot's import clears the reader's own before
+/// replacing them. A second copy of this rule is how a dataset comes to be
+/// dropped by one definition of "child" and exported by another, so it lives
+/// here once.
+///
+/// A name match alone is not enough: the legacy convention
+/// (`{parent}_{values}`) can also spell an unrelated table an operator happens
+/// to have accelerated into the same metastore — partitioning `events` by year
+/// spells `events_2024`. A child is rooted at its partition's own directory
+/// ([`crate::partition_creator`] passes one path to both the partition row and
+/// the child table), so the row's `path` must equal the partition's before it
+/// counts as one. A child whose path somehow differs is left behind rather than
+/// matched, which is the safe direction to be wrong in for a drop and the loud
+/// one for an export, where [`snapshot::DatasetMetastoreSlice::validate`]
+/// refuses the resulting slice.
+///
+/// The key is **derived** from the partition's stored values rather than read
+/// from `cayenne_partition.partition_key`, because deriving is what
+/// `infer_existing_partitions` does when it opens a child: a child that can
+/// only be found under the stored key is a child the runtime cannot open.
+///
+/// A child never has partitions of its own, so this does not recurse. Empty for
+/// an unpartitioned table, which has no `cayenne_partition` rows.
+///
+/// # Errors
+///
+/// Returns an error if a metastore query fails, or if a partition's stored
+/// `partition_values_json` cannot be read — a partition whose values will not
+/// parse cannot be matched to its child, and silently omitting one is the
+/// failure this lookup exists to prevent.
+pub(crate) async fn partition_child_table_ids(
+    metastore: &impl MetastoreBackend,
+    parent_name: &str,
+    parent_table_id: &str,
+) -> CatalogResult<Vec<String>> {
+    // `ORDER BY partition_id` so the child set — and therefore a slice built
+    // from it — is the same on every read of the same metastore.
+    let partitions: Vec<(String, String)> = metastore
+        .query(
+            QueryParams {
+                sql: "SELECT partition_values_json, path FROM cayenne_partition \
+                      WHERE table_id = ? ORDER BY partition_id",
+                params: vec![MetastoreValue::Text(parent_table_id.to_string())],
+            },
+            |row| Ok((row.get_string(0)?, row.get_string(1)?)),
+        )
+        .await?;
+
+    let mut child_ids: Vec<String> = Vec::new();
+    for (values_json, path) in partitions {
+        let values: Vec<String> =
+            serde_json::from_str(&values_json).map_err(|e| CatalogError::Database {
+                message: format!(
+                    "cannot resolve the partition child tables of '{parent_name}': a partition's stored values are unreadable: {e}"
+                ),
+            })?;
+        let matched: Vec<String> = metastore
+            .query(
+                QueryParams {
+                    sql: "SELECT table_id FROM cayenne_table \
+                          WHERE table_name IN (?1, ?2) AND path = ?3",
+                    params: vec![
+                        MetastoreValue::Text(crate::partition_naming::partition_child_table_name(
+                            parent_name,
+                            &crate::metadata::composite_partition_key(&values),
+                        )),
+                        MetastoreValue::Text(
+                            crate::partition_naming::legacy_partition_child_table_name(
+                                parent_name,
+                                &values,
+                            ),
+                        ),
+                        MetastoreValue::Text(path),
+                    ],
+                },
+                |row| row.get_string(0),
+            )
+            .await?;
+        // `cayenne_table(table_name)` is unique and a partition owns its
+        // directory, so a child matches at most one partition — but matching
+        // one twice would export its rows twice and fail the import's INSERT on
+        // that same uniqueness, so do not depend on it holding.
+        for id in matched {
+            if !child_ids.contains(&id) {
+                child_ids.push(id);
+            }
+        }
+    }
+    Ok(child_ids)
+}
+
 /// Validate the existing metadata table schemas against the expected definitions.
 ///
 /// Compares the actual column names of each metadata table against
