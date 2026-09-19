@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::federated::FederatedTableProvider;
 use crate::parameters::ConnectorContext;
+use data_components::cdc::{AccelerationContents, ChangesStream};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -1265,6 +1267,47 @@ pub trait ListingTableConnector: DataConnector {
         Ok(())
     }
 
+    /// Whether this listing connector can produce a [`ChangesStream`].
+    ///
+    /// Defaults to `false`. The blanket [`DataConnector`] impl forwards this, so
+    /// a listing connector that supports CDC (S3 via SQS) must override it —
+    /// inheriting the default would report no change stream and refuse
+    /// `refresh_mode: changes`.
+    fn supports_changes_stream(&self) -> bool {
+        false
+    }
+
+    /// Fail closed on connector-specific dataset configuration that the default
+    /// listing `read_provider` would otherwise accept.
+    ///
+    /// Called from the blanket [`DataConnector::read_provider`] before the
+    /// listing table is built. Defaults to `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the connector's own configuration error when `dataset` names a
+    /// combination it cannot serve, so registration fails with that message
+    /// instead of a generic one. The default implementation accepts every
+    /// dataset.
+    fn validate_dataset(&self, _dataset: &DatasetSpec) -> DataConnectorResult<()> {
+        Ok(())
+    }
+
+    /// The CDC stream for `dataset`, if this listing connector produces one.
+    ///
+    /// Wrappers must not inherit a defaulted no-op: the blanket [`DataConnector`]
+    /// impl forwards this to the listing connector. See
+    /// [`DataConnector::changes_stream`].
+    async fn changes_stream(
+        &self,
+        _context: &dyn ConnectorContext,
+        _federated_table: Arc<dyn FederatedTableProvider>,
+        _dataset: &DatasetSpec,
+        _acceleration: AccelerationContents,
+    ) -> Option<ChangesStream> {
+        None
+    }
+
     /// Turn an `object_store` error into the error the user sees.
     ///
     /// An implementation that inspects [`object_store::Error::Generic`] must call
@@ -1668,11 +1711,27 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         Some(self.construct_metadata_provider(dataset).await)
     }
 
+    fn supports_changes_stream(&self) -> bool {
+        ListingTableConnector::supports_changes_stream(self)
+    }
+
+    async fn changes_stream(
+        &self,
+        context: &dyn ConnectorContext,
+        federated_table: Arc<dyn FederatedTableProvider>,
+        dataset: &DatasetSpec,
+        acceleration: AccelerationContents,
+    ) -> Option<ChangesStream> {
+        ListingTableConnector::changes_stream(self, context, federated_table, dataset, acceleration)
+            .await
+    }
+
     async fn read_provider(
         &self,
         _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        ListingTableConnector::validate_dataset(self, dataset)?;
         let url = self.get_object_store_url(dataset, None)?;
 
         let (file_format_opt, extension) = self.get_file_format_and_extension(dataset).await?;
@@ -2150,7 +2209,15 @@ fn listing_object_matches_format_selected(location: &Path, format_ext: &str) -> 
     file_name_has_extension(name, format_ext.trim_start_matches('.')) || !name.contains('.')
 }
 
-fn file_matches_extension(location: &Path, extension: &str) -> bool {
+/// Whether the listing table reads the object at `location`, for an `extension`
+/// from [`ListingTableConnector::get_file_format_and_extension`].
+///
+/// A plain extension (`.parquet`, `.csv.gz`) is `DataFusion`'s suffix match. A
+/// format-selected one (`*.orc`, `*.parquet`) also accepts extensionless Hive
+/// data objects and skips job markers (`_SUCCESS`, `_committed_*`, `.crc`) and
+/// `_temporary` staging paths.
+#[must_use]
+pub fn file_matches_extension(location: &Path, extension: &str) -> bool {
     if let Some(format_ext) = format_selected_data_suffix(extension) {
         return listing_object_matches_format_selected(location, format_ext);
     }
