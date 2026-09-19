@@ -101,7 +101,7 @@ jobs:
             const includeWindowsAndLinuxArm = isTaggedRelease || isReleaseBranch || isManualDispatch;
 
             // Tagged releases use GitHub hosted runners, others use spiceai runners
-            const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos";
+            const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos-large";
             const linuxRunner = isTaggedRelease ? "ubuntu-24.04" : "spiceai-dev-runners";
 
             // Use minio for spiceai runners (trunk, release branches, manual dispatch on non-tagged)
