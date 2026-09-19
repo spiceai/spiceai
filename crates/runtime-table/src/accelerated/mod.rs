@@ -1493,6 +1493,15 @@ impl AcceleratedTable {
         Arc::clone(&self.accelerator)
     }
 
+    /// Whether grouping independent lookups preserves this table's read semantics.
+    /// Cache misses and source fallback must be evaluated per original lookup.
+    #[must_use]
+    pub fn supports_shared_lookup(&self) -> bool {
+        self.scan_readiness() == ScanReadiness::Accelerated
+            && self.refresh_mode != RefreshMode::Caching
+            && matches!(self.zero_results_action, ZeroResultsAction::ReturnEmpty)
+    }
+
     /// The schema this table presents to query planning.
     ///
     /// In caching mode the storage schema carries a hidden namespace column, so
