@@ -22,6 +22,30 @@ limitations under the License.
 /// that receive data in bursts with long idle gaps between them.
 pub const KEEPALIVE_APP_METADATA: &[u8] = b"spice-keepalive";
 
+/// Whether a `FlightData` message is a keepalive: the sentinel over an empty envelope.
+///
+/// The sentinel alone cannot decide it. `app_metadata` is the writer's to set, so any message
+/// can wear it, and a receiver that skips on the sentinel alone discards whatever it was
+/// attached to while the write still reports success. Requiring the envelope to be empty is what
+/// makes the skip lossless: a message with no header declares nothing and a message with no body
+/// carries no bytes, so anything either half is populated is client data and has to reach the
+/// receiver's own decode or count path. A heartbeat has neither --
+/// `forward_batches_to_executor` builds one from `FlightData::default()` and sets only the
+/// sentinel.
+///
+/// Asking instead what the header *declares* cannot give that guarantee, because such a
+/// predicate is open over the kinds it does not know: a schema message, a trailer, a `Tensor`
+/// and any IPC header a later Arrow adds all answer "not data", so the sentinel over any one of
+/// them would be skipped. A schema re-declared partway through a write is the case that costs
+/// the most, since the batches after it would still be decoded under the schema the stream
+/// opened with.
+#[must_use]
+pub fn is_keepalive(message: &arrow_flight::FlightData) -> bool {
+    message.app_metadata.as_ref() == KEEPALIVE_APP_METADATA
+        && message.data_header.is_empty()
+        && message.data_body.is_empty()
+}
+
 /// Returns the `DoPut` idle timeout. Override with the
 /// `SPICE_DO_PUT_IDLE_TIMEOUT_SECS` env-var (useful for tests).
 #[must_use]

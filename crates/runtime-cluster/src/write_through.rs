@@ -43,7 +43,7 @@ use tokio::sync::mpsc::{self, Sender};
 use tokio_stream::{StreamExt, adapters::Peekable, wrappers::ReceiverStream};
 use tonic::{Response, Streaming};
 
-use crate::flight_config::{KEEPALIVE_APP_METADATA, do_put_idle_timeout};
+use crate::flight_config::{self, KEEPALIVE_APP_METADATA, do_put_idle_timeout};
 use crate::{ExecutorRegistry, PartitionStore, PartitionValue, store};
 
 /// Stream type used by Arrow Flight `DoPut` responses — matches what the runtime
@@ -90,8 +90,8 @@ pub enum Error {
     DecodeBatch { source: arrow_schema::ArrowError },
 
     #[snafu(display(
-        "Failed to write to dataset '{table}': an Arrow message partway through the stream \
-        could not be read ({message}), so the rest of the stream was not applied and any batch \
+        "Failed to write to dataset '{table}': an Arrow message in the stream could not be \
+        read ({message}), so the rest of the stream was not applied and any batch \
         already accepted may have been. \
         Check that the writing client emits valid Arrow IPC. \
         See: https://spiceai.org/docs/api/arrow-flight-sql"
@@ -327,26 +327,9 @@ where
         while let Some(result) = messages.next().await {
             let message = result.context(StreamReadSnafu)?;
 
-            // The sentinel alone cannot decide this. On this path `app_metadata` is the
-            // client's to set, so a message carrying data can wear it, and skipping on the
-            // metadata alone discards that data while the write still reports success. A
-            // heartbeat declares no IPC data at all, so requiring that too keeps the skip to
-            // real heartbeats and sends anything data-bearing on to the check below, which
-            // decodes it or fails loudly. The predicate is `declares_ipc_data` rather than
-            // `declares_record_batch` because a dictionary is client data too: the batches
-            // referring to it carry nothing without it, so a tagged dictionary must be refused
-            // rather than dropped. The empty body is a floor under that: the header can only
-            // ever add to what the body already establishes, never narrow it. `declares_ipc_data`
-            // answers `false` for a schema message, a trailer, a `Tensor` and any IPC header a
-            // later Arrow adds, so without the floor a sentinel-tagged message of those kinds
-            // would take its body with it and the write would still report success. A real
-            // heartbeat carries neither header nor body. `do_put.rs`'s discarded-message count
-            // keeps the same header-vs-body floor, for the same reason -- though it applies the
-            // floor only *after* its own sentinel check, which still skips unconditionally.
-            if message.app_metadata.as_ref() == KEEPALIVE_APP_METADATA
-                && message.data_body.is_empty()
-                && !declares_ipc_data(&message.data_header, &table_name)?
-            {
+            // `do_put.rs` skips on the sentinel alone on its own ingest path, which is wider
+            // than this; #14221 tracks bringing the two receivers into agreement.
+            if flight_config::is_keepalive(&message) {
                 continue;
             }
 
@@ -373,22 +356,16 @@ where
     })
 }
 
-/// Whether a message's IPC header declares data the client sent — a record batch, or a
-/// dictionary the batches referencing it cannot be decoded without — reporting an unreadable
-/// header the same way [`declares_record_batch`] does.
-fn declares_ipc_data(data_header: &[u8], table: &str) -> Result<bool> {
-    ipc::declares_ipc_data(data_header).map_err(|message| Error::UnreadableMessageHeader {
-        table: table.to_string(),
-        message,
-    })
-}
-
 /// Whether a message's IPC header declares a record batch, reporting an unreadable header as
 /// this module's own failure so that what the writer sees names the dataset.
 fn declares_record_batch(data_header: &[u8], table: &str) -> Result<bool> {
     ipc::declares_record_batch(data_header).map_err(|message| Error::UnreadableMessageHeader {
         table: table.to_string(),
-        message,
+        // The flatbuffer verifier wraps its text and ends it with a blank line, so interpolating
+        // it raw splits one user-facing error into three log records -- and the dataset and the
+        // fix are both on the first. Normalized here, at the interpolation, rather than trusted
+        // from the source, which is what `util::single_line` is for.
+        message: util::single_line(&message).trim().to_string(),
     })
 }
 
@@ -1748,6 +1725,10 @@ mod tests {
             message.contains("https://spiceai.org/docs/api/arrow-flight-sql"),
             "{message}"
         );
+        // The verifier's own text is interpolated here, and it arrives wrapped and
+        // blank-line-terminated. A break anywhere in this message splits one record into three
+        // for whatever reads the log, and the dataset and the fix both sit on the first line.
+        assert!(!message.contains('\n'), "{message:?}");
     }
 
     /// The header, not the body length, decides whether the first message carries a batch.
@@ -1795,31 +1776,47 @@ mod tests {
         assert!(batches.is_empty());
     }
 
-    /// A message wearing the keepalive sentinel whose header declares something other than IPC
-    /// data — a schema re-declaration, a trailer, a `Tensor`, any header a later Arrow adds —
-    /// but which carries a body, is client data, not a heartbeat.
-    ///
-    /// `declares_ipc_data` answers `false` for all of those, so the sentinel check alone would
-    /// skip the message and take its body with it while the write still reported success: the
-    /// exact silent-row-loss shape this PR exists to remove, reintroduced one layer up. The
-    /// empty-body floor is what refuses it. `do_put.rs` keeps the same header-vs-body floor in
-    /// its discarded-message count, but reaches it only past a sentinel check that still skips
-    /// unconditionally, so on that one point the two receivers do not yet agree.
-    ///
-    /// A schema message is used because it is the shape a real client is likeliest to send; the
-    /// arm it exercises is shared by every non-data header.
-    #[tokio::test]
-    async fn a_sentinel_tagged_message_carrying_a_body_is_not_skipped_as_a_heartbeat() {
-        let schema = client_schema();
-        let mut msgs = encode_batch_to_flight_data(&schema, &client_batch(vec!["US"], vec![1]));
-        let first = msgs.remove(0);
-
-        let mut tagged = batches_to_flight_data(
+    /// A schema message: the non-empty header a real client is likeliest to send, standing in
+    /// for every header kind, since the arm they take is the same one.
+    fn schema_message() -> FlightData {
+        batches_to_flight_data(
             &Schema::new(vec![Field::new("id", DataType::Int32, false)]),
             vec![],
         )
         .expect("encoding a schema as flight data")
-        .remove(0);
+        .remove(0)
+    }
+
+    /// Drives `tagged` through an otherwise well-formed write -- schema, one batch, then it --
+    /// and returns the refusal it earns.
+    async fn refusal_for(tagged: FlightData) -> Error {
+        let schema = client_schema();
+        let mut msgs = encode_batch_to_flight_data(&schema, &client_batch(vec!["US"], vec![1]));
+        let first = msgs.remove(0);
+        let batch = msgs.remove(0);
+
+        decode(first, vec![batch, tagged], &schema)
+            .await
+            .expect_err("a message that is not an empty envelope must not be skipped")
+    }
+
+    /// The refusal a message the skip declines to swallow gets: named, and naming the dataset.
+    fn assert_refused_as_non_batch(err: &Error) {
+        assert!(matches!(err, Error::NonBatchMessage { .. }), "{err:?}");
+        assert!(err.to_string().contains("'test.s.events'"), "{err}");
+    }
+
+    /// A message wearing the keepalive sentinel that carries a body is client data, not a
+    /// heartbeat, whatever its header declares.
+    ///
+    /// Skipping on the sentinel alone takes that body with it while the write still reports
+    /// success -- the silent row loss this module refuses everywhere else, reintroduced one
+    /// layer up. `do_put.rs` keeps the header-vs-body floor in its discarded-message count, but
+    /// reaches it only past a sentinel check that still skips unconditionally, so on that one
+    /// point the two receivers do not yet agree (#14221).
+    #[tokio::test]
+    async fn a_sentinel_tagged_message_carrying_a_body_is_not_skipped_as_a_heartbeat() {
+        let mut tagged = schema_message();
         tagged.data_body = bytes::Bytes::from_static(b"rows the client sent");
         tagged.app_metadata = bytes::Bytes::from_static(KEEPALIVE_APP_METADATA);
 
@@ -1835,13 +1832,70 @@ mod tests {
             "the case needs a body; without one this is a real heartbeat"
         );
 
-        let err = decode(first, vec![msgs.remove(0), tagged], &schema)
-            .await
-            .expect_err("a sentinel-tagged message carrying a body must not be skipped");
-
-        assert!(matches!(err, Error::NonBatchMessage { .. }), "{err:?}");
-        assert!(err.to_string().contains("'test.s.events'"), "{err}");
+        assert_refused_as_non_batch(&refusal_for(tagged).await);
     }
+
+    /// A mid-stream schema re-declaration wearing the keepalive sentinel is a re-declaration,
+    /// not a heartbeat.
+    ///
+    /// Untagged it fails the write: the stream has gone out of step with what it declared, and
+    /// the batches after it would still be decoded under the schema the stream opened with. The
+    /// sentinel must not be able to silence that refusal, and a predicate reading what the
+    /// header declares would let it -- a schema message declares no IPC data, as do a trailer, a
+    /// `Tensor`, and whatever kind a later Arrow adds.
+    #[tokio::test]
+    async fn a_sentinel_tagged_schema_redeclaration_is_refused_not_skipped() {
+        let mut tagged = schema_message();
+        tagged.app_metadata = bytes::Bytes::from_static(KEEPALIVE_APP_METADATA);
+
+        // Asserted so the case cannot quietly stop exercising the bypass: it needs a header that
+        // parses into a non-data kind, and the empty body a real heartbeat also has.
+        assert_eq!(
+            ipc::declares_ipc_data(&tagged.data_header),
+            Ok(false),
+            "the case needs a header that declares something other than IPC data"
+        );
+        assert!(
+            !tagged.data_header.is_empty(),
+            "the case needs a header; without one this is a real heartbeat"
+        );
+        assert!(
+            tagged.data_body.is_empty(),
+            "the case needs an empty body; with one it is the data-bearing case above"
+        );
+
+        assert_refused_as_non_batch(&refusal_for(tagged).await);
+    }
+
+    /// A sentinel-tagged message with no header but a body is client data, not a heartbeat.
+    ///
+    /// The envelope is empty only when both halves are, and this is the half a header check
+    /// cannot reach: with no header there is no declaration to read, so the body is the only
+    /// thing saying the message carries something. Flight allows a message with a body and no
+    /// header, and `flight_data_to_arrow_batch` is what says whether those bytes are a batch --
+    /// so the write must refuse them rather than skip them and acknowledge the rows as written.
+    #[tokio::test]
+    async fn a_sentinel_tagged_message_with_a_body_but_no_header_is_refused_not_skipped() {
+        let tagged = FlightData {
+            app_metadata: bytes::Bytes::from_static(KEEPALIVE_APP_METADATA),
+            data_body: bytes::Bytes::from_static(b"rows the client sent"),
+            ..Default::default()
+        };
+
+        // Asserted so the case cannot quietly stop exercising the body half: a real heartbeat
+        // differs from this message in the body alone.
+        assert!(
+            tagged.data_header.is_empty(),
+            "the case needs no header; with one the header half already refuses it"
+        );
+        assert!(
+            !tagged.data_body.is_empty(),
+            "the case needs a body; without one this is a real heartbeat"
+        );
+
+        assert_refused_as_non_batch(&refusal_for(tagged).await);
+    }
+
     /// A first message whose header declares a schema but which carries a body is lost client
     /// data, not an absent batch.
     ///
