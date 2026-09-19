@@ -10,4 +10,6 @@ def check(url):
  except Exception as e:return {'url':url,'error':str(e)}
 with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:results=list(pool.map(check,urls))
 (root/'evidence/link-check.json').write_text(json.dumps(results,indent=2))
-print(json.dumps({'links':len(results),'non_200':[r for r in results if r.get('status')!=200]},indent=2))
+non_200=[r for r in results if r.get('status')!=200 or 'error' in r]
+print(json.dumps({'links':len(results),'non_200':non_200},indent=2))
+raise SystemExit(1 if non_200 else 0)

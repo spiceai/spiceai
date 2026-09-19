@@ -1,6 +1,6 @@
 # Spice.ai in Action — companion labs
 
-The Northstar fixtures and Python programs accompany the September 2026 manuscript. All customer and policy data is fictional. Python programs use only the standard library. Install a compatible Spice CLI/runtime with the official instructions at https://spiceai.org/docs/getting-started. Record the actual runtime version; build-specific results and limitations are in Appendix A and the sibling `evidence/` directory.
+The Northstar fixtures and Python programs accompany the September 2026 manuscript. All customer and policy data is fictional. Python programs in this directory use only the standard library, except `enterprise/validate.py`, which needs `PyYAML` and `jsonschema` (`pip install pyyaml jsonschema`). Install a compatible Spice CLI/runtime with the official instructions at https://spiceai.org/docs/getting-started. Record the actual runtime version; build-specific results and limitations are in Appendix A and the sibling `evidence/` directory.
 
 ## First lab
 

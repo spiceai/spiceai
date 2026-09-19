@@ -5,8 +5,11 @@ from reportlab.lib.colors import HexColor, Color, white
 import fitz
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-pdfmetrics.registerFont(TTFont("Inter", str(Path.home()/"Library/Fonts/Inter-Regular.ttf")))
-pdfmetrics.registerFont(TTFont("Inter-Bold", str(Path.home()/"Library/Fonts/Inter-Bold.ttf")))
+import os
+# Override with BOOK_FIGURE_FONT_DIR when Inter is not in the macOS per-user Fonts folder.
+_font_dir=Path(os.environ.get("BOOK_FIGURE_FONT_DIR", str(Path.home()/"Library/Fonts")))
+pdfmetrics.registerFont(TTFont("Inter", str(_font_dir/"Inter-Regular.ttf")))
+pdfmetrics.registerFont(TTFont("Inter-Bold", str(_font_dir/"Inter-Bold.ttf")))
 root=Path(__file__).parent/'figures'
 root.mkdir(exist_ok=True)
 W,H=740,399
