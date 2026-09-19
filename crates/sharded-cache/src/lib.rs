@@ -228,17 +228,19 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             let before_window = shard.window_weight();
             let before_protected = shard.protected_weight();
             let removed = shard.remove(key);
-            if let Some((old, old_weight)) = removed {
-                self.sub_weight(old_weight);
+            if let Some((_, old_weight)) = &removed {
+                self.sub_weight(*old_weight);
                 self.sync_segment_weights_after_removal(
                     before_window,
                     shard.window_weight(),
                     before_protected,
                     shard.protected_weight(),
                 );
-                drop(shard);
-                drop(old);
             }
+            // Release the shard before dropping V (stale and/or rejected) so a
+            // costly or re-entrant Drop cannot stall this shard.
+            drop(shard);
+            drop(removed);
             drop(value);
             return;
         }

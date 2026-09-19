@@ -104,15 +104,26 @@ where
         value: V,
         should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
     ) -> bool {
-        // Predicate is borrowed for the call, so use `block_in_place` rather
-        // than `spawn_blocking`. Size + replace/evict stay off the cooperative
-        // async scheduler the same way as `insert`.
+        // Predicate is borrowed for the call, so we cannot `spawn_blocking`
+        // without owning it. On a multi-thread runtime, `block_in_place` keeps
+        // size + replace/evict off the cooperative scheduler the same way as
+        // `insert`. On Tokio's current-thread runtime (e.g. plain
+        // `#[tokio::test]`), `block_in_place` panics — run the sync path
+        // inline instead.
         let cache = Arc::clone(&self.cache);
-        tokio::task::block_in_place(|| {
+        let run = || {
             let weight = value.get_memory_size();
             let keep_ttl = value.keep_remaining_ttl();
             cache.replace_if(key, value, weight, keep_ttl, should_replace)
-        })
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle)
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread =>
+            {
+                run()
+            }
+            _ => tokio::task::block_in_place(run),
+        }
     }
 
     async fn get(&self, key: &u64) -> Option<Arc<V>> {
