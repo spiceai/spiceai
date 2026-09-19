@@ -384,35 +384,42 @@ impl InlinedDataRewrite {
     }
 }
 
-/// How [`InlineAwareDeletionSink`] obtains the file/deletion-vector sink it
-/// publishes through.
+/// Where [`InlineAwareDeletionSink`] gets the deletion-vector sink it publishes
+/// through. Not itself a sink — see [`super::delete::sink::file_based`] for the
+/// file-based delete route, which is a different delete strategy entirely.
 ///
 /// A [`CayenneDeletionSink`] captures the tiers it will scan when it is BUILT and
 /// re-reads only the main listing at execution, so every other source — the
 /// protected snapshots a mem-tier checkpoint publishes into, the cold tier — is
-/// frozen at build time. Whether that is sound depends entirely on what can write
-/// to the table between the build and the delete.
-pub(crate) enum FileDeletionSink {
+/// frozen at build time. How far that freeze can drift from the delete depends on
+/// who builds the sink and when.
+pub(crate) enum DeletionSinkSource {
     /// Built by the caller immediately before it drives the sink itself
-    /// (`delete_from_cdc_fast`). The CDC apply loop is the table's only writer and
-    /// is mid-apply across both, so nothing can land in between.
+    /// (`delete_from_cdc_fast`, the CDC apply loop's own delete path). Its window
+    /// is whatever separates those two statements; this is its pre-existing shape,
+    /// neither widened nor narrowed here.
     Prebuilt(Box<CayenneDeletionSink>),
     /// Built inside the execution-time `write_lock` hold, after the in-memory CDC
     /// tier is checkpointed in that same hold.
     ///
     /// `TableProvider::delete_from` builds a plan and executes it as two separate
-    /// steps with no lock spanning them, so a CDC apply can land between them.
-    /// Against sources frozen at plan build, a row that arrived after the capture
-    /// is invisible to the predicate (a missed delete), and — worse — an upsert
-    /// that superseded a durable row leaves the scan matching the SUPERSEDED
-    /// version, so the key tombstone hides the KEY and takes the live replacement
-    /// with it (#13828, the lost-update shape #13574 closed one tier over).
+    /// steps, so building here left the delete judging the table by a capture taken
+    /// before any apply that landed in between: a row that arrived after it is in no
+    /// scan source, so a predicate naming it deletes nothing, and — worse — an upsert
+    /// that superseded a durable row leaves the scan matching the SUPERSEDED version,
+    /// so the key tombstone hides the KEY and takes the live replacement with it
+    /// (#13828, the lost-update shape #13574 closed one tier over).
+    ///
+    /// This closes that gap, not every drift: a mem-tier checkpoint publishes its
+    /// snapshot under `listing_fence` rather than `write_lock`, so one can still
+    /// appear mid-delete — the residual race `CayenneDeletionSink::live_main_insert_records`
+    /// documents and downgrades for.
     BuildAtExecution(DeletionRequestSource),
 }
 
 pub(crate) struct InlineAwareDeletionSink {
     pub(crate) table: CayenneTableProvider,
-    pub(crate) file_sink: FileDeletionSink,
+    pub(crate) file_sink: DeletionSinkSource,
     pub(crate) filters: Vec<Expr>,
 }
 
@@ -622,15 +629,14 @@ impl DeletionSink for InlineAwareDeletionSink {
         self.table.mark_maintained_aggregates_stale();
 
         // Make the in-memory CDC tier durable and capture the scan sources inside
-        // THIS hold, so the checkpoint, the capture and the delete are one critical
-        // section and no CDC apply can land between them (#13828). The two are not
-        // separable: a checkpoint publishes its rows as a protected snapshot, and
-        // the sink freezes the protected set it will scan, so a checkpoint after the
-        // capture is invisible to this delete.
+        // THIS hold, so no apply lands between the capture and the delete it is
+        // judged by (#13828). The two are not separable: a checkpoint publishes its
+        // rows as a protected snapshot, and the sink freezes the protected set it
+        // will scan. See [`DeletionSinkSource`].
         let built_at_execution;
         let file_sink = match &self.file_sink {
-            FileDeletionSink::Prebuilt(sink) => sink.as_ref(),
-            FileDeletionSink::BuildAtExecution(source) => {
+            DeletionSinkSource::Prebuilt(sink) => sink.as_ref(),
+            DeletionSinkSource::BuildAtExecution(source) => {
                 // A no-op in `mode: memory`, which has no Vortex tier to checkpoint
                 // into — there the tier is reconciled below by
                 // `apply_mem_tier_delete`.

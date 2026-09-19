@@ -50,7 +50,7 @@ use super::maintenance_metrics::{
 use super::manifest::{ManifestSequenceTag, SeqPrefixPlan};
 use super::mutation_writer::AppendMutationWriter;
 use super::on_conflict::{
-    BatchValidationResult, CheckpointCorpusKeys, ExtractedPrimaryKeys, FileDeletionSink,
+    BatchValidationResult, CheckpointCorpusKeys, DeletionSinkSource, ExtractedPrimaryKeys,
     InlineAwareDeletionSink, InlinedDataRewrite, Int64DeletionDelta, OnConflictContext,
     OnConflictDeletionUpdate, OnConflictDeletions, OnConflictUpdate, OnConflictValidationStream,
     PendingTombstoneDeltas, PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink,
@@ -35764,23 +35764,15 @@ impl TableProvider for CayenneTableProvider {
         // branches above materialize inline rows; once durable, the rows are
         // subject to the sink's own tier-aware liveness rule.
         //
-        // The checkpoint and the scan-source capture must share ONE `write_lock`
-        // hold, and that hold must be the one the DELETE itself runs under. They are
-        // not separable: a checkpoint publishes its rows as a PROTECTED snapshot,
-        // and `build_deletion_vector_sink` freezes the protected set the sink will
-        // scan (the sink re-reads only the main listing at execution), so a
-        // checkpoint that lands after the capture is invisible to this delete.
-        //
-        // Doing either here would leave a window: a plan is built and executed as
-        // two steps, `DeletionExec` takes `write_lock` again at execution, and a CDC
-        // apply landing between the two is invisible to sources frozen now (#13828).
-        // So both move into `InlineAwareDeletionSink::delete_from`, under the lock it
-        // already holds. Nothing under the sink builder takes `write_lock`, so
-        // building there cannot deadlock.
+        // The checkpoint and the scan-source capture belong in the hold the DELETE
+        // itself runs under, so both are deferred to
+        // `InlineAwareDeletionSink::delete_from` rather than done here — a plan is
+        // built and executed as two steps, and an apply landing between them was
+        // invisible to sources frozen at build (#13828). See [`DeletionSinkSource`].
         Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
             Arc::new(InlineAwareDeletionSink {
                 table: self.clone_for_write(),
-                file_sink: FileDeletionSink::BuildAtExecution(DeletionRequestSource::User),
+                file_sink: DeletionSinkSource::BuildAtExecution(DeletionRequestSource::User),
                 filters,
             }),
         ))))
@@ -36190,7 +36182,7 @@ impl CayenneTableProvider {
             .await?;
         let sink = InlineAwareDeletionSink {
             table: self.clone_for_write(),
-            file_sink: FileDeletionSink::Prebuilt(Box::new(file_sink)),
+            file_sink: DeletionSinkSource::Prebuilt(Box::new(file_sink)),
             filters: filters.to_vec(),
         };
         let deleted = sink
@@ -54961,16 +54953,9 @@ mod tests {
     /// table with an armed slot advancer lands it in the RAM mem-tier rather than
     /// durably (`insert_into` does not reach that path).
     async fn cdc_apply(provider: &CayenneTableProvider, batch: RecordBatch) {
-        let batch_schema = batch.schema();
         let ctx = SessionContext::new();
         let _cdc_write = provider
-            .write_cdc_append_stream(
-                Box::pin(RecordBatchStreamAdapter::new(
-                    batch_schema,
-                    futures::stream::iter(vec![Ok(batch)]),
-                )),
-                &ctx.task_ctx(),
-            )
+            .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
             .await
             .expect("cdc append");
     }
@@ -55409,40 +55394,18 @@ mod tests {
     #[tokio::test]
     async fn a_cdc_apply_between_plan_build_and_execution_is_judged_by_the_delete() {
         let ctx = SessionContext::new();
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
-        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
-        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
-        let catalog = Arc::new(
-            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
-                .expect("catalog created"),
-        ) as Arc<dyn MetadataCatalog>;
-        catalog.init().await.expect("catalog initialized");
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
-        let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .create(CreateTableOptions {
-                table_name: "delete_cdc_apply_gap".to_string(),
-                schema: Arc::clone(&schema),
-                primary_key: vec!["id".to_string()],
-                on_conflict: Some(OnConflict::Upsert(
-                    datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
-                        "id".to_string(),
-                    ]),
-                )),
-                base_path: data_dir,
-                partition_column: None,
-                vortex_config: VortexConfig {
-                    cdc_durability: crate::metadata::CdcDurability::Memory,
-                    deletion_mode: crate::metadata::DeletionMode::Key,
-                    compaction_background_interval_ms: 3_600_000,
-                    ..VortexConfig::default()
-                },
-            })
-            .await
-            .expect("memory-durability CDC upsert table created");
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "delete_cdc_apply_gap",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
         // The RAM path is armed by the runtime installing a slot advancer; without one
         // the write silently takes the durable path and this test covers nothing.
         provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
