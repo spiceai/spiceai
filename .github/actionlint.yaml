@@ -1,0 +1,88 @@
+# actionlint configuration, read by `.github/workflows/workflow_yaml_check.yml`.
+#
+# Scope, precisely: actionlint lints the definitions under `.github/workflows/`,
+# and parses a local composite action's metadata when a workflow `uses:` it — so
+# it validates the *call site* against that action's declared inputs. It has no
+# composite-action mode: pointed at an `action.yml` directly it reports
+# `"jobs" section is missing in workflow`, and an action reached only from
+# another action is never read at all. The step bodies of composite actions stay
+# with `.github/scripts/check_workflow_yaml.py`, which is why both linters run.
+#
+# `runs-on:` labels that resolve through the organization's self-hosted pools
+# rather than GitHub's hosted catalogue. actionlint cannot know them, so without
+# this block every job that names one is reported as an unknown label — 56 of the
+# 89 findings on the tree this was introduced against, which would have buried
+# the real ones.
+self-hosted-runner:
+  labels:
+    # The self-hosted Apple Silicon fleet that builds and signs off macOS.
+    - spiceai-macos
+    # The self-hosted Linux pool.
+    - spiceai-dev-runners
+    # The hosted Linux aarch64 pool.
+    - hosted-linux-arm-runner
+
+# Finding classes left on the tree deliberately, because each needs a decision
+# the adoption change should not make on its own. They are enumerated with their
+# evidence in https://github.com/spiceai/spiceai/issues/14222, and this list
+# shrinks as that issue is worked; nothing else is suppressed.
+#
+# They live here rather than as `-ignore` flags in the workflow so that a bare
+# `actionlint` run in a checkout gives the same verdict CI does. With the block
+# below removed, this tree reports 17 findings and CI reports none — a gap that
+# trains people to ignore their local run.
+#
+# Each entry names one workflow, never a glob over `.github/workflows/`. An
+# `ignore` under a wildcard path applies to every workflow actionlint reads, so
+# a *new* workflow committing the same mistake is suppressed on arrival and the
+# gate never sees it — the deferral would silently become a permanent exemption.
+# Scoped this way, the 17 findings below stay deferred and the same diagnostic
+# anywhere else still fails the run. An entry whose workflow no longer exists is
+# inert rather than an error, so #14222 can retire them one at a time. Renaming
+# a listed workflow is the other half of that: the old key goes inert *and* the
+# deferred finding reappears under the new name, so CI goes red until the key is
+# renamed with it.
+paths:
+  .github/workflows/e2e_test_ci.yml:
+    ignore:
+      # `concurrency` accepts only `group` and `cancel-in-progress`. Three
+      # workflows set `queue: max` and document behaviour it cannot provide.
+      - 'unexpected key "queue" for "concurrency" section'
+      - 'property "params" is not defined in object type'
+  .github/workflows/integration.yml:
+    ignore:
+      # `queue: max`, as under `e2e_test_ci.yml` above.
+      - 'unexpected key "queue" for "concurrency" section'
+  .github/workflows/spiced_docker.yml:
+    ignore:
+      - 'anchor ".+" is defined but not used'
+  .github/workflows/testoperator_dispatch.yml:
+    ignore:
+      - 'constant expression "false" in condition'
+  # Seven of the `testoperator_run_*` workflows take a `choice` input whose first
+  # option is `''`, used as "no override". The option cannot simply be dropped:
+  # a `choice` default must be one of them.
+  .github/workflows/testoperator_run_append.yml:
+    ignore:
+      - 'string should not be empty'
+  .github/workflows/testoperator_run_bench.yml:
+    ignore:
+      - 'string should not be empty'
+      - 'property "profile_option" is not defined in object type'
+  .github/workflows/testoperator_run_data_consistency.yml:
+    ignore:
+      - 'string should not be empty'
+  .github/workflows/testoperator_run_htap.yml:
+    ignore:
+      - 'string should not be empty'
+      # `queue: max`, as under `e2e_test_ci.yml` above.
+      - 'unexpected key "queue" for "concurrency" section'
+  .github/workflows/testoperator_run_load.yml:
+    ignore:
+      - 'string should not be empty'
+  .github/workflows/testoperator_run_texttosql.yml:
+    ignore:
+      - 'string should not be empty'
+  .github/workflows/testoperator_run_throughput.yml:
+    ignore:
+      - 'string should not be empty'
