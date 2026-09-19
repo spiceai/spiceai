@@ -87,9 +87,9 @@ pub enum EvictionPolicy {
     #[default]
     Lru,
     /// Least-frequently-used. Each hit increments a per-entry counter; overflow
-    /// trim removes a low-frequency resident via a **bounded sample from each
-    /// shard's LRU tail** (not a full-cache scan). Other shards are tried
-    /// first. Ties keep the colder list position.
+    /// trim removes the **global** lowest-frequency resident (full per-shard
+    /// scan under the trim lock). Other shards are tried first so a just-
+    /// admitted key is not self-evicted. Ties keep the colder list position.
     Lfu,
     /// Full W-`TinyLFU` (Caffeine/Moka shape): a ~1% LRU **window**, a ~99%
     /// SLRU **main** space split into ~20% **probation** / ~80% **protected**,
@@ -119,10 +119,6 @@ impl EvictionListener for NoopListener {
 /// (Moka-like): eviction heuristics tolerate lost promotions under overload.
 const TOUCH_DRAIN_THRESHOLD: usize = 64;
 const TOUCH_BUFFER_CAP: usize = 1024;
-/// Bound on how many LRU-tail residents [`Shard::peek_lfu_victim`] examines
-/// per shard (Redis-style sampled LFU). Exact global min-freq is not worth
-/// an O(n) walk under the trim lock.
-const LFU_VICTIM_SAMPLE: usize = 16;
 
 #[repr(align(64))]
 struct TouchBuffer {
@@ -874,20 +870,27 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
 
     /// LFU overflow: remove the lowest-frequency resident, preferring other
     /// shards first so a just-admitted key is not self-evicted while an older
-    /// colder victim exists.
+    /// colder victim exists. Retries when a concurrent hit raises the selected
+    /// key's frequency between snapshot and unlink.
     fn evict_lfu_one(&self, prefer: usize, evicted: &mut Vec<(V, EvictionReason)>) -> bool {
-        if let Some((shard_idx, key, _)) = self.lowest_freq_entry(Some(prefer)) {
-            return self.remove_key_for_size(shard_idx, key, evicted);
-        }
-        if let Some((shard_idx, key, _)) = self.lowest_freq_entry(None) {
-            return self.remove_key_for_size(shard_idx, key, evicted);
+        for _ in 0..NUM_SHARDS {
+            let victim = self
+                .lowest_freq_entry(Some(prefer))
+                .or_else(|| self.lowest_freq_entry(None));
+            let Some((shard_idx, key, freq)) = victim else {
+                return false;
+            };
+            if self.remove_lfu_key_for_size(shard_idx, key, freq, evicted) {
+                return true;
+            }
+            // Selected key got hotter under a concurrent hit; reselect.
         }
         false
     }
 
-    /// Lowest-frequency entry across shards (bounded sample per shard). When
-    /// `skip` is set, that shard is ignored on the first pass (caller retries
-    /// with `None`). Shard walk starts at the rotating hand.
+    /// Lowest-frequency entry across shards (full per-shard scan). When `skip`
+    /// is set, that shard is ignored on the first pass (caller retries with
+    /// `None`). Shard walk starts at the rotating hand.
     fn lowest_freq_entry(&self, skip: Option<usize>) -> Option<(usize, u64, u16)> {
         let mut best: Option<(usize, u64, u16)> = None;
         let start = self.next_hand_start();
@@ -897,7 +900,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
                 continue;
             }
             let shard = self.shards[shard_idx].0.lock();
-            let Some((key, _weight, freq)) = shard.peek_lfu_victim(LFU_VICTIM_SAMPLE) else {
+            let Some((key, _weight, freq)) = shard.peek_lfu_victim() else {
                 continue;
             };
             let take = best.is_none_or(|(_, _, best_freq)| freq < best_freq);
@@ -965,15 +968,19 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
         progressed
     }
 
-    /// Unlink `key` to reclaim its weight (LFU victim or rejected `TinyLFU`
-    /// candidate). Does not fall back to an LRU tail — that would evict a
-    /// different resident than selection compared.
-    fn remove_key_for_size(
+    /// Unlink an LFU victim after revalidating its frequency under the shard
+    /// lock. A concurrent hit can raise the snapshot frequency; when that
+    /// happens we return false so [`Self::evict_lfu_one`] reselects.
+    fn remove_lfu_key_for_size(
         &self,
         shard_idx: usize,
         key: u64,
+        expected_freq: u16,
         evicted: &mut Vec<(V, EvictionReason)>,
     ) -> bool {
+        // Test hook: simulate a concurrent hit after selection, before drain.
+        #[cfg(test)]
+        self.run_before_size_victim();
         self.drain_touches_blocking(shard_idx);
         let mut shard = self.shards[shard_idx].0.lock();
         let now = Instant::now();
@@ -998,16 +1005,19 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
                 return true;
             }
         }
-        if self.weight.load(Ordering::Relaxed) <= self.max_weight
-            && !matches!(self.policy, EvictionPolicy::TinyLfu)
-        {
+        if self.weight.load(Ordering::Relaxed) <= self.max_weight {
             return false;
         }
-        // W-TinyLFU may reject a window candidate while total weight still fits
-        // but the window segment is over its cap.
-        if matches!(self.policy, EvictionPolicy::TinyLfu)
-            && self.weight.load(Ordering::Relaxed) <= self.max_weight
-            && self.window_weight.load(Ordering::Relaxed) <= self.window_cap()
+        let Some(current_freq) = shard.peek_freq(key) else {
+            return false;
+        };
+        if current_freq > expected_freq {
+            // Concurrent hit made this key hotter than the selection snapshot.
+            return false;
+        }
+        // Also refuse if another resident on this shard is now strictly colder.
+        if let Some((_, _, victim_freq)) = shard.peek_lfu_victim()
+            && victim_freq < current_freq
         {
             return false;
         }
@@ -1017,26 +1027,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             return false;
         };
         if !self.claim_size_eviction(weight) {
-            // Window-only reject: still allow reclaim when over window cap.
-            if !(matches!(self.policy, EvictionPolicy::TinyLfu)
-                && self.window_weight.load(Ordering::Relaxed) > self.window_cap())
-            {
-                return false;
-            }
-            // Over window cap but under total budget: subtract window weight only.
-            let Some((value, w)) = shard.remove(key) else {
-                return false;
-            };
-            self.sub_weight(w);
-            self.sync_segment_weights_after_removal(
-                before_window,
-                shard.window_weight(),
-                before_protected,
-                shard.protected_weight(),
-            );
-            drop(shard);
-            evicted.push((value, EvictionReason::Size));
-            return true;
+            return false;
         }
         let Some((value, _)) = shard.remove(key) else {
             self.weight.fetch_add(weight, Ordering::Relaxed);
@@ -2044,9 +2035,9 @@ mod tests {
     }
 
     #[test]
-    fn lfu_sampled_victim_still_evicts_colder_cross_shard_key() {
-        // Keys on distinct shards (0, 1, 2). Bounded per-shard sample must
-        // still prefer the colder resident over the hot one when overflowing.
+    fn lfu_evicts_global_lowest_freq_including_cold_mru() {
+        // Keys on distinct shards (0, 1, 2). Full-scan LFU must prefer the
+        // colder resident over the hot one when overflowing.
         let cache: ShardedCache<TestValue> =
             ShardedCache::new(100, Duration::from_mins(1), EvictionPolicy::Lfu);
         cache.insert(0, TestValue::with_size("cold", 50), 50);
@@ -2058,9 +2049,49 @@ mod tests {
         cache.insert(2, TestValue::with_size("new", 50), 50);
         assert!(
             cache.get(&0).is_none(),
-            "sampled LFU must still evict the colder cross-shard key"
+            "LFU must evict the colder cross-shard key"
         );
         assert!(cache.get(&1).is_some());
+        assert!(cache.get(&2).is_some());
+    }
+
+    #[test]
+    fn lfu_revalidates_frequency_before_unlink() {
+        // Select A (freq 0) as victim. The before-unlink hook raises A's
+        // frequency while B stays colder; revalidation must reselect B.
+        let cache = std::sync::Arc::new(ShardedCache::<TestValue>::new(
+            100,
+            Duration::from_mins(1),
+            EvictionPolicy::Lfu,
+        ));
+        cache.insert(0, TestValue::with_size("a", 50), 50);
+        cache.insert(1, TestValue::with_size("b", 50), 50);
+        // Warm B once so A (freq 0) is the colder snapshot victim. The hook
+        // then warms A past B between selection and unlink.
+        assert!(cache.get(&1).is_some());
+        let cache_for_hook = std::sync::Arc::clone(&cache);
+        let hits = std::sync::atomic::AtomicUsize::new(0);
+        let hits = std::sync::Arc::new(hits);
+        let hits_for_hook = std::sync::Arc::clone(&hits);
+        cache.set_before_size_victim(move || {
+            // Call 0 is the outer trim loop (before selection). Call 1 is
+            // inside remove_lfu_key_for_size after A was snapshotted — raise A
+            // there. Later reselect passes no-op.
+            if hits_for_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+                for _ in 0..4 {
+                    let _ = cache_for_hook.get(&0);
+                }
+            }
+        });
+        cache.insert(2, TestValue::with_size("new", 50), 50);
+        assert!(
+            cache.get(&0).is_some(),
+            "A must survive after concurrent hits raised its frequency"
+        );
+        assert!(
+            cache.get(&1).is_none(),
+            "B (still colder) must be the reselected victim"
+        );
         assert!(cache.get(&2).is_some());
     }
 }

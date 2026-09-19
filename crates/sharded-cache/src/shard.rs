@@ -177,7 +177,6 @@ impl<V> Shard<V> {
         }
     }
 
-    #[expect(dead_code)]
     pub(crate) fn peek_freq(&self, key: u64) -> Option<u16> {
         let idx = *self.map.get(&key)?;
         match self.slots.get(idx as usize) {
@@ -206,15 +205,12 @@ impl<V> Shard<V> {
         }
     }
 
-    /// Sample up to `sample` residents from the LRU tail and return the
-    /// lowest-frequency candidate. Bounded O(`sample`) — not a full list walk.
-    pub(crate) fn peek_lfu_victim(&self, sample: usize) -> Option<(u64, u64, u16)> {
-        if sample == 0 {
-            return None;
-        }
+    /// Walk the entire probation list and return the lowest-frequency resident
+    /// (true LFU within this shard). Ties keep the colder (closer-to-tail) key
+    /// because the walk starts at the LRU end.
+    pub(crate) fn peek_lfu_victim(&self) -> Option<(u64, u64, u16)> {
         let mut best: Option<(u64, u64, u16)> = None;
         let mut cursor = self.probation.tail;
-        let mut examined = 0usize;
         while let Some(idx) = cursor {
             let Some(Slot::Occupied(node)) = self.slots.get(idx as usize) else {
                 break;
@@ -222,10 +218,6 @@ impl<V> Shard<V> {
             let take = best.is_none_or(|(_, _, freq)| node.freq < freq);
             if take {
                 best = Some((node.key, node.weight, node.freq));
-            }
-            examined += 1;
-            if examined >= sample {
-                break;
             }
             cursor = node.prev;
         }
@@ -943,28 +935,25 @@ mod tests {
     }
 
     #[test]
-    fn peek_lfu_victim_is_bounded_by_sample() {
+    fn peek_lfu_victim_finds_cold_mru_not_just_tail() {
         let mut shard = Shard::new(crate::EvictionPolicy::Lfu);
         let now = Instant::now();
-        // Insert 8 residents; bump freqs so the MRU (last inserted) is hottest
-        // and the LRU tail is coldest.
-        for i in 0..8u64 {
+        // Insert 20 residents. Leave the MRU (key 19) at freq 0 and bump every
+        // older key so a tail-only sample of 16 would miss the true coldest.
+        for i in 0..20u64 {
             shard.insert(i, i, 1, now);
         }
-        // Hits on keys 1..7 so key 0 (LRU tail after no hits + others promoted
-        // via apply_touch) stays coldest among the tail sample.
-        for key in 1..8u64 {
-            for _ in 0..key {
-                let _ = shard.get(key, now, Duration::from_mins(1));
-                shard.apply_touch(key);
-            }
+        for key in 0..19u64 {
+            let _ = shard.get(key, now, Duration::from_mins(1));
+            shard.apply_touch(key);
         }
-        let full = shard.peek_lfu_victim(usize::MAX).expect("full scan");
-        let sampled = shard.peek_lfu_victim(3).expect("sample");
-        assert_eq!(full.0, 0, "full scan must find key 0 as coldest");
-        // Sample of 3 from the LRU tail still includes key 0.
-        assert_eq!(sampled.0, 0, "tail sample must still see the coldest key");
-        // Sample of 0 yields nothing.
-        assert!(shard.peek_lfu_victim(0).is_none());
+        // key 19 is MRU with freq 0; keys 0..18 were touched (freq >= 1) and
+        // promoted toward MRU, so the LRU tail is a freq-1 key.
+        let victim = shard.peek_lfu_victim().expect("victim");
+        assert_eq!(
+            victim.0, 19,
+            "full LFU scan must find the cold MRU, not a hotter LRU-tail sample"
+        );
+        assert_eq!(victim.2, 0);
     }
 }

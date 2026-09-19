@@ -374,11 +374,14 @@ impl Embed for Databricks {
         Ok(())
     }
 
-    async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
-        if let Some(CachedEmbeddingResult::Response(cached)) =
-            self.get_cached_embed((&req).into()).await
-        {
-            return Ok(std::sync::Arc::unwrap_or_clone(cached));
+    async fn embed_request(
+        &self,
+        req: CreateEmbeddingRequest,
+    ) -> Result<Arc<CreateEmbeddingResponse>> {
+        if let Some(cached) = self.get_cached_embed((&req).into()).await {
+            if let CachedEmbeddingResult::Response(response) = cached.as_ref() {
+                return Ok(std::sync::Arc::clone(response));
+            }
         }
 
         // Must use `create_byot` with empty path to avoid concatenation of `/embeddings`.
@@ -393,9 +396,10 @@ impl Embed for Databricks {
             .boxed()
             .context(FailedToCreateEmbeddingSnafu)?;
 
+        let response = std::sync::Arc::new(response);
         self.put_cached_embed(
             (&req).into(),
-            CachedEmbeddingResult::Response(std::sync::Arc::new(response.clone())),
+            CachedEmbeddingResult::Response(std::sync::Arc::clone(&response)),
         )
         .await;
 
@@ -406,7 +410,7 @@ impl Embed for Databricks {
         -1
     }
 
-    async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+    async fn embed(&self, input: EmbeddingInput) -> Result<Arc<Vec<Vec<f32>>>> {
         let cache_key = self.embedding_input_cache_key(&input);
 
         let cached_response = if let Some(key) = cache_key {
@@ -415,8 +419,10 @@ impl Embed for Databricks {
             None
         };
 
-        if let Some(CachedEmbeddingResult::Vector(cached)) = cached_response {
-            return Ok(std::sync::Arc::unwrap_or_clone(cached));
+        if let Some(cached) = cached_response {
+            if let CachedEmbeddingResult::Vector(vectors) = cached.as_ref() {
+                return Ok(std::sync::Arc::clone(vectors));
+            }
         }
 
         let resp = self
@@ -433,14 +439,15 @@ impl Embed for Databricks {
 
         let vectors: Vec<Vec<f32>> = resp
             .data
-            .into_iter()
-            .map(|emb| emb.embedding.into())
+            .iter()
+            .map(|emb| emb.embedding.clone().into())
             .collect();
 
+        let vectors = std::sync::Arc::new(vectors);
         if let Some(key) = cache_key {
             self.put_cached_embed(
                 key,
-                CachedEmbeddingResult::Vector(std::sync::Arc::new(vectors.clone())),
+                CachedEmbeddingResult::Vector(std::sync::Arc::clone(&vectors)),
             )
             .await;
         }

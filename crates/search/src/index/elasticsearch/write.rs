@@ -1022,7 +1022,7 @@ mod tests {
             async fn embed(
                 &self,
                 _input: llms::embeddings::EmbeddingInput,
-            ) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+            ) -> llms::embeddings::Result<std::sync::Arc<Vec<Vec<f32>>>> {
                 panic!("build_documents must not embed");
             }
 

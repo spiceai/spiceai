@@ -30,7 +30,7 @@ use tracing::{Instrument, Span};
 
 use super::metrics::{handle_metrics, request_labels, simple_labels};
 
-type InFlightEmbedCell = Arc<OnceCell<Vec<Vec<f32>>>>;
+type InFlightEmbedCell = Arc<OnceCell<std::sync::Arc<Vec<Vec<f32>>>>>;
 type InFlightEmbedMap = Arc<Mutex<HashMap<u64, InFlightEmbedCell>>>;
 
 #[derive(Debug)]
@@ -58,7 +58,10 @@ impl TaskEmbed {
             .as_u64()
     }
 
-    async fn embed_with_coalescing(&self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
+    async fn embed_with_coalescing(
+        &self,
+        input: EmbeddingInput,
+    ) -> EmbedResult<std::sync::Arc<Vec<Vec<f32>>>> {
         let raw_key = self.in_flight_embed_key(&input);
         let cell: InFlightEmbedCell = {
             let mut in_flight = self.in_flight_embed_requests.lock();
@@ -92,7 +95,10 @@ impl TaskEmbed {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl Embed for TaskEmbed {
-    async fn embed<'b>(&'b self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
+    async fn embed<'b>(
+        &'b self,
+        input: EmbeddingInput,
+    ) -> EmbedResult<std::sync::Arc<Vec<Vec<f32>>>> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
         telemetry::track_text_embedding(&request_context.to_dimensions());
 
@@ -163,14 +169,14 @@ impl Embed for TaskEmbed {
         self.inner.parallelism()
     }
 
-    fn embed_sync(&self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
+    fn embed_sync(&self, input: EmbeddingInput) -> EmbedResult<std::sync::Arc<Vec<Vec<f32>>>> {
         self.inner.embed_sync(input)
     }
 
     async fn embed_request<'b>(
         &'b self,
         req: CreateEmbeddingRequest,
-    ) -> EmbedResult<CreateEmbeddingResponse> {
+    ) -> EmbedResult<std::sync::Arc<CreateEmbeddingResponse>> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
         telemetry::track_text_embedding(&request_context.to_dimensions());
 
@@ -208,7 +214,7 @@ impl Embed for TaskEmbed {
     async fn get_cached_embed(
         &self,
         key: CacheKey<'_>,
-    ) -> Option<cache::result::embeddings::CachedEmbeddingResult> {
+    ) -> Option<std::sync::Arc<cache::result::embeddings::CachedEmbeddingResult>> {
         self.inner.get_cached_embed(key).await
     }
 
@@ -279,7 +285,10 @@ mod tests {
 
     #[async_trait]
     impl Embed for CountingEmbed {
-        async fn embed(&self, _input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
+        async fn embed(
+            &self,
+            _input: EmbeddingInput,
+        ) -> EmbedResult<std::sync::Arc<Vec<Vec<f32>>>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok(vec![vec![1.0, 2.0]])

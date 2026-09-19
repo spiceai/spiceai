@@ -124,11 +124,11 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
     async fn embed_request(
         &self,
         req: CreateEmbeddingRequest,
-    ) -> EmbedResult<CreateEmbeddingResponse> {
-        if let Some(CachedEmbeddingResult::Response(cached)) =
-            self.get_cached_embed((&req).into()).await
-        {
-            return Ok(std::sync::Arc::unwrap_or_clone(cached));
+    ) -> EmbedResult<Arc<CreateEmbeddingResponse>> {
+        if let Some(cached) = self.get_cached_embed((&req).into()).await {
+            if let CachedEmbeddingResult::Response(response) = cached.as_ref() {
+                return Ok(std::sync::Arc::clone(response));
+            }
         }
 
         let outer_model = req.model.clone();
@@ -152,16 +152,17 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
 
         resp.model = outer_model;
 
+        let resp = std::sync::Arc::new(resp);
         self.put_cached_embed(
             (&req).into(),
-            CachedEmbeddingResult::Response(std::sync::Arc::new(resp.clone())),
+            CachedEmbeddingResult::Response(std::sync::Arc::clone(&resp)),
         )
         .await;
 
         Ok(resp)
     }
 
-    async fn embed(&self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
+    async fn embed(&self, input: EmbeddingInput) -> EmbedResult<Arc<Vec<Vec<f32>>>> {
         // Batch requests to match OpenAI API limits: max_tokens_per_request and max array size.
         let embed_batches: Vec<EmbeddingInput> = chunk_embedding_input(&input);
         tracing::trace!(
@@ -191,8 +192,10 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
                 let rate_controller = Arc::clone(&self.rate_controller);
                 async move {
                     retry(retry_strategy, async || {
-                        if let Some(CachedEmbeddingResult::Vector(cached)) = self.get_cached_embed((&req).into()).await {
-            return Ok(std::sync::Arc::unwrap_or_clone(cached));
+                        if let Some(cached) = self.get_cached_embed((&req).into()).await {
+                            if let CachedEmbeddingResult::Vector(vectors) = cached.as_ref() {
+                                return Ok(std::sync::Arc::clone(vectors));
+                            }
                         }
 
                         let permit = rate_controller.acquire().await.context(FailedToAcquireRateControllerPermitSnafu)?;
@@ -223,7 +226,8 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
                                 RetryError::permanent(EmbedError::FailedToCreateEmbedding { source: err.into() })
                             })?;
 
-                        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Vector(std::sync::Arc::new(embeddings.clone()))).await;
+                        let embeddings = std::sync::Arc::new(embeddings);
+                        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Vector(std::sync::Arc::clone(&embeddings))).await;
 
                         Ok(embeddings)
                     })
@@ -232,13 +236,15 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
             })
             .collect();
 
-        let combined_results: Vec<Vec<f32>> = try_join_all(embed_futures)
-            .await?
-            .into_iter()
-            .flatten()
+        let batches = try_join_all(embed_futures).await?;
+        if batches.len() == 1 {
+            return Ok(batches.into_iter().next().expect("len checked"));
+        }
+        let combined: Vec<Vec<f32>> = batches
+            .iter()
+            .flat_map(|batch| batch.iter().cloned())
             .collect();
-
-        Ok(combined_results)
+        Ok(std::sync::Arc::new(combined))
     }
 
     fn size(&self) -> i32 {

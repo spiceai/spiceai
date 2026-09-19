@@ -1259,7 +1259,10 @@ mod warm_memory {
 
     #[async_trait]
     impl Embed for ByteEmbed {
-        async fn embed(&self, input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+        async fn embed(
+            &self,
+            input: EmbeddingInput,
+        ) -> llms::embeddings::Result<std::sync::Arc<Vec<Vec<f32>>>> {
             match input {
                 EmbeddingInput::String(s) => Ok(vec![byte_vector(&s)]),
                 EmbeddingInput::StringArray(v) => Ok(v.iter().map(|s| byte_vector(s)).collect()),

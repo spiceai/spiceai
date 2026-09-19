@@ -399,7 +399,7 @@ struct ToolRegistrySearchTool {
     documents: Arc<Vec<ToolDocument>>,
     document_texts: Arc<Vec<String>>,
     embedding_model: Arc<dyn Embed>,
-    tool_embeddings: OnceCell<Vec<Vec<f32>>>,
+    tool_embeddings: OnceCell<std::sync::Arc<Vec<Vec<f32>>>>,
 }
 
 impl ToolRegistrySearchTool {
@@ -757,7 +757,7 @@ async fn hybrid_rank_tools(
     document_texts: &[String],
     params: &ToolSearchParams,
     embedding_model: &Arc<dyn Embed>,
-    tool_embeddings: &OnceCell<Vec<Vec<f32>>>,
+    tool_embeddings: &OnceCell<std::sync::Arc<Vec<Vec<f32>>>>,
 ) -> Result<Vec<RankedTool>, Box<dyn std::error::Error + Send + Sync>> {
     let query_tokens = tokenize_to_vec(&params.query);
     let keyword_tokens = params
@@ -828,7 +828,7 @@ async fn vector_channel_matches(
     document_texts: &[String],
     query: &str,
     embedding_model: &Arc<dyn Embed>,
-    tool_embeddings: &OnceCell<Vec<Vec<f32>>>,
+    tool_embeddings: &OnceCell<std::sync::Arc<Vec<Vec<f32>>>>,
 ) -> Result<Vec<ChannelMatch>, llms::embeddings::Error> {
     if query.trim().is_empty() || document_texts.is_empty() {
         return Ok(Vec::new());
@@ -1321,7 +1321,10 @@ mod tests {
 
     #[async_trait]
     impl Embed for MockEmbed {
-        async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        async fn embed(
+            &self,
+            input: EmbeddingInput,
+        ) -> Result<std::sync::Arc<Vec<Vec<f32>>>, EmbeddingError> {
             let texts = match input {
                 EmbeddingInput::String(text) => vec![text],
                 EmbeddingInput::StringArray(texts) => texts,

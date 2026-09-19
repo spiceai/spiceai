@@ -314,8 +314,11 @@ mod tests {
 
     #[async_trait]
     impl Embed for NoopEmbed {
-        async fn embed(&self, _input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
-            Ok(vec![])
+        async fn embed(
+            &self,
+            _input: EmbeddingInput,
+        ) -> llms::embeddings::Result<std::sync::Arc<Vec<Vec<f32>>>> {
+            Ok(std::sync::Arc::new(vec![]))
         }
 
         fn size(&self) -> i32 {

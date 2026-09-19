@@ -187,14 +187,29 @@ where
         predicate: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
     ) -> usize {
         self.cache.run_pending_tasks().await;
+        // Snapshot candidate keys, then remove each only when the value under
+        // that key still matches. A concurrent insert that replaces a matching
+        // value with a non-matching one must not be removed.
         let keys: Vec<u64> = self
             .cache
             .iter()
             .filter_map(|(key, value)| predicate(&value).then_some(*key))
             .collect();
-        let removed = keys.len();
+        let mut removed = 0usize;
         for key in keys {
-            self.cache.invalidate(&key).await;
+            let outcome = self
+                .cache
+                .entry(key)
+                .and_compute_with(|current| {
+                    let should_remove = current
+                        .as_ref()
+                        .is_some_and(|entry| predicate(entry.value()));
+                    std::future::ready(if should_remove { Op::Remove } else { Op::Nop })
+                })
+                .await;
+            if matches!(outcome, moka::ops::compute::CompResult::Removed(_)) {
+                removed += 1;
+            }
         }
         self.cache.run_pending_tasks().await;
         removed
@@ -255,5 +270,47 @@ mod tests {
             ),
             Some(Duration::from_secs(10))
         );
+    }
+
+    #[tokio::test]
+    async fn invalidate_matching_skips_key_replaced_with_nonmatching_value() {
+        #[derive(Clone, Debug)]
+        struct Val {
+            tag: &'static str,
+        }
+        impl Sizeable for Val {
+            fn get_memory_size(&self) -> usize {
+                1
+            }
+        }
+
+        let backend = MokaBackend::<Val, _>::new(
+            &CacheBackendBuilder::new(1024, Duration::from_mins(1)),
+            std::hash::RandomState::new(),
+        );
+        backend.insert(1, Val { tag: "match" }).await;
+        // Simulate the race: snapshot would have seen key 1, then a concurrent
+        // insert replaces it with a non-matching value before conditional remove.
+        backend
+            .insert(
+                1,
+                Val {
+                    tag: "fresh-nonmatching",
+                },
+            )
+            .await;
+
+        let removed =
+            CacheBackend::invalidate_matching(&backend, &(|v: &Val| v.tag == "match")).await;
+        assert_eq!(
+            removed, 0,
+            "replaced non-matching value must not be removed"
+        );
+        assert!(
+            backend.get(&1).await.is_some(),
+            "fresh non-matching generation must survive"
+        );
+        let got = backend.get(&1).await.expect("present");
+        assert_eq!(got.tag, "fresh-nonmatching");
     }
 }

@@ -998,7 +998,7 @@ impl Query {
                     let now = std::time::Instant::now();
                     if !cached_result.is_stale(ttl, now)
                         && let Ok(records) = cache_provider
-                            .records(&plan_cache_key, cached_result.as_ref())
+                            .records(&plan_cache_key, &cached_result)
                             .await
                     {
                         tracing::debug!(
