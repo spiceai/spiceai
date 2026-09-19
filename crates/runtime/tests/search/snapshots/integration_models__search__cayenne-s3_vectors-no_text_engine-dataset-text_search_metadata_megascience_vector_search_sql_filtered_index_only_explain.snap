@@ -2,4 +2,11 @@
 source: crates/runtime/tests/search/mod.rs
 description: "SELECT id, trunc(_score, 3) as _score FROM vector_search(qs, 'secondary', answer, 4) WHERE subject != 'math' ORDER BY _score DESC, id"
 ---
-Could not prepare EXPLAIN plan: Query execution failed: code: 'Client specified an invalid argument', message: "Table 'spice.public.qs' does not have an embedding index."
++---------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type           | plan                                                                                                                                                                                         |
++---------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan        | Sort: _score DESC NULLS FIRST, vector_search(qs, Utf8("secondary"), answer, Int64(4)).id ASC NULLS LAST                                                                                      |
+|                     |   Projection: vector_search(qs, Utf8("secondary"), answer, Int64(4)).id, trunc(vector_search(qs, Utf8("secondary"), answer, Int64(4))._score, Int64(3)) AS _score                            |
+|                     |     TableScan: vector_search(qs, Utf8("secondary"), answer, Int64(4)) projection=[_score, id], full_filters=[vector_search(qs, Utf8("secondary"), answer, Int64(4)).subject != Utf8("math")] |
+| physical_plan_error | External error: Acceleration not ready; loading initial data for qs                                                                                                                          |
++---------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

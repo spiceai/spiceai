@@ -2,4 +2,12 @@
 source: crates/runtime/tests/search/mod.rs
 description: "SELECT id, answer FROM vector_search(qs, 'second', answer) order by _score desc, id LIMIT 4"
 ---
-Could not prepare EXPLAIN plan: Query execution failed: code: 'Client specified an invalid argument', message: "Table 'spice.public.qs' does not have an embedding index."
++---------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type           | plan                                                                                                                                                             |
++---------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan        | Projection: vector_search(qs, Utf8("second"), answer).id, vector_search(qs, Utf8("second"), answer).answer                                                       |
+|                     |   Sort: vector_search(qs, Utf8("second"), answer)._score DESC NULLS FIRST, vector_search(qs, Utf8("second"), answer).id ASC NULLS LAST, fetch=4                  |
+|                     |     Projection: vector_search(qs, Utf8("second"), answer).id, vector_search(qs, Utf8("second"), answer).answer, vector_search(qs, Utf8("second"), answer)._score |
+|                     |       TableScan: vector_search(qs, Utf8("second"), answer) projection=[_score, answer, id]                                                                       |
+| physical_plan_error | External error: Acceleration not ready; loading initial data for qs                                                                                              |
++---------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+
