@@ -126,7 +126,6 @@ runs:
       uses: ./.github/actions/setup-sccache
       with:
         minio_endpoint: ${{ inputs.minio_endpoint }}
-        os: ${{ steps.detect-os.outputs.os }}
         minio_access_key: ${{ inputs.minio_access_key }}
         minio_secret_key: ${{ inputs.minio_secret_key }}
 
