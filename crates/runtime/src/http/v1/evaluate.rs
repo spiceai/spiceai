@@ -49,6 +49,7 @@ use crate::model::EvaluateModelStore;
         (status = 200, description = "Evaluation succeeded", body = EvaluateResponse),
         (status = 404, description = "Model not found"),
         (status = 400, description = "Invalid request"),
+        (status = 422, description = "Malformed JSON request body (Axum Json extractor)"),
         (status = 401, description = "Upstream authentication failed"),
         (status = 403, description = "Upstream permission denied"),
         (status = 429, description = "Rate limited"),

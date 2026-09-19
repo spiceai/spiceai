@@ -2581,6 +2581,16 @@
           },
           "500": {
             "description": "Evaluation failed"
+          },
+          "422": {
+            "description": "Malformed JSON request body (Axum Json extractor)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [

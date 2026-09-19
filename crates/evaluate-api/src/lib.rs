@@ -526,6 +526,7 @@ mod tests {
         let omitted: NoulCriteria = serde_json::from_value(json!({})).expect("omit");
         assert!(matches!(omitted.true_meaning, NullableEntry::Absent));
         let omitted_json = serde_json::to_value(&omitted).expect("ser");
-        assert!(omitted_json.as_object().unwrap().is_empty());
+        let obj = omitted_json.as_object().expect("object");
+        assert!(obj.is_empty());
     }
 }
