@@ -1,6 +1,16 @@
 allow-expect-in-tests = true
 future-size-threshold = 45520 # Large futures are in tests
 
+# `too-many-lines-threshold` is deliberately absent, so this pass uses clippy's
+# default of 100 while the repository-root clippy.toml raises it to 200. The gap
+# is load-bearing. An `#[expect(clippy::too_many_lines)]` overrides the command
+# line's `-Aclippy::too_many_lines`, so the lint is still evaluated at the
+# attribute, and several of them sit on functions between the two thresholds
+# (`telemetry::track_table_storage` is 115 lines). Set the threshold to 200 here
+# and the lint stops firing on those, the expectation goes unfulfilled, and this
+# pass fails under `-Dwarnings`. The second pass reads the root file and pairs it
+# with `-Aunfulfilled_lint_expectations` for exactly that reason.
+
 # Direct CPU detection is the bug `crates/cpu-budget` exists to prevent: both of
 # these read only a cgroup CPU *quota* and otherwise report the node's cores, so
 # a pod with `requests.cpu` and no `limits.cpu` sizes itself for the whole node.
