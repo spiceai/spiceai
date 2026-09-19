@@ -80,6 +80,8 @@ pub mod oracle;
 pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod postgres_replication;
+#[cfg(feature = "qdrant")]
+pub mod qdrant;
 pub mod refresh_skip;
 pub mod resilient_http;
 pub mod s3_single_file_cached;
