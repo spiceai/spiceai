@@ -64203,6 +64203,72 @@ mod tests {
         );
     }
 
+    /// The delta extend must SHARE the entries it carries over rather than
+    /// re-materialize them: each already-cached entry owns its decoded
+    /// `RecordBatch`es and its envelope, so a per-entry deep copy turns an
+    /// append into O(corpus) allocations on every scan that observes a write.
+    /// Only pointer identity catches that — a deep-copying rebuild still
+    /// returns exactly the right rows, so no correctness assertion can see it.
+    #[tokio::test]
+    async fn inline_cache_delta_extend_shares_carried_over_entries() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_inline_enabled_upsert_table(
+            "inline_cache_delta_entry_sharing",
+            ctx.runtime_env(),
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Warm the cache from the sentinel — this first view is a full rebuild.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        let rebuilt = provider
+            .cached_inlined_view()
+            .await
+            .expect("warm the inline view cache");
+        assert_eq!(rebuilt.len(), 1, "precondition: one inline entry is cached");
+
+        // A pure append keeps the structural epoch, so the next read extends the
+        // cached view through the delta path.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
+        let extended = provider
+            .cached_inlined_view()
+            .await
+            .expect("extend the inline view cache");
+        assert_eq!(extended.len(), 2, "the delta appends exactly the new entry");
+        assert!(
+            !Arc::ptr_eq(&rebuilt, &extended),
+            "precondition: the view was genuinely rebuilt, so entry sharing below \
+             is not trivially true"
+        );
+        assert!(
+            Arc::ptr_eq(&rebuilt[0], &extended[0]),
+            "an entry carried over by the delta extend must be SHARED with the base \
+             view, not deep-copied"
+        );
+
+        // A second delta: an entry first materialized BY a delta must be shared
+        // onward too, not just one that came from the full rebuild.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[3], &[30])).await;
+        let extended_again = provider
+            .cached_inlined_view()
+            .await
+            .expect("extend the inline view cache again");
+        assert_eq!(extended_again.len(), 3);
+        for (index, carried) in extended.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(carried, &extended_again[index]),
+                "entry {index} must stay shared across successive delta extends"
+            );
+        }
+
+        // Sharing must not cost visibility: every appended row is still returned.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "inline_cache_delta_entry_sharing").await,
+            vec![(1, 10), (2, 20), (3, 30)],
+            "shared entries must still surface every row exactly once"
+        );
+    }
+
     // ---- List-files cache delta-apply (FIX 2) ---------------------------------
 
     /// Build a `RuntimeEnv` with an explicit (empty) list-files cache so the
