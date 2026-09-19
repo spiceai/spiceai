@@ -43,6 +43,7 @@ limitations under the License.
 //! insert into an already-walked shard cannot survive the return.
 
 mod hasher;
+mod layout;
 mod shard;
 mod sketch;
 
@@ -52,22 +53,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub use hasher::{IdentityBuildHasher, IdentityHasher};
-
-/// Number of shards. Keys map to shard `key % NUM_SHARDS`.
-pub const NUM_SHARDS: usize = 16;
-
-/// Maps a cache key to its shard: `key % NUM_SHARDS`.
-#[inline]
-#[must_use]
-pub fn shard_index(key: u64) -> usize {
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "shard index only needs the low bits of the u64 key"
-    )]
-    {
-        (key as usize) % NUM_SHARDS
-    }
-}
+// `shard_index` carries a machine-checked bound on what it returns, because
+// that value subscripts `shards` and `touch_buffers` on every operation. See
+// the `layout` module.
+pub use layout::{NUM_SHARDS, shard_index};
 
 /// Why an entry left the cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

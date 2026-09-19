@@ -39,7 +39,8 @@ twox-hash = { workspace = true }
 # `cargo build` erases the specifications, so this carries no runtime cost;
 # `cargo verus focus` re-checks the proofs. Pinned to the Verus release whose
 # verifier is run in CI — the two are versioned together. Must match the
-# `vstd` pin in `crates/hash-index/Cargo.toml` and `VERUS_VSTD_VERSION` in
+# `vstd` pin in `crates/hash-index/Cargo.toml` and
+# `crates/sharded-cache/Cargo.toml`, and `VERUS_VSTD_VERSION` in
 # `.github/workflows/verus_verify.yml`.
 vstd = "=0.0.0-2026-08-30-0159"
 

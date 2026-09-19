@@ -19281,6 +19281,7 @@ name = "sharded-cache"
 version = "2.4.0-unstable"
 dependencies = [
  "parking_lot",
+ "vstd",
 ]
 
 [[package]]

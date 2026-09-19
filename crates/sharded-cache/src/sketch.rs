@@ -19,10 +19,13 @@ limitations under the License.
 //! Four rows of 4096 saturating `u8` counters (~16 KiB). When the addition
 //! counter reaches the sample size, every cell is halved so the sketch tracks
 //! recent frequency rather than lifetime counts.
+//!
+//! The row and column a key lands in are computed by
+//! [`crate::layout::sketch_cell_index`], whose in-range result is proved rather
+//! than sampled: this subscripts a flat array under the shard lock.
 
-const DEPTH: usize = 4;
-const WIDTH: usize = 4096;
-const WIDTH_MASK: usize = WIDTH - 1;
+use crate::layout::{SKETCH_DEPTH as DEPTH, SKETCH_WIDTH as WIDTH, sketch_cell_index};
+
 const SAMPLE_SIZE: u32 = 10_000;
 
 const SEEDS: [u64; DEPTH] = [
@@ -52,8 +55,7 @@ impl CountMinSketch {
             self.age();
         }
         for row in 0..DEPTH {
-            let idx = row * WIDTH + index(key, row);
-            let cell = &mut self.counters[idx];
+            let cell = &mut self.counters[sketch_cell_index(mix(key, row), row)];
             *cell = cell.saturating_add(1);
         }
     }
@@ -61,8 +63,7 @@ impl CountMinSketch {
     pub(crate) fn estimate(&self, key: u64) -> u8 {
         let mut min = u8::MAX;
         for row in 0..DEPTH {
-            let idx = row * WIDTH + index(key, row);
-            min = min.min(self.counters[idx]);
+            min = min.min(self.counters[sketch_cell_index(mix(key, row), row)]);
         }
         min
     }
@@ -75,17 +76,13 @@ impl CountMinSketch {
     }
 }
 
-fn index(key: u64, row: usize) -> usize {
+/// Row-seeded mix of `key`. Only its low bits reach a column, so this is free
+/// to change without affecting the bound `sketch_cell_index` carries.
+fn mix(key: u64, row: usize) -> u64 {
     let mut mixed = key ^ SEEDS[row];
     mixed = mixed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     mixed ^= mixed >> 32;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "width is 4096; only the low bits of the mix are used"
-    )]
-    {
-        mixed as usize & WIDTH_MASK
-    }
+    mixed
 }
 
 #[cfg(test)]
