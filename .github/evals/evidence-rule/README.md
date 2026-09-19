@@ -1,8 +1,7 @@
 # evidence-rule evals
 
 Regression tests for the **Evidence — no claim without a reproduction** rule in
-the agent instructions (`AGENTS.md`, symlinked as `CLAUDE.md` and
-`.github/copilot-instructions.md`).
+the agent instructions (`AGENTS.md`).
 
 The rule says that an issue, concern, bug, regression, or performance claim has
 to carry evidence produced by running something, that a passing unit test is not
