@@ -43,13 +43,17 @@ name: mysql-cayenne[file]-adaptive
 # stock, new_order, district and warehouse stay unpinned (no CH-benCH query filters them),
 # so every run still carries a high-volume table on the default layout to compare against.
 # Keys match the postgres adaptive pod, so the two sources stay comparable.
-# Clustering is not free. It replaces the inference-derived sort order on these tables (the
-# two cannot be combined), so a whole-snapshot write — the initial CDC bootstrap and the
-# ordered compaction rewrite — orders rows along the curve through ONE writer instead of the
-# range-routed parallel write. On the scheduled SF1000 arms that costs nothing at load time
-# (the bootstrap there is bound by reading the source, not by encoding), but it does move the
-# steady state: the mysql arm traded roughly half its QPH for ~6x better worst-table
-# freshness, while the postgres arm moved within its run-to-run spread on both.
+# What it costs and buys, measured on the 3-node lab (mysql, SF-100, 3 reps per side,
+# arms interleaved, one binary, pods differing only by these keys): worst-table freshness
+# halves — 25.1s unpinned vs 12.5s pinned, every pinned arm below every unpinned one, exact
+# permutation p=0.05 — while QPH (p=0.55), tpmC, spiced CPU and RSS all stay put. The layout
+# does change: an explicit key replaces the inference-derived sort order (the two cannot be
+# combined) and routes whole-snapshot writes through ONE ordered writer instead of the
+# range-routed parallel write, so order_line's durable scan reads 4 files in 4 groups where
+# the unpinned arm reads 31 in 20. Fewer footer opens against less scan fan-out cancel out on
+# a 20-core host, which is why query latency does not move. WHY freshness improves is NOT
+# established: every write-path metric scraped (files on disk, write MiB/s, metastore and
+# mem-tier checkpoints, files reclaimed, encode waits) is flat between the arms.
 
 # All `refresh_mode: changes` datasets coalesce onto ONE shared binlog dump
 # (server_id derived from the connection identity - the engine default). The
