@@ -997,7 +997,9 @@ impl Query {
                     let ttl = cache_provider.ttl();
                     let now = std::time::Instant::now();
                     if !cached_result.is_stale(ttl, now)
-                        && let Ok(records) = cached_result.records().await
+                        && let Ok(records) = cache_provider
+                            .records(&plan_cache_key, cached_result.as_ref())
+                            .await
                     {
                         tracing::debug!(
                             job_id,
@@ -1903,7 +1905,7 @@ impl Query {
                     None => None,
                 };
                 let planned = match cached_plan {
-                    Some(plan) => Ok(plan),
+                    Some(plan) => Ok(std::sync::Arc::unwrap_or_clone(plan)),
                     None => {
                         self.df
                             .get_or_create_logical_plan(

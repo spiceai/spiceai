@@ -128,7 +128,7 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
         if let Some(CachedEmbeddingResult::Response(cached)) =
             self.get_cached_embed((&req).into()).await
         {
-            return Ok(cached);
+            return Ok(std::sync::Arc::unwrap_or_clone(cached));
         }
 
         let outer_model = req.model.clone();
@@ -152,8 +152,11 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
 
         resp.model = outer_model;
 
-        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Response(resp.clone()))
-            .await;
+        self.put_cached_embed(
+            (&req).into(),
+            CachedEmbeddingResult::Response(std::sync::Arc::new(resp.clone())),
+        )
+        .await;
 
         Ok(resp)
     }
@@ -189,7 +192,7 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
                 async move {
                     retry(retry_strategy, async || {
                         if let Some(CachedEmbeddingResult::Vector(cached)) = self.get_cached_embed((&req).into()).await {
-                            return Ok(cached);
+            return Ok(std::sync::Arc::unwrap_or_clone(cached));
                         }
 
                         let permit = rate_controller.acquire().await.context(FailedToAcquireRateControllerPermitSnafu)?;
@@ -220,7 +223,7 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
                                 RetryError::permanent(EmbedError::FailedToCreateEmbedding { source: err.into() })
                             })?;
 
-                        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Vector(embeddings.clone())).await;
+                        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Vector(std::sync::Arc::new(embeddings.clone()))).await;
 
                         Ok(embeddings)
                     })

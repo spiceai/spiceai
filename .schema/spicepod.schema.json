@@ -754,7 +754,7 @@
           "const": "lru"
         },
         {
-          "description": "Least Frequently Used caching policy.\nEvicts the lowest hit-count resident; suitable for stable hot-key workloads.",
+          "description": "Least Frequently Used caching policy.\n\nEvicts the lowest hit-count resident; suitable for stable hot-key\nworkloads where frequency beats recency. Prefer `lru` for\nstreaming/recency-biased traffic and `tiny_lfu` as the general\ndefault for mixed database/search/analytics. User-facing docs and\nPM/DX acceptance for shipping this value are tracked in\nhttps://github.com/spiceai/spiceai/issues/14211.",
           "type": "string",
           "const": "lfu"
         },

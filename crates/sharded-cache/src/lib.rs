@@ -45,7 +45,7 @@ mod shard;
 mod sketch;
 
 use parking_lot::Mutex;
-use shard::{GetOutcome, Shard, into_owned};
+use shard::{GetOutcome, Shard};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -255,7 +255,7 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
         self.evict_to_limit(shard_idx, Some(key));
     }
 
-    /// Clone the value for `key` if it is present and unexpired.
+    /// Return a shared handle for `key` if it is present and unexpired.
     ///
     /// Never removes a live entry. An expired entry is dropped and reported
     /// as [`EvictionReason::Expired`].
@@ -263,14 +263,15 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
     /// # Short lock + buffered promote
     ///
     /// Under the shard mutex this only looks up, bumps LFU/sketch metadata,
-    /// and `Arc::clone`s the resident handle — then unlocks. The fat `V`
-    /// clone runs after unlock. LRU / LFU / W-TinyLFU region relinks are
-    /// recorded in a per-shard touch buffer and applied from
-    /// [`Self::run_pending_tasks`], [`Self::insert`], and a best-effort drain
-    /// on this path. Concurrent touch order may be slightly looser (Moka-like
-    /// buffered ops); differential value agreement still holds. Demotion /
-    /// trim stay off the get hot path (`try_lock` / after unlock).
-    pub fn get(&self, key: &u64) -> Option<V> {
+    /// and `Arc::clone`s the resident handle — then unlocks. Callers that need
+    /// an owned `V` clone outside this path (or keep the `Arc`). LRU / LFU /
+    /// W-TinyLFU region relinks are recorded in a per-shard touch buffer and
+    /// applied from [`Self::run_pending_tasks`], [`Self::insert`], and a
+    /// best-effort drain on this path. Concurrent touch order may be slightly
+    /// looser (Moka-like buffered ops); differential value agreement still
+    /// holds. Demotion / trim stay off the get hot path (`try_lock` / after
+    /// unlock).
+    pub fn get(&self, key: &u64) -> Option<std::sync::Arc<V>> {
         let shard_idx = shard_index(*key);
         let handle = {
             let mut shard = self.shards[shard_idx].0.lock();
@@ -298,14 +299,48 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
                 }
             }
         };
-        // Fat payload clone is outside the shard mutex (try_unwrap when unique).
-        let value = into_owned(handle);
         self.record_touch(shard_idx, *key);
         // Promote is off the get latency path: best-effort drain only once
         // the per-shard buffer reaches TOUCH_DRAIN_THRESHOLD (`try_lock`).
         // Insert and `run_pending_tasks` drain the rest (Moka-like buffered ops).
         self.maybe_drain_touches(shard_idx);
-        Some(value)
+        Some(handle)
+    }
+
+    /// Replace the resident at `key` when `should_replace` accepts it.
+    ///
+    /// When `keep_ttl` is true the existing insertion timestamp is preserved so
+    /// the entry's remaining lifetime does not restart.
+    pub fn replace_if<F>(
+        &self,
+        key: u64,
+        value: V,
+        weight: usize,
+        keep_ttl: bool,
+        should_replace: F,
+    ) -> bool
+    where
+        F: FnOnce(&V) -> bool,
+    {
+        let weight = u64::try_from(weight).unwrap_or(u64::MAX);
+        let shard_idx = shard_index(key);
+        self.drain_touches_blocking(shard_idx);
+        let mut shard = self.shards[shard_idx].0.lock();
+        let now = Instant::now();
+        let Some((replaced, delta, old)) =
+            shard.replace_if(key, value, weight, now, keep_ttl, should_replace)
+        else {
+            return false;
+        };
+        if replaced {
+            self.apply_delta(&delta);
+        }
+        drop(shard);
+        drop(old);
+        if replaced && self.weight.load(Ordering::Relaxed) > self.max_weight {
+            self.evict_to_limit(shard_idx, Some(key));
+        }
+        replaced
     }
 
     /// Remove `key` if present. This is not an eviction and is not reported.
@@ -664,6 +699,16 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
 
     fn promote_window_key(&self, shard_idx: usize, key: u64) -> bool {
         let mut shard = self.shards[shard_idx].0.lock();
+        // `drain_all_touches` may have run after the window-tail snapshot was
+        // taken; a concurrent hit can move that key off the tail. Only promote
+        // when `key` is still the current window LRU — otherwise return false
+        // so the caller re-snapshots and retries.
+        let Some(tail_key) = shard.region_tail_key(shard::Region::Window) else {
+            return false;
+        };
+        if tail_key != key {
+            return false;
+        }
         if shard.peek_region(key) != Some(shard::Region::Window) {
             return false;
         }
@@ -1356,7 +1401,10 @@ mod tests {
     fn insert_get_round_trip() {
         let cache = cache(1024, Duration::from_mins(1));
         cache.insert(1, TestValue::new("hello"), 5);
-        assert_eq!(cache.get(&1).map(|v| v.data), Some("hello".to_string()));
+        assert_eq!(
+            cache.get(&1).map(|v| v.data.clone()),
+            Some("hello".to_string())
+        );
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.weighted_size(), 5);
     }
@@ -1449,7 +1497,7 @@ mod tests {
             cache.insert(key, TestValue::new(&format!("v{key}")), 1);
         }
         assert_eq!(
-            cache.get(&16).map(|v| v.data),
+            cache.get(&16).map(|v| v.data.clone()),
             Some("v16".to_string()),
             "read the oldest so recency no longer matches insertion order"
         );
@@ -1470,7 +1518,10 @@ mod tests {
         let cache: ShardedCache<TestValue> =
             ShardedCache::new(1024, Duration::from_mins(1), EvictionPolicy::TinyLfu);
         cache.insert(1, TestValue::new("tiny"), 4);
-        assert_eq!(cache.get(&1).map(|v| v.data), Some("tiny".to_string()));
+        assert_eq!(
+            cache.get(&1).map(|v| v.data.clone()),
+            Some("tiny".to_string())
+        );
     }
 
     #[test]

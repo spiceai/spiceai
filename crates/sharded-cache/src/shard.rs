@@ -98,7 +98,7 @@ pub(crate) enum GetOutcome<V> {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct WeightDelta {
     pub(crate) added: u64,
     pub(crate) removed: u64,
@@ -659,6 +659,75 @@ impl<V: Clone> Shard<V> {
         }
         self.promote(idx, region);
         (delta, Some(old_value))
+    }
+
+    /// Conditionally rewrite a resident. Returns `None` if `key` is absent,
+    /// `Some((false, ..))` if the predicate rejected, or `Some((true, delta, old))`
+    /// when the value was replaced. When `keep_ttl` is set, `inserted_at` is left
+    /// unchanged so the remaining lifetime is preserved.
+    pub(crate) fn replace_if<F>(
+        &mut self,
+        key: u64,
+        value: V,
+        weight: u64,
+        now: Instant,
+        keep_ttl: bool,
+        should_replace: F,
+    ) -> Option<(bool, WeightDelta, Option<V>)>
+    where
+        F: FnOnce(&V) -> bool,
+    {
+        let &idx = self.map.get(&key)?;
+        let accept = match self.slots.get(idx as usize) {
+            Some(Slot::Occupied(node)) => should_replace(node.value.as_ref()),
+            _ => return None,
+        };
+        if !accept {
+            return Some((false, WeightDelta::default(), None));
+        }
+        let (old_weight, old_value, region) = match self.slots.get_mut(idx as usize) {
+            Some(Slot::Occupied(node)) => {
+                let old_weight = node.weight;
+                let old_value = into_owned(std::mem::replace(&mut node.value, Arc::new(value)));
+                let region = node.region;
+                node.weight = weight;
+                if !keep_ttl {
+                    node.inserted_at = now;
+                }
+                (old_weight, old_value, region)
+            }
+            _ => return None,
+        };
+        self.weight = self
+            .weight
+            .saturating_sub(old_weight)
+            .saturating_add(weight);
+        let mut delta = WeightDelta {
+            added: weight,
+            removed: old_weight,
+            window_added: 0,
+            window_removed: 0,
+            protected_added: 0,
+            protected_removed: 0,
+        };
+        if region == Region::Window {
+            self.window_weight = self
+                .window_weight
+                .saturating_sub(old_weight)
+                .saturating_add(weight);
+            delta.window_added = weight;
+            delta.window_removed = old_weight;
+        } else if region == Region::Protected {
+            self.protected_weight = self
+                .protected_weight
+                .saturating_sub(old_weight)
+                .saturating_add(weight);
+            delta.protected_added = weight;
+            delta.protected_removed = old_weight;
+        }
+        // In-place rewrite: do not bump recency (promotion would restart LRU order).
+        let _ = (idx, region);
+        Some((true, delta, Some(old_value)))
     }
 
     fn promote(&mut self, idx: u32, region: Region) {

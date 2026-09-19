@@ -233,7 +233,7 @@ impl Embed for Model2Vec {
         };
 
         if let Some(CachedEmbeddingResult::Vector(cached)) = cached_response {
-            return Ok(cached);
+            return Ok(std::sync::Arc::unwrap_or_clone(cached));
         }
 
         // The forward pass is CPU-bound and synchronous; run it on the blocking
@@ -260,8 +260,11 @@ impl Embed for Model2Vec {
         })??;
 
         if let Some(key) = cache_key {
-            self.put_cached_embed(key, CachedEmbeddingResult::Vector(vectors.clone()))
-                .await;
+            self.put_cached_embed(
+                key,
+                CachedEmbeddingResult::Vector(std::sync::Arc::new(vectors.clone())),
+            )
+            .await;
         }
 
         Ok(vectors)

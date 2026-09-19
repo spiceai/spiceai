@@ -45,7 +45,7 @@ const PREFILL: u64 = 8_000;
 /// the 8 MiB budget holds all of them (`HOT_KEY_SPACE * 32` bytes).
 const HOT_KEY_SPACE: u64 = 8_000;
 /// Hot set for the ~70% hit group. Fully prefilled and fits in budget; 70% of
-/// gets sample this set and 30% sample the wider `KEY_SPACE` (mostly misses).
+/// gets sample this set and 30% sample `HIT70_HOT_SET..KEY_SPACE` (all misses).
 const HIT70_HOT_SET: u64 = 8_000;
 const OPERATIONS_PER_THREAD: usize = 8_000;
 /// Thread counts for every bakeoff group, including the 32/64 contention cells.
@@ -163,7 +163,7 @@ fn run_gets<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
 }
 
 /// ~70% hits / 30% misses: with probability 0.7 sample the prefilled hot set,
-/// otherwise sample the wide key space (mostly misses).
+/// otherwise sample keys in `HIT70_HOT_SET..KEY_SPACE` (misses outside the hot set).
 fn run_gets_hit70<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
     handle: &tokio::runtime::Handle,
     backend: &Arc<B>,
@@ -180,7 +180,7 @@ fn run_gets_hit70<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
                         let key = if rng.random_bool(0.7) {
                             rng.random_range(0..HIT70_HOT_SET)
                         } else {
-                            rng.random_range(0..KEY_SPACE)
+                            rng.random_range(HIT70_HOT_SET..KEY_SPACE)
                         };
                         black_box(backend.get(&key).await);
                     }
@@ -226,7 +226,6 @@ fn run_mixed<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
     }
 }
 
-
 /// Sorted-sample percentile of individual get latencies (nanoseconds).
 fn percentile_ns(sorted: &[u64], p: f64) -> u64 {
     if sorted.is_empty() {
@@ -262,7 +261,7 @@ fn measure_hit70_latency<B: CacheBackend<BenchValue> + Send + Sync + 'static>(
                         let key = if rng.random_bool(0.7) {
                             rng.random_range(0..HIT70_HOT_SET)
                         } else {
-                            rng.random_range(0..KEY_SPACE)
+                            rng.random_range(HIT70_HOT_SET..KEY_SPACE)
                         };
                         let t0 = Instant::now();
                         black_box(backend.get(&key).await);

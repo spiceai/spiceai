@@ -191,7 +191,9 @@ pub trait Embed: Debug + Sync + Send {
                 .get_raw_key(&key.as_raw_key(embeddings_cache.hasher()).as_u64())
                 .await
         {
-            return Some(cached);
+            // Provider returns `Arc`; unwrap_or_clone is cheap because
+            // `CachedEmbeddingResult` interiors are themselves `Arc`-shared.
+            return Some(std::sync::Arc::unwrap_or_clone(cached));
         }
 
         None

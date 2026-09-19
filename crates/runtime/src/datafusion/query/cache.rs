@@ -935,6 +935,7 @@ impl Query {
         let plan = plans_cache
             .get_raw_key(&Self::cached_plan_key(df, sql, Some(namespace)).as_u64())
             .await?;
+        let plan = std::sync::Arc::unwrap_or_clone(plan);
         match parameters {
             Some(parameters) => plan.with_param_values(parameters.clone()).ok(),
             None => Some(plan),
@@ -1060,7 +1061,11 @@ impl Query {
             );
         }
 
-        let records = match cached_result.records().await {
+        let records = match df.results_cache_provider() {
+            Some(provider) => provider.records(&raw_key, &cached_result).await,
+            None => cached_result.records().await,
+        };
+        let records = match records {
             Ok(records) => records,
             Err(e) => {
                 tracing::error!("Failed to decode cached query result: {e}");

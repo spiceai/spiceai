@@ -274,7 +274,7 @@ impl Embed for TeiEmbed {
         };
 
         if let Some(CachedEmbeddingResult::Vector(cached)) = cached_response {
-            return Ok(cached);
+            return Ok(std::sync::Arc::unwrap_or_clone(cached));
         }
 
         let inputs = inputs_from_openai(&input);
@@ -288,8 +288,11 @@ impl Embed for TeiEmbed {
         let results: Vec<Vec<f32>> = resp.into_iter().map(|r| r.results).collect();
 
         if let Some(key) = cache_key {
-            self.put_cached_embed(key, CachedEmbeddingResult::Vector(results.clone()))
-                .await;
+            self.put_cached_embed(
+                key,
+                CachedEmbeddingResult::Vector(std::sync::Arc::new(results.clone())),
+            )
+            .await;
         }
 
         Ok(results)
@@ -300,7 +303,7 @@ impl Embed for TeiEmbed {
         if let Some(CachedEmbeddingResult::Response(cached)) =
             self.get_cached_embed((&req).into()).await
         {
-            return Ok(cached);
+            return Ok(std::sync::Arc::unwrap_or_clone(cached));
         }
 
         let model_name = req.model.clone();
@@ -335,8 +338,11 @@ impl Embed for TeiEmbed {
             },
         };
 
-        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Response(resp.clone()))
-            .await;
+        self.put_cached_embed(
+            (&req).into(),
+            CachedEmbeddingResult::Response(std::sync::Arc::new(resp.clone())),
+        )
+        .await;
 
         Ok(resp)
     }

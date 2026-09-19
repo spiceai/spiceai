@@ -88,7 +88,19 @@ where
         self.cache.insert(key, value, weight);
     }
 
-    async fn get(&self, key: &u64) -> Option<V> {
+    async fn replace_if(
+        &self,
+        key: u64,
+        value: V,
+        should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> bool {
+        let weight = value.get_memory_size();
+        let keep_ttl = value.keep_remaining_ttl();
+        self.cache
+            .replace_if(key, value, weight, keep_ttl, should_replace)
+    }
+
+    async fn get(&self, key: &u64) -> Option<Arc<V>> {
         self.cache.get(key)
     }
 

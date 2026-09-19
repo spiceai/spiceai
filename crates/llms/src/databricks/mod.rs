@@ -378,7 +378,7 @@ impl Embed for Databricks {
         if let Some(CachedEmbeddingResult::Response(cached)) =
             self.get_cached_embed((&req).into()).await
         {
-            return Ok(cached);
+            return Ok(std::sync::Arc::unwrap_or_clone(cached));
         }
 
         // Must use `create_byot` with empty path to avoid concatenation of `/embeddings`.
@@ -395,7 +395,7 @@ impl Embed for Databricks {
 
         self.put_cached_embed(
             (&req).into(),
-            CachedEmbeddingResult::Response(response.clone()),
+            CachedEmbeddingResult::Response(std::sync::Arc::new(response.clone())),
         )
         .await;
 
@@ -416,7 +416,7 @@ impl Embed for Databricks {
         };
 
         if let Some(CachedEmbeddingResult::Vector(cached)) = cached_response {
-            return Ok(cached);
+            return Ok(std::sync::Arc::unwrap_or_clone(cached));
         }
 
         let resp = self
@@ -438,8 +438,11 @@ impl Embed for Databricks {
             .collect();
 
         if let Some(key) = cache_key {
-            self.put_cached_embed(key, CachedEmbeddingResult::Vector(vectors.clone()))
-                .await;
+            self.put_cached_embed(
+                key,
+                CachedEmbeddingResult::Vector(std::sync::Arc::new(vectors.clone())),
+            )
+            .await;
         }
 
         Ok(vectors)

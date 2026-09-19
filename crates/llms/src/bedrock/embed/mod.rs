@@ -300,7 +300,7 @@ where
         if let Some(CachedEmbeddingResult::Response(cached)) =
             self.get_cached_embed((&req).into()).await
         {
-            return Ok(cached);
+            return Ok(std::sync::Arc::unwrap_or_clone(cached));
         }
 
         let texts = Self::convert_input_to_texts(&req.input);
@@ -330,8 +330,11 @@ where
             },
         };
 
-        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Response(resp.clone()))
-            .await;
+        self.put_cached_embed(
+            (&req).into(),
+            CachedEmbeddingResult::Response(std::sync::Arc::new(resp.clone())),
+        )
+        .await;
 
         Ok(resp)
     }
@@ -346,7 +349,7 @@ where
         };
 
         if let Some(CachedEmbeddingResult::Vector(cached)) = cached_response {
-            return Ok(cached);
+            return Ok(std::sync::Arc::unwrap_or_clone(cached));
         }
 
         let texts = Self::convert_input_to_texts(&input);
@@ -374,8 +377,11 @@ where
         );
 
         if let Some(key) = cache_key {
-            self.put_cached_embed(key, CachedEmbeddingResult::Vector(vectors.clone()))
-                .await;
+            self.put_cached_embed(
+                key,
+                CachedEmbeddingResult::Vector(std::sync::Arc::new(vectors.clone())),
+            )
+            .await;
         }
 
         Ok(vectors)

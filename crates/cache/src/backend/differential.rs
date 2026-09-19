@@ -79,9 +79,9 @@ impl Engines {
 }
 
 async fn assert_get_eq(engines: &Engines, key: u64, expected: Option<&str>) {
-    let spice = engines.spice.get(&key).await.map(|v| v.data);
-    let moka = engines.moka.get(&key).await.map(|v| v.data);
-    let pingora = engines.pingora.get(&key).await.map(|v| v.data);
+    let spice = engines.spice.get(&key).await.map(|v| v.data.clone());
+    let moka = engines.moka.get(&key).await.map(|v| v.data.clone());
+    let pingora = engines.pingora.get(&key).await.map(|v| v.data.clone());
     assert_eq!(spice.as_deref(), expected, "spice get({key})");
     assert_eq!(moka.as_deref(), expected, "moka get({key})");
     assert_eq!(pingora.as_deref(), expected, "pingora get({key})");
@@ -165,9 +165,9 @@ async fn differential_weight_lru_eviction_agrees_on_survivors() {
     assert!(engines.pingora.weighted_size().await <= 100);
 
     for key in [0u64, 16, 32] {
-        let spice = engines.spice.get(&key).await.map(|v| v.data);
-        let moka = engines.moka.get(&key).await.map(|v| v.data);
-        let pingora = engines.pingora.get(&key).await.map(|v| v.data);
+        let spice = engines.spice.get(&key).await.map(|v| v.data.clone());
+        let moka = engines.moka.get(&key).await.map(|v| v.data.clone());
+        let pingora = engines.pingora.get(&key).await.map(|v| v.data.clone());
         // If two engines both hit, the stored value must match.
         if let (Some(s), Some(m)) = (&spice, &moka) {
             assert_eq!(s, m, "weight overflow get({key}) spice vs moka");
@@ -182,7 +182,12 @@ async fn differential_weight_lru_eviction_agrees_on_survivors() {
     // The just-inserted key should survive on Spice LRU (other-shard-first /
     // same-shard tail eviction leaves the MRU).
     assert_eq!(
-        engines.spice.get(&32).await.map(|v| v.data).as_deref(),
+        engines
+            .spice
+            .get(&32)
+            .await
+            .as_deref()
+            .map(|v| v.data.as_str()),
         Some("new")
     );
 }
@@ -229,9 +234,9 @@ async fn differential_mixed_ops_sequence_agrees() {
         } else {
             Some(format!("v{i}"))
         };
-        let spice = engines.spice.get(&i).await.map(|v| v.data);
-        let moka = engines.moka.get(&i).await.map(|v| v.data);
-        let pingora = engines.pingora.get(&i).await.map(|v| v.data);
+        let spice = engines.spice.get(&i).await.map(|v| v.data.clone());
+        let moka = engines.moka.get(&i).await.map(|v| v.data.clone());
+        let pingora = engines.pingora.get(&i).await.map(|v| v.data.clone());
         assert_eq!(spice, moka, "mixed get({i}) spice vs moka");
         assert_eq!(spice, pingora, "mixed get({i}) spice vs pingora");
         assert_eq!(spice, expect, "mixed get({i}) expected");

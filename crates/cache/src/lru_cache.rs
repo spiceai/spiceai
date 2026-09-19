@@ -238,7 +238,7 @@ impl<
     H: Hasher + Send + Sync + 'static,
 > CacheProvider<V> for LruCache<V, T, H>
 {
-    async fn get_raw_key(&self, key: &u64) -> Option<V> {
+    async fn get_raw_key(&self, key: &u64) -> Option<std::sync::Arc<V>> {
         let always_valid = |_: &V| true;
         self.get_raw_key_validated(key, &always_valid).await
     }
@@ -247,7 +247,7 @@ impl<
         &self,
         key: &u64,
         is_valid: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
-    ) -> Option<V> {
+    ) -> Option<std::sync::Arc<V>> {
         V::record_request();
         self.total_requests.fetch_add(1, Ordering::Relaxed);
 
@@ -255,7 +255,7 @@ impl<
         // hit would make the hit ratio climb precisely when invalidation is
         // doing its job.
         let found = self.backend.get(key).await;
-        let usable = found.filter(|value| is_valid(value));
+        let usable = found.filter(|value| is_valid(value.as_ref()));
 
         if usable.is_some() {
             V::record_hit();
@@ -294,6 +294,15 @@ impl<
             let total = self.total_requests.load(Ordering::Relaxed);
             V::update_hit_ratio(hits, total);
         }
+    }
+
+    async fn replace_if(
+        &self,
+        key: &u64,
+        value: V,
+        should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> bool {
+        self.backend.replace_if(*key, value, should_replace).await
     }
 
     async fn invalidate_all(&self) {

@@ -32,7 +32,7 @@ pingora-lru = { workspace = true, optional = true }
 sharded-cache = { path = "../sharded-cache" }
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 twox-hash = { workspace = true }
 # Specification and proof vocabulary for `src/namespace_key.rs`. A normal

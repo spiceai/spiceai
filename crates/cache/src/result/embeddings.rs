@@ -18,11 +18,15 @@ use async_openai::types::embeddings::{CreateEmbeddingResponse, Embedding, Embedd
 
 use crate::Sizeable;
 use crate::sizing::{ENTRY_OVERHEAD_BYTES, f32_vectors_heap_size};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum CachedEmbeddingResult {
-    Response(CreateEmbeddingResponse),
-    Vector(Vec<Vec<f32>>),
+    /// Shared so a cache hit is an `Arc` clone rather than a deep copy of the
+    /// `OpenAI` response (large embedding payloads).
+    Response(Arc<CreateEmbeddingResponse>),
+    /// Shared so a cache hit does not deep-clone `Vec<Vec<f32>>` on the get path.
+    Vector(Arc<Vec<Vec<f32>>>),
 }
 
 /// The heap one embedding owns, excluding the struct itself.
@@ -48,7 +52,7 @@ impl Sizeable for CachedEmbeddingResult {
                     + response.data.len() * std::mem::size_of::<Embedding>()
                     + response.data.iter().map(embedding_heap_size).sum::<usize>()
             }
-            CachedEmbeddingResult::Vector(vectors) => f32_vectors_heap_size(vectors),
+            CachedEmbeddingResult::Vector(vectors) => f32_vectors_heap_size(vectors.as_ref()),
         };
 
         std::mem::size_of::<Self>() + payload + ENTRY_OVERHEAD_BYTES
@@ -62,7 +66,7 @@ mod tests {
     use super::*;
 
     fn response(embeddings: Vec<EmbeddingVector>) -> CachedEmbeddingResult {
-        CachedEmbeddingResult::Response(CreateEmbeddingResponse {
+        CachedEmbeddingResult::Response(Arc::new(CreateEmbeddingResponse {
             object: "list".to_string(),
             model: "text-embedding-3-small".to_string(),
             data: embeddings
@@ -78,7 +82,7 @@ mod tests {
                 prompt_tokens: 0,
                 total_tokens: 0,
             },
-        })
+        }))
     }
 
     /// `EmbeddingVector::len()` decodes the whole string to count floats on the
@@ -104,7 +108,8 @@ mod tests {
     /// the vector arm charged every vector the *first* one's length.
     #[test]
     fn a_ragged_vector_batch_is_charged_per_vector() {
-        let ragged = CachedEmbeddingResult::Vector(vec![vec![0.0_f32; 1], vec![0.0_f32; 4_096]]);
+        let ragged =
+            CachedEmbeddingResult::Vector(Arc::new(vec![vec![0.0_f32; 1], vec![0.0_f32; 4_096]]));
 
         assert!(
             ragged.get_memory_size() > 4_096 * std::mem::size_of::<f32>(),
