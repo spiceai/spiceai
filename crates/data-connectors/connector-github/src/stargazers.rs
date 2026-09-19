@@ -32,9 +32,7 @@ pub struct StargazersTableArgs {
 
 impl GraphQLContext for StargazersTableArgs {
     fn query_cost(&self) -> Option<u32> {
-        // stargazers(first: 100) is 1 point
-        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#primary-rate-limit
-        Some(1)
+        Some(crate::rate_limit::graphql_secondary_query_cost())
     }
 }
 
