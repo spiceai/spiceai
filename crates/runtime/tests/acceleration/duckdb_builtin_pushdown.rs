@@ -934,3 +934,208 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
         })
         .await
 }
+
+/// Rows the RE2-versus-`regex` divergences are visible on: an Arabic-Indic
+/// digit (`U+0661`, which the kernel's `\d` matches and RE2's does not), the
+/// Kelvin sign (`U+212A`) and the long s (`U+017F`), which the kernel's `\w`
+/// matches and RE2's does not, and the `U+1C89`/`U+1C8A` case pair, which the
+/// pinned `regex-syntax` folds together and the pinned `DuckDB`'s RE2 does
+/// not.
+fn write_regexp_screen_source(path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::write(
+        path,
+        "id,s\n\
+         1,ab\n\
+         2,xy\u{661}\n\
+         3,\u{212a}\n\
+         4,\u{17f}\n\
+         5,\u{1c89}\n\
+         6,\u{1c8a}\n\
+         7,\n",
+    )?;
+    Ok(())
+}
+
+/// A call's result, or the text of the error it failed with, so a shape both
+/// engines refuse is compared as one answer rather than skipped.
+async fn answer(rt: &Arc<Runtime>, sql: &str) -> Result<String, anyhow::Error> {
+    match run_query(rt, sql).await {
+        Ok(batches) => Ok(to_pretty_display(&batches)?.to_string()),
+        Err(error) => Ok(format!("error: {error}")),
+    }
+}
+
+/// `regexp_like` and `regexp_replace` are pushed down to `DuckDB` only for a
+/// call the two regex engines answer alike, and answer what local evaluation
+/// answers for every other (regression test for #14148).
+///
+/// Each shape below was measured on `trunk` answering *differently* federated
+/// than locally — silently, with no error: `\d` over `xy١` and `\w` over `ſ`
+/// are Unicode-aware in the kernel and ASCII-only in RE2; `[Kk]` is a class
+/// RE2 folds across Unicode once it factors the alternation; `a{01}` is a
+/// repetition to the kernel and literal text to RE2; the `i` flag folds by
+/// each engine's own Unicode tables; and `$2$1` is a capture-group rewrite to
+/// the kernel and plain text to RE2. `a++` is the one that failed loudly, with
+/// `bad repetition operator: ++` from `DuckDB` for a pattern the kernel
+/// diagnoses itself.
+#[tokio::test]
+async fn duckdb_regexp_like_and_replace_stay_local_where_the_engines_disagree()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("regexp_screen.csv");
+            write_regexp_screen_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("duckdb_builtin_pushdown_regexp_screen")
+                .with_dataset(duckdb_accelerated(&from, "accelerated"))
+                .with_dataset(unaccelerated(&from, "local"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            let engine_dependent = [
+                (r"regexp_like(s, '\d')", "a Perl digit class"),
+                (r"regexp_like(s, '\w')", "a Perl word class"),
+                (r"regexp_like(s, '\ba')", "a word boundary"),
+                (
+                    r"regexp_like(s, '[Kk]|a')",
+                    "a case-variant pair in an alternation",
+                ),
+                (
+                    r"regexp_like(s, 'a{01}')",
+                    "a counted bound with a leading zero",
+                ),
+                (
+                    r"regexp_like(s, 'a++')",
+                    "a quantifier applied to a quantifier",
+                ),
+                (
+                    r"regexp_like(s, '(?i)k')",
+                    "an inline case-insensitive flag",
+                ),
+                (
+                    r"regexp_like(s, '\x{1C89}', 'i')",
+                    "a case-insensitive flags argument",
+                ),
+                (
+                    r"regexp_like(s, p_column())",
+                    "a pattern that is not a literal",
+                ),
+                (
+                    r"regexp_replace(s, '\d', 'X')",
+                    "a Perl digit class in a replace",
+                ),
+                (
+                    r"regexp_replace(s, '\w', 'X')",
+                    "a Perl word class in a replace",
+                ),
+                (
+                    r"regexp_replace(s, '\x{1C89}', 'X', 'i')",
+                    "a case-insensitive flags argument in a replace",
+                ),
+                (
+                    r"regexp_replace(s, '(a)(b)', '$2$1')",
+                    "a capture-group rewrite the two engines spell differently",
+                ),
+                (
+                    r"regexp_replace(s, '(a)(b)', '\2\1')",
+                    "the POSIX spelling of that rewrite",
+                ),
+            ];
+            for (call, what) in engine_dependent {
+                // `p_column()` is a stand-in for "not a literal": the fixture has
+                // no pattern column, so use the input column itself.
+                let call = call.replace("p_column()", "s");
+                let sql = format!("SELECT id, {call} AS v FROM {{table}} ORDER BY id");
+                let accelerated = answer(&rt, &sql.replace("{table}", "accelerated")).await?;
+                let local = answer(&rt, &sql.replace("{table}", "local")).await?;
+                assert_eq!(
+                    accelerated, local,
+                    "{what} ({call}) must answer what local evaluation answers on every row"
+                );
+
+                // And it must have stayed local for that to be the reason: an
+                // agreement reached by pushing the call down is the bug.
+                let plan = to_pretty_display(
+                    &run_query(&rt, &format!("EXPLAIN SELECT {call} FROM accelerated")).await?,
+                )?
+                .to_string();
+                let remote_sql = pushed_down_sql(&plan);
+                assert!(
+                    !remote_sql.contains("regexp_matches(")
+                        && !remote_sql.contains("regexp_replace("),
+                    "{what} ({call}) must not reach DuckDB; the SQL sent was:\n{remote_sql}"
+                );
+            }
+
+            // The complement, which is what keeps the assertions above from
+            // being a deny-list of the whole family: a call both engines read
+            // alike still federates and still agrees. An empty-matching
+            // pattern is here deliberately — `regexp_count` refuses one
+            // because the two engines iterate empty matches differently, and
+            // asking *whether* a pattern matches or replacing *a* match does
+            // not.
+            let renderable = [
+                (r"regexp_like(s, 'a')", "regexp_matches("),
+                (r"regexp_like(s, 'a*')", "regexp_matches("),
+                (r"regexp_like(s, '^a+$')", "regexp_matches("),
+                (r"regexp_replace(s, '(a)(b)', 'X')", "regexp_replace("),
+                (r"regexp_replace(s, 'a*', 'X')", "regexp_replace("),
+                (r"regexp_replace(s, 'a', 'X', 'g')", "regexp_replace("),
+            ];
+            for (call, rendered) in renderable {
+                let sql = format!("SELECT id, {call} AS v FROM {{table}} ORDER BY id");
+                let accelerated = answer(&rt, &sql.replace("{table}", "accelerated")).await?;
+                let local = answer(&rt, &sql.replace("{table}", "local")).await?;
+                assert_eq!(
+                    accelerated, local,
+                    "{call} must agree with local evaluation on every row"
+                );
+
+                let plan = to_pretty_display(
+                    &run_query(&rt, &format!("EXPLAIN SELECT {call} FROM accelerated")).await?,
+                )?
+                .to_string();
+                assert!(
+                    pushed_down_sql(&plan).contains(rendered),
+                    "{call} must still be pushed down as DuckDB's {rendered}..); plan was:\n{plan}"
+                );
+            }
+
+            // The values themselves, so the agreements above are not two
+            // engines agreeing on a wrong answer: the kernel's `\d` matches
+            // the Arabic-Indic digit, and its `\w` every row but the NULL one
+            // — the Kelvin sign and the long s included, which RE2's does not
+            // match. A predicate built on the call keeps exactly those rows.
+            assert_batches_eq!(
+                ["+----+", "| id |", "+----+", "| 2  |", "+----+",],
+                &run_query(
+                    &rt,
+                    r"SELECT id FROM accelerated WHERE regexp_like(s, '\d') ORDER BY id"
+                )
+                .await?
+            );
+            assert_batches_eq!(
+                [
+                    "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 3  |", "| 4  |", "| 5  |",
+                    "| 6  |", "+----+",
+                ],
+                &run_query(
+                    &rt,
+                    r"SELECT id FROM accelerated WHERE regexp_like(s, '\w') ORDER BY id"
+                )
+                .await?
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}

@@ -327,9 +327,14 @@ mod tests {
     /// the dialect's regex handler refuses to render the call. Before this
     /// check the refusal surfaced as a planning error for the whole query;
     /// declining to federate leaves the call for `DataFusion` to evaluate.
+    ///
+    /// `i` joined the refused set for #14148: the two engines case-fold by
+    /// their own Unicode tables, so `regexp_like(s, '\x{1C89}', 'i')` over `ᲊ`
+    /// is `true` locally and `false` federated (measured on the bundled
+    /// `DuckDB`). `g` stays, measured to agree row for row.
     #[test]
     fn duckdb_declines_a_regex_flag_duckdb_has_no_equivalent_of() {
-        for flag in ["U", "R", "gU", "iR"] {
+        for flag in ["U", "R", "gU", "iR", "i", "gi", "m", "s"] {
             assert!(
                 !duckdb_can_translate(&call_of(regexp_replace(
                     col("s"),
@@ -345,18 +350,21 @@ mod tests {
             );
         }
 
-        // The flags DuckDB does have keep federating.
-        for flag in ["g", "i", "gi"] {
-            assert!(
-                duckdb_can_translate(&call_of(regexp_replace(
-                    col("s"),
-                    lit("a"),
-                    lit("X"),
-                    Some(lit(flag)),
-                ))),
-                "regexp_replace with flags `{flag}` renders as DuckDB SQL"
-            );
-        }
+        // The one flag both engines were measured to act on alike keeps
+        // federating, and only for the function that takes it.
+        assert!(
+            duckdb_can_translate(&call_of(regexp_replace(
+                col("s"),
+                lit("a"),
+                lit("X"),
+                Some(lit("g")),
+            ))),
+            "regexp_replace with flags `g` renders as DuckDB SQL"
+        );
+        assert!(
+            !duckdb_can_translate(&call_of(regexp_like(col("s"), lit("a"), Some(lit("g"))))),
+            "regexp_like takes no `g`, so the flag has no DuckDB rendering there"
+        );
 
         // No flags argument at all is the common shape and must federate.
         assert!(duckdb_can_translate(&call_of(regexp_replace(
