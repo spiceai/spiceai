@@ -585,6 +585,11 @@ impl RuntimeBuilder {
         };
 
         let caching = Runtime::init_caching(Some(&spicepod_rt.caching));
+        let results_cache_warmup_enabled = spicepod_rt
+            .caching
+            .sql_results
+            .as_ref()
+            .is_some_and(|sql_results| sql_results.enabled && sql_results.warmup.is_enabled());
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
 
         // Resolve CDC tunables once at startup so the per-envelope hot path
@@ -622,6 +627,15 @@ impl RuntimeBuilder {
 
         let http_rate_control_registry = build_http_rate_control_registry(
             spicepod_rt.source_rate_control.as_ref(),
+            spicepod_rt.state.as_ref(),
+            Arc::clone(&secrets),
+            io_runtime.clone(),
+        )
+        .await;
+
+        let results_cache_warmer = crate::datafusion::query::build_results_cache_warmer(
+            results_cache_warmup_enabled,
+            spicepod_rt.state.as_ref(),
             Arc::clone(&secrets),
             io_runtime.clone(),
         )
@@ -643,7 +657,7 @@ impl RuntimeBuilder {
                     .read()
                     .await
                     .as_ref()
-                    .and_then(|app| app.runtime.scheduler.clone())
+                    .and_then(|app| app.runtime.resolved_scheduler())
                 {
                     match crate::cluster::scheduler_registry::build_object_store_internal(
                         Arc::clone(&secrets),
@@ -762,6 +776,8 @@ impl RuntimeBuilder {
         .with_task_history(task_history)
         .with_output_preview(output_preview)
         .with_caching(caching)
+        .with_results_cache_warmup_enabled(results_cache_warmup_enabled)
+        .with_results_cache_warmer(results_cache_warmer)
         .with_metrics(metrics)
         .with_resource_monitor(resource_monitor.clone())
         .with_url_tables(url_tables_enabled)
@@ -921,6 +937,7 @@ impl Default for RuntimeBuilder {
 )]
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
+    _runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
@@ -939,25 +956,18 @@ async fn build_http_rate_control_registry(
 #[cfg(feature = "rate-control")]
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
+    runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
-    let Some((state_location, params, refresh_interval, config_path)) = source_rate_control
-        .and_then(|config| {
-            config.state_location.as_deref().map(|state_location| {
-                (
-                    state_location,
-                    config.params.as_ref(),
-                    config.refresh_interval.as_str(),
-                    "runtime.source_rate_control",
-                )
-            })
-        })
+    let Some((state_location, params, refresh_interval, config_path)) =
+        resolved_rate_control_persist(source_rate_control, runtime_state)
     else {
         return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
     };
 
-    let Some(refresh_interval) = parse_rate_control_refresh_interval(refresh_interval, config_path)
+    let Some(refresh_interval) =
+        parse_rate_control_refresh_interval(&refresh_interval, config_path)
     else {
         return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
     };
@@ -965,8 +975,8 @@ async fn build_http_rate_control_registry(
     match crate::object_store_state::build_object_store(
         secrets,
         io_runtime,
-        state_location,
-        params,
+        &state_location,
+        params.as_ref(),
         "rate-control state",
     )
     .await
@@ -991,6 +1001,45 @@ async fn build_http_rate_control_registry(
             Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default())
         }
     }
+}
+
+#[cfg(feature = "rate-control")]
+fn resolved_rate_control_persist(
+    source_rate_control: Option<&SpicepodSourceRateControl>,
+    runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
+) -> Option<(
+    String,
+    Option<spicepod::param::Params>,
+    String,
+    &'static str,
+)> {
+    if let Some(config) = source_rate_control {
+        if let Some(location) = config.state_location.clone() {
+            return Some((
+                location,
+                config.params.clone(),
+                config.refresh_interval.clone(),
+                "runtime.source_rate_control",
+            ));
+        }
+        if let Some(state) = runtime_state {
+            return Some((
+                state.location.clone(),
+                config.params.clone().or_else(|| state.params.clone()),
+                config.refresh_interval.clone(),
+                "runtime.state",
+            ));
+        }
+        return None;
+    }
+    runtime_state.map(|state| {
+        (
+            state.location.clone(),
+            state.params.clone(),
+            spicepod::component::runtime::default_rate_control_refresh_interval(),
+            "runtime.state",
+        )
+    })
 }
 
 #[cfg(feature = "rate-control")]

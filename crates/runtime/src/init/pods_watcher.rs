@@ -69,6 +69,7 @@ fn start_time_only_changes(
         query,
         cpu,
         metrics,
+        state,
         scheduler,
         source_rate_control,
         drasi,
@@ -144,6 +145,7 @@ fn start_time_only_changes(
             !same_start_time_config(cpu.as_ref(), current.cpu.as_ref()),
         ),
         ("runtime.metrics", Process, *metrics != current.metrics),
+        ("runtime.state", Process, *state != current.state),
         (
             "runtime.scheduler",
             Process,

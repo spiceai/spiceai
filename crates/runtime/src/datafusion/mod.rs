@@ -877,6 +877,10 @@ pub struct DataFusion {
     /// default catalog, keyed by dataset name (see [`DatasetPlacement`]).
     dataset_placements: dashmap::DashMap<String, Arc<dyn DatasetPlacement>>,
     caching: Arc<Caching>,
+    /// First 10 distinct SQL results-cache plan shapes, replayed after the
+    /// first full/append refresh until the cache is full. No-op unless
+    /// `runtime.caching.sql_results.warmup` is `on_first_refresh`.
+    pub(crate) results_cache_warmer: query::ResultsCacheWarmer,
     /// Per-dataset locks that keep writes from overlapping a schema evolution's provider
     /// swap. Writes take the lock shared, evolution takes it exclusively. Without this, a
     /// write can complete through the provider being replaced, and its rows are then
@@ -1030,6 +1034,15 @@ impl DataFusion {
     #[must_use]
     pub fn caching(&self) -> Arc<Caching> {
         Arc::clone(&self.caching)
+    }
+
+    pub(crate) async fn accelerated_table_names(&self) -> Vec<TableReference> {
+        self.accelerated_tables
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect()
     }
 
     #[must_use]

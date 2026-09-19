@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::datafusion::{DataFusion, query::QueryMethod};
 
-use super::{Query, ResultsCacheMode, tracker::QueryTracker};
+use super::{Query, QueryRuntimeBinding, ResultsCacheMode, tracker::QueryTracker};
 
 /// A random (version 4) query id drawn from the thread-local generator.
 ///
@@ -51,6 +51,8 @@ pub struct QueryBuilder {
     cancellation_token: Option<CancellationToken>,
     read_only: bool,
     results_cache_mode: ResultsCacheMode,
+    runtime_binding: QueryRuntimeBinding,
+    emit_tracker: bool,
 }
 
 impl QueryBuilder {
@@ -64,6 +66,8 @@ impl QueryBuilder {
             cancellation_token: None,
             read_only: false,
             results_cache_mode: ResultsCacheMode::default(),
+            runtime_binding: QueryRuntimeBinding::QueryRuntime,
+            emit_tracker: true,
         }
     }
 
@@ -82,6 +86,8 @@ impl QueryBuilder {
             cancellation_token: None,
             read_only: false,
             results_cache_mode: ResultsCacheMode::default(),
+            runtime_binding: QueryRuntimeBinding::QueryRuntime,
+            emit_tracker: true,
         }
     }
 
@@ -103,6 +109,8 @@ impl QueryBuilder {
             read_only: false,
             cancellation_token: None,
             results_cache_mode: ResultsCacheMode::default(),
+            runtime_binding: QueryRuntimeBinding::QueryRuntime,
+            emit_tracker: true,
         }
     }
 
@@ -162,11 +170,24 @@ impl QueryBuilder {
         self
     }
 
+    /// Run this query on the current Tokio runtime without taking a query
+    /// admission permit or emitting query metrics / task-history rows.
+    ///
+    /// Used by SQL results-cache warming so replay stays on the refresh
+    /// runtime and cannot stall user queries.
+    #[must_use]
+    pub(crate) fn for_results_cache_warming(mut self) -> Self {
+        self.runtime_binding = QueryRuntimeBinding::CurrentRuntimeUngated;
+        self.emit_tracker = false;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> Query {
-        // The tracker is the only emitter of the query metrics, so it is always
-        // built — `runtime.task_history.enabled` only controls what it reports.
-        let tracker = Some(QueryTracker {
+        // The tracker is the only emitter of the query metrics. Background
+        // cache warming skips it so replay does not inflate query_count.
+        // `runtime.task_history.enabled` only controls what a built tracker reports.
+        let tracker = self.emit_tracker.then(|| QueryTracker {
             task_history_enabled: self.df.task_history_enabled,
             captured_output_enabled: self.df.task_history_captured_output,
             schema: None,
@@ -205,6 +226,7 @@ impl QueryBuilder {
             cancellation_token: self.cancellation_token,
             read_only: self.read_only,
             results_cache_mode: self.results_cache_mode,
+            runtime_binding: self.runtime_binding,
         }
     }
 }

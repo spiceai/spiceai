@@ -752,6 +752,11 @@ impl Refresher {
         self.initial_load_completed.load(Ordering::Relaxed)
     }
 
+    #[must_use]
+    pub async fn refresh_mode(&self) -> RefreshMode {
+        self.refresh.read().await.mode
+    }
+
     pub fn with_resource_monitor(
         &mut self,
         monitor: runtime_resources::ResourceMonitor,

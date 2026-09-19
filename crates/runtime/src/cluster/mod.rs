@@ -1136,7 +1136,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         return Ok(None);
     };
 
-    if let Some(config) = app.runtime.scheduler.clone() {
+    if let Some(config) = app.runtime.resolved_scheduler() {
         if rt.partition_store().is_some() {
             // Validate all accelerated datasets/views have partition keys
             // for distributed partition assignment.
@@ -2154,7 +2154,7 @@ async fn create_scheduler_server(
         tokio::pin!(shutdown);
         loop {
             if let Some(app) = rt.read_app().await {
-                break app.runtime.scheduler.clone();
+                break app.runtime.resolved_scheduler();
             }
             if last_warn.elapsed() >= std::time::Duration::from_secs(30) {
                 tracing::warn!(
