@@ -948,14 +948,19 @@ pub async fn s3_changes_stream(
     // names an object or a prefix, and the two are the same string in S3.
     if let Some(key) = key_from_may_name(dataset) {
         match connector.get_object_store(dataset) {
-            Ok(store) => {
-                if store.head(&ObjectPath::from(key.as_str())).await.is_ok() {
+            Ok(store) => match store.head(&ObjectPath::from(key.as_str())).await {
+                // Only NotFound proves the path can be treated as a prefix.
+                // Auth / timeout / transient HEAD failures must not become
+                // "object absent" — that path marks an empty accelerator ready.
+                Ok(_) => {
                     return Some(error_stream(Error::FromNamesAnObject {
                         dataset_name: dataset.name.to_string(),
                         from: dataset.from.clone(),
                     }));
                 }
-            }
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Some(error_stream(error)),
+            },
             Err(error) => return Some(error_stream(error)),
         }
     }
@@ -2232,6 +2237,57 @@ mod tests {
     /// Only the object store can tell the two apart, so the refusal needs the
     /// key this returns.
     #[test]
+    /// Only [`object_store::Error::NotFound`] may be treated as "this `from` is a
+    /// prefix". Every other HEAD failure must propagate, or an empty accelerator
+    /// can be marked ready after an auth/timeout/transient miss.
+    fn head_result_means_from_names_an_object(
+        result: Result<object_store::ObjectMeta, object_store::Error>,
+    ) -> Result<bool, object_store::Error> {
+        match result {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[test]
+    fn only_not_found_head_allows_a_prefix_from() {
+        let meta = object_store::ObjectMeta {
+            location: ObjectPath::from("events/part.parquet"),
+            last_modified: chrono::Utc::now(),
+            size: 1,
+            e_tag: None,
+            version: None,
+        };
+        assert!(
+            head_result_means_from_names_an_object(Ok(meta)).expect("Ok is an object"),
+            "a successful HEAD means `from` names an object"
+        );
+        assert!(
+            !head_result_means_from_names_an_object(Err(object_store::Error::NotFound {
+                path: "events/part.parquet".into(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "missing",
+                )),
+            }))
+            .expect("NotFound is a prefix"),
+            "NotFound alone may continue as a prefix"
+        );
+        let err = head_result_means_from_names_an_object(Err(object_store::Error::Generic {
+            store: "S3",
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request timed out",
+            )),
+        }))
+        .expect_err("timeout must not look like a prefix");
+        assert!(
+            matches!(err, object_store::Error::Generic { .. }),
+            "non-NotFound HEAD errors must propagate, got {err:?}"
+        );
+    }
+
     fn a_from_without_a_trailing_slash_may_name_an_object() {
         let object = DatasetSpec::new("s3://my-bucket/events/part-00000.parquet", "events".into());
         assert_eq!(

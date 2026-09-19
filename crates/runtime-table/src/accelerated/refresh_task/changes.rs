@@ -2238,6 +2238,19 @@ impl RefreshTask {
                 .await;
         }
 
+        // The rebuild overwrite has already succeeded. Finalize its committer
+        // now, independently of later CDC groups: if a later group fails to
+        // coalesce/write, `apply_coalesced_run` drops those committers unacked,
+        // and an `AppliedKeysCommitter::drop` would otherwise release keys whose
+        // rows are already present — making the next backfill append them again.
+        if !rebuild_committers.is_empty()
+            && !self
+                .run_finalize_side_effects(context, rebuild_committers, false)
+                .await
+        {
+            return false;
+        }
+
         // Mixed-schema runs (mid-stream schema evolution): `concat_change_batches`
         // requires equal schemas. When the dataset's policy allows evolution,
         // split the run into contiguous same-schema groups applied in order —
@@ -2246,14 +2259,7 @@ impl RefreshTask {
         // today's error/skip behavior verbatim.
         let split_on_schema_change = cdc_schema_evolution_for(context.dataset_name)
             .is_some_and(|evolution| !matches!(evolution.policy, OnSchemaChange::Block));
-        let mut groups = group_run_by_schema(batches, committers, split_on_schema_change);
-        if !rebuild_committers.is_empty()
-            && let Some((_, group_committers)) = groups.first_mut()
-        {
-            let mut combined = rebuild_committers;
-            combined.append(group_committers);
-            *group_committers = combined;
-        }
+        let groups = group_run_by_schema(batches, committers, split_on_schema_change);
         let last_group = groups.len().saturating_sub(1);
         for (group_idx, (group_batches, group_committers)) in groups.into_iter().enumerate() {
             // Exact applied-row count for this group, summed from the just-built
@@ -6978,6 +6984,52 @@ mod tests {
         );
     }
 
+
+    /// Succeeds for the first `allow` writes, then fails. Used to let a listing
+    /// rebuild overwrite land and then fail a later CDC upsert in the same run.
+    #[derive(Debug)]
+    struct FailAfterNWrites {
+        inner: Arc<dyn TableProvider>,
+        writes_seen: Arc<AtomicUsize>,
+        allow: usize,
+    }
+
+    #[async_trait]
+    impl TableProvider for FailAfterNWrites {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+
+        async fn insert_into(
+            &self,
+            state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            insert_op: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let seen = self.writes_seen.fetch_add(1, AtomicOrdering::SeqCst);
+            if seen >= self.allow {
+                return Err(datafusion::error::DataFusionError::Execution(
+                    "synthetic write failure after allowed writes".to_string(),
+                ));
+            }
+            self.inner.insert_into(state, input, insert_op).await
+        }
+    }
+
     #[tokio::test]
     async fn test_apply_envelope_run_skips_commits_after_coalesced_write_failure() {
         let failures_remaining = Arc::new(AtomicUsize::new(1));
@@ -8194,6 +8246,109 @@ mod tests {
             refresh_duration_samples(&registry, dataset, "full"),
             1,
             "a listing-driven replace is still one full refresh of '{dataset}'"
+        );
+    }
+
+    /// Copilot: after a listing rebuild overwrite succeeds, its committer must
+    /// finalize independently of later envelopes. Otherwise a later write failure
+    /// drops the rebuild committer unacked and `AppliedKeysCommitter::drop`
+    /// releases keys whose rows are already present.
+    #[tokio::test]
+    async fn listing_rebuild_commits_before_a_later_write_failure() {
+        let dataset = "listing_rebuild_commits_before_later_fail";
+        let schema = Arc::new(create_test_data_schema());
+        let federated = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(&[99], &["stale-federated"])]],
+            )
+            .expect("federated mem table"),
+        );
+        let accelerator = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(&[0], &["old"])]],
+            )
+            .expect("accelerator mem table"),
+        );
+        let writes_seen = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(FailAfterNWrites {
+            inner: Arc::clone(&accelerator) as Arc<dyn TableProvider>,
+            writes_seen: Arc::clone(&writes_seen),
+            allow: 1, // rebuild overwrite lands; the later upsert fails
+        });
+        let task = make_refresh_task_with_source(
+            dataset,
+            Arc::clone(&federated) as Arc<dyn TableProvider>,
+            provider as Arc<dyn TableProvider>,
+        );
+
+        let dataset_name = TableReference::bare(dataset);
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
+        let initial_load_completed = Arc::new(AtomicBool::new(true));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            ..Refresh::default()
+        }));
+        let mut context = ApplyContext {
+            refresh_sql: None,
+            refresh: &refresh,
+            dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
+            caching: None,
+            refresh_completion: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+
+        let log = CommitLog::new();
+        let listing = id_name_batch(&[1], &["existing"]);
+        let rebuild = cdc::ChangeEnvelope::from_parts(
+            Box::new(TrackingCommitter {
+                id: 1,
+                log: Arc::clone(&log),
+                outcome: Ok(()),
+            }),
+            cdc::wrap_data_as_change_batch(&schema, &listing)
+                .expect("listing snapshot wraps")
+                .with_rebuild_from_this_batch(true),
+            false,
+            true,
+        );
+        let later = make_tracked_envelope(2, Arc::clone(&log), false);
+
+        assert!(
+            !task
+                .apply_envelope_run(&mut context, vec![rebuild, later])
+                .await,
+            "the later upsert must fail the run after the rebuild overwrite"
+        );
+
+        // Drain the rebuild's deferred commit (spawned before the later failure).
+        if let Some(handle) = context.pending_commit.take() {
+            handle
+                .await
+                .expect("rebuild commit task join")
+                .expect("rebuild commit must succeed");
+        }
+        assert_eq!(
+            log.ids().await,
+            vec![1],
+            "rebuild committer must finalize after overwrite even when a later write fails"
+        );
+        assert_eq!(
+            writes_seen.load(AtomicOrdering::SeqCst),
+            2,
+            "rebuild overwrite + failed later upsert = two insert_into attempts"
         );
     }
 
