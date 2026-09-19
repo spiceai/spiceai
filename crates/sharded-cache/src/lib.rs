@@ -119,6 +119,13 @@ impl EvictionListener for NoopListener {
 /// (Moka-like): eviction heuristics tolerate lost promotions under overload.
 const TOUCH_DRAIN_THRESHOLD: usize = 64;
 const TOUCH_BUFFER_CAP: usize = 1024;
+/// Region order the guaranteed-progress fallback reclaims from: coldest main
+/// space first, then new admissions, and only then the protected segment.
+const FALLBACK_EVICT_ORDER: [shard::Region; 3] = [
+    shard::Region::Probation,
+    shard::Region::Window,
+    shard::Region::Protected,
+];
 
 #[repr(align(64))]
 struct TouchBuffer {
@@ -307,6 +314,12 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
     ///
     /// When `keep_ttl` is true the existing insertion timestamp is preserved so
     /// the entry's remaining lifetime does not restart.
+    ///
+    /// A replacement heavier than `max_weight` is refused before the shard is
+    /// locked, for the reason [`Self::insert`] rejects one: admitting it would
+    /// trim unrelated residents on the way to self-evicting. Unlike `insert`,
+    /// the resident already under `key` is left in place — a replacement that
+    /// cannot be held is not a reason to drop the copy that can be.
     pub fn replace_if<F>(
         &self,
         key: u64,
@@ -319,6 +332,9 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
         F: FnOnce(&V) -> bool,
     {
         let weight = u64::try_from(weight).unwrap_or(u64::MAX);
+        if weight > self.max_weight {
+            return false;
+        }
         let shard_idx = shard_index(key);
         self.drain_touches_blocking(shard_idx);
         let mut shard = self.shards[shard_idx].0.lock();
@@ -1227,13 +1243,20 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
         }
         let before_window = shard.window_weight();
         let before_protected = shard.protected_weight();
-        let Some((_, weight)) = shard.peek_tail() else {
+        // This is the guaranteed-progress fallback, so it must be able to
+        // reclaim from whichever region still holds residents. `peek_tail`
+        // alone is the probation list, which under W-`TinyLFU` can be empty
+        // while the window or protected segments are not.
+        let Some((region, weight)) = FALLBACK_EVICT_ORDER
+            .into_iter()
+            .find_map(|region| shard.peek_region_tail(region).map(|(_, w)| (region, w)))
+        else {
             return false;
         };
         if !self.claim_size_eviction(weight) {
             return false;
         }
-        let Some((_, value, _)) = shard.evict_lru() else {
+        let Some((_, value, _)) = shard.evict_region_lru(region) else {
             self.weight.fetch_add(weight, Ordering::Relaxed);
             return false;
         };
@@ -2002,6 +2025,33 @@ mod tests {
         assert!(cache.get(&0).is_none(), "LFU must evict the colder key");
         assert!(cache.get(&1).is_some(), "hot key must survive LFU eviction");
         assert!(cache.get(&2).is_some());
+    }
+
+    #[test]
+    fn replace_if_refuses_a_value_heavier_than_the_budget() {
+        // Admitting an oversized replacement makes the cache over-budget, and
+        // overflow trim walks other shards first — so one uncacheable value
+        // flushes unrelated residents on its way to self-evicting.
+        let cache = cache(100, Duration::from_mins(1));
+        cache.insert(0, TestValue::with_size("unrelated", 60), 60);
+        cache.insert(1, TestValue::with_size("target", 20), 20);
+
+        let replaced = cache.replace_if(1, TestValue::with_size("huge", 500), 500, false, |_| true);
+
+        assert!(
+            !replaced,
+            "a replacement heavier than max_weight must be refused"
+        );
+        assert!(
+            cache.get(&0).is_some(),
+            "an unrelated resident must not be flushed by a refused replacement"
+        );
+        assert_eq!(
+            cache.get(&1).map(|v| v.data.clone()),
+            Some("target".to_string()),
+            "the resident already under the key must survive a refused replacement"
+        );
+        assert_eq!(cache.weighted_size(), 80);
     }
 
     #[test]
