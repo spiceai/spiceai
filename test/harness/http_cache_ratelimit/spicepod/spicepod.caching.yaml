@@ -1,0 +1,61 @@
+version: v1
+kind: Spicepod
+name: http-cache-ratelimit-phase0
+
+# Phase 0: one origin, one caching dataset. Rate control OFF and the SQL
+# results cache OFF, so the acceleration cache is the only cache in front
+# of the origin and the two caches cannot mask each other.
+
+runtime:
+  telemetry:
+    enabled: true
+  caching:
+    # Keep the SQL results cache OFF so the acceleration (refresh_mode:
+    # caching) cache is the only cache in front of the origin.
+    sql_results:
+      enabled: false
+
+datasets:
+  - from: http://127.0.0.1:9001/data
+    name: d1
+    params:
+      file_format: json
+      client_timeout: "2s"
+      connect_timeout: "1s"
+      # `allowed_request_paths` selects the dynamic JSON API provider
+      # (a plain GET on the base URL) instead of the object-store listing
+      # connector (which speaks PROPFIND/Range and cannot talk to a
+      # dynamic endpoint).
+      allowed_request_paths: "/data"
+    # Declaring `columns:` with one catch-all `json_object: "*"` column
+    # decomposes each JSON row into typed top-level columns, so `version`
+    # round-trips as an integer rather than a raw JSON string.
+    columns:
+      - name: id
+        type: bigint
+      - name: version
+        type: bigint
+      - name: served_at_ms
+        type: bigint
+      - name: origin
+        type: text
+      - name: payload
+        type: text
+      - name: extra
+        type: text
+        metadata:
+          json_object: "*"
+    acceleration:
+      enabled: true
+      engine: duckdb
+      refresh_mode: caching
+      params:
+        # max-age: within this age the cached row is served with no fetch.
+        caching_ttl: "3s"
+        # stale-while-revalidate: extra window past max-age during which the
+        # cached (stale) row is served immediately and a background refresh
+        # is triggered.
+        caching_stale_while_revalidate_ttl: "6s"
+      # A retention policy keeps cached entries around long enough for the
+      # SWR window to use them.
+      retention_period: "10m"
