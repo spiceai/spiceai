@@ -2124,53 +2124,55 @@ impl CacheRefreshHelper {
                     );
                 }
                 CacheFreshness::Stale => {
-                    // One revalidation per key: the claim is held for the
-                    // whole refresh and released by the write that lands it.
-                    let claim = CacheKeyClaim::acquire(
-                        in_flight_revalidations,
-                        compute_cache_key_from_filters_and_namespace(
-                            filters,
-                            namespace.storage_id(),
-                        ),
-                    );
-
-                    if let Some(claim) = claim {
-                        tracing::debug!(
-                            "Data is stale for dataset={dataset_name}, triggering background refresh"
-                        );
-
-                        // Log current fetched_at for debugging
-                        if let Some(timestamp) = get_first_fetched_at_timestamp(&cached_batches[0])
-                        {
+                    // Reserve a refresh permit before claiming the key. The
+                    // permit gate is non-blocking: a hit that finds every
+                    // permit taken serves the cached entry and never claims the
+                    // key. Claiming first and dropping the claim on a full
+                    // semaphore would briefly mark the key in-flight, and a
+                    // concurrent cache miss on that key (which fetches from the
+                    // origin but writes only under its own claim) would see the
+                    // claim and skip its write, leaving the fetched response
+                    // uncached.
+                    //
+                    // Queuing instead of dropping would bound only the origin
+                    // scans, not the tasks (one waiter per distinct stale key),
+                    // and each waiter would keep its key claimed for as long as
+                    // the queue took to drain, suppressing the miss-path write
+                    // for that whole time. Dropping keeps revalidation
+                    // demand-driven: the next stale hit on this key retries, and
+                    // a key nobody hits again expires into an ordinary miss
+                    // (spiceai/spiceai#14102).
+                    match Arc::clone(swr_refresh_semaphore).try_acquire_owned() {
+                        Err(_) => {
                             tracing::debug!(
-                                "Current stale data has {CACHE_REFRESHED_AT_COLUMN} timestamp={timestamp}"
+                                "Skipping background refresh for dataset={dataset_name}: {MAX_CONCURRENT_SWR_REFRESHES} refreshes are already in flight, so the cached entry is served stale until its next stale hit retries"
                             );
                         }
+                        Ok(permit) => {
+                            // One revalidation per key: the claim is held for the
+                            // whole refresh and released by the write that lands it.
+                            let claim = CacheKeyClaim::acquire(
+                                in_flight_revalidations,
+                                compute_cache_key_from_filters_and_namespace(
+                                    filters,
+                                    namespace.storage_id(),
+                                ),
+                            );
 
-                        // Non-blocking: a hit that finds every permit taken
-                        // serves the cached entry and drops its claim rather
-                        // than queuing a refresh task behind the permit.
-                        // Queuing would bound only the origin scans, not the
-                        // tasks (one waiter per distinct stale key), and each
-                        // waiter would keep its key claimed for as long as the
-                        // queue took to drain, during which a cache miss on
-                        // that key fetches from the origin but cannot write
-                        // what it fetched (`handle_cache_miss` writes only
-                        // under its own claim), so under sustained load the
-                        // queued keys would stop being cached at all.
-                        // Dropping keeps revalidation demand-driven: the next
-                        // stale hit on this key retries, and a key nobody hits
-                        // again expires into an ordinary miss
-                        // (spiceai/spiceai#14102).
-                        match Arc::clone(swr_refresh_semaphore).try_acquire_owned() {
-                            Err(_) => {
+                            if let Some(claim) = claim {
                                 tracing::debug!(
-                                    "Skipping background refresh for dataset={dataset_name}: {MAX_CONCURRENT_SWR_REFRESHES} refreshes are already in flight, so the cached entry is served stale until its next stale hit retries"
+                                    "Data is stale for dataset={dataset_name}, triggering background refresh"
                                 );
-                                // Releases the key so a miss on it can still write.
-                                drop(claim);
-                            }
-                            Ok(permit) => {
+
+                                // Log current fetched_at for debugging
+                                if let Some(timestamp) =
+                                    get_first_fetched_at_timestamp(&cached_batches[0])
+                                {
+                                    tracing::debug!(
+                                        "Current stale data has {CACHE_REFRESHED_AT_COLUMN} timestamp={timestamp}"
+                                    );
+                                }
+
                                 let federated_clone = Arc::clone(federated);
                                 let dataset_name_clone = dataset_name.to_string();
                                 let filters_for_refresh: Vec<Expr> = filters.to_vec();
@@ -2217,12 +2219,14 @@ impl CacheRefreshHelper {
                                         }
                                     }
                                 });
+                            } else {
+                                tracing::debug!(
+                                    "Skipping background refresh for dataset={dataset_name} because should_revalidate=false (revalidation already in progress for this cache key)"
+                                );
+                                // The permit drops here, freeing the slot for a
+                                // stale hit on another key.
                             }
                         }
-                    } else {
-                        tracing::debug!(
-                            "Skipping background refresh for dataset={dataset_name} because should_revalidate=false (revalidation already in progress for this cache key)"
-                        );
                     }
                 }
                 CacheFreshness::Expired => {
