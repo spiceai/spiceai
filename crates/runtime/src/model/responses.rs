@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -43,7 +43,13 @@ pub type LLMResponsesModelStore = HashMap<String, Arc<dyn Responses>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponsesApiSupport {
     Supported,
-    UnsupportedProvider { provider: String },
+    UnsupportedProvider {
+        provider: String,
+    },
+    /// Provider is evaluate-only (`POST /v1/evaluate`); chat and Responses are unsupported.
+    EvaluateOnly {
+        provider: String,
+    },
     Unavailable,
 }
 

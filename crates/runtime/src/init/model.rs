@@ -130,7 +130,7 @@ impl Runtime {
                         let mut responses_support_map = responses_api_support_store.write().await;
                         responses_support_map.insert(
                             m.name.clone(),
-                            crate::model::ResponsesApiSupport::UnsupportedProvider {
+                            crate::model::ResponsesApiSupport::EvaluateOnly {
                                 provider: "typesafe".to_string(),
                             },
                         );

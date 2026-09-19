@@ -23,7 +23,7 @@ use secrecy::SecretString;
 #[derive(TypedParams)]
 #[params(
     prefix = "typesafe",
-    passthrough = crate::model::params::common::PREFIXED_COMMON,
+    passthrough = crate::model::params::common::EVALUATE_RATE_CONTROLS,
     emit_specs
 )]
 pub struct TypeSafeModelParams {

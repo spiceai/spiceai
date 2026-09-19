@@ -2570,6 +2570,9 @@
           "401": {
             "description": "Upstream authentication failed"
           },
+          "403": {
+            "description": "Upstream permission denied"
+          },
           "404": {
             "description": "Model not found"
           },

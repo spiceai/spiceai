@@ -395,7 +395,7 @@ mod tests {
 
     use crate::{
         http::v1::chat::{SPICE_COMPLETION_PROGRESS_HEADER, post},
-        model::LLMChatCompletionsModelStore,
+        model::{EvaluateModelStore, LLMChatCompletionsModelStore},
     };
     use async_openai::{
         error::OpenAIError,

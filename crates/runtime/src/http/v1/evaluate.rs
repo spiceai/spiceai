@@ -50,6 +50,7 @@ use crate::model::EvaluateModelStore;
         (status = 404, description = "Model not found"),
         (status = 400, description = "Invalid request"),
         (status = 401, description = "Upstream authentication failed"),
+        (status = 403, description = "Upstream permission denied"),
         (status = 429, description = "Rate limited"),
         (status = 500, description = "Evaluation failed")
     )
@@ -106,7 +107,6 @@ mod tests {
         Usage,
     };
     use http_body_util::BodyExt;
-    use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::Arc;
 

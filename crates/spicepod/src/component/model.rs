@@ -231,6 +231,7 @@ impl TryFrom<&str> for ModelSource {
             || value.starts_with("typesafe:")
             || value.starts_with("typesafe/")
         {
+            // Bare / colon / slash forms; schema pattern `^typesafe($|:|/)` matches these.
             Ok(ModelSource::TypeSafe)
         } else {
             Err("Unknown prefix")
@@ -504,20 +505,40 @@ mod tests {
     #[test]
     fn typesafe_from_parses_jev_aliases() {
         for from in [
+            "typesafe",
+            "typesafe:",
+            "typesafe/",
             "typesafe:jev",
+            "typesafe/jev",
             "typesafe:jev-latest",
             "typesafe:jev-preview",
             "typesafe:jev-1.13.0",
         ] {
             let model = Model::new(from, "jev");
-            assert_eq!(model.get_source(), Some(ModelSource::TypeSafe));
-            assert!(
-                model.get_model_id().is_some(),
-                "expected model id for {from}"
+            assert_eq!(
+                model.get_source(),
+                Some(ModelSource::TypeSafe),
+                "expected TypeSafe for {from}"
             );
         }
-        let bare = Model::new("typesafe:jev", "jev");
-        assert_eq!(bare.get_model_id().as_deref(), Some("jev"));
+        assert_eq!(
+            Model::new("typesafe:jev", "jev").get_model_id().as_deref(),
+            Some("jev")
+        );
+        assert_eq!(
+            Model::new("typesafe/jev", "jev").get_model_id().as_deref(),
+            Some("jev")
+        );
+        assert_eq!(Model::new("typesafe", "jev").get_model_id(), None);
+        // Bare separator forms yield an empty id today (caller normalizes to jev-latest).
+        assert_eq!(
+            Model::new("typesafe:", "jev").get_model_id().as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            Model::new("typesafe/", "jev").get_model_id().as_deref(),
+            Some("")
+        );
 
         // Require a complete `typesafe` / `typesafe:` / `typesafe/` prefix — do not
         // accept lookalikes such as `typesafely:…`.
