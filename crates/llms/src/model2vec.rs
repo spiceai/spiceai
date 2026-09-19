@@ -236,10 +236,10 @@ impl Embed for Model2Vec {
             None
         };
 
-        if let Some(cached) = cached_response {
-            if let CachedEmbeddingResult::Vector(vectors) = cached.as_ref() {
-                return Ok(std::sync::Arc::clone(vectors));
-            }
+        if let Some(cached) = cached_response
+            && let CachedEmbeddingResult::Vector(vectors) = cached.as_ref()
+        {
+            return Ok(std::sync::Arc::clone(vectors));
         }
 
         // The forward pass is CPU-bound and synchronous; run it on the blocking
@@ -414,7 +414,7 @@ mod tests {
 
         let embed_sentences = embed_sentences.expect("Must embed sentences");
         assert_eq!(embed_sentences.len(), 2);
-        for embedded_sentence in &embed_sentences {
+        for embedded_sentence in embed_sentences.iter() {
             assert_eq!(embedded_sentence.len(), 256);
         }
 

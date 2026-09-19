@@ -273,10 +273,10 @@ impl Embed for TeiEmbed {
             None
         };
 
-        if let Some(cached) = cached_response {
-            if let CachedEmbeddingResult::Vector(vectors) = cached.as_ref() {
-                return Ok(std::sync::Arc::clone(vectors));
-            }
+        if let Some(cached) = cached_response
+            && let CachedEmbeddingResult::Vector(vectors) = cached.as_ref()
+        {
+            return Ok(std::sync::Arc::clone(vectors));
         }
 
         let inputs = inputs_from_openai(&input);
@@ -306,10 +306,10 @@ impl Embed for TeiEmbed {
         &self,
         req: CreateEmbeddingRequest,
     ) -> Result<Arc<CreateEmbeddingResponse>> {
-        if let Some(cached) = self.get_cached_embed((&req).into()).await {
-            if let CachedEmbeddingResult::Response(response) = cached.as_ref() {
-                return Ok(std::sync::Arc::clone(response));
-            }
+        if let Some(cached) = self.get_cached_embed((&req).into()).await
+            && let CachedEmbeddingResult::Response(response) = cached.as_ref()
+        {
+            return Ok(std::sync::Arc::clone(response));
         }
 
         let model_name = req.model.clone();
