@@ -92,3 +92,113 @@ fn evaluate_error_response(err: EvaluateError) -> Response {
     };
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use evaluate_api::{
+        Answer, EntryType, Evaluate, EvaluateRequest, EvaluateResponse, Question, Usage,
+    };
+    use http_body_util::BodyExt;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct DummyEvaluate {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Evaluate for DummyEvaluate {
+        async fn evaluate(
+            &self,
+            request: EvaluateRequest,
+        ) -> evaluate_api::Result<EvaluateResponse> {
+            if request.questions.is_empty() {
+                return evaluate_api::InvalidRequestSnafu {
+                    model: self.name.clone(),
+                    message: "empty questions",
+                }
+                .fail();
+            }
+            let mut answers = BTreeMap::new();
+            answers.insert("is_urgent".to_string(), Answer::Noul { noul: 0.91 });
+            Ok(EvaluateResponse {
+                model: "jev-test".into(),
+                answers,
+                usage: Some(Usage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                }),
+            })
+        }
+
+        fn model_name(&self) -> &str {
+            &self.name
+        }
+
+        fn provider_model_id(&self) -> &str {
+            "jev-latest"
+        }
+    }
+
+    fn request_with_question(model: &str) -> EvaluateRequest {
+        let mut questions = BTreeMap::new();
+        questions.insert(
+            "is_urgent".into(),
+            Question::Noul {
+                instructions: EntryType::from("urgent?"),
+                criteria: None,
+            },
+        );
+        EvaluateRequest {
+            model: model.into(),
+            state: json!("hello"),
+            questions,
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluate_returns_404_for_unknown_model() {
+        let models = Arc::new(RwLock::new(EvaluateModelStore::new()));
+        let response = post(Extension(models), Json(request_with_question("missing"))).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn evaluate_returns_200_for_registered_model() {
+        let mut store = EvaluateModelStore::new();
+        store.insert("jev".into(), Arc::new(DummyEvaluate { name: "jev".into() }));
+        let models = Arc::new(RwLock::new(store));
+        let response = post(Extension(models), Json(request_with_question("jev"))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["model"], "jev-test");
+        assert_eq!(body["answers"]["is_urgent"]["noul"], 0.91);
+    }
+
+    #[tokio::test]
+    async fn evaluate_maps_invalid_request_to_400() {
+        let mut store = EvaluateModelStore::new();
+        store.insert("jev".into(), Arc::new(DummyEvaluate { name: "jev".into() }));
+        let models = Arc::new(RwLock::new(store));
+        let response = post(
+            Extension(models),
+            Json(EvaluateRequest {
+                model: "jev".into(),
+                state: json!("x"),
+                questions: BTreeMap::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}

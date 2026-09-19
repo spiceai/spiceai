@@ -227,7 +227,10 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::Databricks)
         } else if value.starts_with("bedrock") {
             Ok(ModelSource::Bedrock)
-        } else if value.starts_with("typesafe") {
+        } else if value == "typesafe"
+            || value.starts_with("typesafe:")
+            || value.starts_with("typesafe/")
+        {
             Ok(ModelSource::TypeSafe)
         } else {
             Err("Unknown prefix")
@@ -515,6 +518,12 @@ mod tests {
         }
         let bare = Model::new("typesafe:jev", "jev");
         assert_eq!(bare.get_model_id().as_deref(), Some("jev"));
+
+        // Require a complete `typesafe` / `typesafe:` / `typesafe/` prefix — do not
+        // accept lookalikes such as `typesafely:…`.
+        let lookalike = Model::new("typesafely:jev", "jev");
+        assert_eq!(lookalike.get_source(), None);
+        assert_eq!(lookalike.get_model_id(), None);
     }
 
     use super::*;
