@@ -54963,7 +54963,7 @@ mod tests {
     async fn cdc_apply(provider: &CayenneTableProvider, batch: RecordBatch) {
         let batch_schema = batch.schema();
         let ctx = SessionContext::new();
-        provider
+        let _cdc_write = provider
             .write_cdc_append_stream(
                 Box::pin(RecordBatchStreamAdapter::new(
                     batch_schema,
