@@ -593,15 +593,47 @@ pub async fn import_dataset(
     // existing `table_id` and clear their rows explicitly first, inside the same
     // transaction, before the row is removed.
     for table_name in slice.table_names() {
-        if let Ok(values) = txn
+        let existing_table_id = match txn
             .query_row_values(QueryRowParams {
                 sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?",
                 params: vec![MetastoreValue::Text(table_name.to_string())],
             })
             .await
-            && let Some(MetastoreValue::Text(existing_table_id)) = values.into_iter().next()
         {
-            super::clear_blob_keyed_marker_rows(txn.as_ref(), &existing_table_id).await?;
+            Ok(values) => match values.into_iter().next() {
+                Some(MetastoreValue::Text(id)) => Some(id),
+                _ => None,
+            },
+            Err(_) => None,
+        };
+
+        // A child name the slice supplies is only allowed to displace a local
+        // row that local discovery already agreed is this dataset's child.
+        //
+        // The two sides do not derive it the same way, and that asymmetry is
+        // deliberate on the discovery side: `partition_child_table_ids` requires
+        // the local row's `path` to equal the partition's before it counts as a
+        // child, precisely because the legacy naming convention
+        // (`{parent}_{values}`) can also spell an unrelated table an operator
+        // happens to have accelerated into the same metastore — partitioning
+        // `events` by year spells `events_2024`. `validate` cannot apply that
+        // rule: it sees only names and paths the slice itself supplies. So a
+        // name that reaches here without being locally discovered is either that
+        // collision or a slice that disagrees with this node about what its
+        // children are, and in both cases the row stays: the slice's own INSERT
+        // then fails on `cayenne_table(table_name)` and the whole restore rolls
+        // back, which is the safe direction to be wrong in. The catalog's
+        // `drop_table` declines the same collision for the same reason.
+        let is_parent = table_name == slice.dataset_name;
+        let is_local_child = existing_table_id
+            .as_deref()
+            .is_some_and(|id| stale_child_ids.iter().any(|child| child == id));
+        if !is_parent && !is_local_child {
+            continue;
+        }
+
+        if let Some(existing_table_id) = existing_table_id.as_deref() {
+            super::clear_blob_keyed_marker_rows(txn.as_ref(), existing_table_id).await?;
         }
 
         txn.execute(ExecuteParams {
@@ -1549,6 +1581,96 @@ mod tests {
         assert!(
             write_back_sequences(&ms_b).await.is_empty(),
             "the reader's own markers must not survive the dataset they described"
+        );
+    }
+
+    /// Register `table_name` in `ms` as a table of its own, rooted at `path`.
+    async fn insert_bare_table(ms: &SqliteMetastore, table_id: &str, table_name: &str, path: &str) {
+        ms.execute(ExecuteParams {
+            sql: "INSERT INTO cayenne_table (table_id, table_name, path, path_is_relative, schema_json, primary_key_json, on_conflict_json, current_snapshot_id, partition_column, vortex_config_json, current_sequence_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params: sample_table_row(table_id, table_name, path),
+        })
+        .await
+        .expect("insert table");
+    }
+
+    async fn table_row(ms: &SqliteMetastore, table_name: &str) -> Vec<(String, String)> {
+        ms.query(
+            QueryParams {
+                sql: "SELECT table_id, path FROM cayenne_table WHERE table_name = ?",
+                params: vec![MetastoreValue::Text(table_name.to_string())],
+            },
+            |row| Ok((row.get_string(0)?, row.get_string(1)?)),
+        )
+        .await
+        .expect("read table row")
+    }
+
+    /// Import must not delete a local table just because the slice names it.
+    ///
+    /// The legacy child convention (`{parent}_{values}`) can spell a table an
+    /// operator independently accelerated into the same metastore —
+    /// partitioning `events` by year spells `events_2024` — and `validate`
+    /// cannot tell the two apart, because every name and path it compares comes
+    /// out of the slice. Only local discovery can, and it does: it requires the
+    /// local row's path to equal the partition's. So a slice-named child that
+    /// local discovery did not produce leaves the row alone and the restore
+    /// rolls back on `cayenne_table(table_name)` rather than replacing an
+    /// unrelated dataset. `drop_table` declines the same collision, which is
+    /// what `a_table_colliding_with_the_legacy_partition_name_is_not_dropped`
+    /// pins on the catalog side.
+    #[tokio::test]
+    async fn import_leaves_a_table_that_merely_collides_with_a_legacy_child_name() {
+        let legacy =
+            crate::partition_naming::legacy_partition_child_table_name("events", &["2024".into()]);
+
+        // The writer: `events` partitioned on "2024", its child carrying the
+        // legacy name an older runtime would have written.
+        let (ms_a, tmp_a) = fresh_metastore().await;
+        insert_dataset_without_children(
+            &ms_a,
+            "events",
+            tmp_a.path(),
+            &[("p1", "2024", "events/y2024")],
+        )
+        .await;
+        insert_bare_table(
+            &ms_a,
+            "tid-legacy-child",
+            &legacy,
+            &tmp_a.path().join("events/y2024").to_string_lossy(),
+        )
+        .await;
+        let slice = export_dataset(ms_a.as_ref(), "events", tmp_a.path())
+            .await
+            .expect("export");
+        assert!(
+            slice.table_names().contains(&legacy.as_str()),
+            "the slice must carry the legacy-named child for this test to mean anything"
+        );
+
+        // The reader: its own `events`, plus an unrelated dataset that happens
+        // to be called `events_2024` and is rooted nowhere near the partition.
+        let (ms_b, tmp_b) = fresh_metastore().await;
+        insert_dataset_without_children(&ms_b, "events", tmp_b.path(), &[]).await;
+        let victim_path = tmp_b
+            .path()
+            .join("somewhere/else")
+            .to_string_lossy()
+            .into_owned();
+        insert_bare_table(&ms_b, "tid-victim", &legacy, &victim_path).await;
+
+        let err = import_dataset(ms_b.as_ref(), &slice, tmp_b.path())
+            .await
+            .expect_err("a slice colliding with an unrelated table must not be applied");
+        assert!(
+            err.to_string().contains("cayenne_table.table_name"),
+            "expected the restore to roll back on the name collision, got: {err}"
+        );
+        assert_eq!(
+            table_row(&ms_b, &legacy).await,
+            vec![("tid-victim".to_string(), victim_path)],
+            "the unrelated dataset must keep its own table_id and path"
         );
     }
 }
