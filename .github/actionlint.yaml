@@ -31,15 +31,58 @@ self-hosted-runner:
 # `actionlint` run in a checkout gives the same verdict CI does. With the block
 # below removed, this tree reports 17 findings and CI reports none — a gap that
 # trains people to ignore their local run.
+#
+# Each entry names one workflow, never a glob over `.github/workflows/`. An
+# `ignore` under a wildcard path applies to every workflow actionlint reads, so
+# a *new* workflow committing the same mistake is suppressed on arrival and the
+# gate never sees it — the deferral would silently become a permanent exemption.
+# Scoped this way, the 17 findings below stay deferred and the same diagnostic
+# anywhere else still fails the run. An entry whose workflow no longer exists is
+# inert rather than an error, so #14222 can retire them one at a time. Renaming
+# a listed workflow is the other half of that: the old key goes inert *and* the
+# deferred finding reappears under the new name, so CI goes red until the key is
+# renamed with it.
 paths:
-  .github/workflows/**/*.yml:
+  .github/workflows/e2e_test_ci.yml:
     ignore:
       # `concurrency` accepts only `group` and `cancel-in-progress`. Three
       # workflows set `queue: max` and document behaviour it cannot provide.
       - 'unexpected key "queue" for "concurrency" section'
-      # A `choice` input whose first option is `''`, used as "no override". The
-      # option cannot simply be dropped: a `choice` default must be one of them.
-      - 'string should not be empty'
+      - 'property "params" is not defined in object type'
+  .github/workflows/integration.yml:
+    ignore:
+      # `queue: max`, as under `e2e_test_ci.yml` above.
+      - 'unexpected key "queue" for "concurrency" section'
+  .github/workflows/spiced_docker.yml:
+    ignore:
       - 'anchor ".+" is defined but not used'
+  .github/workflows/testoperator_dispatch.yml:
+    ignore:
       - 'constant expression "false" in condition'
-      - 'property "(params|profile_option)" is not defined in object type'
+  # Seven of the `testoperator_run_*` workflows take a `choice` input whose first
+  # option is `''`, used as "no override". The option cannot simply be dropped:
+  # a `choice` default must be one of them.
+  .github/workflows/testoperator_run_append.yml:
+    ignore:
+      - 'string should not be empty'
+  .github/workflows/testoperator_run_bench.yml:
+    ignore:
+      - 'string should not be empty'
+      - 'property "profile_option" is not defined in object type'
+  .github/workflows/testoperator_run_data_consistency.yml:
+    ignore:
+      - 'string should not be empty'
+  .github/workflows/testoperator_run_htap.yml:
+    ignore:
+      - 'string should not be empty'
+      # `queue: max`, as under `e2e_test_ci.yml` above.
+      - 'unexpected key "queue" for "concurrency" section'
+  .github/workflows/testoperator_run_load.yml:
+    ignore:
+      - 'string should not be empty'
+  .github/workflows/testoperator_run_texttosql.yml:
+    ignore:
+      - 'string should not be empty'
+  .github/workflows/testoperator_run_throughput.yml:
+    ignore:
+      - 'string should not be empty'
