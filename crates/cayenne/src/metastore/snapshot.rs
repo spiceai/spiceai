@@ -49,8 +49,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    EXPECTED_TABLES, ExecuteParams, MetastoreBackend, MetastoreTransaction, MetastoreValue,
-    QueryParams, QueryRowParams,
+    EXPECTED_TABLES, ExecuteParams, MetastoreBackend, MetastoreValue, QueryParams, QueryRowParams,
 };
 use crate::catalog::{CatalogError, CatalogResult};
 
