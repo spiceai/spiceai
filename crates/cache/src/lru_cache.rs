@@ -53,7 +53,7 @@ fn warn_ignored_engine(engine: CacheEngine) {
     }
     IGNORE_ENGINE_WARN.call_once(|| {
         tracing::warn!(
-            "The `engine` cache setting is ignored; SQL, search, and embeddings caches always use the Spice sharded cache. Remove `engine` from the spicepod. See: https://spiceai.org/docs/features/caching"
+            "The `engine` cache setting is ignored at runtime; SQL, search, and embeddings caches always use the Spice sharded-cache backend (`engine: pingora` no longer selects Pingora). Remove `engine` from the spicepod, or leave it for compatibility. See: https://spiceai.org/docs/features/caching"
         );
     });
 }
@@ -163,8 +163,9 @@ impl<
     /// Build an `LruCache`.
     ///
     /// `engine` is accepted for spicepod compatibility and ignored: the Spice
-    /// sharded cache is always used. A configured `pingora` value logs a
-    /// one-time warning.
+    /// sharded-cache backend is always used. `engine: pingora` no longer
+    /// selects Pingora; a configured `pingora` value logs a one-time warning.
+    /// Migration: remove `engine` from the spicepod, or leave it unchanged.
     #[must_use]
     pub fn new(
         cache_max_size: u64,

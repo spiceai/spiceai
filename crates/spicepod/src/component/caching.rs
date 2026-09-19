@@ -55,14 +55,21 @@ pub enum HashingAlgorithm {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CacheEngine {
-    /// Historical default. Accepted for spicepod compatibility and ignored:
-    /// SQL, search, and embeddings `LruCache` paths always use the Spice
-    /// sharded cache.
+    /// Historical default (`moka`). Accepted for spicepod compatibility and
+    /// ignored at runtime: SQL, search, and embeddings `LruCache` paths always
+    /// use the Spice sharded-cache backend.
+    ///
+    /// Migration: leave `engine: moka` in place (no behavior change) or remove
+    /// the field; neither value selects a backend.
     #[default]
     Moka,
-    /// Historical Pingora-LRU option. Accepted and ignored; a one-time warning
-    /// is logged. SQL, search, and embeddings caches always use the Spice
-    /// sharded cache.
+    /// Historical Pingora-LRU option (`pingora`). Accepted for spicepod
+    /// compatibility and ignored at runtime; a one-time warning is logged.
+    /// SQL, search, and embeddings caches always use the Spice sharded-cache
+    /// backend — `engine: pingora` no longer selects Pingora.
+    ///
+    /// Migration: remove `engine: pingora` from the spicepod, or leave it (it is
+    /// ignored). Use `caching_policy` to choose eviction behavior.
     Pingora,
 }
 
@@ -142,8 +149,14 @@ pub struct CacheConfig {
     pub caching_policy: CachingPolicy,
     #[serde(default)]
     pub hashing_algorithm: HashingAlgorithm,
-    /// Accepted for spicepod compatibility and ignored. `LruCache` always uses
-    /// the Spice sharded cache.
+    /// Cache backend selector retained for spicepod compatibility and ignored
+    /// at runtime. Values `moka` and `pingora` still deserialize; the runtime
+    /// always uses the Spice sharded-cache backend for SQL, search, and
+    /// embeddings `LruCache` paths. `engine: pingora` no longer selects
+    /// Pingora (a one-time warning is logged).
+    ///
+    /// Migration: remove `engine` from the spicepod, or leave it unchanged for
+    /// compatibility. See <https://spiceai.org/docs/features/caching>.
     #[serde(default)]
     pub engine: CacheEngine,
 }
@@ -178,8 +191,14 @@ pub struct SQLResultsCacheConfig {
     pub hashing_algorithm: HashingAlgorithm,
     #[serde(default)]
     pub cache_key_type: CacheKeyType,
-    /// Accepted for spicepod compatibility and ignored. `LruCache` always uses
-    /// the Spice sharded cache.
+    /// Cache backend selector retained for spicepod compatibility and ignored
+    /// at runtime. Values `moka` and `pingora` still deserialize; the runtime
+    /// always uses the Spice sharded-cache backend for SQL, search, and
+    /// embeddings `LruCache` paths. `engine: pingora` no longer selects
+    /// Pingora (a one-time warning is logged).
+    ///
+    /// Migration: remove `engine` from the spicepod, or leave it unchanged for
+    /// compatibility. See <https://spiceai.org/docs/features/caching>.
     #[serde(default)]
     pub engine: CacheEngine,
     /// Maximum age for serving stale cached results while revalidating in the background.
@@ -237,8 +256,14 @@ pub struct ResultsCache {
     pub cache_key_type: CacheKeyType,
     #[serde(default)]
     pub hashing_algorithm: HashingAlgorithm,
-    /// Accepted for spicepod compatibility and ignored. `LruCache` always uses
-    /// the Spice sharded cache.
+    /// Cache backend selector retained for spicepod compatibility and ignored
+    /// at runtime. Values `moka` and `pingora` still deserialize; the runtime
+    /// always uses the Spice sharded-cache backend for SQL, search, and
+    /// embeddings `LruCache` paths. `engine: pingora` no longer selects
+    /// Pingora (a one-time warning is logged).
+    ///
+    /// Migration: remove `engine` from the spicepod, or leave it unchanged for
+    /// compatibility. See <https://spiceai.org/docs/features/caching>.
     #[serde(default)]
     pub engine: CacheEngine,
     /// Maximum stale-while-revalidate duration to add to the cache TTL.
