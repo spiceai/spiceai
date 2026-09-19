@@ -92,24 +92,21 @@ jobs:
           echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tar.gz" | sha256sum --check --status \
             || { echo "::error::actionlint ${ACTIONLINT_VERSION} tarball does not match its pinned checksum."; exit 1; }
           tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
-          /tmp/actionlint -version
+          # On PATH, so the lint step below reads as the command a developer runs
+          # locally rather than a path only this job knows.
+          sudo install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
+          actionlint -version
 
       - name: Lint GitHub Actions definitions (actionlint)
         run: |
           set -euo pipefail
-          # -shellcheck= / -pyflakes= turn OFF actionlint's script-body linters.
-          # Those grade the contents of `run:` blocks, which is a separate backlog
-          # with its own findings on this tree; this gate is about whether GitHub
-          # can schedule the definition. Enabling them is tracked in the issue
-          # below rather than bundled here.
+          # Everything suppressed is suppressed in `.github/actionlint.yaml`, so a
+          # bare `actionlint` in a checkout gives the same verdict this does; see
+          # that file and #14222 for what is on the list and why.
           #
-          # Each -ignore is a finding class left on the tree deliberately, because
-          # it needs a decision this PR should not make on its own. They are
-          # enumerated with their evidence in spiceai/spiceai#14222 and this list
-          # shrinks as that issue is worked; nothing else is suppressed.
-          /tmp/actionlint -color -shellcheck= -pyflakes= \
-            -ignore 'unexpected key "queue" for "concurrency" section' \
-            -ignore 'string should not be empty' \
-            -ignore 'anchor ".+" is defined but not used' \
-            -ignore 'constant expression "false" in condition' \
-            -ignore 'property "(params|profile_option)" is not defined in object type'
+          # -shellcheck= / -pyflakes= stay flags because they are about *this*
+          # invocation, not about the tree: they turn OFF actionlint's script-body
+          # linters, which grade the contents of `run:` blocks. That is a separate
+          # backlog with its own findings here; this gate is about whether GitHub
+          # can schedule the definition at all. Enabling them is tracked in #14222.
+          actionlint -color -shellcheck= -pyflakes=

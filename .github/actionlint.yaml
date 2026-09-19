@@ -1,11 +1,18 @@
-# actionlint configuration. See `.github/workflows/workflow_yaml_check.yml`, which
-# runs it over every definition in `.github/workflows/` and `.github/actions/`.
+# actionlint configuration, read by `.github/workflows/workflow_yaml_check.yml`.
+#
+# Scope, precisely: actionlint lints the definitions under `.github/workflows/`,
+# and parses a local composite action's metadata when a workflow `uses:` it — so
+# it validates the *call site* against that action's declared inputs. It has no
+# composite-action mode: pointed at an `action.yml` directly it reports
+# `"jobs" section is missing in workflow`, and an action reached only from
+# another action is never read at all. The step bodies of composite actions stay
+# with `.github/scripts/check_workflow_yaml.py`, which is why both linters run.
 #
 # `runs-on:` labels that resolve through the organization's self-hosted pools
 # rather than GitHub's hosted catalogue. actionlint cannot know them, so without
 # this block every job that names one is reported as an unknown label — 56 of the
-# 89 findings on the tree this was introduced against, which would have buried the
-# real ones.
+# 89 findings on the tree this was introduced against, which would have buried
+# the real ones.
 self-hosted-runner:
   labels:
     # The self-hosted Apple Silicon fleet that builds and signs off macOS.
@@ -14,3 +21,25 @@ self-hosted-runner:
     - spiceai-dev-runners
     # The hosted Linux aarch64 pool.
     - hosted-linux-arm-runner
+
+# Finding classes left on the tree deliberately, because each needs a decision
+# the adoption change should not make on its own. They are enumerated with their
+# evidence in https://github.com/spiceai/spiceai/issues/14222, and this list
+# shrinks as that issue is worked; nothing else is suppressed.
+#
+# They live here rather than as `-ignore` flags in the workflow so that a bare
+# `actionlint` run in a checkout gives the same verdict CI does. With the block
+# below removed, this tree reports 17 findings and CI reports none — a gap that
+# trains people to ignore their local run.
+paths:
+  .github/workflows/**/*.yml:
+    ignore:
+      # `concurrency` accepts only `group` and `cancel-in-progress`. Three
+      # workflows set `queue: max` and document behaviour it cannot provide.
+      - 'unexpected key "queue" for "concurrency" section'
+      # A `choice` input whose first option is `''`, used as "no override". The
+      # option cannot simply be dropped: a `choice` default must be one of them.
+      - 'string should not be empty'
+      - 'anchor ".+" is defined but not used'
+      - 'constant expression "false" in condition'
+      - 'property "(params|profile_option)" is not defined in object type'
