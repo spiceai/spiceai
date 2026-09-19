@@ -21,15 +21,12 @@ inputs:
   minio_endpoint:
     description: 'MinIO endpoint for sccache'
     required: false
-    type: string
   minio_access_key:
     description: 'MinIO access key for sccache'
     required: false
-    type: string
   minio_secret_key:
     description: 'MinIO secret key for sccache'
     required: false
-    type: string
 
 outputs:
   cache-hit:

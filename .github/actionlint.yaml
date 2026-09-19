@@ -1,0 +1,16 @@
+# actionlint configuration. See `.github/workflows/workflow_yaml_check.yml`, which
+# runs it over every definition in `.github/workflows/` and `.github/actions/`.
+#
+# `runs-on:` labels that resolve through the organization's self-hosted pools
+# rather than GitHub's hosted catalogue. actionlint cannot know them, so without
+# this block every job that names one is reported as an unknown label — 56 of the
+# 89 findings on the tree this was introduced against, which would have buried the
+# real ones.
+self-hosted-runner:
+  labels:
+    # The self-hosted Apple Silicon fleet that builds and signs off macOS.
+    - spiceai-macos
+    # The self-hosted Linux pool.
+    - spiceai-dev-runners
+    # The hosted Linux aarch64 pool.
+    - hosted-linux-arm-runner
