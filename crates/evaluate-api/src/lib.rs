@@ -113,7 +113,7 @@ impl From<String> for EntryType {
 
 /// Non-null `EntryType` values: string, object, or array (not JSON null).
 ///
-/// Used for score rubric levels so the OpenAPI contract matches TypeSafe's
+/// Used for score rubric levels so the `OpenAPI` contract matches `TypeSafe`'s
 /// non-empty `list[str | object | array]` criteria shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -139,7 +139,7 @@ impl From<String> for NonNullEntry {
 /// Distinguishes an omitted field from an explicit JSON `null` and a present value.
 ///
 /// Serde's `Option<T>` collapses JSON `null` to `None`, which would drop nested
-/// null criteria when forwarding to TypeSafe. This wrapper preserves that null.
+/// null criteria when forwarding to `TypeSafe`. This wrapper preserves that null.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum NullableEntry {
     /// Field was omitted from the JSON object.
@@ -155,8 +155,7 @@ pub enum NullableEntry {
 impl Serialize for NullableEntry {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
-            Self::Absent => serializer.serialize_none(),
-            Self::Null => serializer.serialize_none(),
+            Self::Absent | Self::Null => serializer.serialize_none(),
             Self::Value(v) => v.serialize(serializer),
         }
     }
@@ -219,7 +218,7 @@ pub enum Question {
     Score {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instructions: Option<EntryType>,
-        /// Non-empty, non-null rubric levels (matches TypeSafe `list[str | object | array]`).
+        /// Non-empty, non-null rubric levels (matches `TypeSafe` `list[str | object | array]`).
         #[serde(deserialize_with = "deserialize_nonempty_score_criteria")]
         #[schemars(length(min = 1))]
         #[cfg_attr(feature = "openapi", schema(min_items = 1))]
@@ -230,7 +229,7 @@ pub enum Question {
 /// Optional yes/no rubric for a noul question.
 ///
 /// `true` / `false` use [`NullableEntry`] so explicit JSON `null` is preserved when
-/// forwarding to TypeSafe (unlike `Option<EntryType>`, which drops nulls).
+/// forwarding to `TypeSafe` (unlike `Option<EntryType>`, which drops nulls).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct NoulCriteria {
