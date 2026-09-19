@@ -17657,6 +17657,7 @@ dependencies = [
  "opentelemetry",
  "parking_lot",
  "regex",
+ "regex-syntax",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
  "runtime-object-store",
