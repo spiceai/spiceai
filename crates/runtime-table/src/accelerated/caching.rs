@@ -287,12 +287,17 @@ enum FollowerResult {
 /// leader path applies on the arms that do not write.
 struct UncoalescedFetch<'a> {
     federated: Arc<dyn TableProvider>,
+    session_state: &'a SessionState,
     dataset_name: &'a str,
     filters: &'a [Expr],
     limit: Option<usize>,
     /// The schema an empty or error stream is given.
     schema: SchemaRef,
-    stale_if_error: bool,
+    stale_if_error: StaleIfError,
+    /// The `caching_ttl` the expired batches are measured past, so a finite
+    /// `caching_stale_if_error` window is applied here the way the leader
+    /// applies it.
+    max_age: Duration,
     expired_batches: Option<Vec<RecordBatch>>,
 }
 
@@ -301,34 +306,48 @@ impl UncoalescedFetch<'_> {
     async fn run(self) -> SendableRecordBatchStream {
         let Self {
             federated,
+            session_state,
             dataset_name,
             filters,
             limit,
             schema,
             stale_if_error,
+            max_age,
             expired_batches,
         } = self;
 
-        match CacheRefreshHelper::fetch_from_source(&federated, dataset_name, filters, limit).await
+        match CacheRefreshHelper::fetch_from_source(
+            &federated,
+            session_state,
+            dataset_name,
+            filters,
+            limit,
+        )
+        .await
         {
             Ok(batches) if !batches.is_empty() => {
                 let batch_schema = batches[0].schema();
 
                 // A failing origin arrives as a successful fetch whose rows
                 // carry a 429 or 5xx status; serve the expired cached response
-                // instead when `caching_stale_if_error` is enabled.
+                // instead when `caching_stale_if_error` allows it.
                 if !cache::batches_cacheable(&batches)
-                    && stale_if_error
                     && let Some(stale) = expired_batches.filter(|b| !b.is_empty())
                 {
-                    tracing::warn!(
-                        "Origin for dataset '{dataset_name}' answered with a transient failure, so the expired cached response is being served instead because `caching_stale_if_error` is enabled."
+                    let staleness = staleness_past_max_age(&stale, max_age);
+                    if stale_if_error.within_error_window(staleness) {
+                        tracing::warn!(
+                            "Origin for dataset '{dataset_name}' answered with a transient failure, so the expired cached response is being served instead because `caching_stale_if_error` allows it."
+                        );
+                        let stale_schema = stale[0].schema();
+                        return Box::pin(RecordBatchStreamAdapter::new(
+                            stale_schema,
+                            futures::stream::iter(stale.into_iter().map(Ok)),
+                        ));
+                    }
+                    tracing::debug!(
+                        "Stale entry for dataset '{dataset_name}' is {staleness:?} past the stale-if-error window ({stale_if_error}), returning the origin's transient response."
                     );
-                    let stale_schema = stale[0].schema();
-                    return Box::pin(RecordBatchStreamAdapter::new(
-                        stale_schema,
-                        futures::stream::iter(stale.into_iter().map(Ok)),
-                    ));
                 }
 
                 Box::pin(RecordBatchStreamAdapter::new(
@@ -341,18 +360,21 @@ impl UncoalescedFetch<'_> {
                 futures::stream::empty(),
             )),
             Err(e) => {
-                if stale_if_error
-                    && let Some(batches) = expired_batches
-                    && !batches.is_empty()
-                {
-                    tracing::warn!(
-                        "Cache miss fetch failed for dataset {dataset_name}, serving stale data due to stale_if_error: {e}"
+                if let Some(batches) = expired_batches.filter(|b| !b.is_empty()) {
+                    let staleness = staleness_past_max_age(&batches, max_age);
+                    if stale_if_error.within_error_window(staleness) {
+                        tracing::warn!(
+                            "Origin fetch for dataset '{dataset_name}' failed, so the expired cached response is being served instead because `caching_stale_if_error` allows it. Cause: {e}"
+                        );
+                        let stale_schema = batches[0].schema();
+                        return Box::pin(RecordBatchStreamAdapter::new(
+                            stale_schema,
+                            futures::stream::iter(batches.into_iter().map(Ok)),
+                        ));
+                    }
+                    tracing::debug!(
+                        "Stale entry for dataset '{dataset_name}' is {staleness:?} past the stale-if-error window ({stale_if_error}), propagating the origin error."
                     );
-                    let stale_schema = batches[0].schema();
-                    return Box::pin(RecordBatchStreamAdapter::new(
-                        stale_schema,
-                        futures::stream::iter(batches.into_iter().map(Ok)),
-                    ));
                 }
 
                 tracing::error!("Cache miss fetch failed for dataset {dataset_name}: {e}");
@@ -2173,11 +2195,13 @@ impl CacheRefreshHelper {
             ClaimOutcome::Follower(in_flight) => {
                 let own_fetch = UncoalescedFetch {
                     federated,
+                    session_state,
                     dataset_name,
                     filters,
                     limit,
                     schema: fallback_schema,
                     stale_if_error,
+                    max_age,
                     expired_batches,
                 };
                 if in_flight.serves(limit) {
@@ -4844,7 +4868,7 @@ mod tests {
             vec![],
         ));
         let in_flight: InFlightRevalidations =
-            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
 
         let stream = CacheRefreshHelper::handle_cache_miss(
@@ -5155,16 +5179,19 @@ mod tests {
         let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
         let filters = vec![col("content").eq(lit("test"))];
         let io = tokio::runtime::Handle::current();
+        let session_state = test_session_state();
 
         let make = || {
             CacheRefreshHelper::handle_cache_miss(
                 Arc::clone(&origin) as Arc<dyn TableProvider>,
+                &session_state,
                 "test_dataset",
                 &filters,
                 None,
                 Arc::clone(&schema),
                 false,
-                false,
+                StaleIfError::Disabled,
+                Duration::ZERO,
                 None,
                 &io,
                 Arc::new(vec![].into()),
@@ -5229,16 +5256,19 @@ mod tests {
         let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
         let filters = vec![col("content").eq(lit("test"))];
         let io = tokio::runtime::Handle::current();
+        let session_state = test_session_state();
 
         let make = || {
             CacheRefreshHelper::handle_cache_miss(
                 Arc::clone(&origin) as Arc<dyn TableProvider>,
+                &session_state,
                 "test_dataset",
                 &filters,
                 None,
                 Arc::clone(&schema),
                 false,
-                false,
+                StaleIfError::Disabled,
+                Duration::ZERO,
                 None,
                 &io,
                 Arc::new(vec![].into()),
@@ -5297,16 +5327,19 @@ mod tests {
         let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
         let filters = vec![col("content").eq(lit("test"))];
         let io = tokio::runtime::Handle::current();
+        let session_state = test_session_state();
 
         let make = |limit| {
             CacheRefreshHelper::handle_cache_miss(
                 Arc::clone(&origin) as Arc<dyn TableProvider>,
+                &session_state,
                 "test_dataset",
                 &filters,
                 limit,
                 Arc::clone(&schema),
                 false,
-                false,
+                StaleIfError::Disabled,
+                Duration::ZERO,
                 None,
                 &io,
                 Arc::new(vec![].into()),
@@ -5386,6 +5419,7 @@ mod tests {
             async move {
                 CacheRefreshHelper::refresh_entry(
                     origin,
+                    &test_session_state(),
                     "test_dataset",
                     &filters,
                     CacheNamespace::Public,
@@ -5401,12 +5435,14 @@ mod tests {
         let served = drain(
             CacheRefreshHelper::handle_cache_miss(
                 Arc::clone(&origin) as Arc<dyn TableProvider>,
+                &test_session_state(),
                 "test_dataset",
                 &filters,
                 None,
                 Arc::clone(&schema),
                 true,
-                false,
+                StaleIfError::Disabled,
+                Duration::ZERO,
                 None,
                 &tokio::runtime::Handle::current(),
                 Arc::new(vec![].into()),
@@ -5494,6 +5530,7 @@ mod tests {
                 CacheRefreshHelper::refresh_all_stale_rows(
                     origin,
                     stored,
+                    test_session_state(),
                     "test_dataset",
                     Duration::from_secs(1),
                     Arc::new(Mutex::new(())),
@@ -5512,12 +5549,14 @@ mod tests {
         let served = drain_rows(
             CacheRefreshHelper::handle_cache_miss(
                 Arc::clone(&origin) as Arc<dyn TableProvider>,
+                &test_session_state(),
                 "test_dataset",
                 &entry_filters,
                 None,
                 Arc::clone(&schema),
                 true,
-                false,
+                StaleIfError::Disabled,
+                Duration::ZERO,
                 None,
                 &tokio::runtime::Handle::current(),
                 Arc::new(vec![].into()),
@@ -5567,15 +5606,18 @@ mod tests {
         drop(leader);
 
         let filters = [col("content").eq(lit("test"))];
+        let session_state = test_session_state();
         let mut stream = CacheRefreshHelper::follow_cache_miss(
             in_flight_fetch.state,
             UncoalescedFetch {
                 federated: Arc::clone(&origin) as Arc<dyn TableProvider>,
+                session_state: &session_state,
                 dataset_name: "test_dataset",
                 filters: &filters,
                 limit: None,
                 schema: Arc::clone(&schema),
-                stale_if_error: false,
+                stale_if_error: StaleIfError::Disabled,
+                max_age: Duration::ZERO,
                 expired_batches: None,
             },
         )
@@ -6065,7 +6107,7 @@ mod tests {
             vec![],
         ));
         let in_flight_revalidations: InFlightRevalidations =
-            Arc::new(parking_lot::Mutex::new(HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let (batch_write_tx, _consumer_handle) =
             spawn_test_cache_write_consumer(&accelerator, &in_flight_revalidations);
 
