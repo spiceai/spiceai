@@ -300,6 +300,32 @@ pub fn table_id_to_key_bytes(table_id: &str) -> Vec<u8> {
     }
 }
 
+/// The metadata tables whose `table_id` column holds the raw-UUID-bytes `BLOB`
+/// of [`table_id_to_key_bytes`] rather than the 36-char text.
+///
+/// Both are the high-write per-key marker sets, encoded that way to cut WAL
+/// volume on hot upsert bursts; neither carries a foreign key back to
+/// `cayenne_table`, so neither is reached by its `ON DELETE CASCADE`. A caller
+/// filtering or clearing one of them by `table_id` therefore has to bind a
+/// `BLOB` *and* clear it explicitly — and because those are two obligations on
+/// the same set, the set is named once here. A `TEXT` bind against a `BLOB`
+/// column is not an error in `SQLite`: the comparison simply never matches, so
+/// the filter silently reads zero rows.
+pub const BLOB_KEYED_TABLE_ID_TABLES: &[&str] =
+    &["cayenne_insert_record", "cayenne_pending_write_back"];
+
+/// The value to bind for a `WHERE table_id = ?` filter against `table`.
+///
+/// See [`BLOB_KEYED_TABLE_ID_TABLES`] for why the encoding is per-table.
+#[must_use]
+pub fn table_id_filter_value(table: &str, table_id: &str) -> MetastoreValue {
+    if BLOB_KEYED_TABLE_ID_TABLES.contains(&table) {
+        MetastoreValue::Blob(table_id_to_key_bytes(table_id))
+    } else {
+        MetastoreValue::Text(table_id.to_string())
+    }
+}
+
 /// Resolve the `table_id`s of `parent_name`'s per-partition child tables.
 ///
 /// A partitioned Cayenne table's partitions are catalog tables of their own:
