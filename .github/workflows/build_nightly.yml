@@ -237,7 +237,12 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: spiceai-macos-large
+    # The standard pool, not `spiceai-macos-large`: this build blocks nothing,
+    # so its own latency is free, and it starts at 09:13 UTC when the pool is
+    # near-idle. Its tail is the cost -- the slowest recent run took 235 minutes
+    # and finished at 13:10 UTC -- which is paid by whatever shares its Mac mini
+    # by then, not by the nightly.
+    runs-on: spiceai-macos
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
       CARGO_TERM_COLOR: always
