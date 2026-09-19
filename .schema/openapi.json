@@ -13185,8 +13185,9 @@
               "criteria": {
                 "type": "array",
                 "items": {
-                  "$ref": "#/components/schemas/EntryType"
-                }
+                  "$ref": "#/components/schemas/NonNullEntry"
+                },
+                "minItems": 1
               }
             }
           }
@@ -13362,6 +13363,22 @@
       },
       "EvaluateState": {
         "description": "Evaluation state: string, object, or array.",
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": true
+          }
+        ]
+      },
+      "NonNullEntry": {
+        "description": "Non-null EntryType: string, object, or array (score rubric levels).",
         "oneOf": [
           {
             "type": "string"

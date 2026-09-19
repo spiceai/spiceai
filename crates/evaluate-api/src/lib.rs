@@ -111,6 +111,91 @@ impl From<String> for EntryType {
     }
 }
 
+/// Non-null `EntryType` values: string, object, or array (not JSON null).
+///
+/// Used for score rubric levels so the OpenAPI contract matches TypeSafe's
+/// non-empty `list[str | object | array]` criteria shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum NonNullEntry {
+    String(String),
+    Array(Vec<Value>),
+    Object(Map<String, Value>),
+}
+
+impl From<&str> for NonNullEntry {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_string())
+    }
+}
+
+impl From<String> for NonNullEntry {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+/// Distinguishes an omitted field from an explicit JSON `null` and a present value.
+///
+/// Serde's `Option<T>` collapses JSON `null` to `None`, which would drop nested
+/// null criteria when forwarding to TypeSafe. This wrapper preserves that null.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum NullableEntry {
+    /// Field was omitted from the JSON object.
+    #[default]
+    Absent,
+    /// Field was present as JSON `null`.
+    Null,
+    /// Field was present with a concrete `EntryType` value (including nested null
+    /// via [`EntryType::Null`] is not used here — top-level null is [`Self::Null`]).
+    Value(EntryType),
+}
+
+impl Serialize for NullableEntry {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Absent => serializer.serialize_none(),
+            Self::Null => serializer.serialize_none(),
+            Self::Value(v) => v.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NullableEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Option::<EntryType>::deserialize(deserializer)? {
+            None => Ok(Self::Null),
+            Some(v) => Ok(Self::Value(v)),
+        }
+    }
+}
+
+impl JsonSchema for NullableEntry {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("NullableEntry")
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // Documented as EntryType | null (same wire shape as before).
+        <Option<EntryType> as JsonSchema>::json_schema(generator)
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for NullableEntry {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        <Option<EntryType> as utoipa::PartialSchema>::schema()
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for NullableEntry {}
+
+fn nullable_entry_is_absent(value: &NullableEntry) -> bool {
+    matches!(value, NullableEntry::Absent)
+}
+
 /// A typed question sent to a System One evaluation model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -134,18 +219,48 @@ pub enum Question {
     Score {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instructions: Option<EntryType>,
-        criteria: Vec<EntryType>,
+        /// Non-empty, non-null rubric levels (matches TypeSafe `list[str | object | array]`).
+        #[serde(deserialize_with = "deserialize_nonempty_score_criteria")]
+        #[schemars(length(min = 1))]
+        #[cfg_attr(feature = "openapi", schema(min_items = 1))]
+        criteria: Vec<NonNullEntry>,
     },
 }
 
 /// Optional yes/no rubric for a noul question.
+///
+/// `true` / `false` use [`NullableEntry`] so explicit JSON `null` is preserved when
+/// forwarding to TypeSafe (unlike `Option<EntryType>`, which drops nulls).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct NoulCriteria {
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "true")]
-    pub true_meaning: Option<EntryType>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "false")]
-    pub false_meaning: Option<EntryType>,
+    #[serde(
+        default,
+        skip_serializing_if = "nullable_entry_is_absent",
+        rename = "true"
+    )]
+    pub true_meaning: NullableEntry,
+    #[serde(
+        default,
+        skip_serializing_if = "nullable_entry_is_absent",
+        rename = "false"
+    )]
+    pub false_meaning: NullableEntry,
+}
+
+fn deserialize_nonempty_score_criteria<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<NonNullEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let criteria = Vec::<NonNullEntry>::deserialize(deserializer)?;
+    if criteria.is_empty() {
+        return Err(serde::de::Error::custom(
+            "score criteria must contain at least one non-null item",
+        ));
+    }
+    Ok(criteria)
 }
 
 /// Evaluation `state`: string, object, or array (not bool/number/null).
@@ -362,4 +477,53 @@ mod tests {
             panic!("expected Score");
         }
     }
+
+    #[test]
+    fn score_criteria_rejects_empty_and_null() {
+        let empty = serde_json::from_value::<Question>(json!({
+            "type": "score",
+            "criteria": []
+        }));
+        assert!(empty.is_err(), "empty score criteria must fail");
+
+        let with_null = serde_json::from_value::<Question>(json!({
+            "type": "score",
+            "criteria": [null]
+        }));
+        assert!(with_null.is_err(), "null score criteria items must fail");
+
+        let ok: Question = serde_json::from_value(json!({
+            "type": "score",
+            "criteria": ["low", {"label": "mid"}]
+        }))
+        .expect("non-empty non-null");
+        assert!(matches!(ok, Question::Score { criteria, .. } if criteria.len() == 2));
+    }
+
+    #[test]
+    fn noul_criteria_preserves_explicit_null() {
+        let q: Question = serde_json::from_value(json!({
+            "type": "noul",
+            "criteria": { "true": null, "false": "not urgent" }
+        }))
+        .expect("noul");
+        let Question::Noul { criteria: Some(c), .. } = q else {
+            panic!("expected noul with criteria");
+        };
+        assert!(matches!(c.true_meaning, NullableEntry::Null));
+        assert!(matches!(
+            c.false_meaning,
+            NullableEntry::Value(EntryType::String(_))
+        ));
+
+        let forwarded = serde_json::to_value(&c).expect("serialize");
+        assert_eq!(forwarded.get("true"), Some(&json!(null)));
+        assert_eq!(forwarded.get("false"), Some(&json!("not urgent")));
+
+        let omitted: NoulCriteria = serde_json::from_value(json!({})).expect("omit");
+        assert!(matches!(omitted.true_meaning, NullableEntry::Absent));
+        let omitted_json = serde_json::to_value(&omitted).expect("ser");
+        assert!(omitted_json.as_object().unwrap().is_empty());
+    }
+
 }
