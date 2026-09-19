@@ -19,6 +19,7 @@ limitations under the License.
 //! Connects to a `PostgreSQL` (or Redshift) database and provides schema/table
 //! discovery via `information_schema` queries.
 
+use super::federation::{QUERY_FEDERATION_PARAMETER, is_query_federation_enabled};
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::catalogconnector::postgres_accelerated::{
     AcceleratedCatalogProvider, NoEligibleTablesError, SlotInUseError,
@@ -29,11 +30,18 @@ use crate::{
     dataconnector::parameters::ConnectorParams,
 };
 use async_trait::async_trait;
-use data_components::RefreshableCatalogProvider;
+use data_components::federation::create_spice_federated_table_provider;
 use data_components::postgres::provider::PostgresCatalogProvider;
+use data_components::{Read, RefreshableCatalogProvider};
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::datasource::TableProvider;
+use datafusion::sql::TableReference;
+use datafusion::sql::unparser::dialect::PostgreSqlDialect;
 use datafusion_table_providers::UnsupportedTypeAction;
-use datafusion_table_providers::postgres::PostgresTableFactory;
+use datafusion_table_providers::postgres::DynPostgresConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
+use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
 use snafu::Snafu;
 use std::any::Any;
 use std::collections::HashMap;
@@ -122,7 +130,111 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("sslmode").description("The SSL mode for the connection."),
     ParameterSpec::component("sslrootcert")
         .description("The path to, or inline PEM content for, the SSL root certificate."),
+    QUERY_FEDERATION_PARAMETER,
 ];
+
+/// A [`Read`] for `PostgreSQL` catalog tables that installs the Spice function
+/// deny-list and honours `query_federation`.
+///
+/// `PostgresTableFactory` carries no function-support seam: both of its read
+/// constructors hand to a private `finish_table_provider` that applies the
+/// dialect and federates unconditionally, so a catalog built on it unparses
+/// every Spice-only UDF -- the `json_get_*` set, the embedding and distance
+/// UDFs, every user-registered function -- into the SQL sent to `PostgreSQL`,
+/// which answers "function does not exist".
+///
+/// So this builds the `SqlTable` itself and routes the federation wrapping
+/// through [`create_spice_federated_table_provider`] with the deny-list,
+/// exactly as the `PostgreSQL` *dataset* connector's read path does. Keeping
+/// the synchronous `new_with_schema` constructor matters: the catalog resolves
+/// a whole namespace's schemas in one query, and a [`Read`] that implemented
+/// only [`Read::table_provider`] would turn discovery back into a round trip
+/// per table. See issues #10703 and #13664.
+struct FederatedPostgresTableFactory {
+    pool: Arc<PostgresConnectionPool>,
+    federation_enabled: bool,
+}
+
+impl FederatedPostgresTableFactory {
+    /// The dialect and federation wrapping both constructors share, so a table
+    /// cannot plan differently for having been discovered with its schema
+    /// already in hand.
+    fn finish<T: 'static, P: 'static>(
+        &self,
+        table: SqlTable<T, P>,
+        table_reference: TableReference,
+    ) -> Arc<dyn TableProvider + 'static> {
+        let table = Arc::new(table.with_dialect(Arc::new(PostgreSqlDialect {})));
+        if !self.federation_enabled {
+            return table;
+        }
+        let schema = table.schema();
+        Arc::new(create_spice_federated_table_provider(
+            table,
+            schema,
+            table_reference,
+            Some(deny_spice_functions_for_postgres_table_providers()),
+        ))
+    }
+}
+
+#[async_trait]
+impl Read for FederatedPostgresTableFactory {
+    async fn table_provider(
+        &self,
+        table_reference: TableReference,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        let pool = Arc::clone(&self.pool);
+        let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
+        let table = SqlTable::new(
+            "postgres",
+            &dyn_pool,
+            table_reference.clone(),
+            Some(Engine::Postgres),
+        )
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        Ok(self.finish(table, table_reference))
+    }
+
+    async fn table_provider_with_schema(
+        &self,
+        table_reference: TableReference,
+        schema: SchemaRef,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        let pool = Arc::clone(&self.pool);
+        let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
+        let table = SqlTable::new_with_schema(
+            "postgres",
+            &dyn_pool,
+            schema,
+            table_reference.clone(),
+            Some(Engine::Postgres),
+        );
+
+        Ok(self.finish(table, table_reference))
+    }
+}
+
+/// The read path a `PostgreSQL` catalog's tables are built through, with the
+/// Spice function deny-list installed and the catalog's `query_federation`
+/// setting applied.
+///
+/// Public so the integration tests in `tests/postgres/catalog.rs` build their
+/// providers the way the connector does. A test holding a bare
+/// `PostgresTableFactory` asserts against a provider no user is given, which
+/// is how this gap survived the connector's own test suite.
+#[must_use]
+pub fn build_table_factory(
+    pool: Arc<PostgresConnectionPool>,
+    federation_enabled: bool,
+) -> Arc<dyn Read> {
+    Arc::new(FederatedPostgresTableFactory {
+        pool,
+        federation_enabled,
+    })
+}
 
 /// A catalog connector for `PostgreSQL`, providing access to schemas and tables
 /// within a `PostgreSQL` database. Also usable for Redshift.
@@ -158,6 +270,17 @@ impl CatalogConnector for PostgresCatalog {
                 message,
             })?;
 
+        // Both parsed before the pool is created, so a misspelled value is
+        // reported without first opening a connection to the database.
+        let federation_enabled =
+            is_query_federation_enabled(&self.params.parameters).map_err(|e| {
+                super::Error::InvalidConfigurationNoSource {
+                    connector: PREFIX.to_string(),
+                    connector_component: connector_component.clone(),
+                    message: e.to_string(),
+                }
+            })?;
+
         let pool = PostgresConnectionPool::new(self.params.parameters.to_secret_map())
             .await
             .map_err(|e| super::Error::UnableToGetCatalogProvider {
@@ -181,7 +304,7 @@ impl CatalogConnector for PostgresCatalog {
             if let Some(acceleration) = catalog.acceleration.as_ref() {
                 Arc::new(AcceleratedCatalogProvider::new(catalog, acceleration, pool))
             } else {
-                let table_factory = Arc::new(PostgresTableFactory::new(Arc::clone(&pool)));
+                let table_factory = build_table_factory(Arc::clone(&pool), federation_enabled);
                 Arc::new(PostgresCatalogProvider::new(
                     catalog.name.clone(),
                     pool,
@@ -310,6 +433,19 @@ mod tests {
             })
             .is_none(),
             "the cause is carried as text, so the catalog error that wraps this cannot append it after the documentation link"
+        );
+    }
+
+    /// The catalog must offer the same escape hatch the dataset connector
+    /// offers, spelled the same way, so one value means one thing. Without it a
+    /// user who needs a plan evaluated locally has no configuration that avoids
+    /// federation at all. See #13664.
+    #[test]
+    fn the_parameter_list_offers_query_federation() {
+        let names: Vec<&str> = PARAMETERS.iter().map(|p| p.name).collect();
+        assert!(
+            names.contains(&"query_federation"),
+            "the PostgreSQL catalog connector must accept `query_federation`: {names:?}"
         );
     }
 }
