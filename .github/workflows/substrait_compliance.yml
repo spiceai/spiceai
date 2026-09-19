@@ -1,19 +1,58 @@
-name: Substrait compliance (report-only)
+name: Substrait compliance
 
-# Nightly + manual only. Not on pull_request or merge_group — this is a
-# DataFusion consumer baseline, not a merge gate. Per-query FAIL/ERROR
-# exit 0; do not fail the repository on pass rate until a threshold is
-# set from the Mode A numbers. A harness/build crash must still fail.
+# Mode A TPC-H on pull_request, merge_group, nightly, and manual dispatch.
+# Per-query FAIL/ERROR still exit 0 (report-only pass rate). Do not fail
+# the repository on pass rate until a threshold is set. A harness/build
+# crash must still fail the job.
+#
+# Not a required check (`scripts/signoff` REQUIRED_CHECKS): the job is
+# visible on PRs that touch the paths below and runs in the merge queue,
+# but a low pass rate does not block merge. `merge_group` cannot honour
+# `paths`, so that event is gated with check-code-changes instead.
 
 on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    # Docs-only PRs (repo docs and harness Markdown) must not pay for a
+    # 90m compile. Harness globs omit `*.md` so README/RESULTS edits do
+    # not start this workflow. Keep this list in lockstep with the
+    # check_changes filter below.
+    paths:
+      - 'tools/substrait-compliance/src/**'
+      - 'tools/substrait-compliance/scripts/**'
+      - 'tools/substrait-compliance/Cargo.toml'
+      - 'tools/substrait-compliance/.gitignore'
+      - 'tools/substrait-compliance/NOTICE'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'rust-toolchain'
+      - '.cargo/**'
+      - '.github/workflows/substrait_compliance.yml'
+      - '.github/actions/setup-rust/**'
+      - '.github/actions/install-protoc/**'
+      - '.github/actions/check-code-changes/**'
+      - 'crates/yaml/**'
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
   schedule:
     - cron: '30 8 * * *' # 08:30 UTC daily
   workflow_dispatch:
 
 concurrency:
-  group: substrait-compliance-${{ github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
+# check-code-changes only runs on merge_group here, where dorny/paths-filter
+# diffs the checkout (`git diff <base>..<head>`). No pull-request REST API.
 permissions:
   contents: read
 
@@ -24,8 +63,54 @@ env:
   SUBSTRAIT_COMPLIANCE_REF: 43d31411c69ef7594887c7d759037bcf8244eeed
 
 jobs:
+  # merge_group cannot path-filter, so decide here whether Mode A should
+  # run. Path-filtered pull_request, schedule, and workflow_dispatch
+  # always run — dispatch has no useful base to diff (see verus_verify.yml).
+  check_changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name != 'merge_group' }}
+    steps:
+      - name: Non-merge-group events always run Mode A
+        if: ${{ github.event_name != 'merge_group' }}
+        run: echo "Mode A TPC-H runs on pull_request, schedule, and workflow_dispatch"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ github.event_name == 'merge_group' }}
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check for relevant changes
+        if: ${{ github.event_name == 'merge_group' }}
+        id: check
+        uses: ./.github/actions/check-code-changes
+        with:
+          # Same globs as on.pull_request.paths — a path missing here
+          # reports the merge-queue job green without running Mode A.
+          filters: |
+            code_changes:
+              - 'tools/substrait-compliance/src/**'
+              - 'tools/substrait-compliance/scripts/**'
+              - 'tools/substrait-compliance/Cargo.toml'
+              - 'tools/substrait-compliance/.gitignore'
+              - 'tools/substrait-compliance/NOTICE'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'rust-toolchain'
+              - '.cargo/**'
+              - '.github/workflows/substrait_compliance.yml'
+              - '.github/actions/setup-rust/**'
+              - '.github/actions/install-protoc/**'
+              - '.github/actions/check-code-changes/**'
+              - 'crates/yaml/**'
+
   mode_a_tpch:
-    name: Mode A TPC-H (DataFusion consumer)
+    name: Mode A TPC-H
+    needs: check_changes
+    if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -66,7 +151,7 @@ jobs:
             --out-json tools/substrait-compliance/results/mode-a-tpch.json \
             --out-csv tools/substrait-compliance/results/mode-a-tpch.csv
 
-      - name: Upload JSON report
+      - name: Upload JSON and CSV reports
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

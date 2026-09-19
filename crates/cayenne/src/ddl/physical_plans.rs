@@ -158,6 +158,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
         let arrow_schema = Arc::clone(&self.params.arrow_schema);
         let primary_key = self.params.primary_key.clone();
         let partition_expr_sql = self.params.partition_expr_sql.clone();
+        let cluster_by = self.params.cluster_by.clone();
         let if_not_exists = self.params.if_not_exists;
         let like_source_table = self.params.like_source_table.clone();
         let ctx = self.params.ctx.clone();
@@ -182,6 +183,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 arrow_schema,
                 primary_key,
                 partition_expr_sql,
+                cluster_by,
                 if_not_exists,
                 like_source_table,
                 ctx,

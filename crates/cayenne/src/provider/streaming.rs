@@ -376,7 +376,7 @@ struct BoundedSortState {
 /// lexicographic ordering (e.g. the warm rewrite path, whose files advertise
 /// `file_sort_order`) or otherwise relies on global order. Cold promotion is
 /// safe because cold files are pruned by per-file min/max + PK bloom and
-/// advertise no ordering; bounding the sort trades slight Z-order range
+/// advertise no ordering; bounding the sort trades slight curve range
 /// overlap across runs for bounded sort memory and first-batch latency.
 ///
 /// Rows are conserved: each run's consumed row count is checked against its

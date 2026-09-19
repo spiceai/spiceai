@@ -4,6 +4,7 @@ tests:
     query_set: tpcds
     ready_wait: 600
     runner_type: spiceai-dev-runners
+    validate_results: true
   throughput:
     spicepod_path: accelerated/s3[parquet]-arrow-partitioned.yaml
     query_set: tpcds

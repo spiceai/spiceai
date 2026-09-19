@@ -359,7 +359,7 @@ impl CatalogConnector for DuckLakeCatalog {
 /// the filters `supports_filters_pushdown` screens — leaving the call for
 /// `DataFusion` to evaluate locally. See
 /// [`runtime_datafusion::function_support::DUCKDB_DENIED_BUILTINS`] for why each
-/// of the three cannot be rendered faithfully.
+/// of the two cannot be rendered faithfully.
 ///
 /// The deny-list is the plain one, **not** the `DuckDB`-flavored
 /// `deny_spice_functions_for_duckdb_table_providers`. That variant carves out the
@@ -374,8 +374,7 @@ impl CatalogConnector for DuckLakeCatalog {
 /// It does take the `DuckDB` built-in denials, though, because the dialect it
 /// installs is the `DuckDB` one: without them `regexp_match` and `regexp_instr`
 /// would be unparsed under their `DataFusion` names and fail remotely as unknown
-/// functions, and `regexp_count` would be pushed down at a rendering that answers
-/// NULL where `DataFusion` answers `0` (issues #13809, #13870).
+/// functions (issue #13809).
 ///
 /// The accessor also carries the per-call gate, which is a separate layer from
 /// those name denials and composes with them rather than replacing them: those
@@ -511,11 +510,8 @@ mod federation_tests {
     }
 
     /// The converse, and the reason the list above is not all of them:
-    /// `regexp_match`, `regexp_instr` and `regexp_count` are **denied** rather
-    /// than pushed down. The first two have no handler at all; `regexp_count`
-    /// keeps its handler because the rewrite is right for non-NULL input and
-    /// #13870 is about making it NULL-preserving, so only the deny is asserted
-    /// for it.
+    /// `regexp_match` and `regexp_instr` are **denied** rather than pushed
+    /// down, and neither has a handler.
     ///
     /// A deny-list does withhold a `DataFusion` built-in, contrary to what this
     /// module used to assert: this catalog hands its `FunctionSupport` to the
@@ -544,8 +540,8 @@ mod federation_tests {
             );
         }
 
-        // Every denied name must be withheld, whether or not the dialect still
-        // carries a handler for it: `regexp_count` keeps one on purpose (#13870).
+        // Every denied name must be withheld, whether or not the dialect
+        // carries a handler for it.
         for name in DUCKDB_DENIED_BUILTINS {
             assert!(
                 !federation

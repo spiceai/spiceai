@@ -21,6 +21,7 @@ use std::{
 };
 
 use crate::maintained_aggregate::MaintainedAggregateRegistry;
+use crate::provider::lookup_index::LookupIndexExplain;
 use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
@@ -136,6 +137,9 @@ pub struct CayenneAccelerationExec {
     /// table provider's `scan()`, which costs the message a name and nothing
     /// else — no execution behaviour reads this.
     table_name: Option<Arc<str>>,
+    /// The point-lookup index decision made while planning this scan. This is
+    /// stable plan metadata for `EXPLAIN`; execution does not consult it.
+    lookup_index: Option<LookupIndexExplain>,
 }
 
 impl CayenneAccelerationExec {
@@ -151,6 +155,7 @@ impl CayenneAccelerationExec {
             maintained_aggregate_epoch: 0,
             optimizer_column_overlay: None,
             table_name: None,
+            lookup_index: None,
         }
     }
 
@@ -167,6 +172,7 @@ impl CayenneAccelerationExec {
             maintained_aggregate_epoch: 0,
             optimizer_column_overlay: None,
             table_name: None,
+            lookup_index: None,
         }
     }
 
@@ -187,6 +193,7 @@ impl CayenneAccelerationExec {
             maintained_aggregate_epoch,
             optimizer_column_overlay: None,
             table_name: None,
+            lookup_index: None,
         }
     }
 
@@ -210,6 +217,7 @@ impl CayenneAccelerationExec {
             maintained_aggregate_epoch,
             optimizer_column_overlay: None,
             table_name: None,
+            lookup_index: None,
         }
     }
 
@@ -234,6 +242,13 @@ impl CayenneAccelerationExec {
     #[must_use]
     pub(crate) fn with_table_name(mut self, table_name: impl Into<Arc<str>>) -> Self {
         self.table_name = Some(table_name.into());
+        self
+    }
+
+    /// Attaches the scan-local lookup-index decision for `EXPLAIN`.
+    #[must_use]
+    pub(crate) fn with_lookup_index(mut self, lookup_index: Option<LookupIndexExplain>) -> Self {
+        self.lookup_index = lookup_index;
         self
     }
 
@@ -262,6 +277,7 @@ impl CayenneAccelerationExec {
             maintained_aggregate_epoch: self.maintained_aggregate_epoch,
             optimizer_column_overlay: self.optimizer_column_overlay.clone(),
             table_name: self.table_name.clone(),
+            lookup_index: self.lookup_index.clone(),
         }
     }
 
@@ -909,7 +925,22 @@ impl DisplayAs for CayenneAccelerationExec {
         write!(
             f,
             "CayenneAccelerationExec: snapshots_scanned={snapshots_scanned}, files_scanned={files_scanned}"
-        )
+        )?;
+        if let Some(lookup) = &self.lookup_index {
+            write!(
+                f,
+                ", lookup_index={}, lookup_index_outcome={}",
+                lookup.shape.as_deref().unwrap_or("none"),
+                lookup.outcome.as_str()
+            )?;
+            if let Some(candidate_files) = lookup.candidate_files {
+                write!(f, ", candidate_files={candidate_files}")?;
+            }
+            if let Some(candidate_rows) = lookup.candidate_rows {
+                write!(f, ", candidate_rows={candidate_rows}")?;
+            }
+        }
+        Ok(())
     }
 }
 

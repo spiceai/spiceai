@@ -59,7 +59,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@71b9a1f2d548b19503a023e9b0c033c0931f92da # v0.9.0
+        uses: spiceai/spiceio/.github/actions/setup@2ff3b86989e1b6e142673201100420274ef78c8f # v0.11.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -67,6 +67,11 @@ jobs:
           bucket: sccache
           region: us-west-1
           immutable-objects: "true"
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
 
       - name: Set up sccache
         if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
@@ -135,7 +140,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@71b9a1f2d548b19503a023e9b0c033c0931f92da # v0.9.0
+        uses: spiceai/spiceio/.github/actions/setup@2ff3b86989e1b6e142673201100420274ef78c8f # v0.11.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -143,6 +148,11 @@ jobs:
           bucket: sccache
           region: us-west-1
           immutable-objects: "true"
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
 
       - name: Set up sccache
         if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''

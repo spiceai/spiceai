@@ -43,6 +43,7 @@ use datafusion::sql::TableReference;
 use datafusion::{datasource::TableProvider, logical_expr::Expr};
 use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
+use runtime_acceleration::acceleration::StaleIfError;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use runtime_component::dataset::{ReadyState, TimeFormat};
@@ -304,7 +305,7 @@ pub struct AcceleratedTable {
     synchronized_children: Arc<RwLock<Vec<Arc<dyn TableProvider>>>>,
     cache_ttl: Option<Duration>,
     cache_stale_while_revalidate_ttl: Option<Duration>,
-    cache_stale_if_error: bool,
+    cache_stale_if_error: StaleIfError,
     io_runtime: Handle,
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations
     accelerator_write_mutex: Arc<Mutex<()>>,
@@ -450,7 +451,7 @@ pub struct Builder {
     io_runtime: Handle,
     caching_ttl: Option<Duration>,
     caching_stale_while_revalidate_ttl: Option<Duration>,
-    caching_stale_if_error: bool,
+    caching_stale_if_error: StaleIfError,
     caching_max_size_bytes: Option<u64>,
     caching_max_items: Option<u64>,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
@@ -510,7 +511,7 @@ impl Builder {
             io_runtime,
             caching_ttl: None,
             caching_stale_while_revalidate_ttl: None,
-            caching_stale_if_error: false,
+            caching_stale_if_error: StaleIfError::default(),
             caching_max_size_bytes: None,
             caching_max_items: None,
             resource_monitor: None,
@@ -770,9 +771,10 @@ impl Builder {
         self
     }
 
-    /// Set whether to serve expired data on upstream error in cache mode
-    pub fn caching_stale_if_error(&mut self, enabled: bool) -> &mut Self {
-        self.caching_stale_if_error = enabled;
+    /// Set how expired data is served on upstream error in cache mode (never,
+    /// always, or within a finite staleness window).
+    pub fn caching_stale_if_error(&mut self, stale_if_error: StaleIfError) -> &mut Self {
+        self.caching_stale_if_error = stale_if_error;
         self
     }
 
@@ -2059,12 +2061,30 @@ impl TableLayer for AcceleratedTable {
                 Ok(results)
             }
             ZeroResultsAction::UseSource => {
-                // In UseSource mode, all filters must still flow into scan() so that
+                // In UseSource mode, row filters must still flow into scan() so that
                 // FallbackOnZeroResultsScanExec receives the full predicate set and can use
                 // its internal filter_plan to evaluate those predicates before making a
                 // correct fallback decision. Unsupported-function filters are therefore kept
                 // out of accelerator SQL pushdown, but still participate in the fallback check.
-                Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+                //
+                // An expression the scan cannot evaluate is the exception: the
+                // federation analyzer runs its filter pushdown over the whole plan as
+                // soon as *any* table in the statement is federated, which is before
+                // decorrelation, so a subquery accepted here is written into this
+                // scan's filters and then fails physical planning. Declining it leaves
+                // it above the scan, which is where decorrelation puts it anyway.
+                // Consequence: such a predicate is absent from the fallback check, so
+                // the zero-results decision is made without it.
+                Ok(filters
+                    .iter()
+                    .map(|filter| {
+                        if util::expr::cannot_be_evaluated_at_scan(filter) {
+                            TableProviderFilterPushDown::Unsupported
+                        } else {
+                            TableProviderFilterPushDown::Inexact
+                        }
+                    })
+                    .collect())
             }
         }
     }

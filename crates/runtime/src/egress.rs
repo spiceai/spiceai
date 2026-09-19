@@ -77,6 +77,22 @@ impl EgressAccount {
         self.reservation.grow(bytes);
     }
 
+    /// Reserve `bytes` from `Stream::poll_next`, which cannot await.
+    ///
+    /// Tries the pool once, then over-commits with `grow` — the same last
+    /// resort [`Self::reserve`] uses after its yield loop. Used by the inline
+    /// Flight encoder, which queues schema and batch messages on the request
+    /// task as the client polls.
+    pub(crate) fn reserve_now(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        if self.reservation.try_grow(bytes).is_ok() {
+            return;
+        }
+        self.reservation.grow(bytes);
+    }
+
     /// Release `bytes` once the chunk has been handed downstream. Never shrinks
     /// past the current reservation size (which would panic).
     pub(crate) fn release(&self, bytes: usize) {

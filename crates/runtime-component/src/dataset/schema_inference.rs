@@ -225,17 +225,23 @@ fn apply_inferred_sort(
         return false;
     }
 
+    // Each key is the *external* spelling the engine's parameter validation
+    // accepts: a `ParameterSpec::component` param must carry the engine prefix
+    // (`arrow_sort_columns`, `cayenne_sort_columns`), while DuckDB's
+    // `on_refresh_sort_columns` is a `ParameterSpec::runtime` param and takes
+    // none. An unprefixed component key is dropped by `runtime_parameters` with a
+    // user-facing warning about a parameter the user never wrote (#14023).
     let engine = acceleration.engine.to_unpartitioned();
     let key = match engine {
         Engine::DuckDB => "on_refresh_sort_columns",
-        Engine::Arrow => "sort_columns",
+        Engine::Arrow => "arrow_sort_columns",
         Engine::Cayenne => "cayenne_sort_columns",
         // Sqlite / Turso / PostgreSQL accelerators have no sort param.
         _ => return false,
     };
 
     // For `refresh_mode: changes`, skip engines whose sort param drives the
-    // refresh itself (DuckDB `on_refresh_sort_columns`, Arrow `sort_columns`): a
+    // refresh itself (DuckDB `on_refresh_sort_columns`, Arrow `arrow_sort_columns`): a
     // refresh-time sort is a no-op for a change stream and risks perturbing the
     // initial snapshot. Cayenne is the exception — `cayenne_sort_columns` sorts
     // the background compaction rewrite, not the change stream (which stays
@@ -245,11 +251,15 @@ fn apply_inferred_sort(
         return false;
     }
 
-    // Respect any user-configured sort param (Cayenne also accepts `sort_columns`).
-    // Checked before the DuckDB constraint guard below so an explicitly-sorted
-    // dataset is reported as user-configured, not as a constraint-preservation skip.
+    // Respect any user-configured sort param. Cayenne and Arrow also read the
+    // unprefixed `sort_columns` straight from the acceleration params, so a user
+    // who wrote that spelling has configured a sort even though validation warns
+    // about the missing prefix. Checked before the DuckDB constraint guard below
+    // so an explicitly-sorted dataset is reported as user-configured, not as a
+    // constraint-preservation skip.
     let user_configured = acceleration.params.contains_key(key)
-        || (engine == Engine::Cayenne && acceleration.params.contains_key("sort_columns"));
+        || (matches!(engine, Engine::Cayenne | Engine::Arrow)
+            && acceleration.params.contains_key("sort_columns"));
     if user_configured {
         return false;
     }
@@ -801,9 +811,41 @@ mod tests {
             RefreshMode::Full,
         );
         assert_eq!(
-            acc.params.get("sort_columns").map(String::as_str),
+            acc.params.get("arrow_sort_columns").map(String::as_str),
             Some("created_at DESC, id ASC")
         );
+        // The unprefixed spelling is what Arrow's parameter validation rejects
+        // with a warning; inference must never write it (#14023).
+        assert!(!acc.params.contains_key("sort_columns"));
+    }
+
+    #[test]
+    fn arrow_respects_user_sort_param_in_either_spelling() {
+        // `arrow_sort_columns` is the validated spelling; the Arrow accelerator
+        // also reads a bare `sort_columns` from the acceleration params, so both
+        // count as user-configured and neither is overridden by inference.
+        for user_key in ["arrow_sort_columns", "sort_columns"] {
+            let mut acc = accel(Engine::Arrow);
+            acc.params
+                .insert(user_key.to_string(), "custom".to_string());
+            let inferred = InferredSchema {
+                sort_columns: vec![sort("created_at", true)],
+                ..InferredSchema::default()
+            };
+            apply_inferred_schema(
+                &mut acc,
+                &inferred,
+                &schema(&["created_at"]),
+                "ds",
+                RefreshMode::Full,
+            );
+            assert_eq!(acc.params.len(), 1, "user key {user_key}");
+            assert_eq!(
+                acc.params.get(user_key).map(String::as_str),
+                Some("custom"),
+                "user key {user_key}"
+            );
+        }
     }
 
     #[test]

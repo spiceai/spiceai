@@ -165,7 +165,7 @@ jobs:
       - name: Set up spiceio
         if: matrix.target.builder == 'spiceai-macos' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@71b9a1f2d548b19503a023e9b0c033c0931f92da # v0.9.0
+        uses: spiceai/spiceio/.github/actions/setup@2ff3b86989e1b6e142673201100420274ef78c8f # v0.11.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -173,6 +173,11 @@ jobs:
           bucket: sccache
           region: us-west-1
           immutable-objects: "true"
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}-${{ strategy.job-index }}
+          machine: ${{ runner.name }}
 
       - name: Build spiced and spice CLI
         if: matrix.target.target_os != 'darwin'
@@ -649,6 +654,12 @@ jobs:
         run: |
           ./test/models/search_01.exp
 
+      # No step retry: the 30s timeout in merge-queue job 103597842965 fired
+      # while Qwen2.5-3B was still streaming a long answer on Metal, not on a
+      # Hub download (config probe HTTP 200; `search_01.exp` had already
+      # passed). chat_01_simple.exp now waits 120s per turn (override with
+      # SPICE_CHAT_EXPECT_TIMEOUT) and spicepod_hf.yml caps
+      # hf_max_completion_tokens at 64. A timeout after that is a hang.
       - name: Test chat
         run: |
           ./test/models/chat_01_simple.exp

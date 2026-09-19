@@ -263,6 +263,7 @@ async fn test_metrics_endpoint_rate_limit_e2e() -> Result<(), anyhow::Error> {
                 None,
                 Some(RateLimits::new().with_metrics_endpoint_limit(metrics_quota)),
                 None,
+                None,
             )
             .await?;
 
