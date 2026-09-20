@@ -102,13 +102,12 @@ pub enum CachingPolicy {
     Lru,
     /// Least Frequently Used caching policy.
     ///
-    /// Evicts the global lowest hit-count resident (full per-shard walk, not a
-    /// sampled tail). Suitable for stable hot-key workloads where frequency
-    /// beats recency. Prefer [`Self::Lru`] for streaming/recency-biased traffic
-    /// and [`Self::TinyLfu`] as the general default for mixed
-    /// database/search/analytics. User-facing docs and PM/DX acceptance for
-    /// shipping this value are tracked in
-    /// <https://github.com/spiceai/spiceai/issues/14211>.
+    /// Evicts the lowest hit-count resident, chosen by a full walk of each
+    /// shard rather than a sampled tail. Choose it when a stable set of keys is
+    /// read far more often than the rest and you want that set to survive a
+    /// burst of one-off queries. Prefer `lru` when traffic is recency-biased,
+    /// such as streaming or time-windowed reads, and `tiny_lfu` as the general
+    /// default for mixed database, search and analytics workloads.
     Lfu,
     /// W-`TinyLFU` caching policy.
     /// Admission window + SLRU main (probation/protected) with Count-Min Sketch.
