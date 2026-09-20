@@ -368,7 +368,8 @@ pub struct EvaluateResponse {
     /// Versioned model id that answered (e.g. `jev-1.13.0`), when the provider reports it.
     pub model: String,
     #[serde(deserialize_with = "deserialize_nonempty_answers")]
-    #[schemars(length(min = 1))]
+    #[schemars(extend("minProperties" = 1))]
+    #[cfg_attr(feature = "openapi", schema(min_properties = 1))]
     pub answers: BTreeMap<String, Answer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,

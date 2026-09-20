@@ -6857,7 +6857,8 @@
             },
             "propertyNames": {
               "type": "string"
-            }
+            },
+            "minProperties": 1
           },
           "model": {
             "type": "string",

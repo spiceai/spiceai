@@ -28,7 +28,7 @@ mod list_models;
 use list_models::ModelsResponse;
 pub use list_models::TypeSafeModelLister;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -179,9 +179,12 @@ impl TypeSafe {
                             "question '{id}': answer '{choice}' is not one of its options"
                         )));
                     }
-                    check_distribution(id, probabilities, *confidence, |key| {
-                        criteria.contains_key(key)
-                    })
+                    check_distribution(
+                        id,
+                        probabilities,
+                        *confidence,
+                        criteria.keys().map(String::as_str),
+                    )
                     .map_err(bad)?;
                 }
                 (
@@ -215,13 +218,17 @@ impl TypeSafe {
                             )));
                         }
                     }
-                    check_distribution(id, probabilities, *confidence, |key| {
-                        legend.contains_key(key)
-                            || key
-                                .parse::<usize>()
-                                .ok()
-                                .is_some_and(|idx| idx <= top_idx)
-                    })
+                    let domain: Vec<String> = if legend.is_empty() {
+                        (0..=top_idx).map(|i| i.to_string()).collect()
+                    } else {
+                        legend.keys().cloned().collect()
+                    };
+                    check_distribution(
+                        id,
+                        probabilities,
+                        *confidence,
+                        domain.iter().map(String::as_str),
+                    )
                     .map_err(bad)?;
                 }
                 _ => {}
@@ -248,21 +255,30 @@ fn is_probability(value: f64) -> bool {
     value.is_finite() && (0.0..=1.0).contains(&value)
 }
 
-/// Confidence and every probability in the distribution must be a probability,
-/// and each probability key must belong to the question's domain.
-fn check_distribution(
+/// Confidence and every probability in the distribution must be a probability.
+/// The distribution must cover exactly the question's domain — no missing keys,
+/// no extras.
+fn check_distribution<'a>(
     id: &str,
     probabilities: &BTreeMap<String, f64>,
     confidence: f64,
-    allowed_key: impl Fn(&str) -> bool,
+    domain: impl IntoIterator<Item = &'a str>,
 ) -> std::result::Result<(), String> {
     if !is_probability(confidence) {
         return Err(format!(
             "question '{id}': confidence {confidence} is outside [0, 1]"
         ));
     }
+    let domain: BTreeSet<&str> = domain.into_iter().collect();
+    for key in &domain {
+        if !probabilities.contains_key(*key) {
+            return Err(format!(
+                "question '{id}': probability key '{key}' is missing from the distribution"
+            ));
+        }
+    }
     for (key, p) in probabilities {
-        if !allowed_key(key) {
+        if !domain.contains(key.as_str()) {
             return Err(format!(
                 "question '{id}': probability key '{key}' is not in the question's domain"
             ));
@@ -859,7 +875,7 @@ mod tests {
             &server,
             json!({"model": "jev-latest", "answers": {"q": {
                 "type": "choice", "choice": "billing",
-                "probabilities": {"billing": 1.0}, "confidence": 4.2
+                "probabilities": {"billing": 1.0, "technical": 0.0}, "confidence": 4.2
             }}}),
         )
         .await;
@@ -889,7 +905,7 @@ mod tests {
             &server,
             json!({"model": "jev-latest", "answers": {"q": {
                 "type": "choice", "choice": "billing",
-                "probabilities": {"billing": 0.9, "legal": 0.1}, "confidence": 0.9
+                "probabilities": {"billing": 0.9, "technical": 0.0, "legal": 0.1}, "confidence": 0.9
             }}}),
         )
         .await;
