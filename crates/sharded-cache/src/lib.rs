@@ -232,9 +232,19 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
     pub fn insert(&self, key: u64, value: V, weight: usize) {
         let weight = u64::try_from(weight).unwrap_or(u64::MAX);
         let shard_idx = shard_index(key);
+        // Everything this call ends up owning — the resident it displaced, the
+        // entries it expired, and the replacement itself when it is refused —
+        // is carried out of the gate before it is dropped. `V` can own a whole
+        // query result, and a `Drop` that re-entered `invalidate_matching`
+        // would wait on the gate's write lock, which this read guard cannot
+        // release until that destructor returns.
+        let mut rejected: Option<V> = None;
+        let mut displaced: Option<std::sync::Arc<V>> = None;
+        let mut stale: Option<(std::sync::Arc<V>, u64)> = None;
+        let mut expired: Vec<std::sync::Arc<V>> = Vec::new();
         // Hold the invalidate gate across publish so `invalidate_matching`
         // cannot observe a stable epoch while this write is still invisible.
-        {
+        let admitted = {
             let _gate = self.invalidate_gate.read();
             // Apply deferred get-path promotes before admission so eviction sees
             // up-to-date region / frequency state for this shard.
@@ -257,46 +267,56 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
                     );
                 }
                 // Release the shard before dropping V (stale and/or rejected) so a
-                // costly or re-entrant Drop cannot stall this shard.
+                // costly or re-entrant Drop cannot stall this shard; the gate
+                // below is released before either one is dropped.
                 drop(shard);
-                drop(removed);
-                drop(value);
-                return;
-            }
-            // Sample TTL after the shard lock so wait time is not charged to the
-            // entry (and so TinyLFU can expire this shard before admission).
-            let now = Instant::now();
+                stale = removed;
+                rejected = Some(value);
+                false
+            } else {
+                // Sample TTL after the shard lock so wait time is not charged to the
+                // entry (and so TinyLFU can expire this shard before admission).
+                let now = Instant::now();
 
-            let mut expired = Vec::new();
-            if matches!(self.policy, EvictionPolicy::TinyLfu) {
-                let before_window = shard.window_weight();
-                let before_protected = shard.protected_weight();
-                let (values, expired_weight) = shard.expire_older_than(now, self.ttl);
-                if expired_weight > 0 {
-                    self.sub_weight(expired_weight);
+                if matches!(self.policy, EvictionPolicy::TinyLfu) {
+                    let before_window = shard.window_weight();
+                    let before_protected = shard.protected_weight();
+                    let (values, expired_weight) = shard.expire_older_than(now, self.ttl);
+                    if expired_weight > 0 {
+                        self.sub_weight(expired_weight);
+                    }
+                    self.sync_segment_weights_after_removal(
+                        before_window,
+                        shard.window_weight(),
+                        before_protected,
+                        shard.protected_weight(),
+                    );
+                    expired = values;
+                    shard.increment_sketch(key);
                 }
-                self.sync_segment_weights_after_removal(
-                    before_window,
-                    shard.window_weight(),
-                    before_protected,
-                    shard.protected_weight(),
-                );
-                expired = values;
-                shard.increment_sketch(key);
-            }
 
-            let (delta, replaced) = shard.insert(key, value, weight, now);
-            // Publish the weight before releasing the shard so a concurrent
-            // remove of this key cannot subtract before the matching add.
-            self.apply_delta(&delta);
-            drop(shard);
-            self.note_write();
-            drop(replaced);
-            for _ in expired {
-                L::on_evict(EvictionReason::Expired);
+                let (delta, replaced) = shard.insert(key, value, weight, now);
+                // Publish the weight before releasing the shard so a concurrent
+                // remove of this key cannot subtract before the matching add.
+                self.apply_delta(&delta);
+                drop(shard);
+                self.note_write();
+                displaced = replaced;
+                #[cfg(test)]
+                self.wait_after_publish();
+                true
             }
-            #[cfg(test)]
-            self.wait_after_publish();
+        };
+        // The gate is released here, so these drops and reports cannot stall a
+        // writer or deadlock one that re-enters the cache.
+        drop(stale);
+        drop(rejected);
+        drop(displaced);
+        for _ in expired.drain(..) {
+            L::on_evict(EvictionReason::Expired);
+        }
+        if !admitted {
+            return;
         }
         self.evict_to_limit(shard_idx, Some(key));
     }
@@ -2506,6 +2526,46 @@ mod drop_outside_locks_tests {
             SAW_LOCKED_SHARD.with(Cell::get),
             Some(false),
             "the declined value must be dropped after the shard is unlocked"
+        );
+        PROBE_CACHE.with(|c| c.set(None));
+    }
+
+    /// `insert` holds the gate across its publish. The resident it displaces
+    /// must not be dropped under that guard: a `Drop` re-entering
+    /// `invalidate_matching` would wait for the gate's write lock that this
+    /// read guard cannot release until the destructor returns.
+    #[test]
+    fn insert_drops_the_resident_it_displaces_outside_the_gate() {
+        let cache = cache();
+        cache.insert(KEY, Probe, 8);
+        PROBE_CACHE.with(|c| c.set(Some(Arc::downgrade(&cache))));
+        SAW_HELD_GATE.with(|f| f.set(false));
+
+        // Displaces the resident above, so `insert` owns its `Arc` on return.
+        cache.insert(KEY, Probe, 8);
+
+        assert!(
+            !SAW_HELD_GATE.with(Cell::get),
+            "a displaced resident must not be dropped while the gate is held"
+        );
+        PROBE_CACHE.with(|c| c.set(None));
+    }
+
+    /// The refused-admission path owns the replacement it was handed, and any
+    /// stale resident it removed on the way out. Both leave the gate first.
+    #[test]
+    fn an_oversized_insert_drops_its_value_outside_the_gate() {
+        let cache = cache();
+        cache.insert(KEY, Probe, 8);
+        PROBE_CACHE.with(|c| c.set(Some(Arc::downgrade(&cache))));
+        SAW_HELD_GATE.with(|f| f.set(false));
+
+        // Heavier than the whole budget, so admission is refused.
+        cache.insert(KEY, Probe, 4 * 1024 * 1024);
+
+        assert!(
+            !SAW_HELD_GATE.with(Cell::get),
+            "a refused value must not be dropped while the gate is held"
         );
         PROBE_CACHE.with(|c| c.set(None));
     }
