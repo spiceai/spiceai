@@ -601,10 +601,9 @@ impl RuntimeBuilder {
                     sql_results.cache_key_type,
                     spicepod::component::caching::CacheKeyType::Sql
                 ) {
-                    tracing::error!(
-                        "SQL results cache warmup requires cache_key_type: plan (or the default).                          cache_key_type: sql hashes raw SQL without parameters, so warmed entries                          cannot be hit. Disable warmup or set cache_key_type: plan."
+                    panic!(
+                        "invalid spicepod: SQL results cache warmup requires cache_key_type: plan                          (or the default). cache_key_type: sql hashes raw SQL without parameters,                          so warmed entries cannot be hit. Disable warmup or set cache_key_type: plan."
                     );
-                    return false;
                 }
                 true
             });
