@@ -312,6 +312,29 @@ impl From<String> for EvaluateState {
     }
 }
 
+/// `minProperties` has no utoipa attribute, but `ObjectBuilder` supports it, so these
+/// describe the two maps that must carry at least one entry.
+#[cfg(feature = "openapi")]
+fn nonempty_map_of(component: &str) -> utoipa::openapi::schema::Object {
+    utoipa::openapi::ObjectBuilder::new()
+        .schema_type(utoipa::openapi::schema::SchemaType::new(
+            utoipa::openapi::schema::Type::Object,
+        ))
+        .additional_properties(Some(utoipa::openapi::Ref::from_schema_name(component)))
+        .min_properties(Some(1))
+        .build()
+}
+
+#[cfg(feature = "openapi")]
+fn nonempty_question_map() -> utoipa::openapi::schema::Object {
+    nonempty_map_of("Question")
+}
+
+#[cfg(feature = "openapi")]
+fn nonempty_answer_map() -> utoipa::openapi::schema::Object {
+    nonempty_map_of("Answer")
+}
+
 /// Request body for `POST /v1/evaluate` and provider System One calls.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -324,7 +347,7 @@ pub struct EvaluateRequest {
     /// `/v1/evaluate` handler enforces that so an empty map returns the endpoint's
     /// documented 400 body rather than an extractor rejection.
     #[schemars(extend("minProperties" = 1))]
-    #[cfg_attr(feature = "openapi", schema(min_properties = 1))]
+    #[cfg_attr(feature = "openapi", schema(schema_with = nonempty_question_map))]
     pub questions: BTreeMap<String, Question>,
 }
 
@@ -369,7 +392,7 @@ pub struct EvaluateResponse {
     pub model: String,
     #[serde(deserialize_with = "deserialize_nonempty_answers")]
     #[schemars(extend("minProperties" = 1))]
-    #[cfg_attr(feature = "openapi", schema(min_properties = 1))]
+    #[cfg_attr(feature = "openapi", schema(schema_with = nonempty_answer_map))]
     pub answers: BTreeMap<String, Answer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
