@@ -132,6 +132,11 @@ pub enum Error {
         "Failed to register dataset {dataset_name} (s3): `refresh_mode: changes` needs `from` to name an S3 prefix, but '{from}' names a single object. Point `from` at the prefix that holds the objects (for example 's3://bucket/events/'), or keep this object on `refresh_mode: full`. See: {S3_DOCS}"
     ))]
     FromNamesAnObject { dataset_name: String, from: String },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} (s3): `refresh_mode: changes` does not support unstructured text objects. Set `file_format` to `parquet`, `csv`, or `json` (or point `from` at objects with one of those extensions). See: {S3_DOCS}"
+    ))]
+    UnstructuredTextUnsupported { dataset_name: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -626,6 +631,7 @@ impl S3ChangesConfig {
                 if params.get("auth").expose().ok() == Some("public") {
                     return PublicAuthCannotConsumeSqsSnafu { dataset_name }.fail();
                 }
+                ensure_structured_file_format(params, dataset)?;
 
                 let on_object_removed = match params.get("on_object_removed").expose().ok() {
                     None => OnObjectRemoved::Ignore,
@@ -671,6 +677,45 @@ impl S3ChangesConfig {
             }
         }
     }
+}
+
+
+/// Changes-mode object reads go through `create_listing_table`, which cannot
+/// open unstructured text. Refuse at validate time so startup does not accept
+/// a config that then errors on every notification.
+fn ensure_structured_file_format(params: &Parameters, dataset: &DatasetSpec) -> Result<()> {
+    let file_format = params
+        .get("file_format")
+        .expose()
+        .ok()
+        .map(str::to_ascii_lowercase)
+        .filter(|v| !v.is_empty());
+    let path_extension = dataset
+        .from
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, ext)| ext.to_ascii_lowercase());
+
+    const STRUCTURED: &[&str] = &["parquet", "csv", "json", "tsv", "jsonl", "ndjson", "ldjson"];
+    let explicit_ok = file_format
+        .as_deref()
+        .is_some_and(|fmt| STRUCTURED.contains(&fmt));
+    let inferred_ok = path_extension
+        .as_deref()
+        .is_some_and(|ext| STRUCTURED.contains(&ext));
+
+    // `auto` still needs a structured path extension; a bare prefix has none.
+    let auto_ok = file_format.as_deref() == Some("auto") && inferred_ok;
+
+    if explicit_ok || inferred_ok || auto_ok {
+        return Ok(());
+    }
+
+    UnstructuredTextUnsupportedSnafu {
+        dataset_name: dataset.name.to_string(),
+    }
+    .fail()
 }
 
 fn parse_backfill_interval(params: &Parameters, dataset_name: &str) -> Result<Duration> {
@@ -2100,6 +2145,7 @@ mod tests {
         let params = test_params(vec![
             ("s3_changes_queue_url", QUEUE_URL),
             ("s3_auth", "iam_role"),
+            ("file_format", "parquet"),
         ])
         .await;
         let config = S3ChangesConfig::try_from_params(&params, &events_dataset())
@@ -2177,6 +2223,39 @@ mod tests {
         let error = S3ChangesConfig::try_from_params(&params, &events_dataset())
             .expect_err("public auth cannot consume SQS");
         assert!(error.to_string().contains("public"));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_unstructured_text_without_file_format() {
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_auth", "iam_role"),
+        ])
+        .await;
+        let error = S3ChangesConfig::try_from_params(&params, &events_dataset())
+            .expect_err("unstructured text must fail closed for changes mode");
+        let message = error.to_string();
+        assert!(
+            message.contains("unstructured text"),
+            "must name unstructured text, got: {message}"
+        );
+        assert!(
+            message.contains("file_format"),
+            "must tell the operator to set file_format, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_structured_file_format() {
+        let params = test_params(vec![
+            ("s3_changes_queue_url", QUEUE_URL),
+            ("s3_auth", "iam_role"),
+            ("file_format", "parquet"),
+        ])
+        .await;
+        S3ChangesConfig::try_from_params(&params, &events_dataset())
+            .expect("parquet changes config")
+            .expect("changes enabled");
     }
 
     #[tokio::test]
@@ -2325,6 +2404,7 @@ mod tests {
             ("s3_changes_key_prefix", "events/year=2026"),
             ("s3_on_object_removed", "rebuild"),
             ("s3_changes_backfill_interval", "30m"),
+            ("file_format", "parquet"),
         ])
         .await;
         let config = S3ChangesConfig::try_from_params(&params, &events_dataset())
