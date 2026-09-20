@@ -137,6 +137,11 @@ pub enum Error {
         "Failed to register dataset {dataset_name} (s3): `refresh_mode: changes` does not support unstructured text objects. Set `file_format` to `parquet`, `csv`, or `json` (or point `from` at objects with one of those extensions). See: {S3_DOCS}"
     ))]
     UnstructuredTextUnsupported { dataset_name: String },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} (s3): `s3_changes_queue_url` value '{url}' is not an SQS queue URL. Use a URL like https://sqs.<region>.amazonaws.com/<account>/<queue>. See: {S3_DOCS}"
+    ))]
+    QueueUrlNotHttp { dataset_name: String, url: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -627,6 +632,13 @@ impl S3ChangesConfig {
             (Some(url), true) => {
                 if url.starts_with("arn:") {
                     return QueueUrlIsArnSnafu { dataset_name }.fail();
+                }
+                if !(url.starts_with("https://") || url.starts_with("http://")) {
+                    return QueueUrlNotHttpSnafu {
+                        dataset_name,
+                        url: url.to_string(),
+                    }
+                    .fail();
                 }
                 if params.get("auth").expose().ok() == Some("public") {
                     return PublicAuthCannotConsumeSqsSnafu { dataset_name }.fail();
@@ -2211,6 +2223,24 @@ mod tests {
             .expect_err("ARN must be refused");
         assert!(error.to_string().contains("not an ARN"));
         assert!(error.to_string().contains("s3_changes_queue_url"));
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_a_non_url_queue_value() {
+        let params = test_params(vec![
+            ("s3_changes_queue_url", "not-a-url"),
+            ("s3_auth", "iam_role"),
+            ("s3_changes_region", "us-east-1"),
+            ("file_format", "parquet"),
+        ])
+        .await;
+        let error = S3ChangesConfig::try_from_params(&params, &events_dataset())
+            .expect_err("non-URL queue values must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("not an SQS queue URL"),
+            "must reject non-URL queue values, got: {message}"
+        );
     }
 
     #[tokio::test]
