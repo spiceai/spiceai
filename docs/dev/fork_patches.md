@@ -105,10 +105,10 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `3af703dba0accdff5fdb0ae92ef12588e1dfe88a` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `97248459e6581e289e1f2ad364049f47a4387192` | `spiceai-54` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `333f1651cce801bab9fb07ffa62d3a5db8b02a0e` | `spiceai-54` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
-| [duckdb-rs](#duckdb-rs) | `4939f16b5462c869ca44a35a7f5f8df61a432a24` | `spiceai-1.4.4` |
+| [duckdb-rs](#duckdb-rs) | `76655d2ffc1b1e4dfc886de561759b70ead48b96` | `spiceai-1.4.4` |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `351d1bc7b6ac9a835397e248e9c687f305e947d1` | `spiceai-0.10.1-df-54` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
