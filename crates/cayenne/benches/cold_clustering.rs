@@ -37,7 +37,8 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BinaryArray, Int64Array};
 use cayenne::__bench_clustering::cluster_keys;
-use criterion::{Criterion, Throughput, black_box};
+use criterion::{Criterion, Throughput};
+use std::hint::black_box;
 
 /// Grid side length: `GRID * GRID` points.
 const GRID: i64 = 64;

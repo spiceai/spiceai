@@ -27,7 +27,10 @@ limitations under the License.
 use crate::identity::push_identity_fields;
 use crate::nested_connection::{NestedConnection, fan_out};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use connector_graphql::graphql::{ErrorChecker, GraphQLContext, Result, client::UnnestBehavior};
+use connector_graphql::graphql::{
+    ErrorChecker, GraphQLContext, Result,
+    client::{NestedConnectionPager, UnnestBehavior},
+};
 use data_connector_api::ConnectorComponent;
 use serde_json::Value;
 use std::sync::Arc;
@@ -41,6 +44,17 @@ const RELEASE_ID_KEY: &str = "release_id";
 
 /// Response key holding the release's tag on every asset row.
 const RELEASE_TAG_NAME_KEY: &str = "release_tag_name";
+
+const ASSET_NODE_SELECTION: &str = r"
+    id
+    name
+    size
+    url: downloadUrl
+    download_count: downloadCount
+    content_type: contentType
+    created_at: createdAt
+    updated_at: updatedAt
+";
 
 /// Fans each release's `releaseAssets` connection out into one row per asset.
 const RELEASE_ASSETS_CONNECTION: NestedConnection<'static> = NestedConnection {
@@ -71,9 +85,7 @@ impl GraphQLContext for ReleaseAssetsTableArgs {
     }
 
     fn query_cost(&self) -> Option<u32> {
-        // 1 (releases) + 100 (releaseAssets per release)
-        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
-        Some(1 + ASSETS_PER_RELEASE)
+        Some(crate::rate_limit::graphql_secondary_query_cost())
     }
 }
 
@@ -100,15 +112,12 @@ impl GitHubTableArgs for ReleaseAssetsTableArgs {
                             {release_tag_name}: tagName
                             releaseAssets(first: {assets_per_release}) {{
                                 totalCount
+                                pageInfo {{
+                                    hasNextPage
+                                    endCursor
+                                }}
                                 nodes {{
-                                    id
-                                    name
-                                    size
-                                    url: downloadUrl
-                                    download_count: downloadCount
-                                    content_type: contentType
-                                    created_at: createdAt
-                                    updated_at: updatedAt
+                                    {asset_node_selection}
                                 }}
                             }}
                         }}
@@ -121,6 +130,7 @@ impl GitHubTableArgs for ReleaseAssetsTableArgs {
             assets_per_release = ASSETS_PER_RELEASE,
             release_id = RELEASE_ID_KEY,
             release_tag_name = RELEASE_TAG_NAME_KEY,
+            asset_node_selection = ASSET_NODE_SELECTION,
         );
 
         let owner = self.owner.clone();
@@ -134,6 +144,13 @@ impl GitHubTableArgs for ReleaseAssetsTableArgs {
             })),
             Some(gql_schema()),
         )
+        .with_nested_pager(NestedConnectionPager {
+            connection_key: "releaseAssets",
+            parent_id_key: RELEASE_ID_KEY,
+            type_condition: "Release",
+            node_selection: ASSET_NODE_SELECTION,
+            page_size: ASSETS_PER_RELEASE,
+        })
     }
 }
 
@@ -210,6 +227,14 @@ mod tests {
                 ]
             }
         })
+    }
+
+    #[test]
+    fn query_requests_page_info_so_overflow_assets_can_be_paginated() {
+        crate::test_util::assert_nested_pager_wired(
+            &args().get_graphql_values(),
+            "releaseAssets(first:",
+        );
     }
 
     #[test]

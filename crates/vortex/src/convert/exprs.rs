@@ -315,11 +315,44 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
                 return Ok(lit(Scalar::from(in_list.negated())));
             };
 
-            let list = Scalar::list(
-                first_element.dtype().clone(),
-                list_elements,
-                Nullability::Nullable,
-            );
+            // `Scalar::list` compares every element's dtype against the list's
+            // element dtype including nullability, and panics on a mismatch —
+            // inside the scan, so it surfaces as a panicked task rather than an
+            // error a caller can report. DataFusion types a NULL in an `IN` list
+            // as a nullable value of the list's type and the elements that carry
+            // a value as non-nullable, so the first element's dtype describes the
+            // whole list only when every element agrees with it: a list holding
+            // both a NULL and a value does not, whichever comes first. Take the
+            // dtype from an element that carries a value, widen it to hold the
+            // nulls when there are any, and bring every element to it.
+            let holds_a_null = list_elements.iter().any(Scalar::is_null);
+            let element_dtype = list_elements
+                .iter()
+                .find(|element| !element.is_null())
+                .unwrap_or(first_element)
+                .dtype()
+                .clone();
+            let element_dtype = if holds_a_null {
+                element_dtype.as_nullable()
+            } else {
+                element_dtype
+            };
+
+            let list_elements: Vec<Scalar> = list_elements
+                .into_iter()
+                .map(|element| {
+                    if element.dtype() == &element_dtype {
+                        return Ok(element);
+                    }
+                    element.cast(&element_dtype).map_err(|e| {
+                        exec_datafusion_err!(
+                            "Failed to convert IN list literal to a Vortex scalar: {e}"
+                        )
+                    })
+                })
+                .try_collect()?;
+
+            let list = Scalar::list(element_dtype, list_elements, Nullability::Nullable);
             let expr = list_contains(lit(list), value);
 
             return Ok(if in_list.negated() { not(expr) } else { expr });

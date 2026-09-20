@@ -44,7 +44,7 @@ jobs:
     # Emit the required context on pull requests without running the expensive
     # feature matrix; the real check runs on the merge-group commit.
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: spiceai-macos
+    runs-on: spiceai-macos-large
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
