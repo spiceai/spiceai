@@ -437,10 +437,12 @@ impl Embed for Databricks {
             .boxed()
             .context(FailedToCreateEmbeddingSnafu)?;
 
-        let vectors: Vec<Vec<f32>> = resp
+        // Consume the response: nothing else reads it, so a uniquely owned one
+        // moves its embeddings rather than copying every dimension.
+        let vectors: Vec<Vec<f32>> = std::sync::Arc::unwrap_or_clone(resp)
             .data
-            .iter()
-            .map(|emb| emb.embedding.clone().into())
+            .into_iter()
+            .map(|emb| emb.embedding.into())
             .collect();
 
         let vectors = std::sync::Arc::new(vectors);

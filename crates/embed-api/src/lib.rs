@@ -267,13 +267,16 @@ pub trait Embed: Debug + Sync + Send {
         Ok(Arc::new(CreateEmbeddingResponse {
             object: "list".to_string(),
             model: req.model.clone(),
-            data: result
-                .iter()
+            // `unwrap_or_clone` so an uncached result, which owns its `Arc`
+            // alone, moves its vectors here instead of copying every one of
+            // them; a result shared with the cache still clones.
+            data: Arc::unwrap_or_clone(result)
+                .into_iter()
                 .enumerate()
                 .map(|(i, emb)| Embedding {
                     index: i as u32,
                     object: "embedding".to_string(),
-                    embedding: encode_embedding(&format, emb.clone()),
+                    embedding: encode_embedding(&format, emb),
                 })
                 .collect(),
             usage: EmbeddingUsage {

@@ -243,9 +243,11 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
             Ok([single]) => return Ok(single),
             Err(batches) => batches,
         };
+        // Each batch that is not shared with the cache is moved out of its
+        // `Arc` rather than copied vector by vector.
         let combined: Vec<Vec<f32>> = batches
-            .iter()
-            .flat_map(|batch| batch.iter().cloned())
+            .into_iter()
+            .flat_map(std::sync::Arc::unwrap_or_clone)
             .collect();
         Ok(std::sync::Arc::new(combined))
     }

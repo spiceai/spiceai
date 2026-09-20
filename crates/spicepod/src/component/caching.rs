@@ -106,8 +106,9 @@ pub enum CachingPolicy {
     /// shard rather than a sampled tail. Choose it when a stable set of keys is
     /// read far more often than the rest and you want that set to survive a
     /// burst of one-off queries. Prefer `lru` when traffic is recency-biased,
-    /// such as streaming or time-windowed reads, and `tiny_lfu` as the general
-    /// default for mixed database, search and analytics workloads.
+    /// such as streaming or time-windowed reads, and `tiny_lfu` as the
+    /// general-purpose choice for mixed database, search and analytics
+    /// workloads. The default remains `lru`.
     Lfu,
     /// W-`TinyLFU` caching policy.
     /// Admission window + SLRU main (probation/protected) with Count-Min Sketch.

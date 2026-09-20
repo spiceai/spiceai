@@ -48,7 +48,7 @@ mod shard;
 mod sketch;
 
 use parking_lot::{Mutex, RwLock};
-use shard::{GetOutcome, Shard};
+use shard::{GetOutcome, ReplaceOutcome, Shard};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -379,30 +379,45 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             return false;
         }
         let shard_idx = shard_index(key);
+        // Whichever value this call ends up owning — the resident it displaced,
+        // or the replacement a decline hands back — leaves scope only after the
+        // shard mutex and the invalidate gate are both released. `V` can own a
+        // whole query result, so a costly `Drop` here would stall every reader
+        // of this shard, and one that re-enters the cache would deadlock
+        // against the gate.
+        let mut old_resident: Option<std::sync::Arc<V>> = None;
+        let mut declined: Option<V> = None;
         let replaced = {
             let _gate = self.invalidate_gate.read();
             self.drain_touches_blocking(shard_idx);
             let mut shard = self.shards[shard_idx].0.lock();
             let now = Instant::now();
-            let Some((replaced, delta, old)) =
-                shard.replace_if(key, value, weight, now, keep_ttl, should_replace)
-            else {
-                return false;
-            };
-            if replaced {
-                self.apply_delta(&delta);
-                self.note_write();
+            match shard.replace_if(key, value, weight, now, keep_ttl, should_replace) {
+                ReplaceOutcome::Replaced { delta, old } => {
+                    self.apply_delta(&delta);
+                    drop(shard);
+                    self.note_write();
+                    old_resident = Some(old);
+                    true
+                }
+                ReplaceOutcome::Declined { value } => {
+                    drop(shard);
+                    declined = Some(value);
+                    false
+                }
             }
-            drop(shard);
-            drop(old);
-            replaced
         };
+        drop(old_resident);
+        drop(declined);
+        if !replaced {
+            return false;
+        }
         // Segment caps (window/protected) can require trim even when total
         // weight is still under max_weight — same predicate as insert overflow.
-        if replaced && self.needs_overflow_trim() {
+        if self.needs_overflow_trim() {
             self.evict_to_limit(shard_idx, Some(key));
         }
-        replaced
+        true
     }
 
     /// Remove `key` if present. This is not an eviction and is not reported.
@@ -538,17 +553,43 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
         let mut removed = self.invalidate_matching_once(&predicate);
         // Wait for in-flight writers and block new publishes before the
         // epoch comparison so nothing can land between "stable" and return.
-        let _gate = self.invalidate_gate.write();
+        let gate = self.invalidate_gate.write();
         if self.write_epoch.load(Ordering::Acquire) == start {
             return removed;
         }
         // Epoch moved during the optimistic pass: one gated final pass.
         // Writers are blocked on the gate, so this pass observes a stable set.
-        removed += self.invalidate_matching_once(&predicate);
+        // Its values and eviction reports are carried out of the gate rather
+        // than handled under it: every writer is held out for as long as this
+        // pass runs, and `V` can own a whole query result, so dropping a shard's
+        // worth of them here would charge that cost to every waiting writer —
+        // and a `Drop` that re-entered the cache would deadlock against the gate
+        // it is still holding.
+        let mut drained = Vec::new();
+        removed += self.invalidate_matching_once_into(&predicate, Some(&mut drained));
+        drop(gate);
+        for value in drained {
+            drop(value);
+            L::on_evict(EvictionReason::Invalidated);
+        }
         removed
     }
 
     fn invalidate_matching_once<F>(&self, predicate: &F) -> usize
+    where
+        F: Fn(&V) -> bool,
+    {
+        self.invalidate_matching_once_into(predicate, None)
+    }
+
+    /// One pass over every shard. With `defer`, the removed values are handed
+    /// to the caller instead of being dropped and reported here, so a caller
+    /// holding the invalidate gate can release it first.
+    fn invalidate_matching_once_into<F>(
+        &self,
+        predicate: &F,
+        mut defer: Option<&mut Vec<std::sync::Arc<V>>>,
+    ) -> usize
     where
         F: Fn(&V) -> bool,
     {
@@ -569,8 +610,12 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             #[cfg(test)]
             self.run_after_invalidate_shard(shard_idx);
             removed += values.len();
-            for _ in values {
-                L::on_evict(EvictionReason::Invalidated);
+            if let Some(defer) = defer.as_deref_mut() {
+                defer.extend(values);
+            } else {
+                for _ in values {
+                    L::on_evict(EvictionReason::Invalidated);
+                }
             }
         }
         removed
@@ -2393,5 +2438,130 @@ mod tests {
             "B (still colder) must be the reselected victim"
         );
         assert!(cache.get(&2).is_some());
+    }
+}
+
+#[cfg(test)]
+mod drop_outside_locks_tests {
+    use super::{ShardedCache, shard_index};
+    use std::cell::Cell;
+    use std::sync::{Arc, Weak};
+    use std::time::Duration;
+
+    const KEY: u64 = 7;
+
+    thread_local! {
+        /// Weak so the cache can be dropped normally at the end of the test;
+        /// the probe simply stops reporting once it is gone.
+        static PROBE_CACHE: Cell<Option<Weak<ShardedCache<Probe>>>> = const { Cell::new(None) };
+        /// Whether the most recent `Probe` drop found this key's shard locked.
+        static SAW_LOCKED_SHARD: Cell<Option<bool>> = const { Cell::new(None) };
+        /// Whether any `Probe` drop found the cache-wide invalidate gate held.
+        static SAW_HELD_GATE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// A value that reports, from its own `Drop`, whether the shard it belongs
+    /// to is still locked at that moment.
+    #[derive(Clone)]
+    struct Probe;
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let weak = PROBE_CACHE.with(Cell::take);
+            let Some(weak) = weak else { return };
+            if let Some(cache) = weak.upgrade() {
+                let locked = cache.shards[shard_index(KEY)].0.try_lock().is_none();
+                SAW_LOCKED_SHARD.with(|f| f.set(Some(locked)));
+                if cache.invalidate_gate.try_write().is_none() {
+                    SAW_HELD_GATE.with(|f| f.set(true));
+                }
+            }
+            PROBE_CACHE.with(|c| c.set(Some(weak)));
+        }
+    }
+
+    fn cache() -> Arc<ShardedCache<Probe>> {
+        Arc::new(ShardedCache::new(
+            1024 * 1024,
+            Duration::from_mins(1),
+            crate::EvictionPolicy::Lru,
+        ))
+    }
+
+    /// A `replace_if` the predicate turns down still owns the replacement it
+    /// was handed. Dropping it inside the shard lock stalls every reader of
+    /// that shard behind an arbitrary `Drop`, and deadlocks outright if that
+    /// `Drop` re-enters the cache.
+    #[test]
+    fn a_declined_replace_drops_its_value_outside_the_shard_lock() {
+        let cache = cache();
+        cache.insert(KEY, Probe, 8);
+        PROBE_CACHE.with(|c| c.set(Some(Arc::downgrade(&cache))));
+        SAW_LOCKED_SHARD.with(|f| f.set(None));
+
+        let replaced = cache.replace_if(KEY, Probe, 8, false, |_| false);
+        assert!(!replaced, "the predicate declined, so nothing was replaced");
+
+        assert_eq!(
+            SAW_LOCKED_SHARD.with(Cell::get),
+            Some(false),
+            "the declined value must be dropped after the shard is unlocked"
+        );
+        PROBE_CACHE.with(|c| c.set(None));
+    }
+
+    /// `invalidate_matching`'s gated final pass runs while every writer is
+    /// held out on `invalidate_gate.write()`. The values it removes must leave
+    /// that gate behind before they are dropped: `V` can own a whole query
+    /// result, so dropping a shard's worth under the gate charges that cost to
+    /// every waiting writer, and a `Drop` that re-entered the cache would
+    /// deadlock against the gate still being held.
+    #[test]
+    fn the_gated_invalidation_pass_drops_its_values_outside_the_gate() {
+        let cache = cache();
+        // Seed a match on another shard so the walk continues past shard 0.
+        cache.insert(1, Probe, 8);
+        PROBE_CACHE.with(|c| c.set(Some(Arc::downgrade(&cache))));
+        SAW_HELD_GATE.with(|f| f.set(false));
+
+        let cache_for_hook = Arc::clone(&cache);
+        let inserted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        cache.set_after_invalidate_shard(move |shard_idx| {
+            if shard_idx == 0 && !inserted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                // Publishing into an already-scanned shard bumps the write
+                // epoch, which is what forces the gated final pass.
+                cache_for_hook.insert(0, Probe, 8);
+            }
+        });
+
+        let removed = cache.invalidate_matching(|_| true);
+        assert!(
+            removed >= 2,
+            "seed plus mid-scan insert must both go, got {removed}"
+        );
+        assert!(
+            !SAW_HELD_GATE.with(Cell::get),
+            "no invalidated value may be dropped while the invalidate gate is held"
+        );
+        PROBE_CACHE.with(|c| c.set(None));
+    }
+
+    /// The same guarantee for the key the cache has never seen: `replace_if`
+    /// still took ownership of the replacement and still has to hand it back.
+    #[test]
+    fn a_replace_of_an_absent_key_drops_its_value_outside_the_shard_lock() {
+        let cache = cache();
+        PROBE_CACHE.with(|c| c.set(Some(Arc::downgrade(&cache))));
+        SAW_LOCKED_SHARD.with(|f| f.set(None));
+
+        let replaced = cache.replace_if(KEY, Probe, 8, false, |_| true);
+        assert!(!replaced, "there was no resident to replace");
+
+        assert_eq!(
+            SAW_LOCKED_SHARD.with(Cell::get),
+            Some(false),
+            "the value must be dropped after the shard is unlocked"
+        );
+        PROBE_CACHE.with(|c| c.set(None));
     }
 }

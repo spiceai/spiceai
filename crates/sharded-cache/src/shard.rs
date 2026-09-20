@@ -123,6 +123,18 @@ impl WeightDelta {
     }
 }
 
+/// Result of [`Shard::replace_if`].
+///
+/// A declined replace hands `value` back rather than dropping it: the caller
+/// holds the shard mutex (and the invalidate gate) across this call, and `V`
+/// can own a whole query result, so its `Drop` belongs outside both.
+pub(crate) enum ReplaceOutcome<V> {
+    /// The resident was rewritten in place. `old` is the value it displaced.
+    Replaced { delta: WeightDelta, old: Arc<V> },
+    /// No resident, or the predicate rejected the one found.
+    Declined { value: V },
+}
+
 impl<V> Shard<V> {
     pub(crate) fn new(policy: EvictionPolicy) -> Self {
         Self {
@@ -663,17 +675,19 @@ impl<V: Clone> Shard<V> {
         now: Instant,
         keep_ttl: bool,
         should_replace: F,
-    ) -> Option<(bool, WeightDelta, Option<Arc<V>>)>
+    ) -> ReplaceOutcome<V>
     where
         F: FnOnce(&V) -> bool,
     {
-        let &idx = self.map.get(&key)?;
+        let Some(&idx) = self.map.get(&key) else {
+            return ReplaceOutcome::Declined { value };
+        };
         let accept = match self.slots.get(idx as usize) {
             Some(Slot::Occupied(node)) => should_replace(node.value.as_ref()),
-            _ => return None,
+            _ => return ReplaceOutcome::Declined { value },
         };
         if !accept {
-            return Some((false, WeightDelta::default(), None));
+            return ReplaceOutcome::Declined { value };
         }
         let (old_weight, old_value, region) = match self.slots.get_mut(idx as usize) {
             Some(Slot::Occupied(node)) => {
@@ -686,7 +700,7 @@ impl<V: Clone> Shard<V> {
                 }
                 (old_weight, old_value, region)
             }
-            _ => return None,
+            _ => return ReplaceOutcome::Declined { value },
         };
         self.weight = self
             .weight
@@ -717,7 +731,10 @@ impl<V: Clone> Shard<V> {
         }
         // In-place rewrite: do not bump recency (promotion would restart LRU order).
         let _ = (idx, region);
-        Some((true, delta, Some(old_value)))
+        ReplaceOutcome::Replaced {
+            delta,
+            old: old_value,
+        }
     }
 
     fn promote(&mut self, idx: u32, region: Region) {
