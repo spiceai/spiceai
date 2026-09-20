@@ -962,7 +962,8 @@ mod tests {
             .await
             .expect_err("empty score criteria must fail closed");
         assert!(
-            err.to_string().contains("score criteria must contain at least one level"),
+            err.to_string()
+                .contains("score criteria must contain at least one level"),
             "{err}"
         );
     }
