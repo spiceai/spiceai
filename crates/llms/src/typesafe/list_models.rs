@@ -38,9 +38,12 @@ pub(super) struct ModelsResponse {
 }
 
 impl ModelsResponse {
-    /// Model ids and aliases, one per listed entry.
+    /// Canonical model ids plus every listed alias, flattened for health checks.
     pub(super) fn into_names(self) -> Vec<String> {
-        self.models.into_iter().map(|m| m.name).collect()
+        self.models
+            .into_iter()
+            .flat_map(|m| std::iter::once(m.name).chain(m.alias))
+            .collect()
     }
 }
 
@@ -48,6 +51,9 @@ impl ModelsResponse {
 struct ModelCard {
     #[serde(alias = "id")]
     name: String,
+    /// Additional names callers may configure (e.g. `jev-latest`).
+    #[serde(default)]
+    alias: Vec<String>,
 }
 
 /// `TypeSafe` model lister (`GET /v1/models`).
@@ -142,6 +148,25 @@ mod tests {
         let openai_style: ModelsResponse =
             serde_json::from_str(r#"{"data":[{"id":"jev-1.13.0"}]}"#).expect("openai style");
         assert_eq!(openai_style.models[0].name, "jev-1.13.0");
+    }
+
+    #[test]
+    fn into_names_includes_aliases() {
+        let parsed: ModelsResponse = serde_json::from_value(serde_json::json!({
+            "models": [
+                {"id": "jev-1.13.0", "alias": ["jev-latest", "jev-preview"]}
+            ]
+        }))
+        .expect("model card");
+        let names = parsed.into_names();
+        assert_eq!(
+            names,
+            vec![
+                "jev-1.13.0".to_string(),
+                "jev-latest".to_string(),
+                "jev-preview".to_string()
+            ]
+        );
     }
 
     #[test]

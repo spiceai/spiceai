@@ -179,28 +179,50 @@ impl TypeSafe {
                             "question '{id}': answer '{choice}' is not one of its options"
                         )));
                     }
-                    check_distribution(id, probabilities, *confidence).map_err(bad)?;
+                    check_distribution(id, probabilities, *confidence, |key| {
+                        criteria.contains_key(key)
+                    })
+                    .map_err(bad)?;
                 }
                 (
                     Question::Score { criteria, .. },
                     Answer::Score {
                         score,
+                        legend,
                         probabilities,
                         confidence,
-                        ..
                     },
                 ) => {
+                    let Some(top_idx) = criteria.len().checked_sub(1) else {
+                        return Err(bad(format!(
+                            "question '{id}': score criteria must contain at least one level"
+                        )));
+                    };
                     #[expect(
                         clippy::cast_precision_loss,
                         reason = "score criteria are bounded at ten levels"
                     )]
-                    let top = (criteria.len() - 1) as f64;
+                    let top = top_idx as f64;
                     if !score.is_finite() || *score < 0.0 || *score > top {
                         return Err(bad(format!(
                             "question '{id}': score {score} is outside [0, {top}]"
                         )));
                     }
-                    check_distribution(id, probabilities, *confidence).map_err(bad)?;
+                    for key in legend.keys() {
+                        if key.parse::<usize>().ok().is_none_or(|idx| idx > top_idx) {
+                            return Err(bad(format!(
+                                "question '{id}': legend key '{key}' is not in the score rubric [0, {top_idx}]"
+                            )));
+                        }
+                    }
+                    check_distribution(id, probabilities, *confidence, |key| {
+                        legend.contains_key(key)
+                            || key
+                                .parse::<usize>()
+                                .ok()
+                                .is_some_and(|idx| idx <= top_idx)
+                    })
+                    .map_err(bad)?;
                 }
                 _ => {}
             }
@@ -226,11 +248,13 @@ fn is_probability(value: f64) -> bool {
     value.is_finite() && (0.0..=1.0).contains(&value)
 }
 
-/// Confidence and every probability in the distribution must be a probability.
+/// Confidence and every probability in the distribution must be a probability,
+/// and each probability key must belong to the question's domain.
 fn check_distribution(
     id: &str,
     probabilities: &BTreeMap<String, f64>,
     confidence: f64,
+    allowed_key: impl Fn(&str) -> bool,
 ) -> std::result::Result<(), String> {
     if !is_probability(confidence) {
         return Err(format!(
@@ -238,6 +262,11 @@ fn check_distribution(
         ));
     }
     for (key, p) in probabilities {
+        if !allowed_key(key) {
+            return Err(format!(
+                "question '{id}': probability key '{key}' is not in the question's domain"
+            ));
+        }
         if !is_probability(*p) {
             return Err(format!(
                 "question '{id}': probability for '{key}' is {p}, outside [0, 1]"
@@ -848,6 +877,76 @@ mod tests {
             .expect_err("out-of-range confidence must not be published");
         assert!(
             err.to_string().contains("confidence 4.2 is outside"),
+            "{err}"
+        );
+    }
+
+    /// Probability keys must stay inside the question's own domain.
+    #[tokio::test]
+    async fn evaluate_rejects_probability_keys_outside_the_question_domain() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "choice", "choice": "billing",
+                "probabilities": {"billing": 0.9, "legal": 0.1}, "confidence": 0.9
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: choice_question("q"),
+            })
+            .await
+            .expect_err("an unknown probability key must not be published");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("probability key 'legal' is not in the question's domain"),
+            "{msg}"
+        );
+    }
+
+    /// Empty score criteria via the Rust API must not panic on `len - 1`.
+    #[tokio::test]
+    async fn evaluate_rejects_empty_score_criteria_without_panicking() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "score", "score": 0.0,
+                "legend": {"0": "low"},
+                "probabilities": {"0": 1.0}, "confidence": 0.9
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let mut questions = BTreeMap::new();
+        questions.insert(
+            "q".into(),
+            Question::Score {
+                instructions: "how bad?".into(),
+                criteria: vec![],
+            },
+        );
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions,
+            })
+            .await
+            .expect_err("empty score criteria must fail closed");
+        assert!(
+            err.to_string().contains("score criteria must contain at least one level"),
             "{err}"
         );
     }

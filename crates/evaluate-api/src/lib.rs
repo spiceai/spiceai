@@ -323,7 +323,8 @@ pub struct EvaluateRequest {
     /// Questions keyed by caller-selected identifiers. At least one is required; the
     /// `/v1/evaluate` handler enforces that so an empty map returns the endpoint's
     /// documented 400 body rather than an extractor rejection.
-    #[schemars(length(min = 1))]
+    #[schemars(extend("minProperties" = 1))]
+    #[cfg_attr(feature = "openapi", schema(min_properties = 1))]
     pub questions: BTreeMap<String, Question>,
 }
 
