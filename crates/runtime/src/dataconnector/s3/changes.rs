@@ -691,7 +691,6 @@ impl S3ChangesConfig {
     }
 }
 
-
 /// Changes-mode object reads go through `create_listing_table`, which cannot
 /// open unstructured text. Refuse at validate time so startup does not accept
 /// a config that then errors on every notification.
@@ -2375,10 +2374,7 @@ mod tests {
         assert!(
             !head_result_means_from_names_an_object(Err(object_store::Error::NotFound {
                 path: "events/part.parquet".into(),
-                source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "missing",
-                )),
+                source: Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "missing",)),
             }))
             .expect("NotFound is a prefix"),
             "NotFound alone may continue as a prefix"

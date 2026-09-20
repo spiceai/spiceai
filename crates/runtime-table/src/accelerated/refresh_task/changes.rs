@@ -6984,7 +6984,6 @@ mod tests {
         );
     }
 
-
     /// Succeeds for the first `allow` writes, then fails. Used to let a listing
     /// rebuild overwrite land and then fail a later CDC upsert in the same run.
     #[derive(Debug)]
