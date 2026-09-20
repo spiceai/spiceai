@@ -1003,7 +1003,10 @@ impl Query {
                         let records = if let Some(raw) = cached_result.raw_batches() {
                             Some(raw)
                         } else {
-                            cached_result.records().await.ok()
+                            cache_provider
+                                .records(&plan_cache_key, &cached_result)
+                                .await
+                                .ok()
                         };
                         if let Some(records) = records {
                             tracing::debug!(

@@ -1060,14 +1060,18 @@ impl Query {
         }
 
         let records = if let Some(raw) = cached_result.raw_batches() {
-            raw
+            Ok(raw)
         } else {
-            match cached_result.records().await {
-                Ok(records) => records,
-                Err(e) => {
-                    tracing::error!("Failed to decode cached query result: {e}");
-                    return Served::Undecodable(tracker);
-                }
+            match df.results_cache_provider() {
+                Some(provider) => provider.records(&raw_key, &cached_result).await,
+                None => cached_result.records().await,
+            }
+        };
+        let records = match records {
+            Ok(records) => records,
+            Err(e) => {
+                tracing::error!("Failed to decode cached query result: {e}");
+                return Served::Undecodable(tracker);
             }
         };
 
