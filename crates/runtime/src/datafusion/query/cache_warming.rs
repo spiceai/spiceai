@@ -274,9 +274,13 @@ fn apply_catalog(
     templates: Vec<WarmupTemplate>,
 ) {
     let mut catalog = catalog.lock();
-    catalog.ids = templates.iter().map(template_id).collect();
-    count.store(templates.len(), Ordering::Relaxed);
-    catalog.templates = templates;
+    // A concurrent observation may have added templates after this task
+    // snapped `local`. Keep any live entries that are not in `templates`
+    // so a stale remote apply cannot permanently drop them.
+    let merged = merge_templates(&templates, &catalog.templates);
+    catalog.ids = merged.iter().map(template_id).collect();
+    count.store(merged.len(), Ordering::Relaxed);
+    catalog.templates = merged;
 }
 
 async fn persist_remote(

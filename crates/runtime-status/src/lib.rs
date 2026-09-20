@@ -327,6 +327,17 @@ impl RuntimeStatus {
             return false;
         }
 
+        // Warmup (and similar) holds Ready until release; `/v1/ready` must stay
+        // false for both OnLoad and OnRegistration while that hold is active.
+        let hold_active = self
+            .dataset_ready_hold
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        if hold_active {
+            return false;
+        }
+
         let ready_state = *self
             .ready_state
             .read()
@@ -674,6 +685,23 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn test_is_ready_false_while_dataset_ready_hold_is_active_on_registration() {
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnRegistration);
+        status.update_dataset(&TableReference::bare("orders"), ComponentStatus::Initializing);
+        assert!(status.is_ready());
+
+        status.hold_dataset_ready();
+        assert!(
+            !status.is_ready(),
+            "an active ready-hold must keep /v1/ready false under OnRegistration"
+        );
+
+        status.release_dataset_ready();
+        assert!(status.is_ready());
+    }
+
     fn test_is_ready_on_registration_requires_registered_component() {
         let status = RuntimeStatus::new();
         let dataset = TableReference::bare("test_dataset");

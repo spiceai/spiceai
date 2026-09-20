@@ -589,7 +589,25 @@ impl RuntimeBuilder {
             .caching
             .sql_results
             .as_ref()
-            .is_some_and(|sql_results| sql_results.enabled && sql_results.warmup.is_enabled());
+            .is_some_and(|sql_results| {
+                if !(sql_results.enabled && sql_results.warmup.is_enabled()) {
+                    return false;
+                }
+                // Warmup replays plan-shaped templates (SQL + bound params). Under
+                // `cache_key_type: sql` a live literal query hashes raw SQL with no
+                // parameters, so a warmed entry can never be hit. Refuse the
+                // combination rather than silently warming dead keys.
+                if matches!(
+                    sql_results.cache_key_type,
+                    spicepod::component::caching::CacheKeyType::Sql
+                ) {
+                    tracing::error!(
+                        "SQL results cache warmup requires cache_key_type: plan (or the default).                          cache_key_type: sql hashes raw SQL without parameters, so warmed entries                          cannot be hit. Disable warmup or set cache_key_type: plan."
+                    );
+                    return false;
+                }
+                true
+            });
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
 
         // Resolve CDC tunables once at startup so the per-envelope hot path
