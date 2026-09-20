@@ -58,7 +58,7 @@ FROM orders;
 
 Observed output is `rows = 8`, `known_customers = 7`, and `distinct_customers = 4`. `COUNT(*)` counts rows. `COUNT(expression)` counts non-NULL values. A NULL customer does not become a fifth known customer.
 
-This distinction changes outer-join reports. To count orders per customer, count a nonnullable order key from the joined order relation, not `COUNT(*)`; an unmatched customer still contributes an outer-join row. Also include the tenant relationship in the join when identifiers are scoped by tenant.
+This distinction changes outer-join reports. To count orders per customer, count a nonnullable order key from the joined order relation, not `COUNT(*)`; an unmatched customer still contributes an outer-join row. Also include the tenant relationship in the join when identifiers are scoped by tenant, and keep `tenant_id` in the SELECT/GROUP BY/ORDER BY report key so tenant-scoped customer IDs cannot collapse across tenants.
 
 An empty aggregate is another common boundary:
 

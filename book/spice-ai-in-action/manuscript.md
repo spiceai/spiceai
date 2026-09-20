@@ -3892,14 +3892,14 @@ A production article contract needs a stable document key, tenant scope, content
 ## C.4 Customers with zero orders
 
 ```sql
-SELECT c.customer_id, c.customer_name,
+SELECT c.tenant_id, c.customer_id, c.customer_name,
        COUNT(o.order_id) AS order_count
 FROM customers c
 LEFT JOIN orders o
   ON c.customer_id = o.customer_id
  AND c.tenant_id = o.tenant_id
-GROUP BY c.customer_id, c.customer_name
-ORDER BY c.customer_id;
+GROUP BY c.tenant_id, c.customer_id, c.customer_name
+ORDER BY c.tenant_id, c.customer_id;
 ```
 
 The expected counts are 2, 2, 2, 1, and 0 for customers 1 through 5. Count the joined order key, not `COUNT(*)`, so the unmatched outer-join row contributes zero orders. Order 1007 has no customer and therefore belongs to none of these customer counts.

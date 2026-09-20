@@ -1,32 +1,37 @@
 [
   {
     "name": "appendix-c-1",
-    "sql": "SELECT c.customer_id, c.customer_name,\n       COUNT(o.order_id) AS order_count\nFROM customers c\nLEFT JOIN orders o\n  ON c.customer_id = o.customer_id\n AND c.tenant_id = o.tenant_id\nGROUP BY c.customer_id, c.customer_name\nORDER BY c.customer_id;\n",
+    "sql": "SELECT c.tenant_id, c.customer_id, c.customer_name,\n       COUNT(o.order_id) AS order_count\nFROM customers c\nLEFT JOIN orders o\n  ON c.customer_id = o.customer_id\n AND c.tenant_id = o.tenant_id\nGROUP BY c.tenant_id, c.customer_id, c.customer_name\nORDER BY c.tenant_id, c.customer_id;\n",
     "actual": [
       {
+        "tenant_id": "north",
         "customer_id": 1,
         "customer_name": "Ada Outfitters",
         "order_count": 2
       },
       {
+        "tenant_id": "north",
         "customer_id": 2,
         "customer_name": "Birch Books",
         "order_count": 2
       },
       {
+        "tenant_id": "north",
+        "customer_id": 5,
+        "customer_name": "Elm Studio",
+        "order_count": 0
+      },
+      {
+        "tenant_id": "south",
         "customer_id": 3,
         "customer_name": "Cedar Cycles",
         "order_count": 2
       },
       {
+        "tenant_id": "south",
         "customer_id": 4,
         "customer_name": "Dune Design",
         "order_count": 1
-      },
-      {
-        "customer_id": 5,
-        "customer_name": "Elm Studio",
-        "order_count": 0
       }
     ]
   },
