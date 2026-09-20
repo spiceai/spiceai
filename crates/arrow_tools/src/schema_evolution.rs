@@ -93,6 +93,22 @@ impl WideningPlan {
         self.widened_columns.is_empty() && self.relaxed_nullability.is_empty()
     }
 
+    /// `true` when any widened column is a decimal whose scale grew.
+    ///
+    /// Unscaled min/max integers in a Vortex stats blob are interpreted with
+    /// the *current* schema's scale, so a scale change without rewriting those
+    /// blobs silently shifts every bound (e.g. 123.45 at scale 2 becomes 1.2345
+    /// at scale 4). Callers that persist statistics must drop or rebuild them.
+    #[must_use]
+    pub fn changes_decimal_scale(&self) -> bool {
+        self.widened_columns.iter().any(|widening| {
+            match (decimal_parts(&widening.from), decimal_parts(&widening.to)) {
+                (Some((_, _, from_scale)), Some((_, _, to_scale))) => from_scale != to_scale,
+                _ => false,
+            }
+        })
+    }
+
     /// Short human summary for logs, e.g.
     /// `2 added columns (c, d), 1 widened (a: Int32 -> Int64)`.
     #[must_use]
@@ -140,6 +156,42 @@ impl WideningPlan {
             parts.join(", ")
         }
     }
+}
+
+/// `incoming` with every column of `current` that it does not name added back.
+///
+/// [`classify`] reads `incoming` as a full replacement schema, so a column it omits is a
+/// removal — and a removal is [`SchemaEvolution::Incompatible`]. A writer that builds its
+/// schema from the columns its own batch carries omits every column added since it read the
+/// schema, and would have its perfectly compatible addition refused. Restoring the current
+/// columns leaves only that writer's own additions to classify, so it evolves in one step no
+/// matter how many other writers are in flight.
+///
+/// Keeps `current`'s column order, and for a column in both keeps `incoming`'s field, so a
+/// type or nullability change is still classified.
+#[must_use]
+pub fn retain_current_columns(current: &Schema, incoming: &Schema) -> SchemaRef {
+    let mut fields: Vec<FieldRef> =
+        Vec::with_capacity(current.fields().len() + incoming.fields().len());
+    for current_field in current.fields() {
+        let field = incoming
+            .fields()
+            .iter()
+            .find(|incoming_field| incoming_field.name() == current_field.name())
+            .unwrap_or(current_field);
+        fields.push(Arc::clone(field));
+    }
+    fields.extend(
+        incoming
+            .fields()
+            .iter()
+            .filter(|incoming_field| current.field_with_name(incoming_field.name()).is_err())
+            .map(Arc::clone),
+    );
+    Arc::new(Schema::new_with_metadata(
+        fields,
+        incoming.metadata().clone(),
+    ))
 }
 
 /// Classifies `incoming` against `current` using name-based field matching.
@@ -537,6 +589,57 @@ mod tests {
         }
     }
 
+    /// A writer that never saw a column another writer just added must still be judged on
+    /// what it adds. Without restoring the current columns, its schema reads as removing
+    /// that column, which classifies as incompatible and refuses the addition.
+    #[test]
+    fn retain_current_columns_restores_columns_the_incoming_schema_never_saw() {
+        let current = Schema::new(vec![
+            Field::new("value", DataType::Float64, true),
+            Field::new("region", DataType::Utf8, true),
+            // Added by a concurrent writer, after the incoming schema was built.
+            Field::new("tier", DataType::Utf8, true),
+        ]);
+        let incoming = Schema::new(vec![
+            Field::new("value", DataType::Float64, true),
+            Field::new("region", DataType::Utf8, true),
+            // This writer's own addition.
+            Field::new("zone", DataType::Utf8, true),
+        ]);
+
+        let merged = retain_current_columns(&current, &incoming);
+
+        assert_eq!(
+            merged
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["value", "region", "tier", "zone"],
+            "the current columns keep their order, and the addition goes last"
+        );
+
+        // Classifying that against the current schema is a plain addition, not a removal.
+        let evolution = classify(&current, &merged, &NO_CONSTRAINTS);
+        assert!(
+            matches!(evolution, SchemaEvolution::Widening(_)),
+            "restoring the current columns must leave only the addition, got {evolution:?}"
+        );
+    }
+
+    /// A column both schemas name keeps the incoming field, so a type change is still seen.
+    #[test]
+    fn retain_current_columns_keeps_the_incoming_field_for_a_shared_column() {
+        let current = Schema::new(vec![Field::new("n", DataType::Int32, false)]);
+        let incoming = Schema::new(vec![Field::new("n", DataType::Int64, true)]);
+
+        let merged = retain_current_columns(&current, &incoming);
+
+        let field = merged.field_with_name("n").expect("column is present");
+        assert_eq!(field.data_type(), &DataType::Int64);
+        assert!(field.is_nullable());
+    }
+
     fn assert_identical(evolution: &SchemaEvolution) {
         assert!(
             matches!(evolution, SchemaEvolution::Identical),
@@ -694,6 +797,36 @@ mod tests {
                 (DataType::Int64, DataType::Float32),
                 (DataType::Int8, DataType::Float16),
             ]);
+        }
+
+        #[test]
+        fn decimal_scale_change_is_flagged_on_the_widening_plan() {
+            let current = Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(10, 2),
+                true,
+            )]);
+            let wider_scale = Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(14, 4),
+                true,
+            )]);
+            let plan = expect_widening(classify(&current, &wider_scale, &NO_CONSTRAINTS));
+            assert!(
+                plan.changes_decimal_scale(),
+                "Decimal128(10,2) -> Decimal128(14,4) must be reported as a scale change"
+            );
+
+            let wider_precision = Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(12, 2),
+                true,
+            )]);
+            let plan = expect_widening(classify(&current, &wider_precision, &NO_CONSTRAINTS));
+            assert!(
+                !plan.changes_decimal_scale(),
+                "precision-only widening keeps the unscaled integer's meaning"
+            );
         }
 
         #[test]

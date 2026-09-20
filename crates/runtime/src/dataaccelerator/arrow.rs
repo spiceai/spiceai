@@ -156,3 +156,68 @@ impl DataAccelerator for ArrowAccelerator {
 }
 
 data_accelerator_api::register_data_accelerator!(Engine::Arrow, ArrowAccelerator);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::dataset::acceleration::Acceleration;
+    use crate::component::dataset::schema_inference::apply_inferred_schema;
+    use crate::parameters::Parameters;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use data_components::inferred_schema::{InferredSchema, InferredSortColumn};
+    use runtime_secrets::{Secrets, get_params_with_secrets};
+    use tokio::sync::RwLock;
+
+    /// Regression test for #14023: the sort order schema inference writes into
+    /// the acceleration params must be spelled the way this accelerator's
+    /// parameter validation accepts it. An unprefixed `sort_columns` is dropped
+    /// by `Parameters::try_new` with a warning about a parameter the user never
+    /// wrote, so this drives the inferred params through the same validation the
+    /// runtime applies before the table is created.
+    #[tokio::test]
+    async fn inferred_sort_columns_survive_arrow_parameter_validation() {
+        let mut acceleration = Acceleration {
+            engine: Engine::Arrow,
+            ..Acceleration::default()
+        };
+        let inferred = InferredSchema {
+            sort_columns: vec![InferredSortColumn {
+                column: "id".to_string(),
+                desc: false,
+                nulls_first: None,
+            }],
+            ..InferredSchema::default()
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        apply_inferred_schema(
+            &mut acceleration,
+            &inferred,
+            &schema,
+            "ds",
+            RefreshMode::Full,
+        );
+
+        // The same conversion and validation the runtime applies before it
+        // creates the accelerated table.
+        let accelerator = ArrowAccelerator::new();
+        let secrets = Arc::new(RwLock::new(Secrets::new()));
+        let params_with_secrets =
+            get_params_with_secrets(Arc::clone(&secrets), &acceleration.params).await;
+        let params = Parameters::try_new(
+            "accelerator arrow",
+            params_with_secrets.into_iter().collect(),
+            accelerator.prefix(),
+            secrets,
+            accelerator.parameters(),
+        )
+        .await
+        .expect("inferred acceleration params validate");
+
+        let sort_columns = params
+            .get("sort_columns")
+            .expose()
+            .ok()
+            .expect("inferred sort order must survive parameter validation");
+        assert_eq!(sort_columns, "id ASC");
+    }
+}

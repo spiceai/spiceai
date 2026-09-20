@@ -1,0 +1,1472 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Verify that a result set honors its own query's top-level `ORDER BY`.
+//!
+//! This is a **self-check on one engine's output**, not a comparison between two
+//! engines: it needs no oracle, so it applies on every lane, including the ones
+//! that compare against a single reference engine.
+//!
+//! It exists because multiset content equality — the comparison
+//! [`super::compare_query_result_batches`] performs under
+//! [`super::RowOrder::Multiset`] — canonically sorts both sides before comparing
+//! and therefore says nothing about the order an engine actually returned. A
+//! query whose sort is wrong and whose rows are otherwise right compares equal.
+//! Checking each side against its own `ORDER BY` closes that gap without
+//! reintroducing the reason multiset equality is used in the first place:
+//! an `ORDER BY` on a non-unique key leaves the relative order of tied rows
+//! engine-dependent, and tied rows never violate the check below.
+//!
+//! # What goes unverified, and why it is reported
+//!
+//! Anything this module cannot check surfaces as [`SortCheck::Skipped`] or
+//! [`SortCheck::PartiallyOrdered`] rather than as a silent success, because a
+//! coverage hole that reads as a pass is the failure mode this whole check
+//! exists to remove. Callers must keep that distinction: see
+//! [`super::compare_query_result_batches_with_sort_check`], which returns the
+//! reasons rather than folding them into `Pass`.
+//!
+//! - **`NULL` placement, unless the query states it.** Engines disagree on where
+//!   `NULL`s sort absent an explicit `NULLS FIRST`/`NULLS LAST` — `DataFusion`
+//!   and `PostgreSQL` put them last for `ASC`, `SQLite` puts them first. So when
+//!   exactly one side of a row pair is `NULL` and the query did not say, that
+//!   pair's relative order is not judged. When the query *does* say, the stated
+//!   placement is enforced like any other key.
+//!
+//!   Two rows that are **both** `NULL` in a key column are tied under every
+//!   convention, so the check continues to the next key column for them, exactly
+//!   as SQL requires.
+//!
+//!   Leaving pairs unjudged would still hide two shapes that no placement
+//!   convention produces, so both are checked within the run of rows tied on the
+//!   columns before the key — the only span that key orders. `ORDER BY cnt,
+//!   state` may therefore still step `state` backwards the moment `cnt` changes,
+//!   while either shape inside one `cnt` group is caught.
+//!
+//!   - An inversion straddling a `NULL`: `[2, NULL, 1]` skips both of its pairs,
+//!     so the key column's non-`NULL` values are checked as a subsequence.
+//!   - An interleaved `NULL` block: `[1, NULL, 2]` is neither the `[NULL, 1, 2]`
+//!     that `NULLS FIRST` gives nor the `[1, 2, NULL]` that `NULLS LAST` gives.
+//!     Whichever end an engine picks, the `NULL`s land in one block against a
+//!     boundary, so a run that crosses between `NULL` and non-`NULL` more than
+//!     once is a violation — and the end it picks holds for the whole result,
+//!     so a term whose `NULL`s lead in one tie group and trail in another
+//!     matches no placement either.
+//! - **Terms that do not map onto an output column.** `ORDER BY` over an
+//!   expression absent from the projection cannot be located in the result. The
+//!   mappable leading terms are still checked and the rest is named — dropping a
+//!   whole key because its second term is a `CASE` would leave the first term
+//!   unverified for no reason.
+
+use std::cmp::Ordering;
+use std::ops::ControlFlow;
+
+use anyhow::Result;
+use arrow::array::{Array, ArrayRef, RecordBatch, make_comparator};
+use arrow::compute::SortOptions;
+use arrow::datatypes::SchemaRef;
+use datafusion::sql::sqlparser::ast::{
+    Expr, GroupByExpr, Ident, LimitClause, OrderBy, OrderByKind, Query as SqlQuery, Select,
+    SelectItem, SetExpr, Statement, Value, Visit, Visitor,
+};
+use datafusion::sql::sqlparser::dialect::{Dialect, GenericDialect, PostgreSqlDialect};
+use datafusion::sql::sqlparser::parser::Parser;
+
+use super::array_value_to_string;
+
+/// One resolved `ORDER BY` term, mapped onto a result column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortKeyColumn {
+    /// Position in the result schema.
+    pub index: usize,
+    /// Result column name, for failure messages.
+    pub name: String,
+    /// `true` for `DESC`.
+    pub descending: bool,
+    /// `Some` when the query states `NULLS FIRST`/`NULLS LAST`, which makes the
+    /// placement part of the requested order; `None` leaves it to the engine.
+    pub nulls_first: Option<bool>,
+}
+
+/// Outcome of mapping a query's top-level `ORDER BY` onto its result columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SortKeyResolution {
+    /// No top-level `ORDER BY`: the engine may return rows in any order.
+    Unordered,
+    /// The leading `key` terms map onto result columns, in significance order.
+    /// `unresolved_suffix` names the first term that did not map, if any; the
+    /// terms from there on go unchecked.
+    Resolved {
+        key: Vec<SortKeyColumn>,
+        unresolved_suffix: Option<String>,
+    },
+    /// Not even the first term mapped onto a result column.
+    Unresolved { reason: String },
+}
+
+impl SortKeyResolution {
+    /// True when at least one `ORDER BY` term does not appear in the result, so
+    /// the rows cannot show the full sort key.
+    #[must_use]
+    pub fn hides_a_sort_term(&self) -> bool {
+        matches!(
+            self,
+            Self::Unresolved { .. }
+                | Self::Resolved {
+                    unresolved_suffix: Some(_),
+                    ..
+                }
+        )
+    }
+}
+
+/// A row that breaks the query's `ORDER BY`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortOrderViolation {
+    /// Result column whose values are out of order.
+    pub column: String,
+    /// 1-based position of the row that breaks the order.
+    pub row_number: usize,
+    /// Key value on the preceding row.
+    pub previous: String,
+    /// Key value on the offending row.
+    pub current: String,
+}
+
+/// Result of checking one engine's rows against its own `ORDER BY`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SortCheck {
+    /// Every `ORDER BY` term was verified.
+    Ordered,
+    /// The terms that could be located were verified; `unchecked` names what
+    /// could not be. Not a clean pass — a partial one, reported as such.
+    PartiallyOrdered { unchecked: String },
+    /// Nothing was verified. Not a pass — a hole, named so it can be counted.
+    Skipped { reason: String },
+    /// A row sorts before its predecessor.
+    Violation(SortOrderViolation),
+}
+
+impl SortCheck {
+    /// The coverage hole this outcome represents, if any.
+    #[must_use]
+    pub fn unchecked_reason(&self) -> Option<&str> {
+        match self {
+            Self::PartiallyOrdered { unchecked } => Some(unchecked.as_str()),
+            Self::Skipped { reason } => Some(reason.as_str()),
+            Self::Ordered | Self::Violation(_) => None,
+        }
+    }
+}
+
+/// Parse `sql` and map its top-level `ORDER BY` onto the columns of `schema`.
+///
+/// `schema` is the result schema of the query, so a term is resolved by output
+/// position: an ordinal (`ORDER BY 2`), a name or alias carried into the result
+/// (`ORDER BY revenue`), or an expression that matches a projection item
+/// textually (`ORDER BY sum(l_quantity)`).
+#[must_use]
+pub fn resolve_sort_key(sql: &str, schema: &SchemaRef) -> SortKeyResolution {
+    let Some(statement) = parse_one_statement(sql) else {
+        return SortKeyResolution::Unresolved {
+            reason: "SQL did not parse as a single statement".to_string(),
+        };
+    };
+    resolve_statement_sort_key(&statement, schema)
+}
+
+/// Same as [`resolve_sort_key`] for a statement already parsed, so a caller
+/// checking both sides of a comparison parses the SQL once rather than per side.
+#[must_use]
+pub fn resolve_statement_sort_key(statement: &Statement, schema: &SchemaRef) -> SortKeyResolution {
+    let Statement::Query(query) = statement else {
+        return SortKeyResolution::Unordered;
+    };
+    let Some(order_by) = query.order_by.as_ref() else {
+        return SortKeyResolution::Unordered;
+    };
+    resolve_order_by(order_by, query, schema)
+}
+
+/// Try each dialect the corpus is written in; the first that yields exactly one
+/// statement wins. A query no dialect parses resolves as `Unresolved`, never as
+/// ordered.
+#[must_use]
+pub fn parse_one_statement(sql: &str) -> Option<Statement> {
+    let dialects: [&dyn Dialect; 2] = [&PostgreSqlDialect {}, &GenericDialect {}];
+    for dialect in dialects {
+        if let Ok(mut statements) = Parser::parse_sql(dialect, sql)
+            && statements.len() == 1
+        {
+            return Some(statements.remove(0));
+        }
+    }
+    None
+}
+
+fn resolve_order_by(order_by: &OrderBy, query: &SqlQuery, schema: &SchemaRef) -> SortKeyResolution {
+    let OrderByKind::Expressions(terms) = &order_by.kind else {
+        return SortKeyResolution::Unresolved {
+            reason: "ORDER BY ALL is not mapped to result columns".to_string(),
+        };
+    };
+    if terms.is_empty() {
+        return SortKeyResolution::Unordered;
+    }
+
+    let projection = positional_projection(leftmost_projection(&query.body), schema);
+    let mut key: Vec<SortKeyColumn> = Vec::with_capacity(terms.len());
+    let mut unresolved_suffix: Option<String> = None;
+    for term in terms {
+        // A collation asks for an ordering this check cannot reproduce, so the
+        // term is reported rather than judged. Comparison runs on Arrow's native
+        // ordering — byte order for strings — while a collation may be case- or
+        // locale-insensitive: SQLite answers `ORDER BY v COLLATE NOCASE` over
+        // `('a'), ('B')` with `['a', 'B']`, which byte order calls an inversion.
+        // Honoring the request would mean reimplementing each engine's
+        // collations, and judging it without them fails correct output.
+        if requests_a_collation(&term.expr.to_string()) {
+            unresolved_suffix = Some(match key.last() {
+                Some(last) => format!(
+                    "verified through '{}'; ORDER BY term '{}' requests a collation, whose ordering is not reproduced here, so it and any term after it are unchecked",
+                    last.name, term.expr
+                ),
+                None => format!(
+                    "nothing about the row order was verified: the first ORDER BY term '{}' requests a collation, whose ordering is not reproduced here",
+                    term.expr
+                ),
+            });
+            break;
+        }
+        // Stop at the first term that cannot be located, keeping the prefix: a
+        // violation on the prefix is a real violation, and the terms after it are
+        // only ever consulted once the prefix ties.
+        let Some(index) = resolve_term(&term.expr, projection, schema) else {
+            unresolved_suffix = Some(match key.last() {
+                Some(last) => format!(
+                    "verified through '{}'; ORDER BY term '{}' does not map to a result column, so it and any term after it are unchecked",
+                    last.name, term.expr
+                ),
+                None => format!(
+                    "nothing about the row order was verified: the first ORDER BY term '{}' does not map to a result column",
+                    term.expr
+                ),
+            });
+            break;
+        };
+        key.push(SortKeyColumn {
+            index,
+            name: schema.field(index).name().clone(),
+            descending: term.options.asc == Some(false),
+            nulls_first: term.options.nulls_first,
+        });
+    }
+
+    match (key.is_empty(), unresolved_suffix) {
+        (true, Some(reason)) => SortKeyResolution::Unresolved { reason },
+        (true, None) => SortKeyResolution::Unordered,
+        (false, unresolved_suffix) => SortKeyResolution::Resolved {
+            key,
+            unresolved_suffix,
+        },
+    }
+}
+
+/// Projection of the leftmost `SELECT` in a set expression. A top-level
+/// `ORDER BY` over a `UNION` applies to the whole result, whose column names
+/// come from the first branch.
+fn leftmost_projection(body: &SetExpr) -> Option<&[SelectItem]> {
+    match body {
+        SetExpr::Select(select) => Some(&select.projection),
+        SetExpr::Query(query) => leftmost_projection(&query.body),
+        SetExpr::SetOperation { left, .. } => leftmost_projection(left),
+        _ => None,
+    }
+}
+
+/// A projection is only usable for resolving by *position* when every item
+/// contributes exactly one output column in order. A wildcard expands to an
+/// unknown number of columns, so its neighbours' positions no longer line up
+/// with the result — resolving through it would name the wrong column and could
+/// report a violation on a correctly sorted result.
+fn positional_projection<'a>(
+    projection: Option<&'a [SelectItem]>,
+    schema: &SchemaRef,
+) -> Option<&'a [SelectItem]> {
+    let items = projection?;
+    if items.len() != schema.fields().len() {
+        return None;
+    }
+    items
+        .iter()
+        .all(|item| {
+            matches!(
+                item,
+                SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. }
+            )
+        })
+        .then_some(items)
+}
+
+fn resolve_term(
+    expr: &Expr,
+    projection: Option<&[SelectItem]>,
+    schema: &SchemaRef,
+) -> Option<usize> {
+    // `ORDER BY 2` — a 1-based output ordinal.
+    if let Expr::Value(value) = expr
+        && let Value::Number(digits, _) = &value.value
+        && let Ok(ordinal) = digits.parse::<usize>()
+        && ordinal >= 1
+        && ordinal <= schema.fields().len()
+    {
+        return Some(ordinal - 1);
+    }
+
+    // `ORDER BY revenue` — a bare name that survives into the result schema, or a
+    // projection alias. Only when the name picks out one column: a join can
+    // project two columns sharing a name, and taking the first would silently
+    // check the wrong one. An ambiguous name falls through to the projection.
+    if let Expr::Identifier(ident) = expr {
+        let name = ident.value.as_str();
+        if let [only] = field_indices(schema, name).as_slice() {
+            return Some(*only);
+        }
+        if let Some(index) = projection.and_then(|items| alias_index(items, name)) {
+            return Some(index);
+        }
+    }
+
+    // `ORDER BY o.o_orderdate` — the qualifier names the term's table, which the
+    // result schema does not carry, so only the projection can say which column is
+    // meant. Matching on the trailing name would resolve `ORDER BY b.x` onto a
+    // projected `a.x` and report that column's order as this term's, so a
+    // qualifier the projection does not confirm leaves the term unresolved.
+    if let Expr::CompoundIdentifier(parts) = expr {
+        if let Some(index) = projection.and_then(|items| expression_index(items, expr)) {
+            return Some(index);
+        }
+        // `SELECT o_orderdate … ORDER BY o.o_orderdate`: a bare projection of the
+        // same name is the same column, because SQL requires that bare name to be
+        // unambiguous across the query's tables.
+        let name = parts.last()?.value.as_str();
+        return projection.and_then(|items| bare_column_index(items, name));
+    }
+
+    // `ORDER BY sum(l_quantity)` — an expression repeated from the projection.
+    projection.and_then(|items| expression_index(items, expr))
+}
+
+/// The projection item that is exactly the unqualified column `name`, when only
+/// one is. Two would leave the name ambiguous, which is the caller's cue to stop
+/// rather than guess.
+fn bare_column_index(items: &[SelectItem], name: &str) -> Option<usize> {
+    let mut found = None;
+    for (index, item) in items.iter().enumerate() {
+        let SelectItem::UnnamedExpr(Expr::Identifier(ident)) = item else {
+            continue;
+        };
+        if ident.value.eq_ignore_ascii_case(name) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(index);
+        }
+    }
+    found
+}
+
+/// Every result column carrying `name`. More than one means the name alone does
+/// not identify a column, so the caller must resolve it some other way rather
+/// than guessing at the first.
+fn field_indices(schema: &SchemaRef, name: &str) -> Vec<usize> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name().eq_ignore_ascii_case(name))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn alias_index(items: &[SelectItem], name: &str) -> Option<usize> {
+    items.iter().position(|item| match item {
+        SelectItem::ExprWithAlias { alias, .. } => alias.value.eq_ignore_ascii_case(name),
+        _ => false,
+    })
+}
+
+/// Position of a projection item whose expression renders identically to `expr`.
+/// Rendering both through the parser's own `Display` normalizes the source
+/// text's whitespace and casing of keywords.
+fn expression_index(items: &[SelectItem], expr: &Expr) -> Option<usize> {
+    let wanted = fold_unquoted_case(&expr.to_string());
+    items.iter().position(|item| {
+        let (SelectItem::UnnamedExpr(projected)
+        | SelectItem::ExprWithAlias {
+            expr: projected, ..
+        }) = item
+        else {
+            return false;
+        };
+        fold_unquoted_case(&projected.to_string()) == wanted
+    })
+}
+
+/// Whether a rendered `ORDER BY` term asks for a SQL collation.
+///
+/// Scanned over the rendering rather than matched against the AST, so a
+/// `COLLATE` nested anywhere inside the term counts: what matters is that some
+/// part of the ordering was requested under a collation, not where it sits. An
+/// AST match would have to enumerate the expression variants that can contain
+/// one, and the variant it forgets fails the wrong way — judging a collated
+/// order by byte order and reporting correct output as a violation. Missing the
+/// other way costs only an unnecessary coverage note.
+///
+/// Quoted runs are skipped, so a string literal or a quoted identifier that
+/// happens to contain the word does not count.
+fn requests_a_collation(rendered: &str) -> bool {
+    let mut inside: Option<char> = None;
+    let mut word = String::new();
+    for character in rendered.chars() {
+        match inside {
+            Some(delimiter) => {
+                if character == delimiter {
+                    inside = None;
+                }
+            }
+            None if character == '\'' || character == '"' => {
+                inside = Some(character);
+                word.clear();
+            }
+            None if character.is_ascii_alphanumeric() || character == '_' => {
+                word.push(character.to_ascii_lowercase());
+            }
+            None => {
+                if word == "collate" {
+                    return true;
+                }
+                word.clear();
+            }
+        }
+    }
+    word == "collate"
+}
+
+/// A rendered expression with its unquoted text lowercased, so two renderings
+/// that differ only in keyword or bare-identifier case compare equal.
+///
+/// Quoted runs keep the case they were written with, because SQL gives it
+/// meaning there: `x = 'a'` and `x = 'A'` match different rows, and `"Foo"` and
+/// `"foo"` are different columns. Folding the whole rendering would make those
+/// pairs equal and map an `ORDER BY` term onto a projected column the query
+/// never asked to be ordered.
+fn fold_unquoted_case(rendered: &str) -> String {
+    let mut folded = String::with_capacity(rendered.len());
+    let mut inside: Option<char> = None;
+    for character in rendered.chars() {
+        match inside {
+            // A doubled delimiter is SQL's escape for one literal delimiter. It
+            // reads here as a close followed by a reopen, which copies the run
+            // verbatim either way — the case inside is what matters.
+            Some(delimiter) => {
+                folded.push(character);
+                if character == delimiter {
+                    inside = None;
+                }
+            }
+            None if character == '\'' || character == '"' => {
+                inside = Some(character);
+                folded.push(character);
+            }
+            None => folded.push(character.to_ascii_lowercase()),
+        }
+    }
+    folded
+}
+
+/// Render one cell for a failure message. Only reached on a violation, so a
+/// column whose type has no string form degrades the message, never the verdict.
+fn value_string(array: &dyn Array, index: usize) -> String {
+    match array_value_to_string(array, index) {
+        Ok(Some(value)) => value,
+        Ok(None) => "NULL".to_string(),
+        Err(e) => format!("<unrenderable {}: {e}>", array.data_type()),
+    }
+}
+
+/// One key column's array plus the comparators used to judge it.
+struct KeyComparator<'a> {
+    column: &'a SortKeyColumn,
+    array: &'a ArrayRef,
+    /// Honors the query's `NULLS FIRST`/`NULLS LAST` when it stated one.
+    compare: arrow::array::DynComparator,
+}
+
+fn violation(
+    column: &SortKeyColumn,
+    array: &dyn Array,
+    previous_row: usize,
+    row: usize,
+) -> SortCheck {
+    SortCheck::Violation(SortOrderViolation {
+        column: column.name.clone(),
+        row_number: row + 1,
+        previous: value_string(array, previous_row),
+        current: value_string(array, row),
+    })
+}
+
+/// Verify `batches` are ordered by `key`.
+///
+/// Ties are legal: an `ORDER BY` on a non-unique key leaves the relative order
+/// of equal rows engine-dependent, so only a row that sorts strictly *before*
+/// its predecessor is a violation. See the module docs for how `NULL`s are
+/// treated.
+///
+/// # Errors
+/// Returns an error if the batches cannot be concatenated.
+pub fn verify_sorted(batches: &[RecordBatch], key: &[SortKeyColumn]) -> Result<SortCheck> {
+    let Some(schema) = batches.first().map(RecordBatch::schema) else {
+        return Ok(SortCheck::Ordered);
+    };
+    let batch = arrow::compute::concat_batches(&schema, batches)?;
+    verify_sorted_batch(&batch, key)
+}
+
+/// [`verify_sorted`] over an already-concatenated batch, so a caller that has
+/// one does not copy the result set again.
+///
+/// # Errors
+/// Returns an error if a key column's comparator cannot be built.
+pub fn verify_sorted_batch(batch: &RecordBatch, key: &[SortKeyColumn]) -> Result<SortCheck> {
+    if key.is_empty() {
+        return Ok(SortCheck::Skipped {
+            reason: "empty sort key".to_string(),
+        });
+    }
+    if batch.num_rows() < 2 {
+        return Ok(SortCheck::Ordered);
+    }
+
+    // One comparator per key column, built once and reused across rows.
+    let mut comparators = Vec::with_capacity(key.len());
+    for column in key {
+        let Some(array) = batch.columns().get(column.index) else {
+            return Ok(SortCheck::Skipped {
+                reason: format!(
+                    "sort key column '{}' at index {} is outside the result schema",
+                    column.name, column.index
+                ),
+            });
+        };
+        let options = SortOptions {
+            descending: column.descending,
+            // Only consulted for a pair the query pinned with NULLS FIRST/LAST;
+            // otherwise such pairs are skipped before the comparator is called.
+            nulls_first: column.nulls_first.unwrap_or(false),
+        };
+        match make_comparator(array.as_ref(), array.as_ref(), options) {
+            Ok(compare) => comparators.push(KeyComparator {
+                column,
+                array,
+                compare,
+            }),
+            Err(e) => {
+                return Ok(SortCheck::Skipped {
+                    reason: format!(
+                        "sort key column '{}' has a type that cannot be compared ({}): {e}",
+                        column.name,
+                        array.data_type()
+                    ),
+                });
+            }
+        }
+    }
+
+    if let Some(found) = check_adjacent_rows(batch.num_rows(), &comparators) {
+        return Ok(found);
+    }
+    if let Some(found) = check_within_tie_groups(batch.num_rows(), &comparators) {
+        return Ok(found);
+    }
+    Ok(SortCheck::Ordered)
+}
+
+/// The ordinary walk: each row against the one before it, most significant key
+/// column first.
+fn check_adjacent_rows(rows: usize, comparators: &[KeyComparator]) -> Option<SortCheck> {
+    for row in 1..rows {
+        for KeyComparator {
+            column,
+            array,
+            compare,
+        } in comparators
+        {
+            let previous_null = array.is_null(row - 1);
+            let current_null = array.is_null(row);
+            // Both NULL is a tie under every convention, so SQL requires the next
+            // key column to decide — keep going rather than accepting the pair.
+            if previous_null && current_null {
+                continue;
+            }
+            // Exactly one NULL, and the query did not pin the placement: this
+            // column decides the pair in an engine-specific way, so neither judge
+            // it nor consult the later columns SQL would never reach.
+            if (previous_null || current_null) && column.nulls_first.is_none() {
+                break;
+            }
+            match compare(row - 1, row) {
+                Ordering::Less => break,
+                Ordering::Equal => {}
+                Ordering::Greater => return Some(violation(column, array.as_ref(), row - 1, row)),
+            }
+        }
+    }
+    None
+}
+
+/// Two illegal shapes survive the adjacent walk once a `NULL` leaves pairs
+/// unjudged, and neither takes a position on where `NULL`s belong:
+///
+/// - `[2, NULL, 1]` inverts across the `NULL` while skipping both of its pairs.
+///   Comparing each non-`NULL` value against the previous non-`NULL` one catches
+///   it.
+/// - `[1, NULL, 2]` interleaves the `NULL`s: `NULLS FIRST` orders these rows
+///   `[NULL, 1, 2]` and `NULLS LAST` orders them `[1, 2, NULL]`, so under either
+///   convention the `NULL`s form one block against a boundary. A run that crosses
+///   between `NULL` and non-`NULL` twice has non-`NULL` values on both sides of a
+///   `NULL` block and matches neither.
+///
+/// Which boundary is never judged, but it must be the *same* boundary
+/// throughout: the engine picks one placement for the term and sorts the whole
+/// result with it. `ORDER BY k1, k2` over `[(1, 1), (1, NULL), (2, NULL), (2, 2)]`
+/// puts `k2`'s `NULL` last in one `k1` group and first in the next, which
+/// `NULLS FIRST` (`[(1, NULL), (1, 1), (2, NULL), (2, 2)]`) and `NULLS LAST`
+/// (`[(1, 1), (1, NULL), (2, 2), (2, NULL)]`) both refuse.
+///
+/// Every key column needs both, not just the leading one, because a later column
+/// is still constrained *within* a run of rows tied on the columns before it:
+/// `ORDER BY k1, k2` over `[(1, 2), (1, NULL), (1, 1)]` is illegal, and both of
+/// its adjacent pairs are unjudged. So each column is checked inside its own tie
+/// group, which is what keeps `ORDER BY cnt, state` free to step `state`
+/// backwards the moment `cnt` changes.
+///
+/// What restarts per group is the value scan and the `NULL` block; the boundary
+/// those `NULL`s sit against does not. That belongs to the `ORDER BY` term, which
+/// the engine sorts the whole result by, so the first group to reveal it fixes it
+/// for the rest.
+fn check_within_tie_groups(rows: usize, comparators: &[KeyComparator]) -> Option<SortCheck> {
+    for (depth, key) in comparators.iter().enumerate() {
+        let KeyComparator {
+            column,
+            array,
+            compare,
+        } = key;
+        if !(0..rows).any(|row| array.is_null(row)) {
+            // No NULLs, so no pair went unjudged and the adjacent walk covered it.
+            continue;
+        }
+        let preceding = &comparators[..depth];
+        let mut previous: Option<usize> = None;
+        let mut crossings = 0usize;
+        // Which end this column's NULLs were seen at, once any group has shown
+        // it. The engine picks one placement for the term and sorts the whole
+        // result with it, so this is carried *across* groups even though the
+        // crossing count restarts within each.
+        let mut nulls_first: Option<bool> = None;
+        for row in 0..rows {
+            if row > 0 {
+                if tied_on(preceding, row - 1, row) {
+                    if array.is_null(row - 1) != array.is_null(row) {
+                        crossings += 1;
+                        if crossings > 1 {
+                            return Some(violation(column, array.as_ref(), row - 1, row));
+                        }
+                        // Crossing into a NULL puts them after the values, out of
+                        // one means they came before.
+                        let places_nulls_first = !array.is_null(row);
+                        match nulls_first {
+                            Some(established) if established != places_nulls_first => {
+                                return Some(violation(column, array.as_ref(), row - 1, row));
+                            }
+                            _ => nulls_first = Some(places_nulls_first),
+                        }
+                    }
+                } else {
+                    // An earlier key separated these rows (or left them unjudged),
+                    // so this column's ordering — and its NULL block — starts over.
+                    // Its placement does not: that belongs to the term, not the
+                    // group.
+                    previous = None;
+                    crossings = 0;
+                }
+            }
+            if array.is_null(row) {
+                continue;
+            }
+            if let Some(previous_row) = previous
+                && compare(previous_row, row) == Ordering::Greater
+            {
+                return Some(violation(column, array.as_ref(), previous_row, row));
+            }
+            previous = Some(row);
+        }
+    }
+    None
+}
+
+/// Whether two adjacent rows are *known* equal on every one of `keys`.
+///
+/// Treating two `NULL`s as unequal here would reset the group on every row of a
+/// `NULL` run and hide inversions inside it: `ORDER BY k1, k2` over
+/// `[(NULL, 2), (NULL, NULL), (NULL, 1)]` is illegal under `NULLS FIRST` and
+/// `NULLS LAST` alike, and every one of its pairs ties on `k1`.
+fn tied_on(keys: &[KeyComparator], a: usize, b: usize) -> bool {
+    keys.iter().all(|KeyComparator { array, compare, .. }| {
+        match (array.is_null(a), array.is_null(b)) {
+            // Equal under every placement convention — the same reasoning the
+            // adjacent walk uses to keep checking later columns.
+            (true, true) => true,
+            (false, false) => compare(a, b) == Ordering::Equal,
+            // Exactly one NULL: placement decides this pair, which is not a
+            // known tie, so the group ends here.
+            _ => false,
+        }
+    })
+}
+
+/// Whether `sql` carries a top-level `ORDER BY`, i.e. whether the order of its
+/// result rows is constrained at all.
+///
+/// Parser-backed, so an `ORDER BY` inside a subquery, a CTE or a window frame —
+/// none of which constrain the outer result — does not count. A substring search
+/// for `ORDER BY` counts all three.
+#[must_use]
+pub fn has_top_level_order_by(sql: &str) -> bool {
+    parse_one_statement(sql).is_some_and(|statement| statement_has_top_level_order_by(&statement))
+}
+
+fn statement_has_top_level_order_by(statement: &Statement) -> bool {
+    let Statement::Query(query) = statement else {
+        return false;
+    };
+    match query.order_by.as_ref().map(|o| &o.kind) {
+        Some(OrderByKind::Expressions(terms)) => !terms.is_empty(),
+        Some(OrderByKind::All(_)) => true,
+        None => false,
+    }
+}
+
+/// Whether `sql` carries a top-level `LIMIT`/`OFFSET`/`FETCH`, i.e. whether the
+/// *set* of returned rows depends on the order.
+///
+/// Parser-backed for the same reason as [`has_top_level_order_by`]: a `LIMIT`
+/// inside a subquery does not make the outer result order-dependent, and a
+/// substring search cannot tell the two apart.
+#[must_use]
+pub fn has_top_level_limit(sql: &str) -> bool {
+    parse_one_statement(sql).is_some_and(|statement| statement_has_top_level_limit(&statement))
+}
+
+fn statement_has_top_level_limit(statement: &Statement) -> bool {
+    let Statement::Query(query) = statement else {
+        return false;
+    };
+    query.limit_clause.is_some() || query.fetch.is_some()
+}
+
+/// Top-level `LIMIT n` count, when it is a single integer literal.
+///
+/// `None` if there is no top-level limit, or if it is not a literal (`LIMIT
+/// $1`, `FETCH`, expressions). Callers that need to know whether a result
+/// filled the limit must treat `None` as unproven.
+#[must_use]
+pub fn top_level_limit_count(sql: &str) -> Option<usize> {
+    let statement = parse_one_statement(sql)?;
+    let Statement::Query(query) = statement else {
+        return None;
+    };
+    match query.limit_clause.as_ref() {
+        Some(LimitClause::LimitOffset {
+            limit: Some(expr), ..
+        }) => expr_as_usize(expr),
+        _ => None,
+    }
+}
+
+/// Top-level `OFFSET m` count, when it is a single integer literal.
+///
+/// `None` if there is no top-level offset, or if it is not a literal.
+#[must_use]
+pub fn top_level_offset_count(sql: &str) -> Option<usize> {
+    let statement = parse_one_statement(sql)?;
+    let Statement::Query(query) = statement else {
+        return None;
+    };
+    match query.limit_clause.as_ref() {
+        Some(LimitClause::LimitOffset {
+            offset: Some(offset),
+            ..
+        }) => expr_as_usize(&offset.value),
+        _ => None,
+    }
+}
+
+/// A top-level `LIMIT` that leaves unspecified which rows it keeps.
+///
+/// SQL lets a query with a top-level `LIMIT n [OFFSET m]` and no top-level
+/// `ORDER BY` return any `n` rows of its full result after skipping any `m`, so
+/// two correct engines — or one engine at two thread counts — can return
+/// different rows. See [`unordered_limit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnorderedLimit {
+    /// The `LIMIT` count.
+    pub limit: usize,
+    /// The `OFFSET` count, `0` when there is none.
+    pub offset: usize,
+    /// The query without its top-level `LIMIT`/`OFFSET`: the full result the
+    /// returned rows are taken from.
+    pub unlimited_sql: String,
+}
+
+impl UnorderedLimit {
+    /// Whether two results of this query can hold different rows and still both
+    /// be correct.
+    ///
+    /// The full result fixes how many rows the `LIMIT` keeps, so both sides must
+    /// agree on the count. Without an `OFFSET`, a result shorter than the `LIMIT`
+    /// is the whole full result, so only one that filled the `LIMIT` can have
+    /// left rows out.
+    #[must_use]
+    pub fn may_keep_different_rows(&self, left_rows: usize, right_rows: usize) -> bool {
+        left_rows == right_rows && (self.offset > 0 || left_rows == self.limit)
+    }
+}
+
+/// The top-level `LIMIT` of `sql`, when it lets the query keep any of its groups
+/// and every row it returns names its group.
+///
+/// `Some` only for a single `SELECT … GROUP BY` — no set operation, parenthesized
+/// query, `DISTINCT` or `TOP` — that returns every `GROUP BY` expression, with a
+/// top-level `LIMIT n [OFFSET m]` of integer literals, no top-level `ORDER BY`, and
+/// no row limit nested inside it. A row such a query returns is either its group's
+/// row of the full result or wrong. Every other query gets `None` and keeps the
+/// comparison it already has: a plain projection can return wrongly computed rows
+/// that still occur in its full result (`SELECT o_orderkey + 1 … LIMIT 10`
+/// evaluated as `o_orderkey + 2`), and a nested row limit leaves the full result
+/// itself unspecified.
+#[must_use]
+pub fn unordered_limit(sql: &str) -> Option<UnorderedLimit> {
+    let statement = parse_one_statement(sql)?;
+    if statement_has_top_level_order_by(&statement) || has_nested_row_limit(&statement) {
+        return None;
+    }
+    let Statement::Query(mut query) = statement else {
+        return None;
+    };
+    if query.fetch.is_some() {
+        return None;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    if select.distinct.is_some() || select.top.is_some() || !returns_group_keys(select) {
+        return None;
+    }
+    let Some(LimitClause::LimitOffset {
+        limit: Some(limit),
+        offset,
+        limit_by,
+    }) = &query.limit_clause
+    else {
+        return None;
+    };
+    if !limit_by.is_empty() {
+        return None;
+    }
+    let limit = expr_as_usize(limit)?;
+    let offset = match offset {
+        Some(offset) => expr_as_usize(&offset.value)?,
+        None => 0,
+    };
+    query.limit_clause = None;
+    Some(UnorderedLimit {
+        limit,
+        offset,
+        unlimited_sql: Statement::Query(query).to_string(),
+    })
+}
+
+/// A top-level `ORDER BY … LIMIT` whose answer is judged against the reference
+/// query's leading rows read back with their sort keys, because comparing it with
+/// the reference's own answer cannot tell a wrong row from another choice among
+/// tied rows. Built by [`unprojected_sort_limit`] and [`projected_sort_limit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyedSortLimit {
+    /// The `LIMIT` count.
+    pub limit: usize,
+    /// The `OFFSET` count, `0` when there is none.
+    pub offset: usize,
+    /// Where each row [`Self::keyed_sql`] returns carries its sort key.
+    pub key: SortKeyCells,
+    keyed_sql_without_limit: String,
+}
+
+/// Where a row of a [`KeyedSortLimit::keyed_sql`] result carries its sort key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SortKeyCells {
+    /// In this many cells appended after the result's own columns.
+    Appended(usize),
+    /// In the result's own columns at these indexes, most significant first.
+    Returned(Vec<usize>),
+}
+
+impl KeyedSortLimit {
+    /// The query's first `rows` rows in `ORDER BY` order, counted from the top of
+    /// its result rather than from its `OFFSET`, each carrying its sort key where
+    /// [`Self::key`] says.
+    #[must_use]
+    pub fn keyed_sql(&self, rows: usize) -> String {
+        format!("{} LIMIT {rows}", self.keyed_sql_without_limit)
+    }
+}
+
+/// The top-level `ORDER BY … LIMIT` of `sql`, when at least one sort term is not
+/// a column of `schema`, the result's.
+///
+/// When the first `ORDER BY` term is not a result column — `ClickBench` Q25
+/// returns `"SearchPhrase"` ordered by `to_timestamp("EventTime")` — the rows
+/// cannot show where one tie group ends and the next begins, so neither the order
+/// of tied rows nor which tied rows the `LIMIT` kept can be judged from them.
+/// [`KeyedSortLimit::keyed_sql`] appends each `ORDER BY` term to the result's
+/// columns, so the reference rows carry [`SortKeyCells::Appended`] keys.
+///
+/// `Some` only for a single `SELECT` — no set operation, `DISTINCT` or `TOP` —
+/// with a top-level `ORDER BY` of expressions, an integer-literal `LIMIT`, and no
+/// `OFFSET`, `FETCH` or `LIMIT … BY`: the shape where appending the `ORDER BY`
+/// terms to the projection leaves the rows unchanged. Includes a resolved prefix
+/// with a hidden suffix (`ORDER BY visible, hidden`): ties on `visible` are not
+/// free when `hidden` distinguishes them. `None` otherwise, including for a
+/// positional term such as `ORDER BY 1` and for a term that applies a `COLLATE`:
+/// the collation decides which rows tie, and the rendered sort keys the keyed
+/// check compares cannot show it. A term that names a select-list alias is
+/// refused too, because the alias is not in scope in the select list the keyed
+/// query appends it to.
+#[must_use]
+pub fn unprojected_sort_limit(sql: &str, schema: &SchemaRef) -> Option<KeyedSortLimit> {
+    let statement = parse_one_statement(sql)?;
+    if has_nested_row_limit(&statement) {
+        return None;
+    }
+    if !resolve_statement_sort_key(&statement, schema).hides_a_sort_term() {
+        return None;
+    }
+    let Statement::Query(mut query) = statement else {
+        return None;
+    };
+    if query.fetch.is_some() {
+        return None;
+    }
+    let limit = match &query.limit_clause {
+        Some(LimitClause::LimitOffset {
+            limit: Some(limit),
+            offset: None,
+            limit_by,
+        }) if limit_by.is_empty() => expr_as_usize(limit)?,
+        _ => return None,
+    };
+    let Some(OrderByKind::Expressions(terms)) =
+        query.order_by.as_ref().map(|order_by| &order_by.kind)
+    else {
+        return None;
+    };
+    if terms.is_empty()
+        || terms.iter().any(|term| {
+            term.with_fill.is_some()
+                || expr_as_usize(&term.expr).is_some()
+                || applies_collation(&term.expr)
+        })
+    {
+        return None;
+    }
+    let sort_keys: Vec<Expr> = terms.iter().map(|term| term.expr.clone()).collect();
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return None;
+    };
+    if select.distinct.is_some() || select.top.is_some() {
+        return None;
+    }
+    let aliases: Vec<String> = select
+        .projection
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+            _ => None,
+        })
+        .collect();
+    if sort_keys
+        .iter()
+        .any(|expr| names_a_select_alias(expr, &aliases))
+    {
+        return None;
+    }
+    let key_columns = sort_keys.len();
+    select
+        .projection
+        .extend(
+            sort_keys
+                .into_iter()
+                .enumerate()
+                .map(|(index, expr)| SelectItem::ExprWithAlias {
+                    expr,
+                    alias: Ident::new(format!("__validation_sort_key_{index}")),
+                }),
+        );
+    query.limit_clause = None;
+    Some(KeyedSortLimit {
+        limit,
+        offset: 0,
+        key: SortKeyCells::Appended(key_columns),
+        keyed_sql_without_limit: Statement::Query(query).to_string(),
+    })
+}
+
+/// The top-level `ORDER BY … LIMIT` of `sql`, when every sort term is a column of
+/// `schema`, the result's.
+///
+/// The rows then show their own sort keys, and so where their tie groups begin
+/// and end, but not which rows past the `LIMIT` or before the `OFFSET` tie with
+/// the rows at either end of the page: `ClickBench` Q31 keeps ten groups by
+/// `c DESC`, and over the full `hits` dataset two groups share the tenth count,
+/// `1058`, so a correct engine may return either one. [`KeyedSortLimit::keyed_sql`]
+/// is the query with its `LIMIT` raised and its `OFFSET` dropped, so its rows are
+/// the query's own, carrying [`SortKeyCells::Returned`] keys.
+///
+/// `Some` only for a query whose top-level `ORDER BY` expressions all resolve onto
+/// result columns — so none applies a `COLLATE` — with an integer-literal `LIMIT`,
+/// an optional integer-literal `OFFSET`, and no `FETCH`, `LIMIT … BY`, `TOP`,
+/// `WITH FILL` or row limit nested inside it: a nested limit leaves the rows past
+/// the page unspecified.
+#[must_use]
+pub fn projected_sort_limit(sql: &str, schema: &SchemaRef) -> Option<KeyedSortLimit> {
+    let statement = parse_one_statement(sql)?;
+    if has_nested_row_limit(&statement) {
+        return None;
+    }
+    let SortKeyResolution::Resolved {
+        key,
+        unresolved_suffix: None,
+    } = resolve_statement_sort_key(&statement, schema)
+    else {
+        return None;
+    };
+    let Statement::Query(mut query) = statement else {
+        return None;
+    };
+    if query.fetch.is_some() {
+        return None;
+    }
+    let (limit, offset) = match &query.limit_clause {
+        Some(LimitClause::LimitOffset {
+            limit: Some(limit),
+            offset,
+            limit_by,
+        }) if limit_by.is_empty() => (
+            expr_as_usize(limit)?,
+            match offset {
+                Some(offset) => expr_as_usize(&offset.value)?,
+                None => 0,
+            },
+        ),
+        _ => return None,
+    };
+    if matches!(query.body.as_ref(), SetExpr::Select(select) if select.top.is_some()) {
+        return None;
+    }
+    let Some(OrderByKind::Expressions(terms)) =
+        query.order_by.as_ref().map(|order_by| &order_by.kind)
+    else {
+        return None;
+    };
+    if terms.iter().any(|term| term.with_fill.is_some()) {
+        return None;
+    }
+    query.limit_clause = None;
+    Some(KeyedSortLimit {
+        limit,
+        offset,
+        key: SortKeyCells::Returned(key.iter().map(|column| column.index).collect()),
+        keyed_sql_without_limit: Statement::Query(query).to_string(),
+    })
+}
+
+/// Whether `select` groups its rows and returns every `GROUP BY` expression — as
+/// the expression itself, its alias, or its 1-based position in the `SELECT` list
+/// — so each row it returns names its group.
+fn returns_group_keys(select: &Select) -> bool {
+    let GroupByExpr::Expressions(keys, modifiers) = &select.group_by else {
+        return false;
+    };
+    !keys.is_empty()
+        && modifiers.is_empty()
+        && keys.iter().all(|key| match expr_as_usize(key) {
+            Some(position) => position
+                .checked_sub(1)
+                .and_then(|index| select.projection.get(index))
+                .is_some_and(|item| {
+                    matches!(
+                        item,
+                        SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. }
+                    )
+                }),
+            None => select.projection.iter().any(|item| match item {
+                SelectItem::UnnamedExpr(expr) => expr == key,
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    expr == key || matches!(key, Expr::Identifier(ident) if ident == alias)
+                }
+                _ => false,
+            }),
+        })
+}
+
+/// Whether `expr` names one of `aliases`, the select list's own output names. An
+/// alias is not in scope inside the select list that defines it, so a sort key
+/// that names one cannot be appended to that select list.
+fn names_a_select_alias(expr: &Expr, aliases: &[String]) -> bool {
+    struct AliasReference<'a> {
+        aliases: &'a [String],
+    }
+
+    impl Visitor for AliasReference<'_> {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if let Expr::Identifier(ident) = expr
+                && self
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(&ident.value))
+            {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    expr.visit(&mut AliasReference { aliases }).is_break()
+}
+
+/// Whether `expr` applies a `COLLATE` anywhere inside it. Under `COLLATE NOCASE`,
+/// `'a'` and `'A'` are one tie group but two different rendered strings.
+fn applies_collation(expr: &Expr) -> bool {
+    struct Collation;
+
+    impl Visitor for Collation {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if matches!(expr, Expr::Collate { .. }) {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    expr.visit(&mut Collation).is_break()
+}
+
+/// Whether a query nested in `statement` — a subquery, derived table or CTE —
+/// limits its rows with `LIMIT`, `OFFSET`, `FETCH` or `TOP`.
+///
+/// Such a limit can keep unspecified rows, so the full result a reference run
+/// produces for the outer query is only one of the results the query allows. The
+/// checks that read that full result refuse the query rather than judge an answer
+/// against one of them.
+fn has_nested_row_limit(statement: &Statement) -> bool {
+    struct NestedRowLimit {
+        query_depth: usize,
+        found: bool,
+    }
+
+    impl Visitor for NestedRowLimit {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &SqlQuery) -> ControlFlow<Self::Break> {
+            self.query_depth += 1;
+            if self.query_depth > 1 && (query.limit_clause.is_some() || query.fetch.is_some()) {
+                self.found = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &SqlQuery) -> ControlFlow<Self::Break> {
+            self.query_depth -= 1;
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<Self::Break> {
+            if self.query_depth > 1 && select.top.is_some() {
+                self.found = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut nested = NestedRowLimit {
+        query_depth: 0,
+        found: false,
+    };
+    let _ = statement.visit(&mut nested);
+    nested.found
+}
+
+fn expr_as_usize(expr: &Expr) -> Option<usize> {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            Value::Number(n, _) => n.parse().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Resolve `sql`'s `ORDER BY` against `batches` and verify they honor it.
+///
+/// # Errors
+/// Returns an error if the batches cannot be concatenated.
+pub fn check_sort_order(sql: &str, batches: &[RecordBatch]) -> Result<SortCheck> {
+    let Some(schema) = batches.first().map(RecordBatch::schema) else {
+        return Ok(SortCheck::Ordered);
+    };
+    let batch = arrow::compute::concat_batches(&schema, batches)?;
+    match resolve_sort_key(sql, &schema) {
+        SortKeyResolution::Unordered => Ok(SortCheck::Ordered),
+        SortKeyResolution::Unresolved { reason } => Ok(SortCheck::Skipped { reason }),
+        SortKeyResolution::Resolved {
+            key,
+            unresolved_suffix,
+        } => Ok(finish_sort_check(
+            verify_sorted_batch(&batch, &key)?,
+            unresolved_suffix,
+        )),
+    }
+}
+
+/// Fold a partially resolved key's unchecked suffix into an otherwise clean
+/// result, so the hole travels with the outcome instead of being dropped.
+fn finish_sort_check(check: SortCheck, unresolved_suffix: Option<String>) -> SortCheck {
+    match (check, unresolved_suffix) {
+        (SortCheck::Ordered, Some(unchecked)) => SortCheck::PartiallyOrdered { unchecked },
+        (check, _) => check,
+    }
+}
+
+/// [`check_sort_order`] for a caller that already parsed the SQL and
+/// concatenated the rows, so neither is repeated per side of a comparison.
+///
+/// # Errors
+/// Returns an error if a key column's comparator cannot be built.
+pub fn check_sort_order_parsed(
+    statement: Option<&Statement>,
+    batch: &RecordBatch,
+) -> Result<SortCheck> {
+    let Some(statement) = statement else {
+        return Ok(SortCheck::Skipped {
+            reason: "SQL did not parse as a single statement".to_string(),
+        });
+    };
+    let schema = batch.schema();
+    match resolve_statement_sort_key(statement, &schema) {
+        SortKeyResolution::Unordered => Ok(SortCheck::Ordered),
+        SortKeyResolution::Unresolved { reason } => Ok(SortCheck::Skipped { reason }),
+        SortKeyResolution::Resolved {
+            key,
+            unresolved_suffix,
+        } => Ok(finish_sort_check(
+            verify_sorted_batch(batch, &key)?,
+            unresolved_suffix,
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use super::{
+        SortKeyCells, projected_sort_limit, top_level_limit_count, top_level_offset_count,
+        unordered_limit, unprojected_sort_limit,
+    };
+
+    /// rustdoc immediately above `fn_sig` in this file. A glued pair of comments
+    /// lands on the first function and leaves the second undocumented.
+    fn rustdoc_immediately_above<'a>(source: &'a str, fn_sig: &str) -> &'a str {
+        let fn_pos = source
+            .find(fn_sig)
+            .expect("function signature is in this file");
+        let before = &source[..fn_pos];
+        let start = before.rfind("\n\n").map_or(0, |i| i + 2);
+        let block = before[start..].trim();
+        assert!(
+            !block.is_empty()
+                && block
+                    .lines()
+                    .all(|line| line.starts_with("///") || line.is_empty()),
+            "{fn_sig} is not immediately preceded by rustdoc:\n{block}"
+        );
+        block
+    }
+
+    #[test]
+    fn rustdoc_for_nested_row_limit_and_select_alias_sits_on_the_right_fn() {
+        let source = include_str!("sort_order.rs");
+        let alias_doc = rustdoc_immediately_above(source, "fn names_a_select_alias(");
+        let nested_doc = rustdoc_immediately_above(source, "fn has_nested_row_limit(");
+
+        assert!(
+            nested_doc.contains("limits its rows with `LIMIT`, `OFFSET`, `FETCH` or `TOP`"),
+            "has_nested_row_limit must own the nested-limit rustdoc, got:\n{nested_doc}"
+        );
+        assert!(
+            alias_doc.contains("names one of `aliases`"),
+            "names_a_select_alias must own the alias rustdoc, got:\n{alias_doc}"
+        );
+        assert!(
+            !alias_doc.contains("`FETCH`") && !alias_doc.contains("nested in `statement`"),
+            "names_a_select_alias must not carry the nested-limit rustdoc, got:\n{alias_doc}"
+        );
+        assert!(
+            !nested_doc.contains("names one of `aliases`"),
+            "has_nested_row_limit must not carry the alias rustdoc, got:\n{nested_doc}"
+        );
+    }
+
+    #[test]
+    fn top_level_limit_count_reads_integer_literals() {
+        assert_eq!(
+            top_level_limit_count("SELECT v FROM t LIMIT 100"),
+            Some(100)
+        );
+        assert_eq!(top_level_limit_count("SELECT v FROM t LIMIT 2"), Some(2));
+        assert_eq!(top_level_limit_count("SELECT v FROM t"), None);
+        assert_eq!(
+            top_level_limit_count("SELECT v FROM t WHERE id IN (SELECT i FROM u LIMIT 5)"),
+            None
+        );
+    }
+
+    #[test]
+    fn top_level_offset_count_reads_integer_literals() {
+        assert_eq!(
+            top_level_offset_count("SELECT v FROM t LIMIT 10 OFFSET 100"),
+            Some(100)
+        );
+        assert_eq!(top_level_offset_count("SELECT v FROM t OFFSET 3"), Some(3));
+        assert_eq!(top_level_offset_count("SELECT v FROM t LIMIT 10"), None);
+        assert_eq!(top_level_offset_count("SELECT v FROM t"), None);
+        assert_eq!(
+            top_level_offset_count(
+                "SELECT v FROM t WHERE id IN (SELECT i FROM u LIMIT 1 OFFSET 5)"
+            ),
+            None
+        );
+        assert_eq!(
+            top_level_offset_count("SELECT v FROM t LIMIT 10 OFFSET $1"),
+            None
+        );
+    }
+
+    #[test]
+    fn sql_shape_detectors_accept_and_reject_representative_queries() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("c", DataType::Int64, false),
+        ]));
+
+        for sql in [
+            "SELECT a AS k, count(*) FROM t GROUP BY k LIMIT 10",
+            "SELECT a, count(*) FROM t GROUP BY 1 LIMIT 10",
+            "SELECT a, count(*) FROM t GROUP BY a LIMIT 10 OFFSET 5",
+        ] {
+            assert!(
+                unordered_limit(sql).is_some(),
+                "grouped LIMIT that returns its keys: {sql}"
+            );
+        }
+        for sql in [
+            "SELECT DISTINCT a FROM t LIMIT 10",
+            "SELECT TOP 10 a, count(*) FROM t GROUP BY a",
+            "SELECT a, count(*) FROM (SELECT a FROM t LIMIT 5) AS s GROUP BY a LIMIT 10",
+            "SELECT count(*) FROM t GROUP BY a LIMIT 10",
+            "SELECT a FROM t LIMIT 10",
+        ] {
+            assert_eq!(unordered_limit(sql), None, "{sql}");
+        }
+
+        let hidden = "SELECT a, c FROM t ORDER BY hidden LIMIT 2";
+        let shown = "SELECT a, c FROM t ORDER BY c LIMIT 2 OFFSET 7";
+        let hidden_limit = unprojected_sort_limit(hidden, &schema)
+            .expect("a hidden sort key is read back beside the result");
+        assert_eq!(
+            (hidden_limit.limit, hidden_limit.offset, &hidden_limit.key),
+            (2, 0, &SortKeyCells::Appended(1))
+        );
+        let shown_limit = projected_sort_limit(shown, &schema)
+            .expect("a returned sort key keeps OFFSET on the struct");
+        assert_eq!(
+            (shown_limit.limit, shown_limit.offset, &shown_limit.key),
+            (2, 7, &SortKeyCells::Returned(vec![1]))
+        );
+        let zero = projected_sort_limit("SELECT a, c FROM t ORDER BY c LIMIT 0", &schema)
+            .expect("LIMIT 0 is still an ORDER BY … LIMIT");
+        assert_eq!((zero.limit, zero.offset), (0, 0));
+        assert_eq!(
+            shown_limit.keyed_sql(4),
+            "SELECT a, c FROM t ORDER BY c LIMIT 4"
+        );
+        assert_eq!(unprojected_sort_limit(shown, &schema), None);
+        assert_eq!(projected_sort_limit(hidden, &schema), None);
+
+        let positional = projected_sort_limit("SELECT a, c FROM t ORDER BY 1 LIMIT 2", &schema)
+            .expect("ordinal 1 is the first result column");
+        assert_eq!(positional.key, SortKeyCells::Returned(vec![0]));
+        assert_eq!(
+            unprojected_sort_limit("SELECT a, c FROM t ORDER BY 1 LIMIT 2", &schema),
+            None
+        );
+
+        let alias_schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        assert_eq!(
+            unprojected_sort_limit(
+                "SELECT a AS x FROM t ORDER BY x, hidden LIMIT 1",
+                &alias_schema
+            ),
+            None
+        );
+        for sql in [
+            "SELECT a FROM t ORDER BY hidden COLLATE NOCASE LIMIT 1",
+            "SELECT a FROM (SELECT a, hidden FROM t LIMIT 5) AS s ORDER BY hidden LIMIT 1",
+            "SELECT TOP 10 a FROM t ORDER BY hidden LIMIT 10",
+        ] {
+            assert_eq!(unprojected_sort_limit(sql, &schema), None, "{sql}");
+        }
+    }
+}

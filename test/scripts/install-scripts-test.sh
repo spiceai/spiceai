@@ -12,7 +12,7 @@
 #   ./test/scripts/install-scripts-test.sh [--live] [--verbose]
 #
 # Options:
-#   --live      Run live download tests (requires network, slower)
+#   --live      Run live download tests (requires network and Python 3, slower)
 #   --verbose   Show detailed output for each test
 #
 # Exit codes:
@@ -48,6 +48,14 @@ NC='\033[0m' # No Color
 # =============================================================================
 # Utility Functions
 # =============================================================================
+
+github_api() {
+    local headers=(-H "Accept: application/vnd.github+json")
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        headers+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+    fi
+    curl --fail --silent --show-error "${headers[@]}" "$@"
+}
 
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $*"
@@ -300,7 +308,8 @@ test_artifacts_exist_in_latest_release() {
     fi
     
     local release_assets
-    release_assets=$(curl -sS "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"name":' | grep -E "spice.*\.tar\.gz" || true)
+    release_assets=$(github_api "https://api.github.com/repos/spiceai/spiceai/releases/latest" |
+        python3 -c 'import json, sys; print(json.dumps([asset["name"] for asset in json.load(sys.stdin)["assets"]]))') || return 1
     
     if [[ -z "$release_assets" ]]; then
         log_verbose "Could not fetch release assets"
@@ -312,15 +321,16 @@ test_artifacts_exist_in_latest_release() {
         "spice_linux_x86_64.tar.gz"
         "spice_linux_aarch64.tar.gz"
         "spice_darwin_aarch64.tar.gz"
+        "spice.exe_windows_x86_64.tar.gz"
         "spiced_linux_x86_64.tar.gz"
         "spiced_linux_aarch64.tar.gz"
         "spiced_darwin_aarch64.tar.gz"
-        "spiced_models_linux_x86_64.tar.gz"
-        "spiced_models_linux_aarch64.tar.gz"
-        "spiced_models_darwin_aarch64.tar.gz"
         "spiced_metal_darwin_aarch64.tar.gz"
-        "spiced.exe_windows_x86_64.tar.gz"
-        "spiced.exe_models_windows_x86_64.tar.gz"
+        "spiced_cuda_80_linux_x86_64.tar.gz"
+        "spiced_cuda_86_linux_x86_64.tar.gz"
+        "spiced_cuda_87_linux_x86_64.tar.gz"
+        "spiced_cuda_89_linux_x86_64.tar.gz"
+        "spiced_cuda_90_linux_x86_64.tar.gz"
     )
     
     local missing=0
@@ -592,36 +602,35 @@ test_cuda_version_invalid() {
 # Default Value Tests
 # =============================================================================
 
-test_default_variant_is_models() {
-    # Source the script in a subshell and check VARIANT default
+read_spiced_variant() {
+    local installer_preamble
+    installer_preamble=$(awk '
+        /^# main$/ { found = 1; exit }
+        { print }
+        END { if (!found) exit 1 }
+    ' "$INSTALL_SPICED_SCRIPT") || return 1
+    bash -c "$installer_preamble"$'\nprintf "%s" "$VARIANT"\n'
+}
+
+test_default_variant_is_empty() {
     local variant
-    variant=$(bash -c 'source /dev/stdin <<< "
-        : \${VARIANT:=\"models\"}
-        echo \$VARIANT
-    "')
-    [[ "$variant" == "models" ]]
+    variant=$(
+        unset VARIANT
+        read_spiced_variant
+    ) || return 1
+    [[ -z "$variant" ]]
 }
 
 test_variant_can_be_overridden() {
     local variant
-    variant=$(VARIANT="metal" bash -c '
-        : ${VARIANT:="models"}
-        echo $VARIANT
-    ')
+    variant=$(VARIANT="metal" read_spiced_variant) || return 1
     [[ "$variant" == "metal" ]]
 }
 
 test_variant_can_be_empty() {
     local variant
-    variant=$(VARIANT="" bash -c '
-        : ${VARIANT:="models"}
-        echo $VARIANT
-    ')
-    # When VARIANT is set to empty, :="models" will still set it to models
-    # because := checks for unset OR empty. To allow empty, use := vs :-
-    # The current script uses := so empty becomes "models"
-    # This test validates the current behavior
-    [[ "$variant" == "models" ]]
+    variant=$(VARIANT="" read_spiced_variant) || return 1
+    [[ -z "$variant" ]]
 }
 
 # =============================================================================
@@ -658,7 +667,8 @@ test_live_latest_release_accessible() {
     fi
     
     local response
-    response=$(curl -sS -o /dev/null -w "%{http_code}" "https://api.github.com/repos/spiceai/spiceai/releases/latest")
+    response=$(github_api -o /dev/null -w "%{http_code}" "https://api.github.com/repos/spiceai/spiceai/releases/latest") || return 1
+    log_verbose "Latest release HTTP status: $response"
     [[ "$response" == "200" ]]
 }
 
@@ -669,14 +679,15 @@ test_live_download_url_resolves() {
     
     # Get latest release tag
     local tag
-    tag=$(curl -sS "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*: "\(.*\)",/\1/')
+    tag=$(github_api "https://api.github.com/repos/spiceai/spiceai/releases/latest" |
+        python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])') || return 1
     
     if [[ -z "$tag" ]]; then
         log_verbose "Could not get latest tag"
         return 1
     fi
     
-    # Check if a known artifact URL returns 302 (redirect to download)
+    # Follow the asset redirect and require a successful download.
     local url="https://github.com/spiceai/spiceai/releases/download/${tag}/spice_linux_x86_64.tar.gz"
     local response
     response=$(curl -sS -o /dev/null -w "%{http_code}" -L "$url" 2>/dev/null || echo "000")
@@ -684,19 +695,20 @@ test_live_download_url_resolves() {
     [[ "$response" == "200" ]]
 }
 
-test_live_spiced_models_linux_downloadable() {
+test_live_spiced_linux_downloadable() {
     if [[ "$LIVE_TESTS" != "true" ]]; then
         return 0
     fi
     
     local tag
-    tag=$(curl -sS "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*: "\(.*\)",/\1/')
+    tag=$(github_api "https://api.github.com/repos/spiceai/spiceai/releases/latest" |
+        python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])') || return 1
     
     if [[ -z "$tag" ]]; then
         return 1
     fi
     
-    local url="https://github.com/spiceai/spiceai/releases/download/${tag}/spiced_models_linux_x86_64.tar.gz"
+    local url="https://github.com/spiceai/spiceai/releases/download/${tag}/spiced_linux_x86_64.tar.gz"
     local response
     response=$(curl -sS -o /dev/null -w "%{http_code}" -L "$url" 2>/dev/null || echo "000")
     
@@ -848,7 +860,7 @@ run_all_tests() {
     # Artifact Naming - Linux x86_64
     echo "--- Artifact Naming: Linux x86_64 ---"
     run_test "Linux x86_64 default artifact name" test_artifact_name_linux_x86_64_default
-    run_test "Linux x86_64 models artifact name" test_artifact_name_linux_x86_64_models
+    run_test "Legacy Linux x86_64 models artifact name" test_artifact_name_linux_x86_64_models
     run_test "Linux x86_64 CUDA 90 artifact name" test_artifact_name_linux_x86_64_cuda_90
     run_test "Linux x86_64 CUDA 89 artifact name" test_artifact_name_linux_x86_64_cuda_89
     run_test "Linux x86_64 CUDA 87 artifact name" test_artifact_name_linux_x86_64_cuda_87
@@ -859,20 +871,20 @@ run_all_tests() {
     # Artifact Naming - Linux aarch64
     echo "--- Artifact Naming: Linux aarch64 ---"
     run_test "Linux aarch64 default artifact name" test_artifact_name_linux_aarch64_default
-    run_test "Linux aarch64 models artifact name" test_artifact_name_linux_aarch64_models
+    run_test "Legacy Linux aarch64 models artifact name" test_artifact_name_linux_aarch64_models
     echo ""
     
     # Artifact Naming - macOS
     echo "--- Artifact Naming: macOS (darwin) ---"
     run_test "Darwin aarch64 default artifact name" test_artifact_name_darwin_aarch64_default
-    run_test "Darwin aarch64 models artifact name" test_artifact_name_darwin_aarch64_models
+    run_test "Legacy Darwin aarch64 models artifact name" test_artifact_name_darwin_aarch64_models
     run_test "Darwin aarch64 metal artifact name" test_artifact_name_darwin_aarch64_metal
     echo ""
     
     # Artifact Naming - Windows
     echo "--- Artifact Naming: Windows ---"
-    run_test "Windows x86_64 default artifact name" test_artifact_name_windows_x86_64_default
-    run_test "Windows x86_64 models artifact name" test_artifact_name_windows_x86_64_models
+    run_test "Legacy Windows x86_64 runtime artifact name" test_artifact_name_windows_x86_64_default
+    run_test "Legacy Windows x86_64 models artifact name" test_artifact_name_windows_x86_64_models
     echo ""
     
     # Artifact Naming - Spice CLI
@@ -935,7 +947,7 @@ run_all_tests() {
     
     # Default Values
     echo "--- Default Values ---"
-    run_test "Default variant is models" test_default_variant_is_models
+    run_test "Default variant has no archive suffix" test_default_variant_is_empty
     run_test "Variant can be overridden" test_variant_can_be_overridden
     run_test "Empty variant behavior" test_variant_can_be_empty
     echo ""
@@ -964,7 +976,7 @@ run_all_tests() {
     echo "--- Documentation ---"
     run_test "Naming convention documented" test_spiced_naming_convention_documented
     run_test "Empty variant documented" test_spiced_variant_empty_documented
-    run_test "Models variant documented" test_spiced_variant_models_documented
+    run_test "Model support documented" test_spiced_variant_models_documented
     run_test "Metal variant documented" test_spiced_variant_metal_documented
     run_test "CUDA variant documented" test_spiced_variant_cuda_documented
     echo ""
@@ -982,7 +994,7 @@ run_all_tests() {
         echo "--- Live Network Tests ---"
         run_test "Latest release accessible" test_live_latest_release_accessible
         run_test "Download URL resolves" test_live_download_url_resolves
-        run_test "spiced_models_linux downloadable" test_live_spiced_models_linux_downloadable
+        run_test "spiced_linux downloadable" test_live_spiced_linux_downloadable
         run_test "All expected artifacts exist" test_artifacts_exist_in_latest_release
         echo ""
     fi

@@ -34,10 +34,10 @@ use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
 /// Errors that can occur when parsing acceleration configuration.
 #[derive(Debug, Snafu)]
 pub enum ParseError {
-    #[snafu(display("Unable to parse column reference {column_ref}: {source}"))]
+    #[snafu(display("Failed to parse the column reference '{column_ref}': {source}"))]
     UnableToParseColumnReference {
         column_ref: String,
-        source: datafusion_table_providers::util::column_reference::Error,
+        source: util::column_reference::Error,
     },
 
     #[snafu(display("Error parsing {field} as duration: {source}"))]
@@ -374,21 +374,79 @@ impl Display for OnConflictBehavior {
     }
 }
 
-/// Behavior when a stale-if-error condition occurs in caching mode.
-/// When enabled, serves expired cached data if the upstream source returns an error.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+/// How long a cached entry stays fresh when a `refresh_mode: caching` dataset
+/// sets no `caching_ttl`.
+///
+/// Defined here, below every crate that reads it, so the parser that checks the
+/// caching windows fit a `Duration`, the scan that decides whether a row may be
+/// served and the sweep that decides whether it may be kept all read one value:
+/// a sweep with a shorter default than the scan would delete rows the scan still
+/// calls fresh.
+pub const DEFAULT_CACHING_TTL: Duration = Duration::from_secs(30);
+
+/// Behavior when a caching-mode origin fetch fails and an expired entry is still
+/// held. Models RFC 5861 `stale-if-error`: how much staleness — measured from the
+/// point the entry passed `caching_ttl` — an operator will tolerate before the
+/// origin error is propagated instead of the stale copy.
+///
+/// `Enabled` is `stale-if-error=∞` (always serve stale, unbounded retention),
+/// `Disabled` is `stale-if-error=0` (never serve stale), and `For(d)` is
+/// `stale-if-error=d` (serve stale only while its staleness is provably `≤ d`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StaleIfError {
     /// Do not serve stale data on error - propagate the error to the client.
     #[default]
     Disabled,
-    /// Serve expired data if the upstream source returns an error.
+    /// Serve expired data if the upstream source returns an error, with no upper
+    /// bound on the entry's age — and so no derived retention that could evict it.
     Enabled,
+    /// Serve expired data on error only while the entry's staleness past
+    /// `caching_ttl` is provably at most this duration; beyond it, propagate the
+    /// error. A finite window, so retention stays bounded.
+    For(Duration),
 }
 
 impl StaleIfError {
+    /// Whether an expired entry may ever be served when the origin fails, and so
+    /// whether the read path must keep the expired batches around to fall back to.
+    /// Only `Disabled` never serves stale.
     #[must_use]
-    pub fn is_enabled(self) -> bool {
-        matches!(self, StaleIfError::Enabled)
+    pub fn serves_stale_on_error(self) -> bool {
+        !matches!(self, StaleIfError::Disabled)
+    }
+
+    /// Whether an entry with the given staleness (past `caching_ttl`) may be served
+    /// on an origin error.
+    ///
+    /// `None` staleness means the entry's age is unknown — a missing or null
+    /// `_fetched_at`. `For(d)` fails closed on that (cannot prove `≤ d`), while
+    /// `Enabled` serves regardless because it has no bound to check.
+    #[must_use]
+    pub fn within_error_window(self, staleness: Option<Duration>) -> bool {
+        match self {
+            StaleIfError::Disabled => false,
+            StaleIfError::Enabled => true,
+            StaleIfError::For(d) => matches!(staleness, Some(s) if s <= d),
+        }
+    }
+
+    /// The window beyond `caching_ttl` that retention must keep an entry for, so a
+    /// finite `stale-if-error` fallback is not evicted before it can be served.
+    ///
+    /// `None` means no finite cutoff at all — `Enabled`'s unbounded retention, the
+    /// one case with no deadline. Every other variant returns `Some`, a concrete
+    /// grace of at least zero: `Disabled` keeps only the stale-while-revalidate
+    /// grace (zero when unset), and `For(d)` keeps the larger of `d` and that
+    /// grace. The `Some`/`None` split is load-bearing — `expiry_cutoff` reads
+    /// `None` as "never expires", so `Disabled` must not collapse to it when SWR
+    /// is unset, or the default caching cache would stop evicting.
+    #[must_use]
+    pub fn error_retention_window(self, swr: Option<Duration>) -> Option<Duration> {
+        match self {
+            StaleIfError::Disabled => Some(swr.unwrap_or_default()),
+            StaleIfError::For(d) => Some(d.max(swr.unwrap_or_default())),
+            StaleIfError::Enabled => None,
+        }
     }
 }
 
@@ -397,6 +455,11 @@ impl Display for StaleIfError {
         match self {
             StaleIfError::Disabled => write!(f, "disabled"),
             StaleIfError::Enabled => write!(f, "enabled"),
+            // Round-trips through `fundu::parse_duration`, so a `Display`ed value
+            // re-parses to the same `For`. Whole seconds read naturally; a
+            // sub-second window keeps full precision as nanoseconds.
+            StaleIfError::For(d) if d.subsec_nanos() == 0 => write!(f, "{}s", d.as_secs()),
+            StaleIfError::For(d) => write!(f, "{}ns", d.as_nanos()),
         }
     }
 }
@@ -852,12 +915,12 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         acceleration: spicepod_acceleration::Acceleration,
     ) -> std::result::Result<Self, Self::Error> {
         let try_parse_column_reference = |column: &str| {
-            ColumnReference::try_from(column).map_err(|e| {
-                ParseError::UnableToParseColumnReference {
+            util::column_reference::parse(column)
+                .map(ColumnReference::new)
+                .map_err(|e| ParseError::UnableToParseColumnReference {
                     column_ref: column.to_string(),
                     source: e,
-                }
-            })
+                })
         };
 
         let try_parse_duration = |field: &str, duration: Option<String>| {
@@ -941,6 +1004,11 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         let caching_stale_while_revalidate_ttl =
             parse_caching_stale_while_revalidate_ttl(&mut params)?;
         let caching_stale_if_error = parse_caching_stale_if_error(&mut params)?;
+        ensure_caching_windows_fit(
+            caching_ttl,
+            caching_stale_while_revalidate_ttl,
+            caching_stale_if_error,
+        )?;
         let caching_max_size = parse_caching_max_size(&mut params)?;
         let caching_max_items = parse_caching_max_items(&mut params)?;
 
@@ -1181,7 +1249,20 @@ fn parse_caching_stale_while_revalidate_ttl(
 }
 
 /// Parse `caching_stale_if_error` from params for caching mode.
-/// Valid values: "enabled", "disabled" (default)
+///
+/// Accepts (RFC 5861 `stale-if-error`):
+/// - `enabled` → `Enabled` (∞ — always serve stale, unbounded retention),
+/// - `disabled` → `Disabled` (0 — never serve stale),
+/// - a duration such as `600s` or `10m` → `For(d)` (serve stale only while its
+///   staleness is at most `d`); `0` normalizes to `Disabled`.
+///
+/// The two keywords match case-insensitively. A duration is handed to `fundu`
+/// as written, the way `caching_ttl` and the other duration params are, because
+/// its units are case-sensitive: `Ms` is microseconds and `ms` milliseconds.
+///
+/// `infinity`/`inf` is deliberately not an alias — use `enabled`. Booleans
+/// (`true`/`false` strings, or a YAML bool) are rejected: the setting names a
+/// behavior, not a switch.
 fn parse_caching_stale_if_error(params: &mut Option<Params>) -> Result<StaleIfError, ParseError> {
     let Some(params) = params else {
         return Ok(StaleIfError::default());
@@ -1193,18 +1274,64 @@ fn parse_caching_stale_if_error(params: &mut Option<Params>) -> Result<StaleIfEr
         spicepod::param::ParamValue::String(s) => match s.to_lowercase().as_str() {
             "enabled" => Ok(StaleIfError::Enabled),
             "disabled" => Ok(StaleIfError::Disabled),
-            _ => Err(ParseError::InvalidAccelerationConfiguration {
-                detail: format!(
-                    "Invalid 'caching_stale_if_error' value: '{s}'. Expected 'enabled' or 'disabled'."
-                ),
-            }),
+            _ => {
+                let invalid = || ParseError::InvalidAccelerationConfiguration {
+                    detail: format!(
+                        "Invalid 'caching_stale_if_error' value: '{s}'. Expected a duration such as '600s', or 'enabled'/'disabled'."
+                    ),
+                };
+                // `s` as written, not the lowercased match key: `fundu`'s time
+                // units are case-sensitive.
+                match fundu::parse_duration(&s) {
+                    // A zero window can never serve stale, so it is exactly
+                    // `Disabled` — normalized here to avoid a `staleness <= 0`
+                    // boundary case.
+                    Ok(d) if d.is_zero() => Ok(StaleIfError::Disabled),
+                    // `fundu` accepts `inf`/`infinity` as a saturated
+                    // `Duration::MAX`. That is not a finite window, and infinity
+                    // is deliberately not an alias for `enabled` (decision 3), so
+                    // reject it rather than store a ~584-billion-year window.
+                    Ok(d) if d == Duration::MAX => Err(invalid()),
+                    Ok(d) => Ok(StaleIfError::For(d)),
+                    Err(_) => Err(invalid()),
+                }
+            }
         },
         _ => Err(ParseError::InvalidAccelerationConfiguration {
             detail: format!(
-                "Invalid 'caching_stale_if_error' param value: {value:?}. Expected 'enabled' or 'disabled'."
+                "Invalid 'caching_stale_if_error' param value: {value:?}. Expected a duration such as '600s', or 'enabled'/'disabled'."
             ),
         }),
     }
+}
+
+/// Reject caching windows whose eviction deadline does not fit a `Duration`.
+///
+/// The retention paths compute the deadline as `caching_ttl` plus the longer of
+/// a finite `caching_stale_if_error` and `caching_stale_while_revalidate_ttl`.
+/// `fundu` saturates an oversized duration at `Duration::MAX` rather than
+/// failing, so without this check such a value parses and the addition panics
+/// while the dataset loads. `enabled` derives no deadline and has nothing to
+/// overflow.
+fn ensure_caching_windows_fit(
+    caching_ttl: Option<Duration>,
+    caching_stale_while_revalidate_ttl: Option<Duration>,
+    caching_stale_if_error: StaleIfError,
+) -> Result<(), ParseError> {
+    let Some(window) =
+        caching_stale_if_error.error_retention_window(caching_stale_while_revalidate_ttl)
+    else {
+        return Ok(());
+    };
+    let ttl = caching_ttl.unwrap_or(DEFAULT_CACHING_TTL);
+    if ttl.checked_add(window).is_some() {
+        return Ok(());
+    }
+    Err(ParseError::InvalidAccelerationConfiguration {
+        detail: format!(
+            "Invalid caching windows: 'caching_ttl' ({ttl:?}) plus the longer of 'caching_stale_if_error' and 'caching_stale_while_revalidate_ttl' ({window:?}) exceeds the longest supported duration. Lower one of them so the sum fits."
+        ),
+    })
 }
 
 /// Helper to parse a duration parameter from params.
@@ -1301,34 +1428,244 @@ mod tests {
         assert!(!is_disabled);
     }
 
+    /// Parse one `caching_stale_if_error` string value in isolation.
+    fn parse_sie(value: &str) -> Result<StaleIfError, ParseError> {
+        let params = Params::from_string_map(HashMap::from([(
+            "caching_stale_if_error".to_string(),
+            value.to_string(),
+        )]));
+        parse_caching_stale_if_error(&mut Some(params))
+    }
+
     #[test]
     fn test_parse_caching_stale_if_error() {
-        // Test "enabled"
-        let params_enabled = Params::from_string_map(HashMap::from([(
-            "caching_stale_if_error".to_string(),
-            "enabled".to_string(),
-        )]));
-        let result = parse_caching_stale_if_error(&mut Some(params_enabled)).expect("to parse");
-        assert_eq!(result, StaleIfError::Enabled);
+        // The two words keep their meaning (∞ and 0).
+        assert_eq!(parse_sie("enabled").expect("parse"), StaleIfError::Enabled);
+        assert_eq!(
+            parse_sie("disabled").expect("parse"),
+            StaleIfError::Disabled
+        );
 
-        // Test "disabled"
-        let params_disabled = Params::from_string_map(HashMap::from([(
-            "caching_stale_if_error".to_string(),
-            "disabled".to_string(),
-        )]));
-        let result = parse_caching_stale_if_error(&mut Some(params_disabled)).expect("to parse");
-        assert_eq!(result, StaleIfError::Disabled);
+        // The keywords match regardless of case.
+        assert_eq!(parse_sie("Enabled").expect("parse"), StaleIfError::Enabled);
+        assert_eq!(
+            parse_sie("DISABLED").expect("parse"),
+            StaleIfError::Disabled
+        );
 
-        // Test invalid value
-        let params_invalid = Params::from_string_map(HashMap::from([(
-            "caching_stale_if_error".to_string(),
-            "invalid".to_string(),
-        )]));
-        parse_caching_stale_if_error(&mut Some(params_invalid)).expect_err("should error");
+        // Booleans are not spellings of this setting: the setting names a
+        // behavior, not a switch, so `true`/`false` strings and a YAML bool
+        // are rejected, and the error names the accepted forms.
+        for s in ["true", "false"] {
+            let err = parse_sie(s).expect_err("boolean strings are rejected");
+            let msg = format!("{err}");
+            assert!(msg.contains("'enabled'/'disabled'"), "{msg}");
+        }
+        for b in [true, false] {
+            let mut params = Some(Params::from_string_map(HashMap::new()));
+            if let Some(p) = params.as_mut() {
+                p.data
+                    .insert("caching_stale_if_error".to_string(), ParamValue::Bool(b));
+            }
+            let err =
+                parse_caching_stale_if_error(&mut params).expect_err("a YAML boolean is rejected");
+            let msg = format!("{err}");
+            assert!(msg.contains("'enabled'/'disabled'"), "{msg}");
+        }
 
-        // Test missing parameter (default)
-        let result = parse_caching_stale_if_error(&mut None).expect("to parse");
-        assert_eq!(result, StaleIfError::Disabled);
+        // A duration is the new form.
+        assert_eq!(
+            parse_sie("600s").expect("parse"),
+            StaleIfError::For(Duration::from_mins(10))
+        );
+        assert_eq!(
+            parse_sie("10m").expect("parse"),
+            StaleIfError::For(Duration::from_mins(10))
+        );
+
+        // Zero normalizes to `Disabled`, so no `staleness <= 0` boundary exists.
+        assert_eq!(parse_sie("0").expect("parse"), StaleIfError::Disabled);
+        assert_eq!(parse_sie("0s").expect("parse"), StaleIfError::Disabled);
+
+        // `infinity`/`inf` is not an alias for `enabled` — it must error.
+        parse_sie("infinity").expect_err("infinity is not an alias");
+        parse_sie("inf").expect_err("inf is not an alias");
+
+        // Garbage errors and names the parameter and the accepted forms.
+        let err = parse_sie("soon").expect_err("garbage should error");
+        let msg = format!("{err}");
+        assert!(msg.contains("caching_stale_if_error"), "{msg}");
+        assert!(msg.contains("enabled"), "{msg}");
+
+        // Missing parameter is the default (`Disabled`).
+        assert_eq!(
+            parse_caching_stale_if_error(&mut None).expect("parse"),
+            StaleIfError::Disabled
+        );
+    }
+
+    /// `fundu` time units are case-sensitive — `Ms` is microseconds, `ms` is
+    /// milliseconds, and `M` (month) is not a unit it accepts at all. The value
+    /// must reach it as written: lowercasing it first would turn a 500µs window
+    /// into a 500ms one and read `1M` as one minute.
+    #[test]
+    fn stale_if_error_duration_units_keep_their_case() {
+        assert_eq!(
+            parse_sie("500Ms").expect("parse"),
+            StaleIfError::For(Duration::from_micros(500))
+        );
+        assert_eq!(
+            parse_sie("500ms").expect("parse"),
+            StaleIfError::For(Duration::from_millis(500))
+        );
+        parse_sie("1M").expect_err("`M` is not a supported unit and must not be read as `m`");
+        // The same value through the sibling duration parser `caching_ttl`
+        // uses, so the two cannot disagree on what a unit means.
+        let params = Params::from_string_map(HashMap::from([(
+            "caching_ttl".to_string(),
+            "500Ms".to_string(),
+        )]));
+        assert_eq!(
+            parse_caching_ttl(&mut Some(params)).expect("parse"),
+            Some(Duration::from_micros(500))
+        );
+    }
+
+    /// `fundu` saturates an oversized duration at `Duration::MAX` instead of
+    /// failing, and the retention paths add the stale window to `caching_ttl`.
+    /// A window that fits on its own but not in that sum is a configuration
+    /// error when the Spicepod is parsed, not a panic when the dataset loads.
+    #[test]
+    fn caching_windows_that_overflow_the_eviction_deadline_are_rejected() {
+        // `Duration::MAX` is 18446744073709551615.999999999s; two seconds under
+        // it parses as a finite window that no `caching_ttl` can be added to.
+        const NEAR_MAX: &str = "18446744073709551613s";
+
+        for (param, other) in [
+            (
+                "caching_stale_if_error",
+                "caching_stale_while_revalidate_ttl",
+            ),
+            (
+                "caching_stale_while_revalidate_ttl",
+                "caching_stale_if_error",
+            ),
+        ] {
+            let acceleration = spicepod_acceleration::Acceleration {
+                refresh_mode: Some(spicepod_acceleration::RefreshMode::Caching),
+                params: Some(Params::from_string_map(HashMap::from([(
+                    param.to_string(),
+                    NEAR_MAX.to_string(),
+                )]))),
+                ..Default::default()
+            };
+            let err = Acceleration::try_from(acceleration)
+                .expect_err("a window that overflows `caching_ttl` + window is rejected");
+            let msg = format!("{err}");
+            assert!(msg.contains("caching_ttl"), "{msg}");
+            assert!(msg.contains(param), "{msg}");
+            assert!(msg.contains(other), "{msg}");
+            assert!(!msg.contains('\n'), "{msg}");
+        }
+
+        // The check is on the sum: an explicit `caching_ttl` counts too.
+        let acceleration = spicepod_acceleration::Acceleration {
+            refresh_mode: Some(spicepod_acceleration::RefreshMode::Caching),
+            params: Some(Params::from_string_map(HashMap::from([
+                (
+                    "caching_ttl".to_string(),
+                    "18446744073709551600s".to_string(),
+                ),
+                ("caching_stale_if_error".to_string(), "1m".to_string()),
+            ]))),
+            ..Default::default()
+        };
+        Acceleration::try_from(acceleration).expect_err("`caching_ttl` + 1m overflows");
+
+        // `enabled` derives no deadline, so it has no sum to overflow, and a
+        // window that fits is accepted unchanged.
+        for (value, expected) in [
+            ("enabled", StaleIfError::Enabled),
+            ("10m", StaleIfError::For(Duration::from_mins(10))),
+        ] {
+            let acceleration = spicepod_acceleration::Acceleration {
+                refresh_mode: Some(spicepod_acceleration::RefreshMode::Caching),
+                params: Some(Params::from_string_map(HashMap::from([(
+                    "caching_stale_if_error".to_string(),
+                    value.to_string(),
+                )]))),
+                ..Default::default()
+            };
+            let parsed = Acceleration::try_from(acceleration).expect("a window that fits parses");
+            assert_eq!(parsed.caching_stale_if_error, expected);
+        }
+    }
+
+    #[test]
+    fn stale_if_error_helpers_gate_the_read_and_retention_paths() {
+        let d = Duration::from_mins(1);
+
+        // Only `Disabled` refuses to keep expired batches to fall back to.
+        assert!(!StaleIfError::Disabled.serves_stale_on_error());
+        assert!(StaleIfError::Enabled.serves_stale_on_error());
+        assert!(StaleIfError::For(d).serves_stale_on_error());
+
+        // `Disabled` never serves; `Enabled` always serves, even with unknown age.
+        assert!(!StaleIfError::Disabled.within_error_window(Some(Duration::ZERO)));
+        assert!(StaleIfError::Enabled.within_error_window(None));
+
+        // `For(N)` serves at or inside N and refuses past it — and fails closed
+        // when the staleness is unknown (missing/null `_fetched_at`).
+        assert!(StaleIfError::For(d).within_error_window(Some(Duration::from_secs(59))));
+        assert!(StaleIfError::For(d).within_error_window(Some(d)));
+        assert!(!StaleIfError::For(d).within_error_window(Some(Duration::from_secs(61))));
+        assert!(!StaleIfError::For(d).within_error_window(None));
+
+        // Retention window: `Disabled` honors only SWR, `Enabled` has no finite
+        // cutoff, `For(N)` takes the larger of N and SWR.
+        let swr = Duration::from_secs(30);
+        assert_eq!(
+            StaleIfError::Disabled.error_retention_window(Some(swr)),
+            Some(swr)
+        );
+        // Disabled with no SWR is a zero grace, NOT "no cutoff" — else the
+        // default caching cache stops expiring (`expiry_cutoff` reads None as
+        // never-expires). Only Enabled is the None case.
+        assert_eq!(
+            StaleIfError::Disabled.error_retention_window(None),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            StaleIfError::Enabled.error_retention_window(Some(swr)),
+            None
+        );
+        assert_eq!(
+            StaleIfError::For(d).error_retention_window(Some(swr)),
+            Some(d)
+        );
+        assert_eq!(
+            StaleIfError::For(swr).error_retention_window(Some(d)),
+            Some(d),
+            "SWR wins when it is the larger window"
+        );
+        assert_eq!(StaleIfError::For(d).error_retention_window(None), Some(d));
+    }
+
+    #[test]
+    fn stale_if_error_display_round_trips() {
+        for value in [
+            StaleIfError::Disabled,
+            StaleIfError::Enabled,
+            StaleIfError::For(Duration::from_mins(10)),
+            StaleIfError::For(Duration::from_millis(500)),
+        ] {
+            let rendered = value.to_string();
+            assert_eq!(
+                parse_sie(&rendered).expect("Display output must re-parse"),
+                value,
+                "round-trip failed for {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -1594,6 +1931,68 @@ mod tests {
         acceleration
             .validate_primary_key(&schema_with(&["marker_id", "value"]))
             .expect("primary key column present, so validation passes");
+    }
+
+    /// A column whose name contains dots is referenced the way it would be written in
+    /// SQL, so the quotes are not part of the name.
+    #[test]
+    fn quoted_primary_key_column_resolves_to_the_schema_column() {
+        let acceleration = spicepod_acceleration::Acceleration {
+            primary_key: Some(r#"(time_unix_nano, "service.instance.id")"#.to_string()),
+            ..Default::default()
+        };
+        let parsed = Acceleration::try_from(acceleration).expect("acceleration should parse");
+
+        let schema = schema_with(&["time_unix_nano", "service.instance.id", "value"]);
+        parsed
+            .validate_primary_key(&schema)
+            .expect("quoted primary key column present, so validation passes");
+
+        let constraints = parsed
+            .table_constraints(Arc::clone(&schema))
+            .expect("constraints should build")
+            .expect("a primary key was configured");
+        assert_eq!(
+            constraints,
+            Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![1, 0])]),
+            "the primary key must point at both configured columns"
+        );
+    }
+
+    #[test]
+    fn quoted_index_column_resolves_to_the_schema_column() {
+        let acceleration = spicepod_acceleration::Acceleration {
+            indexes: HashMap::from([(
+                r#""service.instance.id""#.to_string(),
+                spicepod_acceleration::IndexType::Enabled,
+            )]),
+            ..Default::default()
+        };
+        let parsed = Acceleration::try_from(acceleration).expect("acceleration should parse");
+
+        parsed
+            .validate_indexes(&schema_with(&["service.instance.id", "value"]))
+            .expect("quoted index column present, so validation passes");
+    }
+
+    #[test]
+    fn malformed_primary_key_reference_names_the_reference() {
+        let acceleration = spicepod_acceleration::Acceleration {
+            primary_key: Some(r#"(time_unix_nano, "service.instance.id"#.to_string()),
+            ..Default::default()
+        };
+        let err = Acceleration::try_from(acceleration).expect_err("unterminated quote must fail");
+
+        assert!(
+            matches!(err, ParseError::UnableToParseColumnReference { .. }),
+            "expected UnableToParseColumnReference, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(r#"(time_unix_nano, "service.instance.id"#)
+                && msg.contains("must end with ')'"),
+            "message should name the reference and what is missing: {msg}"
+        );
     }
 
     /// The exact configuration that turns durable federated write-back on.

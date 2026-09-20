@@ -1,0 +1,147 @@
+name: Substrait compliance
+
+# Mode A TPC-H on merge_group, push to trunk/release/feature branches,
+# nightly schedule, and manual dispatch. Not triggered on pull_request.
+# Per-query FAIL/ERROR still exit 0 (report-only pass rate). Do not fail
+# the repository on pass rate until a threshold is set. A harness/build
+# crash must still fail the job.
+#
+# Not a required check (`scripts/signoff` REQUIRED_CHECKS): the job runs
+# in the merge queue (path-gated below), on push to trunk/release/feature,
+# and on schedule/dispatch, but a low pass rate does not block merge.
+# `merge_group` cannot honour `paths`, so that event is gated with
+# check-code-changes instead. Docs-only / harness Markdown edits are
+# excluded from those globs so they do not pay for a 90m compile.
+
+on:
+  push:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+  schedule:
+    - cron: '30 8 * * *' # 08:30 UTC daily
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+# check-code-changes only runs on merge_group here, where dorny/paths-filter
+# diffs the checkout (`git diff <base>..<head>`). push/schedule/dispatch
+# skip path filtering and always run Mode A.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  SUBSTRAIT_COMPLIANCE_REF: 43d31411c69ef7594887c7d759037bcf8244eeed
+
+jobs:
+  # merge_group cannot path-filter, so decide here whether Mode A should
+  # run. push, schedule, and workflow_dispatch always run Mode A —
+  # dispatch has no useful base to diff (see verus_verify.yml).
+  check_changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name != 'merge_group' }}
+    steps:
+      - name: Non-merge-group events always run Mode A
+        if: ${{ github.event_name != 'merge_group' }}
+        run: echo "Mode A TPC-H runs on push, schedule, and workflow_dispatch"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ github.event_name == 'merge_group' }}
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check for relevant changes
+        if: ${{ github.event_name == 'merge_group' }}
+        id: check
+        uses: ./.github/actions/check-code-changes
+        with:
+          # Path gate for merge_group only. Harness globs omit `*.md` so
+          # README/RESULTS edits report green without running Mode A.
+          # Keep this list in lockstep with any future path documentation.
+          filters: |
+            code_changes:
+              - 'tools/substrait-compliance/src/**'
+              - 'tools/substrait-compliance/scripts/**'
+              - 'tools/substrait-compliance/Cargo.toml'
+              - 'tools/substrait-compliance/.gitignore'
+              - 'tools/substrait-compliance/NOTICE'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'rust-toolchain'
+              - '.cargo/**'
+              - '.github/workflows/substrait_compliance.yml'
+              - '.github/actions/setup-rust/**'
+              - '.github/actions/install-protoc/**'
+              - '.github/actions/check-code-changes/**'
+              - 'crates/yaml/**'
+
+  mode_a_tpch:
+    name: Mode A TPC-H
+    needs: check_changes
+    if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout spiceai
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # spiceai/substrait-compliance `spiceai` branch: IBM main (suite files
+      # identical to v0.1.1) plus the TPC-H q01 shipdate-cutoff correction. Keep
+      # this pin, scripts/fetch-ibm.sh, and SUITE_REF in src/main.rs together.
+      - name: Checkout spiceai/substrait-compliance
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: spiceai/substrait-compliance
+          ref: 43d31411c69ef7594887c7d759037bcf8244eeed
+          path: tools/substrait-compliance/.ibm
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Install Protoc
+        uses: ./.github/actions/install-protoc
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: '. -> target'
+          save-if: ${{ github.ref == 'refs/heads/trunk' }}
+
+      - name: Run Mode A TPC-H
+        # Per-query FAIL/ERROR already exit 0 (report-only pass rate).
+        # A nonzero exit is a harness/build/IO failure and must fail the job.
+        run: |
+          cargo run -p spice-substrait-compliance -- \
+            --mode mode-a \
+            --suite tools/substrait-compliance/.ibm/test-suites/tpch \
+            --out-json tools/substrait-compliance/results/mode-a-tpch.json \
+            --out-csv tools/substrait-compliance/results/mode-a-tpch.csv
+
+      - name: Upload JSON and CSV reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: substrait-compliance-mode-a-tpch
+          path: |
+            tools/substrait-compliance/results/mode-a-tpch.json
+            tools/substrait-compliance/results/mode-a-tpch.csv
+          if-no-files-found: warn

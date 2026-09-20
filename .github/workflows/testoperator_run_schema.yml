@@ -232,6 +232,17 @@ jobs:
 
       - name: Run the schema test - ${{ github.event.inputs.spicepod_path }}
         run: |
+          # A variable set to "" is not unset. `AWS_ENDPOINT_URL=""` is an endpoint
+          # override the AWS SDK rejects by panicking, which aborts the whole
+          # runtime, and `DUCKLAKE_CONNECTION_STRING=""` is a connection the
+          # DuckLake extension tries to open. These are only meaningful for
+          # `ducklake[postgres+s3]`.
+          for name in AWS_ENDPOINT_URL AWS_ALLOW_HTTP DUCKLAKE_CONNECTION_STRING; do
+            if [ -z "${!name:-}" ]; then
+              unset "$name"
+            fi
+          done
+
           rm -rf .spice/data
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run schema \
             -s /usr/local/bin/spiced \

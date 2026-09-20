@@ -26,7 +26,7 @@ use arrow_array::UInt16Array;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{Constraints, project_schema},
+    common::{Constraints, TableReference, project_schema},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -617,6 +617,7 @@ impl CacheKey {
 /// A table provider that fetches data from HTTP endpoints based on path and query filters
 #[derive(Clone)]
 pub struct HttpTableProvider {
+    table_ref: Option<TableReference>,
     base_url: Url,
     client: Client,
     file_format: String,
@@ -669,6 +670,7 @@ impl HttpTableProvider {
         acceleration_enabled: bool,
     ) -> Self {
         Self {
+            table_ref: None,
             base_url,
             client,
             file_format,
@@ -701,6 +703,19 @@ impl HttpTableProvider {
             rate_controller: None,
             json_nesting: None,
         }
+    }
+
+    /// Associates this provider with its registered `DataFusion` table.
+    #[must_use]
+    pub fn with_table_reference(mut self, table_ref: TableReference) -> Self {
+        self.table_ref = Some(table_ref);
+        self
+    }
+
+    /// Returns the registered `DataFusion` table associated with this provider.
+    #[must_use]
+    pub fn table_reference(&self) -> Option<&TableReference> {
+        self.table_ref.as_ref()
     }
 
     #[must_use]
