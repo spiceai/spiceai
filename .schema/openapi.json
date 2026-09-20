@@ -6827,7 +6827,7 @@
           },
           "questions": {
             "type": "object",
-            "description": "Questions keyed by caller-selected identifiers. At least one is required.",
+            "description": "Questions keyed by caller-selected identifiers. At least one is required; the\n`/v1/evaluate` handler enforces that so an empty map returns the endpoint's\ndocumented 400 body rather than an extractor rejection.",
             "additionalProperties": {
               "$ref": "#/components/schemas/Question"
             },
@@ -10245,32 +10245,25 @@
       "NullableEntry": {
         "oneOf": [
           {
-            "type": "null"
+            "type": "string"
           },
           {
-            "oneOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "array",
-                "items": {}
-              },
-              {
-                "type": "object",
-                "additionalProperties": {},
-                "propertyNames": {
-                  "type": "string"
-                }
-              },
-              {
-                "type": "null",
-                "default": null
-              }
-            ],
-            "description": "`TypeSafe` `EntryType`: string, object, array, or null.\n\nUsed for `instructions` and structured criteria descriptions.\nSee <https://docs.typesafe.ai/primitives/advanced>."
+            "type": "array",
+            "items": {}
+          },
+          {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null",
+            "default": null
           }
-        ]
+        ],
+        "description": "`TypeSafe` `EntryType`: string, object, array, or null.\n\nUsed for `instructions` and structured criteria descriptions.\nSee <https://docs.typesafe.ai/primitives/advanced>."
       },
       "OutputItem": {
         "oneOf": [
@@ -11000,7 +10993,8 @@
                 "items": {
                   "$ref": "#/components/schemas/NonNullEntry"
                 },
-                "description": "At least two non-null rubric levels; TypeSafe documents score criteria as an\narray of two or more levels (<https://docs.typesafe.ai/primitives/score>).",
+                "description": "Two to ten non-null rubric levels: `TypeSafe` documents score criteria as\n\"at least two levels and takes up to 10\"\n(<https://docs.typesafe.ai/primitives/score>).",
+                "maxItems": 10,
                 "minItems": 2
               },
               "instructions": {
@@ -11015,7 +11009,7 @@
             }
           }
         ],
-        "description": "A typed question sent to a System One evaluation model.\n\n`instructions` uses [`NullableEntry`] so an explicit JSON `null` survives the round\ntrip to TypeSafe instead of collapsing into an omitted field."
+        "description": "A typed question sent to a System One evaluation model.\n\n`instructions` uses [`NullableEntry`] so an explicit JSON `null` survives the round\ntrip to `TypeSafe` instead of collapsing into an omitted field."
       },
       "RankVersionType": {
         "type": "string",

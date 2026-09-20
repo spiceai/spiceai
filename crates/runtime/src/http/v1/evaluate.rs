@@ -77,6 +77,18 @@ pub(crate) async fn post(
     crate::task_history::correlation::record_task_history_trace_id(&span, &context);
 
     async move {
+    // Validated here rather than during deserialization so an empty map returns this
+    // endpoint's documented 400 body instead of an Axum extractor rejection.
+    if req.questions.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "`questions` must contain at least one question."
+            })),
+        )
+            .into_response();
+    }
+
     let model_id = req.model.clone();
     let Some(model) = models.read().await.get(&model_id).cloned() else {
         return (
@@ -91,8 +103,19 @@ pub(crate) async fn post(
     };
 
     match model.evaluate(req).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(e) => evaluate_error_response(&e),
+        Ok(response) => {
+            // The exporter reads `captured_output` for the row's result and derives
+            // `error_message` only from ERROR events, so both are emitted here.
+            tracing::info!(
+                target: "task_history",
+                captured_output = %serde_json::to_string(&response).unwrap_or_default()
+            );
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "task_history", "{e}");
+            evaluate_error_response(&e)
+        }
     }
     }
     .instrument(span.clone())
@@ -217,5 +240,32 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    /// An empty `questions` map must return this endpoint's documented 400 envelope,
+    /// not an extractor rejection with a different shape.
+    #[tokio::test]
+    async fn evaluate_rejects_empty_questions_with_the_documented_body() {
+        let models = Arc::new(RwLock::new(EvaluateModelStore::new()));
+        let response = post(
+            Extension(models),
+            Json(EvaluateRequest {
+                model: "jev".to_string(),
+                state: EvaluateState::String("s".to_string()),
+                questions: BTreeMap::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert!(
+            json.get("error").is_some(),
+            "must use the documented error envelope: {json}"
+        );
     }
 }

@@ -120,40 +120,89 @@ impl TypeSafe {
     }
 
     /// Every question asked must come back answered, with an answer of the matching
-    /// kind. A 200 that silently drops or re-types an answer is a wrong result, not a
-    /// success, so it is surfaced as an unparseable response rather than published.
+    /// kind and a value inside the domain the question defined. A 200 that drops,
+    /// re-types, or answers outside its own options is a wrong result, not a success,
+    /// so it is surfaced as an unparseable response rather than published.
     fn ensure_answers_match(
         &self,
-        asked: &BTreeMap<String, &'static str>,
+        asked: &BTreeMap<String, Question>,
         response: &EvaluateResponse,
     ) -> Result<()> {
+        let bad = |detail: String| evaluate_api::Error::UnparseableResponse {
+            model: self.name.clone(),
+            response: detail,
+        };
+
         let missing: Vec<&str> = asked
             .keys()
             .filter(|id| !response.answers.contains_key(*id))
             .map(String::as_str)
             .collect();
         if !missing.is_empty() {
-            return Err(evaluate_api::Error::UnparseableResponse {
-                model: self.name.clone(),
-                response: format!("no answer for question(s): {}", missing.join(", ")),
-            });
+            return Err(bad(format!(
+                "no answer for question(s): {}",
+                missing.join(", ")
+            )));
         }
 
         for (id, answer) in &response.answers {
-            let Some(expected) = asked.get(id) else {
-                return Err(evaluate_api::Error::UnparseableResponse {
-                    model: self.name.clone(),
-                    response: format!("answer for question '{id}', which was not asked"),
-                });
+            let Some(question) = asked.get(id) else {
+                return Err(bad(format!(
+                    "answer for question '{id}', which was not asked"
+                )));
             };
-            let got = answer_kind(answer);
-            if got != *expected {
-                return Err(evaluate_api::Error::UnparseableResponse {
-                    model: self.name.clone(),
-                    response: format!(
-                        "question '{id}' is a {expected} question but the answer is a {got}"
-                    ),
-                });
+            let (expected, got) = (question_kind(question), answer_kind(answer));
+            if expected != got {
+                return Err(bad(format!(
+                    "question '{id}' is a {expected} question but the answer is a {got}"
+                )));
+            }
+
+            match (question, answer) {
+                (_, Answer::Noul { noul }) => {
+                    if !is_probability(*noul) {
+                        return Err(bad(format!(
+                            "question '{id}': noul {noul} is outside [0, 1]"
+                        )));
+                    }
+                }
+                (
+                    Question::Choice { criteria, .. },
+                    Answer::Choice {
+                        choice,
+                        probabilities,
+                        confidence,
+                    },
+                ) => {
+                    if !criteria.contains_key(choice) {
+                        return Err(bad(format!(
+                            "question '{id}': answer '{choice}' is not one of its options"
+                        )));
+                    }
+                    check_distribution(id, probabilities, *confidence).map_err(bad)?;
+                }
+                (
+                    Question::Score { criteria, .. },
+                    Answer::Score {
+                        score,
+                        probabilities,
+                        confidence,
+                        ..
+                    },
+                ) => {
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "score criteria are bounded at ten levels"
+                    )]
+                    let top = (criteria.len() - 1) as f64;
+                    if !score.is_finite() || *score < 0.0 || *score > top {
+                        return Err(bad(format!(
+                            "question '{id}': score {score} is outside [0, {top}]"
+                        )));
+                    }
+                    check_distribution(id, probabilities, *confidence).map_err(bad)?;
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -170,6 +219,32 @@ fn is_version_pinned(model_id: &str) -> bool {
             .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
             && tail.contains('.')
     })
+}
+
+/// `TypeSafe` reports probabilities and confidence as values in `[0, 1]`.
+fn is_probability(value: f64) -> bool {
+    value.is_finite() && (0.0..=1.0).contains(&value)
+}
+
+/// Confidence and every probability in the distribution must be a probability.
+fn check_distribution(
+    id: &str,
+    probabilities: &BTreeMap<String, f64>,
+    confidence: f64,
+) -> std::result::Result<(), String> {
+    if !is_probability(confidence) {
+        return Err(format!(
+            "question '{id}': confidence {confidence} is outside [0, 1]"
+        ));
+    }
+    for (key, p) in probabilities {
+        if !is_probability(*p) {
+            return Err(format!(
+                "question '{id}': probability for '{key}' is {p}, outside [0, 1]"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The primitive a question asks for, used to check the answer that comes back.
@@ -224,11 +299,7 @@ impl Evaluate for TypeSafe {
         // Always send the upstream model id, not the Spicepod component name.
         request.model = self.model_id.clone();
 
-        let asked: BTreeMap<String, &'static str> = request
-            .questions
-            .iter()
-            .map(|(id, q)| (id.clone(), question_kind(q)))
-            .collect();
+        let asked = request.questions.clone();
 
         let response = self
             .client
@@ -316,11 +387,19 @@ impl Evaluate for TypeSafe {
 
         // A reachable endpoint is not the same as a usable model: without this, a typo
         // such as `typesafe:jev-does-not-exist` loads Ready and fails every evaluation.
+        // A listing we cannot decode is a broken endpoint, not an empty account: only a
+        // successfully decoded response may take the permissive path below.
         let listed = response
             .json::<ModelsResponse>()
             .await
             .map(ModelsResponse::into_names)
-            .unwrap_or_default();
+            .map_err(|e| evaluate_api::Error::HealthCheckFailed {
+                source: format!(
+                    "could not read the model list from {}: {e}",
+                    self.models_url()
+                )
+                .into(),
+            })?;
 
         // An empty or unreadable list is not evidence the model is missing, and a
         // versioned pin is accepted by TypeSafe even when only aliases are listed.
@@ -677,5 +756,125 @@ mod tests {
             .expect("client")
             .with_base_url(server.uri());
         pinned.health().await.expect("a versioned pin is healthy");
+    }
+    fn choice_question(id: &str) -> BTreeMap<String, Question> {
+        BTreeMap::from([(
+            id.to_string(),
+            Question::Choice {
+                instructions: "which team?".into(),
+                criteria: BTreeMap::from([
+                    ("billing".to_string(), EntryType::String("pay".into())),
+                    ("technical".to_string(), EntryType::String("bugs".into())),
+                ]),
+            },
+        )])
+    }
+
+    /// A choice outside the options the question defined is a wrong result.
+    #[tokio::test]
+    async fn evaluate_rejects_a_choice_outside_the_offered_options() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "choice", "choice": "legal",
+                "probabilities": {"legal": 1.0}, "confidence": 0.9
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: choice_question("q"),
+            })
+            .await
+            .expect_err("an out-of-domain choice must not be published");
+        let msg = err.to_string();
+        assert!(msg.contains("'legal' is not one of its options"), "{msg}");
+    }
+
+    /// A noul outside its documented [0, 1] range is a wrong result.
+    #[tokio::test]
+    async fn evaluate_rejects_a_noul_outside_its_range() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {"type": "noul", "noul": 1.7}}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: noul_question("q"),
+            })
+            .await
+            .expect_err("an out-of-range noul must not be published");
+        assert!(err.to_string().contains("outside [0, 1]"), "{err}");
+    }
+
+    /// Confidence outside [0, 1] is equally a wrong result.
+    #[tokio::test]
+    async fn evaluate_rejects_confidence_outside_its_range() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "choice", "choice": "billing",
+                "probabilities": {"billing": 1.0}, "confidence": 4.2
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: choice_question("q"),
+            })
+            .await
+            .expect_err("out-of-range confidence must not be published");
+        assert!(
+            err.to_string().contains("confidence 4.2 is outside"),
+            "{err}"
+        );
+    }
+
+    /// A valid in-domain answer still succeeds.
+    #[tokio::test]
+    async fn evaluate_accepts_a_well_formed_choice() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "choice", "choice": "technical",
+                "probabilities": {"billing": 0.1, "technical": 0.9}, "confidence": 0.88
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: choice_question("q"),
+            })
+            .await
+            .expect("a well-formed answer is still accepted");
     }
 }

@@ -177,14 +177,14 @@ impl JsonSchema for NullableEntry {
 
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         // Documented as EntryType | null (same wire shape as before).
-        <Option<EntryType> as JsonSchema>::json_schema(generator)
+        <EntryType as JsonSchema>::json_schema(generator)
     }
 }
 
 #[cfg(feature = "openapi")]
 impl utoipa::PartialSchema for NullableEntry {
     fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
-        <Option<EntryType> as utoipa::PartialSchema>::schema()
+        <EntryType as utoipa::PartialSchema>::schema()
     }
 }
 
@@ -227,11 +227,12 @@ pub enum Question {
     Score {
         #[serde(default, skip_serializing_if = "nullable_entry_is_absent")]
         instructions: NullableEntry,
-        /// At least two non-null rubric levels; `TypeSafe` documents score criteria as an
-        /// array of two or more levels (<https://docs.typesafe.ai/primitives/score>).
+        /// Two to ten non-null rubric levels: `TypeSafe` documents score criteria as
+        /// "at least two levels and takes up to 10"
+        /// (<https://docs.typesafe.ai/primitives/score>).
         #[serde(deserialize_with = "deserialize_score_criteria")]
-        #[schemars(length(min = 2))]
-        #[cfg_attr(feature = "openapi", schema(min_items = 2))]
+        #[schemars(length(min = 2, max = 10))]
+        #[cfg_attr(feature = "openapi", schema(min_items = 2, max_items = 10))]
         criteria: Vec<NonNullEntry>,
     },
 }
@@ -264,29 +265,12 @@ where
     D: serde::Deserializer<'de>,
 {
     let criteria = Vec::<NonNullEntry>::deserialize(deserializer)?;
-    if criteria.len() < 2 {
+    if !(2..=10).contains(&criteria.len()) {
         return Err(serde::de::Error::custom(
-            "score criteria must contain at least two non-null levels",
+            "score criteria must contain between two and ten non-null levels",
         ));
     }
     Ok(criteria)
-}
-
-/// `TypeSafe` requires at least one question per request, so reject an empty map here
-/// rather than after a round trip to the provider.
-fn deserialize_nonempty_questions<'de, D>(
-    deserializer: D,
-) -> std::result::Result<BTreeMap<String, Question>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let questions = BTreeMap::<String, Question>::deserialize(deserializer)?;
-    if questions.is_empty() {
-        return Err(serde::de::Error::custom(
-            "questions must contain at least one question",
-        ));
-    }
-    Ok(questions)
 }
 
 /// A successful evaluation answers something; an empty `answers` map is a malformed
@@ -336,8 +320,9 @@ pub struct EvaluateRequest {
     pub model: String,
     /// State for the model to evaluate: string, object, or array.
     pub state: EvaluateState,
-    /// Questions keyed by caller-selected identifiers. At least one is required.
-    #[serde(deserialize_with = "deserialize_nonempty_questions")]
+    /// Questions keyed by caller-selected identifiers. At least one is required; the
+    /// `/v1/evaluate` handler enforces that so an empty map returns the endpoint's
+    /// documented 400 body rather than an extractor rejection.
     #[schemars(length(min = 1))]
     pub questions: BTreeMap<String, Question>,
 }
@@ -609,7 +594,7 @@ mod tests {
         );
     }
 
-    /// `TypeSafe` documents score criteria as two or more levels.
+    /// `TypeSafe` documents score criteria as two to ten levels.
     #[test]
     fn score_criteria_requires_two_levels() {
         let one = serde_json::from_value::<Question>(
@@ -621,18 +606,18 @@ mod tests {
             json!({"type": "score", "instructions": "how bad?", "criteria": ["calm", "angry"]}),
         )
         .expect("two levels are valid");
-    }
 
-    /// An empty `questions` map is rejected by the contract, not only by the provider.
-    #[test]
-    fn request_requires_at_least_one_question() {
-        let empty = serde_json::from_value::<EvaluateRequest>(
-            json!({"model": "jev", "state": "s", "questions": {}}),
+        let ten: Vec<String> = (0..10).map(|i| format!("level {i}")).collect();
+        serde_json::from_value::<Question>(
+            json!({"type": "score", "instructions": "how bad?", "criteria": ten}),
+        )
+        .expect("ten levels are valid");
+
+        let eleven: Vec<String> = (0..11).map(|i| format!("level {i}")).collect();
+        let over = serde_json::from_value::<Question>(
+            json!({"type": "score", "instructions": "how bad?", "criteria": eleven}),
         );
-        assert!(
-            empty.is_err(),
-            "empty questions must be rejected: {empty:?}"
-        );
+        assert!(over.is_err(), "eleven levels must be rejected: {over:?}");
     }
 
     /// A provider reply with no answers is malformed, not a successful evaluation.
