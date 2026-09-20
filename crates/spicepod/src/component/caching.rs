@@ -55,12 +55,13 @@ pub enum HashingAlgorithm {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CacheEngine {
-    /// Historical default (`moka`). Accepted for spicepod compatibility and
-    /// ignored at runtime: SQL, search, and embeddings `LruCache` paths always
-    /// use the Spice sharded-cache backend.
+    /// Historical default (`moka`). Accepted for spicepod configuration
+    /// compatibility and ignored at runtime: SQL, search, and embeddings
+    /// `LruCache` paths always use the Spice sharded-cache backend. Leaving
+    /// `engine: moka` does not preserve Moka eviction or timing behavior.
     ///
-    /// Migration: leave `engine: moka` in place (no behavior change) or remove
-    /// the field; neither value selects a backend.
+    /// Migration: leave `engine: moka` in place for deserialize compatibility,
+    /// or remove the field; neither value selects a backend.
     #[default]
     Moka,
     /// Historical Pingora-LRU option (`pingora`). Accepted for spicepod
