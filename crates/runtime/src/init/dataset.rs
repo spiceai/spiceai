@@ -4639,8 +4639,10 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         assert!(
             accelerator.was_initialized(),
             "so `init` is reachable, and the refusal above is what stopped it"
+        );
+    }
 
-/// A dataset performing its first load reports `Refreshing`, exactly like one
+    /// A dataset performing its first load reports `Refreshing`, exactly like one
     /// refreshing data it already holds; the registry's ever-ready record is what
     /// tells them apart, so the summary counts the first as loading and the second
     /// as ready, and stays unsettled while the first load is in flight.
