@@ -51,8 +51,9 @@ impl ModelsResponse {
 struct ModelCard {
     #[serde(alias = "id")]
     name: String,
-    /// Additional names callers may configure (e.g. `jev-latest`).
-    #[serde(default)]
+    /// Additional names callers may configure (e.g. `jev-latest`). The documented
+    /// listing uses `aliases`; `alias` is accepted for compatibility.
+    #[serde(default, alias = "aliases")]
     alias: Vec<String>,
 }
 
@@ -177,5 +178,19 @@ mod tests {
             SecretString::from("sk-test"),
         );
         TypeSafeModelLister::from_params(&params).expect("alias key");
+    }
+
+    /// The documented listing shape uses `aliases`; dropping it makes the
+    /// documented `jev-latest` alias look unavailable at startup.
+    #[test]
+    fn plural_aliases_are_listed() {
+        let body = serde_json::json!({
+            "models": [{"id": "jev-1.13.0", "aliases": ["jev-latest", "jev-preview"]}]
+        });
+        let parsed: ModelsResponse =
+            serde_json::from_value(body).expect("the documented listing shape parses");
+        let names = parsed.into_names();
+        assert!(names.contains(&"jev-latest".to_string()), "{names:?}");
+        assert!(names.contains(&"jev-1.13.0".to_string()), "{names:?}");
     }
 }

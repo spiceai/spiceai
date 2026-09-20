@@ -218,11 +218,16 @@ impl TypeSafe {
                             )));
                         }
                     }
-                    let domain: Vec<String> = if legend.is_empty() {
-                        (0..=top_idx).map(|i| i.to_string()).collect()
-                    } else {
-                        legend.keys().cloned().collect()
-                    };
+                    let domain: Vec<String> = (0..=top_idx).map(|i| i.to_string()).collect();
+                    if !legend.is_empty() {
+                        for level in &domain {
+                            if !legend.contains_key(level) {
+                                return Err(bad(format!(
+                                    "question '{id}': legend is missing score level '{level}' of the rubric [0, {top_idx}]"
+                                )));
+                            }
+                        }
+                    }
                     check_distribution(
                         id,
                         probabilities,
@@ -258,6 +263,9 @@ fn is_probability(value: f64) -> bool {
 /// Confidence and every probability in the distribution must be a probability.
 /// The distribution must cover exactly the question's domain — no missing keys,
 /// no extras.
+/// Floating-point slack allowed when checking that a distribution sums to 1.
+const PROBABILITY_SUM_TOLERANCE: f64 = 1e-6;
+
 fn check_distribution<'a>(
     id: &str,
     probabilities: &BTreeMap<String, f64>,
@@ -288,6 +296,12 @@ fn check_distribution<'a>(
                 "question '{id}': probability for '{key}' is {p}, outside [0, 1]"
             ));
         }
+    }
+    let sum: f64 = probabilities.values().sum();
+    if (sum - 1.0).abs() > PROBABILITY_SUM_TOLERANCE {
+        return Err(format!(
+            "question '{id}': probabilities sum to {sum}, which is not a distribution over [0, 1]"
+        ));
     }
     Ok(())
 }
@@ -468,7 +482,7 @@ impl Evaluate for TypeSafe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use evaluate_api::{Answer, EntryType, EvaluateState, Question};
+    use evaluate_api::{Answer, EntryType, EvaluateState, NonNullEntry, NullableEntry, Question};
     use serde_json::json;
     use std::collections::BTreeMap;
     use wiremock::matchers::{header, method, path};
@@ -841,6 +855,77 @@ mod tests {
             .expect_err("an out-of-domain choice must not be published");
         let msg = err.to_string();
         assert!(msg.contains("'legal' is not one of its options"), "{msg}");
+    }
+
+    fn score_question(id: &str, levels: usize) -> BTreeMap<String, Question> {
+        BTreeMap::from([(
+            id.to_string(),
+            Question::Score {
+                instructions: NullableEntry::default(),
+                criteria: (0..levels)
+                    .map(|i| NonNullEntry::String(format!("level {i}")))
+                    .collect(),
+            },
+        )])
+    }
+
+    /// A legend that omits rubric levels must not narrow the domain its own answer
+    /// is then checked against, or an incomplete score validates.
+    #[tokio::test]
+    async fn evaluate_rejects_a_score_legend_missing_a_rubric_level() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "score", "score": 0,
+                "legend": {"0": "poor"},
+                "probabilities": {"0": 1.0}, "confidence": 0.9
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: score_question("q", 2),
+            })
+            .await
+            .expect_err("a legend that drops a rubric level must not be published");
+        let msg = err.to_string();
+        assert!(msg.contains("missing score level '1'"), "{msg}");
+    }
+
+    /// Probabilities that do not sum to 1 are not a distribution, whatever each
+    /// individual value is.
+    #[tokio::test]
+    async fn evaluate_rejects_probabilities_that_do_not_sum_to_one() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "choice", "choice": "billing",
+                "probabilities": {"billing": 0.1, "technical": 0.2}, "confidence": 0.9
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: choice_question("q"),
+            })
+            .await
+            .expect_err("probabilities summing to 0.3 must not be published");
+        let msg = err.to_string();
+        assert!(msg.contains("sum to"), "{msg}");
     }
 
     /// A noul outside its documented [0, 1] range is a wrong result.

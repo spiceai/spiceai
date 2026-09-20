@@ -21,6 +21,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use crate::model::metrics::{handle_metrics, handle_token_metrics};
 use axum::{
     Extension, Json,
     http::StatusCode,
@@ -29,6 +30,8 @@ use axum::{
 #[cfg(feature = "openapi")]
 use evaluate_api::EvaluateResponse;
 use evaluate_api::{Error as EvaluateError, EvaluateRequest};
+use opentelemetry::{Key, KeyValue, Value};
+use std::time::Instant;
 use tokio::sync::RwLock;
 
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -102,8 +105,26 @@ pub(crate) async fn post(
             .into_response();
     };
 
-    match model.evaluate(req).await {
+    // Evaluations are inference: they belong in the same request, failure, duration and
+    // token series as the chat and responses paths rather than a family of their own.
+    let labels = [KeyValue::new(
+        Key::new("model"),
+        Value::String(model_id.clone().into()),
+    )];
+    let start = Instant::now();
+
+    let result = model.evaluate(req).await;
+    handle_metrics(start.elapsed(), result.is_err(), &labels);
+
+    match result {
         Ok(response) => {
+            if let Some(usage) = response.usage.as_ref() {
+                handle_token_metrics(
+                    u32::try_from(usage.input_tokens).unwrap_or(u32::MAX),
+                    u32::try_from(usage.output_tokens).unwrap_or(u32::MAX),
+                    &labels,
+                );
+            }
             // The exporter reads `captured_output` for the row's result and derives
             // `error_message` only from ERROR events, so both are emitted here.
             tracing::info!(
