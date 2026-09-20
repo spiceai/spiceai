@@ -950,6 +950,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "arrow",
  "arrow-cast",
+ "arrow-ipc",
  "arrow-json",
  "arrow-schema",
  "base64 0.22.1",
