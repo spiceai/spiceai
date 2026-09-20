@@ -93,7 +93,7 @@ pub enum CachedData {
         /// promote). If that promotion cannot fit `max_size`, the store is
         /// rewritten with a fresh empty cell again so decoded batches are not
         /// retained while the weigher still bills compressed size.
-        decoded: Arc<tokio::sync::OnceCell<Arc<Vec<RecordBatch>>>>,
+        decoded: Arc<tokio::sync::OnceCell<CachedBatches>>,
         /// Successful decode-serves recorded on the stored entry. `0` at
         /// insert; `1` after the first cache hit (still encoded); the second
         /// hit promotes to [`CachedData::Raw`].
@@ -263,7 +263,7 @@ impl CachedQueryResult {
                             .as_ref()
                             .ok_or(crate::encoding::Error::NoEncoderSpecified)?;
                         let batches = encoder.decode(&bytes).await?;
-                        Ok(Arc::new(super::prepare_for_storage(batches)))
+                        Ok(wrap_raw_batches(super::prepare_for_storage(batches)))
                     })
                     .await
                     .map(Arc::clone)
@@ -357,7 +357,7 @@ impl CachedQueryResult {
     /// `cached_at` / `read_started_at`) is not overwritten. [`Self::keep_remaining_ttl`]
     /// is set so the backend reweighs without restarting the entry's TTL.
     #[must_use]
-    pub(crate) fn to_promoted_raw(&self, records: Arc<Vec<RecordBatch>>) -> Self {
+    pub(crate) fn to_promoted_raw(&self, records: CachedBatches) -> Self {
         Self {
             data: CachedData::Raw(records),
             schema: self.schema.clone(),
@@ -1922,7 +1922,7 @@ mod tests {
             "recording a decode hit is a reweigh of the same result, so TTL must not restart"
         );
 
-        let raw = recorded.to_promoted_raw(Arc::new(Vec::new()));
+        let raw = recorded.to_promoted_raw(wrap_raw_batches(Vec::new()));
 
         assert!(!raw.is_encoded());
         assert!(encoded.is_same_generation(&raw));
