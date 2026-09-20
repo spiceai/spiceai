@@ -1311,6 +1311,12 @@ fn literal_utf8(expr: &Expr) -> Option<&str> {
 /// the pattern is emitted as a `BigQuery` **raw** string literal (see
 /// [`raw_string`]), which a `'` would terminate and a control character has no
 /// spelling in.
+///
+/// The `DuckDB` dialect answers the same RE2-versus-`regex` question for
+/// `regexp_count` with the syntax-tree walker in [`super::re2`], which admits a
+/// slightly different set (no POSIX classes or `m`/`s` flags, non-ASCII
+/// literals allowed); folding this scanner into that walker is the intended
+/// consolidation (#14151).
 fn pattern_is_engine_agnostic(pattern: &str) -> bool {
     let mut chars = pattern.chars().peekable();
     let mut in_character_class = false;
@@ -1384,11 +1390,11 @@ fn counted_repetition_exceeds_re2_limit(chars: &std::iter::Peekable<std::str::Ch
     let Some(lower) = repetition_bound(&mut chars) else {
         return false;
     };
-    if lower > 1000 {
+    if lower > super::re2::RE2_MAX_REPETITION {
         return true;
     }
     matches!(chars.next(), Some(','))
-        && repetition_bound(&mut chars).is_some_and(|upper| upper > 1000)
+        && repetition_bound(&mut chars).is_some_and(|upper| upper > super::re2::RE2_MAX_REPETITION)
 }
 
 fn repetition_bound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<u32> {
