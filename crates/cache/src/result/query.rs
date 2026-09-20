@@ -44,7 +44,33 @@ pub enum CachedData {
     /// Raw `RecordBatches` stored directly (encoding: none)
     Raw(Arc<Vec<RecordBatch>>),
     /// IPC-serialized bytes, additionally compressed (e.g., with zstd)
-    Encoded(Bytes),
+    Encoded {
+        bytes: Bytes,
+        /// The size of the Arrow IPC stream `bytes` decodes to. See
+        /// [`crate::encoding::Encoded::decoded_len`].
+        decoded_len: usize,
+        /// Filled by a successful decode of *this* stored value. Clones of the
+        /// same fetch share the cell, so concurrent `records()` on one get
+        /// decode once. The store writes a fresh empty cell after the first
+        /// hit so a later fetch of the key decodes again (and may then
+        /// promote). If that promotion cannot fit `max_size`, the store is
+        /// rewritten with a fresh empty cell again so decoded batches are not
+        /// retained while the weigher still bills compressed size.
+        decoded: Arc<tokio::sync::OnceCell<Arc<Vec<RecordBatch>>>>,
+        /// Successful decode-serves recorded on the stored entry. `0` at
+        /// insert; `1` after the first cache hit (still encoded); the second
+        /// hit promotes to [`CachedData::Raw`].
+        decode_hits: u8,
+    },
+}
+
+fn encoded_payload(bytes: Bytes, decoded_len: usize) -> CachedData {
+    CachedData::Encoded {
+        bytes,
+        decoded_len,
+        decoded: Arc::new(tokio::sync::OnceCell::new()),
+        decode_hits: 0,
+    }
 }
 
 #[derive(Clone)]
@@ -73,6 +99,11 @@ pub struct CachedQueryResult {
     pub read_started_at: Instant,
     /// Encoder used to decode the data
     encoder: Option<Arc<dyn Encoder>>,
+    /// Set when this value is a reweigh of an entry already in the store
+    /// (first-hit decode counter, or `Encoded` → `Raw`). A replace that keeps
+    /// this flag must not reset the entry's remaining TTL: it is not a new
+    /// result.
+    keep_remaining_ttl: bool,
 }
 
 impl CachedQueryResult {
@@ -95,13 +126,17 @@ impl CachedQueryResult {
             cached_at,
             read_started_at,
             encoder: None,
+            keep_remaining_ttl: false,
         }
     }
 
     /// Create a new cached query result with encoded data.
+    ///
+    /// `decoded_len` is the size of the Arrow IPC stream `encoded_data` decodes to.
     #[must_use]
     pub fn new(
         encoded_data: Bytes,
+        decoded_len: usize,
         schema: Arc<Schema>,
         input_tables: Arc<HashSet<TableReference>>,
         cached_at: Instant,
@@ -109,17 +144,22 @@ impl CachedQueryResult {
         encoder: Option<Arc<dyn Encoder>>,
     ) -> Self {
         Self {
-            data: CachedData::Encoded(encoded_data),
+            data: encoded_payload(encoded_data, decoded_len),
             schema: crate::intern::schema::intern(schema),
             input_tables: crate::intern::table_set::intern(input_tables),
             cached_at,
             read_started_at,
             encoder,
+            keep_remaining_ttl: false,
         }
     }
 
     /// Create a cached query result from record batches.
-    /// Only store encoded data if an encoder is provided.
+    ///
+    /// Encoded whenever an encoder is configured, which is what
+    /// `caching.sql_results.encoding` selects. A hit on a small encoded entry is
+    /// still served where the request arrived: the decode is bounded there by
+    /// the runtime's `INLINE_DECODE_MAX_BYTES`, read from [`Self::decoded_len`].
     ///
     /// The `schema` parameter must be provided explicitly to ensure the correct
     /// schema is preserved even when `records` is empty (e.g., 0-row query results).
@@ -135,10 +175,15 @@ impl CachedQueryResult {
         read_started_at: Instant,
         encoder: Option<Arc<dyn Encoder>>,
     ) -> Result<Self, crate::encoding::Error> {
-        // Only store encoded data if an encoder is provided
+        // An encoder is configured for the whole cache, so every entry it can
+        // encode is encoded: `caching.sql_results.encoding` says what the cache
+        // compresses with, and storing some entries raw would make it describe
+        // only part of what it holds. A hit on a small encoded entry is still
+        // served where the request arrived — the decode is bounded there by
+        // `INLINE_DECODE_MAX_BYTES`, which reads `Self::decoded_len`.
         let data = if let Some(encoder) = encoder.as_ref() {
-            let encoded_data = encoder.encode(&records).await?;
-            CachedData::Encoded(Bytes::from(encoded_data))
+            let payload = encoder.encode(&records).await?;
+            encoded_payload(Bytes::from(payload.bytes), payload.decoded_len)
         } else {
             CachedData::Raw(Arc::new(super::prepare_for_storage(records)))
         };
@@ -150,10 +195,16 @@ impl CachedQueryResult {
             cached_at,
             read_started_at,
             encoder,
+            keep_remaining_ttl: false,
         })
     }
 
     /// Decode and return the cached record batches.
+    ///
+    /// Concurrent `records()` on clones of the same fetch share one zstd+IPC
+    /// pass through [`tokio::sync::OnceCell`]. The cache store is updated
+    /// separately (see [`crate::QueryResultsCacheProvider::records`]): the
+    /// first hit stays encoded, the second promotes to [`CachedData::Raw`].
     ///
     /// # Errors
     ///
@@ -161,13 +212,133 @@ impl CachedQueryResult {
     pub async fn records(&self) -> Result<Arc<Vec<RecordBatch>>, crate::encoding::Error> {
         match &self.data {
             CachedData::Raw(batches) => Ok(Arc::clone(batches)),
-            CachedData::Encoded(bytes) => {
-                if let Some(encoder) = &self.encoder {
-                    encoder.decode(bytes).await.map(Arc::new)
-                } else {
-                    Err(crate::encoding::Error::NoEncoderSpecified)
-                }
+            CachedData::Encoded { bytes, decoded, .. } => {
+                let decoded = Arc::clone(decoded);
+                let bytes = bytes.clone();
+                let encoder = self.encoder.clone();
+                decoded
+                    .get_or_try_init(|| async move {
+                        let encoder = encoder
+                            .as_ref()
+                            .ok_or(crate::encoding::Error::NoEncoderSpecified)?;
+                        let batches = encoder.decode(&bytes).await?;
+                        Ok(Arc::new(super::prepare_for_storage(batches)))
+                    })
+                    .await
+                    .map(Arc::clone)
             }
+        }
+    }
+
+    /// How many successful decode-serves the store has recorded for this
+    /// encoded entry, or `None` if it is already raw.
+    #[must_use]
+    pub(crate) fn encoded_decode_hits(&self) -> Option<u8> {
+        match &self.data {
+            CachedData::Raw(_) => None,
+            CachedData::Encoded { decode_hits, .. } => Some(*decode_hits),
+        }
+    }
+
+    /// Whether this encoded value's decode `OnceCell` currently holds batches.
+    ///
+    /// Used to assert that a skipped promotion dropped the stored decode
+    /// rather than leaving it billed as compressed bytes only.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn encoded_has_resident_decode(&self) -> bool {
+        match &self.data {
+            CachedData::Raw(_) => false,
+            CachedData::Encoded { decoded, .. } => decoded.get().is_some(),
+        }
+    }
+
+    /// Encoded copy after the first successful decode-serve: still compressed,
+    /// with a fresh decode cell so the next fetch of the key pays zstd+IPC
+    /// again. [`Self::keep_remaining_ttl`] is set so the counter bump does not
+    /// restart TTL.
+    #[must_use]
+    pub(crate) fn with_recorded_decode_hit(&self) -> Self {
+        self.with_fresh_decode_cell(|hits| hits.saturating_add(1))
+    }
+
+    /// Encoded copy with a fresh empty decode cell and the same hit counter.
+    /// Used when promotion cannot fit `max_size`: the response still holds the
+    /// decoded `Arc`, and the store must not retain those batches off-budget.
+    #[must_use]
+    pub(crate) fn with_cleared_decode_cell(&self) -> Self {
+        self.with_fresh_decode_cell(std::convert::identity)
+    }
+
+    fn with_fresh_decode_cell(&self, next_hits: impl FnOnce(u8) -> u8) -> Self {
+        let data = match &self.data {
+            CachedData::Encoded {
+                bytes,
+                decoded_len,
+                decode_hits,
+                ..
+            } => CachedData::Encoded {
+                bytes: bytes.clone(),
+                decoded_len: *decoded_len,
+                decoded: Arc::new(tokio::sync::OnceCell::new()),
+                decode_hits: next_hits(*decode_hits),
+            },
+            CachedData::Raw(batches) => CachedData::Raw(Arc::clone(batches)),
+        };
+        Self {
+            data,
+            schema: self.schema.clone(),
+            input_tables: self.input_tables.clone(),
+            cached_at: self.cached_at,
+            read_started_at: self.read_started_at,
+            encoder: self.encoder.clone(),
+            keep_remaining_ttl: true,
+        }
+    }
+
+    /// A raw copy of this entry holding `records`, used to replace the stored
+    /// encoded value after the second successful decode.
+    ///
+    /// Timestamps are copied so a concurrent store of a newer result (different
+    /// `cached_at` / `read_started_at`) is not overwritten. [`Self::keep_remaining_ttl`]
+    /// is set so the backend reweighs without restarting the entry's TTL.
+    #[must_use]
+    pub(crate) fn to_promoted_raw(&self, records: Arc<Vec<RecordBatch>>) -> Self {
+        Self {
+            data: CachedData::Raw(records),
+            schema: self.schema.clone(),
+            input_tables: self.input_tables.clone(),
+            cached_at: self.cached_at,
+            read_started_at: self.read_started_at,
+            encoder: None,
+            keep_remaining_ttl: true,
+        }
+    }
+
+    /// Whether `other` is the same stored generation as `self` (same write,
+    /// same read window). Used so a promotion does not replace a newer result.
+    #[must_use]
+    pub(crate) fn is_same_generation(&self, other: &Self) -> bool {
+        self.cached_at == other.cached_at && self.read_started_at == other.read_started_at
+    }
+
+    /// Whether this entry holds encoded bytes rather than the batches themselves.
+    #[must_use]
+    pub fn is_encoded(&self) -> bool {
+        matches!(self.data, CachedData::Encoded { .. })
+    }
+
+    /// The size of the Arrow IPC stream an encoded entry decodes to, or `None` for an entry
+    /// held as batches.
+    ///
+    /// Reading an encoded entry decompresses and decodes all of that stream, so this, not the
+    /// size of the stored payload, is what the read costs; reading a raw entry hands out the
+    /// batches it already holds.
+    #[must_use]
+    pub fn decoded_len(&self) -> Option<usize> {
+        match &self.data {
+            CachedData::Raw(_) => None,
+            CachedData::Encoded { decoded_len, .. } => Some(*decoded_len),
         }
     }
 
@@ -232,7 +403,7 @@ impl CachedQueryResult {
                         BUFFER_OVERHEAD_BYTES * arrow_tools::record_batch::buffers_in_batch(batch);
                 }
             }
-            CachedData::Encoded(bytes) => {
+            CachedData::Encoded { bytes, .. } => {
                 size += bytes.len();
             }
         }
@@ -257,6 +428,10 @@ impl Sizeable for CachedQueryResult {
             );
             usize::MAX
         }
+    }
+
+    fn keep_remaining_ttl(&self) -> bool {
+        self.keep_remaining_ttl
     }
 }
 
@@ -421,6 +596,7 @@ mod tests {
 
         let cached_result = CachedQueryResult::new(
             encoded_data.clone(),
+            64,
             schema,
             input_tables,
             cached_at,
@@ -747,6 +923,379 @@ mod tests {
             stream.schema().fields().len(),
             3,
             "CachedStream schema must match the original schema"
+        );
+    }
+
+    fn encoder() -> Option<Arc<dyn crate::encoding::Encoder>> {
+        crate::encoding::get_encoder(spicepod::component::caching::Encoding::Zstd)
+    }
+
+    /// A small result is encoded too when zstd is configured: the setting names
+    /// what the cache compresses with, not which entries it compresses. A hit on
+    /// one is still served where the request arrived, decoded within the
+    /// runtime's inline budget.
+    #[tokio::test]
+    async fn a_small_result_is_encoded_when_an_encoder_is_configured() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("batch");
+        let cached_result = CachedQueryResult::from_batches(
+            vec![batch],
+            schema,
+            Arc::new(HashSet::new()),
+            Instant::now(),
+            Instant::now(),
+            encoder(),
+        )
+        .await
+        .expect("should create cached result");
+
+        assert!(
+            cached_result.is_encoded(),
+            "`encoding: zstd` encodes every entry it can, whatever the result's size"
+        );
+        let records = cached_result.records().await.expect("decoded batches");
+        assert_eq!(records[0].num_rows(), 3);
+    }
+
+    /// A large result is encoded when zstd is configured, and round-trips.
+    #[tokio::test]
+    async fn a_large_result_is_encoded_when_an_encoder_is_configured() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        // ~20 KiB of zeros: large, and highly compressible.
+        let values = vec![0i32; 5_000];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(values))],
+        )
+        .expect("batch");
+
+        let cached_result = CachedQueryResult::from_batches(
+            vec![batch],
+            schema,
+            Arc::new(HashSet::new()),
+            Instant::now(),
+            Instant::now(),
+            encoder(),
+        )
+        .await
+        .expect("should create cached result");
+
+        assert!(
+            cached_result.is_encoded(),
+            "a result over the raw-store budget must still be encoded under zstd"
+        );
+        let records = cached_result.records().await.expect("decoded batches");
+        assert_eq!(records[0].num_rows(), 5_000);
+    }
+
+    /// A compressible result larger than the cache `max_size` raw is stored,
+    /// because it is encoded first (regression for
+    /// <https://github.com/spiceai/spiceai/issues/8508>).
+    #[tokio::test]
+    async fn a_result_over_a_small_cache_limit_is_encoded() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let n = 300;
+        let col = Arc::new(Int32Array::from(vec![0i32; n]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::clone(&col) as _, Arc::clone(&col) as _],
+        )
+        .expect("batch");
+        let raw_bytes = batch.get_array_memory_size();
+        let cache_max = 2 * 1024;
+        assert!(
+            raw_bytes > cache_max,
+            "fixture must exceed a 2 KiB cache, got {raw_bytes}"
+        );
+        let cached_result = CachedQueryResult::from_batches(
+            vec![batch],
+            schema,
+            Arc::new(HashSet::new()),
+            Instant::now(),
+            Instant::now(),
+            encoder(),
+        )
+        .await
+        .expect("should create cached result");
+
+        assert!(
+            cached_result.is_encoded(),
+            "a result that cannot fit raw in the cache must still be encoded under zstd"
+        );
+        let records = cached_result.records().await.expect("decoded batches");
+        assert_eq!(records[0].num_rows(), n);
+    }
+
+    /// Array bytes under `max_size` can still weigh more than `max_size` once
+    /// the weigher adds entry and buffer overhead. Those must encode under
+    /// zstd or the store path skips them (the #8508 weigher boundary).
+    #[tokio::test]
+    async fn a_result_under_max_size_in_array_bytes_is_encoded_when_the_weigher_does_not_fit() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let n = 200;
+        let col = Arc::new(Int32Array::from(vec![0i32; n]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::clone(&col) as _, Arc::clone(&col) as _],
+        )
+        .expect("batch");
+        let cache_max = 2 * 1024;
+        let raw_bytes = batch.get_array_memory_size();
+        assert!(
+            raw_bytes <= cache_max,
+            "fixture must sit under max_size in array bytes, got {raw_bytes}"
+        );
+
+        let now = Instant::now();
+        let raw = CachedQueryResult::new_raw(
+            vec![batch.clone()],
+            Arc::clone(&schema),
+            Arc::new(HashSet::new()),
+            now,
+            now,
+        );
+        assert!(
+            raw.memory_size() > u64::try_from(cache_max).expect("2 KiB"),
+            "fixture must exceed max_size once weighed, got {} vs {cache_max}",
+            raw.memory_size()
+        );
+
+        let cached_result = CachedQueryResult::from_batches(
+            vec![batch],
+            schema,
+            Arc::new(HashSet::new()),
+            now,
+            now,
+            encoder(),
+        )
+        .await
+        .expect("should create cached result");
+
+        assert!(
+            cached_result.is_encoded(),
+            "a result whose weigher exceeds max_size must still be encoded under zstd"
+        );
+        assert!(
+            cached_result.memory_size() <= u64::try_from(cache_max).expect("2 KiB"),
+            "encoded entry must fit the cache, got {}",
+            cached_result.memory_size()
+        );
+        let records = cached_result.records().await.expect("decoded batches");
+        assert_eq!(records[0].num_rows(), n);
+    }
+
+    fn counting_encoder() -> (
+        Option<Arc<dyn crate::encoding::Encoder>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (encoder, decodes) = crate::encoding::CountingEncoder::zstd();
+        (Some(encoder), decodes)
+    }
+
+    /// The first `records()` of an encoded *clone* pays zstd+IPC; a second
+    /// call on that same clone (or one that shares its decode cell) must not.
+    /// Store promotion is a separate replace after a *second cache fetch*.
+    #[tokio::test]
+    async fn records_on_one_encoded_clone_decodes_once() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
+        )
+        .expect("batch");
+        let (encoder, decodes) = counting_encoder();
+        let cached_result = CachedQueryResult::from_batches(
+            vec![batch],
+            schema,
+            Arc::new(HashSet::new()),
+            Instant::now(),
+            Instant::now(),
+            encoder,
+        )
+        .await
+        .expect("should create cached result");
+
+        assert!(
+            cached_result.is_encoded(),
+            "fixture must start encoded under zstd"
+        );
+        assert_eq!(cached_result.encoded_decode_hits(), Some(0));
+
+        let first = cached_result.records().await.expect("first decode");
+        assert_eq!(first[0].num_rows(), 5);
+        assert_eq!(
+            decodes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first records() must decode once"
+        );
+
+        let clone = cached_result.clone();
+        let second = clone.records().await.expect("second call on same clone");
+        assert_eq!(second[0].num_rows(), 5);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a second records() on the same clone must Arc-share the first decode"
+        );
+        assert_eq!(
+            decodes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a second records() on the same clone must not decode again"
+        );
+        assert!(
+            cached_result.is_encoded(),
+            "records() itself does not rewrite this value; the store promotion is a separate replace"
+        );
+    }
+
+    /// Concurrent first hits on clones of one encoded entry decode once and
+    /// Arc-share the result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_records_decode_once() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let values = vec![7i32; 2_000];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(values))],
+        )
+        .expect("batch");
+        let (encoder, decodes) = counting_encoder();
+        let cached_result = CachedQueryResult::from_batches(
+            vec![batch],
+            schema,
+            Arc::new(HashSet::new()),
+            Instant::now(),
+            Instant::now(),
+            encoder,
+        )
+        .await
+        .expect("should create cached result");
+
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let entry = cached_result.clone();
+                tokio::spawn(async move { entry.records().await.expect("decode") })
+            })
+            .collect();
+
+        let mut results = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            results.push(task.await.expect("task joins"));
+        }
+
+        assert_eq!(
+            decodes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only one of the concurrent first hits may decode"
+        );
+        let first = &results[0];
+        for (i, result) in results.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(first, result),
+                "concurrent first hit {i} must Arc-share the winning decode"
+            );
+            assert_eq!(result[0].num_rows(), 2_000);
+        }
+    }
+
+    #[test]
+    fn promoted_raw_keeps_generation_and_asks_the_store_to_keep_ttl() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let cached_at = Instant::now();
+        let read_started_at = cached_at;
+        let encoded = CachedQueryResult::new(
+            Bytes::from(vec![1u8, 2, 3]),
+            16,
+            Arc::clone(&schema),
+            Arc::new(HashSet::new()),
+            cached_at,
+            read_started_at,
+            None,
+        );
+        let recorded = encoded.with_recorded_decode_hit();
+        assert!(recorded.is_encoded());
+        assert_eq!(recorded.encoded_decode_hits(), Some(1));
+        assert!(encoded.is_same_generation(&recorded));
+        assert!(
+            recorded.keep_remaining_ttl(),
+            "recording a decode hit is a reweigh of the same result, so TTL must not restart"
+        );
+
+        let raw = recorded.to_promoted_raw(Arc::new(Vec::new()));
+
+        assert!(!raw.is_encoded());
+        assert!(encoded.is_same_generation(&raw));
+        assert!(
+            raw.keep_remaining_ttl(),
+            "a promotion is a reweigh of the same result, so TTL must not restart"
+        );
+        assert!(!encoded.keep_remaining_ttl());
+    }
+
+    /// Clearing the stored decode cell must drop resident batches on the
+    /// replacement without dropping the response's `Arc`.
+    #[tokio::test]
+    async fn clearing_the_decode_cell_keeps_the_response_arc() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
+        )
+        .expect("batch");
+        let (encoder, decodes) = counting_encoder();
+        let cached = CachedQueryResult::from_batches(
+            vec![batch],
+            schema,
+            Arc::new(HashSet::new()),
+            Instant::now(),
+            Instant::now(),
+            encoder,
+        )
+        .await
+        .expect("should create cached result");
+
+        let served = cached.records().await.expect("decode");
+        assert!(
+            cached.encoded_has_resident_decode(),
+            "records() fills this value's decode cell"
+        );
+        assert_eq!(decodes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let reset = cached.with_cleared_decode_cell();
+        assert!(reset.is_encoded());
+        assert_eq!(reset.encoded_decode_hits(), cached.encoded_decode_hits());
+        assert!(
+            !reset.encoded_has_resident_decode(),
+            "the replacement must not retain decoded batches"
+        );
+        assert!(
+            reset.keep_remaining_ttl(),
+            "clearing the decode cell is a reweigh of the same result, so TTL must not restart"
+        );
+        assert!(cached.is_same_generation(&reset));
+        assert!(
+            Arc::ptr_eq(
+                &served,
+                &cached
+                    .records()
+                    .await
+                    .expect("original still holds the cell")
+            ),
+            "the response Arc must remain on the original value"
+        );
+        assert_eq!(
+            decodes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the original value must not decode again"
         );
     }
 }

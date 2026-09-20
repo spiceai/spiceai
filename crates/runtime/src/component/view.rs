@@ -27,12 +27,11 @@ use std::{collections::HashMap, fs, sync::Arc};
 use crate::{Runtime, dataaccelerator::AccelerationSource};
 
 use super::{
-    AcceleratedComponent,
     dataset::{
         Dataset, ReadyState,
         acceleration::{self, Acceleration},
     },
-    deprecated_ready_state_warning, validate_identifier,
+    validate_identifier,
 };
 use spicepod::semantic::Column;
 
@@ -168,16 +167,12 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
         // parses cleanly on a view as well as on a dataset. A dataset reads it out of the block
         // and applies it; resolve it the same way here so the key means one thing wherever it is
         // written, rather than being accepted and dropped on one of the two components. See
-        // `DatasetBuilder::try_from` for the dataset side.
+        // `DatasetBuilder::try_from` for the dataset side. The deprecation is reported by the
+        // load path (`init::dataset::warn_about_acceleration_block`), not from this
+        // conversion, which read-only callers run too.
         #[expect(deprecated)]
         let ready_state = match view.acceleration.as_ref().map(|a| a.ready_state) {
-            Some(Some(ready_state)) => {
-                tracing::warn!(
-                    "{}",
-                    deprecated_ready_state_warning(AcceleratedComponent::View, &view.name)
-                );
-                ReadyState::from(ready_state)
-            }
+            Some(Some(ready_state)) => ReadyState::from(ready_state),
             _ => ReadyState::from(view.ready_state),
         };
 
@@ -419,7 +414,8 @@ impl ViewBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::{AcceleratedComponent, ReadyState, ViewBuilder, deprecated_ready_state_warning};
+    use super::{ReadyState, ViewBuilder};
+    use crate::component::{AcceleratedComponent, deprecated_ready_state_warning};
     use spicepod::component::view as spicepod_view;
 
     /// Resolves a view from its Spicepod YAML, so the test covers the same parse that a

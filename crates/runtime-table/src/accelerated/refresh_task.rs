@@ -41,7 +41,7 @@ use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use datafusion::catalog::MemoryCatalogProvider;
 use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::execution::SessionStateBuilder;
-use datafusion::execution::context::SessionContext;
+use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_planner::ExtensionPlanner;
 use datafusion::{
@@ -432,6 +432,8 @@ impl RefreshTaskBuilder {
 
         let dataset_metric_labels = DatasetMetricLabels::new(&self.dataset_name);
 
+        let session_state = Arc::clone(&crate::accelerated::caching::SHARED_SESSION_STATE);
+
         RefreshTask {
             runtime_status: self.runtime_status,
             dataset_name: self.dataset_name,
@@ -464,6 +466,7 @@ impl RefreshTaskBuilder {
             cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
             cdc_param_overrides: self.cdc_param_overrides,
             in_flight_revalidations: self.in_flight_revalidations,
+            session_state,
         }
     }
 }
@@ -543,6 +546,8 @@ pub struct RefreshTask {
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
     in_flight_revalidations: super::caching::InFlightRevalidations,
+    /// Built once instead of a fresh `SessionContext` per stale entry.
+    session_state: Arc<SessionState>,
 }
 
 impl std::fmt::Debug for RefreshTask {
@@ -1235,6 +1240,7 @@ impl RefreshTask {
         let refreshed_count = CacheRefreshHelper::refresh_all_stale_rows(
             federated_provider,
             Arc::clone(&self.accelerator),
+            Arc::clone(&self.session_state),
             self.dataset_name.to_string().as_str(),
             ttl,
             Arc::clone(&self.accelerator_write_mutex),
@@ -3882,6 +3888,40 @@ mod tests {
         assert!(
             generation_count.abs() < f64::EPSILON,
             "a non-generation connector failure must not be labeled object_generation_changed (got {generation_count})"
+        );
+    }
+
+    /// The periodic caching refresh fetches under the same process-wide `SessionState` as the
+    /// query path; a copy built per task would rebuild the default registry for every dataset.
+    #[tokio::test]
+    async fn refresh_task_reuses_the_shared_session_state() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("shared_session_state"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        assert!(
+            Arc::ptr_eq(
+                &task.session_state,
+                &crate::accelerated::caching::SHARED_SESSION_STATE
+            ),
+            "RefreshTaskBuilder::build must hand out the shared state, not build its own"
         );
     }
 

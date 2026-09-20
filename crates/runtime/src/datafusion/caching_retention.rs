@@ -29,8 +29,7 @@ limitations under the License.
 
 use std::time::Duration;
 
-/// `caching_ttl`'s own default, applied when the dataset does not set one.
-const DEFAULT_CACHING_TTL: Duration = Duration::from_secs(30);
+use runtime_acceleration::acceleration::{DEFAULT_CACHING_TTL, StaleIfError};
 
 /// Floor on the derived check interval, so a sub-second `caching_ttl` does not
 /// put the accelerator under a delete every tick of it.
@@ -81,12 +80,17 @@ fn check_interval_for(period: Duration) -> Duration {
 /// What a `refresh_mode: caching` dataset's caching parameters imply about
 /// evicting its cache entries.
 ///
-/// With `caching_stale_if_error` disabled, an entry past
+/// With `caching_stale_if_error` `disabled`, an entry past
 /// `caching_ttl + caching_stale_while_revalidate_ttl` can never be served again,
 /// so that sum is a retention period, and one derived from the caching
 /// parameters is more specific than anything the dataset declared.
 ///
-/// Enabling `caching_stale_if_error` changes what an expired entry *is*: it is
+/// A finite `caching_stale_if_error: <duration>` keeps an expired entry servable
+/// as error-fallback for at most that window, so the deadline is
+/// `caching_ttl + max(duration, caching_stale_while_revalidate_ttl)` — still
+/// finite, so it still derives a bounded policy.
+///
+/// `caching_stale_if_error: enabled` changes what an expired entry *is*: it is
 /// the copy served when the source fails, with no upper bound on its age.
 /// Evicting at the sum above would delete exactly the data the setting exists to
 /// serve, and no duration in the caching parameters can derive an expiry policy.
@@ -106,16 +110,29 @@ fn check_interval_for(period: Duration) -> Duration {
 /// outside this retention-policy selection, so a budget bounds the accelerator
 /// even though nothing here derives a period for it.
 pub(crate) fn caching_retention(
-    stale_if_error: bool,
+    stale_if_error: StaleIfError,
     caching_ttl: Option<Duration>,
     caching_stale_while_revalidate_ttl: Option<Duration>,
     declared_retention_runs: bool,
     cache_limit_configured: bool,
 ) -> CachingRetention {
-    if !stale_if_error {
-        let period = caching_ttl.unwrap_or(DEFAULT_CACHING_TTL)
-            + caching_stale_while_revalidate_ttl.unwrap_or_default();
-
+    // `Disabled` and a finite `For(N)` both leave the entry unservable past a
+    // finite deadline — `caching_ttl` plus the error-retention window — so that
+    // deadline derives a bounded policy. Only `Enabled` keeps entries with no
+    // upper bound on their age, and so derives no deadline at all.
+    //
+    // The Spicepod parser rejects caching windows whose sum does not fit a
+    // `Duration`, so a loaded dataset always derives here. `checked_add` keeps
+    // a caller that bypassed that check from panicking: an unrepresentable
+    // deadline derives no policy and falls through to whatever else bounds the
+    // accelerator.
+    if !matches!(stale_if_error, StaleIfError::Enabled)
+        && let Some(period) = caching_ttl.unwrap_or(DEFAULT_CACHING_TTL).checked_add(
+            stale_if_error
+                .error_retention_window(caching_stale_while_revalidate_ttl)
+                .unwrap_or_default(),
+        )
+    {
         return CachingRetention::Derive {
             period,
             check_interval: check_interval_for(period),
@@ -156,7 +173,10 @@ pub(crate) fn unbounded_caching_retention_warning(dataset_name: &str) -> String 
         running, so no cached entry is ever evicted and the accelerator grows with every distinct \
         request it serves. An expired entry is the copy served when the source fails, so \
         `caching_ttl` and `caching_stale_while_revalidate_ttl` bound how long an entry is served \
-        fresh, not how long it is stored. To bound how long an entry is kept, set \
+        fresh, not how long it is stored. Prefer a finite `caching_stale_if_error: <duration>` \
+        (for example '10m'): it keeps the stale-on-error fallback for that window and evicts at \
+        `caching_ttl` + the longer of that window and `caching_stale_while_revalidate_ttl`, \
+        bounding the accelerator on its own. Or set \
         `retention_check_enabled: true` with a `retention_period`, a `retention_check_interval` and \
         the dataset's `time_column` — a policy missing any one of those starts nothing, so check \
         all four if you have already set some. Or set `caching_stale_if_error: disabled` to evict \
@@ -170,11 +190,18 @@ mod tests {
         CachingRetention, MAX_CHECK_INTERVAL, MIN_CHECK_INTERVAL, caching_retention,
         unbounded_caching_retention_warning,
     };
+    use runtime_acceleration::acceleration::StaleIfError;
     use std::time::Duration;
 
     #[test]
     fn a_disabled_stale_if_error_evicts_at_ttl_plus_stale_while_revalidate() {
-        let retention = caching_retention(false, Some(Duration::from_secs(5)), None, false, false);
+        let retention = caching_retention(
+            StaleIfError::Disabled,
+            Some(Duration::from_secs(5)),
+            None,
+            false,
+            false,
+        );
 
         assert_eq!(
             retention,
@@ -187,9 +214,13 @@ mod tests {
 
     #[test]
     fn an_unset_caching_ttl_falls_back_to_its_own_default() {
-        let CachingRetention::Derive { period, .. } =
-            caching_retention(false, None, Some(Duration::from_secs(10)), false, false)
-        else {
+        let CachingRetention::Derive { period, .. } = caching_retention(
+            StaleIfError::Disabled,
+            None,
+            Some(Duration::from_secs(10)),
+            false,
+            false,
+        ) else {
             panic!("a dataset with `caching_stale_if_error` disabled always derives a policy");
         };
 
@@ -201,16 +232,91 @@ mod tests {
     #[test]
     fn a_declared_retention_does_not_change_what_a_disabled_stale_if_error_derives() {
         assert_eq!(
-            caching_retention(false, Some(Duration::from_secs(5)), None, true, false),
-            caching_retention(false, Some(Duration::from_secs(5)), None, false, false),
+            caching_retention(
+                StaleIfError::Disabled,
+                Some(Duration::from_secs(5)),
+                None,
+                true,
+                false
+            ),
+            caching_retention(
+                StaleIfError::Disabled,
+                Some(Duration::from_secs(5)),
+                None,
+                false,
+                false
+            ),
         );
+    }
+
+    /// A finite `caching_stale_if_error` still derives a bounded policy: the
+    /// deadline extends by the error window (here 60s past a 5s ttl), so the
+    /// accelerator is bounded rather than left to grow.
+    #[test]
+    fn a_finite_stale_if_error_derives_a_bounded_policy() {
+        let retention = caching_retention(
+            StaleIfError::For(Duration::from_mins(1)),
+            Some(Duration::from_secs(5)),
+            None,
+            false,
+            false,
+        );
+
+        // A 65s period sits between the 30s floor and the 1h ceiling, so it is
+        // its own check interval.
+        assert_eq!(
+            retention,
+            CachingRetention::Derive {
+                period: Duration::from_secs(65),
+                check_interval: Duration::from_secs(65),
+            }
+        );
+    }
+
+    /// The derived deadline takes the larger of the finite `stale-if-error`
+    /// window and `stale_while_revalidate`, so neither fallback is evicted early.
+    #[test]
+    fn a_finite_stale_if_error_takes_the_larger_of_it_and_stale_while_revalidate() {
+        let CachingRetention::Derive { period, .. } = caching_retention(
+            StaleIfError::For(Duration::from_mins(1)),
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_mins(2)),
+            false,
+            false,
+        ) else {
+            panic!("a finite stale-if-error always derives a policy");
+        };
+
+        assert_eq!(period, Duration::from_secs(125), "5s ttl + max(60s, 120s)");
+    }
+
+    /// A window so long that `caching_ttl + window` does not fit a `Duration`
+    /// is rejected by the Spicepod parser; should one reach here anyway, it
+    /// derives no policy rather than panicking on the addition.
+    #[test]
+    fn a_deadline_that_overflows_derives_no_policy() {
+        let retention = caching_retention(
+            StaleIfError::For(Duration::MAX.saturating_sub(Duration::from_secs(1))),
+            Some(Duration::from_secs(30)),
+            None,
+            false,
+            false,
+        );
+
+        assert_eq!(retention, CachingRetention::Unbounded);
     }
 
     /// The reported half of #13525: enabling `caching_stale_if_error` left the
     /// dataset with no retention policy at all, and said nothing about it.
     #[test]
     fn an_enabled_stale_if_error_with_no_declared_retention_is_unbounded() {
-        let retention = caching_retention(true, Some(Duration::from_secs(5)), None, false, false);
+        let retention = caching_retention(
+            StaleIfError::Enabled,
+            Some(Duration::from_secs(5)),
+            None,
+            false,
+            false,
+        );
 
         assert_eq!(retention, CachingRetention::Unbounded);
     }
@@ -220,7 +326,13 @@ mod tests {
     /// with a policy keyed on a different column.
     #[test]
     fn an_enabled_stale_if_error_leaves_a_running_declared_retention_alone() {
-        let retention = caching_retention(true, Some(Duration::from_secs(5)), None, true, false);
+        let retention = caching_retention(
+            StaleIfError::Enabled,
+            Some(Duration::from_secs(5)),
+            None,
+            true,
+            false,
+        );
 
         assert_eq!(retention, CachingRetention::LeaveDeclared);
     }
@@ -228,7 +340,13 @@ mod tests {
     #[test]
     fn a_cache_limit_bounds_stale_on_error_without_a_declared_retention_policy() {
         assert_eq!(
-            caching_retention(true, Some(Duration::from_secs(5)), None, false, true),
+            caching_retention(
+                StaleIfError::Enabled,
+                Some(Duration::from_secs(5)),
+                None,
+                false,
+                true
+            ),
             CachingRetention::BoundedByCacheLimit
         );
     }
@@ -239,7 +357,13 @@ mod tests {
     /// This is the caller's contract: it passes whether the policy *runs*.
     #[test]
     fn a_declared_retention_that_did_not_build_is_still_unbounded() {
-        let retention = caching_retention(true, Some(Duration::from_secs(5)), None, false, false);
+        let retention = caching_retention(
+            StaleIfError::Enabled,
+            Some(Duration::from_secs(5)),
+            None,
+            false,
+            false,
+        );
 
         assert_eq!(retention, CachingRetention::Unbounded);
     }
@@ -257,7 +381,7 @@ mod tests {
             period,
             check_interval,
         } = caching_retention(
-            false,
+            StaleIfError::Disabled,
             Some(Duration::from_secs(1)),
             Some(year),
             false,
@@ -292,6 +416,20 @@ mod tests {
         assert!(warning.contains("`retention_check_interval`"), "{warning}");
         assert!(
             warning.contains("`caching_stale_if_error: disabled`"),
+            "{warning}"
+        );
+        // The deprecation hint toward a finite duration, tied to the
+        // unbounded-growth path this warning covers — and the bound it promises
+        // is the one `caching_retention` derives, `caching_ttl` plus the longer
+        // of the two windows, not the error window alone.
+        assert!(
+            warning.contains("`caching_stale_if_error: <duration>`"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains(
+                "`caching_ttl` + the longer of that window and `caching_stale_while_revalidate_ttl`"
+            ),
             "{warning}"
         );
         assert!(warning.contains("https://spiceai.org/docs"), "{warning}");

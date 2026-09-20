@@ -20,6 +20,7 @@ use crate::HashBuilder;
 use crate::HashProvider;
 #[cfg(feature = "pingora")]
 use crate::InvalidationDidNotFinishSnafu;
+use crate::KeyHasher;
 use crate::Result;
 use crate::Sizeable;
 use crate::TabledCacheProvider;
@@ -83,6 +84,21 @@ where
             Self::Pingora(backend) => backend.insert(key, value).await,
             #[cfg(not(feature = "pingora"))]
             Self::MokaFallback(backend) => backend.insert(key, value).await,
+        }
+    }
+
+    async fn replace_if(
+        &self,
+        key: u64,
+        value: V,
+        should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> bool {
+        match self {
+            Self::Moka(backend) => backend.replace_if(key, value, should_replace).await,
+            #[cfg(feature = "pingora")]
+            Self::Pingora(backend) => backend.replace_if(key, value, should_replace).await,
+            #[cfg(not(feature = "pingora"))]
+            Self::MokaFallback(backend) => backend.replace_if(key, value, should_replace).await,
         }
     }
 
@@ -231,7 +247,7 @@ impl<
     }
 }
 
-type BuiltLruCache<V> = LruCache<V, HashBuilder, Box<dyn Hasher + Send + Sync + 'static>>;
+type BuiltLruCache<V> = LruCache<V, HashBuilder, KeyHasher>;
 
 /// Builds an LRU cache provider from the given configuration.
 ///
@@ -306,7 +322,7 @@ fn build_moka_cache<
     };
 
     Cache::builder()
-        .time_to_live(ttl)
+        .expire_after(crate::backend::moka::CacheTtl { ttl })
         .weigher(|_key, value: &V| -> u32 {
             let val: usize = value.get_memory_size();
             match val.try_into() {
@@ -516,6 +532,15 @@ impl<
             let total = self.total_requests.load(Ordering::Relaxed);
             V::update_hit_ratio(hits, total);
         }
+    }
+
+    async fn replace_if(
+        &self,
+        key: &u64,
+        value: V,
+        should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> bool {
+        self.backend.replace_if(*key, value, should_replace).await
     }
 
     async fn invalidate_all(&self) {

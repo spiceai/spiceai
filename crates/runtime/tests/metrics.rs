@@ -62,7 +62,8 @@ use arrow_flight::{FlightClient, FlightDescriptor, Ticket};
 use cache::{
     metrics::CacheMetrics,
     result::{
-        embeddings::CachedEmbeddingResult, query::CachedQueryResult, search::CachedSearchResult,
+        CacheStatus, embeddings::CachedEmbeddingResult, query::CachedQueryResult,
+        search::CachedSearchResult,
     },
 };
 use futures::{StreamExt, TryStreamExt};
@@ -72,6 +73,7 @@ use runtime::{Runtime, auth::EndpointAuth, config::Config, datafusion::query::Qu
 use spicepod::param::Params;
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
+    component::caching::{Caching, SQLResultsCacheConfig},
     component::dataset::{Dataset, TimeFormat},
     component::runtime::{Query, Runtime as SpicepodRuntime, TaskHistory},
 };
@@ -1044,4 +1046,300 @@ async fn each_flight_rpc_records_exactly_one_request() -> Result<(), anyhow::Err
     assert_recorded_once(registry, before, "do_put with no flight data");
 
     Ok(())
+}
+
+/// The sum of every series of a counter family.
+fn counter_total(registry: &prometheus::Registry, name: &str) -> f64 {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == name)
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .map(|metric| metric.get_counter().value())
+        .sum()
+}
+
+/// A runtime serving the `scores` fixture, with the SQL results cache on and task
+/// history off, loaded and ready.
+async fn runtime_with_results_cache(dir: &std::path::Path, app_name: &str) -> Arc<Runtime> {
+    let app = AppBuilder::new(app_name)
+        .with_dataset(csv_backed_dataset(dir, "scores"))
+        .with_runtime(SpicepodRuntime {
+            caching: Caching {
+                sql_results: Some(SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            task_history: TaskHistory {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .build();
+
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    tokio::time::timeout(Duration::from_mins(1), Arc::clone(&rt).load_components())
+        .await
+        .expect("the dataset to load within a minute");
+    assert!(
+        wait_until(Duration::from_mins(1), || async { rt.status().is_ready() }).await,
+        "the runtime never reported ready, so the dataset never loaded"
+    );
+    rt
+}
+
+/// A query looks the results cache up once, however it is answered.
+///
+/// The lookup happens before anything is planned, and a miss found there is handed
+/// to the planned path so it does not look the same key up again. Getting that
+/// handoff wrong changes no response — every query still returns the right rows —
+/// and shows only here, as each miss counted twice.
+///
+/// The early lookup is made under SQL keys from a query's first run, but under plan
+/// keys only once the plan is cached, so each is exercised where it looks up: a
+/// SQL-keyed query from its first run, and a plan-keyed query whose result was
+/// invalidated while its plan stayed cached.
+///
+/// Counts compare before/after deltas, which only `cargo nextest` isolates by giving
+/// the test its own process.
+#[tokio::test]
+async fn a_query_counts_one_results_cache_lookup() {
+    use runtime_request_context::{CacheControl, CacheKeyType, Protocol, RequestContext};
+
+    let registry = &*PROMETHEUS;
+
+    let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+    let rt = runtime_with_results_cache(dir.path(), "metrics_results_cache_lookups").await;
+    let context = |key_type| {
+        Arc::new(
+            RequestContext::builder(Protocol::Http)
+                .with_cache_control(CacheControl::Cache(key_type))
+                .build(),
+        )
+    };
+    let miss_then_hit = [
+        (CacheStatus::CacheMiss, [1.0, 0.0, 1.0]),
+        (CacheStatus::CacheHit, [1.0, 1.0, 0.0]),
+    ];
+
+    // SQL keys: looked up early from the query's first run.
+    let sql_keyed = context(CacheKeyType::Raw);
+    for (status, recorded) in miss_then_hit {
+        assert_lookups(
+            registry,
+            &rt,
+            &sql_keyed,
+            "SELECT id, score FROM scores WHERE id >= 0",
+            status,
+            recorded,
+        )
+        .await;
+    }
+
+    // Plan keys: looked up early only once the plan is cached. The first run caches the
+    // plan and the result; invalidating the result keeps the plan, so the runs after it
+    // look up early.
+    let plan_keyed = context(CacheKeyType::Default);
+    let sql = "SELECT id, score FROM scores";
+    assert_lookups(
+        registry,
+        &rt,
+        &plan_keyed,
+        sql,
+        CacheStatus::CacheMiss,
+        [1.0, 0.0, 1.0],
+    )
+    .await;
+    rt.datafusion()
+        .results_cache_provider()
+        .expect("the results cache is configured")
+        .invalidate_for_table(datafusion::sql::TableReference::bare("scores"))
+        .await
+        .expect("the cached result to be invalidated");
+    for (status, recorded) in miss_then_hit {
+        assert_lookups(registry, &rt, &plan_keyed, sql, status, recorded).await;
+    }
+}
+
+/// Runs `sql` under `request_context`, reads its whole result, and asserts how it was
+/// answered and the `[requests, hits, misses]` it added to the results cache counters.
+async fn assert_lookups(
+    registry: &prometheus::Registry,
+    rt: &Arc<Runtime>,
+    request_context: &Arc<runtime_request_context::RequestContext>,
+    sql: &str,
+    expected_status: CacheStatus,
+    expected: [f64; 3],
+) {
+    let lookups = || {
+        [
+            "results_cache_requests",
+            "results_cache_hits",
+            "results_cache_misses",
+        ]
+        .map(|name| counter_total(registry, name))
+    };
+
+    let before = lookups();
+    let status = Arc::clone(request_context)
+        .scope(async {
+            let mut result = QueryBuilder::new(sql, rt.datafusion())
+                .build()
+                .run()
+                .await
+                .expect("query to run");
+            while let Some(batch) = result.data.next().await {
+                batch.expect("batch to stream without error");
+            }
+            result.cache_status
+        })
+        .await;
+    let after = lookups();
+
+    assert_eq!(status, expected_status, "{sql}");
+    let recorded = [
+        after[0] - before[0],
+        after[1] - before[1],
+        after[2] - before[2],
+    ];
+    assert!(
+        recorded
+            .iter()
+            .zip(expected)
+            .all(|(got, want)| (got - want).abs() < f64::EPSILON),
+        "a {expected_status:?} of {sql} must be one results cache request, recorded [requests, hits, misses] = {recorded:?}, expected {expected:?}"
+    );
+}
+
+/// The number of cache hits `query_duration_ms` has recorded, and the milliseconds
+/// they add up to, over every series.
+fn cache_hit_query_durations(registry: &prometheus::Registry) -> (u64, f64) {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == "query_duration_ms")
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .filter(|metric| {
+            metric
+                .get_label()
+                .iter()
+                .any(|label| label.name() == "tags" && label.value() == "cache-hit")
+        })
+        .fold((0, 0.0), |(count, sum), metric| {
+            let histogram = metric.get_histogram();
+            (
+                count + histogram.get_sample_count(),
+                sum + histogram.get_sample_sum(),
+            )
+        })
+}
+
+/// How long a slow caller waits before reading a cache hit it has been served.
+const SLOW_READER_DELAY: Duration = Duration::from_millis(250);
+
+/// The number of observations and the sum of a histogram family.
+fn histogram_count_and_sum(registry: &prometheus::Registry, name: &str) -> (u64, f64) {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == name)
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .fold((0, 0.0), |(count, sum), metric| {
+            let histogram = metric.get_histogram();
+            (
+                count + histogram.get_sample_count(),
+                sum + histogram.get_sample_sum(),
+            )
+        })
+}
+
+/// A cache hit's duration and returned-output counters are recorded when the
+/// result stream is consumed, matching a miss.
+///
+/// Finalizing at serve time would change `query_duration_ms` and the
+/// task-history duration, and would add every cached batch to
+/// `query_returned_rows` / `query_returned_bytes` before HTTP or Flight read
+/// them. Both are user-facing contracts; neither changes without an Enhancement.
+///
+/// Counts compare before/after deltas, which only `cargo nextest` isolates by giving
+/// the test its own process.
+#[tokio::test]
+async fn a_cache_hit_is_recorded_when_the_stream_is_consumed() {
+    let registry = &*PROMETHEUS;
+
+    let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+    let rt = runtime_with_results_cache(dir.path(), "metrics_served_cache_hit").await;
+    let run = || {
+        QueryBuilder::new("SELECT id, score FROM scores", rt.datafusion())
+            .build()
+            .run()
+    };
+
+    let mut miss = run().await.expect("query to run");
+    assert_eq!(miss.cache_status, CacheStatus::CacheMiss);
+    while let Some(batch) = miss.data.next().await {
+        batch.expect("batch to stream without error");
+    }
+
+    let (hits_before, ms_before) = cache_hit_query_durations(registry);
+    let (rows_before, rows_sum_before) = histogram_count_and_sum(registry, "query_returned_rows");
+    let bytes_before = counter_total(registry, "query_returned_bytes");
+    let mut hit = run().await.expect("query to run");
+    assert_eq!(hit.cache_status, CacheStatus::CacheHit);
+    let (hits_served, _) = cache_hit_query_durations(registry);
+    let (rows_served, _) = histogram_count_and_sum(registry, "query_returned_rows");
+    let bytes_served = counter_total(registry, "query_returned_bytes");
+    assert_eq!(
+        hits_served - hits_before,
+        0,
+        "a cache hit must not record query_duration_ms until its stream is consumed"
+    );
+    assert_eq!(
+        rows_served - rows_before,
+        0,
+        "a cache hit must not record query_returned_rows until its stream is consumed"
+    );
+    assert!(
+        (bytes_served - bytes_before).abs() < f64::EPSILON,
+        "a cache hit must not record query_returned_bytes until its stream is consumed"
+    );
+
+    // The caller's delay is the behavior under test, so it is a fixed sleep.
+    tokio::time::sleep(SLOW_READER_DELAY).await;
+    let mut rows = 0;
+    while let Some(batch) = hit.data.next().await {
+        rows += batch.expect("batch to stream without error").num_rows();
+    }
+    assert!(rows > 0, "the hit must return the fixture's rows");
+
+    let (hits_read, ms_read) = cache_hit_query_durations(registry);
+    let (rows_read, rows_sum_read) = histogram_count_and_sum(registry, "query_returned_rows");
+    let bytes_read = counter_total(registry, "query_returned_bytes");
+    assert_eq!(
+        hits_read - hits_before,
+        1,
+        "consuming a cache hit must record query_duration_ms once"
+    );
+    assert!(
+        rows_read > rows_before,
+        "consuming a cache hit must record query_returned_rows"
+    );
+    assert!(
+        rows_sum_read - rows_sum_before
+            >= f64::from(u32::try_from(rows).expect("the fixture's row count fits in a u32")),
+        "query_returned_rows recorded {} rows, expected at least the {rows} the caller read",
+        rows_sum_read - rows_sum_before
+    );
+    assert!(
+        bytes_read - bytes_before > 0.0,
+        "consuming a cache hit must record query_returned_bytes"
+    );
+    let recorded_ms = ms_read - ms_before;
+    assert!(
+        recorded_ms >= SLOW_READER_DELAY.as_secs_f64() * 1000.0,
+        "the hit recorded {recorded_ms}ms, missing the {SLOW_READER_DELAY:?} its caller took to read it"
+    );
 }

@@ -328,6 +328,16 @@ impl Default for CayenneOptimizerRules {
     }
 }
 
+/// Whether queries build the output preview that `runtime.task_history` records in its
+/// `captured_output` column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputPreview {
+    /// Build it: task history is enabled and `captured_output` records it.
+    Build,
+    /// Skip it: nothing records it.
+    Skip,
+}
+
 pub struct DataFusionBuilder {
     config: SessionConfig,
     status: Arc<status::RuntimeStatus>,
@@ -343,6 +353,7 @@ pub struct DataFusionBuilder {
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     query_admission_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
+    output_preview: OutputPreview,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
     cluster_config: Option<Arc<ResolvedClusterConfig>>,
@@ -433,6 +444,7 @@ impl DataFusionBuilder {
             accelerated_refresh_semaphore: None,
             query_admission_semaphore: None,
             task_history_enabled: true,
+            output_preview: OutputPreview::Build,
             caching: None,
             spill_compression: None,
             cluster_config: None,
@@ -459,6 +471,14 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_task_history(mut self, task_history: bool) -> Self {
         self.task_history_enabled = task_history;
+        self
+    }
+
+    /// Whether queries build the output preview; see
+    /// `DataFusion::task_history_captured_output`.
+    #[must_use]
+    pub fn with_output_preview(mut self, output_preview: OutputPreview) -> Self {
+        self.output_preview = output_preview;
         self
     }
 
@@ -1303,6 +1323,7 @@ impl DataFusionBuilder {
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             query_admission_semaphore: self.query_admission_semaphore,
             task_history_enabled: self.task_history_enabled,
+            task_history_captured_output: self.output_preview == OutputPreview::Build,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
             refresh_runtime: OnceLock::new(),
