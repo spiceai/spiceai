@@ -287,13 +287,13 @@ fn merge_templates(base: &[WarmupTemplate], extra: &[WarmupTemplate]) -> Vec<War
 fn apply_catalog(
     catalog: &parking_lot::Mutex<WarmupCatalog>,
     count: &AtomicUsize,
-    templates: Vec<WarmupTemplate>,
+    templates: &[WarmupTemplate],
 ) {
     let mut catalog = catalog.lock();
     // A concurrent observation may have added templates after this task
     // snapped `local`. Keep any live entries that are not in `templates`
     // so a stale remote apply cannot permanently drop them.
-    let merged = merge_templates(&templates, &catalog.templates);
+    let merged = merge_templates(templates, &catalog.templates);
     catalog.ids = merged.iter().map(template_id).collect();
     count.store(merged.len(), Ordering::Relaxed);
     catalog.templates = merged;
@@ -315,13 +315,13 @@ async fn persist_remote(
         };
         let merged = merge_templates(&remote, &local);
         if merged == remote {
-            apply_catalog(catalog.as_ref(), count.as_ref(), merged);
+            apply_catalog(catalog.as_ref(), count.as_ref(), &merged);
             return;
         }
         if remote.is_empty() {
             match state.insert(WARMUP_STATE_KEY, &merged).await {
                 Ok(InsertResult::Ok) => {
-                    apply_catalog(catalog.as_ref(), count.as_ref(), merged);
+                    apply_catalog(catalog.as_ref(), count.as_ref(), &merged);
                     return;
                 }
                 Ok(InsertResult::AlreadyExists) => {
@@ -336,7 +336,7 @@ async fn persist_remote(
         }
         match state.update(WARMUP_STATE_KEY, &merged).await {
             Ok(UpdateResult::Ok) => {
-                apply_catalog(catalog.as_ref(), count.as_ref(), merged);
+                apply_catalog(catalog.as_ref(), count.as_ref(), &merged);
                 return;
             }
             Ok(UpdateResult::NotFound) => {
