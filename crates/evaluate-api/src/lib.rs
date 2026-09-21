@@ -88,6 +88,49 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl Error {
+    /// Stable failure text for `runtime.task_history`.
+    ///
+    /// Omits upstream response bodies and other provider-supplied text so a
+    /// redacted capture cannot still persist them via `error_message`.
+    #[must_use]
+    pub fn telemetry_message(&self) -> String {
+        match self {
+            Self::HealthCheckFailed { .. } => "Evaluation health check failed".to_string(),
+            Self::ModelCallFailed { model, .. } => {
+                format!("Evaluation of model '{model}' failed: provider call failed")
+            }
+            Self::UnparseableResponse { model, .. } => {
+                format!("Evaluation of model '{model}' failed: unparseable response")
+            }
+            Self::HttpClientCreationFailed { model } => {
+                format!("Evaluation of model '{model}' failed: could not build HTTP client")
+            }
+            Self::InvalidRequest { model, .. } => {
+                format!("Evaluation of model '{model}' failed: invalid request")
+            }
+            Self::AuthenticationFailed { model, .. } => {
+                format!("Evaluation of model '{model}' failed: authentication failed")
+            }
+            Self::PermissionDenied { model, .. } => {
+                format!("Evaluation of model '{model}' failed: permission denied")
+            }
+            Self::RateLimited { model, .. } => {
+                format!("Evaluation of model '{model}' failed: rate limited")
+            }
+            Self::ServiceUnavailable { model, .. } => {
+                format!("Evaluation of model '{model}' failed: provider unavailable")
+            }
+            Self::ModelNotFound { model, .. } => {
+                format!("Evaluation of model '{model}' failed: model not found")
+            }
+            Self::RatePermitFailed { model, .. } => {
+                format!("Evaluation of model '{model}' failed: rate-limit permit failed")
+            }
+        }
+    }
+}
+
 /// `TypeSafe` `EntryType`: string, object, array, or null.
 ///
 /// Used for `instructions` and structured criteria descriptions.
@@ -420,6 +463,46 @@ pub trait Evaluate: Send + Sync + Debug {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `Display` embeds the upstream body; task history must not.
+    #[test]
+    fn telemetry_message_omits_upstream_body() {
+        let secret = "sk-upstream-secret-body";
+        let err = Error::AuthenticationFailed {
+            model: "jev".into(),
+            message: secret.into(),
+        };
+        let logged = err.telemetry_message();
+        assert!(
+            !logged.contains(secret),
+            "telemetry must not carry the provider body: {logged}"
+        );
+        assert!(
+            logged.contains("'jev'"),
+            "telemetry must name the model: {logged}"
+        );
+        assert!(
+            logged.contains("authentication failed"),
+            "telemetry must name the failure class: {logged}"
+        );
+        assert!(
+            err.to_string().contains(secret),
+            "Display still has the body"
+        );
+    }
+
+    #[test]
+    fn telemetry_message_omits_unparseable_response_body() {
+        let body = "internal stack: token=abc";
+        let err = Error::UnparseableResponse {
+            model: "jev-latest".into(),
+            response: body.into(),
+        };
+        let logged = err.telemetry_message();
+        assert!(!logged.contains(body), "{logged}");
+        assert!(logged.contains("'jev-latest'"), "{logged}");
+        assert!(logged.contains("unparseable response"), "{logged}");
+    }
 
     #[test]
     fn instructions_accept_string_object_and_array() {

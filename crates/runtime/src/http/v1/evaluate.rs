@@ -135,7 +135,9 @@ pub(crate) async fn post(
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(e) => {
-            tracing::error!(target: "task_history", "{e}");
+            // Task history copies ERROR event text into `error_message` without
+            // the redaction applied to `input` / `captured_output`.
+            tracing::error!(target: "task_history", "{}", e.telemetry_message());
             evaluate_error_response(&e)
         }
     }
