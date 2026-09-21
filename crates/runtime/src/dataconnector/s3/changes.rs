@@ -695,6 +695,8 @@ impl S3ChangesConfig {
 /// open unstructured text. Refuse at validate time so startup does not accept
 /// a config that then errors on every notification.
 fn ensure_structured_file_format(params: &Parameters, dataset: &DatasetSpec) -> Result<()> {
+    const STRUCTURED: &[&str] = &["parquet", "csv", "json", "tsv", "jsonl", "ndjson", "ldjson"];
+
     let file_format = params
         .get("file_format")
         .expose()
@@ -708,7 +710,6 @@ fn ensure_structured_file_format(params: &Parameters, dataset: &DatasetSpec) -> 
         .and_then(|name| name.rsplit_once('.'))
         .map(|(_, ext)| ext.to_ascii_lowercase());
 
-    const STRUCTURED: &[&str] = &["parquet", "csv", "json", "tsv", "jsonl", "ndjson", "ldjson"];
     let explicit_ok = file_format
         .as_deref()
         .is_some_and(|fmt| STRUCTURED.contains(&fmt));
