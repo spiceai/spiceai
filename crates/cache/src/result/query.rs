@@ -631,6 +631,20 @@ pub enum QueryResultData {
     },
 }
 
+impl QueryResultData {
+    /// Schema of the result stream.
+    ///
+    /// Inherent forwarder so callers can use `.schema()` without importing
+    /// [`RecordBatchStream`] (e.g. integration tests that only touch `.data`).
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        match self {
+            Self::Stream(stream) => stream.schema(),
+            Self::CachedRaw { schema, .. } => Arc::clone(schema),
+        }
+    }
+}
+
 impl Stream for QueryResultData {
     type Item = Result<RecordBatch, DataFusionError>;
 
@@ -653,10 +667,7 @@ impl Stream for QueryResultData {
 
 impl RecordBatchStream for QueryResultData {
     fn schema(&self) -> SchemaRef {
-        match self {
-            Self::Stream(stream) => stream.schema(),
-            Self::CachedRaw { schema, .. } => Arc::clone(schema),
-        }
+        QueryResultData::schema(self)
     }
 }
 

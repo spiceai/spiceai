@@ -17,9 +17,10 @@ limitations under the License.
 //! Software prefetch for a Raw results-cache serve.
 //!
 //! [`prefetch_raw_serve_arced`] issues architecture prefetch hints for the
-//! first batch's leading data buffers and the next batch's headers. Hints do
-//! not change results. A >LLC working-set drain of this path was slower than
-//! the legacy clone stream; do not read a miss-hiding benefit from that bench.
+//! first batch's leading data buffers and the next batch's headers before the
+//! stream is returned. Later polls use [`prefetch_index_after_serve`] /
+//! [`prefetch_batch_headers`] to keep a one-batch lookahead. Hints do not
+//! change results.
 
 use std::sync::Arc;
 
