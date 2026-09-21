@@ -102,15 +102,20 @@ pub const INFERRED_SHARD_KEY_METADATA_KEY: &str = "spice.inferred_shard_key";
 /// `[{ "column": "created_at", "distinct_count": 100000, "correlation": 0.99 }]`.
 pub const INFERRED_COLUMN_STATS_METADATA_KEY: &str = "spice.inferred_column_stats";
 
-/// Arrow field metadata key marking the HTTP connector's `response_status`
-/// column as authoritative — the value is always `"1"`.
+/// Arrow schema metadata key the HTTP connector sets on every batch it
+/// produces (via `HttpTableProvider::schema_with_fetch_status`) to the real,
+/// per-fetch HTTP status as a string (e.g. `"503"`) — not a fixed sentinel.
 ///
-/// `refresh_mode: caching` calls `cache::batches_cacheable` on every fetch to
-/// tell a transient origin failure from real data, regardless of connector.
+/// `refresh_mode: caching` (and the independent, runtime-wide SQL results
+/// cache) calls `cache::batches_cacheable` on every fetch to tell a
+/// transient origin failure from real data, regardless of connector.
 /// Inferring that a batch came from the HTTP connector by its column names
 /// and types alone is not sound: an unrelated `refresh_mode: caching`
 /// dataset (e.g. a `localpod` table) can legitimately have its own
 /// `response_status: UInt16` and `_fetched_at` columns, and a business value
-/// of `503` in that column is not an origin failure. This key lets the HTTP
-/// connector mark its own column so the check does not have to guess.
+/// of `503` in that column is not an origin failure. This key's mere
+/// presence on the *schema* (not a field) is the provenance signal that
+/// tells the two cases apart, and it survives a schema rebuilt into a
+/// narrower, JSON-decomposed shape regardless of which columns that schema
+/// keeps.
 pub const HTTP_RESPONSE_STATUS_METADATA_KEY: &str = "spice.http_response_status";
