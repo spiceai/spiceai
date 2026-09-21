@@ -304,7 +304,8 @@ mod tests {
         ] {
             let builder = crate::get_hash_builder(algorithm).expect("a supported algorithm");
             let mut write_by_write = builder.build_hasher();
-            write_by_write.write(&crate::namespace_key::namespace_key_header(1, b"abc"));
+            write_by_write.write_u8(1);
+            write_by_write.write_u64(b"abc".len() as u64);
             write_by_write.write(b"abc");
             wide.hash(&mut write_by_write);
 
