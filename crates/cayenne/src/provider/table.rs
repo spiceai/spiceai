@@ -9954,11 +9954,13 @@ impl CayenneTableProvider {
     /// decoded inline view cache's resident Arrow bytes, each physical
     /// allocation counted once.
     ///
-    /// Public so a test can weigh the published figure against the memory the
-    /// process actually gives up to the cache — see
-    /// `crates/cayenne/tests/inline_cache_gauge_test.rs`. Synchronous, and the
-    /// sampler deliberately does not call it: on the runtime this walk belongs
-    /// on the blocking pool (see [`Self::sample_inline_cache_metrics`]).
+    /// Exposed as `#[doc(hidden)] pub` for the integration test that weighs the
+    /// published figure against the memory the process actually gives up to the
+    /// cache (`crates/cayenne/tests/inline_cache_gauge_test.rs`) — not a stable
+    /// API. Synchronous, and the sampler deliberately does not call it: on the
+    /// runtime this walk belongs on the blocking pool (see
+    /// [`Self::sample_inline_cache_metrics`]).
+    #[doc(hidden)]
     #[must_use]
     pub fn inline_cache_resident_bytes(&self) -> u64 {
         u64::try_from(inlined_cache::resident_bytes(
