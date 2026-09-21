@@ -335,6 +335,17 @@ try:
     (_demo / "tests" / "second" / "mod.rs").write_text("", encoding="utf-8")
     (_demo / "tests" / "orphan" / "mod.rs").write_text("", encoding="utf-8")
     (_demo / "tests" / "standalone.rs").write_text("", encoding="utf-8")
+    # A second binary of the demo crate, which is its own target even though the
+    # crate also builds a library.
+    (_demo / "src" / "bin").mkdir(parents=True, exist_ok=True)
+    (_demo / "src" / "bin" / "aux.rs").write_text("", encoding="utf-8")
+    # A crate that builds *no* library: `kind(=lib)` does not reach its `src/`,
+    # so a guard there runs only because a clause names its binary.
+    _tool = _reach / "tools" / "harness"
+    (_tool / "src").mkdir(parents=True, exist_ok=True)
+    (_tool / "Cargo.toml").write_text('[package]\nname = "harness"\n', encoding="utf-8")
+    (_tool / "src" / "main.rs").write_text("mod mode_a;\n", encoding="utf-8")
+    (_tool / "src" / "mode_a.rs").write_text("", encoding="utf-8")
 
     def reachability(ledger: str, filterset: str, outside: dict | None = None) -> list[str]:
         """`guard_reachability` against the temporary tree rather than the repo."""
@@ -407,8 +418,8 @@ try:
     )
 
     # Not compiled at all is a different failure from not being selected, and the
-    # one that used to pass green: `_integration_target` answered `None` for it,
-    # which the caller read as "nothing to say about this path".
+    # two must not share an exit: a resolver that answers `None` for both leaves
+    # the caller reading an orphan as "nothing to say about this path".
     check_contains(
         "a `tests/` module no target declares is reported, not skipped",
         reachability("`crates/demo/tests/orphan/mod.rs::a_guard`", NAMES_THE_BINARY),
@@ -464,6 +475,51 @@ try:
     check(
         "a `src/` guard is left to the `kind(=lib)` sweep",
         reachability("`crates/demo/src/lib.rs::a_guard`", LIB_ONLY),
+        [],
+    )
+    # …but only because that clause is there. Skipping every `src/` path meant
+    # the sweep was assumed rather than checked.
+    check_contains(
+        "a library guard is reported when `kind(=lib)` is gone",
+        reachability("`crates/demo/src/lib.rs::a_guard`", "kind(=proc-macro)"),
+        "restore `kind(=lib)`",
+    )
+
+    # A crate with no library is where the assumption broke: its `src/` guards run
+    # solely because a clause names its binary, and dropping that clause was
+    # invisible.
+    check_contains(
+        "a guard in a bin-only crate is reported when nothing names its binary",
+        reachability("`tools/harness/src/mode_a.rs::a_guard`", LIB_ONLY),
+        "(package(=harness) & kind(=bin))",
+    )
+    check(
+        "naming the crate's binaries satisfies it",
+        reachability(
+            "`tools/harness/src/mode_a.rs::a_guard`",
+            "kind(=lib) + (package(=harness) & kind(=bin))",
+        ),
+        [],
+    )
+    check_contains(
+        "`kind(=bin)` for another package does not count",
+        reachability(
+            "`tools/harness/src/mode_a.rs::a_guard`",
+            "kind(=lib) + (package(=demo) & kind(=bin))",
+        ),
+        "(package(=harness) & kind(=bin))",
+    )
+
+    # `src/bin/<name>.rs` is its own target even in a crate that has a library,
+    # so `kind(=lib)` does not cover it either.
+    check_contains(
+        "a `src/bin/<name>.rs` guard is not swept up by `kind(=lib)`",
+        reachability("`crates/demo/src/bin/aux.rs::a_guard`", LIB_ONLY),
+        "(package(=demo) & kind(=bin))",
+    )
+    check(
+        "naming that binary satisfies it",
+        reachability("`crates/demo/src/bin/aux.rs::a_guard`", "kind(=lib) + binary(=aux)"),
         [],
     )
     check_contains(

@@ -343,15 +343,47 @@ TARGETS_RUN_OUTSIDE_THE_UNIT_GATE = {
 }
 
 
-def _package_of(path: Path) -> str | None:
-    """The package a repo-relative source path belongs to."""
+def _crate_of(path: Path) -> tuple[str, Path] | None:
+    """The `(package, crate directory)` a repo-relative source path belongs to."""
     for parent in path.parents:
         manifest = REPO / parent / "Cargo.toml"
         if not manifest.is_file():
             continue
         name = re.search(r'^name\s*=\s*"(?P<name>[^"]+)"', manifest.read_text(encoding="utf-8"), re.M)
-        return name.group("name") if name else None
+        return (name.group("name"), parent) if name else None
     return None
+
+
+def _package_of(path: Path) -> str | None:
+    """The package a repo-relative source path belongs to."""
+    crate = _crate_of(path)
+    return crate[0] if crate else None
+
+
+def _has_lib_target(crate_dir: Path, manifest: str) -> bool:
+    """Whether the crate builds a library, which `kind(=lib)` sweeps wholesale."""
+    return (REPO / crate_dir / "src" / "lib.rs").is_file() or re.search(r"^\[lib\]", manifest, re.M) is not None
+
+
+def _bin_targets(package: str, crate_dir: Path, manifest: str) -> frozenset[str]:
+    """Every binary the crate builds, by target name.
+
+    `[[bin]] name` where the manifest declares one, `src/bin/<name>.rs` for the
+    auto-discovered ones, and the package's own name for a bare `src/main.rs` —
+    which is the case that matters here, since a crate with no library is where
+    a `src/` guard stops being covered by `kind(=lib)`.
+    """
+    names = set()
+    for section in re.findall(r"^\[\[bin\]\](?P<body>.*?)(?=^\[|\Z)", manifest, re.S | re.M):
+        declared = re.search(r'^name\s*=\s*"(?P<name>[^"]+)"', section, re.M)
+        if declared:
+            names.add(declared.group("name"))
+    bin_dir = REPO / crate_dir / "src" / "bin"
+    if bin_dir.is_dir():
+        names.update(entry.stem for entry in bin_dir.glob("*.rs"))
+    if not names and (REPO / crate_dir / "src" / "main.rs").is_file():
+        names.add(package)
+    return frozenset(names)
 
 
 def _module_file(module_dir: Path) -> Path | None:
@@ -369,34 +401,55 @@ def _module_file(module_dir: Path) -> Path | None:
     return sibling if sibling.is_file() else None
 
 
-def _integration_target(path: str) -> tuple[str, str] | str | None:
-    """`(package, binary)` when `path` is compiled into an integration-test binary.
+def _cargo_target(path: str) -> tuple[str, str, frozenset[str]] | str | None:
+    """`(package, kind, target names)` for the cargo target that compiles `path`.
 
-    `None` for a guard in a `src/` tree — a lib or bin target, which the gate
-    selects wholesale by kind.
+    `kind` is `lib`, `bin` or `test`, which is what decides how the gate's
+    filterset has to name it: `kind(=lib)` sweeps every library wholesale, while
+    a bin or an integration-test target is only run if some clause names it.
 
-    A `str` when the path sits under a crate's `tests/` directory and yet belongs
-    to no target: the reason, for the caller to report. Cargo compiles nothing
-    there, so the ledger names a guard that never runs at all — a worse state than
-    one the gate merely does not select, and the two must not share an exit.
+    `None` when the path belongs to no crate in a way worth reporting. A `str` is
+    a reason the path resolves to no target at all — cargo compiles nothing
+    there, so the ledger names a guard that never runs, a worse state than one
+    the gate merely does not select, and the two must not share an exit.
     """
+    crate = _crate_of(Path(path))
+    if crate is None:
+        return (
+            "no Cargo.toml above it names a package, so cargo builds it into no target — "
+            "correct the path, or add the manifest"
+        )
+    package, crate_dir = crate
     parts = Path(path).parts
+    inside_crate = Path(path).relative_to(crate_dir).parts
+
+    if inside_crate and inside_crate[0] == "src":
+        manifest = (REPO / crate_dir / "Cargo.toml").read_text(encoding="utf-8")
+        bins = _bin_targets(package, crate_dir, manifest)
+        # `src/bin/<name>.rs` is its own binary whether or not the crate also
+        # builds a library.
+        if len(inside_crate) >= 3 and inside_crate[1] == "bin":
+            return package, "bin", frozenset({inside_crate[2].removesuffix(".rs")})
+        if _has_lib_target(crate_dir, manifest):
+            return package, "lib", frozenset()
+        if bins:
+            # No library, so every module under `src/` is compiled into the
+            # crate's binaries and runs only if a clause names one of them —
+            # `kind(=lib)` does not reach it.
+            return package, "bin", bins
+        return (
+            f"{crate_dir} builds neither a library nor a binary that could compile it"
+        )
+
     if "tests" not in parts:
         return None
     index = parts.index("tests")
-    crate_dir = Path(*parts[:index])
     inside = parts[index + 1 :]
     if not inside:
         return None
-    package = _package_of(Path(path))
-    if package is None:
-        return (
-            f"no Cargo.toml above it names a package, so cargo builds it into no target — "
-            f"correct the path, or add the manifest"
-        )
     if len(inside) == 1:
         # `tests/<name>.rs` is its own target.
-        return package, inside[0].removesuffix(".rs")
+        return package, "test", frozenset({inside[0].removesuffix(".rs")})
     # `tests/<name>/…` is a module; the target is whichever `tests/*.rs` declares it.
     tests_dir = Path(*parts[: index + 1])
     declaration = _module_declaration(inside[0])
@@ -435,7 +488,7 @@ def _integration_target(path: str) -> tuple[str, str] | str | None:
                 f"correct the path"
             )
         module_dir = module_dir / module
-    return package, binary
+    return package, "test", frozenset({binary})
 
 
 # `package(=…)` / `binary(=…)` inside one clause of the gate's filterset.
@@ -466,20 +519,21 @@ def _union_clauses(selection: str) -> list[str]:
     return [clause.strip() for clause in clauses if clause.strip()]
 
 
-def _clause_selects(clause: str, package: str, binary: str) -> bool:
-    """Whether one union clause selects `(package, binary)`.
+def _clause_selects(clause: str, package: str, kind: str, names: frozenset[str]) -> bool:
+    """Whether one union clause selects this target.
 
-    Two forms count, which are the two the Makefile is written in: a
-    `binary(=…)` naming this binary — qualified with this package, or
-    unqualified, as `binary(=metrics)` is — and `package(=…) & kind(=test)`,
-    which takes every integration target in the package.
+    Three forms count, which are the ones the Makefile is written in: a bare
+    `kind(=lib)`, which sweeps every library in the workspace; a `binary(=…)`
+    naming this target — qualified with this package, or unqualified, as
+    `binary(=metrics)` is — and `package(=…) & kind(=bin|test)`, which takes
+    every target of that kind in the package.
     """
     packages = set(_PACKAGE_CLAUSE_RE.findall(clause))
     if packages and packages != {package}:
         return False
-    if binary in set(_BINARY_CLAUSE_RE.findall(clause)):
+    if f"kind(={kind})" in clause and (kind == "lib" or packages):
         return True
-    return bool(packages) and "kind(=test)" in clause
+    return bool(names & set(_BINARY_CLAUSE_RE.findall(clause)))
 
 
 def guard_reachability(ledger_text: str) -> list[str]:
@@ -491,14 +545,20 @@ def guard_reachability(ledger_text: str) -> list[str]:
     integration-test targets, which the filterset has to name one at a time.
 
     This matches the filterset's clauses textually rather than evaluating them —
-    it splits the union at `+` and looks in each clause for the `binary(=…)` or
-    `package(=…) & kind(=test)` forms the Makefile is written in. A clause
-    written some other way reads here as unreachable, which fails loudly and is
-    fixed by naming it the usual way.
+    it splits the union at `+` and looks in each clause for the `kind(=lib)`,
+    `binary(=…)` or `package(=…) & kind(=bin|test)` forms the Makefile is
+    written in. A clause written some other way reads here as unreachable, which
+    fails loudly and is fixed by naming it the usual way.
 
-    A guard in a `src/` tree is skipped, because `kind(=lib)` and the per-crate
-    `kind(=bin)` clauses already cover those. A path under a crate's `tests/`
-    directory whose owning target cannot be resolved is reported rather than
+    Every guard is resolved to its cargo target first, because which clause has
+    to name it depends on the kind. A `src/` guard in a library is swept up by
+    `kind(=lib)`; a `src/` guard in a crate that builds **no** library is not,
+    and runs only because some clause names the binary — the ledger's
+    `tools/substrait-compliance/src/mode_a.rs` guards run solely on
+    `(package(=spice-substrait-compliance) & kind(=bin))`, so treating every
+    `src/` path as covered let that selector be dropped with nothing to notice.
+
+    A path whose owning target cannot be resolved is reported rather than
     skipped: a `tests/<dir>/` module no `tests/*.rs` declares is not compiled at
     all, so the ledger claims a guard cargo never builds.
     """
@@ -516,22 +576,44 @@ def guard_reachability(ledger_text: str) -> list[str]:
                 f"docs/dev/fork_patches.md names a guard in {path}, which does not exist"
             )
             continue
-        target = _integration_target(path)
+        target = _cargo_target(path)
         if target is None:
             continue
         if isinstance(target, str):
             errors.append(f"docs/dev/fork_patches.md names {path} as a guard, but {target}")
             continue
-        if target in TARGETS_RUN_OUTSIDE_THE_UNIT_GATE:
+        package, kind, names = target
+        if any(
+            (package, name) in TARGETS_RUN_OUTSIDE_THE_UNIT_GATE for name in names
+        ):
             continue
-        package, binary = target
-        if any(_clause_selects(clause, package, binary) for clause in _union_clauses(selection)):
+        if any(
+            _clause_selects(clause, package, kind, names) for clause in _union_clauses(selection)
+        ):
             continue
+        # The advice has to name a clause that would really select it, and the
+        # clause differs by kind: a library is only ever reached by `kind(=lib)`;
+        # an integration target is named one at a time, as the Makefile does, so
+        # adding one guard does not drag in the credentialed binaries beside it;
+        # a crate's binaries are taken together, which is how the one bin-only
+        # crate in the ledger is selected today.
+        if kind == "lib":
+            fix = "restore `kind(=lib)` to NEXTEST_FILTER"
+        elif kind == "bin":
+            fix = (
+                f"add `(package(={package}) & kind(=bin))` to NEXTEST_FILTER, or record "
+                f"({package}, {sorted(names)[0]}) in TARGETS_RUN_OUTSIDE_THE_UNIT_GATE with the "
+                f"runner that does run it"
+            )
+        else:
+            fix = (
+                f"add `(package(={package}) & binary({'=' + sorted(names)[0]}))` to "
+                f"NEXTEST_FILTER, or record ({package}, {sorted(names)[0]}) in "
+                f"TARGETS_RUN_OUTSIDE_THE_UNIT_GATE with the runner that does run it"
+            )
         errors.append(
             f"docs/dev/fork_patches.md names {path} as a guard, but `make nextest` does not "
-            f"select it: add `(package(={package}) & binary(={binary}))` to NEXTEST_FILTER, or "
-            f"record ({package}, {binary}) in TARGETS_RUN_OUTSIDE_THE_UNIT_GATE with the runner "
-            f"that does run it"
+            f"select it: {fix}"
         )
     return errors
 
