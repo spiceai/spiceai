@@ -1,0 +1,146 @@
+---
+name: CodeQL SARIF upload
+
+# Privileged companion to `codeql-analysis.yml`.
+#
+# `pull_request` (and `merge_group`) load the analysis workflow from the PR,
+# so a job defined there that holds `security-events: write` can be rewritten
+# with checkout or a `run` step and still receive the write-capable token.
+# `workflow_run` always loads *this* file from the default branch. The job
+# never checks out the repository and never reads ref/sha from the artifact,
+# so a PR cannot redirect the upload or execute its own code with write
+# scope. See https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
+#
+# `workflow_dispatch` is the recovery path when a completed CodeQL run has a
+# SARIF artifact but nothing published it (the companion is not yet on the
+# default branch, or a `workflow_run` delivery was missed).
+on:
+  workflow_run:
+    workflows: ['CodeQL']
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'ID of a completed CodeQL run whose SARIF artifact should be uploaded'
+        required: true
+        type: string
+
+concurrency:
+  group: codeql-sarif-upload-${{ inputs.run_id || github.event.workflow_run.id }}
+  # Same source run should finish, not be cancelled mid-upload.
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    name: Upload SARIF
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    # Download plus one code-scanning upload. Anything past this is wedged,
+    # not slow, and would otherwise inherit GitHub's six-hour ceiling.
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Resolve the analysis run
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.run_id || github.event.workflow_run.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${SOURCE_RUN_ID}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Source run id '${SOURCE_RUN_ID}' is not a workflow run id, so SARIF is not uploaded."
+            exit 1
+          fi
+
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}")"
+          path="$(jq -r '.path // empty' <<<"${run_json}")"
+          conclusion="$(jq -r '.conclusion // empty' <<<"${run_json}")"
+          event="$(jq -r '.event // empty' <<<"${run_json}")"
+          head_sha="$(jq -r '.head_sha // empty' <<<"${run_json}")"
+          head_branch="$(jq -r '.head_branch // empty' <<<"${run_json}")"
+          run_repo="$(jq -r '.repository.full_name // empty' <<<"${run_json}")"
+
+          expected_path='.github/workflows/codeql-analysis.yml'
+          if [[ "${path}" != "${expected_path}" ]]; then
+            echo "::error::Refusing to upload SARIF from '${path}'. Only '${expected_path}' is the trusted CodeQL analysis workflow."
+            exit 1
+          fi
+
+          if [[ "${run_repo}" != "${GITHUB_REPOSITORY}" ]]; then
+            echo "::error::Refusing to upload SARIF from '${run_repo}', so a foreign workflow run cannot publish results here."
+            exit 1
+          fi
+
+          if [[ "${conclusion}" != 'success' ]]; then
+            echo "::error::CodeQL run ${SOURCE_RUN_ID} concluded '${conclusion}', so there is no SARIF to publish."
+            exit 1
+          fi
+
+          if [[ ! "${head_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::CodeQL run ${SOURCE_RUN_ID} has no commit SHA, so results cannot be attached to a scan."
+            exit 1
+          fi
+
+          # Ref and SHA come from the Actions API (trusted), never from the
+          # artifact a pull-request run produced.
+          ref=''
+          if [[ "${event}" == 'pull_request' ]]; then
+            pr_number="$(jq -r '.pull_requests[0].number // empty' <<<"${run_json}")"
+            if [[ -z "${pr_number}" ]]; then
+              pr_number="$(
+                gh api "repos/${GITHUB_REPOSITORY}/commits/${head_sha}/pulls" \
+                  --jq '.[0].number // empty'
+              )"
+            fi
+            if [[ ! "${pr_number}" =~ ^[0-9]+$ ]]; then
+              echo "::error::No pull request found for CodeQL head '${head_sha}', so results cannot be attached to a PR ref."
+              exit 1
+            fi
+            ref="refs/pull/${pr_number}/head"
+          elif [[ -n "${head_branch}" ]]; then
+            ref="refs/heads/${head_branch}"
+          else
+            echo "::error::CodeQL run ${SOURCE_RUN_ID} has no head branch, so results cannot be attached to a ref."
+            exit 1
+          fi
+
+          case "${ref}" in
+            refs/heads/*|refs/tags/*|refs/pull/[0-9]*/head|refs/pull/[0-9]*/merge) ;;
+            *)
+              echo "::error::Unsupported upload ref '${ref}'."
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "run-id=${SOURCE_RUN_ID}"
+            echo "sha=${head_sha}"
+            echo "ref=${ref}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Download SARIF artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: codeql-sarif-*
+          path: sarif-results
+          merge-multiple: true
+          run-id: ${{ steps.source.outputs.run-id }}
+          github-token: ${{ github.token }}
+
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          sarif_file: sarif-results
+          category: /language:rust
+          sha: ${{ steps.source.outputs.sha }}
+          ref: ${{ steps.source.outputs.ref }}
+          wait-for-processing: true
