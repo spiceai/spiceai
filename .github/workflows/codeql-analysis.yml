@@ -20,7 +20,10 @@ on:
       - release-*
       - release/*
   push:
-    branches: [trunk, release-*]
+    branches:
+      - trunk
+      - release-*
+      - release/*
     paths-ignore:
       - 'docs/**'
       - '.github/**'
@@ -35,7 +38,9 @@ jobs:
     # spiceai-dev-runners.
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || 'spiceai-dev-runners' }}
     env:
-      HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
+      # Same-repo pull requests still receive secrets; do not hand MinIO
+      # credentials to a PR-controlled setup-sccache action.
+      HAS_TEST_MINIO_SECRET: ${{ github.event_name != 'pull_request' && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     permissions:
       actions: read
       contents: read
