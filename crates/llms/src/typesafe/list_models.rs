@@ -56,9 +56,32 @@ struct ModelCard {
     #[serde(default)]
     id: Option<String>,
     /// Additional names callers may configure (e.g. `jev-latest`). The documented
-    /// listing uses `aliases`; `alias` is accepted for compatibility.
-    #[serde(default, alias = "aliases")]
+    /// listing uses `aliases`; a singular `alias` string is also accepted.
+    #[serde(
+        default,
+        alias = "aliases",
+        deserialize_with = "deserialize_alias_list"
+    )]
     alias: Vec<String>,
+}
+
+/// `GET /v1/models` may send `alias` as one string or `aliases` as an array.
+fn deserialize_alias_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(match Option::<OneOrMany>::deserialize(deserializer)? {
+        None => Vec::new(),
+        Some(OneOrMany::One(name)) => vec![name],
+        Some(OneOrMany::Many(names)) => names,
+    })
 }
 
 /// `TypeSafe` model lister (`GET /v1/models`).
@@ -197,6 +220,19 @@ mod tests {
         let names = parsed.into_names();
         assert!(names.contains(&"jev-latest".to_string()), "{names:?}");
         assert!(names.contains(&"jev-1.13.0".to_string()), "{names:?}");
+    }
+
+    /// `GET /v1/models` may return a singular `alias` string rather than an array.
+    #[test]
+    fn singular_alias_string_is_listed() {
+        let body = serde_json::json!({
+            "models": [{"id": "jev-1.13.0", "alias": "jev-latest"}]
+        });
+        let parsed: ModelsResponse =
+            serde_json::from_value(body).expect("a singular alias string parses");
+        let names = parsed.into_names();
+        assert!(names.contains(&"jev-1.13.0".to_string()), "{names:?}");
+        assert!(names.contains(&"jev-latest".to_string()), "{names:?}");
     }
 
     /// The documented card carries `name` and `id` together; `alias = "id"` makes
