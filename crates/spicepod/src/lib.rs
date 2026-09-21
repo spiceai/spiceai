@@ -1133,7 +1133,10 @@ mod version_tests {
             .scheduler
             .as_ref()
             .expect("scheduler should be present");
-        assert_eq!(scheduler.state_location.as_deref(), Some("s3://my-bucket/scheduler-state"));
+        assert_eq!(
+            scheduler.state_location.as_deref(),
+            Some("s3://my-bucket/scheduler-state")
+        );
         assert_eq!(scheduler.partition_assignment_interval, "15s");
         assert_eq!(scheduler.max_partition_assignments_per_interval, 50);
         assert_eq!(scheduler.max_partitions_per_executor, 500);
@@ -1274,7 +1277,10 @@ mod version_tests {
         let scheduler = runtime
             .resolved_scheduler()
             .expect("runtime.state should fill scheduler state");
-        assert_eq!(scheduler.state_location.as_deref(), Some("s3://my-bucket/spice-state"));
+        assert_eq!(
+            scheduler.state_location.as_deref(),
+            Some("s3://my-bucket/spice-state")
+        );
     }
 
     #[test]
@@ -1289,7 +1295,10 @@ mod version_tests {
         let scheduler = runtime
             .resolved_scheduler()
             .expect("scheduler section should exist");
-        assert_eq!(scheduler.state_location.as_deref(), Some("s3://cluster/scheduler-state"));
+        assert_eq!(
+            scheduler.state_location.as_deref(),
+            Some("s3://cluster/scheduler-state")
+        );
     }
 
     #[test]
@@ -1319,7 +1328,6 @@ mod version_tests {
             "omitted scheduler.params must fall back to runtime.state.params"
         );
     }
-
 
     /// `read_write_create` access mode deserializes.
     #[test]
@@ -1880,7 +1888,10 @@ mod version_tests {
         ";
         let scheduler: component::runtime::Scheduler =
             yaml::from_str(yaml).expect("Should parse Scheduler");
-        assert_eq!(scheduler.state_location.as_deref(), Some("s3://bucket/state"));
+        assert_eq!(
+            scheduler.state_location.as_deref(),
+            Some("s3://bucket/state")
+        );
         assert_eq!(
             scheduler.max_partitions_per_executor, 1000,
             "partition assignment fields should default when not specified"

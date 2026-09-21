@@ -2184,15 +2184,12 @@ async fn create_scheduler_server(
                 state_location = %state_location,
                 "Scheduler using shared object-store job state"
             );
-            let (store, base_prefix) = scheduler_registry::build_object_store(
-                rt.as_ref(),
-                state_location,
-                &scheduler_cfg,
-            )
-            .await
-            .map_err(|e| crate::Error::FailedToStartClusterScheduler {
-                source: Box::new(e),
-            })?;
+            let (store, base_prefix) =
+                scheduler_registry::build_object_store(rt.as_ref(), state_location, &scheduler_cfg)
+                    .await
+                    .map_err(|e| crate::Error::FailedToStartClusterScheduler {
+                        source: Box::new(e),
+                    })?;
             let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
                 SpiceLogicalCodec::new_codec(),
                 SpicePhysicalCodec::new(Arc::clone(rt))
