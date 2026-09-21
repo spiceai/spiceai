@@ -354,11 +354,16 @@ def _package_of(path: Path) -> str | None:
     return None
 
 
-def _integration_target(path: str) -> tuple[str, str] | None:
+def _integration_target(path: str) -> tuple[str, str] | str | None:
     """`(package, binary)` when `path` is compiled into an integration-test binary.
 
     `None` for a guard in a `src/` tree — a lib or bin target, which the gate
     selects wholesale by kind.
+
+    A `str` when the path sits under a crate's `tests/` directory and yet belongs
+    to no target: the reason, for the caller to report. Cargo compiles nothing
+    there, so the ledger names a guard that never runs at all — a worse state than
+    one the gate merely does not select, and the two must not share an exit.
     """
     parts = Path(path).parts
     if "tests" not in parts:
@@ -370,7 +375,10 @@ def _integration_target(path: str) -> tuple[str, str] | None:
         return None
     package = _package_of(Path(path))
     if package is None:
-        return None
+        return (
+            f"no Cargo.toml above it names a package, so cargo builds it into no target — "
+            f"correct the path, or add the manifest"
+        )
     if len(inside) == 1:
         # `tests/<name>.rs` is its own target.
         return package, inside[0].removesuffix(".rs")
@@ -379,7 +387,10 @@ def _integration_target(path: str) -> tuple[str, str] | None:
     for candidate in sorted((REPO / crate_dir / "tests").glob("*.rs")):
         if declaration.search(candidate.read_text(encoding="utf-8")):
             return package, candidate.stem
-    return None
+    return (
+        f"no `tests/*.rs` in {crate_dir} declares `mod {inside[0]};`, so cargo compiles it into "
+        f"no integration-test binary and nothing runs it — declare the module, or correct the path"
+    )
 
 
 def guard_reachability(ledger_text: str) -> list[str]:
@@ -396,9 +407,10 @@ def guard_reachability(ledger_text: str) -> list[str]:
     unreachable, which fails loudly and is fixed by naming it the usual way.
 
     A guard in a `src/` tree is skipped, because `kind(=lib)` and the per-crate
-    `kind(=bin)` clauses already cover those. So is a path whose owning target
-    cannot be resolved — a `tests/<dir>/` module no `tests/*.rs` declares is not
-    compiled at all, which is a different problem from not being selected.
+    `kind(=bin)` clauses already cover those. A path under a crate's `tests/`
+    directory whose owning target cannot be resolved is reported rather than
+    skipped: a `tests/<dir>/` module no `tests/*.rs` declares is not compiled at
+    all, so the ledger claims a guard cargo never builds.
     """
     if not MAKEFILE.is_file():
         return [f"{MAKEFILE.relative_to(REPO)} not found, so the nextest filterset cannot be read"]
@@ -416,6 +428,9 @@ def guard_reachability(ledger_text: str) -> list[str]:
             continue
         target = _integration_target(path)
         if target is None:
+            continue
+        if isinstance(target, str):
+            errors.append(f"docs/dev/fork_patches.md names {path} as a guard, but {target}")
             continue
         if target in TARGETS_RUN_OUTSIDE_THE_UNIT_GATE:
             continue

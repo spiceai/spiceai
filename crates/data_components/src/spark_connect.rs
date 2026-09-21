@@ -805,6 +805,52 @@ mod tests {
         );
     }
 
+    /// A connection string's `user_agent` has to *replace* the client's default,
+    /// not extend it.
+    ///
+    /// Live on every production Databricks connection:
+    /// `DatabricksSparkConnect::new_with_rate_controller` formats
+    /// `user_agent={user_agent}` into the connection string, `from_connection`
+    /// keeps it in `base_options` (only `token` and `session_id` are dropped), and
+    /// `render_connection` puts it back for `SparkSessionBuilder::remote`. Fork
+    /// PRs #9 and #10 are what make the builder read the option and send it as the
+    /// whole `client_type`; without them Databricks attributes Spice's traffic to
+    /// the connect library, and nothing fails while it does.
+    ///
+    /// Read out of `Debug` because the value's only other appearance is the
+    /// `client_type` field of an outgoing Spark Connect request, which needs a
+    /// gRPC server to observe. The control is the second half: it asserts the
+    /// library default is what appears when the option is absent, so the
+    /// replacement assertion cannot be met by a builder carrying no user agent at
+    /// all.
+    #[test]
+    fn a_connection_string_user_agent_replaces_the_client_default() {
+        const DEFAULT_MARKER: &str = "_SPARK_CONNECT_RUST";
+
+        let configured = SparkSessionBuilder::remote(TEST_CONNECTION)
+            .expect("the Databricks connection string should parse");
+        let configured = format!("{:?}", configured.channel_builder);
+        assert!(
+            configured.contains("SpiceAI_OSS/1.0"),
+            "the connection string's user agent never reached the client, so Databricks \
+             attributes Spice's traffic to the connect library instead: {configured}"
+        );
+        assert!(
+            !configured.contains(DEFAULT_MARKER),
+            "the user agent extends the library default rather than replacing it, which is \
+             not the attribution Databricks is given: {configured}"
+        );
+
+        let defaulted = SparkSessionBuilder::remote("sc://127.0.0.1:15002/;user_id=spice.ai")
+            .expect("a connection string without a user agent should parse");
+        let defaulted = format!("{:?}", defaulted.channel_builder);
+        assert!(
+            defaulted.contains(DEFAULT_MARKER),
+            "the control has to show the default the assertion above requires to be absent, \
+             or a builder that carried no user agent would satisfy it: {defaulted}"
+        );
+    }
+
     /// What a non-TLS Spark Connect endpoint actually receives when Spice dials it:
     /// the HTTP/2 connection preface, in the clear.
     ///

@@ -342,7 +342,7 @@ mod chat_backend_tests {
 /// Guards the `async-openai` fork patch that only sends `Authorization` when there
 /// is a key to send.
 ///
-/// Upstream inserts the header unconditionally. Spice builds every OpenAI client
+/// Upstream inserts the header unconditionally. Spice builds every `OpenAI` client
 /// through [`new_openai_client_with_chat_backend`], which starts from
 /// `with_api_key("")` on purpose — so the downstream library cannot pick a key up
 /// from the environment — and overrides it only when a key was configured. Without

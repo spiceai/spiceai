@@ -305,6 +305,125 @@ check("the duckdb-rs repo constant is set", DUCKDB_RS_REPO, "duckdb-rs")
 
 
 
+print("\nguard reachability")
+
+# `guard_reachability` reads the live Makefile and the live tree, so the only way
+# to pin what it does with a shape this workspace does not currently contain is to
+# point it at one that does. The cases below are the four the ledger's Guard
+# column can produce and the two ways a named guard is not run at all.
+import check_fork_patches as cfp  # noqa: E402
+
+_reach = Path(__file__).resolve().parent / ".test_reachability_tmp"
+try:
+    _demo = _reach / "crates" / "demo"
+    (_demo / "src").mkdir(parents=True, exist_ok=True)
+    (_demo / "tests" / "covered").mkdir(parents=True, exist_ok=True)
+    (_demo / "tests" / "second").mkdir(parents=True, exist_ok=True)
+    (_demo / "tests" / "orphan").mkdir(parents=True, exist_ok=True)
+    (_demo / "Cargo.toml").write_text('[package]\nname = "demo"\n', encoding="utf-8")
+    (_demo / "src" / "lib.rs").write_text("", encoding="utf-8")
+    # One binary, two modules, and a third directory nothing declares.
+    (_demo / "tests" / "integration.rs").write_text("mod covered;\npub mod second;\n", encoding="utf-8")
+    (_demo / "tests" / "covered" / "mod.rs").write_text("", encoding="utf-8")
+    (_demo / "tests" / "second" / "mod.rs").write_text("", encoding="utf-8")
+    (_demo / "tests" / "orphan" / "mod.rs").write_text("", encoding="utf-8")
+    (_demo / "tests" / "standalone.rs").write_text("", encoding="utf-8")
+
+    def reachability(ledger: str, filterset: str, outside: dict | None = None) -> list[str]:
+        """`guard_reachability` against the temporary tree rather than the repo."""
+        (_reach / "Makefile").write_text(f"NEXTEST_FILTER := {filterset}\n", encoding="utf-8")
+        saved = (cfp.REPO, cfp.MAKEFILE, cfp.TARGETS_RUN_OUTSIDE_THE_UNIT_GATE)
+        cfp.REPO = _reach
+        cfp.MAKEFILE = _reach / "Makefile"
+        cfp.TARGETS_RUN_OUTSIDE_THE_UNIT_GATE = {} if outside is None else outside
+        try:
+            return cfp.guard_reachability(ledger)
+        finally:
+            cfp.REPO, cfp.MAKEFILE, cfp.TARGETS_RUN_OUTSIDE_THE_UNIT_GATE = saved
+
+    LIB_ONLY = "kind(=lib)"
+    NAMES_THE_BINARY = "kind(=lib) + (package(=demo) & binary(=integration))"
+
+    # Both spellings the Guard column uses have to reach the same target. The
+    # second is the one a `::<test>`-anchored pattern skipped silently.
+    check_contains(
+        "a `path.rs::test` guard the filterset does not name is reported",
+        reachability("| `crates/demo/tests/standalone.rs::a_guard` |", LIB_ONLY),
+        "binary(=standalone)",
+    )
+    check_contains(
+        "a `` `path.rs`: `test` `` guard is parsed the same way",
+        reachability("| `crates/demo/tests/standalone.rs`: `a_guard` |", LIB_ONLY),
+        "binary(=standalone)",
+    )
+
+    # A `tests/<dir>/` guard belongs to whichever `tests/*.rs` declares the module,
+    # not to a target named after the directory.
+    check_contains(
+        "a module guard resolves to the binary that declares it",
+        reachability("`crates/demo/tests/covered/mod.rs::a_guard`", LIB_ONLY),
+        "binary(=integration)",
+    )
+    check(
+        "naming that binary in the filterset satisfies the check",
+        reachability("`crates/demo/tests/covered/mod.rs::a_guard`", NAMES_THE_BINARY),
+        [],
+    )
+    check(
+        "the `package(=…) & kind(=test)` form is accepted too",
+        reachability(
+            "`crates/demo/tests/covered/mod.rs::a_guard`",
+            "kind(=lib) + (package(=demo) & kind(=test))",
+        ),
+        [],
+    )
+
+    # The allowlist is keyed by `(package, binary)`, so one entry covers every
+    # module compiled into that binary — adding a module must not need a new entry.
+    check(
+        "one allowlist entry covers every module in the binary",
+        reachability(
+            "`crates/demo/tests/covered/mod.rs` and `crates/demo/tests/second/mod.rs`",
+            LIB_ONLY,
+            outside={("demo", "integration"): "runs in another workflow"},
+        ),
+        [],
+    )
+    check_contains(
+        "the allowlist does not excuse a different binary",
+        reachability(
+            "`crates/demo/tests/standalone.rs::a_guard`",
+            LIB_ONLY,
+            outside={("demo", "integration"): "runs in another workflow"},
+        ),
+        "binary(=standalone)",
+    )
+
+    # Not compiled at all is a different failure from not being selected, and the
+    # one that used to pass green: `_integration_target` answered `None` for it,
+    # which the caller read as "nothing to say about this path".
+    check_contains(
+        "a `tests/` module no target declares is reported, not skipped",
+        reachability("`crates/demo/tests/orphan/mod.rs::a_guard`", NAMES_THE_BINARY),
+        "declares `mod orphan;`",
+    )
+
+    check(
+        "a `src/` guard is left to the `kind(=lib)` sweep",
+        reachability("`crates/demo/src/lib.rs::a_guard`", LIB_ONLY),
+        [],
+    )
+    check_contains(
+        "a guard path that does not exist is reported",
+        reachability("`crates/demo/tests/gone.rs::a_guard`", NAMES_THE_BINARY),
+        "does not exist",
+    )
+finally:
+    import shutil
+
+    shutil.rmtree(_reach, ignore_errors=True)
+
+
 if failures:
     print(f"\n{failures} of {checks} checks FAILED")
     raise SystemExit(1)

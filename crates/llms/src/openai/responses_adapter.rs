@@ -1238,9 +1238,12 @@ mod tests {
     /// a reply that omits it fails to deserialize and the request errors, on a
     /// path this adapter builds and reads (`InputItem::EasyMessage`).
     ///
-    /// The second half is the control: a message that *does* carry the field has
-    /// to keep the value it carries, so a default that swallowed the field would
-    /// not pass.
+    /// The control has to establish that the field is still *read*, and a present
+    /// `"type":"message"` cannot: `MessageType` has one variant, which is also its
+    /// default, so consuming the field and ignoring it produce the same value. A
+    /// value no variant names separates them — it deserializes only if nothing is
+    /// looking at the field, which is the regression `#[serde(default)]` must not
+    /// become (`#[serde(skip)]`, or the field dropped).
     #[test]
     fn a_responses_message_deserializes_with_or_without_its_type_field() {
         let omitted: EasyInputMessage =
@@ -1256,5 +1259,14 @@ mod tests {
             serde_json::from_str(r#"{"role":"user","content":"hello","type":"message"}"#)
                 .expect("a responses message may carry `type`");
         assert_eq!(present.r#type, MessageType::Message);
+
+        serde_json::from_str::<EasyInputMessage>(
+            r#"{"role":"user","content":"hello","type":"not_a_message_type"}"#,
+        )
+        .expect_err(
+            "a `type` no variant names has to be refused: if it deserializes, the field is \
+             being ignored rather than defaulted, and the two assertions above cannot tell \
+             those apart",
+        );
     }
 }
