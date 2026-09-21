@@ -34,11 +34,13 @@ limitations under the License.
 mod common;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
-use cayenne::{CayenneTableProvider, MetadataCatalog};
+use cayenne::provider::CayenneContext;
+use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
 
@@ -46,6 +48,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 test_with_backends!(selective_join_probe_emits_one_row_impl);
 test_with_backends!(selective_join_pushes_a_dynamic_filter_to_the_probe_impl);
+test_with_backends!(dynamic_filter_probes_declared_lookup_index_impl);
 test_with_backends!(mixed_tier_join_keeps_the_inlined_side_in_the_metastore_impl);
 
 const PARENT_ROWS: i64 = 20_000;
@@ -75,21 +78,26 @@ async fn make_table(
     name: &str,
     schema: Arc<Schema>,
     pk: Vec<String>,
+    secondary_indexes: Vec<Vec<String>>,
 ) -> CayenneTableProvider {
     let ctx = SessionContext::new();
-    CayenneTableProvider::create_table(
+    let runtime_env = ctx.runtime_env();
+    let vortex_config = VortexConfig::default();
+    CayenneTableProviderBuilder::new(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-        CreateTableOptions {
-            table_name: name.to_string(),
-            schema,
-            primary_key: pk,
-            on_conflict: None,
-            base_path: fixture.data_path.to_string_lossy().to_string(),
-            partition_column: None,
-            vortex_config: VortexConfig::default(),
-        },
-        ctx.runtime_env(),
+        Arc::clone(&runtime_env),
     )
+    .with_context(CayenneContext::new(&vortex_config, runtime_env, name))
+    .with_secondary_indexes(secondary_indexes)
+    .create(CreateTableOptions {
+        table_name: name.to_string(),
+        schema,
+        primary_key: pk,
+        on_conflict: None,
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config,
+    })
     .await
     .expect("create table")
 }
@@ -148,9 +156,34 @@ fn output_rows(plan: &str) -> Vec<usize> {
 async fn seed(
     fixture: &common::TestFixture,
 ) -> (Arc<CayenneTableProvider>, Arc<CayenneTableProvider>) {
-    let parent = Arc::new(make_table(fixture, "p", parent_schema(), vec!["id".to_string()]).await);
-    let child =
-        Arc::new(make_table(fixture, "c", child_schema(), vec!["child_id".to_string()]).await);
+    seed_with_parent_configuration(fixture, vec!["id".to_string()], vec![]).await
+}
+
+async fn seed_with_parent_configuration(
+    fixture: &common::TestFixture,
+    primary_key: Vec<String>,
+    secondary_indexes: Vec<Vec<String>>,
+) -> (Arc<CayenneTableProvider>, Arc<CayenneTableProvider>) {
+    let parent = Arc::new(
+        make_table(
+            fixture,
+            "p",
+            parent_schema(),
+            primary_key,
+            secondary_indexes,
+        )
+        .await,
+    );
+    let child = Arc::new(
+        make_table(
+            fixture,
+            "c",
+            child_schema(),
+            vec!["child_id".to_string()],
+            vec![],
+        )
+        .await,
+    );
 
     let ids: Vec<i64> = (0..PARENT_ROWS).collect();
     let values: Vec<i64> = ids.iter().map(|i| i * 7).collect();
@@ -188,6 +221,36 @@ async fn seed(
     .expect("insert child");
 
     (parent, child)
+}
+
+/// Triggers the declared lookup index with a literal once, then waits until its
+/// published selection has reached the real Vortex scan path.
+async fn wait_for_parent_lookup_index(parent: &Arc<CayenneTableProvider>) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let ctx = SessionContext::new();
+        ctx.register_table("p", Arc::clone(parent) as Arc<dyn TableProvider>)
+            .expect("register p");
+        ctx.sql("SELECT id FROM p WHERE id = 1")
+            .await
+            .expect("lookup SQL")
+            .collect()
+            .await
+            .expect("lookup execution");
+
+        if parent
+            .lookup_index_counters()
+            .is_some_and(|counters| counters.access_plans_attached > 0)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "declared lookup index was never published: {:?}",
+            parent.lookup_index_counters()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// The load-bearing property: the one-row build side's key reaches the probe
@@ -245,6 +308,51 @@ async fn selective_join_pushes_a_dynamic_filter_to_the_probe_impl(
         "no dynamic filter reached the probe scan — sideways information passing \
          is off, and every such join now reads its whole probe table. Plan:\n{plan}"
     );
+    Ok(())
+}
+
+/// An execution-time join key reaches a lookup index only when that index was
+/// explicitly declared. The probe table has no primary key, so the test cannot
+/// accidentally pass through the primary-key path.
+async fn dynamic_filter_probes_declared_lookup_index_impl(
+    fixture: common::TestFixture,
+) -> TestResult {
+    let (parent, child) =
+        seed_with_parent_configuration(&fixture, vec![], vec![vec!["id".to_string()]]).await;
+    wait_for_parent_lookup_index(&parent).await;
+
+    let before = parent
+        .lookup_index_counters()
+        .expect("parent has the declared lookup index");
+    let first_key = PARENT_ROWS / 4;
+    let second_key = PARENT_ROWS / 2;
+    let sql = format!(
+        "SELECT p.id, p.value FROM p INNER JOIN c ON p.id = c.parent_id \
+         WHERE c.sel IN ('sel_{first_key}', 'sel_{second_key}')"
+    );
+    let (plan, rows) = explain_and_run(&parent, &child, &sql).await;
+    let after = parent
+        .lookup_index_counters()
+        .expect("parent retains the declared lookup index");
+
+    assert_eq!(
+        rows, 2,
+        "the indexed dynamic probe must return both join rows"
+    );
+    assert!(
+        plan.contains("DynamicFilter") || plan.contains("dynamic_filter"),
+        "the join did not materialize a runtime probe filter:\n{plan}"
+    );
+    assert!(
+        after.selected > before.selected,
+        "the declared lookup index was not probed by the dynamic filter: {before:?} -> {after:?}"
+    );
+    assert!(
+        after.access_plans_attached > before.access_plans_attached,
+        "the dynamic lookup did not attach a row selection: {before:?} -> {after:?}"
+    );
+    println!("dynamic lookup counters: {before:?} -> {after:?}");
+
     Ok(())
 }
 
@@ -374,10 +482,20 @@ async fn mixed_tier_join_keeps_the_inlined_side_in_the_metastore_impl(
             "f",
             Arc::clone(&fact_schema),
             vec!["id".to_string()],
+            vec![],
         )
         .await,
     );
-    let dim = Arc::new(make_table(&fixture, "d", dim_schema(), vec!["dim_id".to_string()]).await);
+    let dim = Arc::new(
+        make_table(
+            &fixture,
+            "d",
+            dim_schema(),
+            vec!["dim_id".to_string()],
+            vec![],
+        )
+        .await,
+    );
 
     let ids: Vec<i64> = (0..PARENT_ROWS).collect();
     let dim_ids: Vec<i64> = ids.iter().map(|i| i % DIM_ROWS).collect();

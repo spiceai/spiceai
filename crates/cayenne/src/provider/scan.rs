@@ -245,6 +245,14 @@ impl CayenneAccelerationExec {
         self
     }
 
+    /// Returns the dataset name carried by a scan produced by the Cayenne table
+    /// provider. Optimizer integrations use it to identify the scan without
+    /// relying on display output or the shape of its file-source children.
+    #[must_use]
+    pub fn table_name(&self) -> Option<&str> {
+        self.table_name.as_deref()
+    }
+
     /// Attaches the scan-local lookup-index decision for `EXPLAIN`.
     #[must_use]
     pub(crate) fn with_lookup_index(mut self, lookup_index: Option<LookupIndexExplain>) -> Self {

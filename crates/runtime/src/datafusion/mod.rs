@@ -85,7 +85,9 @@ use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
 use cache::result::query::QueryResult;
 use cache::result::search::CachedSearchResult;
-use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
+use cache::{
+    CacheProvider, CachedPhysicalPlan, Caching, QueryResultsCacheProvider, key::RawCacheKey,
+};
 use data_components::poly::PolyTableProvider;
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
@@ -4310,6 +4312,12 @@ impl DataFusion {
         &self,
     ) -> Option<Arc<dyn TabledCacheProvider<LogicalPlan> + Send + Sync>> {
         self.caching.plans.clone()
+    }
+
+    pub fn physical_plans_cache_provider(
+        &self,
+    ) -> Option<Arc<dyn TabledCacheProvider<CachedPhysicalPlan> + Send + Sync>> {
+        self.caching.physical_plans.clone()
     }
 
     pub fn embeddings_cache_provider(

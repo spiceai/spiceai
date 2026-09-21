@@ -65,10 +65,18 @@ impl Runtime {
                 let plans_cache_provider = Arc::new(SimpleCache::new(
                     DEFAULT_CACHED_PLANS_MAX_CAPACITY,
                     Duration::from_hours(1),
+                    hash_builder.clone(),
+                ))
+                .as_tabled_provider();
+                let physical_plans_cache_provider = Arc::new(SimpleCache::new(
+                    DEFAULT_CACHED_PLANS_MAX_CAPACITY,
+                    Duration::from_hours(1),
                     hash_builder,
                 ))
                 .as_tabled_provider();
-                caching = caching.with_plans_cache(plans_cache_provider);
+                caching = caching
+                    .with_plans_cache(plans_cache_provider)
+                    .with_physical_plans_cache(physical_plans_cache_provider);
             }
             Err(e) => {
                 tracing::error!("Failed to initialize plans cache: {e}");

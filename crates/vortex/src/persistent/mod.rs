@@ -16,7 +16,9 @@ mod sink;
 mod source;
 mod stream;
 
-pub use access_plan::{VortexAccessPlan, VortexAccessPlanProvider};
+pub use access_plan::{
+    VortexAccessPlan, VortexAccessPlanProvider, VortexDynamicAccessPlanProvider,
+};
 pub use format::ProjectionPushdown;
 pub use format::ScanConcurrency;
 pub use format::VortexFormat;

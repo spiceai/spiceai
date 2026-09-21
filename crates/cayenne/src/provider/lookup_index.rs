@@ -42,12 +42,14 @@ limitations under the License.
 //! table keeps scanning. This index is always safe to go without, which is what
 //! lets it degrade rather than fail.
 //!
-//! Each key is held as sorted, compressed Vortex arrays: one per key column in
-//! its stored type and one packed `(file, position)` column, ordered by key and
-//! then by address. Resident size is therefore close to the compressed size of the key
-//! columns. A lookup finds the block of [`BLOCK_ROWS`] entries its key can fall in
-//! from the row-encoded key retained for the start of every block, decodes only
-//! that block, and compares row-encoded keys inside it.
+//! Each key is held as a sorted hash-to-posting array for the serving path and
+//! as compressed Vortex key/posting arrays for verification. Hash collisions
+//! can only add candidates because the original SQL predicate is always
+//! evaluated on the returned rows. A write-time full refresh also retains the
+//! snapshot's Arrow batches when the query memory pool can fit them, allowing a
+//! hit to slice its row without reopening and decoding a Vortex file. If that
+//! row store is not admitted, the same posting falls back to a Vortex point
+//! read.
 //!
 //! Footguns this code depends on:
 //!
@@ -85,6 +87,10 @@ use arrow_schema::{DataType, Field, FieldRef};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_common::{ScalarValue, Statistics};
 use datafusion_datasource::{PartitionedFile, file_groups::FileGroup};
+use datafusion_expr::Operator;
+use datafusion_physical_expr::expressions::{BinaryExpr, Column, InListExpr, Literal};
+use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef, split_conjunction};
+use datafusion_physical_plan::expressions::DynamicFilterPhysicalExpr;
 use futures::StreamExt;
 use object_store::{ObjectMeta, ObjectStore};
 use parking_lot::Mutex;
@@ -97,7 +103,9 @@ use vortex::compressor::{BtrBlocksCompressor, BtrBlocksCompressorBuilder};
 use vortex::dtype::Nullability;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::layout::layouts::row_idx::row_idx;
-use vortex_datafusion::{VortexAccessPlan, VortexAccessPlanProvider};
+use vortex_datafusion::{
+    VortexAccessPlan, VortexAccessPlanProvider, VortexDynamicAccessPlanProvider,
+};
 use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
 
@@ -281,8 +289,6 @@ pub(crate) struct KeyColumn {
     /// The column's stored type. Build and probe both cast to it, so an encoding
     /// never depends on how a value reached the index.
     pub(crate) data_type: DataType,
-    /// Whether the stored column admits nulls.
-    nullable: bool,
 }
 
 impl KeyColumn {
@@ -321,22 +327,12 @@ impl KeyColumn {
         Ok(Self {
             name: field.name().clone(),
             data_type: field.data_type().clone(),
-            nullable: field.is_nullable(),
         })
     }
 
     /// The field of this column inside the index, where nulls never appear.
     fn indexed_field(&self) -> Field {
         Field::new(&self.name, self.data_type.clone(), false)
-    }
-
-    /// The field of this column as a scan of the table's files returns it.
-    fn stored_field(&self) -> FieldRef {
-        Arc::new(Field::new(
-            &self.name,
-            self.data_type.clone(),
-            self.nullable,
-        ))
     }
 }
 
@@ -365,21 +361,6 @@ pub(crate) fn cast_to(array: &ArrayRef, data_type: &DataType) -> Result<ArrayRef
     }
     arrow::compute::cast(array, data_type)
         .map_err(|e| format!("cast {} -> {data_type}: {e}", array.data_type()))
-}
-
-/// The first index in `0..len` for which `pred` is false, for a `pred` that is
-/// true on a prefix of the range.
-fn partition_point(len: usize, pred: impl Fn(usize) -> bool) -> usize {
-    let (mut lo, mut hi) = (0usize, len);
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if pred(mid) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
 }
 
 fn usize_of(bytes: u64) -> usize {
@@ -438,6 +419,12 @@ struct ShapeIndex {
     keys: Vec<vortex::array::ArrayRef>,
     /// The packed postings, in the same order as `keys`.
     postings: vortex::array::ArrayRef,
+    /// Hashes of row-encoded keys paired with their postings, sorted by hash and
+    /// posting. This is the serving path: a hash collision only admits an extra
+    /// candidate which the scan's original predicate rejects, so exact key
+    /// bytes do not need to be decoded on every lookup. The compressed arrays
+    /// remain the source of truth for index verification and diagnostics.
+    fast_entries: Box<[(u64, u64)]>,
     len: usize,
     /// The row-encoded key of the first entry of every block, concatenated.
     heads: Vec<u8>,
@@ -446,13 +433,202 @@ struct ShapeIndex {
     distinct_keys: usize,
 }
 
-impl ShapeIndex {
-    fn blocks(&self) -> usize {
-        self.head_offsets.len().saturating_sub(1)
+/// Full Arrow batches retained beside a file index so an exact hit can return
+/// its rows without reopening and decoding the Vortex file. The index remains
+/// optional: if the memory pool cannot retain every batch, point lookups keep
+/// using the file postings rather than publishing a partial row store.
+struct CoveringRowStore {
+    schema: Arc<arrow_schema::Schema>,
+    files: HashMap<String, Vec<StoredBatch>>,
+    bytes: usize,
+}
+
+struct StoredBatch {
+    first: u64,
+    last: u64,
+    positions: StoredPositions,
+    batch: RecordBatch,
+}
+
+enum StoredPositions {
+    Contiguous(u64),
+    Explicit(Box<[u64]>),
+}
+
+impl StoredBatch {
+    fn row_for(&self, position: u64) -> Option<usize> {
+        match &self.positions {
+            StoredPositions::Contiguous(first) => position
+                .checked_sub(*first)
+                .and_then(|row| usize::try_from(row).ok())
+                .filter(|&row| row < self.batch.num_rows()),
+            StoredPositions::Explicit(positions) => positions.binary_search(&position).ok(),
+        }
+    }
+}
+
+impl CoveringRowStore {
+    fn new(schema: Arc<arrow_schema::Schema>) -> Self {
+        Self {
+            schema,
+            files: HashMap::new(),
+            bytes: 0,
+        }
     }
 
-    fn head(&self, block: usize) -> &[u8] {
-        &self.heads[self.head_offsets[block]..self.head_offsets[block + 1]]
+    fn ingest(
+        &mut self,
+        file_path: &str,
+        positions: RowPositions<'_>,
+        batch: &RecordBatch,
+    ) -> Result<usize, String> {
+        if batch.num_rows() == 0 {
+            return Ok(0);
+        }
+        if batch.schema().as_ref() != self.schema.as_ref() {
+            return Err(format!(
+                "{file_path}: covering row schema differs from the indexed table schema"
+            ));
+        }
+        let (first, last, positions, position_bytes) = match positions {
+            RowPositions::Contiguous(first) => {
+                let last = first
+                    .checked_add(batch.num_rows() as u64 - 1)
+                    .ok_or_else(|| format!("{file_path}: covering row position overflow"))?;
+                (first, last, StoredPositions::Contiguous(first), 0)
+            }
+            RowPositions::Explicit(positions) => {
+                if positions.len() != batch.num_rows() {
+                    return Err(format!(
+                        "{file_path}: {} covering row positions for {} rows",
+                        positions.len(),
+                        batch.num_rows()
+                    ));
+                }
+                let values = positions.values();
+                if values.windows(2).any(|pair| pair[0] >= pair[1]) {
+                    return Err(format!(
+                        "{file_path}: covering row positions are not strictly increasing"
+                    ));
+                }
+                let first = values[0];
+                let last = values[values.len() - 1];
+                let copied = values.to_vec().into_boxed_slice();
+                let bytes = std::mem::size_of_val(copied.as_ref());
+                (first, last, StoredPositions::Explicit(copied), bytes)
+            }
+        };
+        let bytes = batch
+            .get_array_memory_size()
+            .saturating_add(position_bytes)
+            .saturating_add(std::mem::size_of::<StoredBatch>());
+        self.files
+            .entry(file_path.to_string())
+            .or_default()
+            .push(StoredBatch {
+                first,
+                last,
+                positions,
+                batch: batch.clone(),
+            });
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(bytes)
+    }
+
+    fn finish(mut self) -> Option<Self> {
+        for batches in self.files.values_mut() {
+            batches.sort_unstable_by_key(|batch| batch.first);
+            if batches.windows(2).any(|pair| pair[0].last >= pair[1].first) {
+                return None;
+            }
+        }
+        Some(self)
+    }
+
+    fn candidate_batches(
+        &self,
+        selections: &HashMap<String, Vec<u64>>,
+        files: &[&PartitionedFile],
+        table_plans: &dyn VortexAccessPlanProvider,
+    ) -> Option<Vec<RecordBatch>> {
+        let mut output = Vec::new();
+        for (path, positions) in selections {
+            // Use the scan's actual file metadata. A table access-plan provider
+            // may bind deletion vectors to more than the object-store path, so
+            // synthesizing a file here could resurrect a deleted row.
+            let file = files
+                .iter()
+                .find(|file| file.object_meta.location.as_ref() == path)?;
+            let table_plan = table_plans.access_plan_for_file(file);
+            output.extend(self.candidate_batches_for_file(
+                path,
+                positions,
+                table_plan.as_deref(),
+            )?);
+        }
+        Some(output)
+    }
+
+    fn candidate_batches_for_file(
+        &self,
+        path: &str,
+        positions: &[u64],
+        existing: Option<&VortexAccessPlan>,
+    ) -> Option<Vec<RecordBatch>> {
+        let batches = self.files.get(path)?;
+        let table_selection = existing.and_then(VortexAccessPlan::selection);
+        let mut output = Vec::new();
+        let mut position_at = 0;
+        while position_at < positions.len() {
+            let position = positions[position_at];
+            if table_selection.is_some_and(|selection| !selection_keeps(selection, position)) {
+                position_at += 1;
+                continue;
+            }
+            let batch_at = batches.partition_point(|batch| batch.last < position);
+            let stored = batches.get(batch_at)?;
+            if position < stored.first || position > stored.last {
+                return None;
+            }
+            let mut row_indices = Vec::new();
+            while position_at < positions.len() {
+                let position = positions[position_at];
+                if position > stored.last {
+                    break;
+                }
+                position_at += 1;
+                if table_selection.is_some_and(|selection| !selection_keeps(selection, position)) {
+                    continue;
+                }
+                row_indices.push(u64::try_from(stored.row_for(position)?).ok()?);
+            }
+            if !row_indices.is_empty() {
+                // `RecordBatch::slice` keeps every backing buffer of the writer's
+                // batch alive. Besides overstating the candidate's physical size,
+                // that can make join selection build the small dimension table
+                // instead of this one-row lookup result, preventing the next
+                // indexed join input from receiving a dynamic filter. `take`
+                // materializes only the selected values and gives costing the
+                // actual candidate size.
+                let indices = UInt64Array::from(row_indices);
+                let columns = stored
+                    .batch
+                    .columns()
+                    .iter()
+                    .map(|column| arrow::compute::take(column.as_ref(), &indices, None))
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()?;
+                output.push(RecordBatch::try_new(stored.batch.schema(), columns).ok()?);
+            }
+        }
+        Some(output)
+    }
+}
+
+impl ShapeIndex {
+    #[cfg(test)]
+    fn blocks(&self) -> usize {
+        self.head_offsets.len().saturating_sub(1)
     }
 
     /// Resident bytes: the compressed arrays' buffers plus the retained heads.
@@ -463,27 +639,12 @@ impl ShapeIndex {
             .fold(usize_of(self.postings.nbytes()), usize::saturating_add)
             .saturating_add(self.heads.capacity())
             .saturating_add(self.head_offsets.capacity() * std::mem::size_of::<usize>())
-    }
-
-    /// The entries of every block that can hold `key`.
-    ///
-    /// A block whose head is below `key` may hold it; so may a block whose head
-    /// equals it, and the block before the first such block may end with it.
-    fn candidate_range(&self, key: &[u8]) -> Range<usize> {
-        let blocks = self.blocks();
-        let below = partition_point(blocks, |block| self.head(block) < key);
-        let through = partition_point(blocks, |block| self.head(block) <= key);
-        if through == 0 {
-            return 0..0;
-        }
-        let start = below.saturating_sub(1) * BLOCK_ROWS;
-        let end = (through * BLOCK_ROWS).min(self.len);
-        start..end
+            .saturating_add(std::mem::size_of_val(self.fast_entries.as_ref()))
     }
 
     /// The packed postings of the key whose column values are `values`, in
     /// `columns` order.
-    fn probe(&self, session: &VortexSession, values: &[ScalarValue]) -> ShapeProbe {
+    fn probe(&self, values: &[ScalarValue]) -> ShapeProbe {
         if values.len() != self.columns.len() {
             return ShapeProbe::Unanswerable;
         }
@@ -506,17 +667,18 @@ impl ShapeIndex {
             return ShapeProbe::Unanswerable;
         };
         let key = rows.row(0);
-        let range = self.candidate_range(key.as_ref());
-        if range.is_empty() {
-            return ShapeProbe::Postings(Vec::new());
-        }
-        match self.postings_in(session, range, key.as_ref()) {
-            Ok(postings) => ShapeProbe::Postings(postings),
-            Err(error) => {
-                tracing::debug!(shape = %self.label, %error, "Point-lookup index block could not be read; scanning instead");
-                ShapeProbe::Unanswerable
-            }
-        }
+        let hash = hash_index::hash_key_bytes_oneshot(key.as_ref());
+        let start = self
+            .fast_entries
+            .partition_point(|&(candidate, _)| candidate < hash);
+        let end =
+            start + self.fast_entries[start..].partition_point(|&(candidate, _)| candidate == hash);
+        ShapeProbe::Postings(
+            self.fast_entries[start..end]
+                .iter()
+                .map(|&(_, posting)| posting)
+                .collect(),
+        )
     }
 
     /// Decodes every key column of the entries `range`.
@@ -546,28 +708,6 @@ impl ShapeIndex {
             .as_primitive_opt::<UInt64Type>()
             .cloned()
             .ok_or_else(|| "postings did not decode as UInt64".to_string())
-    }
-
-    /// The postings of `key` within the entries `range`.
-    fn postings_in(
-        &self,
-        session: &VortexSession,
-        range: Range<usize>,
-        key: &[u8],
-    ) -> Result<Vec<u64>, String> {
-        let mut ctx = session.create_execution_ctx();
-        let rows = self
-            .converter
-            .convert_columns(&self.decode_keys(session, range.clone(), &mut ctx)?)
-            .map_err(|e| format!("encode block: {e}"))?;
-        let lo = partition_point(rows.num_rows(), |row| rows.row(row).as_ref() < key);
-        let hi = partition_point(rows.num_rows(), |row| rows.row(row).as_ref() <= key);
-        if lo == hi {
-            return Ok(Vec::new());
-        }
-        let postings =
-            self.decode_postings(session, range.start + lo..range.start + hi, &mut ctx)?;
-        Ok(postings.values().to_vec())
     }
 
     /// Every entry as `(row-encoded key, file path, position)`, sorted.
@@ -606,6 +746,7 @@ pub(crate) struct SnapshotLookupIndex {
     files: Vec<IndexedFile>,
     file_ids: HashMap<String, u32>,
     shapes: Vec<ShapeIndex>,
+    covering_rows: Option<CoveringRowStore>,
     session: VortexSession,
     stats: BuildStats,
     /// The file set this index covers. A scan that finds a file the index lacks
@@ -619,6 +760,35 @@ pub(crate) struct SnapshotLookupIndex {
 impl SnapshotLookupIndex {
     pub(crate) fn snapshot_id(&self) -> &str {
         &self.snapshot_id
+    }
+
+    /// Whether this immutable index covers every file in a scan of
+    /// `snapshot_id`. A listing may omit files that statistics already proved
+    /// cannot satisfy the query, but every file it retains must exactly match
+    /// the file metadata recorded by the index.
+    fn covers_files<'a>(
+        &self,
+        snapshot_id: &str,
+        files: impl Iterator<Item = &'a PartitionedFile>,
+    ) -> bool {
+        if self.snapshot_id != snapshot_id {
+            return false;
+        }
+        for file in files {
+            let path: &str = file.object_meta.location.as_ref();
+            let Some(&id) = self.file_ids.get(path) else {
+                return false;
+            };
+            let Some(indexed) = self.files.get(id as usize) else {
+                return false;
+            };
+            if indexed.size != file.object_meta.size
+                || indexed.last_modified_ms != file.object_meta.last_modified.timestamp_millis()
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// Resolves `filters` against one indexed key, returning the candidate row
@@ -635,41 +805,96 @@ impl SnapshotLookupIndex {
             else {
                 continue;
             };
-            let postings = match shape.probe(&self.session, &values) {
+            let postings = match shape.probe(&values) {
                 ShapeProbe::Postings(postings) => postings,
                 ShapeProbe::Unanswerable => continue,
             };
-
-            // Grouped under the index's own path strings, so each candidate
-            // file's path is copied once rather than once per posting.
-            let mut by_file: HashMap<&str, Vec<u64>> = HashMap::new();
-            for &packed in &postings {
-                let (file_id, position) = unpack(packed);
-                // A posting that cannot be resolved to a file means the index is
-                // not internally consistent; refuse the probe rather than
-                // returning a partial selection.
-                let file = self.files.get(file_id)?;
-                by_file
-                    .entry(file.path.as_str())
-                    .or_default()
-                    .push(position);
-            }
-            let per_file = by_file
-                .into_iter()
-                .map(|(path, mut positions)| {
-                    positions.sort_unstable();
-                    positions.dedup();
-                    (path.to_string(), positions)
-                })
-                .collect();
-
-            return Some(ProbeHit {
-                shape: shape.label.clone(),
-                per_file,
-                rows: postings.len(),
-            });
+            return self.probe_hit(shape, postings);
         }
         None
+    }
+
+    /// Resolves a materialized dynamic filter against the declared indexes.
+    /// A one-column index can probe every value of an `IN` set and union the
+    /// postings. Composite keys keep the ordinary rule: every component must
+    /// resolve to one point, because independent sets would require a Cartesian
+    /// product and do not identify which tuples the build side produced.
+    fn probe_dynamic(&self, points: &HashMap<String, Vec<ScalarValue>>) -> Option<ProbeHit> {
+        'shapes: for shape in &self.shapes {
+            let Some(values) = shape
+                .columns
+                .iter()
+                .map(|column| points.get(&column.name))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            if values.iter().any(|values| values.is_empty()) {
+                continue;
+            }
+
+            if values.iter().all(|values| values.len() == 1) {
+                let values = values
+                    .iter()
+                    .map(|values| values[0].clone())
+                    .collect::<Vec<_>>();
+                let postings = match shape.probe(&values) {
+                    ShapeProbe::Postings(postings) => postings,
+                    ShapeProbe::Unanswerable => continue,
+                };
+                return self.probe_hit(shape, postings);
+            }
+
+            if shape.columns.len() != 1 {
+                continue;
+            }
+            let mut postings = Vec::new();
+            for value in values[0] {
+                match shape.probe(std::slice::from_ref(value)) {
+                    ShapeProbe::Postings(mut value_postings) => {
+                        postings.append(&mut value_postings);
+                    }
+                    // A partial union could miss a matching value, so this
+                    // shape must fall back if any member cannot be resolved.
+                    ShapeProbe::Unanswerable => continue 'shapes,
+                }
+            }
+            return self.probe_hit(shape, postings);
+        }
+        None
+    }
+
+    /// Groups postings by scan file after removing repeats from a dynamic `IN`
+    /// list. A posting that cannot resolve to an indexed file makes the whole
+    /// probe unanswerable rather than returning a partial result.
+    fn probe_hit(&self, shape: &ShapeIndex, mut postings: Vec<u64>) -> Option<ProbeHit> {
+        postings.sort_unstable();
+        postings.dedup();
+        // Grouped under the index's own path strings, so each candidate file's
+        // path is copied once rather than once per posting.
+        let mut by_file: HashMap<&str, Vec<u64>> = HashMap::new();
+        for &packed in &postings {
+            let (file_id, position) = unpack(packed);
+            let file = self.files.get(file_id)?;
+            by_file
+                .entry(file.path.as_str())
+                .or_default()
+                .push(position);
+        }
+        let per_file = by_file
+            .into_iter()
+            .map(|(path, mut positions)| {
+                positions.sort_unstable();
+                positions.dedup();
+                (path.to_string(), positions)
+            })
+            .collect();
+
+        Some(ProbeHit {
+            shape: shape.label.clone(),
+            per_file,
+            rows: postings.len(),
+        })
     }
 }
 
@@ -693,6 +918,13 @@ pub(crate) struct LookupSelection {
 pub(crate) enum LookupProbe {
     Selection(LookupSelection),
     Fallback(LookupIndexExplain),
+}
+
+pub(crate) struct LookupRestriction {
+    pub(crate) file_groups: Vec<FileGroup>,
+    pub(crate) access_plan: Option<Arc<dyn VortexAccessPlanProvider>>,
+    pub(crate) explain: LookupIndexExplain,
+    pub(crate) covering_batches: Option<Vec<RecordBatch>>,
 }
 
 impl LookupSelection {
@@ -719,26 +951,30 @@ impl LookupSelection {
         file_groups: Vec<FileGroup>,
         table_plans: Arc<dyn VortexAccessPlanProvider>,
         current: FileSetVersion,
-    ) -> (
-        Vec<FileGroup>,
-        Option<Arc<dyn VortexAccessPlanProvider>>,
-        LookupIndexExplain,
-    ) {
+    ) -> LookupRestriction {
         if !self.validate(snapshot_id, file_groups.iter().flat_map(FileGroup::iter)) {
             self.state
                 .record_probe(&self.shape, ProbeOutcome::SnapshotMismatch);
             if self.index.snapshot_id == snapshot_id && self.index.file_set != current {
                 self.state.discard_stale(&self.index);
             }
-            return (
+            return LookupRestriction {
                 file_groups,
-                None,
-                LookupIndexExplain::fallback(
+                access_plan: None,
+                explain: LookupIndexExplain::fallback(
                     self.shape,
                     LookupIndexExplainOutcome::SnapshotMismatch,
                 ),
-            );
+                covering_batches: None,
+            };
         }
+        let scan_files = file_groups
+            .iter()
+            .flat_map(FileGroup::iter)
+            .collect::<Vec<_>>();
+        let covering_batches = self.index.covering_rows.as_ref().and_then(|rows| {
+            rows.candidate_batches(&self.per_file, &scan_files, table_plans.as_ref())
+        });
         let file_groups: Vec<FileGroup> = file_groups
             .into_iter()
             .filter_map(|group| {
@@ -756,16 +992,17 @@ impl LookupSelection {
         let candidate_files: usize = file_groups.iter().map(FileGroup::len).sum();
         if candidate_files == 0 {
             self.state.record_probe(&self.shape, ProbeOutcome::Empty);
-            return (
+            return LookupRestriction {
                 file_groups,
-                None,
-                LookupIndexExplain::selection(
+                access_plan: None,
+                explain: LookupIndexExplain::selection(
                     self.shape,
                     LookupIndexExplainOutcome::Empty,
                     Some(0),
                     0,
                 ),
-            );
+                covering_batches,
+            };
         }
         self.state
             .record_selection(&self.shape, candidate_files as u64, self.rows as u64);
@@ -774,16 +1011,17 @@ impl LookupSelection {
             selections: self.per_file,
             table: table_plans,
         };
-        (
+        LookupRestriction {
             file_groups,
-            Some(Arc::new(provider)),
-            LookupIndexExplain::selection(
+            access_plan: Some(Arc::new(provider)),
+            explain: LookupIndexExplain::selection(
                 self.shape,
                 LookupIndexExplainOutcome::Selected,
                 Some(candidate_files),
                 u64::try_from(self.rows).unwrap_or(u64::MAX),
             ),
-        )
+            covering_batches,
+        }
     }
 
     /// Accepts this selection only for the exact snapshot and files it was built
@@ -795,24 +1033,7 @@ impl LookupSelection {
         snapshot_id: &str,
         files: impl Iterator<Item = &'a PartitionedFile>,
     ) -> bool {
-        if self.index.snapshot_id != snapshot_id {
-            return false;
-        }
-        for file in files {
-            let path: &str = file.object_meta.location.as_ref();
-            let Some(&id) = self.index.file_ids.get(path) else {
-                return false;
-            };
-            let Some(indexed) = self.index.files.get(id as usize) else {
-                return false;
-            };
-            if indexed.size != file.object_meta.size
-                || indexed.last_modified_ms != file.object_meta.last_modified.timestamp_millis()
-            {
-                return false;
-            }
-        }
-        true
+        self.index.covers_files(snapshot_id, files)
     }
 }
 
@@ -858,25 +1079,327 @@ impl VortexAccessPlanProvider for LookupAccessPlanProvider {
             // would read it.
             return table_plan;
         };
-        let positions = match table_plan.as_deref().and_then(VortexAccessPlan::selection) {
-            None | Some(Selection::All) => Buffer::copy_from(candidates.as_slice()),
-            Some(table_selection) => candidates
-                .iter()
-                .copied()
-                .filter(|&position| selection_keeps(table_selection, position))
-                .collect::<Buffer<u64>>(),
-        };
+        let plan = lookup_access_plan(candidates, table_plan.as_deref());
         self.state
             .counters
             .access_plans_attached
             .fetch_add(1, Ordering::Relaxed);
-        Some(Arc::new(
-            VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(positions)),
-        ))
+        Some(Arc::new(plan))
     }
 
     fn adjust_statistics(&self, object: &ObjectMeta, statistics: Statistics) -> Statistics {
         self.table.adjust_statistics(object, statistics)
+    }
+}
+
+/// Builds the row selection for `candidates`, intersecting it with a table's
+/// existing deletion selection when present.
+fn lookup_access_plan(candidates: &[u64], existing: Option<&VortexAccessPlan>) -> VortexAccessPlan {
+    let positions = match existing.and_then(VortexAccessPlan::selection) {
+        None | Some(Selection::All) => Buffer::copy_from(candidates),
+        Some(table_selection) => candidates
+            .iter()
+            .copied()
+            .filter(|&position| selection_keeps(table_selection, position))
+            .collect::<Buffer<u64>>(),
+    };
+    VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(positions))
+}
+
+/// A point recovered from a materialized dynamic filter.
+#[derive(Default)]
+struct DynamicPointBounds {
+    lower: Option<ScalarValue>,
+    upper: Option<ScalarValue>,
+    points: Vec<ScalarValue>,
+}
+
+impl DynamicPointBounds {
+    fn record_lower(&mut self, value: ScalarValue) {
+        self.lower = Some(value);
+    }
+
+    fn record_upper(&mut self, value: ScalarValue) {
+        self.upper = Some(value);
+    }
+
+    fn record_point(&mut self, value: ScalarValue) {
+        self.points.push(value);
+    }
+
+    fn record_points(&mut self, values: Vec<ScalarValue>) {
+        self.points.extend(values);
+    }
+
+    /// Values known to be a superset of every row the dynamic filter can pass.
+    /// An equality or `IN` member is already an exact point; otherwise equal
+    /// inclusive bounds prove the same thing. Keeping every direct point is
+    /// safe for conjunctions too: the residual filter still evaluates them.
+    fn points(self) -> Vec<ScalarValue> {
+        if !self.points.is_empty() {
+            return self.points;
+        }
+        self.lower
+            .zip(self.upper)
+            .and_then(|(lower, upper)| (lower == upper).then_some(lower))
+            .into_iter()
+            .collect()
+    }
+}
+
+/// Cached result for one dynamic-filter generation vector. A `None` selection
+/// is retained only for that vector, so a later materialized value gets a new
+/// probe rather than being pinned to the ordinary scan.
+#[derive(Clone)]
+struct DynamicLookupSelection {
+    selections: Arc<HashMap<String, Vec<u64>>>,
+}
+
+#[derive(Default)]
+struct DynamicLookupCache {
+    generations: Option<Vec<u64>>,
+    selection: Option<DynamicLookupSelection>,
+}
+
+/// Per-scan resolver for a lookup index and a dynamic filter that materializes
+/// after physical planning. It shares one probe result among every file opener
+/// in the scan, so concurrent file opens do not decode the same index block.
+pub(crate) struct DynamicLookupAccessPlanProvider {
+    state: Arc<LookupIndexState>,
+    index: Arc<SnapshotLookupIndex>,
+    cache: Mutex<DynamicLookupCache>,
+}
+
+impl DynamicLookupAccessPlanProvider {
+    fn new(state: Arc<LookupIndexState>, index: Arc<SnapshotLookupIndex>) -> Self {
+        Self {
+            state,
+            index,
+            cache: Mutex::new(DynamicLookupCache::default()),
+        }
+    }
+
+    fn selection_for_filter(
+        &self,
+        filter: Option<&PhysicalExprRef>,
+    ) -> Option<DynamicLookupSelection> {
+        let filter = filter?;
+        let generations = dynamic_filter_generations(filter);
+        if generations.is_empty() {
+            return None;
+        }
+
+        let mut cache = self.cache.lock();
+        if cache.generations.as_ref() == Some(&generations) {
+            return cache.selection.clone();
+        }
+
+        let points = dynamic_points(filter);
+        let selection = points.and_then(|points| {
+            let hit = self.index.probe_dynamic(&points)?;
+            if hit.per_file.is_empty() {
+                self.state.record_probe(&hit.shape, ProbeOutcome::Empty);
+            } else {
+                self.state.record_selection(
+                    &hit.shape,
+                    u64::try_from(hit.per_file.len()).unwrap_or(u64::MAX),
+                    u64::try_from(hit.rows).unwrap_or(u64::MAX),
+                );
+            }
+            Some(DynamicLookupSelection {
+                selections: Arc::new(hit.per_file),
+            })
+        });
+        cache.generations = Some(generations);
+        cache.selection.clone_from(&selection);
+        selection
+    }
+}
+
+impl std::fmt::Debug for DynamicLookupAccessPlanProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicLookupAccessPlanProvider")
+            .field("snapshot_id", &self.index.snapshot_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VortexDynamicAccessPlanProvider for DynamicLookupAccessPlanProvider {
+    fn dynamic_record_batches_for_file(
+        &self,
+        file: &PartitionedFile,
+        filter: Option<&PhysicalExprRef>,
+        existing: Option<&VortexAccessPlan>,
+    ) -> Option<Vec<RecordBatch>> {
+        let selection = self.selection_for_filter(filter)?;
+        let path: &str = file.object_meta.location.as_ref();
+        let candidates = selection
+            .selections
+            .get(path)
+            .map_or_else(|| &[][..], Vec::as_slice);
+        let batches = self
+            .index
+            .covering_rows
+            .as_ref()?
+            .candidate_batches_for_file(path, candidates, existing)?;
+        if !candidates.is_empty() {
+            self.state
+                .counters
+                .access_plans_attached
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Some(batches)
+    }
+
+    fn dynamic_access_plan_for_file(
+        &self,
+        file: &PartitionedFile,
+        filter: Option<&PhysicalExprRef>,
+        existing: Option<&VortexAccessPlan>,
+    ) -> Option<Arc<VortexAccessPlan>> {
+        let selection = self.selection_for_filter(filter)?;
+        let path: &str = file.object_meta.location.as_ref();
+        let candidates = selection
+            .selections
+            .get(path)
+            .map_or_else(|| &[][..], Vec::as_slice);
+        if !candidates.is_empty() {
+            self.state
+                .counters
+                .access_plans_attached
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Some(Arc::new(lookup_access_plan(candidates, existing)))
+    }
+}
+
+/// The ordered snapshot generations of the dynamic expressions in `expr`.
+/// The vector keeps independently changing filters distinct; summing their
+/// generations could reuse a stale row selection when two filters advance.
+fn dynamic_filter_generations(expr: &PhysicalExprRef) -> Vec<u64> {
+    let mut generations = Vec::new();
+    collect_dynamic_filter_generations(expr, &mut generations);
+    generations
+}
+
+fn collect_dynamic_filter_generations(expr: &PhysicalExprRef, generations: &mut Vec<u64>) {
+    if let Some(dynamic_filter) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() {
+        generations.push(dynamic_filter.snapshot_generation());
+        return;
+    }
+    for child in expr.children() {
+        collect_dynamic_filter_generations(child, generations);
+    }
+}
+
+/// Returns dynamic point sets safe to probe against a lookup index. It
+/// recognizes equality, literal `IN`, and equal dynamic lower and upper bounds.
+/// Any other dynamic shape falls back to the ordinary scan.
+fn dynamic_points(filter: &PhysicalExprRef) -> Option<HashMap<String, Vec<ScalarValue>>> {
+    let mut bounds = HashMap::<String, DynamicPointBounds>::new();
+    let mut found_dynamic_filter = false;
+    collect_dynamic_points(filter, &mut bounds, &mut found_dynamic_filter);
+    if !found_dynamic_filter {
+        return None;
+    }
+    let points = bounds
+        .into_iter()
+        .filter_map(|(column, bounds)| {
+            let points = bounds.points();
+            (!points.is_empty()).then_some((column, points))
+        })
+        .collect::<HashMap<_, _>>();
+    Some(points)
+}
+
+fn collect_dynamic_points(
+    expr: &PhysicalExprRef,
+    bounds: &mut HashMap<String, DynamicPointBounds>,
+    found_dynamic_filter: &mut bool,
+) {
+    if let Some(dynamic_filter) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() {
+        *found_dynamic_filter = true;
+        if let Ok(current) = dynamic_filter.current() {
+            for conjunct in split_conjunction(&current) {
+                collect_dynamic_point_conjunct(conjunct, bounds);
+            }
+        }
+        return;
+    }
+    for child in expr.children() {
+        collect_dynamic_points(child, bounds, found_dynamic_filter);
+    }
+}
+
+fn collect_dynamic_point_conjunct(
+    expr: &PhysicalExprRef,
+    bounds: &mut HashMap<String, DynamicPointBounds>,
+) {
+    if let Some(binary) = expr.downcast_ref::<BinaryExpr>()
+        && let Some((column, comparison, scalar)) = column_literal_comparison(binary)
+    {
+        let bounds = bounds.entry(column.to_string()).or_default();
+        match comparison {
+            DynamicComparison::Equal => bounds.record_point(scalar),
+            DynamicComparison::GreaterThanOrEqual => bounds.record_lower(scalar),
+            DynamicComparison::LessThanOrEqual => bounds.record_upper(scalar),
+        }
+        return;
+    }
+    if let Some(in_list) = expr.downcast_ref::<InListExpr>()
+        && !in_list.negated()
+        && let Some(column) = in_list.expr().downcast_ref::<Column>()
+        && let Some(points) = in_list
+            .list()
+            .iter()
+            .map(|item| {
+                item.downcast_ref::<Literal>()
+                    .map(|literal| literal.value().clone())
+            })
+            .collect::<Option<Vec<_>>>()
+        && !points.is_empty()
+    {
+        bounds
+            .entry(column.name().to_string())
+            .or_default()
+            .record_points(points);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DynamicComparison {
+    Equal,
+    GreaterThanOrEqual,
+    LessThanOrEqual,
+}
+
+fn column_literal_comparison(
+    binary: &BinaryExpr,
+) -> Option<(&str, DynamicComparison, ScalarValue)> {
+    let literal = |expr: &Arc<dyn PhysicalExpr>| {
+        expr.downcast_ref::<Literal>()
+            .map(|literal| literal.value().clone())
+    };
+    match (
+        binary.left().downcast_ref::<Column>(),
+        literal(binary.right()),
+        binary.right().downcast_ref::<Column>(),
+        literal(binary.left()),
+        binary.op(),
+    ) {
+        (Some(column), Some(value), _, _, Operator::Eq)
+        | (_, _, Some(column), Some(value), Operator::Eq) => {
+            Some((column.name(), DynamicComparison::Equal, value))
+        }
+        (Some(column), Some(value), _, _, Operator::GtEq)
+        | (_, _, Some(column), Some(value), Operator::LtEq) => {
+            Some((column.name(), DynamicComparison::GreaterThanOrEqual, value))
+        }
+        (Some(column), Some(value), _, _, Operator::LtEq)
+        | (_, _, Some(column), Some(value), Operator::GtEq) => {
+            Some((column.name(), DynamicComparison::LessThanOrEqual, value))
+        }
+        _ => None,
     }
 }
 
@@ -1068,6 +1591,32 @@ impl LookupIndexState {
 
     pub(crate) fn published(&self) -> Option<Arc<SnapshotLookupIndex>> {
         self.index.load_full()
+    }
+
+    /// Creates a resolver for an execution-time dynamic probe if the currently
+    /// published index covers this scan's exact snapshot and file list. A
+    /// missing or stale index leaves the normal dynamic-filter scan in place;
+    /// it can never become a false empty result.
+    pub(crate) fn dynamic_access_plan_provider<'a>(
+        self: &Arc<Self>,
+        snapshot_id: &str,
+        files: impl Iterator<Item = &'a PartitionedFile>,
+        current: FileSetVersion,
+    ) -> Option<Arc<dyn VortexDynamicAccessPlanProvider>> {
+        let index = self.published()?;
+        if index.snapshot_id != snapshot_id {
+            return None;
+        }
+        if !index.covers_files(snapshot_id, files) {
+            if index.file_set != current {
+                self.discard_stale(&index);
+            }
+            return None;
+        }
+        Some(Arc::new(DynamicLookupAccessPlanProvider::new(
+            Arc::clone(self),
+            index,
+        )))
     }
 
     pub(crate) fn counters(&self) -> LookupIndexCounters {
@@ -1572,6 +2121,9 @@ struct ShapeBuild {
     keys: Vec<Vec<ArrayRef>>,
     /// The packed posting of every retained row, in arrival order.
     postings: Vec<u64>,
+    /// Hash/posting pairs used directly by the serving path. Hash collisions
+    /// are safe because every selected row still evaluates the SQL predicate.
+    fast_entries: Vec<(u64, u64)>,
     /// Bytes held by `keys` and `postings`.
     retained: usize,
 }
@@ -1584,6 +2136,7 @@ impl ShapeBuild {
             columns,
             keys,
             postings: Vec::new(),
+            fast_entries: Vec::new(),
             retained: 0,
         }
     }
@@ -1594,6 +2147,7 @@ impl ShapeBuild {
             *chunks = Vec::new();
         }
         self.postings = Vec::new();
+        self.fast_entries = Vec::new();
         self.retained = 0;
     }
 
@@ -1662,11 +2216,34 @@ impl ShapeBuild {
                 .push((u64::from(file_id) << POSITION_BITS) | position);
         }
         let mut retained = indices.len() * std::mem::size_of::<u64>();
-        for (column, chunks) in columns.iter().zip(&mut self.keys) {
-            let kept = arrow::compute::take(column.as_ref(), &indices, None)
-                .map_err(|e| format!("{file_path}: {e}"))?;
-            retained += kept.get_array_memory_size();
-            chunks.push(kept);
+        let kept_columns = columns
+            .iter()
+            .map(|column| {
+                let kept = arrow::compute::take(column.as_ref(), &indices, None)
+                    .map_err(|e| format!("{file_path}: {e}"))?;
+                retained = retained.saturating_add(kept.get_array_memory_size());
+                Ok(kept)
+            })
+            .collect::<Result<Vec<ArrayRef>, String>>()?;
+        let converter = key_converter(&self.columns)?;
+        let encoded = converter
+            .convert_columns(&kept_columns)
+            .map_err(|e| format!("{file_path}: encode lookup keys: {e}"))?;
+        self.fast_entries.reserve(indices.len());
+        let postings_start = self.postings.len().saturating_sub(indices.len());
+        for (row, &posting) in self.postings[postings_start..].iter().enumerate() {
+            self.fast_entries.push((
+                hash_index::hash_key_bytes_oneshot(encoded.row(row).as_ref()),
+                posting,
+            ));
+        }
+        retained = retained.saturating_add(
+            indices
+                .len()
+                .saturating_mul(std::mem::size_of::<(u64, u64)>()),
+        );
+        for (column, chunks) in kept_columns.into_iter().zip(&mut self.keys) {
+            chunks.push(column);
         }
         self.retained = self.retained.saturating_add(retained);
         Ok(retained)
@@ -1685,8 +2262,10 @@ impl ShapeBuild {
             columns,
             keys,
             postings,
+            mut fast_entries,
             ..
         } = self;
+        fast_entries.sort_unstable();
         let converter = key_converter(&columns)?;
         let keys = keys
             .into_iter()
@@ -1781,6 +2360,7 @@ impl ShapeBuild {
             converter,
             keys: arrays,
             postings,
+            fast_entries: fast_entries.into_boxed_slice(),
             columns,
             len,
             heads,
@@ -1868,6 +2448,9 @@ impl BlockHeads {
 /// in how they select, pack or sort entries.
 struct BuildState {
     shapes: Vec<ShapeBuild>,
+    /// Full rows retained for direct indexed reads. `None` means the pool could
+    /// not fit a complete store; the postings index remains usable.
+    covering_rows: Option<CoveringRowStore>,
     file_ids: HashMap<String, u32>,
     /// `file_id -> path`, in assignment order.
     file_order: Vec<String>,
@@ -1902,6 +2485,7 @@ impl BuildState {
             .collect::<Result<Vec<_>, String>>()?;
         Ok(Self {
             shapes,
+            covering_rows: Some(CoveringRowStore::new(Arc::new(schema.clone()))),
             file_ids: HashMap::new(),
             file_order: Vec::new(),
             rows: 0,
@@ -1934,19 +2518,6 @@ impl BuildState {
         Ok(id)
     }
 
-    /// The key columns the read-back build projects, once each.
-    fn key_columns(&self) -> Vec<KeyColumn> {
-        let mut columns: Vec<KeyColumn> = Vec::new();
-        for shape in &self.shapes {
-            for column in &shape.columns {
-                if !columns.iter().any(|c| c.name == column.name) {
-                    columns.push(column.clone());
-                }
-            }
-        }
-        columns
-    }
-
     fn ingest(
         &mut self,
         file_id: u32,
@@ -1965,6 +2536,21 @@ impl BuildState {
                 explicit.len(),
                 batch.num_rows()
             ));
+        }
+        if let Some(covering) = self.covering_rows.as_mut() {
+            let retained_before = covering.bytes;
+            match covering.ingest(file_path, positions, batch) {
+                Ok(retained) if self.reservation.try_grow(retained).is_ok() => {}
+                Ok(_) => {
+                    self.reservation.shrink(retained_before);
+                    self.covering_rows = None;
+                }
+                Err(error) => {
+                    self.reservation.shrink(retained_before);
+                    self.covering_rows = None;
+                    tracing::debug!(%error, "Covering lookup rows could not be retained; using file point reads");
+                }
+            }
         }
         for shape in &mut self.shapes {
             let retained = shape.ingest(file_id, positions, batch, file_path)?;
@@ -2010,6 +2596,7 @@ impl BuildState {
     ) -> Result<Option<SnapshotLookupIndex>, String> {
         let Self {
             shapes,
+            covering_rows,
             file_ids,
             file_order,
             rows,
@@ -2056,6 +2643,9 @@ impl BuildState {
             resident = resident.saturating_add(shape.resident_bytes());
             built.push(shape);
         }
+        let covering_rows = covering_rows.and_then(CoveringRowStore::finish);
+        let covering_bytes = covering_rows.as_ref().map_or(0, |rows| rows.bytes);
+        resident = resident.saturating_add(covering_bytes);
         let Some(resident_reservation) = account.try_reserve_lookup_index(resident) else {
             return Ok(None);
         };
@@ -2080,6 +2670,7 @@ impl BuildState {
                 per_key_entries,
             },
             shapes: built,
+            covering_rows,
             session,
             file_set,
             reservation: resident_reservation,
@@ -2408,10 +2999,12 @@ async fn read_back(
     let started = Instant::now();
     let rss_before = super::tuning::proc_self_rss_bytes();
     let mut build = BuildState::new(&state.specs, state.build_reservation(), schema)?;
-    let columns = build.key_columns();
     let session = VortexSession::default();
 
-    let mut target_fields: Vec<FieldRef> = columns.iter().map(KeyColumn::stored_field).collect();
+    // Rebuild the covering row store as well as the key postings. Projecting
+    // only key columns here made a runtime restart rebuild an index that still
+    // had to reopen the data file for every hit until the next full refresh.
+    let mut target_fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
     target_fields.push(Arc::new(Field::new(
         READ_BACK_POSITION_COLUMN,
         DataType::UInt64,
@@ -2419,9 +3012,15 @@ async fn read_back(
     )));
     let target = Field::new_struct("", target_fields, false);
     let projection = pack(
-        columns
+        schema
+            .fields()
             .iter()
-            .map(|column| (column.name.clone(), get_item(column.name.as_str(), root())))
+            .map(|field| {
+                (
+                    field.name().clone(),
+                    get_item(field.name().as_str(), root()),
+                )
+            })
             .chain(std::iter::once((
                 READ_BACK_POSITION_COLUMN.to_string(),
                 row_idx(),
@@ -2455,16 +3054,21 @@ async fn read_back(
                 .arrow()
                 .execute_arrow(chunk, Some(&target), &mut ctx)
                 .map_err(|e| format!("to arrow {}: {e}", file.path))?;
-            let batch = RecordBatch::from(
+            let batch_with_position = RecordBatch::from(
                 array
                     .as_struct_opt()
                     .ok_or_else(|| format!("{}: scan did not return a struct", file.path))?,
             );
-            let positions = batch
+            let positions = batch_with_position
                 .column_by_name(READ_BACK_POSITION_COLUMN)
                 .and_then(|column| column.as_primitive_opt::<UInt64Type>())
                 .ok_or_else(|| format!("{}: row positions are not UInt64", file.path))?
                 .clone();
+            let batch = RecordBatch::try_new(
+                Arc::new(schema.clone()),
+                batch_with_position.columns()[..schema.fields().len()].to_vec(),
+            )
+            .map_err(|e| format!("{}: rebuild covering rows: {e}", file.path))?;
             build.ingest(
                 file_id,
                 RowPositions::Explicit(&positions),
@@ -2550,6 +3154,50 @@ mod tests {
     }
 
     #[test]
+    fn covering_rows_return_candidates_and_honor_position_deletes() {
+        let batch = keyed_batch(
+            vec![Some(1), Some(2), Some(3)],
+            vec![
+                Some("a".to_string()),
+                Some("b".to_string()),
+                Some("c".to_string()),
+            ],
+            vec![None, None, None],
+        );
+        let mut rows = CoveringRowStore::new(keyed_schema());
+        rows.ingest("snapshot/file.vortex", RowPositions::Contiguous(0), &batch)
+            .expect("retain rows");
+        let rows = rows.finish().expect("non-overlapping row positions");
+        let deleted = VortexAccessPlan::default()
+            .with_selection(Selection::ExcludeByIndex(Buffer::from_iter([1u64])));
+
+        let candidates = rows
+            .candidate_batches_for_file("snapshot/file.vortex", &[0, 1, 2], Some(&deleted))
+            .expect("all retained positions resolve");
+        let tenants = candidates
+            .iter()
+            .flat_map(|batch| {
+                let values = batch
+                    .column(0)
+                    .as_primitive::<arrow::datatypes::Int64Type>();
+                (0..values.len())
+                    .map(|row| values.value(row))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tenants, vec![1, 3]);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "rows from one writer batch stay grouped"
+        );
+        assert!(
+            candidates[0].get_array_memory_size() < batch.get_array_memory_size(),
+            "lookup candidates must own only their selected values, not retain the writer batch"
+        );
+    }
+
+    #[test]
     fn a_column_matching_by_case_only_twice_is_refused() {
         let schema = arrow_schema::Schema::new(vec![
             Field::new("TenantId", DataType::Utf8, false),
@@ -2563,7 +3211,6 @@ mod tests {
         KeyColumn::resolve(&schema, "TENANTID").expect_err("a name matching two columns by case");
         let service = KeyColumn::resolve(&schema, "service").expect("unique by case");
         assert_eq!(service.name, "Service");
-        assert!(service.nullable);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_groups::FileGroupPartitioner;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::file_stream::FileOpener;
+use datafusion_datasource::morsel::Morselizer;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr::PhysicalExprRef;
@@ -36,10 +37,12 @@ use vortex::metrics::MetricsRegistry;
 use vortex::session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
 
+use super::opener::VortexMorselizer;
 use super::opener::VortexOpener;
 use super::segment_cache::SharedSegmentCache;
 use crate::ProjectionPushdown;
 use crate::ScanConcurrency;
+use crate::VortexDynamicAccessPlanProvider;
 use crate::VortexTableOptions;
 use crate::convert::exprs::DefaultExpressionConvertor;
 use crate::convert::exprs::ExpressionConvertor;
@@ -82,6 +85,9 @@ pub struct VortexSource {
     /// the fan-out only multiplies per-split Vortex footer-opens the lookup never
     /// needs. Default `true`, preserving full-scan read parallelism.
     allow_repartitioning: bool,
+    /// Optional resolver for selections that require execution-time dynamic
+    /// filters, which are unavailable to a format-level access-plan provider.
+    dynamic_access_plan_provider: Option<Arc<dyn VortexDynamicAccessPlanProvider>>,
 }
 
 impl VortexSource {
@@ -113,6 +119,7 @@ impl VortexSource {
             target_partitions: None,
             options: VortexTableOptions::default(),
             allow_repartitioning: true,
+            dynamic_access_plan_provider: None,
         }
     }
 
@@ -199,6 +206,17 @@ impl VortexSource {
         self
     }
 
+    /// Set the resolver that may replace a file's access plan once a dynamic
+    /// filter materializes during execution.
+    #[must_use]
+    pub fn with_dynamic_access_plan_provider(
+        mut self,
+        provider: Arc<dyn VortexDynamicAccessPlanProvider>,
+    ) -> Self {
+        self.dynamic_access_plan_provider = Some(provider);
+        self
+    }
+
     /// The number of splits this source decodes CONCURRENTLY inside one file scan
     /// for `base_config`.
     ///
@@ -229,15 +247,13 @@ impl VortexSource {
         self.target_partitions
             .unwrap_or_else(|| base_config.file_groups.len().max(1))
     }
-}
 
-impl FileSource for VortexSource {
-    fn create_file_opener(
+    fn file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
         base_config: &FileScanConfig,
         partition: usize,
-    ) -> DFResult<Arc<dyn FileOpener>> {
+    ) -> DFResult<VortexOpener> {
         let batch_size = self
             .batch_size
             .ok_or_else(|| exec_datafusion_err!("batch_size must be supplied to VortexSource"))?;
@@ -267,7 +283,7 @@ impl FileSource for VortexSource {
             "Resolved Vortex scan concurrency"
         );
 
-        let opener = VortexOpener {
+        Ok(VortexOpener {
             partition,
             session: self.session.clone(),
             vortex_reader_factory,
@@ -277,7 +293,7 @@ impl FileSource for VortexSource {
             expr_adapter_factory,
             table_schema: self.table_schema.clone(),
             batch_size,
-            limit: base_config.limit.map(|l| l as u64),
+            limit: base_config.limit.map(|limit| limit as u64),
             metrics_registry: Arc::clone(&self.vx_metrics_registry),
             layout_readers: Arc::clone(&self.layout_readers),
             natural_split_ranges: Arc::clone(&self.natural_split_ranges),
@@ -288,9 +304,39 @@ impl FileSource for VortexSource {
             object_store_url: Arc::from(base_config.object_store_url.as_str()),
             projection_pushdown: self.options.projection_pushdown.enabled(),
             scan_concurrency: Some(scan_concurrency),
-        };
+            dynamic_access_plan_provider: self
+                .dynamic_access_plan_provider
+                .as_ref()
+                .map(Arc::clone),
+        })
+    }
+}
 
-        Ok(Arc::new(opener))
+impl FileSource for VortexSource {
+    fn create_file_opener(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+    ) -> DFResult<Arc<dyn FileOpener>> {
+        Ok(Arc::new(self.file_opener(
+            object_store,
+            base_config,
+            partition,
+        )?))
+    }
+
+    fn create_morselizer(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+    ) -> DFResult<Box<dyn Morselizer>> {
+        Ok(Box::new(VortexMorselizer::new(self.file_opener(
+            object_store,
+            base_config,
+            partition,
+        )?)))
     }
 
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {

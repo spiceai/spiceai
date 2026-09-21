@@ -5,7 +5,9 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use datafusion_common::Statistics;
+use datafusion_common::arrow::record_batch::RecordBatch;
 use datafusion_datasource::PartitionedFile;
+use datafusion_physical_expr::PhysicalExprRef;
 use object_store::ObjectMeta;
 use vortex::layout::scan::scan_builder::ScanBuilder;
 use vortex::scan::selection::Selection;
@@ -39,6 +41,42 @@ pub trait VortexAccessPlanProvider: Debug + Send + Sync + 'static {
     fn adjust_statistics(&self, _object: &ObjectMeta, statistics: Statistics) -> Statistics {
         statistics
     }
+}
+
+/// Resolves a Vortex access plan when an execution-time filter has materialized.
+///
+/// Unlike [`VortexAccessPlanProvider`], which attaches a plan while the physical
+/// scan is built, this hook runs while execution plans each file's I/O. It lets
+/// an external index consume a dynamic filter without making the Vortex scan
+/// depend on the index implementation. An empty selection prevents the file
+/// from producing an I/O planner. Returning `None` preserves the plan already
+/// attached to the file.
+pub trait VortexDynamicAccessPlanProvider: Debug + Send + Sync + 'static {
+    /// Returns already-materialized candidate rows for `file`, if an external
+    /// index can serve them without opening the Vortex file.
+    ///
+    /// The batches use the file schema and are still candidates: the caller
+    /// must evaluate `filter` before returning them. `existing` carries any
+    /// static row selection (for example, position deletes) that the provider
+    /// must honor. `Some([])` proves that this file has no candidate rows;
+    /// `None` falls back to [`Self::dynamic_access_plan_for_file`].
+    fn dynamic_record_batches_for_file(
+        &self,
+        _file: &PartitionedFile,
+        _filter: Option<&PhysicalExprRef>,
+        _existing: Option<&VortexAccessPlan>,
+    ) -> Option<Vec<RecordBatch>> {
+        None
+    }
+
+    /// Returns a replacement access plan for `file`, if the runtime filter can
+    /// safely narrow it. `existing` is the static plan attached while planning.
+    fn dynamic_access_plan_for_file(
+        &self,
+        file: &PartitionedFile,
+        filter: Option<&PhysicalExprRef>,
+        existing: Option<&VortexAccessPlan>,
+    ) -> Option<Arc<VortexAccessPlan>>;
 }
 
 impl VortexAccessPlan {

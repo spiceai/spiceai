@@ -12,11 +12,16 @@ use datafusion_common::Result as DFResult;
 use datafusion_common::ScalarValue;
 use datafusion_common::arrow::array::AsArray;
 use datafusion_common::arrow::array::RecordBatch;
+use datafusion_common::arrow::compute::filter_record_batch;
 use datafusion_common::exec_datafusion_err;
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file_stream::FileOpenFuture;
 use datafusion_datasource::file_stream::FileOpener;
+use datafusion_datasource::morsel::Morsel;
+use datafusion_datasource::morsel::MorselPlan;
+use datafusion_datasource::morsel::MorselPlanner;
+use datafusion_datasource::morsel::Morselizer;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
 use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_expr::projection::ProjectionExprs;
@@ -33,6 +38,7 @@ use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream;
+use futures::stream::BoxStream;
 use itertools::Itertools;
 use object_store::path::Path;
 use tracing::Instrument;
@@ -49,11 +55,11 @@ use vortex::layout::scan::split_by::SplitBy;
 use vortex::mask::Mask;
 use vortex::metrics::Label;
 use vortex::metrics::MetricsRegistry;
+use vortex::scan::selection::Selection;
 use vortex::session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
 use vortex_utils::aliases::dash_map::Entry;
 
-use crate::VortexAccessPlan;
 use crate::convert::exprs::ExpressionConvertor;
 use crate::convert::exprs::ProcessedProjection;
 use crate::convert::exprs::make_vortex_predicate;
@@ -65,6 +71,7 @@ use crate::persistent::deferred_projection::DeferredProjectionReader;
 use crate::persistent::reader::VortexReaderFactory;
 use crate::persistent::segment_cache::SharedSegmentCache;
 use crate::persistent::stream::PrunableStream;
+use crate::{VortexAccessPlan, VortexDynamicAccessPlanProvider};
 
 #[derive(Clone)]
 pub(crate) struct VortexOpener {
@@ -112,6 +119,240 @@ pub(crate) struct VortexOpener {
     /// Whether to enable expression pushdown into the underlying Vortex scan.
     pub projection_pushdown: bool,
     pub scan_concurrency: Option<usize>,
+    /// Optional resolver for access plans that depend on runtime dynamic
+    /// filters. It is invoked before scheduling Vortex file I/O, so a
+    /// known-empty selection produces no I/O planner or footer/segment reads.
+    pub dynamic_access_plan_provider: Option<Arc<dyn VortexDynamicAccessPlanProvider>>,
+}
+
+/// Plans Vortex file work after execution-time dynamic filters have materialized.
+/// Files excluded by the external index produce no I/O planner or morsel.
+pub(crate) struct VortexMorselizer {
+    opener: Arc<VortexOpener>,
+    dynamic_access_plan_provider: Option<Arc<dyn VortexDynamicAccessPlanProvider>>,
+}
+
+impl std::fmt::Debug for VortexMorselizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VortexMorselizer")
+            .field(
+                "has_dynamic_access_plan_provider",
+                &self.dynamic_access_plan_provider.is_some(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl VortexMorselizer {
+    pub(crate) fn new(opener: VortexOpener) -> Self {
+        // Keep the provider on the opener as well as the file-planning stage.
+        // A join filter commonly materializes after `plan_file` has run but
+        // before the returned open future is polled. Removing the provider here
+        // made that transition irreversible: the early check fell back to an
+        // unopened file and the opener no longer had the index with which to
+        // reconsider it.
+        let dynamic_access_plan_provider =
+            opener.dynamic_access_plan_provider.as_ref().map(Arc::clone);
+        Self {
+            opener: Arc::new(opener),
+            dynamic_access_plan_provider,
+        }
+    }
+}
+
+impl Morselizer for VortexMorselizer {
+    fn plan_file(&self, mut file: PartitionedFile) -> DFResult<Box<dyn MorselPlanner>> {
+        let static_access_plan = file
+            .extensions
+            .get::<VortexAccessPlan>()
+            .map(|plan| Arc::new(plan.clone()));
+        let access_plan = if let Some(provider) = self.dynamic_access_plan_provider.as_ref() {
+            let filter = filter_with_partition_values(
+                self.opener.filter.as_ref(),
+                &self.opener.table_schema,
+                &file,
+            )?;
+            if self.opener.table_schema.table_partition_cols().is_empty()
+                && let Some(batches) = provider.dynamic_record_batches_for_file(
+                    &file,
+                    filter.as_ref(),
+                    static_access_plan.as_deref(),
+                )
+            {
+                let stream = project_covering_batches(
+                    &self.opener.projection,
+                    self.opener.table_schema.file_schema(),
+                    batches,
+                    filter.as_ref(),
+                )?;
+                if stream.is_empty() {
+                    return Ok(Box::new(VortexMorselPlanner::Empty));
+                }
+                return Ok(Box::new(VortexMorselPlanner::Ready(
+                    stream::iter(stream.into_iter().map(Ok)).boxed(),
+                )));
+            }
+            provider
+                .dynamic_access_plan_for_file(&file, filter.as_ref(), static_access_plan.as_deref())
+                .or(static_access_plan)
+        } else {
+            static_access_plan
+        };
+
+        if matches!(
+            access_plan.as_deref().and_then(VortexAccessPlan::selection),
+            Some(Selection::IncludeByIndex(rows)) if rows.is_empty()
+        ) {
+            return Ok(Box::new(VortexMorselPlanner::Empty));
+        }
+
+        if let Some(access_plan) = access_plan {
+            file.extensions.insert(access_plan.as_ref().clone());
+        }
+
+        Ok(Box::new(VortexMorselPlanner::Unopened {
+            opener: Arc::clone(&self.opener),
+            file: Box::new(file),
+        }))
+    }
+}
+
+/// Applies the scan's residual predicate and projection to rows supplied by an
+/// external index. These are the same operations a Vortex file scan performs,
+/// but the candidate batches already use the unified file schema and therefore
+/// need no schema adapter or encoded-data projection.
+fn project_covering_batches(
+    projection: &ProjectionExprs,
+    file_schema: &Arc<Schema>,
+    batches: Vec<RecordBatch>,
+    filter: Option<&PhysicalExprRef>,
+) -> DFResult<Vec<RecordBatch>> {
+    let projector = projection.make_projector(file_schema)?;
+    let mut output = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let batch = cast_batch_to_schema(batch, file_schema)?;
+        let batch = if let Some(filter) = filter {
+            let value = filter.evaluate(&batch)?;
+            let array = value.into_array(batch.num_rows())?;
+            let mask = array.as_boolean_opt().ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Vortex scan filter did not evaluate to BooleanArray, got {}",
+                    array.data_type()
+                ))
+            })?;
+            filter_record_batch(&batch, mask)?
+        } else {
+            batch
+        };
+        if batch.num_rows() != 0 {
+            output.push(projector.project_batch(&batch)?);
+        }
+    }
+    Ok(output)
+}
+
+fn cast_batch_to_schema(batch: RecordBatch, schema: &Arc<Schema>) -> DFResult<RecordBatch> {
+    if batch.schema_ref().as_ref() == schema.as_ref() {
+        return Ok(batch);
+    }
+    if batch.num_columns() != schema.fields().len() {
+        return Err(DataFusionError::Execution(format!(
+            "Indexed row has {} columns but the Vortex scan schema has {}",
+            batch.num_columns(),
+            schema.fields().len()
+        )));
+    }
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            if column.data_type() == field.data_type() {
+                Ok(Arc::clone(column))
+            } else {
+                datafusion_common::arrow::compute::cast(column, field.data_type())
+                    .map_err(DataFusionError::from)
+            }
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+    RecordBatch::try_new(Arc::clone(schema), columns).map_err(DataFusionError::from)
+}
+
+enum VortexMorselPlanner {
+    Empty,
+    Unopened {
+        opener: Arc<VortexOpener>,
+        file: Box<PartitionedFile>,
+    },
+    Ready(BoxStream<'static, DFResult<RecordBatch>>),
+}
+
+impl std::fmt::Debug for VortexMorselPlanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("VortexMorselPlanner::Empty"),
+            Self::Unopened { .. } => f.write_str("VortexMorselPlanner::Unopened"),
+            Self::Ready(_) => f.write_str("VortexMorselPlanner::Ready"),
+        }
+    }
+}
+
+impl MorselPlanner for VortexMorselPlanner {
+    fn plan(self: Box<Self>) -> DFResult<Option<MorselPlan>> {
+        match *self {
+            Self::Empty => Ok(None),
+            Self::Unopened { opener, file } => {
+                let open_future = opener.open(*file)?;
+                let pending = async move {
+                    let stream = open_future.await?;
+                    Ok(Box::new(Self::Ready(stream)) as Box<dyn MorselPlanner>)
+                };
+                Ok(Some(MorselPlan::new().with_pending_planner(pending)))
+            }
+            Self::Ready(stream) => Ok(Some(
+                MorselPlan::new().with_morsels(vec![Box::new(VortexMorsel { stream })]),
+            )),
+        }
+    }
+}
+
+struct VortexMorsel {
+    stream: BoxStream<'static, DFResult<RecordBatch>>,
+}
+
+impl std::fmt::Debug for VortexMorsel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VortexMorsel").finish_non_exhaustive()
+    }
+}
+
+impl Morsel for VortexMorsel {
+    fn into_stream(self: Box<Self>) -> BoxStream<'static, DFResult<RecordBatch>> {
+        self.stream
+    }
+}
+
+fn filter_with_partition_values(
+    filter: Option<&PhysicalExprRef>,
+    table_schema: &TableSchema,
+    file: &PartitionedFile,
+) -> DFResult<Option<PhysicalExprRef>> {
+    let literal_value_cols: std::collections::HashMap<String, ScalarValue> = table_schema
+        .table_partition_cols()
+        .iter()
+        .map(|field| field.name())
+        .cloned()
+        .zip(file.partition_values.clone())
+        .collect();
+
+    match (filter, literal_value_cols.is_empty()) {
+        (Some(filter), false) => Ok(Some(replace_columns_with_literals(
+            Arc::clone(filter),
+            &literal_value_cols,
+        )?)),
+        (Some(filter), true) => Ok(Some(Arc::clone(filter))),
+        (None, _) => Ok(None),
+    }
 }
 
 impl FileOpener for VortexOpener {
@@ -126,12 +367,7 @@ impl FileOpener for VortexOpener {
         let mut projection = self.projection.clone();
         let mut filter = self.filter.clone();
 
-        let reader = self
-            .vortex_reader_factory
-            .create_reader(file.path().as_ref(), &session)?;
-
-        let reader =
-            InstrumentedReadAt::new_with_labels(reader, metrics_registry.as_ref(), labels.clone());
+        let vortex_reader_factory = Arc::clone(&self.vortex_reader_factory);
 
         let file_pruning_predicate = self.file_pruning_predicate.as_ref().map(Arc::clone);
         let expr_adapter_factory = Arc::clone(&self.expr_adapter_factory);
@@ -149,6 +385,8 @@ impl FileOpener for VortexOpener {
 
         let expr_convertor = Arc::clone(&self.expression_convertor);
         let projection_pushdown = self.projection_pushdown;
+        let dynamic_access_plan_provider =
+            self.dynamic_access_plan_provider.as_ref().map(Arc::clone);
 
         // Replace column access for partition columns with literals
         let literal_value_cols: std::collections::HashMap<String, ScalarValue> = self
@@ -170,6 +408,44 @@ impl FileOpener for VortexOpener {
         }
 
         Ok(async move {
+            let static_access_plan = file
+                .extensions
+                .get::<VortexAccessPlan>()
+                .map(|plan| Arc::new(plan.clone()));
+            // Resolve the access plan before asking for retained rows. A join's
+            // filter can publish between file planning and this open future;
+            // resolving it here populates the provider's per-generation
+            // selection, which the retained-row lookup immediately reuses.
+            let dynamic_access_plan = dynamic_access_plan_provider.as_ref().and_then(|provider| {
+                provider.dynamic_access_plan_for_file(
+                    &file,
+                    filter.as_ref(),
+                    static_access_plan.as_deref(),
+                )
+            });
+            if let Some(provider) = dynamic_access_plan_provider.as_ref()
+                && let Some(batches) = provider.dynamic_record_batches_for_file(
+                    &file,
+                    filter.as_ref(),
+                    static_access_plan.as_deref(),
+                )
+            {
+                let batches = project_covering_batches(
+                    &projection,
+                    &unified_file_schema,
+                    batches,
+                    filter.as_ref(),
+                )?;
+                return Ok(stream::iter(batches.into_iter().map(Ok)).boxed());
+            }
+            let access_plan = dynamic_access_plan.or(static_access_plan);
+            if matches!(
+                access_plan.as_deref().and_then(VortexAccessPlan::selection),
+                Some(Selection::IncludeByIndex(rows)) if rows.is_empty()
+            ) {
+                return Ok(stream::empty().boxed());
+            }
+
             // Create FilePruner when we have a predicate and either dynamic expressions
             // or file statistics available. The pruner can eliminate files without
             // opening them based on:
@@ -202,7 +478,14 @@ impl FileOpener for VortexOpener {
                 .open_options()
                 .with_file_size(file.object_meta.size)
                 .with_metrics_registry(Arc::clone(&metrics_registry))
-                .with_labels(labels);
+                .with_labels(labels.clone());
+
+            let reader = vortex_reader_factory.create_reader(file.path().as_ref(), &session)?;
+            let reader = InstrumentedReadAt::new_with_labels(
+                reader,
+                metrics_registry.as_ref(),
+                labels.clone(),
+            );
 
             if let Some(segment_cache) = segment_cache {
                 open_opts = open_opts.with_segment_cache(segment_cache.for_path(
@@ -459,7 +742,7 @@ impl FileOpener for VortexOpener {
 
             let mut scan_builder = ScanBuilder::new(session.clone(), layout_reader);
 
-            if let Some(vortex_plan) = file.extensions.get::<VortexAccessPlan>() {
+            if let Some(vortex_plan) = access_plan.as_ref() {
                 scan_builder = vortex_plan.apply_to_builder(scan_builder);
             }
 
@@ -688,6 +971,7 @@ fn split_midpoint_to_byte(split_range: &Range<u64>, row_count: u64, total_size: 
 mod tests {
     use std::sync::Arc;
     use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use arrow_schema::Field;
     use arrow_schema::Fields;
@@ -911,7 +1195,235 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            dynamic_access_plan_provider: None,
         }
+    }
+
+    #[derive(Debug)]
+    struct EmptyDynamicAccessPlan;
+
+    impl VortexDynamicAccessPlanProvider for EmptyDynamicAccessPlan {
+        fn dynamic_access_plan_for_file(
+            &self,
+            _file: &PartitionedFile,
+            _filter: Option<&PhysicalExprRef>,
+            _existing: Option<&VortexAccessPlan>,
+        ) -> Option<Arc<VortexAccessPlan>> {
+            Some(Arc::new(VortexAccessPlan::default().with_selection(
+                Selection::IncludeByIndex(Vec::new().into()),
+            )))
+        }
+    }
+
+    #[derive(Debug)]
+    struct CoveringDynamicRows {
+        batch: RecordBatch,
+    }
+
+    impl VortexDynamicAccessPlanProvider for CoveringDynamicRows {
+        fn dynamic_record_batches_for_file(
+            &self,
+            _file: &PartitionedFile,
+            _filter: Option<&PhysicalExprRef>,
+            _existing: Option<&VortexAccessPlan>,
+        ) -> Option<Vec<RecordBatch>> {
+            Some(vec![self.batch.clone()])
+        }
+
+        fn dynamic_access_plan_for_file(
+            &self,
+            _file: &PartitionedFile,
+            _filter: Option<&PhysicalExprRef>,
+            _existing: Option<&VortexAccessPlan>,
+        ) -> Option<Arc<VortexAccessPlan>> {
+            panic!("covering rows must not fall back to file I/O")
+        }
+    }
+
+    #[derive(Debug)]
+    struct LateCoveringDynamicRows {
+        batch: RecordBatch,
+        ready: AtomicBool,
+    }
+
+    impl VortexDynamicAccessPlanProvider for LateCoveringDynamicRows {
+        fn dynamic_record_batches_for_file(
+            &self,
+            _file: &PartitionedFile,
+            _filter: Option<&PhysicalExprRef>,
+            _existing: Option<&VortexAccessPlan>,
+        ) -> Option<Vec<RecordBatch>> {
+            self.ready
+                .load(Ordering::Acquire)
+                .then(|| vec![self.batch.clone()])
+        }
+
+        fn dynamic_access_plan_for_file(
+            &self,
+            _file: &PartitionedFile,
+            _filter: Option<&PhysicalExprRef>,
+            _existing: Option<&VortexAccessPlan>,
+        ) -> Option<Arc<VortexAccessPlan>> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct AccessPlanResolvesCoveringRows {
+        batch: RecordBatch,
+        resolved: AtomicBool,
+    }
+
+    impl VortexDynamicAccessPlanProvider for AccessPlanResolvesCoveringRows {
+        fn dynamic_record_batches_for_file(
+            &self,
+            _file: &PartitionedFile,
+            _filter: Option<&PhysicalExprRef>,
+            _existing: Option<&VortexAccessPlan>,
+        ) -> Option<Vec<RecordBatch>> {
+            self.resolved
+                .load(Ordering::Acquire)
+                .then(|| vec![self.batch.clone()])
+        }
+
+        fn dynamic_access_plan_for_file(
+            &self,
+            _file: &PartitionedFile,
+            _filter: Option<&PhysicalExprRef>,
+            _existing: Option<&VortexAccessPlan>,
+        ) -> Option<Arc<VortexAccessPlan>> {
+            self.resolved.store(true, Ordering::Release);
+            Some(Arc::new(
+                VortexAccessPlan::default()
+                    .with_selection(Selection::IncludeByIndex(vec![1].into())),
+            ))
+        }
+    }
+
+    #[test]
+    fn dynamic_empty_selection_schedules_no_file_io() -> anyhow::Result<()> {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let mut opener = make_opener(object_store, TableSchema::from_file_schema(schema), None);
+        opener.dynamic_access_plan_provider = Some(Arc::new(EmptyDynamicAccessPlan));
+
+        let morselizer = VortexMorselizer::new(opener);
+        let planner = morselizer.plan_file(PartitionedFile::new("missing.vortex", 1))?;
+
+        assert!(planner.plan()?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dynamic_covering_rows_apply_the_residual_filter_without_file_io() -> anyhow::Result<()>
+    {
+        use futures::TryStreamExt;
+
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch = record_batch!(("a", Int32, vec![1, 2, 3]))?;
+        let table_schema = TableSchema::from_file_schema(batch.schema());
+        let filter = logical2physical(&col("a").eq(lit(2)), table_schema.table_schema());
+        let mut opener = make_opener(object_store, table_schema, Some(filter));
+        opener.dynamic_access_plan_provider = Some(Arc::new(CoveringDynamicRows { batch }));
+
+        let morselizer = VortexMorselizer::new(opener);
+        let planner = morselizer.plan_file(PartitionedFile::new("missing.vortex", 1))?;
+        let mut plan = planner.plan()?.expect("the retained row produces a plan");
+        assert!(
+            plan.take_pending_planner().is_none(),
+            "retained rows must not schedule file I/O"
+        );
+        let mut morsels = plan.take_morsels();
+        assert_eq!(morsels.len(), 1);
+        let output = morsels
+            .pop()
+            .expect("one morsel")
+            .into_stream()
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(output.len(), 1);
+        let values = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int32Array>()
+            .expect("Int32 output");
+        assert_eq!(values.values(), &[2]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dynamic_covering_rows_can_materialize_after_file_planning() -> anyhow::Result<()> {
+        use futures::TryStreamExt;
+
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch = record_batch!(("a", Int32, vec![1, 2, 3]))?;
+        let table_schema = TableSchema::from_file_schema(batch.schema());
+        let filter = logical2physical(&col("a").eq(lit(2)), table_schema.table_schema());
+        let provider = Arc::new(LateCoveringDynamicRows {
+            batch,
+            ready: AtomicBool::new(false),
+        });
+        let mut opener = make_opener(object_store, table_schema, Some(filter));
+        opener.dynamic_access_plan_provider = Some(provider.clone());
+
+        let morselizer = VortexMorselizer::new(opener);
+        let planner = morselizer.plan_file(PartitionedFile::new("missing.vortex", 1))?;
+        let mut unopened = planner.plan()?.expect("the file initially needs an opener");
+        let pending = unopened
+            .take_pending_planner()
+            .expect("the unresolved dynamic filter schedules a deferred open");
+
+        provider.ready.store(true, Ordering::Release);
+        let ready_planner = pending.await?;
+        let mut ready = ready_planner
+            .plan()?
+            .expect("the retained row produces a plan after the filter resolves");
+        let mut morsels = ready.take_morsels();
+        assert_eq!(morsels.len(), 1);
+        let output = morsels
+            .pop()
+            .expect("one morsel")
+            .into_stream()
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(output.len(), 1);
+        let values = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int32Array>()
+            .expect("Int32 output");
+        assert_eq!(values.values(), &[2]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn late_open_resolves_dynamic_selection_before_requesting_rows() -> anyhow::Result<()> {
+        use futures::TryStreamExt;
+
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch = record_batch!(("a", Int32, vec![1, 2, 3]))?;
+        let table_schema = TableSchema::from_file_schema(batch.schema());
+        let filter = logical2physical(&col("a").eq(lit(2)), table_schema.table_schema());
+        let provider = Arc::new(AccessPlanResolvesCoveringRows {
+            batch,
+            resolved: AtomicBool::new(false),
+        });
+        let mut opener = make_opener(object_store, table_schema, Some(filter));
+        opener.dynamic_access_plan_provider = Some(provider);
+
+        let output = opener
+            .open(PartitionedFile::new("missing.vortex", 1))?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(output.len(), 1);
+        let values = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int32Array>()
+            .expect("Int32 output");
+        assert_eq!(values.values(), &[2]);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1180,6 +1692,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            dynamic_access_plan_provider: None,
         };
 
         let filter = col("a").lt(lit(100_i32));
@@ -1269,6 +1782,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            dynamic_access_plan_provider: None,
         };
 
         let stream = opener.open(file)?.await?;
@@ -1426,6 +1940,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            dynamic_access_plan_provider: None,
         };
 
         // This should succeed and return the correctly projected and cast data
@@ -1488,6 +2003,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            dynamic_access_plan_provider: None,
         }
     }
 
@@ -1697,6 +2213,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            dynamic_access_plan_provider: None,
         };
 
         let file = PartitionedFile::new(file_path.to_string(), data_size);

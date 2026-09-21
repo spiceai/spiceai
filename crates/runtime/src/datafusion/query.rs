@@ -17,8 +17,9 @@ limitations under the License.
 use std::{borrow::Cow, fmt::Display, fmt::Write as _, sync::Arc};
 
 use ::cache::{
-    AsTableRefs, get_logical_plan_input_tables,
+    AsTableRefs, CachedPhysicalPlan, get_logical_plan_input_tables,
     key::CacheKey,
+    resolved_table_match,
     result::{CacheStatus, query::QueryResult},
 };
 use app::spicepod::component::runtime::FlightBatchSize;
@@ -38,9 +39,11 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext, memory_pool::MemoryLimit},
     logical_expr::LogicalPlan,
     physical_plan::{
-        ExecutionPlan, ExecutionPlanProperties, execute_stream, repartition::RepartitionExec,
+        ExecutionPlan, ExecutionPlanProperties, execute_stream, execution_plan::reset_plan_states,
+        joins::HashJoinExec, repartition::RepartitionExec,
         sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
     },
+    physical_planner::DefaultPhysicalPlanner,
     scalar::ScalarValue,
     sql::TableReference,
 };
@@ -69,13 +72,296 @@ mod tracker;
 
 pub use handle::{DistributedJobStatus, QueryHandle, QueryHandleError};
 
+/// Physical optimizer rules that cannot change a projection/filter/join/scan
+/// plan. The guarded parameterized selective-join path omits these repeated
+/// tree walks; rules needed for join choice, distribution, cooperative
+/// execution, dynamic-filter pushdown, plan validation, and every Spice
+/// extension remain in their original order.
+fn irrelevant_selective_join_physical_rule(name: &str) -> bool {
+    matches!(
+        name,
+        "OutputRequirementExec"
+            | "aggregate_statistics"
+            | "eager_aggregation"
+            | "LimitedDistinctAggregation"
+            | "FilterPushdown"
+            | "CombinePartialFinalAggregate"
+            | "EnforceSorting"
+            | "OptimizeAggregateOrder"
+            | "WindowTopN"
+            | "ProjectionPushdown"
+            | "LimitAggregation"
+            | "LimitPushPastWindows"
+            | "HashJoinBuffering"
+            | "LimitPushdown"
+            | "TopKRepartition"
+            | "PushdownSort"
+    )
+}
+
+fn selective_join_physical_session(session: &SessionState) -> SessionState {
+    let rules = session
+        .physical_optimizers()
+        .iter()
+        .filter(|rule| !irrelevant_selective_join_physical_rule(rule.name()))
+        .map(Arc::clone)
+        .collect();
+    SessionStateBuilder::new_from_existing(session.clone())
+        .with_physical_optimizer_rules(rules)
+        .build()
+}
+
+fn selective_join_physical_sessions(
+    session: &SessionState,
+) -> Option<(SessionState, SessionState)> {
+    let rules = session
+        .physical_optimizers()
+        .iter()
+        .filter(|rule| !irrelevant_selective_join_physical_rule(rule.name()))
+        .map(Arc::clone)
+        .collect::<Vec<_>>();
+    let tail_start = rules
+        .iter()
+        .position(|rule| rule.name() == "FilterPushdown(Post)")?;
+    let pre = SessionStateBuilder::new_from_existing(session.clone())
+        .with_physical_optimizer_rules(rules[..tail_start].to_vec())
+        .build();
+    let tail = SessionStateBuilder::new_from_existing(session.clone())
+        .with_physical_optimizer_rules(rules[tail_start..].to_vec())
+        .build();
+    Some((pre, tail))
+}
+
+fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
+    matches!(plan, LogicalPlan::Join(_))
+        || plan.inputs().into_iter().any(logical_plan_contains_join)
+}
+
+fn logical_plan_reads_table(plan: &LogicalPlan, table: &TableReference) -> bool {
+    resolved_table_match(&get_logical_plan_input_tables(plan), table)
+}
+
+/// Finds the direct input of the deepest join that reads `table`. That input is
+/// the only part of the physical template whose values depend on the request's
+/// lookup parameter.
+fn parameterized_join_input(plan: &LogicalPlan, table: &TableReference) -> Option<LogicalPlan> {
+    for input in plan.inputs() {
+        if logical_plan_reads_table(input, table)
+            && let Some(branch) = parameterized_join_input(input, table)
+        {
+            return Some(branch);
+        }
+    }
+
+    let LogicalPlan::Join(join) = plan else {
+        return None;
+    };
+    [&join.left, &join.right]
+        .into_iter()
+        .find(|input| logical_plan_reads_table(input, table) && !logical_plan_contains_join(input))
+        .map(|input| input.as_ref().clone())
+}
+
+#[cfg(not(windows))]
+fn physical_plan_contains_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.is::<HashJoinExec>() || plan.children().into_iter().any(physical_plan_contains_join)
+}
+
+#[cfg(not(windows))]
+fn physical_plan_reads_cayenne_table(
+    plan: &Arc<dyn ExecutionPlan>,
+    table: &TableReference,
+) -> bool {
+    if let Some(scan) = plan.downcast_ref::<cayenne::provider::CayenneAccelerationExec>()
+        && scan.table_name().is_some_and(|name| name == table.table())
+    {
+        return true;
+    }
+    plan.children()
+        .into_iter()
+        .any(|child| physical_plan_reads_cayenne_table(child, table))
+}
+
+/// Replaces exactly one direct hash-join input that contains the indexed
+/// Cayenne scan. Returning an error on zero or multiple matches prevents an old
+/// parameter value from ever leaking out of a cached template.
+#[cfg(not(windows))]
+fn replace_parameterized_join_input(
+    plan: Arc<dyn ExecutionPlan>,
+    table: &TableReference,
+    replacement: &Arc<dyn ExecutionPlan>,
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    fn replace(
+        plan: Arc<dyn ExecutionPlan>,
+        table: &TableReference,
+        replacement: &Arc<dyn ExecutionPlan>,
+    ) -> DataFusionResult<(Arc<dyn ExecutionPlan>, usize)> {
+        if plan.is::<HashJoinExec>() {
+            let children = plan.children();
+            let matches = children
+                .iter()
+                .enumerate()
+                .filter(|(_, child)| {
+                    physical_plan_reads_cayenne_table(child, table)
+                        && !physical_plan_contains_join(child)
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if matches.len() == 1 {
+                let index = matches[0];
+                if children[index].schema() != replacement.schema() {
+                    return Err(DataFusionError::Internal(
+                        "Parameterized join input schema changed while instantiating a cached physical plan"
+                            .to_string(),
+                    ));
+                }
+                let mut rewritten = children.into_iter().cloned().collect::<Vec<_>>();
+                rewritten[index] = Arc::clone(replacement);
+                return Ok((plan.with_new_children(rewritten)?, 1));
+            }
+            if matches.len() > 1 {
+                return Err(DataFusionError::Internal(
+                    "Cached physical plan has multiple parameterized join inputs".to_string(),
+                ));
+            }
+        }
+
+        let children = plan.children();
+        if children.is_empty() {
+            return Ok((plan, 0));
+        }
+        let mut replacements = 0;
+        let mut rewritten = Vec::with_capacity(children.len());
+        for child in children {
+            let (child, count) = replace(Arc::clone(child), table, replacement)?;
+            replacements += count;
+            rewritten.push(child);
+        }
+        if replacements == 0 {
+            Ok((plan, 0))
+        } else {
+            Ok((plan.with_new_children(rewritten)?, replacements))
+        }
+    }
+
+    let (plan, replacements) = replace(plan, table, replacement)?;
+    if replacements == 1 {
+        Ok(plan)
+    } else {
+        Err(DataFusionError::Internal(format!(
+            "Cached physical plan replaced {replacements} parameterized join inputs; expected one"
+        )))
+    }
+}
+
+#[cfg(not(windows))]
+async fn create_physical_plan_from_template(
+    df: &DataFusion,
+    session: &SessionState,
+    plan: &LogicalPlan,
+    cache_key: ::cache::key::RawCacheKey,
+    parameterized_table: &TableReference,
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    let cache = df.physical_plans_cache_provider().ok_or_else(|| {
+        DataFusionError::Internal("Physical plans cache is not configured".to_string())
+    })?;
+    let (pre_session, tail_session) =
+        selective_join_physical_sessions(session).ok_or_else(|| {
+            DataFusionError::Internal(
+                "Physical optimizer has no post-optimization filter phase".to_string(),
+            )
+        })?;
+
+    let planner = DefaultPhysicalPlanner::default();
+    let pre_plan = if let Some(template) = cache.get_raw_key(&cache_key.as_u64()).await {
+        let branch = parameterized_join_input(plan, parameterized_table).ok_or_else(|| {
+            DataFusionError::Internal(
+                "Unable to locate the parameterized logical join input".to_string(),
+            )
+        })?;
+        let replacement = pre_session
+            .query_planner()
+            .create_physical_plan(&branch, &pre_session)
+            .await?;
+        let instantiated = replace_parameterized_join_input(
+            Arc::clone(&template.plan),
+            parameterized_table,
+            &replacement,
+        )?;
+        reset_plan_states(instantiated)?
+    } else {
+        let created = pre_session
+            .query_planner()
+            .create_physical_plan(plan, &pre_session)
+            .await?;
+        cache
+            .put_raw_key(
+                &cache_key.as_u64(),
+                CachedPhysicalPlan {
+                    plan: Arc::clone(&created),
+                    input_tables: Arc::new(get_logical_plan_input_tables(plan)),
+                },
+            )
+            .await;
+        created
+    };
+
+    planner.optimize_physical_plan(pre_plan, &tail_session, |_, _| {})
+}
+
+async fn create_physical_plan_for_query(
+    df: &DataFusion,
+    session: &SessionState,
+    plan: &LogicalPlan,
+    already_optimized: bool,
+    selective_join_fast_path: bool,
+    physical_template: Option<&(::cache::key::RawCacheKey, TableReference)>,
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    #[cfg(not(windows))]
+    if let Some((cache_key, parameterized_table)) = physical_template
+        && let Ok(plan) =
+            create_physical_plan_from_template(df, session, plan, *cache_key, parameterized_table)
+                .await
+    {
+        return Ok(plan);
+    }
+
+    create_physical_plan_for_execution(session, plan, already_optimized, selective_join_fast_path)
+        .await
+}
+
+async fn create_physical_plan_for_execution(
+    session: &SessionState,
+    plan: &LogicalPlan,
+    already_optimized: bool,
+    selective_join_fast_path: bool,
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    if !already_optimized {
+        return session.create_physical_plan(plan).await;
+    }
+    if selective_join_fast_path {
+        let fast_session = selective_join_physical_session(session);
+        if let Ok(plan) = fast_session
+            .query_planner()
+            .create_physical_plan(plan, &fast_session)
+            .await
+        {
+            return Ok(plan);
+        }
+    }
+    session
+        .query_planner()
+        .create_physical_plan(plan, session)
+        .await
+}
+
 use {
     ballista_core::extension::SessionConfigExt,
     ballista_scheduler::scheduler_server::SchedulerServer,
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
 };
 
-use datafusion::execution::SessionState;
+use datafusion::execution::{SessionState, SessionStateBuilder};
 use datafusion::prelude::SessionContext;
 
 use async_stream::stream;
@@ -968,7 +1254,7 @@ impl Query {
                             } else {
                                 None
                             };
-                            (*plan, tracker, cache_key)
+                            (*plan.plan, tracker, cache_key)
                         }
                     }
                 }
@@ -1298,7 +1584,12 @@ impl Query {
                             Some(Query::cached_plan_key(&ctx.df, sql.as_ref(), None))
                         };
                         let plan = if let Some(plan) = pre_parsed_plan {
-                            plan
+                            cache::PlanForExecution {
+                                plan,
+                                already_optimized: false,
+                                selective_join_fast_path: false,
+                                physical_template: None,
+                            }
                         } else {
                             Self::ensure_not_cancelled(
                                 &query_cancel_token,
@@ -1314,7 +1605,12 @@ impl Query {
                             )
                             .await
                             {
-                                Ok(plan) => Box::new(plan),
+                                Ok(plan) => cache::PlanForExecution {
+                                    plan: Box::new(plan),
+                                    already_optimized: false,
+                                    selective_join_fast_path: false,
+                                    physical_template: None,
+                                },
                                 Err(e) => match e {
                                     Error::UnableToExecuteQuery { source } => {
                                         let code = ErrorCode::from(&source);
@@ -1337,7 +1633,7 @@ impl Query {
                             &query_id_str,
                             &timeout_state,
                         )?;
-                        let tables_referenced = plan.as_table_refs();
+                        let tables_referenced = plan.plan.as_table_refs();
                         if let Some(disallowed_table) = tables_referenced
                             .iter()
                             .find(|&t| !allowlist.table_is_allowed(t))
@@ -1428,9 +1724,25 @@ impl Query {
                                 ns_id,
                             ),
                         );
-                        (logical_plan, None, cache_manager)
+                        (
+                            cache::PlanForExecution {
+                                plan: logical_plan,
+                                already_optimized: false,
+                                selective_join_fast_path: false,
+                                physical_template: None,
+                            },
+                            None,
+                            cache_manager,
+                        )
                     }
                 };
+
+                let cache::PlanForExecution {
+                    plan,
+                    already_optimized: plan_already_optimized,
+                    selective_join_fast_path,
+                    physical_template,
+                } = plan;
 
                 Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
 
@@ -1642,7 +1954,16 @@ impl Query {
                 } else {
                     // For regular plans, use the standard physical plan execution
                     Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
-                    let mut physical_plan = match session.create_physical_plan(&plan).await {
+                    let mut physical_plan = match create_physical_plan_for_query(
+                        &ctx.df,
+                        &session,
+                        &plan,
+                        plan_already_optimized,
+                        selective_join_fast_path,
+                        physical_template.as_ref(),
+                    )
+                    .await
+                    {
                         Ok(stream) => stream,
                         Err(e) => {
                             let e = find_datafusion_root(e);
@@ -1669,7 +1990,14 @@ impl Query {
                             &timeout_state,
                         )?;
                         let adaptive_session = Self::session_with_batch_size(&session, batch_size);
-                        physical_plan = match adaptive_session.create_physical_plan(&plan).await {
+                        physical_plan = match create_physical_plan_for_execution(
+                            &adaptive_session,
+                            &plan,
+                            plan_already_optimized,
+                            selective_join_fast_path,
+                        )
+                        .await
+                        {
                             Ok(stream) => stream,
                             Err(e) => {
                                 let e = find_datafusion_root(e);

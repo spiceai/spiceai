@@ -24,6 +24,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use byte_unit::Byte;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::TableReference;
 use fundu::ParseError;
 use key::CacheKey;
@@ -163,6 +164,32 @@ pub trait AsTableRefs {
 impl AsTableRefs for LogicalPlan {
     fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
         Arc::new(get_logical_plan_input_tables(self))
+    }
+}
+
+/// A physical-plan template whose table dependencies are retained for eager
+/// invalidation when an accelerated table is refreshed or written.
+///
+/// The runtime only stores plans that are safe to instantiate for a new query;
+/// the cache itself deliberately remains agnostic to the instantiation method.
+#[derive(Clone)]
+pub struct CachedPhysicalPlan {
+    pub plan: Arc<dyn ExecutionPlan>,
+    pub input_tables: Arc<HashSet<TableReference>>,
+}
+
+impl std::fmt::Debug for CachedPhysicalPlan {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedPhysicalPlan")
+            .field("plan", &self.plan.name())
+            .field("input_tables", &self.input_tables)
+            .finish()
+    }
+}
+
+impl AsTableRefs for CachedPhysicalPlan {
+    fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
+        Arc::clone(&self.input_tables)
     }
 }
 
@@ -478,6 +505,7 @@ mod xxhash_compat {
 pub struct Caching {
     pub results: Option<Arc<QueryResultsCacheProvider>>,
     pub plans: Option<Arc<dyn TabledCacheProvider<LogicalPlan> + Send + Sync>>,
+    pub physical_plans: Option<Arc<dyn TabledCacheProvider<CachedPhysicalPlan> + Send + Sync>>,
     pub search: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
     pub embeddings: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 }
@@ -487,6 +515,7 @@ impl std::fmt::Debug for Caching {
         f.debug_struct("Caching")
             .field("results", &self.results)
             .field("plans", &self.plans)
+            .field("physical_plans", &self.physical_plans)
             .field("search", &self.search)
             .field("embeddings", &self.embeddings)
             .finish_non_exhaustive()
@@ -511,6 +540,15 @@ impl Caching {
         plans: Arc<dyn TabledCacheProvider<LogicalPlan> + Send + Sync>,
     ) -> Self {
         self.plans = Some(plans);
+        self
+    }
+
+    #[must_use]
+    pub fn with_physical_plans_cache(
+        mut self,
+        physical_plans: Arc<dyn TabledCacheProvider<CachedPhysicalPlan> + Send + Sync>,
+    ) -> Self {
+        self.physical_plans = Some(physical_plans);
         self
     }
 
@@ -552,6 +590,11 @@ impl Caching {
         if let Some(plans_cache) = &self.plans {
             plans_cache.invalidate_for_table(table_ref.clone()).await?;
         }
+        if let Some(physical_plans_cache) = &self.physical_plans {
+            physical_plans_cache
+                .invalidate_for_table(table_ref.clone())
+                .await?;
+        }
         if let Some(search_cache) = &self.search {
             search_cache.invalidate_for_table(table_ref).await?;
         }
@@ -582,6 +625,9 @@ impl Caching {
         }
         if let Some(plans) = &self.plans {
             plans.checkpoint().await;
+        }
+        if let Some(physical_plans) = &self.physical_plans {
+            physical_plans.checkpoint().await;
         }
         if let Some(search) = &self.search {
             search.checkpoint().await;

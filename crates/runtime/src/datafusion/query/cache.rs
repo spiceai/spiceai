@@ -26,9 +26,12 @@ use cache::{
     to_cached_record_batch_stream,
 };
 use datafusion::{
-    common::ParamValues,
+    common::{
+        ParamValues,
+        tree_node::{TreeNode, TreeNodeRecursion},
+    },
     execution::{SendableRecordBatchStream, SessionState},
-    logical_expr::LogicalPlan,
+    logical_expr::{Expr, LogicalPlan, Operator},
     sql::TableReference,
 };
 use futures::TryStreamExt;
@@ -41,13 +44,158 @@ use std::{collections::HashSet, hash::Hasher, sync::Arc};
 
 /// Returns `Plan` if the result is not cached and needs to be executed, otherwise returns `Cached`
 pub(super) enum PlanOrCached {
-    Plan(Box<LogicalPlan>, Option<QueryTracker>, RequestCacheManager),
+    Plan(PlanForExecution, Option<QueryTracker>, RequestCacheManager),
     /// Batches are ready; the tracker is not yet on the stream so the caller
     /// can wrap cancellation inside it (source → cancel → tracker).
     Cached {
         result: QueryResult,
         tracker: Option<QueryTracker>,
     },
+}
+
+/// A logical plan together with whether the session's analyzer and logical
+/// optimizer have already run on it.
+pub(super) struct PlanForExecution {
+    pub(super) plan: Box<LogicalPlan>,
+    pub(super) already_optimized: bool,
+    /// Whether physical planning can omit optimizer rules for operators this
+    /// plan provably does not contain. The fast path is restricted to cached,
+    /// parameterized selective joins and falls back to the full optimizer on
+    /// any planning error.
+    pub(super) selective_join_fast_path: bool,
+    /// Cache key and indexed table for a reusable physical join template. The
+    /// template is only used after its parameter-dependent scan is replaced.
+    pub(super) physical_template: Option<(RawCacheKey, TableReference)>,
+}
+
+impl PlanForExecution {
+    fn unoptimized(plan: Box<LogicalPlan>) -> Self {
+        Self {
+            plan,
+            already_optimized: false,
+            selective_join_fast_path: false,
+            physical_template: None,
+        }
+    }
+}
+
+// The shared plans cache holds both the parsed/analyzed-independent template
+// and this optimized template. A disjoint key keeps callers of
+// `get_or_create_logical_plan` seeing the plan shape they have always received.
+const OPTIMIZED_PLAN_CACHE_KEY_MASK: u64 = 0x8f4d_8b3c_d9a7_61e5;
+const PHYSICAL_PLAN_CACHE_KEY_MASK: u64 = 0x34e1_1d20_ada5_790b;
+
+#[derive(Default)]
+struct SelectiveJoinShape {
+    joins: usize,
+    scans: usize,
+    has_literal_lookup: bool,
+}
+
+/// Whether `plan` contains only the relational operators needed by a selective
+/// join and pins at least one scan column to a literal. Physical optimizer
+/// passes for aggregates, windows, sorts, limits, and repartition operators
+/// cannot affect this shape.
+fn is_selective_join_shape(plan: &LogicalPlan) -> bool {
+    fn visit(plan: &LogicalPlan, shape: &mut SelectiveJoinShape) -> bool {
+        match plan {
+            LogicalPlan::Projection(projection) => visit(&projection.input, shape),
+            LogicalPlan::Filter(filter) => {
+                shape.has_literal_lookup |= expr_has_literal_lookup(&filter.predicate);
+                visit(&filter.input, shape)
+            }
+            LogicalPlan::Join(join) => {
+                shape.joins += 1;
+                visit(&join.left, shape) && visit(&join.right, shape)
+            }
+            LogicalPlan::SubqueryAlias(alias) => visit(&alias.input, shape),
+            LogicalPlan::TableScan(scan) => {
+                shape.scans += 1;
+                shape.has_literal_lookup |= scan.filters.iter().any(expr_has_literal_lookup);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    let mut shape = SelectiveJoinShape::default();
+    visit(plan, &mut shape) && shape.joins > 0 && shape.scans > 1 && shape.has_literal_lookup
+}
+
+fn expr_has_literal_lookup(expr: &Expr) -> bool {
+    let mut found = false;
+    let _ = expr.apply(|expr| {
+        let is_match = matches!(
+            expr,
+            Expr::BinaryExpr(binary)
+                if binary.op == Operator::Eq
+                    && (matches!(binary.left.as_ref(), Expr::Column(_))
+                        && matches!(binary.right.as_ref(), Expr::Literal(_, _))
+                        || matches!(binary.right.as_ref(), Expr::Column(_))
+                            && matches!(binary.left.as_ref(), Expr::Literal(_, _)))
+        ) || matches!(
+            expr,
+            Expr::InList(in_list)
+                if !in_list.negated
+                    && matches!(in_list.expr.as_ref(), Expr::Column(_))
+                    && !in_list.list.is_empty()
+                    && in_list.list.iter().all(|value| matches!(value, Expr::Literal(_, _)))
+        );
+        if is_match {
+            found = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    });
+    found
+}
+
+fn expr_has_placeholder(expr: &Expr) -> bool {
+    let mut found = false;
+    let _ = expr.apply(|expr| {
+        if matches!(expr, Expr::Placeholder(_)) {
+            found = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    });
+    found
+}
+
+/// Returns the sole table scan constrained by a parameterized equality or
+/// literal-list lookup. Ambiguous shapes stay on ordinary physical planning.
+fn parameterized_lookup_table(plan: &LogicalPlan) -> Option<TableReference> {
+    fn scans(plan: &LogicalPlan, result: &mut HashSet<TableReference>) {
+        match plan {
+            LogicalPlan::TableScan(scan) => {
+                if scan.filters.iter().any(expr_has_placeholder) {
+                    result.insert(scan.table_name.clone());
+                }
+            }
+            LogicalPlan::Filter(filter) if expr_has_placeholder(&filter.predicate) => {
+                let input_tables = cache::get_logical_plan_input_tables(&filter.input);
+                if input_tables.len() == 1 {
+                    result.extend(input_tables);
+                }
+                scans(&filter.input, result);
+            }
+            _ => {
+                for input in plan.inputs() {
+                    scans(input, result);
+                }
+            }
+        }
+    }
+
+    let mut result = HashSet::new();
+    scans(plan, &mut result);
+    if result.len() == 1 {
+        result.into_iter().next()
+    } else {
+        None
+    }
 }
 
 pub(super) struct RequestCacheManager {
@@ -546,13 +694,21 @@ impl Query {
         let sql_raw_cache_key =
             sql_cache_key.as_raw_key_in_namespace(Self::plan_hasher(df), ns_tag, ns_id);
         let cached_plan_key = Self::shared_plans_cache_key(df, sql, &request_context);
-        let plan: Box<LogicalPlan> = if let Some(plan) = pre_parsed_plan {
+        let plan = if let Some(plan) = pre_parsed_plan {
             // Reuse the pre-parsed plan to avoid re-parsing. Parameters are
             // already bound from `check_read_only_sql`.
-            plan
+            PlanForExecution::unoptimized(plan)
         } else {
-            match Self::get_plan(df, session, sql, cached_plan_key.as_ref(), parameters).await {
-                Ok(plan) => Box::new(plan),
+            match Self::get_plan_for_execution(
+                df,
+                session,
+                sql,
+                cached_plan_key.as_ref(),
+                parameters,
+            )
+            .await
+            {
+                Ok(plan) => plan,
                 Err(e) => {
                     if let super::Error::UnableToExecuteQuery { source } = e {
                         let code = ErrorCode::from(&source);
@@ -577,7 +733,7 @@ impl Query {
             df,
             &request_context,
             tracker,
-            &CacheKey::LogicalPlan(&plan),
+            &CacheKey::LogicalPlan(&plan.plan),
             sql,
             already_looked_up,
             // A `LogicalPlan` key carries the parameter values already bound
@@ -606,7 +762,7 @@ impl Query {
         }
         .unwrap_or(sql_raw_cache_key);
 
-        let cache_status = Self::should_cache_results(df, &plan, status);
+        let cache_status = Self::should_cache_results(df, &plan.plan, status);
         tracker = tracker.map(|t| t.results_cache_hit(false));
 
         Ok(PlanOrCached::Plan(
@@ -635,10 +791,18 @@ impl Query {
         );
         let cached_plan_key = Self::shared_plans_cache_key(df, sql, request_context);
         let plan = if let Some(plan) = pre_parsed_plan {
-            plan
+            PlanForExecution::unoptimized(plan)
         } else {
-            match Self::get_plan(df, session, sql, cached_plan_key.as_ref(), parameters).await {
-                Ok(plan) => Box::new(plan),
+            match Self::get_plan_for_execution(
+                df,
+                session,
+                sql,
+                cached_plan_key.as_ref(),
+                parameters,
+            )
+            .await
+            {
+                Ok(plan) => plan,
                 Err(super::Error::UnableToExecuteQuery { source }) => {
                     let code = ErrorCode::from(&source);
                     let error = super::Error::UnableToExecuteQuery { source };
@@ -686,6 +850,112 @@ impl Query {
             None => plan,
         };
         Ok(plan)
+    }
+
+    /// Return a bound plan for local execution, reusing the analyzer + logical
+    /// optimizer output for the parameterized SQL shape when possible.
+    ///
+    /// Parameter binding substitutes scalar values without changing table
+    /// resolution or relational structure. Optimizing the placeholder-bearing
+    /// template once therefore leaves physical planning with the same bound
+    /// expressions while avoiding a full optimizer tree walk on every lookup.
+    /// Plans whose top-level node has statement semantics stay on DataFusion's
+    /// ordinary path: `EXPLAIN` must capture optimizer stages, and DDL/DML /
+    /// session statements have execution-specific planning behavior.
+    async fn get_plan_for_execution(
+        df: &Arc<DataFusion>,
+        session: &SessionState,
+        sql: &str,
+        sql_raw_cache_key: Option<&RawCacheKey>,
+        parameters: Option<ParamValues>,
+    ) -> super::Result<PlanForExecution> {
+        let parameterized = parameters.is_some();
+        let Some(raw_key) = sql_raw_cache_key else {
+            return Self::get_plan(df, session, sql, None, parameters)
+                .await
+                .map(|plan| PlanForExecution::unoptimized(Box::new(plan)));
+        };
+        let Some(plans_cache) = df.plans_cache_provider() else {
+            return Self::get_plan(df, session, sql, Some(raw_key), parameters)
+                .await
+                .map(|plan| PlanForExecution::unoptimized(Box::new(plan)));
+        };
+
+        let template = df
+            .get_or_create_logical_plan(session, Some(raw_key), sql)
+            .await
+            .map_err(|source| super::Error::UnableToExecuteQuery {
+                source: find_datafusion_root(source),
+            })?;
+        if matches!(
+            template,
+            LogicalPlan::Explain(_)
+                | LogicalPlan::Analyze(_)
+                | LogicalPlan::DescribeTable(_)
+                | LogicalPlan::Ddl(_)
+                | LogicalPlan::Dml(_)
+                | LogicalPlan::Copy(_)
+                | LogicalPlan::Statement(_)
+        ) {
+            let plan = match parameters {
+                Some(values) => template
+                    .with_param_values(values)
+                    .context(BindingParametersSnafu)?,
+                None => template,
+            };
+            return Ok(PlanForExecution::unoptimized(Box::new(plan)));
+        }
+
+        let optimized_key = RawCacheKey::new(raw_key.as_u64() ^ OPTIMIZED_PLAN_CACHE_KEY_MASK);
+        let optimized = match plans_cache.get_raw_key(&optimized_key.as_u64()).await {
+            Some(plan) => plan,
+            None => match session.optimize(&template) {
+                Ok(plan) => {
+                    plans_cache
+                        .put_raw_key(&optimized_key.as_u64(), plan.clone())
+                        .await;
+                    plan
+                }
+                // Optimizing placeholders is an acceleration, not a new
+                // requirement. If a rule needs concrete values, retain the
+                // ordinary bind-then-optimize path.
+                Err(_) => {
+                    let plan = match parameters {
+                        Some(values) => template
+                            .with_param_values(values)
+                            .context(BindingParametersSnafu)?,
+                        None => template,
+                    };
+                    return Ok(PlanForExecution::unoptimized(Box::new(plan)));
+                }
+            },
+        };
+        let parameterized_table = parameterized
+            .then(|| parameterized_lookup_table(&optimized))
+            .flatten();
+        let plan = match parameters {
+            Some(values) => optimized
+                .with_param_values(values)
+                .context(BindingParametersSnafu)?,
+            None => optimized,
+        };
+        let selective_join_fast_path = parameterized && is_selective_join_shape(&plan);
+        let physical_template = if selective_join_fast_path {
+            parameterized_table.map(|table| {
+                (
+                    RawCacheKey::new(raw_key.as_u64() ^ PHYSICAL_PLAN_CACHE_KEY_MASK),
+                    table,
+                )
+            })
+        } else {
+            None
+        };
+        Ok(PlanForExecution {
+            plan: Box::new(plan),
+            already_optimized: true,
+            selective_join_fast_path,
+            physical_template,
+        })
     }
 
     /// The key a cached [`LogicalPlan`] lives under: the SQL text and the
@@ -1552,6 +1822,141 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn optimized_placeholder_plan_binds_and_executes_without_reoptimizing() {
+        let df = prepare_runtime(None).await;
+        let session = df.ctx.state();
+        let sql = "SELECT CAST($1 AS BIGINT) + 1 AS answer";
+        let key = Query::cached_plan_key(&df, sql, None);
+
+        for value in [41_i64, 99] {
+            let prepared = Query::get_plan_for_execution(
+                &df,
+                &session,
+                sql,
+                Some(&key),
+                Some(ParamValues::from(vec![ScalarValue::Int64(Some(value))])),
+            )
+            .await
+            .expect("prepare optimized parameterized plan");
+            assert!(
+                prepared.already_optimized,
+                "the placeholder-bearing template should be safe to optimize once"
+            );
+            assert!(
+                !prepared.selective_join_fast_path,
+                "a parameterized scalar query must keep the full physical optimizer"
+            );
+            let physical = session
+                .query_planner()
+                .create_physical_plan(&prepared.plan, &session)
+                .await
+                .expect("create physical plan without another logical optimizer pass");
+            let batches = datafusion::physical_plan::collect(
+                physical,
+                Arc::new(datafusion::execution::TaskContext::from(&session)),
+            )
+            .await
+            .expect("execute bound plan");
+            let answer = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 result")
+                .value(0);
+            assert_eq!(answer, value + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn selective_parameterized_join_uses_reduced_physical_optimizer() {
+        let df = prepare_runtime(None).await;
+        register_id_table(&df, "selective_join_left", &[1, 2, 3]);
+        register_id_table(&df, "selective_join_right", &[1, 2, 3]);
+        let session = df.ctx.state();
+        let sql = "SELECT l.id FROM selective_join_left l \
+                   INNER JOIN selective_join_right r ON l.id = r.id \
+                   WHERE l.id = $1";
+        let key = Query::cached_plan_key(&df, sql, None);
+
+        for value in [1_i64, 3] {
+            let prepared = Query::get_plan_for_execution(
+                &df,
+                &session,
+                sql,
+                Some(&key),
+                Some(ParamValues::from(vec![ScalarValue::Int64(Some(value))])),
+            )
+            .await
+            .expect("prepare selective parameterized join");
+            assert!(prepared.already_optimized);
+            assert!(
+                prepared.selective_join_fast_path,
+                "the bound selective join should use the reduced physical optimizer"
+            );
+            assert!(
+                prepared.physical_template.is_some(),
+                "an equality parameter on one join input should identify a reusable physical template"
+            );
+
+            let physical = super::super::create_physical_plan_for_execution(
+                &session,
+                &prepared.plan,
+                prepared.already_optimized,
+                prepared.selective_join_fast_path,
+            )
+            .await
+            .expect("create selective join physical plan");
+            let batches = datafusion::physical_plan::collect(
+                physical,
+                Arc::new(datafusion::execution::TaskContext::from(&session)),
+            )
+            .await
+            .expect("execute selective join");
+            let ids = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id should be an Int64 column")
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(ids, vec![value]);
+        }
+    }
+
+    #[tokio::test]
+    async fn selective_parameterized_in_join_identifies_physical_template() {
+        let df = prepare_runtime(None).await;
+        register_id_table(&df, "selective_in_left", &[1, 2, 3]);
+        register_id_table(&df, "selective_in_right", &[1, 2, 3]);
+        let session = df.ctx.state();
+        let sql = "SELECT l.id FROM selective_in_left l \
+                   INNER JOIN selective_in_right r ON l.id = r.id \
+                   WHERE l.id IN ($1, $2)";
+        let key = Query::cached_plan_key(&df, sql, None);
+        let prepared = Query::get_plan_for_execution(
+            &df,
+            &session,
+            sql,
+            Some(&key),
+            Some(ParamValues::from(vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(3)),
+            ])),
+        )
+        .await
+        .expect("prepare selective parameterized IN join");
+
+        assert!(prepared.selective_join_fast_path);
+        assert!(prepared.physical_template.is_some());
+    }
+
     /// Build a `RequestContext` with an explicit cache namespace. Used to
     /// drive cross-principal isolation tests in this module without going
     /// through real auth middleware.
@@ -1984,6 +2389,11 @@ mod tests {
             Duration::from_hours(1),
             std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
         ));
+        let physical_plans_cache = Arc::new(SimpleCache::new(
+            512,
+            Duration::from_hours(1),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
+        ));
         let results_cache_config = results_cache_config.unwrap_or(SQLResultsCacheConfig {
             item_ttl: Some("10m".to_string()),
             cache_key_type: spicepod::component::caching::CacheKeyType::Plan,
@@ -2005,7 +2415,8 @@ mod tests {
             .with_caching(Arc::new(
                 Caching::new()
                     .with_results_cache(Arc::new(cache_provider))
-                    .with_plans_cache(plans_cache),
+                    .with_plans_cache(plans_cache)
+                    .with_physical_plans_cache(physical_plans_cache),
             ))
             .build(),
         )

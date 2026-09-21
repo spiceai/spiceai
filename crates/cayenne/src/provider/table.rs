@@ -33075,15 +33075,22 @@ impl CayenneTableProvider {
         // otherwise attach: deleted candidates are removed from the selection,
         // never resurrected.
         let mut lookup_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>> = None;
+        let mut covering_lookup_batches: Option<Vec<RecordBatch>> = None;
         if let Some(selection) = lookup_selection {
-            let (restricted_files, provider, explain) = selection.restrict(
+            let super::lookup_index::LookupRestriction {
+                file_groups,
+                access_plan,
+                explain,
+                covering_batches,
+            } = selection.restrict(
                 snapshot_id,
                 partitioned_file_lists,
                 Self::position_deletion_plans(&self.pk_deletion_strategy),
                 self.file_set_version(),
             );
-            partitioned_file_lists = restricted_files;
-            lookup_plan_provider = provider;
+            partitioned_file_lists = file_groups;
+            lookup_plan_provider = access_plan;
+            covering_lookup_batches = covering_batches;
             if let Some(slot) = lookup_index_explain {
                 *slot = explain;
             }
@@ -33092,6 +33099,118 @@ impl CayenneTableProvider {
                 // so exact-aggregate optimizations must not read it as live.
                 statistics = statistics.to_inexact();
             }
+        }
+
+        // A file-mode secondary index retains a complete Arrow row store when
+        // the query memory pool can fit it. Serve a validated exact lookup from
+        // those rows directly, avoiding Vortex opener, footer, segment decode,
+        // and per-hit scan allocation. The ordinary file path remains the
+        // fallback for partitioned schemas, projection mismatches, or a store
+        // the pool could not admit. Query filters are evaluated here because a
+        // hash collision may deliberately admit an extra candidate.
+        if let Some(batches) = covering_lookup_batches {
+            let direct_plan = (|| -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+                let projected_schema = project_schema(&scan_schema, projection)?;
+                let physical_filter = conjunction(filters.iter().cloned())
+                    .map(|predicate| {
+                        let df_schema = DFSchema::try_from(scan_schema.as_ref().clone())?;
+                        create_physical_expr(&predicate, &df_schema, &ExecutionProps::new())
+                    })
+                    .transpose()?;
+                let projected_batches = batches
+                    .into_iter()
+                    .filter_map(|batch| {
+                        let batch = match arrow_tools::record_batch::try_cast_to(
+                            batch,
+                            Arc::clone(&scan_schema),
+                        ) {
+                            Ok(batch) => batch,
+                            Err(error) => return Some(Err(error.into())),
+                        };
+                        let batch = if let Some(filter) = physical_filter.as_ref() {
+                            let value = match filter.evaluate(&batch) {
+                                Ok(value) => value,
+                                Err(error) => return Some(Err(error)),
+                            };
+                            let array = match value.into_array(batch.num_rows()) {
+                                Ok(array) => array,
+                                Err(error) => return Some(Err(error)),
+                            };
+                            let Some(mask) = array.as_any().downcast_ref::<BooleanArray>() else {
+                                return Some(Err(datafusion_common::DataFusionError::Execution(
+                                    format!(
+                                        "Cayenne scan filter did not evaluate to BooleanArray, got {}",
+                                        array.data_type()
+                                    ),
+                                )));
+                            };
+                            match arrow::compute::filter_record_batch(&batch, mask) {
+                                Ok(batch) => batch,
+                                Err(error) => return Some(Err(error.into())),
+                            }
+                        } else {
+                            batch
+                        };
+                        if batch.num_rows() == 0 {
+                            return None;
+                        }
+                        let projected = match projection {
+                            Some(projection) => match batch.project(projection) {
+                                Ok(batch) => batch,
+                                Err(error) => return Some(Err(error.into())),
+                            },
+                            None => batch,
+                        };
+                        Some(
+                            arrow_tools::record_batch::try_cast_to(
+                                projected,
+                                Arc::clone(&projected_schema),
+                            )
+                            .map_err(Into::into),
+                        )
+                    })
+                    .collect::<datafusion_common::Result<Vec<_>>>()?;
+                if projected_batches.is_empty() {
+                    return Ok(Arc::new(EmptyExec::new(projected_schema)));
+                }
+                let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+                    &[projected_batches],
+                    projected_schema,
+                    None,
+                )?;
+                Ok(exec as Arc<dyn ExecutionPlan>)
+            })();
+            match direct_plan {
+                Ok(plan) => return Ok(plan),
+                Err(error) => tracing::debug!(
+                    table = %self.table_metadata.table_name,
+                    %error,
+                    "Covering secondary-index rows could not serve this scan; using Vortex point reads"
+                ),
+            }
+        }
+
+        // A dynamic filter is materialized only after this physical scan has
+        // been planned. When an already-published lookup index covers the
+        // captured files, thread it into the Vortex source so each file opener
+        // can resolve an exact runtime point. The resolver preserves the
+        // ordinary scan whenever the filter is absent, non-exact, or not ready.
+        let dynamic_lookup_plan_provider = if lookup_plan_provider.is_none() {
+            self.lookup_index.as_ref().and_then(|index| {
+                index.dynamic_access_plan_provider(
+                    snapshot_id,
+                    partitioned_file_lists.iter().flat_map(FileGroup::iter),
+                    self.file_set_version(),
+                )
+            })
+        } else {
+            None
+        };
+        if dynamic_lookup_plan_provider.is_some() {
+            // A runtime row selection may make footer row counts upper bounds.
+            // Keep exact aggregate rewrites disabled for this scan even if the
+            // dynamic predicate ultimately falls back.
+            statistics = statistics.to_inexact();
         }
 
         if partitioned_file_lists.is_empty() {
@@ -33156,6 +33275,19 @@ impl CayenneTableProvider {
             .format
             .file_source(Self::snapshot_file_table_schema(&base_schema, &options));
 
+        if let Some(provider) = dynamic_lookup_plan_provider.as_ref() {
+            let replacement: Option<Arc<dyn FileSource>> =
+                file_source.downcast_ref::<VortexSource>().map(|vs| {
+                    Arc::new(
+                        vs.clone()
+                            .with_dynamic_access_plan_provider(Arc::clone(provider)),
+                    ) as Arc<dyn FileSource>
+                });
+            if let Some(replacement) = replacement {
+                file_source = replacement;
+            }
+        }
+
         // Small groups gain no decode parallelism worth having from being
         // byte-range-split into `target_partitions` scan units, but pay a Vortex
         // footer-open per split (measured at SF-1000: 44 protected snapshots ×
@@ -33175,6 +33307,7 @@ impl CayenneTableProvider {
             .sum();
         let disable_repartition = disable_repartition
             || lookup_plan_provider.is_some()
+            || dynamic_lookup_plan_provider.is_some()
             || (small_group_repartition_opt_out_bytes > 0
                 && group_bytes < small_group_repartition_opt_out_bytes);
 
