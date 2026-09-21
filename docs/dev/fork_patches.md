@@ -105,10 +105,10 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `3af703dba0accdff5fdb0ae92ef12588e1dfe88a` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `461e5f8777215c21a483da67023b07ec468ebc54` | `spiceai-54` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `b10ae96a0ad1c16a6d138d7aaa491b6ddbc12a91` | `spiceai-54` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
-| [duckdb-rs](#duckdb-rs) | `9d7be742f060d70066fc041319af787772716e0d` | `spiceai-1.4.4` |
+| [duckdb-rs](#duckdb-rs) | `76655d2ffc1b1e4dfc886de561759b70ead48b96` | `spiceai-1.4.4` |
 | [graph-rs-sdk](#graph-rs-sdk) | `af383410a9c86915263fbd1145b8becfc1e317b5` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `351d1bc7b6ac9a835397e248e9c687f305e947d1` | `spiceai-0.10.1-df-54` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
@@ -358,6 +358,7 @@ Upstream [duckdb/duckdb-rs](https://github.com/duckdb/duckdb-rs), branch
 | ICU extension statically linked into bundled DuckDB (fork PR #23) | Any query using a named timezone (`AT TIME ZONE 'America/New_York'`) fails at runtime, and DuckDB tries to download the extension from the network | silent (query failure) | `crates/accelerators/accelerator-duckdb/src/lib.rs::bundled_duckdb_resolves_a_named_time_zone_without_installing_icu` |
 | VSS (HNSW) extension statically linked (fork PR #37) | Vector search over a DuckDB accelerator fails, or silently falls back to a full scan | silent (query failure) | `crates/accelerators/accelerator-duckdb/src/lib.rs::bundled_duckdb_builds_an_hnsw_index_without_installing_vss` |
 | Bundled DuckDB version pinned to the release (fork PR #38) | Extension downloads resolve against a mismatched DuckDB version and fail | silent | covered by the two extension guards above |
+| Thrift `TEnumIterator::operator==` backport for macOS 27 (fork PR #47; upstream [duckdb/duckdb@fccde6aa](https://github.com/duckdb/duckdb/commit/fccde6aa1932f48dfa6282a916ea2477b57aa44d)) | Bundled DuckDB with Parquet fails to compile against the macOS 27 SDK: newer libc++ builds the Thrift enum maps with `iterator == end`, and the vendored Thrift header defined only `operator!=` | build (macOS 27) | **GAP** — the fork's own `crates/libduckdb-sys/tests/test_bundled_thrift.py` asserts it inside the fork and does not survive a re-cut of this pin |
 
 ## iceberg-rust
 
@@ -537,7 +538,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**37 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**38 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -606,13 +607,21 @@ being honoured:
 24. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
 25. `graph-rs-sdk` tower middleware application.
 
+**Build only.** Loud rather than silent — the compiler catches the loss, but only on
+the platform it affects:
+
+26. `duckdb-rs` Thrift `TEnumIterator::operator==` backport (fork PR #47) — bundled
+    DuckDB stops compiling against the macOS 27 SDK. Invisible on every other
+    platform and on CI images that predate that SDK, so a re-cut that drops it is
+    found by whoever upgrades first rather than by the build.
+
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
 the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time and
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-26. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+27. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
