@@ -1468,6 +1468,14 @@ mod tests {
             Ok(None)
         }
 
+        async fn set_schema(
+            &self,
+            _schema: &SchemaRef,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            // Not needed for this test
+            Ok(())
+        }
+
         async fn last_checkpoint_time(
             &self,
         ) -> Result<Option<SystemTime>, Box<dyn std::error::Error + Send + Sync>> {

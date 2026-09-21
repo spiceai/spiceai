@@ -17,6 +17,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use std::collections::HashSet;
+use std::time::Instant;
 use std::{collections::HashMap, sync::Arc};
 
 use super::embeddings::table::EmbeddingTable;
@@ -37,7 +38,7 @@ use cache::key::{CacheKey, RawCacheKey, SearchKey};
 use cache::result::CacheStatus;
 use cache::result::query::CachedStream;
 use cache::result::search::{CachedAggregationResult, CachedSearchResult};
-use cache::{Sizeable, TabledCacheProvider};
+use cache::{AsTableRefs, Sizeable, TabledCacheProvider};
 use datafusion::catalog::TableProvider;
 use datafusion::common::{Column, DFSchema, SchemaError};
 use datafusion::error::DataFusionError;
@@ -500,15 +501,26 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                 cache_key.as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
             };
 
-            match (
-                cache_control,
-                cache_provider.get_raw_key(&raw_cache_key.as_u64()).await,
-            ) {
+            let cached = cache_provider
+                .get_raw_key_validated(&raw_cache_key.as_u64(), &|value| {
+                    !cache_provider.tables_changed_since(
+                        value.as_table_refs().as_ref(),
+                        value.read_started_at(),
+                    )
+                })
+                .await;
+            match (cache_control, cached) {
                 (CacheControl::NoCache, _) => {
                     tracing::trace!("Search cache bypass");
+                    let read_started_at = Instant::now();
                     let results = self.search(req).await?;
                     (
-                        wrap_cache_to_result(raw_cache_key, results, Arc::clone(&cache_provider)),
+                        wrap_cache_to_result(
+                            raw_cache_key,
+                            results,
+                            Arc::clone(&cache_provider),
+                            read_started_at,
+                        ),
                         CacheStatus::CacheBypass,
                     )
                 }
@@ -520,9 +532,15 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                     None,
                 ) => {
                     tracing::trace!("Search cache miss");
+                    let read_started_at = Instant::now();
                     let results = self.search(req).await?;
                     (
-                        wrap_cache_to_result(raw_cache_key, results, Arc::clone(&cache_provider)),
+                        wrap_cache_to_result(
+                            raw_cache_key,
+                            results,
+                            Arc::clone(&cache_provider),
+                            read_started_at,
+                        ),
                         CacheStatus::CacheMiss,
                     )
                 }
@@ -667,7 +685,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
                     Ok((tbl.clone(), agg_result))
                 }
-            }).collect::<Vec<_>>()).await?.into_iter().filter_map(|(tbl, result)| Some((tbl, result?))).collect();
+            })).await?.into_iter().filter_map(|(tbl, result)| Some((tbl, result?))).collect();
 
             Ok(response)
 
@@ -753,6 +771,7 @@ fn wrap_cache_to_result(
     key: RawCacheKey,
     aggregation_result: HashMap<TableReference, AggregationResult>,
     cache_provider: Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>,
+    read_started_at: Instant,
 ) -> HashMap<TableReference, AggregationResult> {
     // each hashmap entry is an aggregation result which contains a sendable record batch stream
     // for each table reference, we need to wrap the batch stream in another stream to pull out the record batches
@@ -862,10 +881,22 @@ fn wrap_cache_to_result(
 
         tracing::trace!("Caching search results for key: {}", key.as_u64());
 
-        let result = CachedSearchResult::new(Arc::new(results), Arc::new(expected_keys));
+        let result = CachedSearchResult::new(
+            Arc::new(results),
+            Arc::new(expected_keys.clone()),
+            read_started_at,
+        );
 
         if result.get_memory_size() > cache_provider.max_size() {
             tracing::trace!("Search results exceed cache size, not caching");
+            return;
+        }
+
+        // A table invalidation that landed after this search began must not
+        // publish a stale result (the gate alone only orders concurrent inserts
+        // against the scan, not work that started earlier and finishes later).
+        if cache_provider.tables_changed_since(&expected_keys, read_started_at) {
+            tracing::trace!("Skipping search cache put; a table changed since the search began");
             return;
         }
 

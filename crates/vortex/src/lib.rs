@@ -98,6 +98,16 @@ mod common_tests {
     impl TestSessionContext {
         /// Create a new test session context with the given projection pushdown setting.
         pub fn new(projection_pushdown: bool) -> Self {
+            Self::build(projection_pushdown, false)
+        }
+
+        /// Like [`Self::new`], but registers DataFusion nested-array functions
+        /// (`array_length`, `make_array`, and related) so SQL tests can construct and query list columns.
+        pub fn with_nested_functions(projection_pushdown: bool) -> Self {
+            Self::build(projection_pushdown, true)
+        }
+
+        fn build(projection_pushdown: bool, register_nested_functions: bool) -> Self {
             let store = Arc::new(InMemory::new());
             let opts = VortexTableOptions {
                 projection_pushdown: ProjectionPushdown::from_bool(projection_pushdown),
@@ -119,8 +129,13 @@ mod common_tests {
                 file_formats.push(factory as _);
             }
 
+            let mut session_state = session_state_builder.build();
+            if register_nested_functions {
+                datafusion_functions_nested::register_all(&mut session_state)
+                    .expect("nested DataFusion functions should register");
+            }
             let session: SessionContext =
-                SessionContext::new_with_state(session_state_builder.build()).enable_url_table();
+                SessionContext::new_with_state(session_state).enable_url_table();
 
             Self { store, session }
         }

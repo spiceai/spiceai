@@ -1712,6 +1712,31 @@ fn decode_binary_text(raw: &[u8], type_oid: u32) -> Result<Cow<'_, str>> {
         25 | 1043 | 1042 | 19 | 114 | 142 => {
             Ok(Cow::Borrowed(pg::text_from_sql(raw).map_err(decode_err)?))
         }
+        // jsonb_send prefixes its UTF-8 JSON text with the wire-format version.
+        3802 => {
+            let Some((&version, json)) = raw.split_first() else {
+                return PgOutputDecodeSnafu {
+                    message: "postgres_replication: missing JSONB binary format version"
+                        .to_string(),
+                }
+                .fail();
+            };
+            ensure!(
+                version == 1,
+                PgOutputDecodeSnafu {
+                    message: format!(
+                        "postgres_replication: unsupported JSONB binary format version {version}"
+                    )
+                }
+            );
+            ensure!(
+                !json.is_empty(),
+                PgOutputDecodeSnafu {
+                    message: "postgres_replication: missing JSONB binary text payload".to_string()
+                }
+            );
+            Ok(Cow::Borrowed(pg::text_from_sql(json).map_err(decode_err)?))
+        }
         // uuid → canonical lowercase hyphenated form.
         2950 => Ok(Cow::Owned(format_uuid(
             &pg::uuid_from_sql(raw).map_err(decode_err)?,
@@ -3260,11 +3285,45 @@ mod tests {
     }
 
     #[test]
+    fn binary_jsonb_decodes_versioned_text() {
+        for json in [
+            r#"{"level_0": "survey-cell", "nested": [null, true, 42]}"#,
+            "null",
+            r#""한글""#,
+        ] {
+            let mut wire = vec![1];
+            wire.extend_from_slice(json.as_bytes());
+            assert_eq!(
+                bin_one(&DataType::Utf8, 3802, &wire)
+                    .as_string::<i32>()
+                    .value(0),
+                json
+            );
+            assert_eq!(
+                bin_one(&DataType::LargeUtf8, 3802, &wire)
+                    .as_string::<i64>()
+                    .value(0),
+                json
+            );
+            assert_eq!(
+                decode_binary_text(json.as_bytes(), 114).expect("JSON text"),
+                json
+            );
+        }
+    }
+
+    #[test]
+    fn binary_jsonb_rejects_missing_version_unknown_version_and_invalid_utf8() {
+        for wire in [&[][..], &[1][..], &[2, b'{', b'}'][..], &[1, 0xff][..]] {
+            decode_binary_text(wire, 3802).expect_err("invalid JSONB wire value");
+        }
+    }
+
+    #[test]
     fn binary_text_column_rejects_unsupported_oid() {
         // An OID with no supported text/binary mapping targeting a Utf8 column
-        // must error loudly (here: jsonb, whose binary carries a version byte),
-        // never silently mis-decode into a wrong string.
-        decode_binary_text(&[0x01, b'{', b'}'], 3802).expect_err("unsupported oid must error");
+        // must error loudly rather than silently mis-decode into a wrong string.
+        decode_binary_text(&[0x01, b'{', b'}'], 999_999).expect_err("unsupported oid must error");
     }
 
     #[test]

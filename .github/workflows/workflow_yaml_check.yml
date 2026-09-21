@@ -14,6 +14,7 @@ on:
     paths:
       - '.github/workflows/**'
       - '.github/actions/**'
+      - '.github/actionlint.yaml'
       - '.github/scripts/check_workflow_yaml.py'
       - '.github/scripts/test_check_workflow_yaml.py'
   push:
@@ -22,6 +23,7 @@ on:
     paths:
       - '.github/workflows/**'
       - '.github/actions/**'
+      - '.github/actionlint.yaml'
       - '.github/scripts/check_workflow_yaml.py'
       - '.github/scripts/test_check_workflow_yaml.py'
   workflow_dispatch:
@@ -36,6 +38,13 @@ jobs:
     # GitHub-hosted on purpose: this is a sub-second check and must not queue
     # behind the saturated self-hosted pool.
     runs-on: ubuntu-24.04
+    # Reads the checkout and nothing else.
+    permissions:
+      contents: read
+    # The whole job is a download plus two linters over ~120 small files. Anything
+    # past this is wedged, not slow, and without a bound it would inherit GitHub's
+    # six-hour ceiling.
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -55,3 +64,49 @@ jobs:
 
       - name: Validate GitHub Actions definitions
         run: python .github/scripts/check_workflow_yaml.py
+
+      # `check_workflow_yaml.py` above encodes the failures this repository has
+      # actually been bitten by, cell by cell, each one added after an incident.
+      # actionlint carries GitHub's whole context-availability table plus its key
+      # schema, expression types and matrix rules, so it covers that class without
+      # anyone having to write the next cell out by hand — including the one that
+      # took `Install Scripts Test` off the air in #14052 (a step `shell:` naming
+      # `matrix`; actionlint reports it as `context "matrix" is not allowed here`,
+      # our own guard does not). The two are complementary, not redundant: the
+      # Python guard checks repo-specific rules actionlint knows nothing about
+      # (step budgets a job budget pre-empts, the compiler cache's
+      # AWS_ENDPOINT_URL leaking into a runtime step, a nightly's later suites
+      # skipping behind an earlier failure), so both run.
+      - name: Install actionlint
+        env:
+          # Pin both the version and the artifact. A linter that installs
+          # whatever is newest turns an upstream release into a CI failure on a
+          # PR that changed nothing.
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+            -o /tmp/actionlint.tar.gz "$url"
+          echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tar.gz" | sha256sum --check --status \
+            || { echo "::error::actionlint ${ACTIONLINT_VERSION} tarball does not match its pinned checksum."; exit 1; }
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          # On PATH, so the lint step below reads as the command a developer runs
+          # locally rather than a path only this job knows.
+          sudo install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
+          actionlint -version
+
+      - name: Lint GitHub Actions definitions (actionlint)
+        run: |
+          set -euo pipefail
+          # Everything suppressed is suppressed in `.github/actionlint.yaml`, so a
+          # bare `actionlint` in a checkout gives the same verdict this does; see
+          # that file and #14222 for what is on the list and why.
+          #
+          # -shellcheck= / -pyflakes= stay flags because they are about *this*
+          # invocation, not about the tree: they turn OFF actionlint's script-body
+          # linters, which grade the contents of `run:` blocks. That is a separate
+          # backlog with its own findings here; this gate is about whether GitHub
+          # can schedule the definition at all. Enabling them is tracked in #14222.
+          actionlint -color -shellcheck= -pyflakes=

@@ -7750,6 +7750,106 @@ mod tests {
             .expect("heartbeat envelope builds")
     }
 
+    /// Observations recorded on `dataset_acceleration_refresh_duration_ms` for
+    /// one dataset at one `mode`. The histogram's sample count is what says a
+    /// re-read happened; its buckets are what say how long it took.
+    fn refresh_duration_samples(registry: &prometheus::Registry, dataset: &str, mode: &str) -> u64 {
+        for family in registry.gather() {
+            if family.name() != "dataset_acceleration_refresh_duration_ms"
+                || family.get_field_type() != prometheus::proto::MetricType::HISTOGRAM
+            {
+                continue;
+            }
+            for series in family.get_metric() {
+                let labels = series.get_label();
+                let matches = |key: &str, value: &str| {
+                    labels
+                        .iter()
+                        .any(|label| label.name() == key && label.value() == value)
+                };
+                if matches("dataset", dataset)
+                    && matches("mode", mode)
+                    && let Some(histogram) = series.get_histogram().as_ref()
+                {
+                    return histogram.get_sample_count();
+                }
+            }
+        }
+        0
+    }
+
+    /// A rebuild is the `refresh_mode: changes` equivalent of a refresh, and is
+    /// reported as one: it runs through `RefreshTask::run` at `RefreshMode::Full`,
+    /// so it lands on `dataset_acceleration_refresh_duration_ms{mode="full"}` with
+    /// the duration of the re-read. That is the whole alerting story for a
+    /// changes-mode dataset, because nothing else it does emits a `full` point —
+    /// so the assertion is on the labelled series, not just on the metric.
+    ///
+    /// Guards the coupling rather than the arithmetic: `rebuild_from_source`
+    /// re-entering the refresh path is what puts a re-read on an operator's
+    /// dashboard at all, and it is only two lines from being a bespoke reload
+    /// that reports nothing.
+    #[tokio::test]
+    async fn a_rebuild_is_reported_as_a_full_refresh_of_the_changes_dataset() {
+        let registry = crate::accelerated::refresh_task::test_prometheus_registry().clone();
+        let dataset = "rebuild_reported_as_full_refresh";
+        let task = make_refresh_task_named(dataset, make_mem_table() as Arc<dyn TableProvider>);
+
+        let dataset_name = TableReference::bare(dataset);
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
+        let initial_load_completed = Arc::new(AtomicBool::new(true));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        // Seated at `Changes`, the mode a dataset on this path actually carries.
+        // `Refresh::default()` is `Full`, and starting there would leave the test
+        // green even with `rebuild_from_source`'s `Changes` -> `Full` override
+        // deleted — while production would reach `run_once`'s
+        // `RefreshMode::Changes => unreachable!` instead. The override is the link
+        // under test, so the fixture has to make its absence observable.
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            ..Refresh::default()
+        }));
+        let mut context = ApplyContext {
+            refresh_sql: None,
+            refresh: &refresh,
+            dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
+            caching: None,
+            refresh_completion: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+
+        assert_eq!(
+            refresh_duration_samples(&registry, dataset, "full"),
+            0,
+            "control: nothing has re-read the source yet"
+        );
+
+        let schema = Arc::new(create_test_data_schema());
+        let signal =
+            cdc::build_history_unavailable_envelope(&schema).expect("rebuild signal builds");
+        assert!(
+            task.apply_envelope_run(&mut context, vec![signal]).await,
+            "the rebuild must succeed, so the sample below is of a re-read that landed"
+        );
+
+        assert_eq!(
+            refresh_duration_samples(&registry, dataset, "full"),
+            1,
+            "a rebuild must be timed as one full refresh of '{dataset}', or a changes-mode \
+             dataset re-reads its whole source with nothing to show for it"
+        );
+    }
+
     /// A rebuild signal is an ordering barrier, not a jump to the front of the
     /// run: what the run carries ahead of it is subsumed by the re-read and must
     /// go with it. See `trim_to_rebuild_signal`.

@@ -12,6 +12,9 @@ name: runtime-test
 # =============================================================================
 runtime:
   caching:
+    # `runtime.caching.*.engine` (`moka` | `pingora`) is accepted for
+    # compatibility and ignored at runtime; LruCache always uses the Spice
+    # sharded-cache backend. `engine: pingora` no longer selects Pingora.
     sql_results:
       enabled: true
       max_size: 1GiB # Default 128 MiB
@@ -24,6 +27,10 @@ runtime:
   task_history:
     enabled: true
     captured_context: redacted
+  query:
+    # Materialize multi-reference CTEs once on the Cayenne query path.
+    # disabled (default) | auto
+    cte_materialization: auto
   cpu:
     # How many CPUs the runtime behaves as though it has. Accepts 4, 3.5, 3500m,
     # or `auto` (the default) to detect it. Also settable via --cpu-cores or

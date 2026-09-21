@@ -400,7 +400,7 @@ three: 3
     #[test]
     fn test_to_string_simple() {
         let yaml = to_string(&42).expect("should serialize 42");
-        assert!(yaml.trim() == "42");
+        assert_eq!(yaml.trim(), "42");
     }
 
     #[test]

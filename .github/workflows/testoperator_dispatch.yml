@@ -50,7 +50,7 @@ jobs:
       matrix:
         branch:
           - 'trunk'
-          - 'release/2.2'
+          - 'release/2.3'
     concurrency:
       group: testoperator-dispatch-scheduled-${{ matrix.branch }}-${{ github.event.schedule || github.event.ref }}
       cancel-in-progress: false
@@ -166,8 +166,9 @@ jobs:
           failed=0
           for file in ./tools/testoperator/dispatch/tpch/sf1/**/*.yaml; do
             case "$file" in
-              ./tools/testoperator/dispatch/tpch/sf1/accelerated/dynamodb-arrow.yaml|./tools/testoperator/dispatch/tpch/sf1/accelerated/dynamodb-duckdb\[file\].yaml|./tools/testoperator/dispatch/tpch/sf1/federated/dynamodb.yaml) continue ;;
-              # The ScyllaDB connector is not in the `default` feature set, so the spiced build this suite runs against cannot load it.
+              # ScyllaDB is an Enterprise-only connector: OSS builds carry no `scylladb` feature, so the spiced
+              # binary these suites run against cannot load it. No dispatch config for it is kept here; this
+              # skip covers one that gets re-added.
               ./tools/testoperator/dispatch/tpch/sf1/federated/scylladb.yaml) continue ;;
             esac
             if ! testoperator dispatch "$file" --workflow bench; then

@@ -25,22 +25,24 @@ use runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME;
 
 mod bigquery;
 mod duckdb;
+mod re2;
 
 pub use bigquery::SpiceBigQueryDialect;
 
 const REGEXP_LIKE_FLAGS_POSITION: usize = 2; // The position of the flags argument in regexp_like function calls
-const REGEXP_MATCH_FLAGS_POSITION: usize = 2; // The position of the flags argument in regexp_match function calls
 const REGEXP_REPLACE_FLAGS_POSITION: usize = 3; // The position of the flags argument in regexp_replace function calls
 const REGEXP_COUNT_FLAGS_POSITION: usize = 3; // The position of the flags argument in regexp_count function calls
 
 pub(crate) const BTRIM_NAME: &str = "btrim";
 const TO_HEX_NAME: &str = "to_hex";
+const CONCAT_NAME: &str = "concat";
 const SHA256_NAME: &str = "sha256";
 
 pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_like";
 pub(crate) const REGEXP_MATCH_NAME: &str = "regexp_match";
+pub(crate) const REGEXP_INSTR_NAME: &str = "regexp_instr";
 const REGEXP_REPLACE_NAME: &str = "regexp_replace";
-const REGEXP_COUNT_NAME: &str = "regexp_count";
+pub(crate) const REGEXP_COUNT_NAME: &str = "regexp_count";
 
 /// The scalar functions the `DuckDB` unparser dialect rewrites to native
 /// `DuckDB` SQL, paired with their handlers.
@@ -78,15 +80,6 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
             ) as ScalarFnToSqlHandler,
         ),
         (
-            // DuckDB dialect: regexp_extract(string, pattern[, group = 0, options])
-            // DataFusion dialect: regexp_match(str, regexp[, flags])
-            REGEXP_MATCH_NAME,
-            Box::new(
-                duckdb::DuckDBRegexpFunction::Match
-                    .to_datafusion_function(REGEXP_MATCH_FLAGS_POSITION),
-            ) as ScalarFnToSqlHandler,
-        ),
-        (
             // DuckDB dialect: regexp_replace(string, pattern, replacement[, options])
             // DataFusion dialect: regexp_replace(str, regexp, replacement[, flags])
             REGEXP_REPLACE_NAME,
@@ -96,7 +89,7 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
             ) as ScalarFnToSqlHandler,
         ),
         (
-            // DuckDB dialect: len(regex_extract_all(string, pattern[, group = 0, options]))
+            // DuckDB dialect: coalesce(len(regexp_extract_all(string, pattern)), 0)
             // DataFusion dialect: regexp_count(str, regexp[, start, flags])
             REGEXP_COUNT_NAME,
             Box::new(
@@ -116,9 +109,11 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
 /// would do nothing. What a built-in needs is the handler — without one the
 /// unparser emits the `DataFusion` call verbatim, and `DuckDB` either rejects
 /// the name (`btrim`) or accepts it and answers differently (`to_hex`, whose
-/// digits come back upper-case; `sha256`, which returns the digest's hex text
-/// where the kernel returns its bytes). The second is the worse of the two: it
-/// is a silently different result rather than a query error.
+/// digits come back upper-case; `concat`, which skips a NULL argument where
+/// the kernel returns NULL for the whole call; `sha256`, which returns the
+/// digest's hex text where the kernel returns its bytes). The second is the
+/// worse of the two: it is a silently different result rather than a query
+/// error.
 fn duckdb_builtin_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
     vec![
         (
@@ -132,6 +127,14 @@ fn duckdb_builtin_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)
             // DataFusion dialect: to_hex(int) — lower-case digits
             TO_HEX_NAME,
             Box::new(duckdb::to_hex_to_lowercase_hex) as ScalarFnToSqlHandler,
+        ),
+        (
+            // DuckDB dialect: a || b || … — NULL propagates
+            // Spice: `concat` resolves to datafusion-spark's SparkConcat,
+            // which returns NULL if any argument is NULL — unlike DuckDB's
+            // function of the same name, which skips it
+            CONCAT_NAME,
+            Box::new(duckdb::concat_to_string_concat) as ScalarFnToSqlHandler,
         ),
         (
             // DuckDB dialect: sha256(x) — the digest's hex text, as VARCHAR
@@ -151,11 +154,20 @@ fn duckdb_builtin_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)
 /// federation deny-list derives its `DuckDB` carve-out from this list (see
 /// [`crate::function_support::deny_spice_functions_for_duckdb`]), so the dialect
 /// and the deny-list stay in sync automatically.
+///
+/// A name in [`crate::function_support::DUCKDB_DENIED_BUILTINS`] is filtered out
+/// rather than trusted not to appear. The dialect carries no handler for a
+/// denied name (`the_constructed_duckdb_dialect_renders_no_denied_builtin`
+/// asserts it), and a handler whose rendering is unfaithful for some call
+/// shapes refuses those shapes per call instead (#13870 is the precedent); the
+/// filter is defence in depth, so "has a handler" can never be read as "may be
+/// pushed down".
 #[must_use]
 pub fn duckdb_native_function_names() -> Vec<&'static str> {
     duckdb_scalar_overrides()
         .into_iter()
         .map(|(name, _)| name)
+        .filter(|name| !crate::function_support::DUCKDB_DENIED_BUILTINS.contains(name))
         .collect()
 }
 
@@ -227,11 +239,8 @@ pub fn duckdb_can_translate(call: &ScalarFunction) -> bool {
 /// [`bigquery_can_translate`] carry.
 ///
 /// The rest stay denied, each for something `BigQuery` cannot be talked out of.
-/// `json_get_json` and `json_as_text` return the matched node's own bytes,
-/// spacing and number spelling intact, where `JSON_QUERY` re-renders it — a
-/// document holding `{"b": -1}` comes back as `{"b":-1}`. `json_contains`
-/// counts a JSON `null` as present, and `BigQuery` returns SQL NULL for such a
-/// node exactly as it does for a missing key, so the two cannot be told apart.
+/// `json_get_json` returns the matched node's own bytes, including spacing,
+/// where `JSON_QUERY` serializes containers with different whitespace.
 /// `json_get`, `json_get_array` and the union helpers carry the crate's JSON
 /// union, which has no SQL type to unparse into.
 #[must_use]
@@ -250,8 +259,11 @@ pub fn bigquery_native_function_names() -> Vec<&'static str> {
 /// this so an untranslatable call is left to evaluate locally instead of being
 /// unparsed.
 #[must_use]
-pub fn bigquery_can_translate(call: &ScalarFunction) -> bool {
-    bigquery::can_translate(call)
+pub fn bigquery_can_translate(
+    call: &ScalarFunction,
+    scope: Option<&datafusion::common::DFSchema>,
+) -> bool {
+    bigquery::can_translate(call, scope)
 }
 
 /// Whether the `BigQuery` dialect can translate this particular aggregate call.
@@ -388,6 +400,114 @@ mod tests {
             ))),
             "an integer start position renders as a DuckDB substring offset"
         );
+        assert!(
+            duckdb_can_translate(&call_of(regexp_count(
+                col("s"),
+                lit("a"),
+                Some(lit(4_294_967_295_i64)),
+                None,
+            ))),
+            "the last offset DuckDB's SUBSTRING accepts still renders"
+        );
+        assert!(
+            !duckdb_can_translate(&call_of(regexp_count(
+                col("s"),
+                lit("a"),
+                Some(lit(4_294_967_296_i64)),
+                None,
+            ))),
+            "a start past DuckDB's SUBSTRING range has no rendering and stays local"
+        );
+    }
+
+    /// `regexp_count` is rendered only for the call shapes `DuckDB` has been
+    /// measured to count as the kernel does (#13870): a string-literal pattern
+    /// that cannot match the empty string and uses only syntax both engines
+    /// read alike, and no flags. Every other shape stays local
+    /// rather than answering differently.
+    #[test]
+    fn duckdb_declines_a_regexp_count_it_cannot_count_faithfully() {
+        for (pattern, why) in [
+            ("a*", "a pattern that can match the empty string"),
+            ("a|\\b", "an alternation with a zero-width branch"),
+            ("", "the empty pattern"),
+            ("(", "a pattern the kernel cannot compile"),
+            (
+                "\\d",
+                "a Perl class, Unicode-aware in the kernel and ASCII-only in RE2",
+            ),
+            (
+                "\\ba",
+                "a word boundary, which the two engines read differently",
+            ),
+            (
+                "[a&&a]",
+                "a class intersection, which RE2 reads as a class of `a` and `&`",
+            ),
+            ("(?x)a b", "the `x` flag, which RE2 rejects"),
+            (
+                "(a{100}){11}",
+                "nested counted repetitions whose product passes RE2's limit of 1000",
+            ),
+            (
+                "a++",
+                "a quantifier applied to a quantifier, which RE2 rejects",
+            ),
+            (
+                "a{01}",
+                "a counted bound with a leading zero, which RE2 reads literally",
+            ),
+            (
+                "([Kk]|a)",
+                "a two-character class of case variants, which RE2 folds across Unicode when it factors an alternation",
+            ),
+            (
+                "(?i)a",
+                "case-insensitive matching, whose folding tables differ by Unicode version",
+            ),
+        ] {
+            assert!(
+                !duckdb_can_translate(&call_of(regexp_count(col("s"), lit(pattern), None, None))),
+                "{why} (`{pattern}`) has no faithful DuckDB rendering"
+            );
+        }
+        assert!(
+            !duckdb_can_translate(&call_of(regexp_count(col("s"), col("p"), None, None))),
+            "a pattern read from a column cannot be inspected and stays local"
+        );
+        for flags in ["i", "m", "s", "c", "gi"] {
+            assert!(
+                !duckdb_can_translate(&call_of(regexp_count(
+                    col("s"),
+                    lit("a"),
+                    Some(lit(1)),
+                    Some(lit(flags)),
+                ))),
+                "flags `{flags}` are refused (case folding differs by Unicode version, the rest RE2 reads differently) and stay local"
+            );
+        }
+        assert!(
+            !duckdb_can_translate(&call_of(regexp_count(
+                col("s"),
+                lit("a"),
+                Some(lit(1)),
+                Some(col("f")),
+            ))),
+            "a flags column is not a constant DuckDB accepts and stays local"
+        );
+
+        // The shapes that are rendered: the plain call, an anchored pattern
+        // (zero-width anchors do not make the match itself empty), and a start.
+        for expr in [
+            regexp_count(col("s"), lit("a"), None, None),
+            regexp_count(col("s"), lit("^a+$"), None, None),
+            regexp_count(col("s"), lit("[0-9]{2,}"), Some(lit(3)), None),
+        ] {
+            assert!(
+                duckdb_can_translate(&call_of(expr.clone())),
+                "{expr:?} has a faithful DuckDB rendering and must federate"
+            );
+        }
     }
 
     /// A function the dialect installs no handler for is deferred to, so an
@@ -415,6 +535,11 @@ mod tests {
             regexp_count(col("s"), lit("a"), Some(col("start")), None),
             regexp_count(col("s"), lit("a"), Some(lit(0)), None),
             regexp_count(col("s"), lit("a"), Some(lit(2)), None),
+            regexp_count(col("s"), lit("a*"), None, None),
+            regexp_count(col("s"), lit("\\d"), None, None),
+            regexp_count(col("s"), col("p"), None, None),
+            regexp_count(col("s"), lit("a"), Some(lit(1)), Some(lit("i"))),
+            regexp_count(col("s"), lit("a"), Some(lit(1)), Some(lit("m"))),
             upper(col("s")),
         ] {
             let renders = unparser.expr_to_sql(&expr).is_ok();
@@ -428,12 +553,54 @@ mod tests {
 
     #[test]
     fn every_carved_out_bigquery_name_is_a_function_the_deny_list_knows() {
-        let json = runtime_udfs_api::json_function_names();
+        let spice = runtime_udfs_api::spice_function_names();
         for name in bigquery_native_function_names() {
             assert!(
-                json.iter().any(|known| known == name),
-                "`{name}` is not a name `datafusion-functions-json` registers, so carving it out \
+                spice.iter().any(|known| known == name),
+                "`{name}` is not registered with the Spice deny-list, so carving it out \
                  of the deny-list does nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn no_denied_builtin_is_advertised_as_a_native_duckdb_function() {
+        // `duckdb_native_function_names` is what the deny-list reads as its
+        // carve-out, so a denied name appearing there would un-deny it and push
+        // down a call DuckDB answers differently (#13809). Driven from the
+        // deny-list itself rather than a hardcoded name, so denying another
+        // built-in cannot skip this check.
+        for name in crate::function_support::DUCKDB_DENIED_BUILTINS {
+            assert!(
+                !duckdb_native_function_names().contains(name),
+                "`{name}` is denied for DuckDB and must not be advertised as native"
+            );
+        }
+    }
+
+    #[test]
+    fn the_constructed_duckdb_dialect_renders_no_denied_builtin() {
+        // Asserted against the dialect `new_duckdb_dialect` actually builds, not
+        // against `duckdb_scalar_overrides` alone: the constructor chains
+        // `duckdb_builtin_scalar_overrides` too, so checking one list would leave
+        // this test green while a handler was restored in the other.
+        //
+        // `regexp_match` had one, rendering `ARRAY[regexp_extract(s, p, 0)] AS
+        // item` — the whole match rather than the capture groups, the empty
+        // string rather than NULL, and an `AS item` DuckDB's parser rejects
+        // wherever the expression is aliased (#13809).
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let args = [col("c0"), col("c1")];
+
+        for name in crate::function_support::DUCKDB_DENIED_BUILTINS {
+            assert!(
+                matches!(
+                    dialect.scalar_function_to_sql_overrides(&unparser, name, &args),
+                    Ok(None)
+                ),
+                "the constructed DuckDB dialect must render no handler for the denied \
+                 `{name}`; one here would send DuckDB a call it answers differently"
             );
         }
     }

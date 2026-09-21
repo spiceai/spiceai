@@ -50,6 +50,8 @@ adbc_ffi.workspace = true
 runtime = { path = "../../runtime", features = ["adbc"] }
 app = { path = "../../app" }
 datafusion-federation = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
 
 [features]
 default = []

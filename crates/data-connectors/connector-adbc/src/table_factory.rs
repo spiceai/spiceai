@@ -31,7 +31,7 @@ use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
 use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use runtime_datafusion::dialect::new_bigquery_dialect;
 use runtime_datafusion::function_support::deny_spice_functions_for_bigquery_table_providers;
-use runtime_datafusion::optimizer_rule::RegexpMatchNullCheckRewrite;
+use runtime_datafusion::optimizer_rule::{JsonGetNullCheckRewrite, RegexpMatchNullCheckRewrite};
 use runtime_udfs_api::deny_spice_functions_for_table_providers;
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync>;
@@ -67,7 +67,10 @@ fn pre_federation_optimizer_rules_for_driver(
     driver_name: &str,
 ) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     match driver_name {
-        BIGQUERY_DRIVER => vec![Arc::new(RegexpMatchNullCheckRewrite::new())],
+        BIGQUERY_DRIVER => vec![
+            Arc::new(RegexpMatchNullCheckRewrite::new()),
+            Arc::new(JsonGetNullCheckRewrite),
+        ],
         _ => vec![],
     }
 }
@@ -93,9 +96,10 @@ fn pre_federation_optimizer_rules_for_driver(
 /// now applied in one function that cannot be bypassed, so dropping it is an
 /// edit to that function rather than an omission a move can make invisible.
 ///
-/// The scope is this connector. The ADBC **catalog** connector builds an
-/// `AdbcTableFactory` directly and carries no policy at all —
-/// [#13664](https://github.com/spiceai/spiceai/issues/13664).
+/// The scope is the ADBC **dataset** connector. The catalog connector has a
+/// separate factory path in `runtime`; it now installs the generic Spice
+/// policy plus driver-specific expression restrictions, but deliberately keeps
+/// its existing function surface and optimizer rules distinct from this one.
 pub(crate) struct AdbcTableFactoryWithPolicy<D>
 where
     D: adbc_core::Database + Send + 'static,
