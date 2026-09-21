@@ -22,7 +22,7 @@ use cache::{
     EntryValidity, QueryResultsCacheProvider, RevalidationOutcome,
     key::{CacheKey, RawCacheKey},
     result::CacheStatus,
-    result::query::{CachedQueryResult, CachedStream},
+    result::query::CachedQueryResult,
     to_cached_record_batch_stream,
 };
 use datafusion::{
@@ -31,7 +31,6 @@ use datafusion::{
     logical_expr::LogicalPlan,
     sql::TableReference,
 };
-use futures::TryStreamExt;
 use runtime_request_context::{
     CacheControl, CacheKeyType, CacheNamespace, Protocol, RequestContext,
 };
@@ -1061,9 +1060,13 @@ impl Query {
             );
         }
 
-        let records = match df.results_cache_provider() {
-            Some(provider) => provider.records(&raw_key, &cached_result).await,
-            None => cached_result.records().await,
+        let records = if let Some(raw) = cached_result.raw_batches() {
+            Ok(raw)
+        } else {
+            match df.results_cache_provider() {
+                Some(provider) => provider.records(&raw_key, &cached_result).await,
+                None => cached_result.records().await,
+            }
         };
         let records = match records {
             Ok(records) => records,
@@ -1093,10 +1096,7 @@ impl Query {
         });
 
         Served::Hit {
-            result: QueryResult::new(
-                Box::pin(CachedStream::new(records, cached_result.schema.arc())),
-                cache_status,
-            ),
+            result: QueryResult::from_cached_raw(records, cached_result.schema.arc(), cache_status),
             tracker,
         }
     }
@@ -1385,12 +1385,14 @@ impl Query {
 
                     match result {
                         Ok(query_result) => {
-                            let schema = query_result.data.schema();
+                            let schema = query_result
+                                .cached_schema()
+                                .unwrap_or_else(|| query_result.schema());
                             tracing::debug!(
                                 cache_key = cache_key_u64,
                                 "Background query execution succeeded, collecting batches"
                             );
-                            match query_result.data.try_collect::<Vec<_>>().await {
+                            match query_result.collect_batches().await {
                                 Ok(batches) => {
                                     tracing::debug!(
                                         cache_key = cache_key_u64,
@@ -1495,8 +1497,6 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::Schema;
     use datafusion::scalar::ScalarValue;
-
-    use futures::TryStreamExt;
 
     use cache::{
         Caching, QueryResultsCacheProvider, SimpleCache, key::CacheKey, result::CacheStatus,
@@ -2035,8 +2035,7 @@ mod tests {
             .expect("query should succeed");
         let cache_status = result.cache_status;
         let records = result
-            .data
-            .try_collect::<Vec<_>>()
+            .collect_batches()
             .await
             .expect("query should return records");
         let value = records
@@ -2121,7 +2120,7 @@ mod tests {
             .scope(async move {
                 let r = q.run().await.expect("ok");
                 assert_eq!(r.cache_status, CacheStatus::CacheMiss);
-                let _ = r.data.try_collect::<Vec<_>>().await.expect("drain");
+                let _ = r.collect_batches().await.expect("drain");
             })
             .await;
 
@@ -2134,7 +2133,7 @@ mod tests {
             .scope(async move {
                 let r = q.run().await.expect("ok");
                 assert_eq!(r.cache_status, CacheStatus::CacheStaleWhileRevalidate);
-                let _ = r.data.try_collect::<Vec<_>>().await.expect("drain");
+                let _ = r.collect_batches().await.expect("drain");
             })
             .await;
 
@@ -2197,11 +2196,7 @@ mod tests {
             .scope(async move {
                 let result = query.run().await.expect("query should succeed");
                 let cache_status = result.cache_status;
-                let _ = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should drain");
+                let _ = result.collect_batches().await.expect("should drain");
                 cache_status
             })
             .await
@@ -2507,11 +2502,7 @@ mod tests {
             .scope(async move {
                 let result = q.run().await.expect("query should succeed");
                 assert_eq!(result.cache_status, CacheStatus::CacheMiss);
-                let _ = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should drain");
+                let _ = result.collect_batches().await.expect("should drain");
             })
             .await;
 
@@ -2535,11 +2526,7 @@ mod tests {
                     CacheStatus::CacheMiss,
                     "bob must not see alice's cached entry"
                 );
-                let _ = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should drain");
+                let _ = result.collect_batches().await.expect("should drain");
             })
             .await;
 
@@ -2586,11 +2573,7 @@ mod tests {
                 let result = query.run().await.expect("query should succeed");
                 assert_eq!(result.cache_status, CacheStatus::CacheMiss);
                 // Need to drain the stream to ensure the cache is populated
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
             })
@@ -2627,11 +2610,7 @@ mod tests {
                 // Expect to miss cache because we are using the default cache key type
                 assert_eq!(result.cache_status, CacheStatus::CacheMiss);
                 // Need to drain the stream to ensure the cache is populated
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
             })
@@ -2670,11 +2649,7 @@ mod tests {
                 // Expect to miss cache because it is the first request
                 assert_eq!(result.cache_status, CacheStatus::CacheMiss);
                 // Need to drain the stream to ensure the cache is populated
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
                 assert_eq!(
@@ -2697,11 +2672,7 @@ mod tests {
                 let result = query.run().await.expect("query should succeed");
                 assert_eq!(result.cache_status, CacheStatus::CacheHit);
 
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
 
@@ -2733,11 +2704,7 @@ mod tests {
                 // An invalid key results in a cache miss
                 assert_eq!(result.cache_status, CacheStatus::CacheMiss);
 
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
 
@@ -2793,11 +2760,7 @@ mod tests {
             .scope(async move {
                 let result = query.run().await.expect("query should succeed");
                 assert_eq!(result.cache_status, CacheStatus::CacheMiss);
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 let total_rows: usize = records
                     .iter()
                     .map(arrow::array::RecordBatch::num_rows)
@@ -2816,11 +2779,7 @@ mod tests {
                     CacheStatus::CacheHit,
                     "empty result sets should be served from cache on repeat requests"
                 );
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 let total_rows: usize = records
                     .iter()
                     .map(arrow::array::RecordBatch::num_rows)
@@ -2851,11 +2810,7 @@ mod tests {
                 let result = query.run().await.expect("query should succeed");
                 assert_eq!(result.cache_status, CacheStatus::CacheMiss);
                 // Need to drain the stream to ensure the cache is populated
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
             })
@@ -2895,11 +2850,7 @@ mod tests {
                 let result = query.run().await.expect("query should succeed");
                 assert_eq!(result.cache_status, CacheStatus::CacheMiss);
                 // Need to drain the stream to ensure the cache is populated
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
             })
@@ -2915,11 +2866,7 @@ mod tests {
                 let result = query.run().await.expect("query should succeed");
                 assert_eq!(result.cache_status, CacheStatus::CacheMiss);
                 // Need to drain the stream to ensure the cache is populated
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
             })
@@ -2976,8 +2923,7 @@ mod tests {
                 let result = query.run().await.expect("query should succeed");
                 let cache_status = result.cache_status;
                 let ids = result
-                    .data
-                    .try_collect::<Vec<_>>()
+                    .collect_batches()
                     .await
                     .expect("should drain")
                     .iter()
@@ -3146,11 +3092,7 @@ mod tests {
                 // Expect to miss cache because it is the first request
                 assert_eq!(result.cache_status, CacheStatus::CacheMiss);
                 // Need to drain the stream to ensure the cache is populated
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
                 assert_eq!(
@@ -3173,11 +3115,7 @@ mod tests {
                 let result = query.run().await.expect("query should succeed");
                 assert_eq!(result.cache_status, CacheStatus::CacheHit);
 
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
 
@@ -3212,11 +3150,7 @@ mod tests {
                 // Cache miss after expiry
                 assert_eq!(result.cache_status, CacheStatus::CacheMiss);
 
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
 
@@ -3270,11 +3204,7 @@ mod tests {
                     CacheStatus::CacheMiss,
                     "First query should be a cache miss"
                 );
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(
                     records[0]
                         .column(0)
@@ -3306,11 +3236,7 @@ mod tests {
                     CacheStatus::CacheStaleWhileRevalidate,
                     "Should be serving stale data with background revalidation"
                 );
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
                 // Verify we got the STALE cached result from the first query (1, not 2)
@@ -3346,11 +3272,7 @@ mod tests {
                         tracing::debug!("Attempt {}: No cache hit yet", attempt);
                         return None;
                     }
-                    let records = result
-                        .data
-                        .try_collect::<Vec<_>>()
-                        .await
-                        .expect("should collect");
+                    let records = result.collect_batches().await.expect("should collect");
                     if records.is_empty() || records[0].num_rows() == 0 {
                         tracing::debug!("Attempt {}: Empty records", attempt);
                         return None;
@@ -3405,11 +3327,7 @@ mod tests {
                     CacheStatus::CacheHit,
                     "Should still be a cache hit - entry not yet evicted"
                 );
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(
                     records[0]
                         .column(0)
@@ -3435,11 +3353,7 @@ mod tests {
                     CacheStatus::CacheHit,
                     "Revalidated entry should be a cache hit"
                 );
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
                 assert_eq!(
@@ -3486,11 +3400,7 @@ mod tests {
             .scope(async move {
                 let result = query.run().await.expect("query should succeed");
                 assert_eq!(result.cache_status, CacheStatus::CacheMiss);
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
                 assert_eq!(
@@ -3512,11 +3422,7 @@ mod tests {
             .scope(async move {
                 let result = query.run().await.expect("query should succeed");
                 assert_eq!(result.cache_status, CacheStatus::CacheHit);
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
                 // Cached result from first query (SELECT 1)
@@ -3543,11 +3449,7 @@ mod tests {
             .scope(async move {
                 let result = query.run().await.expect("query should succeed");
                 assert_eq!(result.cache_status, CacheStatus::CacheStaleWhileRevalidate);
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
                 // Still serving stale cached result from first query
@@ -3574,11 +3476,7 @@ mod tests {
             .scope(async move {
                 let result = query.run().await.expect("query should succeed");
                 assert_eq!(result.cache_status, CacheStatus::CacheHit);
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
                 // Now serving revalidated cached result from SELECT 3
@@ -3605,11 +3503,7 @@ mod tests {
             .scope(async move {
                 let result = query.run().await.expect("query should succeed");
                 assert_eq!(result.cache_status, CacheStatus::CacheStaleWhileRevalidate);
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
                 // Should still get stale value from the previous revalidation (3)
@@ -3662,11 +3556,7 @@ mod tests {
             .scope(async move {
                 let result = query.run().await.expect("query should succeed");
                 assert_eq!(result.cache_status, CacheStatus::CacheMiss);
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
                 assert_eq!(
                     records[0]
                         .column(0)
@@ -3707,11 +3597,7 @@ mod tests {
                             "Request {i} should get stale data"
                         );
 
-                        let records = result
-                            .data
-                            .try_collect::<Vec<_>>()
-                            .await
-                            .expect("should collect");
+                        let records = result.collect_batches().await.expect("should collect");
 
                         // Verify we got the STALE value (100 from initial query, not 200)
                         assert_eq!(
@@ -3754,11 +3640,7 @@ mod tests {
                     CacheStatus::CacheHit,
                     "Cache should have been revalidated"
                 );
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
+                let records = result.collect_batches().await.expect("should collect");
 
                 // Verify cache now contains the revalidated value (200 from the single background query)
                 assert_eq!(
