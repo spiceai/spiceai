@@ -188,11 +188,7 @@ impl RuntimeStatus {
             }
         }
 
-        let ds_name = dataset.to_string();
-        let metric_value = status.discriminant();
-        self.update_component_status(&format!("dataset:{ds_name}"), status);
-        runtime_metrics::datasets::STATUS
-            .record(metric_value, &[KeyValue::new("dataset", ds_name)]);
+        self.apply_dataset_status_now(dataset, status);
     }
 
     /// Hold dataset `Ready` until [`Self::release_dataset_ready`].
@@ -210,17 +206,31 @@ impl RuntimeStatus {
     ///
     /// A dataset whose last update was not `Ready` (error, disabled, …) is not
     /// in the pending set and is left as-is.
+    ///
+    /// Pending `Ready` values are applied while still holding
+    /// [`Self::dataset_ready_hold`]'s write lock so a concurrent non-Ready
+    /// update cannot land between `take()` and replay (and then be overwritten
+    /// by a stale Ready). Concurrent writers block until replay finishes.
     pub fn release_dataset_ready(&self) {
-        let pending = self
+        let mut hold = self
             .dataset_ready_hold
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(pending) = pending {
-            for dataset in pending {
-                self.update_dataset(&dataset, ComponentStatus::Ready);
-            }
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(pending) = hold.take() else {
+            return;
+        };
+        for dataset in pending {
+            self.apply_dataset_status_now(&dataset, ComponentStatus::Ready);
         }
+    }
+
+    /// Apply a dataset status without consulting [`Self::dataset_ready_hold`].
+    fn apply_dataset_status_now(&self, dataset: &TableReference, status: ComponentStatus) {
+        let ds_name = dataset.to_string();
+        let metric_value = status.discriminant();
+        self.update_component_status(&format!("dataset:{ds_name}"), status);
+        runtime_metrics::datasets::STATUS
+            .record(metric_value, &[KeyValue::new("dataset", ds_name)]);
     }
 
     pub fn update_model(&self, model_name: &str, status: ComponentStatus) {
@@ -1138,6 +1148,49 @@ mod tests {
             "an error after a deferred Ready must not be overwritten with Ready"
         );
         assert!(!status.is_ready());
+    }
+
+    /// Forced interleaving: a concurrent Error that arrives after `take()` must
+    /// not be overwritten by replaying a stale Ready from the pending set.
+    #[test]
+    fn test_release_does_not_overwrite_concurrent_error_after_take() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("orders");
+
+        status.update_dataset(&dataset, ComponentStatus::Refreshing);
+        status.hold_dataset_ready();
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let status_err = Arc::clone(&status);
+        let dataset_err = dataset.clone();
+        let barrier_err = Arc::clone(&barrier);
+
+        let err_thread = thread::spawn(move || {
+            // Block until release has taken the hold write lock (or finished).
+            // Parking briefly lets release enter the critical section first on
+            // typical schedulers; the barrier then forces Error to contend.
+            barrier_err.wait();
+            status_err.update_dataset(
+                &dataset_err,
+                ComponentStatus::error_with_message("refresh failed"),
+            );
+        });
+
+        // Enter release; Error thread starts contending once we pass the barrier.
+        barrier.wait();
+        status.release_dataset_ready();
+        err_thread.join().expect("error thread");
+
+        assert!(
+            status
+                .get_dataset_status(&dataset)
+                .is_some_and(|s| s.is_error()),
+            "concurrent Error after take must win over stale Ready replay"
+        );
     }
 
     #[tokio::test]
