@@ -114,12 +114,17 @@ fn http_fetch_status(schema: &arrow::datatypes::Schema) -> Option<u16> {
         .and_then(|v| v.parse().ok())
 }
 
-/// A JSON-decomposed HTTP dataset never materializes `response_status` as a
-/// column (so #14157's schema-contract regression can't recur), but every
-/// row in a batch shares one fetch's status regardless — a single HTTP
-/// response never contains a per-row mix of status codes — so the
-/// schema-metadata value alone, without a column to scan, is enough to
-/// classify the whole batch.
+/// `response_status` is force-included as a real column for every HTTP
+/// dataset, decomposed or not (see `parse_http_json_nesting` in
+/// `runtime::dataconnector::https`) — the schema-metadata status alone isn't
+/// reliable once a query plan wraps the scan in another physical operator
+/// (a `FilterExec` rebuilds its output against the plan's own, plan-time
+/// schema, discarding the per-fetch metadata). The metadata check below is
+/// a fallback for the rare batch that reaches this function without the
+/// column at all; every row in a batch shares one fetch's status regardless
+/// — a single HTTP response never contains a per-row mix of status codes —
+/// so the schema-metadata value alone, without a column to scan, is still
+/// enough to classify the whole batch in that case.
 fn has_transient_http_error_responses(batches: &[RecordBatch]) -> bool {
     let Some(first_batch) = batches.first() else {
         return false;

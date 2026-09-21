@@ -258,10 +258,16 @@ WHERE request_path = '/shows/1';
   - JSON string → the string (unquoted)
   - JSON null → SQL `NULL`
   - JSON number / boolean / array / object → JSON text
-- The `content`, `request_path`, `response_status`, … metadata columns
-  are **not** available when decomposition is enabled. If you need
-  them, don't enable decomposition — use a view on top of the default
-  schema instead.
+- The `content`, `request_path`, `request_query`, `request_body`,
+  `request_headers`, `response_headers`, … metadata columns are **not**
+  available when decomposition is enabled, with two exceptions:
+  `_fetched_at` and `response_status` are always added even when you
+  don't declare them. The runtime needs both to work correctly under
+  decomposition — `_fetched_at` for caching TTL eviction and
+  `time_column`, and `response_status` to tell a real (if empty) result
+  apart from an origin failure (`caching_stale_if_error`, and the SQL
+  results cache). If you need the other metadata columns, don't enable
+  decomposition — use a view on top of the default schema instead.
 
 ## Building a normalized attributes view
 
@@ -284,5 +290,5 @@ full-text search.
 | `Multiple columns have 'json_object' metadata defined: …`               | Only one column may be marked. Remove the extra `json_object: "*"` entries.                                                                        |
 | `Column 'X' has invalid 'json_object' value: …. Only '*' is supported.` | Change the marker to the string `"*"`. Other patterns/selectors aren't supported yet.                                                              |
 | `Columns not found in table schema: …` (DynamoDB)                       | A declared static column doesn't exist in the sampled DynamoDB items. Fix the name or raise `schema_infer_max_records`.                            |
-| HTTP `content`/`response_status` columns are missing                    | Expected — decomposition replaces the default HTTP schema. Remove the `json_object` marker, or project those fields from a non-decomposed dataset. |
+| HTTP `content`/`request_path` columns are missing                       | Expected — decomposition replaces the default HTTP schema, except for the always-present `_fetched_at` and `response_status`. Remove the `json_object` marker, or project those fields from a non-decomposed dataset. |
 | Catch-all column is `NULL`                                              | The row had no keys outside the declared static columns. This is correct behavior.                                                                 |
