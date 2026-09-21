@@ -127,12 +127,12 @@ impl Runtime {
         match (&self.scheduler, &self.state) {
             (Some(scheduler), state) => {
                 let mut resolved = scheduler.clone();
-                if resolved.state_location.is_none() {
-                    if let Some(state) = state {
-                        resolved.state_location = Some(state.location.clone());
-                        if resolved.params.is_none() {
-                            resolved.params = state.params.clone();
-                        }
+                if resolved.state_location.is_none()
+                    && let Some(state) = state
+                {
+                    resolved.state_location = Some(state.location.clone());
+                    if resolved.params.is_none() {
+                        resolved.params.clone_from(&state.params);
                     }
                 }
                 Some(resolved)
