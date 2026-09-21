@@ -260,16 +260,16 @@ def parse_mods(path: Path) -> list[tuple[str, str, tuple[str, ...], tuple[str, .
     events.sort(key=lambda e: (e[0], e[1]))
 
     mods: list[tuple[str, str, tuple[str, ...], tuple[str, ...], str]] = []
-    stack: list[tuple[int, str]] = []
+    stack: list[tuple[int, str, str]] = []
     depth = 0
-    pending: str | None = None
+    pending: tuple[str, str] | None = None
 
     for _, _, item in events:
         if isinstance(item, str):
             if item == "{":
                 depth += 1
                 if pending is not None:
-                    stack.append((depth, pending))
+                    stack.append((depth, *pending))
                     pending = None
             else:
                 if stack and stack[-1][0] == depth:
@@ -277,35 +277,43 @@ def parse_mods(path: Path) -> list[tuple[str, str, tuple[str, ...], tuple[str, .
                 depth -= 1
             continue
 
-        if item.group("kind") == "{":
-            pending = item.group("name")
-            continue
-
-        # Every `path = "…"` in the attributes immediately preceding this
-        # declaration. Bounded by the previous `;`/`{`/`}` so an attribute
-        # belonging to an earlier item cannot be picked up by this one.
-        #
-        # All of them are kept, not just the last. A module routed per platform
-        # carries one `#[cfg_attr(…, path = "…")]` per configuration, and since
-        # `cfg` is never evaluated every candidate is reachable under some build
-        # — keeping only the last would report the others' files as dead.
+        # The attributes immediately preceding this declaration, bounded by the
+        # previous `;`/`{`/`}` so an attribute belonging to an earlier item
+        # cannot be picked up by this one.
         start = max(
             blanked.rfind(";", 0, item.start()),
             blanked.rfind("}", 0, item.start()),
             blanked.rfind("{", 0, item.start()),
         )
+        attributes = blanked[start + 1 : item.start()]
+        cfg = cfg_predicate(attributes, literals)
+
+        if item.group("kind") == "{":
+            # An inline module's own `cfg` governs everything declared inside
+            # it, so it rides the nesting stack rather than being dropped here.
+            pending = (item.group("name"), cfg)
+            continue
+
+        # Every `path = "…"` on the declaration, not just the last. A module
+        # routed per platform carries one `#[cfg_attr(…, path = "…")]` per
+        # configuration, and each candidate is reachable under some build —
+        # keeping only the last would report the others' files as dead.
         overrides = []
-        for pm in PATH_ATTR_RE.finditer(blanked[start + 1 : item.start()]):
+        for pm in PATH_ATTR_RE.finditer(attributes):
             idx = int(pm.group("idx"))
             if idx < len(literals) and literals[idx] not in overrides:
                 overrides.append(literals[idx])
+        # A declaration is compiled only when its own predicate *and* every
+        # enclosing inline module's predicate hold, which is an implicit
+        # `all(…)` over them.
+        governing = [c for _, _, c in stack if c] + ([cfg] if cfg else [])
         mods.append(
             (
                 item.group("name"),
                 ";",
                 tuple(overrides),
-                tuple(n for _, n in stack),
-                cfg_predicate(blanked[start + 1 : item.start()], literals),
+                tuple(n for _, n, _ in stack),
+                ", ".join(governing),
             )
         )
 

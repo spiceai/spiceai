@@ -326,10 +326,16 @@ try:
     (_demo / "tests" / "orphan").mkdir(parents=True, exist_ok=True)
     (_demo / "Cargo.toml").write_text('[package]\nname = "demo"\n', encoding="utf-8")
     (_demo / "src" / "lib.rs").write_text(
-        'mod shared;\n#[cfg(feature = "extra")]\nmod gated;\n', encoding="utf-8"
+        'mod shared;\n#[cfg(feature = "extra")]\nmod gated;\n'
+        '#[cfg(feature = "extra")]\nmod inline { mod buried; }\n',
+        encoding="utf-8",
     )
     (_demo / "src" / "shared.rs").write_text("", encoding="utf-8")
     (_demo / "src" / "gated.rs").write_text("", encoding="utf-8")
+    # A guard one level further in: the gate is on the *inline* module, and only
+    # the declaration inside it names the file.
+    (_demo / "src" / "inline").mkdir(parents=True, exist_ok=True)
+    (_demo / "src" / "inline" / "buried.rs").write_text("", encoding="utf-8")
     # The default binary declares `guard`; the second binary declares nothing.
     # Each binary has a module tree of its own, which is what stops one being
     # excused because the other is selected.
@@ -617,6 +623,18 @@ try:
     check(
         "…and is clean once the resolve turns that feature on",
         reachability("`crates/demo/src/gated.rs::a_guard`", LIB_ONLY, resolved={"demo": {"extra"}}),
+        [],
+    )
+    check_contains(
+        "a guard inside a gated inline module is reported too",
+        reachability("`crates/demo/src/inline/buried.rs::a_guard`", LIB_ONLY),
+        "behind a `cfg(feature = …)` the gate's build leaves off",
+    )
+    check(
+        "…and is clean once that feature is on",
+        reachability(
+            "`crates/demo/src/inline/buried.rs::a_guard`", LIB_ONLY, resolved={"demo": {"extra"}}
+        ),
         [],
     )
     check_contains(

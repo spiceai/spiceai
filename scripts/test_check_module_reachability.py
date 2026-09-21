@@ -298,6 +298,26 @@ check(
     [("alpha", ";", (), (), 'unix, feature = "x"')],
 )
 check(
+    "an inline module's cfg governs what it declares",
+    mods_of('#[cfg(feature = "off")]\nmod gated { mod guard; }'),
+    [("guard", ";", (), ("gated",), 'feature = "off"')],
+)
+check(
+    "an inline cfg and the declaration's own both have to hold",
+    mods_of('#[cfg(feature = "a")]\nmod outer { #[cfg(feature = "b")]\nmod leaf; }'),
+    [("leaf", ";", (), ("outer",), 'feature = "a", feature = "b"')],
+)
+check(
+    "an ungated inline module adds nothing",
+    mods_of("mod outer { mod leaf; }"),
+    [("leaf", ";", (), ("outer",), "")],
+)
+check(
+    "the inline cfg leaves with its module",
+    mods_of('#[cfg(feature = "a")]\nmod outer { mod leaf; }\nmod after;'),
+    [("leaf", ";", (), ("outer",), 'feature = "a"'), ("after", ";", (), (), "")],
+)
+check(
     "a nested cfg predicate is captured whole",
     mods_of('#[cfg(all(feature = "a", not(feature = "b")))]\nmod alpha;'),
     [("alpha", ";", (), (), 'all(feature = "a", not(feature = "b"))')],
@@ -320,6 +340,14 @@ with tempfile.TemporaryDirectory() as d:
         True,
     )
 
+    (src / "inline").mkdir()
+    (src / "lib.rs").write_text(
+        'mod plain;\n#[cfg(feature = "off")]\nmod gated;\n'
+        '#[cfg(feature = "off")]\nmod inline { mod buried; }\n',
+        encoding="utf-8",
+    )
+    (src / "inline" / "buried.rs").write_text("", encoding="utf-8")
+
     filtered: set[Path] = set()
     walk_from_root(src / "lib.rs", filtered, cfg_enabled=lambda pred: "off" not in pred)
     check(
@@ -331,6 +359,11 @@ with tempfile.TemporaryDirectory() as d:
         "…and leaves its ungated sibling alone",
         (src / "plain.rs").resolve() in filtered,
         True,
+    )
+    check(
+        "a child of a gated inline module is skipped with it",
+        (src / "inline" / "buried.rs").resolve() in filtered,
+        False,
     )
 
 print()
