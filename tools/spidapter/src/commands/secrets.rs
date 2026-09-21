@@ -134,7 +134,7 @@ fn runtime_state_uses_s3(spicepod_yaml: &str) -> bool {
             .runtime
             .scheduler
             .as_ref()
-            .map(|scheduler| scheduler.state_location.as_str()),
+            .and_then(|scheduler| scheduler.state_location.as_deref()),
         spicepod
             .runtime
             .source_rate_control
