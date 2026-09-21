@@ -25,6 +25,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# The module object as well as the names below: the reachability cases point the
+# checker at a temporary tree, which means rebinding `REPO`, `MAKEFILE` and
+# `TARGETS_RUN_OUTSIDE_THE_UNIT_GATE` on the module itself. Imported names cannot
+# do that — a rebound local would leave the functions reading the originals.
+import check_fork_patches as cfp  # noqa: E402
 from check_fork_patches import (  # noqa: E402
     DUCKDB_RS_REPO,
     DUCKDB_THRIFT_EQUALITY_MARKER,
@@ -310,8 +315,7 @@ print("\nguard reachability")
 # `guard_reachability` reads the live Makefile and the live tree, so the only way
 # to pin what it does with a shape this workspace does not currently contain is to
 # point it at one that does. The cases below are the four the ledger's Guard
-# column can produce and the two ways a named guard is not run at all.
-import check_fork_patches as cfp  # noqa: E402
+# column can produce and the ways a named guard is not run at all.
 
 _reach = Path(__file__).resolve().parent / ".test_reachability_tmp"
 try:
