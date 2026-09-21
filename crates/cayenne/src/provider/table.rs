@@ -32974,6 +32974,7 @@ impl CayenneTableProvider {
         // provisional selection as selected, empty, or snapshot_mismatch.
         lookup_index_explain: Option<&mut super::lookup_index::LookupIndexExplain>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let allow_runtime_lookup = lookup_index_explain.is_some();
         // The reference schema the Vortex decode targets. Internal reads
         // (compaction, keyset, stats) pass `None` -> stored `Utf8`/`Binary`,
         // keeping re-encoded files unchanged. The query path passes the
@@ -33183,10 +33184,30 @@ impl CayenneTableProvider {
         }
 
         // The per-file access plan is the only way a row selection reaches the
-        // Vortex scan, and a format carries exactly one provider. Swapping it
-        // here (after listing and footer-statistics collection) keeps the
-        // selection out of the shared file-statistics cache.
-        let plan_format: Arc<dyn FileFormat> = match lookup_plan_provider {
+        // Vortex scan, and a format carries exactly one provider. A static
+        // literal lookup has already resolved its positions above. Otherwise an
+        // indexed table retains a runtime provider: when Vortex opens a file it
+        // can inspect a completed hash-join dynamic filter and batch-probe the
+        // same snapshot index. Unsupported or oversized filters simply return no
+        // runtime plan and keep the ordinary scan path.
+        let runtime_lookup_provider: Option<Arc<dyn VortexAccessPlanProvider>> = self
+            .lookup_index
+            .as_ref()
+            .filter(|_| allow_runtime_lookup)
+            .map(|index| {
+                Arc::new(super::lookup_index::DynamicLookupAccessPlanProvider::new(
+                    Arc::clone(index),
+                    snapshot_id.to_string(),
+                    Self::position_deletion_plans(&self.pk_deletion_strategy),
+                )) as Arc<dyn VortexAccessPlanProvider>
+            });
+        // Runtime lookup filters are populated only while a hash join executes.
+        // Preserve the base scan's exact statistics here so an indexed table can
+        // still use metadata-only aggregates when no runtime filter is present.
+        // Static lookup selections above already make their restricted scan
+        // statistics inexact.
+        let plan_provider = lookup_plan_provider.or(runtime_lookup_provider);
+        let plan_format: Arc<dyn FileFormat> = match plan_provider {
             Some(provider) => Arc::new(
                 self.context
                     .file_format()

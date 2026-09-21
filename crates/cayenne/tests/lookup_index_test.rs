@@ -50,11 +50,16 @@ const PLAIN: &str = "svc_plain";
 /// The plan-evidence test uses its own pair of tables.
 const INDEXED_EVIDENCE: &str = "svc_indexed_evidence";
 const PLAIN_EVIDENCE: &str = "svc_plain_evidence";
+const INDEXED_COUNT: &str = "svc_indexed_count";
 /// The write-time build test owns its own table.
 const INDEXED_WRITE_TIME: &str = "svc_indexed_write_time";
 
 /// The indexed tables' `indexes`, one column set per entry.
-const INDEX_KEYS: [&[&str]; 2] = [&["TenantId", "ServiceId"], &["TenantId", "PoolId"]];
+const INDEX_KEYS: [&[&str]; 3] = [
+    &["TenantId", "ServiceId"],
+    &["TenantId", "PoolId"],
+    &["AutoId"],
+];
 
 const ROWS: usize = 40_000;
 /// Accounts and pools are low-cardinality, so `(TenantId, PoolId)` is
@@ -279,6 +284,48 @@ fn counters_of(provider: &Arc<CayenneTableProvider>) -> cayenne::lookup_index::L
     provider
         .lookup_index_counters()
         .expect("indexed table has index state")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn indexed_table_preserves_metadata_only_count() {
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+    let indexed = build_table(
+        &fixture,
+        INDEXED_COUNT,
+        &INDEX_KEYS,
+        Arc::clone(&runtime_env),
+    )
+    .await;
+    insert(&indexed, INDEXED_COUNT, service_rows(0, ROWS)).await;
+    wait_for_index(&indexed, INDEXED_COUNT).await;
+
+    let analyzed = query(
+        &indexed,
+        INDEXED_COUNT,
+        &format!("EXPLAIN ANALYZE SELECT COUNT(*) FROM {INDEXED_COUNT}"),
+    )
+    .await;
+    let plan = arrow::util::pretty::pretty_format_batches(&analyzed)
+        .expect("format count plan")
+        .to_string();
+    assert!(
+        plan.contains("PlaceholderRowExec") && !plan.contains("DataSourceExec"),
+        "indexed count did not use exact metadata statistics:\n{plan}"
+    );
+    assert_eq!(
+        rendered(
+            &query(
+                &indexed,
+                INDEXED_COUNT,
+                &format!("SELECT COUNT(*) FROM {INDEXED_COUNT}"),
+            )
+            .await
+        ),
+        vec![(ROWS + 5).to_string()]
+    );
 }
 
 /// Issues a probe-shaped query until the background build publishes an index.
@@ -586,6 +633,166 @@ async fn lookup_index_plan_evidence() {
     println!("=== {PLAIN_EVIDENCE} ===\n{plain_text}");
     println!("=== fallback ===\n{fallback_text}");
     println!("lookup-index counters: {:?}", counters_of(&indexed));
+}
+
+/// A hash join's exact runtime key set is batch-probed against the secondary
+/// index after physical planning. The scan-level `lookup_index_outcome` remains
+/// `not_applicable` because no literal existed at `TableProvider::scan` time;
+/// the counter delta proves the later dynamic probe selected row positions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_filter_batch_probes_the_lookup_index() {
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+    let indexed = build_table(
+        &fixture,
+        INDEXED_EVIDENCE,
+        &INDEX_KEYS,
+        Arc::clone(&runtime_env),
+    )
+    .await;
+    insert(&indexed, INDEXED_EVIDENCE, service_rows(0, ROWS)).await;
+    wait_for_index(&indexed, INDEXED_EVIDENCE).await;
+
+    let key_schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)]));
+    let key_batch = RecordBatch::try_new(
+        Arc::clone(&key_schema),
+        vec![Arc::new(Int64Array::from(vec![7, 12_345, 39_999]))],
+    )
+    .expect("key batch");
+    let keys = datafusion::datasource::MemTable::try_new(key_schema, vec![vec![key_batch]])
+        .expect("key table");
+
+    let ctx = SessionContext::new();
+    ctx.register_table(
+        INDEXED_EVIDENCE,
+        Arc::clone(&indexed) as Arc<dyn TableProvider>,
+    )
+    .expect("register indexed table");
+    ctx.register_table("keys", Arc::new(keys))
+        .expect("register keys");
+
+    let sql = format!(
+        "SELECT s.\"AutoId\" FROM keys k INNER JOIN {INDEXED_EVIDENCE} s \
+         ON k.key = s.\"AutoId\" ORDER BY s.\"AutoId\""
+    );
+    let before = counters_of(&indexed);
+    let rows = ctx
+        .sql(&sql)
+        .await
+        .expect("join plan")
+        .collect()
+        .await
+        .expect("join execution");
+    assert_eq!(rendered(&rows), vec!["12345", "39999", "7"]);
+    let after = counters_of(&indexed);
+    assert_eq!(
+        after.selected - before.selected,
+        1,
+        "the three dynamic keys should be one batched index probe: {before:?} -> {after:?}"
+    );
+    assert_eq!(
+        after.candidate_rows - before.candidate_rows,
+        3,
+        "the batch should resolve exactly three row positions: {before:?} -> {after:?}"
+    );
+    assert!(
+        after.access_plans_attached > before.access_plans_attached,
+        "the runtime probe did not reach the Vortex access plan: {before:?} -> {after:?}"
+    );
+
+    let explain = ctx
+        .sql(&format!("EXPLAIN ANALYZE {sql}"))
+        .await
+        .expect("explain plan")
+        .collect()
+        .await
+        .expect("explain execution");
+    let plan = arrow::util::pretty::pretty_format_batches(&explain)
+        .expect("format plan")
+        .to_string();
+    assert!(
+        plan.contains("HashJoinExec") && plan.contains("DynamicFilter"),
+        "the evidence query did not use a dynamically filtered hash join:\n{plan}"
+    );
+    assert!(
+        plan.contains("lookup_index_outcome=not_applicable"),
+        "the index was unexpectedly chosen from static scan filters:\n{plan}"
+    );
+
+    let composite_schema = Arc::new(Schema::new(vec![
+        Field::new("account", DataType::Utf8, false),
+        Field::new("service", DataType::Utf8, false),
+    ]));
+    let composite_batch = RecordBatch::try_new(
+        Arc::clone(&composite_schema),
+        vec![
+            Arc::new(StringArray::from(vec![
+                format!("AC{:032x}", 7 % ACCOUNTS),
+                format!("AC{:032x}", 12_345 % ACCOUNTS),
+                format!("AC{:032x}", 39_999 % ACCOUNTS),
+            ])),
+            Arc::new(StringArray::from(vec![
+                format!("MG{:032x}", 7),
+                format!("MG{:032x}", 12_345),
+                format!("MG{:032x}", 39_999),
+            ])),
+        ],
+    )
+    .expect("composite key batch");
+    let composite_keys =
+        datafusion::datasource::MemTable::try_new(composite_schema, vec![vec![composite_batch]])
+            .expect("composite key table");
+    ctx.register_table("composite_keys", Arc::new(composite_keys))
+        .expect("register composite keys");
+    let composite_sql = format!(
+        "SELECT s.\"AutoId\" FROM composite_keys k INNER JOIN {INDEXED_EVIDENCE} s \
+         ON k.account = s.\"TenantId\" AND k.service = s.\"ServiceId\" \
+         ORDER BY s.\"AutoId\""
+    );
+    let composite_before = counters_of(&indexed);
+    let composite_rows = ctx
+        .sql(&composite_sql)
+        .await
+        .expect("composite join plan")
+        .collect()
+        .await
+        .expect("composite join execution");
+    assert_eq!(rendered(&composite_rows), vec!["12345", "39999", "7"]);
+    let composite_after = counters_of(&indexed);
+    assert_eq!(
+        composite_after.selected - composite_before.selected,
+        1,
+        "the correlated dynamic tuples should be one batched composite index probe: \
+         {composite_before:?} -> {composite_after:?}"
+    );
+    assert_eq!(
+        composite_after.candidate_rows - composite_before.candidate_rows,
+        3,
+        "the composite batch should resolve exactly three row positions: \
+         {composite_before:?} -> {composite_after:?}"
+    );
+    let composite_explain = ctx
+        .sql(&format!("EXPLAIN ANALYZE {composite_sql}"))
+        .await
+        .expect("composite explain plan")
+        .collect()
+        .await
+        .expect("composite explain execution");
+    let composite_plan = arrow::util::pretty::pretty_format_batches(&composite_explain)
+        .expect("format composite plan")
+        .to_string();
+    assert!(
+        composite_plan.contains("HashJoinExec") && composite_plan.contains("DynamicFilter"),
+        "the composite evidence query did not use a dynamically filtered hash join:\n\
+         {composite_plan}"
+    );
+
+    println!("=== dynamic indexed join ===\n{plan}");
+    println!("=== dynamic composite indexed join ===\n{composite_plan}");
+    println!("lookup-index counters: {before:?} -> {after:?}");
+    println!("composite lookup-index counters: {composite_before:?} -> {composite_after:?}");
 }
 
 /// The write-time index must be indistinguishable from one built by reading the

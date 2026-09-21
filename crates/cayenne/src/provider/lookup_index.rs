@@ -70,8 +70,8 @@ limitations under the License.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::memory_account::{CayenneMemoryAccount, LookupIndexReservation};
@@ -85,6 +85,10 @@ use arrow_schema::{DataType, Field, FieldRef};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_common::{ScalarValue, Statistics};
 use datafusion_datasource::{PartitionedFile, file_groups::FileGroup};
+use datafusion_physical_expr::expressions::{
+    Column, DynamicFilterPhysicalExpr, InListExpr, Literal,
+};
+use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use futures::StreamExt;
 use object_store::{ObjectMeta, ObjectStore};
 use parking_lot::Mutex;
@@ -106,6 +110,10 @@ const POSITION_BITS: u32 = 40;
 const POSITION_MASK: u64 = (1u64 << POSITION_BITS) - 1;
 /// File ids above this would not survive the shift into a packed posting.
 const MAX_FILE_ID: u32 = (1u32 << (u64::BITS - POSITION_BITS)) - 1;
+
+/// Runtime index scans stop being attractive once their exact key/posting set is
+/// no longer tiny relative to the table. Mirrors `DuckDB`'s conservative default.
+const RUNTIME_INDEX_MIN_ROWS: usize = 2_048;
 
 /// Sorted entries per block. A lookup decodes the block(s) its key can fall in,
 /// and one row-encoded key is retained per block to find them, so this trades
@@ -671,6 +679,51 @@ impl SnapshotLookupIndex {
         }
         None
     }
+
+    /// Resolves a batch of correlated keys and groups all of the resulting
+    /// postings by file. Returning `None` declines the index entirely; callers
+    /// must never use a partial batch.
+    fn probe_keys(&self, columns: &[String], keys: &[Vec<ScalarValue>]) -> Option<ProbeHit> {
+        let shape = self.shapes.iter().find(|shape| {
+            shape.columns.len() == columns.len()
+                && shape
+                    .columns
+                    .iter()
+                    .zip(columns)
+                    .all(|(indexed, requested)| indexed.name.eq_ignore_ascii_case(requested))
+        })?;
+        let mut postings = Vec::new();
+        for key in keys {
+            if key.len() != columns.len() {
+                return None;
+            }
+            match shape.probe(&self.session, key) {
+                ShapeProbe::Postings(key_postings) => postings.extend(key_postings),
+                ShapeProbe::Unanswerable => return None,
+            }
+        }
+        postings.sort_unstable();
+        postings.dedup();
+
+        let mut by_file: HashMap<&str, Vec<u64>> = HashMap::new();
+        for &packed in &postings {
+            let (file_id, position) = unpack(packed);
+            let file = self.files.get(file_id)?;
+            by_file
+                .entry(file.path.as_str())
+                .or_default()
+                .push(position);
+        }
+        let per_file = by_file
+            .into_iter()
+            .map(|(path, positions)| (path.to_string(), positions))
+            .collect();
+        Some(ProbeHit {
+            shape: shape.label.clone(),
+            per_file,
+            rows: postings.len(),
+        })
+    }
 }
 
 struct ProbeHit {
@@ -829,6 +882,72 @@ struct LookupAccessPlanProvider {
     table: Arc<dyn VortexAccessPlanProvider>,
 }
 
+/// Runtime row selection derived from a completed hash-join dynamic filter.
+struct RuntimeLookupSelection {
+    index: Arc<SnapshotLookupIndex>,
+    per_file: HashMap<String, Vec<u64>>,
+}
+
+/// Adds exact dynamic-filter keys to the table's ordinary per-file access plan.
+///
+/// The provider is installed while the physical scan is built, but probes the
+/// lookup index only when Vortex opens a file. At that point a collect-left hash
+/// join has populated its `DynamicFilterPhysicalExpr` with the exact `IN` list.
+pub(crate) struct DynamicLookupAccessPlanProvider {
+    state: Arc<LookupIndexState>,
+    visible_snapshot: String,
+    table: Arc<dyn VortexAccessPlanProvider>,
+    selection: OnceLock<Option<RuntimeLookupSelection>>,
+}
+
+impl DynamicLookupAccessPlanProvider {
+    pub(crate) fn new(
+        state: Arc<LookupIndexState>,
+        visible_snapshot: String,
+        table: Arc<dyn VortexAccessPlanProvider>,
+    ) -> Self {
+        Self {
+            state,
+            visible_snapshot,
+            table,
+            selection: OnceLock::new(),
+        }
+    }
+
+    fn resolve(
+        &self,
+        predicate: Option<&Arc<dyn PhysicalExpr>>,
+    ) -> Option<&RuntimeLookupSelection> {
+        if let Some(selection) = self.selection.get() {
+            return selection.as_ref();
+        }
+        let predicate = predicate?;
+        // Do not freeze an initial `DynamicFilter [empty]`/`true` as a permanent
+        // decline. Once an exact list is visible, `OnceLock` makes the batched
+        // probe and its counter update occur exactly once across concurrent file
+        // openers.
+        self.state
+            .specs
+            .iter()
+            .find_map(|spec| dynamic_in_list_keys(predicate, &spec.columns))?;
+        self.selection
+            .get_or_init(|| {
+                self.state
+                    .probe_runtime_filter(&self.visible_snapshot, predicate)
+            })
+            .as_ref()
+    }
+}
+
+impl std::fmt::Debug for DynamicLookupAccessPlanProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicLookupAccessPlanProvider")
+            .field("visible_snapshot", &self.visible_snapshot)
+            .field("resolved", &self.selection.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for LookupAccessPlanProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LookupAccessPlanProvider")
@@ -849,6 +968,86 @@ fn selection_keeps(selection: &Selection, position: u64) -> bool {
     }
 }
 
+/// Returns the exact non-null keys carried for `columns` by a dynamic filter.
+/// Bounds and hash-membership expressions deliberately decline: only an
+/// `InListExpr` is an enumerable, exact key set for the lookup index.
+///
+/// `DataFusion` represents a multi-column join key as one `struct(...) IN`
+/// expression. Extracting each struct literal preserves the build rows' tuple
+/// correlation; independent per-column lists must never be combined here.
+fn dynamic_in_list_keys(
+    expr: &Arc<dyn PhysicalExpr>,
+    columns: &[String],
+) -> Option<Vec<Vec<ScalarValue>>> {
+    if let Some(dynamic) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() {
+        return in_list_keys(&dynamic.current().ok()?, columns);
+    }
+    expr.children()
+        .into_iter()
+        .find_map(|child| dynamic_in_list_keys(child, columns))
+}
+
+fn in_list_keys(expr: &Arc<dyn PhysicalExpr>, columns: &[String]) -> Option<Vec<Vec<ScalarValue>>> {
+    if let Some(in_list) = expr.downcast_ref::<InListExpr>()
+        && !in_list.negated()
+        && in_list_matches_columns(in_list, columns)
+    {
+        let mut keys = Vec::with_capacity(in_list.len());
+        for value in in_list.list() {
+            let scalar = value.downcast_ref::<Literal>()?.value();
+            if columns.len() == 1 {
+                if !scalar.is_null() {
+                    keys.push(vec![scalar.clone()]);
+                }
+                continue;
+            }
+
+            let ScalarValue::Struct(struct_array) = scalar else {
+                return None;
+            };
+            if struct_array.len() != 1 {
+                return None;
+            }
+            if struct_array.is_null(0) {
+                continue;
+            }
+            let key = struct_array
+                .columns()
+                .iter()
+                .map(|array| ScalarValue::try_from_array(array, 0).ok())
+                .collect::<Option<Vec<_>>>()?;
+            if key.iter().all(|value| !value.is_null()) {
+                keys.push(key);
+            }
+        }
+        return Some(keys);
+    }
+    expr.children()
+        .into_iter()
+        .find_map(|child| in_list_keys(child, columns))
+}
+
+fn in_list_matches_columns(in_list: &InListExpr, columns: &[String]) -> bool {
+    match columns {
+        [column] => in_list
+            .expr()
+            .downcast_ref::<Column>()
+            .is_some_and(|candidate| candidate.name().eq_ignore_ascii_case(column)),
+        [] => false,
+        columns => in_list
+            .expr()
+            .downcast_ref::<ScalarFunctionExpr>()
+            .filter(|function| function.name().eq_ignore_ascii_case("struct"))
+            .is_some_and(|function| {
+                function.args().len() == columns.len()
+                    && function.args().iter().zip(columns).all(|(arg, column)| {
+                        arg.downcast_ref::<Column>()
+                            .is_some_and(|candidate| candidate.name().eq_ignore_ascii_case(column))
+                    })
+            }),
+    }
+}
+
 impl VortexAccessPlanProvider for LookupAccessPlanProvider {
     fn access_plan_for_file(&self, file: &PartitionedFile) -> Option<Arc<VortexAccessPlan>> {
         let path: &str = file.object_meta.location.as_ref();
@@ -860,6 +1059,54 @@ impl VortexAccessPlanProvider for LookupAccessPlanProvider {
         };
         let positions = match table_plan.as_deref().and_then(VortexAccessPlan::selection) {
             None | Some(Selection::All) => Buffer::copy_from(candidates.as_slice()),
+            Some(table_selection) => candidates
+                .iter()
+                .copied()
+                .filter(|&position| selection_keeps(table_selection, position))
+                .collect::<Buffer<u64>>(),
+        };
+        self.state
+            .counters
+            .access_plans_attached
+            .fetch_add(1, Ordering::Relaxed);
+        Some(Arc::new(
+            VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(positions)),
+        ))
+    }
+
+    fn adjust_statistics(&self, object: &ObjectMeta, statistics: Statistics) -> Statistics {
+        self.table.adjust_statistics(object, statistics)
+    }
+}
+
+impl VortexAccessPlanProvider for DynamicLookupAccessPlanProvider {
+    fn access_plan_for_file(&self, file: &PartitionedFile) -> Option<Arc<VortexAccessPlan>> {
+        self.table.access_plan_for_file(file)
+    }
+
+    fn runtime_access_plan_for_file(
+        &self,
+        file: &PartitionedFile,
+        predicate: Option<&Arc<dyn PhysicalExpr>>,
+    ) -> Option<Arc<VortexAccessPlan>> {
+        let selection = self.resolve(predicate)?;
+        let path: &str = file.object_meta.location.as_ref();
+
+        // A file absent from, or changed since, the indexed snapshot cannot use
+        // the selection. Returning no runtime plan leaves the exact Vortex
+        // predicate and hash probe to produce the result safely.
+        let &file_id = selection.index.file_ids.get(path)?;
+        let indexed = selection.index.files.get(file_id as usize)?;
+        if indexed.size != file.object_meta.size
+            || indexed.last_modified_ms != file.object_meta.last_modified.timestamp_millis()
+        {
+            return None;
+        }
+
+        let candidates = selection.per_file.get(path).map_or(&[][..], Vec::as_slice);
+        let table_plan = self.table.access_plan_for_file(file);
+        let positions = match table_plan.as_deref().and_then(VortexAccessPlan::selection) {
+            None | Some(Selection::All) => Buffer::copy_from(candidates),
             Some(table_selection) => candidates
                 .iter()
                 .copied()
@@ -1384,6 +1631,46 @@ impl LookupIndexState {
             shape: hit.shape,
             per_file: hit.per_file,
             rows: hit.rows,
+        })
+    }
+
+    /// Probes a completed hash-join dynamic filter as one batched lookup.
+    ///
+    /// Single-column membership arrives as `column IN (...)`; composite
+    /// membership arrives as `struct(columns...) IN (struct literals...)`, so
+    /// tuple correlation is preserved without a Cartesian product. Unsupported
+    /// shapes fall through to the ordinary Vortex predicate and hash probe.
+    fn probe_runtime_filter(
+        self: &Arc<Self>,
+        visible_snapshot: &str,
+        predicate: &Arc<dyn PhysicalExpr>,
+    ) -> Option<RuntimeLookupSelection> {
+        let (columns, keys) = self.specs.iter().find_map(|spec| {
+            dynamic_in_list_keys(predicate, &spec.columns)
+                .map(|keys| (spec.columns.as_slice(), keys))
+        })?;
+        let index = self.published()?;
+        if index.snapshot_id != visible_snapshot {
+            return None;
+        }
+
+        let threshold = RUNTIME_INDEX_MIN_ROWS.max(usize_of(index.stats.rows) / 1_000);
+        if keys.len() > threshold {
+            return None;
+        }
+        let hit = index.probe_keys(columns, &keys)?;
+        if hit.rows > threshold {
+            return None;
+        }
+
+        if hit.rows == 0 {
+            self.record_probe(&hit.shape, ProbeOutcome::Empty);
+        } else {
+            self.record_selection(&hit.shape, hit.per_file.len() as u64, hit.rows as u64);
+        }
+        Some(RuntimeLookupSelection {
+            index,
+            per_file: hit.per_file,
         })
     }
 

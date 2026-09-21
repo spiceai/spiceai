@@ -1091,6 +1091,10 @@ impl FileFormat for VortexFormat {
         source = source
             .with_file_metadata_cache(state.runtime_env().cache_manager.get_file_metadata_cache());
 
+        if let Some(provider) = self.access_plan_provider.as_ref() {
+            source = source.with_runtime_access_plan_provider(Arc::clone(provider));
+        }
+
         let conf = FileScanConfigBuilder::from(file_scan_config)
             .with_source(Arc::new(source))
             .build();

@@ -54,6 +54,7 @@ use vortex_utils::aliases::dash_map::DashMap;
 use vortex_utils::aliases::dash_map::Entry;
 
 use crate::VortexAccessPlan;
+use crate::VortexAccessPlanProvider;
 use crate::convert::exprs::ExpressionConvertor;
 use crate::convert::exprs::ProcessedProjection;
 use crate::convert::exprs::make_vortex_predicate;
@@ -112,6 +113,8 @@ pub(crate) struct VortexOpener {
     /// Whether to enable expression pushdown into the underlying Vortex scan.
     pub projection_pushdown: bool,
     pub scan_concurrency: Option<usize>,
+    /// Provider consulted after runtime dynamic filters have been populated.
+    pub runtime_access_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>>,
 }
 
 impl FileOpener for VortexOpener {
@@ -149,6 +152,9 @@ impl FileOpener for VortexOpener {
 
         let expr_convertor = Arc::clone(&self.expression_convertor);
         let projection_pushdown = self.projection_pushdown;
+        let runtime_access_plan_provider =
+            self.runtime_access_plan_provider.as_ref().map(Arc::clone);
+        let runtime_predicate = self.filter.as_ref().map(Arc::clone);
 
         // Replace column access for partition columns with literals
         let literal_value_cols: std::collections::HashMap<String, ScalarValue> = self
@@ -170,6 +176,19 @@ impl FileOpener for VortexOpener {
         }
 
         Ok(async move {
+            let runtime_access_plan = runtime_access_plan_provider.as_ref().and_then(|provider| {
+                provider.runtime_access_plan_for_file(&file, runtime_predicate.as_ref())
+            });
+
+            // A runtime index may prove that this file has no candidate rows. Return
+            // before opening the Vortex footer or constructing its layout reader.
+            if runtime_access_plan
+                .as_deref()
+                .is_some_and(VortexAccessPlan::is_empty)
+            {
+                return Ok(stream::empty().boxed());
+            }
+
             // Create FilePruner when we have a predicate and either dynamic expressions
             // or file statistics available. The pruner can eliminate files without
             // opening them based on:
@@ -463,6 +482,10 @@ impl FileOpener for VortexOpener {
                 scan_builder = vortex_plan.apply_to_builder(scan_builder);
             }
 
+            if let Some(runtime_plan) = runtime_access_plan {
+                scan_builder = runtime_plan.apply_to_builder(scan_builder);
+            }
+
             if let Some(row_range) = row_range {
                 scan_builder = scan_builder.with_row_range(row_range);
             }
@@ -592,14 +615,6 @@ fn collect_vortex_pushdown_conjunct(
         for conjunct in split_conjunction(&current).into_iter().cloned() {
             collect_vortex_pushdown_conjunct(expr_convertor, conjunct, schema, true, conjuncts)?;
         }
-        return Ok(());
-    }
-
-    // Decline the *membership* (`InList`) conjunct of a hash-join dynamic filter.
-    // Vortex evaluates an `InList` with the O(N×M) `list_contains` kernel per row, which
-    // dominates scan time for large build-side lists.
-    if from_dynamic_filter && expr.is::<df_expr::InListExpr>() {
-        conjuncts.skipped_dynamic.push(expr);
         return Ok(());
     }
 
@@ -911,6 +926,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
         }
     }
 
@@ -1180,6 +1196,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
         };
 
         let filter = col("a").lt(lit(100_i32));
@@ -1269,6 +1286,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
         };
 
         let stream = opener.open(file)?.await?;
@@ -1426,6 +1444,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
         };
 
         // This should succeed and return the correctly projected and cast data
@@ -1488,7 +1507,48 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
         }
+    }
+
+    #[derive(Debug)]
+    struct EmptyRuntimeAccessPlanProvider;
+
+    impl VortexAccessPlanProvider for EmptyRuntimeAccessPlanProvider {
+        fn access_plan_for_file(&self, _file: &PartitionedFile) -> Option<Arc<VortexAccessPlan>> {
+            None
+        }
+
+        fn runtime_access_plan_for_file(
+            &self,
+            _file: &PartitionedFile,
+            _predicate: Option<&PhysicalExprRef>,
+        ) -> Option<Arc<VortexAccessPlan>> {
+            Some(Arc::new(
+                VortexAccessPlan::default()
+                    .with_selection(Selection::IncludeByIndex(Buffer::empty())),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_runtime_selection_skips_file_open() -> anyhow::Result<()> {
+        let _ = take_scans_built();
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let schema = make_test_batch_with_10_rows().schema();
+        let file = PartitionedFile::new("/path/does-not-exist.vortex".to_string(), 100);
+        let mut opener = make_test_opener(
+            object_store,
+            Arc::clone(&schema),
+            ProjectionExprs::from_indices(&[0], &schema),
+        );
+        opener.runtime_access_plan_provider = Some(Arc::new(EmptyRuntimeAccessPlanProvider));
+
+        let data = opener.open(file)?.await?.try_collect::<Vec<_>>().await?;
+
+        assert!(data.is_empty());
+        assert_eq!(take_scans_built(), 0);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1697,6 +1757,7 @@ mod tests {
             object_store_url: Arc::from("memory:///"),
             projection_pushdown: false,
             scan_concurrency: None,
+            runtime_access_plan_provider: None,
         };
 
         let file = PartitionedFile::new(file_path.to_string(), data_size);
@@ -1813,27 +1874,35 @@ mod tests {
         dynamic_filter as PhysicalExprRef
     }
 
+    /// The membership conjunct carries what the bounds cannot: which keys inside
+    /// the range are actually present. It only pays when the build side's keys are
+    /// scattered — for a contiguous key range the bounds are already exact — so
+    /// what this pins is that the conjunct reaches the scan at all, leaving the
+    /// scan free to use it or not.
     #[test]
-    fn dynamic_filter_inlist_membership_is_declined() {
+    fn dynamic_filter_inlist_membership_is_pushed() {
         let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
         let convertor = DefaultExpressionConvertor::default();
         let filter = bounds_and_inlist_dynamic_filter();
 
-        // The cheap min/max bounds conjuncts enter the scan (driving zone pruning) while
-        // the expensive `InList` membership is declined and left to the join hash-probe.
         let conjuncts = split_vortex_pushdown_conjuncts(&convertor, &filter, &schema)
             .expect("split should succeed");
         assert_eq!(
             conjuncts.pushed.len(),
-            2,
-            "both min/max bounds conjuncts are pushed into the scan"
+            3,
+            "both min/max bounds conjuncts and the InList membership are pushed"
         );
         assert!(conjuncts.unpushed.is_empty());
-        assert_eq!(
-            conjuncts.skipped_dynamic.len(),
-            1,
-            "the InList membership conjunct is declined"
+        assert!(
+            conjuncts.skipped_dynamic.is_empty(),
+            "nothing is left for the join hash-probe to re-do"
         );
-        assert!(conjuncts.skipped_dynamic[0].is::<df_expr::InListExpr>());
+        assert!(
+            conjuncts
+                .pushed
+                .iter()
+                .any(|expr| expr.is::<df_expr::InListExpr>()),
+            "the membership conjunct is one of them"
+        );
     }
 }
