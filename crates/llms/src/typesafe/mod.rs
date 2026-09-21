@@ -248,12 +248,14 @@ impl TypeSafe {
                     .map_err(bad)?;
                     // `TypeSafe` defines `score` as the probability-weighted average of
                     // the rubric indices. A value that contradicts the distribution is
-                    // a wrong result, not a successful evaluation.
+                    // a wrong result, not a successful evaluation; the slack absorbs
+                    // only the rounding a valid response carries.
                     let weighted: f64 = probabilities
                         .iter()
                         .map(|(key, p)| key.parse::<f64>().unwrap_or(f64::NAN) * p)
                         .sum();
-                    if !weighted.is_finite() || (score - weighted).abs() > PROBABILITY_SUM_TOLERANCE
+                    if !weighted.is_finite()
+                        || (score - weighted).abs() > weighted_score_tolerance(top)
                     {
                         return Err(bad(format!(
                             "question '{id}': score {score} is not the probability-weighted average ({weighted})"
@@ -295,6 +297,23 @@ fn is_probability(value: f64) -> bool {
 /// The slack is slightly above 0.01 so that exact 0.01 shortfall is accepted
 /// despite floating-point representation of `1.0 - 0.99`.
 const PROBABILITY_SUM_TOLERANCE: f64 = 0.011;
+
+/// Half the step of the two-decimal rounding that responses commonly carry.
+const ROUNDING_HALF_STEP: f64 = 0.005;
+
+/// How far a reported score may sit from the weighted average recomputed from the
+/// reported probabilities, for a rubric whose top index is `top`.
+///
+/// Rounding each probability by up to half a step moves that average by up to half a
+/// step times the level's index, and the score may itself be rounded, so the bound is
+/// half a step times the sum of the indices plus one. A tolerance sized for a sum of
+/// probabilities in [0, 1] is too tight once the score spans [0, top]: on a ten-level
+/// rubric, rounding alone can move the average by more than 0.2.
+fn weighted_score_tolerance(top: f64) -> f64 {
+    let index_sum = top * (top + 1.0) / 2.0;
+    // The same floating-point allowance `PROBABILITY_SUM_TOLERANCE` carries.
+    ROUNDING_HALF_STEP * (index_sum + 1.0) + 0.001
+}
 
 fn check_distribution<'a>(
     id: &str,
@@ -1322,6 +1341,78 @@ mod tests {
             })
             .await
             .expect("a two-decimal rounded distribution is still valid");
+    }
+
+    /// A ten-level score whose probabilities are the two-decimal rounding of
+    /// `{8: 0.005, 9: 0.995}`, reported with that distribution's exact weighted
+    /// average. Rounding moves the recomputed average to 9.08, well past a tolerance
+    /// sized for a sum of probabilities, so this is where a fixed slack rejects a
+    /// valid answer.
+    #[tokio::test]
+    async fn evaluate_accepts_a_rounded_distribution_with_its_exact_score() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "score", "score": 8.995,
+                "legend": {"9": "top"},
+                "probabilities": {
+                    "0": 0.0, "1": 0.0, "2": 0.0, "3": 0.0, "4": 0.0,
+                    "5": 0.0, "6": 0.0, "7": 0.0, "8": 0.01, "9": 1.0
+                },
+                "confidence": 0.9
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: score_question("q", 10),
+            })
+            .await
+            .expect("a rounded distribution with its exact score is a valid answer");
+    }
+
+    /// The slack grows with the rubric, but a score that contradicts its
+    /// distribution is still rejected on the widest rubric there is.
+    #[tokio::test]
+    async fn evaluate_rejects_a_contradictory_score_on_a_ten_level_rubric() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "score", "score": 8.5,
+                "legend": {"9": "top"},
+                "probabilities": {
+                    "0": 0.0, "1": 0.0, "2": 0.0, "3": 0.0, "4": 0.0,
+                    "5": 0.0, "6": 0.0, "7": 0.0, "8": 0.0, "9": 1.0
+                },
+                "confidence": 0.9
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: score_question("q", 10),
+            })
+            .await
+            .expect_err("a score half a level from its distribution must not be published");
+        assert!(
+            err.to_string()
+                .contains("is not the probability-weighted average"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
