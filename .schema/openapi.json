@@ -643,6 +643,9 @@
           "429": {
             "description": "Rate limited"
           },
+          "503": {
+            "description": "Upstream provider unavailable"
+          },
           "500": {
             "description": "Evaluation failed"
           }

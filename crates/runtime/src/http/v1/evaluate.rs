@@ -59,6 +59,7 @@ use crate::model::EvaluateModelStore;
         (status = 401, description = "Upstream authentication failed"),
         (status = 403, description = "Upstream permission denied"),
         (status = 429, description = "Rate limited"),
+        (status = 503, description = "Upstream provider unavailable"),
         (status = 500, description = "Evaluation failed")
     )
 ))]
@@ -153,6 +154,9 @@ fn evaluate_error_response(err: &EvaluateError) -> Response {
         EvaluateError::ModelNotFound { message, .. } => (StatusCode::NOT_FOUND, message.clone()),
         EvaluateError::RateLimited { message, .. } => {
             (StatusCode::TOO_MANY_REQUESTS, message.clone())
+        }
+        EvaluateError::ServiceUnavailable { message, .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, message.clone())
         }
         // Acquire failures are controller/internal faults, not provider 429s.
         EvaluateError::RatePermitFailed { .. } => {
@@ -288,5 +292,39 @@ mod tests {
             json.get("error").is_some(),
             "must use the documented error envelope: {json}"
         );
+    }
+
+    #[derive(Debug)]
+    struct UnavailableEvaluate;
+
+    #[async_trait]
+    impl Evaluate for UnavailableEvaluate {
+        async fn evaluate(
+            &self,
+            _request: EvaluateRequest,
+        ) -> evaluate_api::Result<EvaluateResponse> {
+            evaluate_api::ServiceUnavailableSnafu {
+                model: "jev",
+                message: "upstream 503",
+            }
+            .fail()
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluate_maps_service_unavailable_to_503() {
+        let mut store = EvaluateModelStore::new();
+        store.insert("jev".into(), Arc::new(UnavailableEvaluate));
+        let models = Arc::new(RwLock::new(store));
+        let response = post(Extension(models), Json(request_with_question("jev"))).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["error"], "upstream 503");
     }
 }

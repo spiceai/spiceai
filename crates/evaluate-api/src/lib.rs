@@ -71,6 +71,9 @@ pub enum Error {
     #[snafu(display("Rate limited by evaluation provider for model '{model}': {message}"))]
     RateLimited { model: String, message: String },
 
+    #[snafu(display("Evaluation provider is unavailable for model '{model}': {message}"))]
+    ServiceUnavailable { model: String, message: String },
+
     #[snafu(display("Evaluation model '{model}' was not found upstream: {message}"))]
     ModelNotFound { model: String, message: String },
 

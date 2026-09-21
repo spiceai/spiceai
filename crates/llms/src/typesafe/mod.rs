@@ -37,6 +37,7 @@ use evaluate_api::{
     Answer, AuthenticationFailedSnafu, Evaluate, EvaluateRequest, EvaluateResponse,
     HealthCheckFailedSnafu, InvalidRequestSnafu, ModelCallFailedSnafu, ModelNotFoundSnafu,
     PermissionDeniedSnafu, Question, RateLimitedSnafu, RatePermitFailedSnafu, Result,
+    ServiceUnavailableSnafu,
 };
 use reqwest::{Client, StatusCode};
 use runtime_rate_control::RateController;
@@ -186,6 +187,22 @@ impl TypeSafe {
                         criteria.keys().map(String::as_str),
                     )
                     .map_err(bad)?;
+                    // A choice answer is the selected option. Another option with a
+                    // strictly higher probability contradicts that selection; an exact
+                    // tie among the max remains valid.
+                    let Some(&chosen_p) = probabilities.get(choice) else {
+                        return Err(bad(format!(
+                            "question '{id}': answer '{choice}' is missing from the distribution"
+                        )));
+                    };
+                    if probabilities
+                        .iter()
+                        .any(|(option, p)| option != choice && *p > chosen_p)
+                    {
+                        return Err(bad(format!(
+                            "question '{id}': answer '{choice}' is not a highest-probability option"
+                        )));
+                    }
                 }
                 (
                     Question::Score { criteria, .. },
@@ -218,16 +235,10 @@ impl TypeSafe {
                             )));
                         }
                     }
+                    // A sparse legend is valid: every supplied key must be in range,
+                    // but not every rubric level needs a description. The probability
+                    // distribution still covers the full rubric.
                     let domain: Vec<String> = (0..=top_idx).map(|i| i.to_string()).collect();
-                    if !legend.is_empty() {
-                        for level in &domain {
-                            if !legend.contains_key(level) {
-                                return Err(bad(format!(
-                                    "question '{id}': legend is missing score level '{level}' of the rubric [0, {top_idx}]"
-                                )));
-                            }
-                        }
-                    }
                     check_distribution(
                         id,
                         probabilities,
@@ -415,6 +426,11 @@ impl Evaluate for TypeSafe {
 
             // TypeSafe documents 529 Overloaded alongside 429 for backoff.
             s if s == StatusCode::TOO_MANY_REQUESTS || s.as_u16() == 529 => RateLimitedSnafu {
+                model: self.name.clone(),
+                message: body,
+            }
+            .fail(),
+            StatusCode::SERVICE_UNAVAILABLE => ServiceUnavailableSnafu {
                 model: self.name.clone(),
                 message: body,
             }
@@ -906,17 +922,46 @@ mod tests {
         )])
     }
 
-    /// A legend that omits rubric levels must not narrow the domain its own answer
-    /// is then checked against, or an incomplete score validates.
+    /// A sparse legend is valid so long as every supplied key is in the rubric
+    /// and the probability distribution still covers every level.
     #[tokio::test]
-    async fn evaluate_rejects_a_score_legend_missing_a_rubric_level() {
+    async fn evaluate_accepts_a_sparse_score_legend() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "score", "score": 3,
+                "legend": {"0": "routine", "3": "critical"},
+                "probabilities": {"0": 0.1, "1": 0.1, "2": 0.1, "3": 0.7},
+                "confidence": 0.9
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: score_question("q", 4),
+            })
+            .await
+            .expect("a sparse legend with a full distribution is valid");
+    }
+
+    /// A legend key outside the rubric is still a wrong result.
+    #[tokio::test]
+    async fn evaluate_rejects_a_legend_key_outside_the_rubric() {
         let server = MockServer::start().await;
         systemone_returning(
             &server,
             json!({"model": "jev-latest", "answers": {"q": {
                 "type": "score", "score": 0,
-                "legend": {"0": "poor"},
-                "probabilities": {"0": 1.0}, "confidence": 0.9
+                "legend": {"0": "poor", "4": "off-scale"},
+                "probabilities": {"0": 0.5, "1": 0.5},
+                "confidence": 0.9
             }}}),
         )
         .await;
@@ -931,9 +976,12 @@ mod tests {
                 questions: score_question("q", 2),
             })
             .await
-            .expect_err("a legend that drops a rubric level must not be published");
+            .expect_err("an out-of-range legend key must not be published");
         let msg = err.to_string();
-        assert!(msg.contains("missing score level '1'"), "{msg}");
+        assert!(
+            msg.contains("legend key '4' is not in the score rubric"),
+            "{msg}"
+        );
     }
 
     /// Probabilities that do not sum to 1 are not a distribution, whatever each
@@ -1114,5 +1162,98 @@ mod tests {
             })
             .await
             .expect("a well-formed answer is still accepted");
+    }
+
+    /// A selected choice must be a highest-probability option.
+    #[tokio::test]
+    async fn evaluate_rejects_a_choice_that_is_not_highest_probability() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "choice", "choice": "billing",
+                "probabilities": {"billing": 0.1, "technical": 0.9}, "confidence": 0.88
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: choice_question("q"),
+            })
+            .await
+            .expect_err("a non-max choice must not be published");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'billing' is not a highest-probability option"),
+            "{msg}"
+        );
+    }
+
+    /// An exact tie at the maximum remains a valid selection.
+    #[tokio::test]
+    async fn evaluate_accepts_a_tied_highest_probability_choice() {
+        let server = MockServer::start().await;
+        systemone_returning(
+            &server,
+            json!({"model": "jev-latest", "answers": {"q": {
+                "type": "choice", "choice": "billing",
+                "probabilities": {"billing": 0.5, "technical": 0.5}, "confidence": 0.4
+            }}}),
+        )
+        .await;
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::String("s".into()),
+                questions: choice_question("q"),
+            })
+            .await
+            .expect("a tied maximum is still a valid choice");
+    }
+
+    #[tokio::test]
+    async fn evaluate_maps_503() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
+            .mount(&server)
+            .await;
+
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "key")
+            .expect("client")
+            .with_base_url(server.uri());
+
+        let mut questions = BTreeMap::new();
+        questions.insert(
+            "q".into(),
+            Question::Noul {
+                instructions: "yes?".into(),
+                criteria: None,
+            },
+        );
+
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::from("s"),
+                questions,
+            })
+            .await
+            .expect_err("503");
+        assert!(matches!(
+            err,
+            evaluate_api::Error::ServiceUnavailable { .. }
+        ));
     }
 }
