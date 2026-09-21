@@ -249,7 +249,10 @@ pub async fn embed_column(
         .await
         .context(FailedToEmbedSnafu)?;
 
-    Ok(distribute_nulls(embedded_data, nulls))
+    Ok(distribute_nulls(
+        std::sync::Arc::unwrap_or_clone(embedded_data),
+        nulls,
+    ))
 }
 
 /// Update the embedding column in the `RecordBatch` with the computed embeddings.

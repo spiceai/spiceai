@@ -1263,8 +1263,8 @@ impl CayenneCatalog {
 
     /// Reconcile a reopened table's stored `VortexConfig` with the currently
     /// configured options, for the fields that describe how the table is RUN
-    /// rather than how its data is written: the datalake (cold tier) settings
-    /// and the scan concurrency.
+    /// rather than whether existing files remain readable: clustering and
+    /// datalake settings plus scan concurrency.
     ///
     /// These are deliberately excluded from [`configuration_matches`] (changing
     /// them never recreates the table), and the provider runs with the STORED
@@ -1307,7 +1307,7 @@ impl CayenneCatalog {
         let new_vc = &options.vortex_config;
         let runtime_fields_differ = stored_vc.scan_concurrency != new_vc.scan_concurrency
             || stored_vc.cold_tier_location != new_vc.cold_tier_location
-            || stored_vc.cold_clustering_columns != new_vc.cold_clustering_columns
+            || stored_vc.cluster_by != new_vc.cluster_by
             || stored_vc.cold_target_file_size_mb != new_vc.cold_target_file_size_mb
             || stored_vc.cold_clustering_run_size_mb != new_vc.cold_clustering_run_size_mb
             || stored_vc.cold_tier_warm_max_bytes != new_vc.cold_tier_warm_max_bytes
@@ -1326,8 +1326,8 @@ impl CayenneCatalog {
             .clone_from(&new_vc.cold_tier_location);
         stored
             .vortex_config
-            .cold_clustering_columns
-            .clone_from(&new_vc.cold_clustering_columns);
+            .cluster_by
+            .clone_from(&new_vc.cluster_by);
         stored.vortex_config.cold_target_file_size_mb = new_vc.cold_target_file_size_mb;
         stored.vortex_config.cold_clustering_run_size_mb = new_vc.cold_clustering_run_size_mb;
         stored.vortex_config.cold_tier_warm_max_bytes = new_vc.cold_tier_warm_max_bytes;
@@ -5604,6 +5604,39 @@ fn validate_create_table_options(options: &CreateTableOptions) -> CatalogResult<
                 options.table_name
             ),
         });
+    }
+
+    let config = &options.vortex_config;
+    if !config.cluster_by.is_empty()
+        && !config.sort_columns.is_empty()
+        && config.sort_columns_origin == super::metadata::SortColumnsOrigin::User
+    {
+        return Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "Failed to create Cayenne table '{}': `cluster_by` cannot be combined with `sort_columns`. Remove one configuration; sorting within clusters is not supported yet.",
+                options.table_name
+            ),
+        });
+    }
+
+    for column in &config.cluster_by {
+        let Some((_, field)) = options.schema.column_with_name(column) else {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Failed to create Cayenne table '{}': clustering column '{column}' does not exist. Update `CLUSTER BY` or `cayenne_cluster_by` to use an existing column.",
+                    options.table_name
+                ),
+            });
+        };
+        if !crate::provider::clustering::is_clusterable(field.data_type()) {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Failed to create Cayenne table '{}': clustering column '{column}' has unsupported type '{}'. Use a Boolean, numeric (except Decimal256), temporal, string, or binary column, or remove '{column}' from the cluster key.",
+                    options.table_name,
+                    field.data_type()
+                ),
+            });
+        }
     }
 
     Ok(())

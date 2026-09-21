@@ -62,9 +62,7 @@ impl GraphQLContext for ReleasesTableArgs {
     }
 
     fn query_cost(&self) -> Option<u32> {
-        // 1 (releases) + 100 (releaseAssets per release)
-        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
-        Some(1 + ASSETS_PER_RELEASE)
+        Some(crate::rate_limit::graphql_secondary_query_cost())
     }
 }
 
@@ -228,7 +226,7 @@ fn gql_schema() -> SchemaRef {
 
 #[cfg(test)]
 mod tests {
-    use super::{ASSETS_PER_RELEASE, ReleasesTableArgs, gql_schema};
+    use super::{ReleasesTableArgs, gql_schema};
     use crate::GitHubTableArgs;
     use crate::test_util::shared_component;
     use connector_graphql::graphql::GraphQLContext;
@@ -366,7 +364,9 @@ mod tests {
         let cost = args()
             .query_cost()
             .expect("releases to declare a query cost");
-        assert_eq!(cost, 1 + ASSETS_PER_RELEASE);
-        assert!(cost <= 2000, "releases query cost {cost} exceeds the burst");
+        assert_eq!(
+            cost,
+            crate::rate_limit::GITHUB_GRAPHQL_SECONDARY_QUERY_POINTS
+        );
     }
 }

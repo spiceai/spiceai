@@ -71,6 +71,7 @@ limitations under the License.
 //! - [`constants`]: Staging-dir name, WAL filename, and other shared constants.
 //! - [`partitioned_wal`]: Cross-partition WAL for the partitioned-table
 //!   coordinator (feature-gated).
+pub(crate) mod clustering;
 pub(crate) mod cold_partition;
 pub(crate) mod column_stats;
 pub(crate) mod compaction;
@@ -117,7 +118,6 @@ pub(crate) mod utils;
 pub(crate) mod vortex_format;
 pub(crate) mod wal_checksum;
 pub(crate) mod write_budget;
-pub(crate) mod zorder;
 
 // Re-export the main type at the module level for convenience
 pub use compaction::{

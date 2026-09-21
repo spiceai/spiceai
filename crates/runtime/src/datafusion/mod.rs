@@ -83,7 +83,6 @@ use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningP
 use builder::DataFusionBuilder;
 use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
-use cache::result::query::QueryResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
 use data_components::poly::PolyTableProvider;
@@ -5113,7 +5112,7 @@ impl DataFusion {
                 && let Some(plan) = cache.get_raw_key(&cache_key.as_u64()).await
             {
                 tracing::trace!("using cached plan for {sql}");
-                return Ok(plan);
+                return Ok(std::sync::Arc::unwrap_or_clone(plan));
             }
             plans_cache
         } else {
@@ -5141,8 +5140,7 @@ impl DataFusion {
         session: &SessionState,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        let dialect = session.config().options().sql_parser.dialect;
-        let statement = session.sql_to_statement(sql, &dialect)?;
+        let statement = planner::parse_sql_statement(sql, session)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
 
@@ -5395,14 +5393,14 @@ impl runtime_query_engine::query_engine::QueryEngine for DataFusion {
         if let Some(allowlist) = request.table_allowlist {
             qb = qb.allow_tables(allowlist);
         }
-        let QueryResult { data, .. } =
+        let query_result =
             qb.build()
                 .run()
                 .await
                 .map_err(|e| QueryEngineError::QueryExecution {
                     source: DataFusionError::External(Box::new(e)),
                 })?;
-        Ok(data)
+        Ok(query_result.into_record_batch_stream())
     }
 
     async fn execute_plan(
@@ -5419,13 +5417,13 @@ impl runtime_query_engine::query_engine::QueryEngine for DataFusion {
                         .to_string(),
                 ),
             })?;
-        let QueryResult { data, .. } = Query::from_logical_plan(&arc_self, plan)
+        let query_result = Query::from_logical_plan(&arc_self, plan)
             .run()
             .await
             .map_err(|e| QueryEngineError::QueryExecution {
                 source: DataFusionError::External(Box::new(e)),
             })?;
-        Ok(data)
+        Ok(query_result.into_record_batch_stream())
     }
 
     async fn write_data(
@@ -5592,9 +5590,9 @@ pub fn is_schema_mismatch(error: &runtime_query_engine::query_engine::Error) -> 
         .is_some_and(|e| matches!(e, Error::SchemaMismatch { .. }))
 }
 
-// Normalizes a table reference to a full table reference with catalog, schema, and table name
-// so it can be used for comparison.
-fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
+/// Normalizes a table reference to a full table reference with catalog, schema, and table name
+/// so it can be used for comparison.
+pub(crate) fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
     table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
 }
 

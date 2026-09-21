@@ -121,8 +121,6 @@ jobs:
 
       - name: Set up make
         uses: ./.github/actions/setup-make
-        with:
-          os: linux
 
       - name: Set up cc
         uses: ./.github/actions/setup-cc
@@ -237,6 +235,11 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
+    # The standard pool, not `spiceai-macos-large`: this build blocks nothing,
+    # so its own latency is free, and it starts at 09:13 UTC when the pool is
+    # near-idle. Its tail is the cost -- the slowest recent run took 235 minutes
+    # and finished at 13:10 UTC -- which is paid by whatever shares its Mac mini
+    # by then, not by the nightly.
     runs-on: spiceai-macos
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
@@ -259,11 +262,89 @@ jobs:
           grep '^version =' Cargo.toml
 
       - name: Install missing tools
+        # `missing=()` is bash-specific; the default shell is a runner-image property.
+        shell: bash
         run: |
-          brew update
-          brew list cmake || brew install cmake
-          brew install unixodbc
-          echo "RUSTFLAGS=-L /opt/homebrew/lib" >> $GITHUB_ENV
+          # Probe before reaching for brew. On the self-hosted pool the formulas are
+          # already there, so every `brew` call is a no-op that still has to reach brew
+          # first — and any brew-level breakage (an unreadable global lock, a half-written
+          # `brew`) then fails the build over a toolchain it already had (#13463).
+          # `setup-cc` probes the same way for every other macOS job; this step and its
+          # twin in build_and_release.yml are the two that still call brew directly.
+          brew_bin="$(command -v brew || true)"
+          if [ -z "$brew_bin" ]; then
+            echo "::error::'brew' is not on PATH, so cmake and unixodbc cannot be installed or verified on this runner."
+            exit 1
+          fi
+          # The spiceai-macos flock wrapper is `/opt/spice/bin/brew`, so
+          # dirname/dirname of `command -v brew` is `/opt/spice` and every
+          # keg looks missing. Prefer the well-known prefixes; do not invoke
+          # brew (that takes the lock this probe exists to avoid).
+          if [ -x /opt/homebrew/bin/brew ]; then
+            brew_prefix=/opt/homebrew
+          elif [ -x /usr/local/bin/brew ]; then
+            brew_prefix=/usr/local
+          else
+            brew_prefix="$(dirname "$(dirname "$brew_bin")")"
+          fi
+          missing=()
+          # cmake is invoked by bare name from build scripts, so being in the Cellar is
+          # not enough — the name has to resolve to *this* Homebrew. Matching the prefix
+          # rather than a fixed path stays correct on an Intel runner, and catches an
+          # unlinked keg or a foreign copy earlier on PATH; both route into `brew link`.
+          case "$(command -v cmake 2>/dev/null || true)" in
+            "$brew_prefix"/*) ;;
+            *) missing+=("cmake") ;;
+          esac
+          # unixodbc is consumed through the library search path, never by name, so the
+          # keg being present is the whole requirement.
+          [ -d "$brew_prefix/opt/unixodbc" ] || missing+=("unixodbc")
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "Toolchain incomplete on this runner (${missing[*]}); installing."
+            brew update
+            brew install cmake unixodbc
+            # `brew install` only warns — and still exits 0 — on a formula that is in the
+            # Cellar but unlinked, so its binaries never reach PATH.
+            brew link --overwrite cmake || true
+          else
+            echo "cmake and unixodbc already present under $brew_prefix; skipping brew."
+          fi
+          # Assert unconditionally, so a runner whose install was skipped still fails here
+          # with a named cause rather than deep inside a build script. Only that the name
+          # resolves — deliberately not that it resolves under $brew_prefix — so a runner
+          # building today against a cmake from elsewhere on PATH keeps working.
+          if ! command -v cmake >/dev/null 2>&1; then
+            echo "::error::'cmake' is not on PATH after setup. Run 'brew link --overwrite cmake' on this runner."
+            exit 1
+          fi
+          # Prefix resolved from the located brew rather than hardcoded, so an Intel runner
+          # gets its own; unchanged on Apple Silicon. A derived value carries an injection
+          # surface a literal does not — a two-line `$GITHUB_ENV` entry appends a second
+          # variable to every later step — so refuse one, as `setup-cc` does for its own.
+          rustflags="-L $brew_prefix/lib"
+          if [ "$(printf '%s' "$rustflags" | wc -l | tr -d ' ')" != "0" ]; then
+            echo "::error::Refusing to export a multi-line RUSTFLAGS built from '$brew_prefix'."
+            exit 1
+          fi
+          echo "RUSTFLAGS=$rustflags" >> "$GITHUB_ENV"
+          # The probe above accepts an unlinked unixodbc keg — `$brew_prefix/opt/unixodbc`
+          # exists for a formula that was never linked — and in that state the `-L` above
+          # points at a directory holding no `libodbc.dylib`, so the link dies downstream as
+          # "ld: library 'odbc' not found" (#13475). Before this step probed, `brew install
+          # unixodbc` ran every time and linked it, so the gap is this step's to close.
+          # `setup-cc` covers the same case by publishing the keg's own lib directory, and
+          # deliberately only that one: `$brew_prefix/lib` additionally satisfies -lcrypto,
+          # -lssl and -lzstd, so a crate whose build script emits one of those names would
+          # link a second, differently-built copy. clang expands LIBRARY_PATH into -L entries
+          # after those already on the command line, so this restores the search path without
+          # displacing anything a build script emitted, and it is not a cargo fingerprint
+          # input, so it costs no rebuild.
+          library_path="${LIBRARY_PATH:+$LIBRARY_PATH:}$brew_prefix/opt/unixodbc/lib"
+          if [ "$(printf '%s' "$library_path" | wc -l | tr -d ' ')" != "0" ]; then
+            echo "::error::Refusing to export a multi-line LIBRARY_PATH built from '$brew_prefix'."
+            exit 1
+          fi
+          echo "LIBRARY_PATH=$library_path" >> "$GITHUB_ENV"
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -348,7 +429,7 @@ jobs:
           sudo chown $USER /var/run/docker.sock
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so the ubuntu base image
@@ -360,7 +441,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build ARM64 Docker image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile.local
@@ -399,7 +480,7 @@ jobs:
           ./.spiced-local-tmp --version
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so the ubuntu base image
@@ -411,7 +492,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build AMD64 Docker image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile.local
@@ -452,7 +533,7 @@ jobs:
           ls -l /tmp
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before pulling so we use the authenticated
