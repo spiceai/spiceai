@@ -755,16 +755,42 @@ fn scalar_timestamp_nanos(scalar: &ScalarValue) -> Option<i128> {
     }
 }
 
-/// True when `expr` is the `_last_modified` column, possibly wrapped in a cast.
-/// An `append` refresh emits `CAST(_last_modified AS Timestamp(ns, tz)) > …`;
-/// `DataFusion`'s `unwrap_cast_in_comparison` rule may instead present the bare
-/// column with a cast literal, so both forms are accepted.
+/// True when a cast target keeps the `_last_modified` value exactly.
+///
+/// The metadata column is `Timestamp(Microsecond, "UTC")`, and pruning compares
+/// in nanoseconds. A cast to microseconds or nanoseconds preserves that value
+/// (identity or an exact `* 1000`), so pruning stays equivalent to the row
+/// predicate. A coarser target (`Second`, `Millisecond`) or a non-timestamp
+/// target truncates the value, which would let, for example,
+/// `CAST(_last_modified AS Timestamp(Second)) = 200s` prune an object at 200.5s
+/// whose row still matches — so such casts are not prunable.
+fn cast_preserves_last_modified_precision(data_type: &DataType) -> bool {
+    use arrow_schema::TimeUnit;
+    matches!(
+        data_type,
+        DataType::Timestamp(TimeUnit::Microsecond | TimeUnit::Nanosecond, _)
+    )
+}
+
+/// True when `expr` is the `_last_modified` column, possibly wrapped in a
+/// precision-preserving cast. An `append` refresh emits
+/// `CAST(_last_modified AS Timestamp(ns, tz)) > …`; `DataFusion`'s
+/// `unwrap_cast_in_comparison` rule may instead present the bare column with a
+/// cast literal, so both forms are accepted. A coarsening cast is rejected (see
+/// [`cast_preserves_last_modified_precision`]) so it cannot build a prunable
+/// bound; the residual filter still enforces it.
 fn is_last_modified_ref(expr: &datafusion_expr::Expr) -> bool {
     use datafusion_expr::Expr;
     match expr {
         Expr::Column(c) => c.name == "_last_modified",
-        Expr::Cast(cast) => is_last_modified_ref(&cast.expr),
-        Expr::TryCast(cast) => is_last_modified_ref(&cast.expr),
+        Expr::Cast(cast) => {
+            cast_preserves_last_modified_precision(&cast.data_type)
+                && is_last_modified_ref(&cast.expr)
+        }
+        Expr::TryCast(cast) => {
+            cast_preserves_last_modified_precision(&cast.data_type)
+                && is_last_modified_ref(&cast.expr)
+        }
         _ => false,
     }
 }
@@ -4364,6 +4390,58 @@ mod tests {
             version: None,
         };
         assert!(last_modified_meta_passes(&sub_second, &[bound]));
+    }
+
+    #[test]
+    fn extract_last_modified_predicate_rejects_coarsening_cast() {
+        fn cast_last_modified_to(unit: arrow_schema::TimeUnit) -> datafusion_expr::Expr {
+            datafusion_expr::Expr::Cast(datafusion_expr::Cast::new(
+                Box::new(datafusion_expr::col("_last_modified")),
+                DataType::Timestamp(unit, Some("UTC".into())),
+            ))
+        }
+
+        // A coarsening cast (`Second`) truncates the microsecond metadata value,
+        // so `CAST(_last_modified AS Timestamp(Second)) = 200s` matches an object
+        // at 200.5s that a nanosecond prune would drop. It must not build a
+        // bound — the residual filter enforces it instead.
+        assert!(
+            extract_last_modified_predicate(&[cast_last_modified_to(
+                arrow_schema::TimeUnit::Second
+            )
+            .eq(datafusion_expr::lit(ScalarValue::TimestampSecond(
+                Some(200),
+                Some("UTC".into())
+            )))])
+            .is_none(),
+            "a Second-precision cast must not prune"
+        );
+        assert!(
+            extract_last_modified_predicate(&[cast_last_modified_to(
+                arrow_schema::TimeUnit::Millisecond
+            )
+            .gt(watermark_ts_ns(200))])
+            .is_none(),
+            "a Millisecond-precision cast must not prune"
+        );
+
+        // Microsecond/nanosecond casts keep the value exactly and stay prunable.
+        assert!(
+            extract_last_modified_predicate(&[cast_last_modified_to(
+                arrow_schema::TimeUnit::Microsecond
+            )
+            .gt(watermark_ts_ns(200))])
+            .is_some(),
+            "a Microsecond-precision cast preserves the value and is prunable"
+        );
+        assert!(
+            extract_last_modified_predicate(&[cast_last_modified_to(
+                arrow_schema::TimeUnit::Nanosecond
+            )
+            .gt(watermark_ts_ns(200))])
+            .is_some(),
+            "a Nanosecond-precision cast preserves the value and is prunable"
+        );
     }
 
     /// Reproduces issue #14264: an `append` refresh over an object-store source
