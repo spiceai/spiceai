@@ -284,7 +284,7 @@ impl CachedQueryResult {
         }
     }
 
-/// How many successful decode-serves the store has recorded for this
+    /// How many successful decode-serves the store has recorded for this
     /// encoded entry, or `None` if it is already raw.
     #[must_use]
     pub(crate) fn encoded_decode_hits(&self) -> Option<u8> {
@@ -1990,5 +1990,4 @@ mod tests {
             "the original value must not decode again"
         );
     }
-
 }
