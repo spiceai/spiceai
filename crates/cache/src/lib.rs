@@ -1022,7 +1022,7 @@ impl QueryResultsCacheProvider {
         &self,
         raw_key: &RawCacheKey,
         result: &CachedQueryResult,
-    ) -> std::result::Result<Arc<Vec<arrow::array::RecordBatch>>, encoding::Error> {
+    ) -> std::result::Result<crate::result::query::CachedBatches, encoding::Error> {
         let records = result.records().await?;
         self.after_encoded_decode(raw_key, result, &records).await;
         Ok(records)
@@ -1032,7 +1032,7 @@ impl QueryResultsCacheProvider {
         &self,
         raw_key: &RawCacheKey,
         result: &CachedQueryResult,
-        records: &Arc<Vec<arrow::array::RecordBatch>>,
+        records: &crate::result::query::CachedBatches,
     ) {
         match result.encoded_decode_hits() {
             Some(0) => {
@@ -1057,7 +1057,7 @@ impl QueryResultsCacheProvider {
         &self,
         raw_key: &RawCacheKey,
         result: &CachedQueryResult,
-        records: &Arc<Vec<arrow::array::RecordBatch>>,
+        records: &crate::result::query::CachedBatches,
     ) {
         let promoted = result.to_promoted_raw(Arc::clone(records));
         let promoted_size = u64::try_from(promoted.get_memory_size()).unwrap_or(u64::MAX);

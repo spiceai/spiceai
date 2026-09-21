@@ -83,7 +83,6 @@ use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningP
 use builder::DataFusionBuilder;
 use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
-use cache::result::query::QueryResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
 use data_components::poly::PolyTableProvider;
@@ -5356,14 +5355,14 @@ impl runtime_query_engine::query_engine::QueryEngine for DataFusion {
         if let Some(allowlist) = request.table_allowlist {
             qb = qb.allow_tables(allowlist);
         }
-        let QueryResult { data, .. } =
+        let query_result =
             qb.build()
                 .run()
                 .await
                 .map_err(|e| QueryEngineError::QueryExecution {
                     source: DataFusionError::External(Box::new(e)),
                 })?;
-        Ok(data)
+        Ok(query_result.into_record_batch_stream())
     }
 
     async fn execute_plan(
@@ -5380,13 +5379,13 @@ impl runtime_query_engine::query_engine::QueryEngine for DataFusion {
                         .to_string(),
                 ),
             })?;
-        let QueryResult { data, .. } = Query::from_logical_plan(&arc_self, plan)
+        let query_result = Query::from_logical_plan(&arc_self, plan)
             .run()
             .await
             .map_err(|e| QueryEngineError::QueryExecution {
                 source: DataFusionError::External(Box::new(e)),
             })?;
-        Ok(data)
+        Ok(query_result.into_record_batch_stream())
     }
 
     async fn write_data(
