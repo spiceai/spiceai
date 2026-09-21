@@ -33,14 +33,13 @@ on:
 jobs:
   analyze:
     name: Analyze
-    # pull_request heads are untrusted: Cargo build scripts and local composite
-    # actions must not run on the shared self-hosted pool. Trusted events keep
-    # spiceai-dev-runners.
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || 'spiceai-dev-runners' }}
+    # pull_request and merge_group check out PR-controlled code. Cargo build
+    # scripts and local composite actions must not run on the shared
+    # self-hosted pool or receive MinIO credentials. push/schedule/dispatch
+    # keep spiceai-dev-runners.
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'spiceai-dev-runners' || 'ubuntu-24.04' }}
     env:
-      # Same-repo pull requests still receive secrets; do not hand MinIO
-      # credentials to a PR-controlled setup-sccache action.
-      HAS_TEST_MINIO_SECRET: ${{ github.event_name != 'pull_request' && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
+      HAS_TEST_MINIO_SECRET: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     permissions:
       actions: read
       contents: read
