@@ -42,15 +42,19 @@ impl ModelsResponse {
     pub(super) fn into_names(self) -> Vec<String> {
         self.models
             .into_iter()
-            .flat_map(|m| std::iter::once(m.name).chain(m.alias))
+            .flat_map(|m| m.name.into_iter().chain(m.id).chain(m.alias))
             .collect()
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct ModelCard {
-    #[serde(alias = "id")]
-    name: String,
+    /// A card may carry a display name, a canonical id, or both; treating them as one
+    /// field makes the documented pair a duplicate and the listing undecodable.
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
     /// Additional names callers may configure (e.g. `jev-latest`). The documented
     /// listing uses `aliases`; `alias` is accepted for compatibility.
     #[serde(default, alias = "aliases")]
@@ -139,16 +143,17 @@ mod tests {
         ));
     }
 
-    /// Both the `TypeSafe` shape and the `OpenAI`-style envelope land in one field.
+    /// Both the `TypeSafe` shape and the `OpenAI`-style envelope yield the name the
+    /// health check looks for, whichever field carried it.
     #[test]
     fn models_response_accepts_either_envelope() {
         let native: ModelsResponse =
             serde_json::from_str(r#"{"models":[{"name":"jev-latest"}]}"#).expect("native");
-        assert_eq!(native.models[0].name, "jev-latest");
+        assert_eq!(native.into_names(), vec!["jev-latest".to_string()]);
 
         let openai_style: ModelsResponse =
             serde_json::from_str(r#"{"data":[{"id":"jev-1.13.0"}]}"#).expect("openai style");
-        assert_eq!(openai_style.models[0].name, "jev-1.13.0");
+        assert_eq!(openai_style.into_names(), vec!["jev-1.13.0".to_string()]);
     }
 
     #[test]
@@ -189,6 +194,20 @@ mod tests {
         });
         let parsed: ModelsResponse =
             serde_json::from_value(body).expect("the documented listing shape parses");
+        let names = parsed.into_names();
+        assert!(names.contains(&"jev-latest".to_string()), "{names:?}");
+        assert!(names.contains(&"jev-1.13.0".to_string()), "{names:?}");
+    }
+
+    /// The documented card carries `name` and `id` together; `alias = "id"` makes
+    /// them one field, so serde rejects the pair and the listing never decodes.
+    #[test]
+    fn a_card_carrying_both_name_and_id_decodes() {
+        let body = serde_json::json!({
+            "models": [{"name": "jev-latest", "id": "jev-1.13.0"}]
+        });
+        let parsed: ModelsResponse =
+            serde_json::from_value(body).expect("the documented card shape parses");
         let names = parsed.into_names();
         assert!(names.contains(&"jev-latest".to_string()), "{names:?}");
         assert!(names.contains(&"jev-1.13.0".to_string()), "{names:?}");

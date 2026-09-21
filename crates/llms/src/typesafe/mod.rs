@@ -460,19 +460,24 @@ impl Evaluate for TypeSafe {
                 .into(),
             })?;
 
-        // An empty or unreadable list is not evidence the model is missing, and a
-        // versioned pin is accepted by TypeSafe even when only aliases are listed.
-        if listed.is_empty() || is_version_pinned(&self.model_id) {
+        // A versioned pin is accepted by TypeSafe even when only aliases are listed. A
+        // decoded empty list is not that: it says the account is offered nothing, so it
+        // reaches the error below rather than reporting an alias ready.
+        if is_version_pinned(&self.model_id) {
             return Ok(());
         }
         if listed.iter().any(|name| name == &self.model_id) {
             return Ok(());
         }
+        let available = if listed.is_empty() {
+            "none are offered to this account".to_string()
+        } else {
+            format!("available: {}", listed.join(", "))
+        };
         Err(evaluate_api::Error::HealthCheckFailed {
             source: format!(
-                "model '{}' is not offered by TypeSafe for this account (available: {}). Set `from:` to one of those, or to a versioned pin such as `typesafe:jev-1.13.0`. See: https://docs.typesafe.ai/models",
-                self.model_id,
-                listed.join(", ")
+                "model '{}' is not offered by TypeSafe for this account ({available}). Set `from:` to one of those, or to a versioned pin such as `typesafe:jev-1.13.0`. See: https://docs.typesafe.ai/models",
+                self.model_id
             )
             .into(),
         })
@@ -816,6 +821,38 @@ mod tests {
             .with_base_url(server.uri());
         pinned.health().await.expect("a versioned pin is healthy");
     }
+    /// A decoded empty listing says the account is offered nothing, so an alias must
+    /// not load Ready off the back of it; a versioned pin still may.
+    #[tokio::test]
+    async fn health_rejects_an_alias_when_the_account_is_offered_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+            .mount(&server)
+            .await;
+
+        let alias = TypeSafe::try_new("jev", Some("jev-latest"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+        let err = alias
+            .health()
+            .await
+            .expect_err("an empty listing must not report an alias ready");
+        assert!(
+            err.to_string().contains("none are offered to this account"),
+            "{err}"
+        );
+
+        let pinned = TypeSafe::try_new("jev", Some("jev-1.13.0"), "k")
+            .expect("client")
+            .with_base_url(server.uri());
+        pinned
+            .health()
+            .await
+            .expect("a versioned pin stays healthy");
+    }
+
     fn choice_question(id: &str) -> BTreeMap<String, Question> {
         BTreeMap::from([(
             id.to_string(),
