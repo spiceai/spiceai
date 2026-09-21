@@ -1229,4 +1229,32 @@ mod tests {
             "status": status
         })
     }
+
+    /// A Responses-API message has to deserialize with no `type` field.
+    ///
+    /// `EasyInputMessage::type` is `#[serde(default)]` only because the
+    /// `spiceai/async-openai` fork makes it so. Upstream requires the field, and
+    /// the Responses API does not send it on every message — so without the patch
+    /// a reply that omits it fails to deserialize and the request errors, on a
+    /// path this adapter builds and reads (`InputItem::EasyMessage`).
+    ///
+    /// The second half is the control: a message that *does* carry the field has
+    /// to keep the value it carries, so a default that swallowed the field would
+    /// not pass.
+    #[test]
+    fn a_responses_message_deserializes_with_or_without_its_type_field() {
+        let omitted: EasyInputMessage =
+            serde_json::from_str(r#"{"role":"user","content":"hello"}"#)
+                .expect("a responses message may omit `type`");
+        assert_eq!(
+            omitted.r#type,
+            MessageType::Message,
+            "an omitted `type` has to default to a message"
+        );
+
+        let present: EasyInputMessage =
+            serde_json::from_str(r#"{"role":"user","content":"hello","type":"message"}"#)
+                .expect("a responses message may carry `type`");
+        assert_eq!(present.r#type, MessageType::Message);
+    }
 }
