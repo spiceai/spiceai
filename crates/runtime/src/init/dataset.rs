@@ -15,8 +15,9 @@ limitations under the License.
 */
 
 use crate::dataconnector::parameters::RuntimeConnectorContext;
+use crate::datafusion::resolve_table_reference;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -65,7 +66,7 @@ use crate::{
     tracing_util::dataset_registered_trace,
 };
 use app::App;
-use datafusion::sql::TableReference;
+use datafusion::sql::{ResolvedTableReference, TableReference};
 use futures::StreamExt;
 use futures::future::join_all;
 use opentelemetry::KeyValue;
@@ -1916,16 +1917,20 @@ impl Runtime {
 
         // Only the datasets this diff loads or updates are initialized: `mode: file_create`
         // deletes the acceleration state on init, and an unchanged dataset keeps serving from
-        // the `AcceleratedTable` it already has.
-        let datasets_to_apply: Vec<Arc<Dataset>> = valid_datasets
-            .into_iter()
+        // the `AcceleratedTable` it already has. The one exception is a `localpod` dataset
+        // whose parent this diff reloads: it reads through the table the parent is about to
+        // replace, so it reloads too, after its parent.
+        let changed_datasets: Vec<Arc<Dataset>> = valid_datasets
+            .iter()
             .filter(|ds| {
                 existing_datasets
                     .iter()
                     .find(|current| current.name == ds.name)
-                    .is_none_or(|current| current != ds)
+                    .is_none_or(|current| current != *ds)
             })
+            .map(Arc::clone)
             .collect();
+        let datasets_to_apply = with_localpod_dependents(changed_datasets, &valid_datasets);
 
         let init_results = self
             .initialize_datasets_accelerators(&datasets_to_apply)
@@ -1947,13 +1952,17 @@ impl Runtime {
         // `LocalPodConnector::read_provider` raises `InvalidTableName` when its
         // parent is not registered yet, and that is classified permanent, so a
         // child racing its parent would fail for good rather than retry.
-        let mut added_futures: HashMap<TableReference, Pin<Box<dyn Future<Output = ()> + Send>>> =
-            HashMap::new();
+        let mut added_futures: HashMap<
+            ResolvedTableReference,
+            Pin<Box<dyn Future<Output = ()> + Send>>,
+        > = HashMap::new();
         // Keyed by parent so several localpod datasets reading from one newly added
         // dataset all chain behind the same load, rather than the first one
         // consuming it and the rest racing it.
-        let mut localpod_by_parent: HashMap<TableReference, Vec<(Arc<Dataset>, BootstrapStatus)>> =
-            HashMap::new();
+        let mut localpod_by_parent: HashMap<
+            ResolvedTableReference,
+            Vec<(Arc<Dataset>, BootstrapStatus)>,
+        > = HashMap::new();
 
         for ds in &datasets_to_apply {
             let bootstrap_status = match init_results.get(&ds.name) {
@@ -1969,6 +1978,32 @@ impl Runtime {
             };
 
             if existing_datasets.iter().any(|d| d.name == ds.name) {
+                // A `localpod` dataset whose parent this same diff adds — or queues, deeper in
+                // a chain — cannot bind to it until that parent is registered, so it is
+                // unloaded here and queued behind the parent's load below, exactly like a
+                // newly added child.
+                if let Some(parent) = localpod_parent(ds)
+                    && (added_futures.contains_key(&parent)
+                        || is_queued_localpod(&localpod_by_parent, &parent))
+                {
+                    // What `update_dataset` does around its own swap: a plan or result cached
+                    // over the table being unloaded must not answer once the chain below
+                    // registers its replacement. An accelerated dataset's initial refresh
+                    // invalidates again on completion; a pass-through one has only this.
+                    self.df.clear_cached_plans().await;
+                    self.invalidate_cached_results_for(&ds.name).await;
+                    Arc::clone(&self)
+                        .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
+                        .await;
+                    self.status
+                        .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+                    localpod_by_parent
+                        .entry(parent)
+                        .or_default()
+                        .push((Arc::clone(ds), bootstrap_status));
+                    continue;
+                }
+
                 Arc::clone(&self).update_dataset(Arc::clone(ds)).await;
                 continue;
             }
@@ -1976,9 +2011,9 @@ impl Runtime {
             self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
 
-            if ds.source() == LOCALPOD_DATACONNECTOR {
+            if let Some(parent) = localpod_parent(ds) {
                 localpod_by_parent
-                    .entry(TableReference::parse_str(ds.path()))
+                    .entry(parent)
                     .or_default()
                     .push((Arc::clone(ds), bootstrap_status));
                 continue;
@@ -1990,7 +2025,7 @@ impl Runtime {
             let ds_clone = Arc::clone(ds);
             let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
             added_futures.insert(
-                ds.name.clone(),
+                resolve_table_reference(ds.name.clone()),
                 Box::pin(async move {
                     runtime
                         .load_dataset(ds_clone, bootstrap_status, load_semaphore)
@@ -1999,25 +2034,35 @@ impl Runtime {
             );
         }
 
-        for (parent, children) in localpod_by_parent {
-            // Chain behind the parent only when this same diff adds it. A parent
-            // that is unchanged, or that was updated in the loop above, is already
-            // registered.
+        // Every queued `localpod` dataset loads behind its parent: a load this diff spawns
+        // (`added_futures`) or, deeper in a chain, another queued `localpod` dataset. A parent
+        // that is unchanged, or that was updated in the loop above, is already registered, so
+        // its children start at once. Chains are built from their roots, so a key that is
+        // itself queued is reached through its own parent's chain rather than scheduled on
+        // its own — ordering the apply set cannot sequence loads that are spawned.
+        let mut parents: Vec<ResolvedTableReference> = localpod_by_parent.keys().cloned().collect();
+        parents.sort_by_key(|parent| is_queued_localpod(&localpod_by_parent, parent));
+        for parent in parents {
+            let Some(children) = localpod_by_parent.remove(&parent) else {
+                // Already part of a root's chain.
+                continue;
+            };
             let parent_future = added_futures.remove(&parent);
-            let runtime = Arc::clone(&self);
-            let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
+            let chains: Vec<_> = children
+                .into_iter()
+                .map(|(ds, bootstrap_status)| {
+                    Arc::clone(&self).localpod_load_chain(
+                        ds,
+                        bootstrap_status,
+                        &mut localpod_by_parent,
+                    )
+                })
+                .collect();
             tokio::spawn(async move {
                 if let Some(parent_future) = parent_future {
                     parent_future.await;
                 }
-                join_all(children.into_iter().map(|(ds, bootstrap_status)| {
-                    Arc::clone(&runtime).load_dataset(
-                        ds,
-                        bootstrap_status,
-                        Arc::clone(&load_semaphore),
-                    )
-                }))
-                .await;
+                join_all(chains).await;
             });
         }
 
@@ -2060,6 +2105,42 @@ impl Runtime {
                     .await;
             }
         }
+    }
+
+    /// The load of a queued `localpod` dataset, followed by the loads of the `localpod` datasets
+    /// queued behind it, recursively, so a child never binds before its parent registers. Each
+    /// dataset's children are taken out of `localpod_by_parent` as its chain is built, so a
+    /// `localpod` cycle — which can never load — is built once and ends.
+    fn localpod_load_chain(
+        self: Arc<Self>,
+        ds: Arc<Dataset>,
+        bootstrap_status: BootstrapStatus,
+        localpod_by_parent: &mut HashMap<
+            ResolvedTableReference,
+            Vec<(Arc<Dataset>, BootstrapStatus)>,
+        >,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let children: Vec<_> = localpod_by_parent
+            .remove(&resolve_table_reference(ds.name.clone()))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(child, child_status)| {
+                Arc::clone(&self).localpod_load_chain(child, child_status, localpod_by_parent)
+            })
+            .collect();
+        let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
+        Box::pin(async move {
+            let name = ds.name.clone();
+            Arc::clone(&self)
+                .load_dataset(ds, bootstrap_status, load_semaphore)
+                .await;
+            // The registration this dataset reads through has just been replaced, so mark its
+            // results-cache clock again, as `update_dataset` does after its swap: a result read
+            // from the previous registration after the mark above must not be stored as fresh.
+            // For a dataset new to this apply the mark is a no-op.
+            self.invalidate_cached_results_for(&name).await;
+            join_all(children).await;
+        })
     }
 
     /// Initialize datasets configured with accelerators before registering the datasets.
@@ -2598,6 +2679,84 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
 /// Whether a dataset's `drasi:` block is live.
 fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
     drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
+}
+
+/// The dataset a `localpod` dataset reads through, resolved as the query engine resolves it (so
+/// `parent`, `public.parent`, and `spice.public.parent` name one dataset), or `None` for any
+/// other connector.
+fn localpod_parent(ds: &Dataset) -> Option<ResolvedTableReference> {
+    (ds.source() == LOCALPOD_DATACONNECTOR)
+        .then(|| resolve_table_reference(TableReference::parse_str(ds.path())))
+}
+
+/// Whether `name` is a `localpod` dataset queued in `localpod_by_parent`. A queued dataset
+/// registers nothing until its chain runs, so a `localpod` dataset reading through it must queue
+/// behind it too.
+fn is_queued_localpod(
+    localpod_by_parent: &HashMap<ResolvedTableReference, Vec<(Arc<Dataset>, BootstrapStatus)>>,
+    name: &ResolvedTableReference,
+) -> bool {
+    localpod_by_parent
+        .values()
+        .flatten()
+        .any(|(ds, _)| resolve_table_reference(ds.name.clone()) == *name)
+}
+
+/// Extends the datasets a spicepod apply reloads with every `localpod` dataset that reads
+/// through one of them, transitively, and orders the result so each `localpod` dataset follows
+/// its parent.
+///
+/// A `localpod` dataset binds to the table its parent has registered at the moment it loads:
+/// it reads through that provider and hands its refreshes to that table's refresh task. A parent
+/// reloaded onto a new table therefore leaves an unchanged child on the retired one, answering
+/// rows the parent no longer has and keeping the retired refresh task alive (#3288). Reloading
+/// the child after its parent binds it to the parent's new table.
+fn with_localpod_dependents(
+    mut reloading: Vec<Arc<Dataset>>,
+    all: &[Arc<Dataset>],
+) -> Vec<Arc<Dataset>> {
+    let mut reloading_names: HashSet<ResolvedTableReference> = reloading
+        .iter()
+        .map(|ds| resolve_table_reference(ds.name.clone()))
+        .collect();
+
+    // A child of a reloading child reloads too, so iterate to a fixpoint. Each pass adds at
+    // least one dataset or stops, so it runs at most `all.len()` times.
+    let mut added = true;
+    while added {
+        added = false;
+        for ds in all {
+            if !reloading_names.contains(&resolve_table_reference(ds.name.clone()))
+                && localpod_parent(ds).is_some_and(|parent| reloading_names.contains(&parent))
+            {
+                reloading_names.insert(resolve_table_reference(ds.name.clone()));
+                reloading.push(Arc::clone(ds));
+                added = true;
+            }
+        }
+    }
+
+    // Parents first: a child binds to whatever its parent has registered when it reloads. The
+    // walk up is bounded so a `localpod` cycle, which can never load, cannot spin here.
+    let by_name: HashMap<ResolvedTableReference, &Arc<Dataset>> = all
+        .iter()
+        .map(|ds| (resolve_table_reference(ds.name.clone()), ds))
+        .collect();
+    let depth = |ds: &Arc<Dataset>| {
+        let mut depth = 0;
+        let mut current = ds;
+        while let Some(parent) = localpod_parent(current)
+            && reloading_names.contains(&parent)
+            && depth < all.len()
+            && let Some(parent_dataset) = by_name.get(&parent)
+        {
+            depth += 1;
+            current = parent_dataset;
+        }
+        depth
+    };
+    reloading.sort_by_cached_key(depth);
+    reloading
 }
 
 #[cfg(test)]
@@ -4823,6 +4982,96 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         assert!(
             on_read.is_empty(),
             "a read must not emit the deprecation notice: {on_read:?}"
+        );
+    }
+
+    /// Build the runtime datasets of `specs` the way `get_valid_datasets` does.
+    fn datasets_of(
+        runtime: &Arc<crate::Runtime>,
+        specs: &[spicepod::component::dataset::Dataset],
+    ) -> Vec<Arc<Dataset>> {
+        let app = Arc::new(
+            specs
+                .iter()
+                .cloned()
+                .fold(app::AppBuilder::new("localpod_dependents"), |b, ds| {
+                    b.with_dataset(ds)
+                })
+                .build(),
+        );
+        specs
+            .iter()
+            .map(|spec| {
+                Arc::new(
+                    DatasetBuilder::try_from(spec.clone())
+                        .expect("valid dataset builder")
+                        .with_app(Arc::clone(&app))
+                        .with_runtime(Arc::clone(runtime))
+                        .build()
+                        .expect("valid runtime dataset"),
+                )
+            })
+            .collect()
+    }
+
+    fn names(datasets: &[Arc<Dataset>]) -> Vec<String> {
+        datasets.iter().map(|ds| ds.name.to_string()).collect()
+    }
+
+    /// A `localpod` dataset reloads whenever the dataset it reads through does — through any
+    /// depth of `localpod` chaining, and however its parent is spelled — and after it, whatever
+    /// order the spicepod lists them in.
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/3288>.
+    #[tokio::test]
+    async fn localpod_dependents_reload_after_their_parent() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let all = datasets_of(
+            &runtime,
+            &[
+                // The grandchild is listed first, so the order below is the function's. The
+                // parents are spelled with the default schema and catalog: a `localpod` path
+                // is resolved the way the query engine resolves it, not compared as text.
+                spicepod::component::dataset::Dataset::new("localpod:public.child", "grandchild"),
+                spicepod::component::dataset::Dataset::new("localpod:spice.public.parent", "child"),
+                spicepod::component::dataset::Dataset::new("file:data.csv", "parent"),
+                spicepod::component::dataset::Dataset::new("localpod:other", "other_child"),
+                spicepod::component::dataset::Dataset::new("file:other.csv", "other"),
+            ],
+        );
+        let parent = Arc::clone(&all[2]);
+
+        let reloading = with_localpod_dependents(vec![parent], &all);
+        assert_eq!(
+            names(&reloading),
+            ["parent", "child", "grandchild"],
+            "the parent's whole localpod chain reloads, parents first; unrelated datasets do not"
+        );
+
+        // A changed child reloads alone: its parent is untouched.
+        let reloading = with_localpod_dependents(vec![Arc::clone(&all[1])], &all);
+        assert_eq!(names(&reloading), ["child", "grandchild"]);
+
+        // Nothing changed, nothing reloads.
+        assert!(with_localpod_dependents(vec![], &all).is_empty());
+    }
+
+    /// Two `localpod` datasets reading through each other can never load; the ordering walk
+    /// must still terminate.
+    #[tokio::test]
+    async fn localpod_dependents_ordering_tolerates_a_cycle() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let all = datasets_of(
+            &runtime,
+            &[
+                spicepod::component::dataset::Dataset::new("localpod:b", "a"),
+                spicepod::component::dataset::Dataset::new("localpod:a", "b"),
+            ],
+        );
+        let reloading = with_localpod_dependents(vec![Arc::clone(&all[0])], &all);
+        assert_eq!(
+            reloading.len(),
+            2,
+            "both datasets of the cycle are selected"
         );
     }
 }

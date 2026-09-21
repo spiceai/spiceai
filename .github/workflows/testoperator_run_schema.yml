@@ -147,7 +147,12 @@ jobs:
       - name: Bootstrap DuckLake TPCH SF1 catalog
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') }}
         run: |
-          python3 -m pip install --upgrade duckdb minio
+          # DuckLake stamps its catalog with the version of the extension that wrote it, and spiced reads it
+          # with the DuckDB version the `duckdb` crate pins in Cargo.toml. A newer duckdb writes a catalog the
+          # runtime's extension rejects: "Only DuckLake versions 0.1, 0.2, 0.3-dev1 and 0.3 are supported".
+          duckdb_version=$(awk -F'"' '/^duckdb = "/ { print $2; exit }' Cargo.toml)
+          [ -n "$duckdb_version" ] || { echo 'could not read the duckdb version from Cargo.toml'; exit 1; }
+          python3 -m pip install --upgrade "duckdb==$duckdb_version" minio
 
           python3 <<'PY'
           import duckdb
@@ -232,6 +237,17 @@ jobs:
 
       - name: Run the schema test - ${{ github.event.inputs.spicepod_path }}
         run: |
+          # A variable set to "" is not unset. `AWS_ENDPOINT_URL=""` is an endpoint
+          # override the AWS SDK rejects by panicking, which aborts the whole
+          # runtime, and `DUCKLAKE_CONNECTION_STRING=""` is a connection the
+          # DuckLake extension tries to open. These are only meaningful for
+          # `ducklake[postgres+s3]`.
+          for name in AWS_ENDPOINT_URL AWS_ALLOW_HTTP DUCKLAKE_CONNECTION_STRING; do
+            if [ -z "${!name:-}" ]; then
+              unset "$name"
+            fi
+          done
+
           rm -rf .spice/data
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run schema \
             -s /usr/local/bin/spiced \
