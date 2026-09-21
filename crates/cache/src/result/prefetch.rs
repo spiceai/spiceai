@@ -85,6 +85,15 @@ pub(crate) fn prefetch_read_data(ptr: *const u8) {
     }
 }
 
+/// After serving batch `served`, prefetch headers at this index.
+///
+/// [`prefetch_raw_serve_arced`] already warmed `served + 1` (the next poll).
+/// Warming `served + 2` keeps a one-batch lookahead without repeating that work.
+#[inline]
+pub(crate) fn prefetch_index_after_serve(served: usize) -> usize {
+    served.saturating_add(2)
+}
+
 /// Prefetch the first batch's data buffers and the next batch's headers.
 ///
 /// Called from [`super::query::CachedRawStream::from_raw`] before the stream
@@ -206,5 +215,15 @@ mod tests {
         assert_eq!(first.num_rows(), 8);
         assert_eq!(second.num_rows(), 3);
         assert_eq!(first.num_columns(), 1);
+    }
+
+    #[test]
+    fn poll_lookahead_is_two_ahead_of_the_served_batch() {
+        use super::prefetch_index_after_serve;
+
+        // Construct already warms index 1. The first poll must warm 2, not 1.
+        assert_eq!(prefetch_index_after_serve(0), 2);
+        assert_eq!(prefetch_index_after_serve(1), 3);
+        assert_eq!(prefetch_index_after_serve(2), 4);
     }
 }

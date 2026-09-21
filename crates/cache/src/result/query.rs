@@ -556,8 +556,8 @@ impl RecordBatchStream for CachedStream {
 ///
 /// HTTP and Flight drain this via [`QueryResult::from_cached_raw`] /
 /// [`QueryResultSource::CachedRaw`]. Prefetches the first batch's data
-/// buffers and the next batch's headers at construction, and the following
-/// batch's headers on each later poll.
+/// buffers and the next batch's headers at construction. Each later poll
+/// warms headers two batches ahead, so it does not repeat construct.
 pub struct CachedRawStream {
     data: CachedBatches,
     schema: SchemaRef,
@@ -597,8 +597,13 @@ impl Stream for CachedRawStream {
             return Poll::Ready(None);
         };
         self.index = index + 1;
-        if let Some(next) = self.data.get(self.index) {
-            super::prefetch::prefetch_batch_headers(next.as_ref());
+        // Construct already warmed `index + 1`. Warm one more so the next
+        // poll is not a repeat of that lookahead.
+        if let Some(ahead) = self
+            .data
+            .get(super::prefetch::prefetch_index_after_serve(index))
+        {
+            super::prefetch::prefetch_batch_headers(ahead.as_ref());
         }
         Poll::Ready(Some(Ok(batch)))
     }
