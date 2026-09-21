@@ -112,7 +112,7 @@ async fn build_scheduler(
     let cluster_addr = format!("127.0.0.1:{cluster}");
 
     let scheduler_cfg = SchedulerConfig {
-        state_location: state_location.to_string(),
+        state_location: Some(state_location.to_string()),
         params: None,
         partition_assignment_interval: "1s".to_string(),
         max_partition_assignments_per_interval:

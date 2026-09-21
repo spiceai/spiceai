@@ -25,6 +25,11 @@ limitations under the License.
 //! refresh, those shapes are replayed with `SELECT DISTINCT` of the bound
 //! columns until the cache is full. Datasets stay not ready until that warmup
 //! completes, so `/v1/ready` does not succeed on a cold cache.
+//!
+//! Only [`CacheNamespace::Public`] plans are recorded and replayed. Authenticated
+//! (principal-scoped) and system traffic is skipped: results-cache keys include the
+//! namespace, so warming into `Public` could never satisfy a principal-scoped
+//! request, and persisting principal ids into the warmup catalog is undesirable.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -148,8 +153,14 @@ impl ResultsCacheWarmer {
     /// Remember this plan if we do not yet have [`MAX_WARMUP_PLANS`] distinct
     /// shapes. Cheap no-op once the set is full. Must not run on the warmup
     /// path itself (those queries use `CurrentRuntimeUngated`).
-    pub(crate) fn observe_plan(&self, plan: &LogicalPlan) {
+    ///
+    /// Only [`CacheNamespace::Public`] plans are kept; principal-scoped and
+    /// system plans are skipped (see module docs).
+    pub(crate) fn observe_plan(&self, plan: &LogicalPlan, namespace: &CacheNamespace) {
         if !self.enabled {
+            return;
+        }
+        if !matches!(namespace, CacheNamespace::Public) {
             return;
         }
         if self.count.load(Ordering::Relaxed) >= MAX_WARMUP_PLANS {
@@ -377,8 +388,12 @@ pub(crate) async fn build_results_cache_warmer(
 
 impl DataFusion {
     /// Record a cacheable user query's plan shape for the next cold start.
-    pub(crate) fn observe_results_cache_warmup_plan(&self, plan: &LogicalPlan) {
-        self.results_cache_warmer.observe_plan(plan);
+    pub(crate) fn observe_results_cache_warmup_plan(
+        &self,
+        plan: &LogicalPlan,
+        namespace: &CacheNamespace,
+    ) {
+        self.results_cache_warmer.observe_plan(plan, namespace);
     }
 
     /// Whether warmup will replay stored plans this process, so dataset
@@ -716,7 +731,7 @@ mod tests {
                 .expect("sql")
                 .logical_plan()
                 .clone();
-            df.observe_results_cache_warmup_plan(&plan);
+            df.observe_results_cache_warmup_plan(&plan, &CacheNamespace::Public);
         }
         assert_eq!(
             df.results_cache_warmer.templates_snapshot().len(),
@@ -774,7 +789,7 @@ mod tests {
             .expect("sql")
             .logical_plan()
             .clone();
-        df.observe_results_cache_warmup_plan(&plan);
+        df.observe_results_cache_warmup_plan(&plan, &CacheNamespace::Public);
         assert!(
             df.results_cache_warmer.templates_snapshot().is_empty(),
             "warmup: disabled must not record plans"
@@ -821,7 +836,7 @@ mod tests {
             .expect("sql")
             .logical_plan()
             .clone();
-        df.observe_results_cache_warmup_plan(&plan);
+        df.observe_results_cache_warmup_plan(&plan, &CacheNamespace::Public);
         wait_for_catalog(&store).await;
 
         let reloaded = ResultsCacheWarmer::new(store.clone(), true);
@@ -863,7 +878,7 @@ mod tests {
         ];
         for sql in sqls {
             let plan = ctx.sql(sql).await.expect("sql").logical_plan().clone();
-            df.observe_results_cache_warmup_plan(&plan);
+            df.observe_results_cache_warmup_plan(&plan, &CacheNamespace::Public);
         }
         assert_eq!(
             df.results_cache_warmer.templates_snapshot().len(),
@@ -935,7 +950,7 @@ mod tests {
             .expect("sql")
             .logical_plan()
             .clone();
-        warmer.observe_plan(&plan);
+        warmer.observe_plan(&plan, &CacheNamespace::Public);
 
         let state = ObjectState::<Vec<WarmupTemplate>>::new(Arc::clone(&store));
         let start = std::time::Instant::now();
@@ -997,7 +1012,7 @@ mod tests {
             .expect("sql")
             .logical_plan()
             .clone();
-        warmer.observe_plan(&plan);
+        warmer.observe_plan(&plan, &CacheNamespace::Public);
 
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store_occ::LocalConditionalPut::new(&dir).expect("local store"));
@@ -1029,5 +1044,117 @@ mod tests {
             "a new process must load plan shapes from runtime.state"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn principal_scoped_plans_are_not_recorded_for_warmup() {
+        let store = std::env::temp_dir().join(format!(
+            "spice-warmup-principal-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&store);
+        let df = prepare_runtime(None, store.clone()).await;
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE orders (id INT)")
+            .await
+            .expect("create")
+            .collect()
+            .await
+            .expect("collect");
+        let plan = ctx
+            .sql("SELECT id FROM orders WHERE id = 1")
+            .await
+            .expect("sql")
+            .logical_plan()
+            .clone();
+
+        let principal = CacheNamespace::Principal(Arc::from("apikey:test-principal"));
+        df.observe_results_cache_warmup_plan(&plan, &principal);
+        df.observe_results_cache_warmup_plan(&plan, &CacheNamespace::System);
+        assert!(
+            df.results_cache_warmer.templates_snapshot().is_empty(),
+            "principal-scoped and system plans must not enter the warmup catalog"
+        );
+
+        df.observe_results_cache_warmup_plan(&plan, &CacheNamespace::Public);
+        assert_eq!(
+            df.results_cache_warmer.templates_snapshot().len(),
+            1,
+            "public plans must still be recorded"
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// Best-effort lifecycle regression: record → persist → "restart" → warmup →
+    /// ready released → cache hit. Does not drive `load_components` (no accelerated
+    /// table in this harness); that path is covered by the integration binary when
+    /// present.
+    #[tokio::test]
+    async fn record_persist_restart_warmup_ready_and_cache_hit() {
+        let store = std::env::temp_dir().join(format!(
+            "spice-warmup-lifecycle-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_file(store.with_extension("json.tmp"));
+
+        // Process A: record a plan shape and persist it.
+        {
+            let df = prepare_runtime(None, store.clone()).await;
+            let ctx = datafusion::prelude::SessionContext::new();
+            ctx.sql("CREATE TABLE orders (id INT)")
+                .await
+                .expect("create")
+                .collect()
+                .await
+                .expect("collect");
+            let plan = ctx
+                .sql("SELECT id FROM orders WHERE id = 1")
+                .await
+                .expect("sql")
+                .logical_plan()
+                .clone();
+            df.observe_results_cache_warmup_plan(&plan, &CacheNamespace::Public);
+            wait_for_catalog(&store).await;
+        }
+
+        // Process B: reload catalog, hold ready, run warmup, release, observe hit.
+        let df = prepare_runtime(None, store.clone()).await;
+        register_table(&df, "orders", vec![1, 2, 3]).await;
+        assert!(
+            df.results_cache_warmup_holds_ready(),
+            "reloaded templates must hold ready until warmup finishes"
+        );
+
+        let status = status::RuntimeStatus::new();
+        status.set_ready_state(status::RuntimeReadyState::OnRegistration);
+        status.update_dataset(
+            &TableReference::bare("orders"),
+            status::ComponentStatus::Initializing,
+        );
+        assert!(status.is_ready());
+        status.hold_dataset_ready();
+        assert!(
+            !status.is_ready(),
+            "an active ready-hold must keep is_ready false under OnRegistration"
+        );
+
+        assert_eq!(df.results_cache_warmer.templates_snapshot().len(), 1);
+        df.run_warmup_templates(&df.results_cache_warmer.templates_snapshot(), None)
+            .await;
+        status.release_dataset_ready();
+
+        let hit = request_context()
+            .scope(run_sql(&df, "SELECT id FROM orders WHERE id = 2"))
+            .await;
+        assert_eq!(
+            hit,
+            CacheStatus::CacheHit,
+            "after restart + warmup, a distinct key of the recorded shape must hit the cache"
+        );
+
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_file(store.with_extension("json.tmp"));
     }
 }

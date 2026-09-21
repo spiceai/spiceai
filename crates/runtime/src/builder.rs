@@ -585,28 +585,15 @@ impl RuntimeBuilder {
         };
 
         let caching = Runtime::init_caching(Some(&spicepod_rt.caching));
+        // Invalid `warmup` + `cache_key_type: sql` is rejected when the spicepod
+        // deserializes (`validate_sql_results_warmup_config`), so `spiced` never
+        // reaches build with that combination. This flag only enables warmup for
+        // configs that already passed that check (or programmatic AppBuilder use).
         let results_cache_warmup_enabled = spicepod_rt
             .caching
             .sql_results
             .as_ref()
-            .is_some_and(|sql_results| {
-                if !(sql_results.enabled && sql_results.warmup.is_enabled()) {
-                    return false;
-                }
-                // Warmup replays plan-shaped templates (SQL + bound params). Under
-                // `cache_key_type: sql` a live literal query hashes raw SQL with no
-                // parameters, so a warmed entry can never be hit. Refuse the
-                // combination rather than silently warming dead keys.
-                if matches!(
-                    sql_results.cache_key_type,
-                    spicepod::component::caching::CacheKeyType::Sql
-                ) {
-                    panic!(
-                        "invalid spicepod: SQL results cache warmup requires cache_key_type: plan                          (or the default). cache_key_type: sql hashes raw SQL without parameters,                          so warmed entries cannot be hit. Disable warmup or set cache_key_type: plan."
-                    );
-                }
-                true
-            });
+            .is_some_and(|sql_results| sql_results.enabled && sql_results.warmup.is_enabled());
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
 
         // Resolve CDC tunables once at startup so the per-envelope hot path
@@ -675,11 +662,16 @@ impl RuntimeBuilder {
                     .await
                     .as_ref()
                     .and_then(|app| app.runtime.resolved_scheduler())
+                    .filter(|cfg| cfg.state_location.is_some())
                 {
+                    let state_location = scheduler_config
+                        .state_location
+                        .as_deref()
+                        .expect("filtered to Some");
                     match crate::cluster::scheduler_registry::build_object_store_internal(
                         Arc::clone(&secrets),
                         io_runtime.clone(),
-                        &scheduler_config.state_location,
+                        state_location,
                         &scheduler_config,
                     )
                     .await
@@ -728,7 +720,7 @@ impl RuntimeBuilder {
                     }
                 } else {
                     tracing::warn!(
-                        "'--role scheduler' was specified but no `runtime.scheduler` field was found in spicepod.yaml. Using in-memory cluster state."
+                        "'--role scheduler' was specified but no resolved `runtime.scheduler.state_location` / `runtime.state.location` was found in spicepod.yaml. Using in-memory cluster state."
                     );
                     let store: Arc<dyn object_store::ObjectStore> =
                         Arc::new(object_store::memory::InMemory::new());

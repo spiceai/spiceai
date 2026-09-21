@@ -103,6 +103,31 @@ impl ResultsCacheWarmup {
     }
 }
 
+/// Reject `warmup: on_first_refresh` together with `cache_key_type: sql`.
+///
+/// Warmup replays plan-shaped templates (SQL + bound params). Under
+/// `cache_key_type: sql` a live literal query hashes raw SQL without
+/// parameters, so a warmed entry can never be hit.
+///
+/// # Errors
+///
+/// Returns a user-facing message describing the invalid combination and the
+/// corrective action.
+pub fn validate_sql_results_warmup_config(
+    sql_results: &SQLResultsCacheConfig,
+) -> Result<(), String> {
+    if sql_results.enabled
+        && sql_results.warmup.is_enabled()
+        && matches!(sql_results.cache_key_type, CacheKeyType::Sql)
+    {
+        return Err(
+            "invalid spicepod: `runtime.caching.sql_results.warmup: on_first_refresh` requires `cache_key_type: plan` (or the default). `cache_key_type: sql` hashes raw SQL without parameters, so warmed entries cannot be hit. Disable warmup or set `cache_key_type: plan`."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -377,5 +402,23 @@ mod tests {
         .expect("parse");
         assert!(!parsed.enabled);
         assert!(parsed.warmup.is_enabled());
+    }
+
+    #[test]
+    fn test_sql_results_warmup_rejects_sql_cache_key_type() {
+        let parsed: SQLResultsCacheConfig = yaml::from_str(
+            "
+            enabled: true
+            cache_key_type: sql
+            warmup: on_first_refresh
+            ",
+        )
+        .expect("fields themselves are valid");
+        let err = validate_sql_results_warmup_config(&parsed)
+            .expect_err("warmup + cache_key_type: sql must be rejected");
+        assert!(
+            err.contains("cache_key_type: plan"),
+            "error must name the corrective action, got: {err}"
+        );
     }
 }

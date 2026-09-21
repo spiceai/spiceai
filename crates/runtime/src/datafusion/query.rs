@@ -1782,7 +1782,10 @@ impl Query {
 
                 let final_stream = if cache_manager.should_cache_results() {
                     if ctx.runtime_binding == QueryRuntimeBinding::QueryRuntime {
-                        ctx.df.observe_results_cache_warmup_plan(&plan);
+                        ctx.df.observe_results_cache_warmup_plan(
+                            &plan,
+                            &request_context.cache_namespace(),
+                        );
                     }
                     Self::wrap_stream_with_cache(
                         &ctx.df,

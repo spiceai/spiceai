@@ -799,9 +799,12 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         Ok(resolved_cluster_config) => {
             // Validate that scheduler mode has state_location configured
             if resolved_cluster_config.effective_role() == Some(ClusterRole::Scheduler) {
-                let has_state_location = app
-                    .as_ref()
-                    .is_some_and(|a| a.runtime.resolved_scheduler().is_some());
+                let has_state_location = app.as_ref().is_some_and(|a| {
+                    a.runtime
+                        .resolved_scheduler()
+                        .and_then(|s| s.state_location)
+                        .is_some()
+                });
                 if !has_state_location {
                     return Err(Error::InvalidClusterConfig {
                         source: std::io::Error::new(

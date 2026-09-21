@@ -701,7 +701,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_is_ready_false_while_dataset_ready_hold_is_active_on_registration() {
         let status = RuntimeStatus::new();
         status.set_ready_state(RuntimeReadyState::OnRegistration);
@@ -721,6 +720,7 @@ mod tests {
         assert!(status.is_ready());
     }
 
+    #[test]
     fn test_is_ready_on_registration_requires_registered_component() {
         let status = RuntimeStatus::new();
         let dataset = TableReference::bare("test_dataset");
@@ -1183,6 +1183,7 @@ mod tests {
         assert!(status.is_ready());
     }
 
+    #[test]
     fn a_refreshing_dataset_that_was_never_ready_has_not_been_ready() {
         let status = RuntimeStatus::new();
         let first_load = TableReference::bare("first_load");

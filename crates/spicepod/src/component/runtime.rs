@@ -118,11 +118,25 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Scheduler config, using [`Self::state`] when the scheduler section is omitted.
+    /// Scheduler config with field-level fallback onto [`Self::state`].
+    ///
+    /// `runtime.scheduler.state_location` (and params) may be omitted when
+    /// `runtime.state` is set; other scheduler tuning fields are preserved.
     #[must_use]
     pub fn resolved_scheduler(&self) -> Option<Scheduler> {
         match (&self.scheduler, &self.state) {
-            (Some(scheduler), _) => Some(scheduler.clone()),
+            (Some(scheduler), state) => {
+                let mut resolved = scheduler.clone();
+                if resolved.state_location.is_none() {
+                    if let Some(state) = state {
+                        resolved.state_location = Some(state.location.clone());
+                        if resolved.params.is_none() {
+                            resolved.params = state.params.clone();
+                        }
+                    }
+                }
+                Some(resolved)
+            }
             (None, Some(state)) => Some(Scheduler::from_shared_state(state)),
             (None, None) => None,
         }
@@ -1334,8 +1348,10 @@ pub struct RuntimeState {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Scheduler {
-    /// Root URI for shared cluster state.
-    pub state_location: String,
+    /// Root URI for shared cluster state. Optional when [`Runtime::state`]
+    /// provides the location via [`Runtime::resolved_scheduler`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_location: Option<String>,
 
     /// Optional object store params for the shared cluster state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1363,7 +1379,7 @@ impl Scheduler {
     #[must_use]
     pub fn from_shared_state(state: &RuntimeState) -> Self {
         Self {
-            state_location: state.location.clone(),
+            state_location: Some(state.location.clone()),
             params: state.params.clone(),
             partition_assignment_interval: default_partition_assignment_interval(),
             max_partition_assignments_per_interval: default_max_partition_assignments_per_interval(
@@ -1560,6 +1576,10 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             validate_metric_prefix(prefix)?;
         }
 
+        if let Some(sql_results) = &caching.sql_results {
+            crate::component::caching::validate_sql_results_warmup_config(sql_results)?;
+        }
+
         Ok(Runtime {
             caching,
             dataset_load_parallelism: deserializer.dataset_load_parallelism,
@@ -1595,6 +1615,24 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
 mod tests {
     use super::*;
     use yaml;
+
+    #[test]
+    fn test_runtime_rejects_warmup_with_sql_cache_key_type() {
+        let yaml = r"
+            caching:
+              sql_results:
+                enabled: true
+                cache_key_type: sql
+                warmup: on_first_refresh
+        ";
+        let err = yaml::from_str::<Runtime>(yaml)
+            .expect_err("warmup + cache_key_type: sql must fail spicepod load");
+        let message = err.to_string();
+        assert!(
+            message.contains("cache_key_type: plan") || message.contains("warmup"),
+            "error must name the corrective action, got: {message}"
+        );
+    }
 
     #[test]
     fn test_deserialize_api_keys() {

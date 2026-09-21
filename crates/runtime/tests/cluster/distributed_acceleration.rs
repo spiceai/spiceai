@@ -243,7 +243,7 @@ async fn cluster_distributes_accelerated_table_with_federated_source() -> Result
             // Local-filesystem cluster state (avoids the S3 partition store the other
             // cluster tests use, so this runs hermetically without AWS creds).
             let scheduler_cfg = SchedulerConfig {
-                state_location: format!("file://{}", state_tempdir.path().display()),
+                state_location: Some(format!("file://{}", state_tempdir.path().display())),
                 params: None,
                 partition_assignment_interval: "1s".to_string(),
                 max_partition_assignments_per_interval:
@@ -333,7 +333,7 @@ async fn cluster_distributes_accelerated_table_with_column_metadata() -> Result<
             dataset.columns = vec![id_col];
 
             let scheduler_cfg = SchedulerConfig {
-                state_location: format!("file://{}", state_tempdir.path().display()),
+                state_location: Some(format!("file://{}", state_tempdir.path().display())),
                 params: None,
                 partition_assignment_interval: "1s".to_string(),
                 max_partition_assignments_per_interval:
@@ -1285,9 +1285,9 @@ fn make_named_scheduler_config_with_max_partitions_per_executor(
 ) -> SchedulerConfig {
     let run_id = uuid::Uuid::new_v4();
     SchedulerConfig {
-        state_location: format!(
+        state_location: Some(format!(
             "s3://spiceai-integration-tests/cluster-state/{test_name}/{run_id}/"
-        ),
+        )),
         params: Some(spicepod::param::Params::from_string_map(
             std::collections::HashMap::from([
                 ("s3_region".to_string(), "us-east-1".to_string()),

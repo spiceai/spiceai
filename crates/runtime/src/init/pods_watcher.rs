@@ -386,7 +386,7 @@ mod tests {
 
     fn scheduler(state_location: &str) -> Scheduler {
         Scheduler {
-            state_location: state_location.to_string(),
+            state_location: Some(state_location.to_string()),
             params: None,
             partition_assignment_interval: default_partition_assignment_interval(),
             max_partition_assignments_per_interval: default_max_partition_assignments_per_interval(

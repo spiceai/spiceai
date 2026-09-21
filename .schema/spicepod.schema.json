@@ -1602,7 +1602,7 @@
       "type": "object",
       "properties": {
         "state_location": {
-          "description": "Root URI for shared cluster state.",
+          "description": "Root URI for shared cluster state. Optional when runtime.state provides the location via field-level fallback.",
           "type": "string"
         },
         "params": {
@@ -1641,10 +1641,7 @@
           "default": "60s"
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "state_location"
-      ]
+      "additionalProperties": false
     },
     "Params": {
       "type": "object",
