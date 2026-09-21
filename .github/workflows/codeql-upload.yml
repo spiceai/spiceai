@@ -7,11 +7,13 @@ name: CodeQL SARIF upload
 # branch could rewrite this job and still receive `security-events: write`.
 #
 # The job does not check out a repository and does not read ref or sha from
-# the SARIF artifact. `pull_request` and `merge_group` are refused: those
-# events run the analysis workflow from the pull request, which can upload a
-# clean artifact under the expected name. `pull_request_target` is accepted
-# because GitHub runs the default-branch analysis file; the recorded commit
-# is the pull request head, the same commit that file checks out.
+# the SARIF artifact. `pull_request` is refused: that event runs the analysis
+# workflow from the pull request, which can upload a clean artifact under
+# the expected name. `merge_group` is accepted only when the analysis file
+# at the queue SHA is the default-branch blob. `pull_request_target` is
+# accepted because GitHub runs the default-branch analysis file; the
+# recorded commit is the pull request head, the same commit that file
+# checks out.
 on:
   workflow_run:
     workflows: ['CodeQL']
@@ -86,12 +88,53 @@ jobs:
             esac
           }
 
+          # Events that load the analysis file from a merge commit can rewrite
+          # it. Publish only when the blob at the scanned SHA is the default
+          # branch's file. The runs API does not include default_branch.
+          require_default_branch_workflow() {
+            local scanned_ref="$1"
+            local default_branch scanned_blob trusted_blob
+            default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+            if [[ -z "${default_branch}" ]]; then
+              echo "::error::Could not resolve the default branch, so the analysis workflow cannot be authenticated."
+              exit 1
+            fi
+            scanned_blob="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${expected_path}?ref=${scanned_ref}" --jq '.sha')"
+            trusted_blob="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${expected_path}?ref=${default_branch}" --jq '.sha')"
+            if [[ -z "${scanned_blob}" || -z "${trusted_blob}" ]]; then
+              echo "::error::Could not read '${expected_path}' for authentication, so SARIF is not uploaded."
+              exit 1
+            fi
+            if [[ "${scanned_blob}" != "${trusted_blob}" ]]; then
+              echo "::error::Refusing to upload SARIF: '${expected_path}' at '${scanned_ref}' does not match '${default_branch}', so the producer is not the trusted analysis workflow."
+              exit 1
+            fi
+          }
+
           sha=''
           ref=''
           case "${event}" in
-            pull_request|merge_group)
-              echo "::error::Refusing to upload SARIF from '${event}'. That event runs the analysis workflow from the pull request, so the artifact can be a clean stand-in for a real scan."
+            pull_request)
+              echo "::error::Refusing to upload SARIF from 'pull_request'. That event runs the analysis workflow from the pull request, so the artifact can be a clean stand-in for a real scan."
               exit 1
+              ;;
+            merge_group)
+              if [[ ! "${head_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "::error::merge_group run ${SOURCE_RUN_ID} has no merge-queue SHA, so results are not uploaded."
+                exit 1
+              fi
+              if [[ ! "${head_branch}" =~ ^gh-readonly-queue/.+/pr-[0-9]+-[0-9a-f]+$ ]]; then
+                echo "::error::Refusing to upload SARIF from merge_group on '${head_branch}'. Expected a gh-readonly-queue/<base>/pr-<n>-<sha> ref."
+                exit 1
+              fi
+              queue_base="$(sed -E 's|^gh-readonly-queue/(.+)/pr-[0-9]+-[0-9a-f]+$|\1|' <<<"${head_branch}")"
+              if ! trusted_ref "${queue_base}"; then
+                echo "::error::Refusing to upload SARIF from merge_group targeting '${queue_base}'. Only trunk and release branches are trusted merge-queue bases."
+                exit 1
+              fi
+              require_default_branch_workflow "${head_sha}"
+              sha="${head_sha}"
+              ref="refs/heads/${head_branch}"
               ;;
             pull_request_target)
               sha="$(jq -r '.pull_requests[0].head.sha // empty' <<<"${run_json}")"
@@ -122,7 +165,7 @@ jobs:
           fi
 
           case "${ref}" in
-            refs/heads/*|refs/pull/[0-9]*/head) ;;
+            refs/heads/trunk|refs/heads/release-*|refs/heads/release/*|refs/heads/gh-readonly-queue/*|refs/pull/[0-9]*/head) ;;
             *)
               echo "::error::Unsupported upload ref '${ref}'."
               exit 1
