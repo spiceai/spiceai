@@ -1519,10 +1519,9 @@ fn build_json_nest_schema(
     // `cache::http_fetch_status` checks to tell a real HTTP-connector
     // batch from an unrelated dataset that happens to have a same-shaped
     // `response_status` column of its own (see `HTTP_RESPONSE_STATUS_METADATA_KEY`).
-    Ok(std::sync::Arc::new(arrow_schema::Schema::new_with_metadata(
-        fields,
-        base.metadata().clone(),
-    )))
+    Ok(std::sync::Arc::new(
+        arrow_schema::Schema::new_with_metadata(fields, base.metadata().clone()),
+    ))
 }
 
 /// Compute the static schema (no source I/O) for an HTTPS dataset in

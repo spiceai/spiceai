@@ -2358,9 +2358,11 @@ impl HttpExec {
             })
             .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
 
-        let batch =
-            RecordBatch::try_new(self.schema_with_fetch_status(fetch_result.response_status), columns)
-                .map_err(DataFusionError::from)?;
+        let batch = RecordBatch::try_new(
+            self.schema_with_fetch_status(fetch_result.response_status),
+            columns,
+        )
+        .map_err(DataFusionError::from)?;
         Ok(batch)
     }
 
@@ -2583,8 +2585,11 @@ impl HttpExec {
             }
         }
 
-        RecordBatch::try_new(self.schema_with_fetch_status(fetch_result.response_status), columns)
-            .map_err(DataFusionError::from)
+        RecordBatch::try_new(
+            self.schema_with_fetch_status(fetch_result.response_status),
+            columns,
+        )
+        .map_err(DataFusionError::from)
     }
 
     /// Parse content into individual rows
