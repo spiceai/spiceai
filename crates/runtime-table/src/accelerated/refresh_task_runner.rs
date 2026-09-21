@@ -346,7 +346,14 @@ impl RefreshTaskRunner {
                                     // leaves the mark retracted, which declines a publish of
                                     // whatever rows survived it. Same write mutex the snapshot
                                     // path holds when it samples the mark.
-                                    Self::set_materialization_under_write_mutex(
+                                    // Re-check live SQL under the write mutex: an
+                                    // intervening `update_refresh_sql` can change the
+                                    // live definition (and retract provenance) while
+                                    // this run was in flight. Restoring the dequeue-time
+                                    // `pending_configured` would clobber that and let
+                                    // rows from the old SQL publish under the new live
+                                    // state.
+                                    Self::restore_materialization_under_write_mutex(
                                         &base_refresh,
                                         pending_configured,
                                         &accelerator_write_mutex,
@@ -428,6 +435,10 @@ impl RefreshTaskRunner {
     /// Writes [`Refresh::set_materialization_is_configured`] while holding the
     /// accelerator write mutex — the same lock
     /// [`super::snapshots::create_checkpoint_and_snapshot`] samples under.
+    ///
+    /// Production completion uses [`Self::restore_materialization_under_write_mutex`];
+    /// this helper remains for unit tests that set an absolute provenance bit.
+    #[cfg(test)]
     async fn set_materialization_under_write_mutex(
         refresh: &Arc<RwLock<Refresh>>,
         configured: bool,
@@ -438,6 +449,26 @@ impl RefreshTaskRunner {
             .read()
             .await
             .set_materialization_is_configured(configured);
+    }
+
+    /// Restores provenance after a successful refresh, but only if the live
+    /// refresh SQL still matches the Spicepod definition the dequeue-time
+    /// `pending_configured` was computed against.
+    ///
+    /// `update_refresh_sql` acquires the same write mutex, patches live SQL, and
+    /// retracts provenance while a run started earlier is still executing. When
+    /// that older run completes it must not overwrite the newer live state with
+    /// the dequeue-time bit.
+    async fn restore_materialization_under_write_mutex(
+        refresh: &Arc<RwLock<Refresh>>,
+        pending_configured: bool,
+        accelerator_write_mutex: &Arc<Mutex<()>>,
+    ) {
+        let _guard = accelerator_write_mutex.lock().await;
+        let live = refresh.read().await;
+        let configured =
+            pending_configured && live.live_refresh_sql_matches_configured();
+        live.set_materialization_is_configured(configured);
     }
 
     /// Create a new [`Refresh`] based on defaults and overrides, and report what this run
@@ -612,6 +643,61 @@ mod tests {
         assert!(
             !configured,
             "a full refresh after PATCH /acceleration must not publish under the startup fingerprint"
+        );
+    }
+
+    /// Completing a refresh that was dequeued as configured must not restore
+    /// provenance after `update_refresh_sql` has already replaced the live SQL.
+    #[tokio::test]
+    async fn old_completion_cannot_clobber_newer_live_refresh_sql() {
+        let configured_sql = "SELECT * FROM orders WHERE region = 'us'";
+        let live_sql_after_patch = "SELECT * FROM orders WHERE region = 'eu'";
+
+        let refresh =
+            Refresh::new(RefreshMode::Full).refresh_sql(orders_refresh_sql(configured_sql));
+        refresh.set_materialization_is_configured(true);
+        let defaults = Arc::new(RwLock::new(refresh));
+        let mutex = write_mutex();
+
+        // Dequeue-time decision: this run would be configured.
+        let (_request, pending_configured) = RefreshTaskRunner::create_refresh_from_overrides(
+            Arc::clone(&defaults),
+            None,
+            &mutex,
+        )
+        .await;
+        assert!(pending_configured, "precondition: dequeue decided configured");
+
+        // While the run is in flight, PATCH replaces live SQL and retracts.
+        {
+            let mut live = defaults.write().await;
+            live.apply_runtime_refresh_sql(orders_refresh_sql(live_sql_after_patch));
+            assert!(
+                !live.live_refresh_sql_matches_configured(),
+                "precondition: live SQL diverged"
+            );
+            assert!(
+                !live.materialization_is_configured(),
+                "precondition: PATCH retracted provenance"
+            );
+        }
+
+        // Old completion must not flip provenance back to true.
+        RefreshTaskRunner::restore_materialization_under_write_mutex(
+            &defaults,
+            pending_configured,
+            &mutex,
+        )
+        .await;
+
+        let after = defaults.read().await;
+        assert!(
+            !after.materialization_is_configured(),
+            "old completion must not clobber a newer live refresh SQL"
+        );
+        assert!(
+            !after.live_refresh_sql_matches_configured(),
+            "live SQL must remain the patched value"
         );
     }
 

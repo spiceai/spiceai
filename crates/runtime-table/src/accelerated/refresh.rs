@@ -1333,16 +1333,17 @@ impl Refresher {
                             }
                         }
 
-                        if refresh_succeeded && let Some(checkpointer) = &checkpointer {
+                        // Checkpoint whenever the accelerator changed — including a
+                        // FailedToApplyRetentionSql after a successful write — so a
+                        // stale definition fingerprint cannot survive on modified rows.
+                        // Archive publication stays conditional on a fully successful
+                        // refresh: a retention failure must retract/persist identity
+                        // without publishing those rows.
+                        if refresh_changed_accelerator && let Some(checkpointer) = &checkpointer {
                             let refresh_sql = {
                                 let refresh = refresh.read().await;
                                 refresh.sql.as_ref().map(RefreshSQL::to_sql)
                             };
-                            // Persist/retract the local checkpoint fingerprint on every
-                            // successful materialization. Interval and batch triggers
-                            // publish on their own cycle; passing the manager here is
-                            // what lets the checkpoint record (or retract) the stamp
-                            // even when this refresh does not publish.
                             create_checkpoint_and_snapshot(
                                 checkpointer,
                                 snapshot_manager.as_ref(),
@@ -1356,10 +1357,11 @@ impl Refresher {
                                 None,
                                 refresh_sql.as_deref(),
                                 Some(&refresh),
-                                publish_snapshot_on_refresh_completion(
-                                    create_checkpoint_snapshot_after_refresh,
-                                    checkpoint_counting_enabled.load(Ordering::Acquire),
-                                ),
+                                refresh_succeeded
+                                    && publish_snapshot_on_refresh_completion(
+                                        create_checkpoint_snapshot_after_refresh,
+                                        checkpoint_counting_enabled.load(Ordering::Acquire),
+                                    ),
                             ).await;
                         }
 

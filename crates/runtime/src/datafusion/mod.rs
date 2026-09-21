@@ -5051,17 +5051,52 @@ impl DataFusion {
     ///
     /// `None` is `accept_skew` (the operator opted out) or a view that does not
     /// publish. `Some(gate)` consumes the read-shape attested from the plan that
-    /// executed the refresh — it does not re-plan at publish time.
-    fn view_snapshot_publish_gate(
+    /// executed the refresh — it does not re-plan at publish time — and withholds
+    /// while any accelerated dataset dependency has an unpersisted refresh override.
+    async fn view_snapshot_publish_gate(
+        &self,
         table: &TableReference,
+        view: &View,
         refresh_attestation: Option<crate::view::ViewRefreshReadAttestation>,
     ) -> Option<Arc<dyn runtime_acceleration::snapshot::SnapshotPublishGate>> {
-        refresh_attestation.map(|attestation| {
-            Arc::new(crate::view::ViewSnapshotPublishGate::new(
-                table.clone(),
-                attestation,
-            )) as Arc<dyn runtime_acceleration::snapshot::SnapshotPublishGate>
-        })
+        let Some(attestation) = refresh_attestation else {
+            return None;
+        };
+        let dependency_refreshes = self.accelerated_dependency_refreshes(view).await;
+        Some(Arc::new(crate::view::ViewSnapshotPublishGate::new(
+            table.clone(),
+            attestation,
+            dependency_refreshes,
+        )) as Arc<dyn runtime_acceleration::snapshot::SnapshotPublishGate>)
+    }
+
+    /// Live `Refresh` handles for accelerated datasets in `view`'s definition closure.
+    async fn accelerated_dependency_refreshes(
+        &self,
+        view: &View,
+    ) -> Vec<(
+        TableReference,
+        Arc<tokio::sync::RwLock<crate::accelerated::refresh::Refresh>>,
+    )> {
+        let names =
+            crate::view::dataset_names_in_view_closure(&view.name, &view.sql, &view.app);
+        let mut out = Vec::new();
+        for name in names {
+            let Ok(provider) = self.get_accelerated_table_provider(&name).await else {
+                continue;
+            };
+            let Some(accelerated) = spice_table::find_layer::<AcceleratedTable>(
+                provider.as_ref(),
+                spice_table::LayerWalk::Read,
+            ) else {
+                continue;
+            };
+            out.push((
+                TableReference::parse_str(&name),
+                accelerated.refresh_params(),
+            ));
+        }
+        out
     }
 
     /// Returns the waiter for the view's initial refresh together with the
@@ -5260,7 +5295,7 @@ impl DataFusion {
                 // Consistency was decided before bootstrap. Only install the
                 // publish veto when this view will also write archives.
                 if !acceleration.snapshot_behavior.is_disabled() {
-                    let publish_gate = Self::view_snapshot_publish_gate(table, refresh_attestation);
+                    let publish_gate = self.view_snapshot_publish_gate(table, view, refresh_attestation).await;
 
                     if acceleration.snapshot_behavior.create_enabled() {
                         let snapshot_engine_override = match self
@@ -6198,14 +6233,17 @@ async fn build_snapshot_creation_config(
         feature = "postgres",
         not(windows)
     ))]
-    Ok(SnapshotManager::try_new(
-        source.name().to_string(),
-        acceleration_settings.snapshot_behavior.clone(),
-        acceleration_layout,
-        acceleration_engine,
-    )
-    .await
-    .map(|sm| {
+    {
+        let Some(sm) = SnapshotManager::try_new(
+            source.name().to_string(),
+            acceleration_settings.snapshot_behavior.clone(),
+            acceleration_layout,
+            acceleration_engine,
+        )
+        .await
+        else {
+            return Ok(None);
+        };
         let sm = sm.with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy);
         let sm = if let Some(engine) = snapshot_engine_override {
             sm.with_snapshot_engine(engine)
@@ -6213,19 +6251,77 @@ async fn build_snapshot_creation_config(
             sm
         };
         // Stamped on publish and re-checked on bootstrap. A view's identity is its
-        // SQL (the definition fingerprint). Producing-read consistency is a separate
-        // per-entry stamp so a `consistent_read` consumer can refuse an `accept_skew`
-        // archive of the same definition. A dataset's identity is its `from:` plus
-        // `refresh_sql`. Both shape the stored rows while leaving the schema
-        // untouched.
-        let sm = sm.with_source(source);
+        // whole definition closure — and for dataset dependencies, the *effective*
+        // runtime refresh SQL when observable, not only the static Spicepod
+        // declaration. A dataset's identity is its `from:` plus `refresh_sql`.
+        let sm = if let Some(view) = source
+            .as_any()
+            .downcast_ref::<crate::component::view::View>()
+        {
+            let live = live_dataset_refresh_sql_for_view(view).await;
+            let definition = runtime_acceleration::acceleration_source::SourceDefinition {
+                fingerprint: crate::view::definition_fingerprint(
+                    &crate::view::view_definition_closure_with_live_refresh_sql(
+                        &view.name,
+                        &view.sql,
+                        &view.columns,
+                        &view.params,
+                        &view.app,
+                        &live,
+                    ),
+                ),
+                accept_unstamped: false,
+                materialization: runtime_acceleration::acceleration_source::MaterializationSource::PlannedQuery,
+            };
+            sm.with_source_identity(
+                Some(definition),
+                view.acceleration
+                    .as_ref()
+                    .map(|acceleration| acceleration.snapshots_consistency)
+                    .unwrap_or_default(),
+            )
+        } else {
+            sm.with_source(source)
+        };
         let sm = if let Some(gate) = publish_gate {
             sm.with_publish_gate(gate)
         } else {
             sm
         };
-        SnapshotCreationConfig::new(Arc::new(sm), snapshot_creation_trigger)
-    }))
+        return Ok(Some(SnapshotCreationConfig::new(
+            Arc::new(sm),
+            snapshot_creation_trigger,
+        )));
+    }
+}
+
+/// Effective runtime `Refresh.sql` for each accelerated dataset in `view`'s closure.
+async fn live_dataset_refresh_sql_for_view(
+    view: &crate::component::view::View,
+) -> std::collections::HashMap<String, Option<String>> {
+    let df = view.runtime.datafusion();
+    let names = crate::view::dataset_names_in_view_closure(&view.name, &view.sql, &view.app);
+    let mut live = std::collections::HashMap::new();
+    for name in names {
+        let Ok(provider) = df.get_accelerated_table_provider(&name).await else {
+            continue;
+        };
+        let Some(accelerated) = spice_table::find_layer::<AcceleratedTable>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Read,
+        ) else {
+            continue;
+        };
+        let sql = accelerated
+            .refresh_params()
+            .read()
+            .await
+            .sql
+            .as_ref()
+            .map(crate::accelerated::refresh::RefreshSQL::to_sql);
+        live.insert(name, sql);
+    }
+    live
 }
 
 /// Build the per-dataset state required to drive `RefreshMode::Snapshot`.

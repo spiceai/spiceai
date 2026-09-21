@@ -34,6 +34,8 @@ use runtime_acceleration::snapshot::SnapshotPublishGate;
 use runtime_datafusion::refresh_scan::session_is_refresh_scan;
 use runtime_search::embeddings::{table::EmbeddingTable, warm_index_on_zero_results};
 use runtime_table::accelerated::materialization::MaterializationIdentity;
+use runtime_table::accelerated::refresh::Refresh;
+use tokio::sync::RwLock as TokioRwLock;
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use spice_table::TableLayer;
@@ -81,14 +83,23 @@ pub(crate) struct ViewSnapshotPublishGate {
     /// [`SnapshotPublishGate::bind_materialization_epoch`] — tests that only
     /// exercise shape still work; the live snapshot path always binds.
     expected_epoch: parking_lot::Mutex<Option<u64>>,
+    /// Accelerated dataset (or view) dependencies whose live `Refresh.sql` can
+    /// diverge from the Spicepod definition this view's fingerprint describes.
+    /// Publication is withheld while any of them is not proven configured.
+    dependency_refreshes: Vec<(TableReference, Arc<TokioRwLock<Refresh>>)>,
 }
 
 impl ViewSnapshotPublishGate {
-    pub(crate) fn new(view_name: TableReference, attestation: ViewRefreshReadAttestation) -> Self {
+    pub(crate) fn new(
+        view_name: TableReference,
+        attestation: ViewRefreshReadAttestation,
+        dependency_refreshes: Vec<(TableReference, Arc<TokioRwLock<Refresh>>)>,
+    ) -> Self {
         Self {
             view_name,
             attestation,
             expected_epoch: parking_lot::Mutex::new(None),
+            dependency_refreshes,
         }
     }
 }
@@ -105,6 +116,12 @@ fn attestation_epoch_mismatch_reason(view_name: &TableReference) -> String {
     )
 }
 
+fn dependency_override_reason(view_name: &TableReference, dependency: &TableReference) -> String {
+    format!(
+        "view '{view_name}' depends on '{dependency}' whose live refresh SQL does not match the Spicepod definition this view's fingerprint describes (or whose materialization is not proven configured), so publishing would stamp rows that fingerprint cannot vouch for"
+    )
+}
+
 #[async_trait]
 impl SnapshotPublishGate for ViewSnapshotPublishGate {
     async fn check_publish(&self) -> Result<(), String> {
@@ -115,6 +132,17 @@ impl SnapshotPublishGate for ViewSnapshotPublishGate {
                     && epoch != expected
                 {
                     return Err(attestation_epoch_mismatch_reason(&self.view_name));
+                }
+                // A dependency's PATCH /acceleration can replace live refresh SQL
+                // without updating this view's Spicepod fingerprint. Withhold until
+                // every accelerated dependency is again the configured definition.
+                for (dependency, refresh) in &self.dependency_refreshes {
+                    let live = refresh.read().await;
+                    if !live.live_refresh_sql_matches_configured()
+                        || !live.materialization_is_configured()
+                    {
+                        return Err(dependency_override_reason(&self.view_name, dependency));
+                    }
                 }
                 shape.refusal_reason().map_or(Ok(()), Err)
             }
@@ -277,7 +305,14 @@ pub(crate) enum ViewReadShape {
     FederatedSingleStatement { tables: Vec<TableReference> },
     /// Several independent reads: several scans, several federated sub-plans, or a mix.
     MultipleReads {
+        /// Lower bound on independent reads. Exact only when `exact_count` is true —
+        /// fan-out and opaque nodes contribute at least one read whose child count is
+        /// unavailable here, so quoting this number as exact would be wrong.
         reads: usize,
+        /// Whether `reads` is an exact count. False when a partitioned (or otherwise
+        /// fanned-out) scan or an unrecognized opaque extension contributed: those add
+        /// "at least one" read without exposing how many children they actually scan.
+        exact_count: bool,
         tables: Vec<TableReference>,
     },
 }
@@ -291,12 +326,32 @@ impl ViewReadShape {
             ViewReadShape::SingleScan { .. } | ViewReadShape::FederatedSingleStatement { .. } => {
                 None
             }
-            ViewReadShape::MultipleReads { reads, tables } => Some(format!(
-                "its query reads its sources {reads} times ({}), so a snapshot would \
-                 capture each read at a different source position and could store rows \
-                 that never existed together in the source",
-                quoted_list(tables)
-            )),
+            ViewReadShape::MultipleReads {
+                reads,
+                exact_count,
+                tables,
+            } => {
+                let count_clause = if *exact_count {
+                    format!(
+                        "reads its sources {reads} times ({})",
+                        quoted_list(tables)
+                    )
+                } else {
+                    // Fan-out / opaque contributors do not expose a child count, so a
+                    // single partitioned scan must not be reported as "reads its sources
+                    // 1 times (no tables)" — that is both numerically wrong and
+                    // contradictory. Describe the shape without inventing a count.
+                    let detail = if tables.is_empty() {
+                        "including a scan that fans out across child providers or an unrecognized plan node".to_string()
+                    } else {
+                        quoted_list(tables)
+                    };
+                    format!("reads its sources more than once ({detail})")
+                };
+                Some(format!(
+                    "its query {count_clause}, so a snapshot would capture each read at a different source position and could store rows that never existed together in the source"
+                ))
+            },
         }
     }
 }
@@ -433,13 +488,17 @@ pub(crate) fn classify_view_read(plan: &LogicalPlan) -> ViewReadShape {
         (0, 1, 0) => ViewReadShape::FederatedSingleStatement {
             tables: federated.into_iter().next().unwrap_or_default(),
         },
-        (scan_count, federated_count, opaque_count) => {
+        (scan_count, federated_count, unknown_count) => {
             let mut tables = scans;
             for inner in federated {
                 tables.extend(inner);
             }
+            // `unknown_count` is opaque + fan_out: each contributes at least one read
+            // whose exact child count is unavailable, so the reported total is a lower
+            // bound rather than an exact count.
             ViewReadShape::MultipleReads {
-                reads: scan_count + federated_count + opaque_count,
+                reads: scan_count + federated_count + unknown_count,
+                exact_count: unknown_count == 0,
                 tables,
             }
         }
@@ -465,6 +524,7 @@ pub(crate) fn classify_executed_read(plan: &dyn ExecutionPlan) -> ViewReadShape 
         },
         many => ViewReadShape::MultipleReads {
             reads: many.len(),
+            exact_count: true,
             tables: many
                 .iter()
                 .map(|read| match read {
@@ -535,6 +595,35 @@ pub(crate) fn view_definition_closure(
     params: &HashMap<String, String>,
     app: &app::App,
 ) -> String {
+    view_definition_closure_with_live_refresh_sql(
+        name,
+        sql,
+        columns,
+        params,
+        app,
+        &HashMap::new(),
+    )
+}
+
+/// Like [`view_definition_closure`], but each dataset dependency's identity uses
+/// `live_dataset_refresh_sql[name]` (the effective runtime `Refresh.sql`) when
+/// present instead of only the static Spicepod `acceleration.refresh_sql`.
+///
+/// A `PATCH /v1/datasets/{name}/acceleration` can replace live refresh SQL without
+/// touching the Spicepod. Hashing only the declaration would let a view that
+/// refreshed from those overridden rows publish under the old fingerprint. Callers
+/// that can observe live SQL pass it here; the publish gate still withholds while
+/// any dependency is not proven configured, covering overrides that land after the
+/// fingerprint was captured.
+#[must_use]
+pub(crate) fn view_definition_closure_with_live_refresh_sql(
+    name: &TableReference,
+    sql: &str,
+    columns: &[spicepod::semantic::Column],
+    params: &HashMap<String, String>,
+    app: &app::App,
+    live_dataset_refresh_sql: &HashMap<String, Option<String>>,
+) -> String {
     let mut closure: BTreeMap<String, String> = BTreeMap::new();
     visit_view_definition_closure(name, sql, app, |member| match member {
         ViewClosureMember::View { spec, sql } => {
@@ -555,9 +644,13 @@ pub(crate) fn view_definition_closure(
             );
         }
         ViewClosureMember::Dataset(dataset) => {
+            let mut fields = dataset_identity_fields(dataset);
+            if let Some(live_sql) = live_dataset_refresh_sql.get(&dataset.name) {
+                apply_live_refresh_sql_to_identity_fields(&mut fields, live_sql.as_deref());
+            }
             closure.insert(
                 dataset.name.clone(),
-                dataset_definition_identity(&dataset.from, &dataset_identity_fields(dataset)),
+                dataset_definition_identity(&dataset.from, &fields),
             );
         }
         ViewClosureMember::Catalog(catalog) => {
@@ -619,6 +712,23 @@ enum ViewClosureMember<'a> {
 /// `app.catalogs`; rebinding catalog `sales` keeps the view SQL and schema
 /// identical. Folding only datasets would restore an archive of the old
 /// catalog's rows.
+
+/// Declared dataset names in a view's definition closure, in visit order.
+#[must_use]
+pub(crate) fn dataset_names_in_view_closure(
+    name: &TableReference,
+    sql: &str,
+    app: &app::App,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    visit_view_definition_closure(name, sql, app, |member| {
+        if let ViewClosureMember::Dataset(dataset) = member {
+            names.push(dataset.name.clone());
+        }
+    });
+    names
+}
+
 fn visit_view_definition_closure(
     name: &TableReference,
     sql: &str,
@@ -1081,6 +1191,26 @@ fn push_dataset_shape_fields(
     }
     if !embeddings.is_empty() {
         fields.insert("embeddings".to_string(), identity_value(&embeddings));
+    }
+}
+
+
+/// Overlay the effective runtime refresh SQL onto dataset identity fields.
+///
+/// `Some(sql)` replaces `acceleration.refresh_sql`; `None` removes it (a live
+/// clear of a Spicepod-declared filter).
+fn apply_live_refresh_sql_to_identity_fields(
+    fields: &mut BTreeMap<String, String>,
+    live_sql: Option<&str>,
+) {
+    const KEY: &str = "acceleration.refresh_sql";
+    match live_sql {
+        Some(sql) => {
+            fields.insert(KEY.to_string(), sql.trim().to_string());
+        }
+        None => {
+            fields.remove(KEY);
+        }
     }
 }
 
@@ -1721,6 +1851,26 @@ mod tests {
         /// The case an AST-shaped check misses: one table name, two reads. Two scans of
         /// one table resolve two independent read views, so this is exactly as unsafe as
         /// joining two different tables.
+        #[test]
+        fn fanned_out_scan_refusal_is_non_numeric() {
+            // `scan_fans_out` is only a boolean, so a single partitioned scan must not
+            // be reported as the contradictory "reads its sources 1 times (no tables)".
+            let shape = ViewReadShape::MultipleReads {
+                reads: 1,
+                exact_count: false,
+                tables: vec![],
+            };
+            let reason = shape.refusal_reason().expect("fan-out must refuse");
+            assert!(
+                !reason.contains("1 times"),
+                "must not invent an exact count: {reason}"
+            );
+            assert!(
+                reason.contains("more than once"),
+                "must describe multi-read without a count: {reason}"
+            );
+        }
+
         #[tokio::test]
         async fn self_join_of_one_table_is_refused() {
             let shape = shape_of(
@@ -1734,7 +1884,8 @@ mod tests {
             );
             assert!(matches!(
                 shape,
-                ViewReadShape::MultipleReads { reads: 2, .. }
+                ViewReadShape::MultipleReads { reads: 2,
+                exact_count: true, .. }
             ));
         }
 
@@ -1852,7 +2003,8 @@ mod tests {
             let plan = df.create_physical_plan().await.expect("physical plan");
             let shape = classify_executed_read(plan.as_ref());
             assert!(
-                matches!(shape, ViewReadShape::MultipleReads { reads: 2, .. }),
+                matches!(shape, ViewReadShape::MultipleReads { reads: 2,
+                exact_count: true, .. }),
                 "the executing plan of a two-table join must be two reads: {shape:?}"
             );
         }
@@ -1864,6 +2016,7 @@ mod tests {
             let gate = ViewSnapshotPublishGate::new(
                 TableReference::bare("orders_us"),
                 attestation.clone(),
+                vec![],
             );
 
             let missing = gate
@@ -1874,6 +2027,7 @@ mod tests {
 
             attestation.record(ViewReadShape::MultipleReads {
                 reads: 2,
+                exact_count: true,
                 tables: vec![TableReference::bare("orders")],
             });
             let refused = gate
@@ -1906,6 +2060,7 @@ mod tests {
             let epoch_n = identity.begin_refresh();
             attestation.record(ViewReadShape::MultipleReads {
                 reads: 2,
+                exact_count: true,
                 tables: vec![TableReference::bare("orders")],
             });
             identity.set_configured(true);
@@ -1917,6 +2072,7 @@ mod tests {
             let gate = ViewSnapshotPublishGate::new(
                 TableReference::bare("orders_us"),
                 attestation.clone(),
+                vec![],
             );
             gate.bind_materialization_epoch(sampled.epoch);
 
@@ -1959,7 +2115,7 @@ mod tests {
             });
             identity.set_configured(true);
 
-            let gate = ViewSnapshotPublishGate::new(TableReference::bare("orders_us"), attestation);
+            let gate = ViewSnapshotPublishGate::new(TableReference::bare("orders_us"), attestation, vec![]);
             gate.bind_materialization_epoch(epoch);
             gate.check_publish()
                 .await
@@ -2096,6 +2252,7 @@ mod tests {
             let epoch = identity.begin_refresh();
             attestation.record(ViewReadShape::MultipleReads {
                 reads: 2,
+                exact_count: true,
                 tables: vec![
                     TableReference::bare("orders"),
                     TableReference::bare("customers"),
@@ -2110,6 +2267,7 @@ mod tests {
             let gate = ViewSnapshotPublishGate::new(
                 TableReference::bare("orders_us"),
                 attestation.clone(),
+                vec![],
             );
             gate.bind_materialization_epoch(sampled.epoch);
 
@@ -2147,7 +2305,8 @@ mod tests {
                 attestation.last_stamped().map(|(stamped_epoch, shape)| {
                     (
                         stamped_epoch,
-                        matches!(shape, ViewReadShape::MultipleReads { reads: 2, .. }),
+                        matches!(shape, ViewReadShape::MultipleReads { reads: 2,
+                exact_count: true, .. }),
                     )
                 }),
                 Some((epoch, true)),
@@ -3014,6 +3173,40 @@ mod tests {
                 baseline,
                 identity_with(on_conflict),
                 "on_conflict decides which of two colliding rows is kept"
+            );
+        }
+
+        #[test]
+        fn live_dataset_refresh_sql_moves_the_view_fingerprint() {
+            use spicepod::component::dataset::Dataset as SpicepodDataset;
+            use spicepod::acceleration::{Acceleration, RefreshMode};
+
+            let mut dataset = SpicepodDataset::new("file:orders.parquet", "orders");
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                refresh_sql: Some("SELECT * FROM orders WHERE region = 'us'".to_string()),
+                refresh_mode: Some(RefreshMode::Full),
+                ..Acceleration::default()
+            });
+            let app = app::AppBuilder::new("test")
+                .with_dataset(dataset)
+                .build();
+            let outer = TableReference::bare("orders_us");
+            let sql = "SELECT * FROM orders";
+            let spicepod_fp = definition_fingerprint(&view_definition_closure(
+                &outer, sql, &[], &HashMap::new(), &app,
+            ));
+            let mut live = HashMap::new();
+            live.insert(
+                "orders".to_string(),
+                Some("SELECT * FROM orders WHERE region = 'eu'".to_string()),
+            );
+            let live_fp = definition_fingerprint(&view_definition_closure_with_live_refresh_sql(
+                &outer, sql, &[], &HashMap::new(), &app, &live,
+            ));
+            assert_ne!(
+                spicepod_fp, live_fp,
+                "effective runtime refresh SQL must change the view fingerprint"
             );
         }
 
