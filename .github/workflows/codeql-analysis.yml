@@ -3,23 +3,17 @@ name: 'CodeQL'
 # Rust CodeQL security scan. GitHub's automatic Code Quality job covers
 # interpreted languages on pull requests (e.g. Analyze (python)); compiled
 # Rust needs this autobuild. The trunk ruleset requires CodeQL results on the
-# PR head, so this also runs on pull_request and merge_group. Trunk/release
-# pushes, a weekly schedule, and workflow_dispatch still run it. Do not add
-# paths-ignore on pull_request: a skipped rust scan leaves the enterprise
+# PR head. `pull_request` and `merge_group` load this file from the PR, so a
+# pull request can replace the scan with a clean SARIF. `pull_request_target`
+# loads it from the default branch instead. Do not add paths-ignore on
+# `pull_request_target`: a skipped rust scan leaves the enterprise
 # code-scanning rule waiting on a check that never starts.
 #
-# This workflow is read-only. SARIF is published by `codeql-upload.yml`, a
-# `workflow_run` companion GitHub always loads from the default branch, so a
-# pull request cannot add checkout or a `run` step to the job that holds
-# `security-events: write`.
+# This workflow is read-only. SARIF is published by `codeql-upload.yml`, which
+# `workflow_run` loads from the default branch.
 on:
   workflow_dispatch:
-  pull_request:
-    branches:
-      - trunk
-      - release-*
-      - release/*
-  merge_group:
+  pull_request_target:
     branches:
       - trunk
       - release-*
@@ -35,25 +29,23 @@ on:
   schedule:
     - cron: '19 18 * * 4'
 
-# A pull_request run loads this file from the PR. The default token is
-# read-only; Analyze must not request `security-events: write`.
+# pull_request_target still checks out the PR head below. The token stays
+# read-only and the job must not request security-events: write.
 permissions:
   contents: read
 
 jobs:
   analyze:
     name: Analyze
-    # pull_request and merge_group check out PR-controlled code. Cargo build
-    # scripts and local composite actions must not run on the shared
-    # self-hosted pool or receive MinIO credentials. push/schedule/dispatch
-    # keep spiceai-dev-runners.
+    # The PR head is untrusted code. Cargo build scripts and local composite
+    # actions must not run on the shared self-hosted pool or receive MinIO
+    # credentials. push/schedule/dispatch keep spiceai-dev-runners.
     runs-on: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'spiceai-dev-runners' || 'ubuntu-24.04' }}
     env:
       HAS_TEST_MINIO_SECRET: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
-    # Required merge-group check: an unbounded autobuild leaves the queue
-    # candidate waiting for GitHub's six-hour default (#12717). Hosted
-    # uncached rust analysis has been completing in about 80 minutes; the
-    # bound sits above that.
+    # An unbounded autobuild waits out GitHub's six-hour default (#12717).
+    # Hosted uncached rust analysis has been completing in about 80 minutes;
+    # the bound sits above that.
     timeout-minutes: 150
     permissions:
       actions: read
@@ -68,10 +60,21 @@ jobs:
         # https://docs.github.com/en/free-pro-team@latest/github/finding-security-vulnerabilities-and-errors-in-your-code/configuring-code-scanning#changing-the-languages-that-are-analyzed
 
     steps:
+      # push, schedule, and workflow_dispatch scan github.sha. pull_request_target's
+      # github.sha is the base branch; the scan has to be the PR head, which is
+      # the commit the upload records.
       - name: Checkout repository
+        if: github.event_name != 'pull_request_target'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Checkout pull request head
+        if: github.event_name == 'pull_request_target'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set up sccache with local MinIO
         if: env.HAS_TEST_MINIO_SECRET == 'true'

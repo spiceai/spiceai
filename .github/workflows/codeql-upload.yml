@@ -1,33 +1,25 @@
----
 name: CodeQL SARIF upload
 
 # Privileged companion to `codeql-analysis.yml`.
 #
-# `pull_request` (and `merge_group`) load the analysis workflow from the PR,
-# so a job defined there that holds `security-events: write` can be rewritten
-# with checkout or a `run` step and still receive the write-capable token.
-# `workflow_run` always loads *this* file from the default branch. The job
-# never checks out the repository and never reads ref/sha from the artifact,
-# so a PR cannot redirect the upload or execute its own code with write
-# scope. See https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
+# `workflow_run` loads this file from the default branch. There is no
+# `workflow_dispatch`: that event runs whichever branch was selected, so a
+# branch could rewrite this job and still receive `security-events: write`.
 #
-# `workflow_dispatch` is the recovery path when a completed CodeQL run has a
-# SARIF artifact but nothing published it (the companion is not yet on the
-# default branch, or a `workflow_run` delivery was missed).
+# The job does not check out a repository and does not read ref or sha from
+# the SARIF artifact. `pull_request` and `merge_group` are refused: those
+# events run the analysis workflow from the pull request, which can upload a
+# clean artifact under the expected name. `pull_request_target` is accepted
+# because GitHub runs the default-branch analysis file; the recorded commit
+# is the pull request head, the same commit that file checks out.
 on:
   workflow_run:
     workflows: ['CodeQL']
     types:
       - completed
-  workflow_dispatch:
-    inputs:
-      run_id:
-        description: 'ID of a completed CodeQL run whose SARIF artifact should be uploaded'
-        required: true
-        type: string
 
 concurrency:
-  group: codeql-sarif-upload-${{ inputs.run_id || github.event.workflow_run.id }}
+  group: codeql-sarif-upload-${{ github.event.workflow_run.id }}
   # Same source run should finish, not be cancelled mid-upload.
   cancel-in-progress: false
 
@@ -38,7 +30,7 @@ jobs:
   upload:
     name: Upload SARIF
     runs-on: ubuntu-24.04
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    if: github.event.workflow_run.conclusion == 'success'
     # Download plus one code-scanning upload. Anything past this is wedged,
     # not slow, and would otherwise inherit GitHub's six-hour ceiling.
     timeout-minutes: 15
@@ -51,7 +43,7 @@ jobs:
         id: source
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_RUN_ID: ${{ inputs.run_id || github.event.workflow_run.id }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
         shell: bash
         run: |
           set -euo pipefail
@@ -85,36 +77,52 @@ jobs:
             exit 1
           fi
 
-          if [[ ! "${head_sha}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::CodeQL run ${SOURCE_RUN_ID} has no commit SHA, so results cannot be attached to a scan."
-            exit 1
-          fi
+          # trunk and release branches are the pushes this repository treats
+          # as protected. A workflow_dispatch of a pull-request branch is not.
+          trusted_ref() {
+            case "$1" in
+              trunk|release-*|release/*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
 
-          # Ref and SHA come from the Actions API (trusted), never from the
-          # artifact a pull-request run produced.
+          sha=''
           ref=''
-          if [[ "${event}" == 'pull_request' ]]; then
-            pr_number="$(jq -r '.pull_requests[0].number // empty' <<<"${run_json}")"
-            if [[ -z "${pr_number}" ]]; then
-              pr_number="$(
-                gh api "repos/${GITHUB_REPOSITORY}/commits/${head_sha}/pulls" \
-                  --jq '.[0].number // empty'
-              )"
-            fi
-            if [[ ! "${pr_number}" =~ ^[0-9]+$ ]]; then
-              echo "::error::No pull request found for CodeQL head '${head_sha}', so results cannot be attached to a PR ref."
+          case "${event}" in
+            pull_request|merge_group)
+              echo "::error::Refusing to upload SARIF from '${event}'. That event runs the analysis workflow from the pull request, so the artifact can be a clean stand-in for a real scan."
               exit 1
-            fi
-            ref="refs/pull/${pr_number}/head"
-          elif [[ -n "${head_branch}" ]]; then
-            ref="refs/heads/${head_branch}"
-          else
-            echo "::error::CodeQL run ${SOURCE_RUN_ID} has no head branch, so results cannot be attached to a ref."
+              ;;
+            pull_request_target)
+              sha="$(jq -r '.pull_requests[0].head.sha // empty' <<<"${run_json}")"
+              pr_number="$(jq -r '.pull_requests[0].number // empty' <<<"${run_json}")"
+              if [[ ! "${pr_number}" =~ ^[0-9]+$ || ! "${sha}" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "::error::pull_request_target run ${SOURCE_RUN_ID} has no pull-request head SHA, so results are not uploaded."
+                exit 1
+              fi
+              ref="refs/pull/${pr_number}/head"
+              ;;
+            push|schedule|workflow_dispatch)
+              if ! trusted_ref "${head_branch}"; then
+                echo "::error::Refusing to upload SARIF from ${event} on '${head_branch}'. Only trunk and release branches run a trusted analysis workflow."
+                exit 1
+              fi
+              sha="${head_sha}"
+              ref="refs/heads/${head_branch}"
+              ;;
+            *)
+              echo "::error::Refusing to upload SARIF from event '${event}'."
+              exit 1
+              ;;
+          esac
+
+          if [[ ! "${sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Refusing to upload SARIF for sha '${sha}'."
             exit 1
           fi
 
           case "${ref}" in
-            refs/heads/*|refs/tags/*|refs/pull/[0-9]*/head|refs/pull/[0-9]*/merge) ;;
+            refs/heads/*|refs/pull/[0-9]*/head) ;;
             *)
               echo "::error::Unsupported upload ref '${ref}'."
               exit 1
@@ -123,7 +131,7 @@ jobs:
 
           {
             echo "run-id=${SOURCE_RUN_ID}"
-            echo "sha=${head_sha}"
+            echo "sha=${sha}"
             echo "ref=${ref}"
           } >> "${GITHUB_OUTPUT}"
 
