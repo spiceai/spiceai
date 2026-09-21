@@ -1,10 +1,13 @@
 name: build_and_release_cuda
 
 # CUDA is not part of pull-request CI: a single compute-cap 90 compile takes
-# hours on the large runners, and the workflow is not a required check. Tagged
-# releases and manual dispatches still build every compute capability.
+# hours on the large runners, and the workflow is not a required check. Trunk
+# pushes, tagged releases, and manual dispatches still build every compute
+# capability.
 on:
   push:
+    branches:
+      - trunk
     tags:
       - v*
     paths-ignore:
