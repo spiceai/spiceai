@@ -228,10 +228,15 @@ impl TryFrom<&str> for ModelSource {
         } else if value.starts_with("bedrock") {
             Ok(ModelSource::Bedrock)
         } else if value == "typesafe"
-            || value.starts_with("typesafe:")
-            || value.starts_with("typesafe/")
+            || value
+                .strip_prefix("typesafe:")
+                .is_some_and(|id| !id.is_empty())
+            || value
+                .strip_prefix("typesafe/")
+                .is_some_and(|id| !id.is_empty())
         {
-            // Bare / colon / slash forms; schema pattern `^typesafe($|:|/)` matches these.
+            // Bare `typesafe` is the documented default. A colon or slash must
+            // carry a model id — `typesafe:` / `typesafe/` are not that default.
             Ok(ModelSource::TypeSafe)
         } else {
             Err("Unknown prefix")
@@ -506,8 +511,6 @@ mod tests {
     fn typesafe_from_parses_jev_aliases() {
         for from in [
             "typesafe",
-            "typesafe:",
-            "typesafe/",
             "typesafe:jev",
             "typesafe/jev",
             "typesafe:jev-latest",
@@ -530,18 +533,15 @@ mod tests {
             Some("jev")
         );
         assert_eq!(Model::new("typesafe", "jev").get_model_id(), None);
-        // Bare separator forms yield an empty id today (caller normalizes to jev-latest).
-        assert_eq!(
-            Model::new("typesafe:", "jev").get_model_id().as_deref(),
-            Some("")
-        );
-        assert_eq!(
-            Model::new("typesafe/", "jev").get_model_id().as_deref(),
-            Some("")
-        );
 
-        // Require a complete `typesafe` / `typesafe:` / `typesafe/` prefix — do not
-        // accept lookalikes such as `typesafely:…`.
+        // Separator-only forms are not the bare default — they must not parse.
+        for from in ["typesafe:", "typesafe/"] {
+            let model = Model::new(from, "jev");
+            assert_eq!(model.get_source(), None, "expected reject for {from}");
+            assert_eq!(model.get_model_id(), None, "expected no id for {from}");
+        }
+
+        // Require a complete `typesafe` prefix — do not accept lookalikes such as `typesafely:…`.
         let lookalike = Model::new("typesafely:jev", "jev");
         assert_eq!(lookalike.get_source(), None);
         assert_eq!(lookalike.get_model_id(), None);

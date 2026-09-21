@@ -363,11 +363,12 @@ fn create_catalog_specific_schema(
 
 /// `from` pattern aligned with [`spicepod::component::model::ModelSource`] parsing.
 ///
-/// Most providers match `name:…`. `TypeSafe` also accepts bare `typesafe` and slash
-/// form `typesafe/…` (but not typos like `typesafely:…`).
+/// Most providers match `name:…`. `TypeSafe` also accepts bare `typesafe` and a
+/// colon or slash form with a non-empty model id (not `typesafe:` / `typesafe/`,
+/// and not typos like `typesafely:…`).
 fn model_source_from_pattern(name: &str) -> String {
     if name == "typesafe" {
-        format!("^{}($|:|/)", regex::escape(name))
+        format!("^{}($|:.+|/.+)", regex::escape(name))
     } else {
         format!("^{}:", regex::escape(name))
     }
@@ -1409,10 +1410,11 @@ mod tests {
     #[test]
     fn typesafe_from_pattern_covers_bare_colon_and_slash() {
         let pattern = model_source_from_pattern("typesafe");
-        assert_eq!(pattern, "^typesafe($|:|/)");
+        assert_eq!(pattern, "^typesafe($|:.+|/.+)");
         let re = regex::Regex::new(&pattern).expect("pattern compiles");
         assert!(re.is_match("typesafe"));
-        assert!(re.is_match("typesafe:"));
+        assert!(!re.is_match("typesafe:"));
+        assert!(!re.is_match("typesafe/"));
         assert!(re.is_match("typesafe:jev"));
         assert!(re.is_match("typesafe/jev"));
         assert!(!re.is_match("typesafely:jev"));

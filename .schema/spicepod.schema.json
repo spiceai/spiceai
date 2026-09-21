@@ -4317,7 +4317,7 @@
           "if": {
             "properties": {
               "from": {
-                "pattern": "^typesafe($|:|/)"
+                "pattern": "^typesafe($|:.+|/.+)"
               }
             }
           },
@@ -22626,7 +22626,7 @@
         "from": {
           "description": "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/evaluate.",
           "type": "string",
-          "pattern": "^typesafe($|:|/)"
+          "pattern": "^typesafe($|:.+|/.+)"
         },
         "name": {
           "type": "string"
