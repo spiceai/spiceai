@@ -1,22 +1,9 @@
 name: build_and_release_cuda
 
+# CUDA is not part of pull-request CI: a single compute-cap 90 compile takes
+# hours on the large runners, and the workflow is not a required check. Tagged
+# releases and manual dispatches still build every compute capability.
 on:
-  pull_request:
-    branches:
-      - trunk
-    paths:
-      # Every manifest that declares or forwards the CUDA/candle dependency
-      # surface this build compiles: `crates/llms/Cargo.toml` owns `mistralrs`,
-      # `tei_candle` and `cudarc` plus the `cuda`/`flash-attn`/`ring` features,
-      # and the model-contract crates beneath it can shift feature unification
-      # for that graph. Keep this list moving with the dependencies — when the
-      # local-inference stack is split into its own crate, this filter must name
-      # that crate's manifest, or it will still be here pointing at a file that
-      # no longer declares anything CUDA.
-      - 'crates/llms/Cargo.toml'
-      - 'crates/chat-api/Cargo.toml'
-      - 'crates/embed-api/Cargo.toml'
-      - 'crates/rerank-api/Cargo.toml'
   push:
     tags:
       - v*
@@ -136,11 +123,6 @@ jobs:
               }
 
               return filtered;
-            }
-
-            // For `on.pull_request`, only build 90 compute capability on Linux.
-            if (context.eventName === 'pull_request') {
-              return matrix.filter(m => m.compute_cap === "90" && m.target_os === "linux");
             }
 
             return matrix;
