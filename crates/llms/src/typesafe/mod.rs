@@ -426,9 +426,9 @@ impl Evaluate for TypeSafe {
             .json(&request)
             .send()
             .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-            .with_context(|_| ModelCallFailedSnafu {
+            .map_err(|e| evaluate_api::Error::ServiceUnavailable {
                 model: self.name.clone(),
+                message: e.to_string(),
             })?;
 
         let status = response.status();
@@ -1482,5 +1482,36 @@ mod tests {
             err,
             evaluate_api::Error::ServiceUnavailable { .. }
         ));
+    }
+
+    /// A refused TCP connect is a transport outage, not an unclassified provider
+    /// failure: `/v1/evaluate` maps `ServiceUnavailable` to HTTP 503.
+    #[tokio::test]
+    async fn evaluate_maps_transport_failure_to_unavailable() {
+        let client = TypeSafe::try_new("jev", Some("jev-latest"), "key")
+            .expect("client")
+            .with_base_url("http://127.0.0.1:1");
+
+        let mut questions = BTreeMap::new();
+        questions.insert(
+            "q".into(),
+            Question::Noul {
+                instructions: "yes?".into(),
+                criteria: None,
+            },
+        );
+
+        let err = client
+            .evaluate(EvaluateRequest {
+                model: "jev".into(),
+                state: EvaluateState::from("s"),
+                questions,
+            })
+            .await
+            .expect_err("transport failure");
+        assert!(
+            matches!(err, evaluate_api::Error::ServiceUnavailable { .. }),
+            "{err:?}"
+        );
     }
 }
