@@ -354,6 +354,21 @@ def _package_of(path: Path) -> str | None:
     return None
 
 
+def _module_file(module_dir: Path) -> Path | None:
+    """The file whose contents declare what lives inside `module_dir`.
+
+    `mod.rs` first, then the sibling `<name>.rs`, which is the other spelling
+    rustc accepts. Inside a `tests/` tree only the first is used today, but a
+    sibling `tests/<name>.rs` is also a target of its own, so both have to be
+    looked at rather than assumed.
+    """
+    mod_rs = REPO / module_dir / "mod.rs"
+    if mod_rs.is_file():
+        return mod_rs
+    sibling = REPO / module_dir.parent / f"{module_dir.name}.rs"
+    return sibling if sibling.is_file() else None
+
+
 def _integration_target(path: str) -> tuple[str, str] | str | None:
     """`(package, binary)` when `path` is compiled into an integration-test binary.
 
@@ -383,14 +398,44 @@ def _integration_target(path: str) -> tuple[str, str] | str | None:
         # `tests/<name>.rs` is its own target.
         return package, inside[0].removesuffix(".rs")
     # `tests/<name>/…` is a module; the target is whichever `tests/*.rs` declares it.
+    tests_dir = Path(*parts[: index + 1])
     declaration = _module_declaration(inside[0])
-    for candidate in sorted((REPO / crate_dir / "tests").glob("*.rs")):
+    binary = None
+    for candidate in sorted((REPO / tests_dir).glob("*.rs")):
         if declaration.search(candidate.read_text(encoding="utf-8")):
-            return package, candidate.stem
-    return (
-        f"no `tests/*.rs` in {crate_dir} declares `mod {inside[0]};`, so cargo compiles it into "
-        f"no integration-test binary and nothing runs it — declare the module, or correct the path"
-    )
+            binary = candidate.stem
+            break
+    if binary is None:
+        return (
+            f"no `tests/*.rs` in {crate_dir} declares `mod {inside[0]};`, so cargo compiles it into "
+            f"no integration-test binary and nothing runs it — declare the module, or correct the path"
+        )
+    # Every level below that has to be declared by its own parent, or the file is
+    # exactly as uncompiled as an undeclared top-level directory: reaching the
+    # binary through the *first* component says nothing about the rest of the
+    # chain.
+    module_dir = tests_dir / inside[0]
+    descend = list(inside[1:])
+    if descend and descend[-1] == "mod.rs":
+        # `…/<name>/mod.rs` is the file *for* `<name>`, which the step that
+        # declared `<name>` has already accounted for — not a submodule `mod`.
+        descend.pop()
+    for component in descend:
+        parent = _module_file(module_dir)
+        module = component.removesuffix(".rs")
+        if parent is None:
+            return (
+                f"{module_dir} has no `mod.rs` and no `{module_dir.name}.rs` beside it, so nothing "
+                f"declares what is inside it and cargo compiles none of it"
+            )
+        if not _module_declaration(module).search(parent.read_text(encoding="utf-8")):
+            return (
+                f"{parent.relative_to(REPO)} does not declare `mod {module};`, so cargo compiles it "
+                f"into no integration-test binary and nothing runs it — declare the module, or "
+                f"correct the path"
+            )
+        module_dir = module_dir / module
+    return package, binary
 
 
 # `package(=…)` / `binary(=…)` inside one clause of the gate's filterset.

@@ -324,7 +324,10 @@ try:
     (_demo / "src" / "lib.rs").write_text("", encoding="utf-8")
     # One binary, two modules, and a third directory nothing declares.
     (_demo / "tests" / "integration.rs").write_text("mod covered;\npub mod second;\n", encoding="utf-8")
-    (_demo / "tests" / "covered" / "mod.rs").write_text("", encoding="utf-8")
+    (_demo / "tests" / "covered" / "mod.rs").write_text("mod nested;\n", encoding="utf-8")
+    # One level deeper: `nested` is declared by its parent module, `orphan` is not.
+    (_demo / "tests" / "covered" / "nested.rs").write_text("", encoding="utf-8")
+    (_demo / "tests" / "covered" / "orphan.rs").write_text("", encoding="utf-8")
     (_demo / "tests" / "second" / "mod.rs").write_text("", encoding="utf-8")
     (_demo / "tests" / "orphan" / "mod.rs").write_text("", encoding="utf-8")
     (_demo / "tests" / "standalone.rs").write_text("", encoding="utf-8")
@@ -431,6 +434,27 @@ try:
             "kind(=lib) + (package(=demo) & binary(=standalone))",
         ),
         "binary(=integration)",
+    )
+
+    # Reaching the binary through the first component below `tests/` says nothing
+    # about the rest of the chain: a file whose own parent module never declares
+    # it is exactly as uncompiled as an undeclared top-level directory.
+    check(
+        "a nested module its parent declares resolves to the same binary",
+        reachability("`crates/demo/tests/covered/nested.rs::a_guard`", NAMES_THE_BINARY),
+        [],
+    )
+    check_contains(
+        "a nested module its parent does not declare is reported",
+        reachability("`crates/demo/tests/covered/orphan.rs::a_guard`", NAMES_THE_BINARY),
+        "does not declare `mod orphan;`",
+    )
+    # The directory's own `mod.rs` is the file for that directory, not a submodule
+    # called `mod` — the walk has to stop rather than ask its parent for one.
+    check(
+        "a `<dir>/mod.rs` guard is not read as a submodule named `mod`",
+        reachability("`crates/demo/tests/covered/mod.rs::a_guard`", NAMES_THE_BINARY),
+        [],
     )
 
     check(
